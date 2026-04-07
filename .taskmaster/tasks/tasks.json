@@ -10372,10 +10372,11 @@
         "description": "In orchestrator/src/orchestrator/evals/runner.py lines 313-315, replace `isinstance(r, BaseException)` with handling that explicitly re-raises asyncio.CancelledError (or separates it from ordinary eval failures) so graceful shutdown propagates correctly. Add a test that gathers a coroutine raising asyncio.CancelledError and verifies the correct behavior (absorbed vs re-raised, per the chosen design). Also add a test that calls run_eval_matrix with a task raising asyncio.CancelledError and verifies the error is logged but the matrix call handles it gracefully.",
         "details": "",
         "testStrategy": "",
-        "status": "pending",
+        "status": "in-progress",
         "dependencies": [],
         "priority": "medium",
-        "subtasks": []
+        "subtasks": [],
+        "updatedAt": "2026-04-07T04:18:33.697Z"
       },
       {
         "id": "532",
@@ -10901,7 +10902,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-04-07T04:18:33.620Z",
+      "lastModified": "2026-04-07T04:18:33.697Z",
       "taskCount": 555,
       "completedCount": 442,
       "tags": [
