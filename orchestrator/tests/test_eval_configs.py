@@ -154,6 +154,20 @@ class TestEvalConfigsIncludesVllm:
             f'{[c.name for c in EVAL_CONFIGS]}'
         )
 
+    def test_cloud_baselines_equal_eval_minus_vllm(self):
+        """Cloud baselines derived by set-difference must equal the known literal set."""
+        derived = {cfg.name for cfg in EVAL_CONFIGS} - {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+        expected = {
+            'claude-opus-high', 'claude-opus-max', 'claude-sonnet-max',
+            'codex-gpt54-xhigh', 'codex-gpt54mini-xhigh',
+            'gemini-31-pro-high', 'gemini-3-flash-high',
+        }
+        assert derived == expected, (
+            f'Derived cloud baselines do not match expected set.\n'
+            f'  Extra:   {derived - expected}\n'
+            f'  Missing: {expected - derived}'
+        )
+
 
 class TestRunnerDefaultIncludesVllm:
     """run_eval_matrix must receive vLLM configs when called with its default EVAL_CONFIGS."""
