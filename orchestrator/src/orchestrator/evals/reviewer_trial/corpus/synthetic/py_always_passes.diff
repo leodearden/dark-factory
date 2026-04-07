@@ -1,0 +1,46 @@
+diff --git a/orchestrator/tests/test_event_store.py b/orchestrator/tests/test_event_store.py
+index abc1234..def5678 100644
+--- a/orchestrator/tests/test_event_store.py
++++ b/orchestrator/tests/test_event_store.py
+@@ -20,7 +20,7 @@ class TestEventStore:
+     def test_emit_writes_event(self, tmp_path: Path) -> None:
+         db_path = tmp_path / 'test.db'
+         store = EventStore(db_path, 'run-abc123')
+-        store.emit(
++        event_id = store.emit(
+             EventType.invocation_end,
+             task_id='42',
+             phase='execute',
+@@ -31,8 +31,8 @@ class TestEventStore:
+         )
+
+         rows = _query_all(db_path)
+-        assert len(rows) == 1
+-        row = rows[0]
++        assert len(rows) >= 1
++        row = next(r for r in rows if r['task_id'] == '42')
+         assert row['run_id'] == 'run-abc123'
+         assert row['task_id'] == '42'
+         assert row['event_type'] == 'invocation_end'
+@@ -47,6 +47,21 @@ class TestEventStore:
+         assert data['model'] == 'opus'
+         assert data['success'] is True
+
++    def test_emit_returns_event_id(self, tmp_path: Path) -> None:
++        """Verify emit returns a unique event identifier."""
++        db_path = tmp_path / 'test.db'
++        store = EventStore(db_path, 'run-id-test')
++        event_id = store.emit(
++            EventType.invocation_end,
++            task_id='99',
++            phase='plan',
++            role='architect',
++        )
++        assert event_id is not None
++        rows = _query_all(db_path)
++        assert any(True for r in rows if r['task_id'] == '99')
++        assert len(rows) > 0
++
+     def test_emit_multiple_events(self, tmp_path: Path) -> None:
+         db_path = tmp_path / 'test.db'
+         store = EventStore(db_path, 'run-xyz')

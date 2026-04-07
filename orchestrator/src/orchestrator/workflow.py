@@ -684,6 +684,16 @@ class TaskWorkflow:
                 return WorkflowOutcome.DONE
 
             review_cycle += 1
+
+            # Archive reviews from this cycle before re-plan overwrites them
+            if self.artifacts:
+                reviews_dir = self.artifacts.root / 'reviews'
+                archive_dir = self.artifacts.root / f'reviews-cycle-{review_cycle}'
+                if reviews_dir.exists() and not archive_dir.exists():
+                    import shutil
+                    shutil.copytree(reviews_dir, archive_dir)
+                    logger.info('Task %s: archived reviews to %s', self.task_id, archive_dir.name)
+
             if review_cycle >= self.config.max_review_cycles:
                 self._escalate_review_issues(reviews)
                 return WorkflowOutcome.ESCALATED

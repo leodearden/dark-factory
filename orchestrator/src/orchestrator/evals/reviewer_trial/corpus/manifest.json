@@ -1,0 +1,110 @@
+{
+  "version": "1.0",
+  "diffs": [
+    {
+      "diff_id": "py_missing_await",
+      "language": "python",
+      "source": "synthetic",
+      "description": "Missing await on async run_verification() call in collect_metrics — coroutine object used as result",
+      "project": "dark-factory"
+    },
+    {
+      "diff_id": "py_swapped_args",
+      "language": "python",
+      "source": "synthetic",
+      "description": "Swapped positional args (from_sha, to_sha) in git diff command, reversing diff direction",
+      "project": "dark-factory"
+    },
+    {
+      "diff_id": "py_always_passes",
+      "language": "python",
+      "source": "synthetic",
+      "description": "Weakened test assertion from == to >= and added tautological assertion in new test",
+      "project": "dark-factory"
+    },
+    {
+      "diff_id": "py_obvious_copy",
+      "language": "python",
+      "source": "synthetic",
+      "description": "Added _count_diff_changes() which duplicates existing _git_diff_stats() with different implementation",
+      "project": "dark-factory"
+    },
+    {
+      "diff_id": "py_deep_shallow",
+      "language": "python",
+      "source": "synthetic",
+      "description": "Removed .copy() from _deep_merge, causing caller's base dict to be mutated in place",
+      "project": "dark-factory"
+    },
+    {
+      "diff_id": "py_real_01",
+      "language": "python",
+      "source": "real_world",
+      "description": "Fix usage gate cap detection: add 'extra usage' prefix + respect is_error field + heuristic safety net",
+      "project": "dark-factory"
+    },
+    {
+      "diff_id": "rs_off_by_one",
+      "language": "rust",
+      "source": "synthetic",
+      "description": "Changed 0..n to 0..=n in simplex builder — creates n+2 vertices and panics on params[n]",
+      "project": "reify"
+    },
+    {
+      "diff_id": "rs_leaked_resource",
+      "language": "rust",
+      "source": "synthetic",
+      "description": "File::from_raw_fd takes ownership of fd but doc says caller closes it — double-close bug",
+      "project": "reify"
+    },
+    {
+      "diff_id": "rs_heavy_mutation_copy",
+      "language": "rust",
+      "source": "synthetic",
+      "description": "Added create_solution_map() which is a verbatim rename-only copy of build_solved_values()",
+      "project": "reify"
+    },
+    {
+      "diff_id": "rs_iter_vs_recurse",
+      "language": "rust",
+      "source": "synthetic",
+      "description": "Added flawed iterative lower_expr that falls back to recursion and corrupts traversal order",
+      "project": "reify"
+    },
+    {
+      "diff_id": "rs_missing_error_prop",
+      "language": "rust",
+      "source": "synthetic",
+      "description": "Changed .unwrap_or(text) to .unwrap() in string literal lowering — panics on malformed nodes",
+      "project": "reify"
+    },
+    {
+      "diff_id": "rs_real_01",
+      "language": "rust",
+      "source": "real_world",
+      "description": "Fix duplicate template name detection in SCC — HashMap::collect silently overwrites duplicates",
+      "project": "reify"
+    },
+    {
+      "diff_id": "ts_shallow_mutate",
+      "language": "typescript",
+      "source": "synthetic",
+      "description": "Solid.js store reference leak — tool_input stored without deep copy, resultCache replaces reactive object",
+      "project": "reify-gui"
+    },
+    {
+      "diff_id": "ts_obvious_copy",
+      "language": "typescript",
+      "source": "synthetic",
+      "description": "Added focusOnBounds/focusOnEntities duplicating camera positioning logic from fitToView/flyToEntity",
+      "project": "reify-gui"
+    },
+    {
+      "diff_id": "ts_real_01",
+      "language": "typescript",
+      "source": "real_world",
+      "description": "Guard view.dispatch against destroyed EditorView in async gotoDefinition callback",
+      "project": "reify-gui"
+    }
+  ]
+}

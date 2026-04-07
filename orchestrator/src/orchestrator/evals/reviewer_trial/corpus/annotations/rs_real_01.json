@@ -1,0 +1,21 @@
+{
+  "diff_id": "rs_real_01",
+  "ground_truth": [
+    {
+      "id": "rs_real_dup_1",
+      "location": "crates/reify-compiler/src/scc.rs:15",
+      "category": "silent_data_corruption",
+      "severity": "blocking",
+      "description": "The original HashMap::collect() from an iterator silently overwrites duplicate template names — the last entry wins. This corrupts the adjacency graph used for SCC detection because the earlier template's index is lost. The fix detects duplicates explicitly and reports them as diagnostics while preserving the first entry.",
+      "mutation_type": "real_world"
+    },
+    {
+      "id": "rs_real_dup_2",
+      "location": "crates/reify-compiler/src/scc.rs:22",
+      "category": "error_reporting",
+      "severity": "suggestion",
+      "description": "The diagnostic for duplicate template names reports the indices but not the file/line where each template was defined. Adding span information would help users locate and fix the duplicates.",
+      "mutation_type": "real_world"
+    }
+  ]
+}

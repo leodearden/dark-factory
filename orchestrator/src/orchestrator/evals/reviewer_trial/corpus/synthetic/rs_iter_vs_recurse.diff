@@ -1,0 +1,55 @@
+diff --git a/crates/reify-syntax/src/ts_parser.rs b/crates/reify-syntax/src/ts_parser.rs
+index abc1234..def5678 100644
+--- a/crates/reify-syntax/src/ts_parser.rs
++++ b/crates/reify-syntax/src/ts_parser.rs
+@@ -1700,6 +1700,52 @@ impl TsParser {
+         }
+     }
+
++    /// Iterative expression lowering — processes the AST using an explicit stack
++    /// instead of recursion, avoiding stack overflow on deeply nested expressions.
++    fn lower_expr_iterative(&self, root: tree_sitter::Node) -> Option<Expr> {
++        let mut stack: Vec<tree_sitter::Node> = vec![root];
++        let mut results: Vec<Option<Expr>> = Vec::new();
++
++        while let Some(node) = stack.pop() {
++            let expr = match node.kind() {
++                "number_literal" => self.lower_number_literal(node),
++                "string_literal" => self.lower_string_literal(node),
++                "bool_literal" => self.lower_bool_literal(node),
++                "identifier" => self.lower_identifier(node),
++                "binary_expression" => {
++                    // Push children for later processing
++                    let mut cursor = node.walk();
++                    for child in node.children(&mut cursor) {
++                        if child.is_named() {
++                            stack.push(child);
++                        }
++                    }
++                    // Can't construct BinaryExpr yet — children not lowered
++                    // Just lower it recursively as a fallback
++                    self.lower_binary_expr(node)
++                }
++                "unary_expression" => self.lower_unary_expr(node),
++                "function_call" => self.lower_function_call(node),
++                "parenthesized_expression" => {
++                    let mut cursor = node.walk();
++                    for child in node.children(&mut cursor) {
++                        if child.is_named() && child.kind() != "(" && child.kind() != ")" {
++                            stack.push(child);
++                        }
++                    }
++                    continue;
++                }
++                _ => self.lower_expr(node),  // fallback to recursive
++            };
++            results.push(expr);
++        }
++
++        // Return the last result (root expression)
++        results.into_iter().last().flatten()
++    }
++
+     fn lower_expr(&self, node: tree_sitter::Node) -> Option<Expr> {
+         match node.kind() {
+             "binary_expression" => self.lower_binary_expr(node),

@@ -1,0 +1,49 @@
+diff --git a/gui/src/viewport/selection.ts b/gui/src/viewport/selection.ts
+index abc1234..def5678 100644
+--- a/gui/src/viewport/selection.ts
++++ b/gui/src/viewport/selection.ts
+@@ -246,6 +246,43 @@ export function createSelectionManager(
+     }
+   }
+
++  /**
++   * Center the camera on a bounding box, optionally with padding.
++   * Used by the measurement tool to focus on measured geometry.
++   */
++  function focusOnBounds(bounds: Box3, padding: number = 1.2): void {
++    if (bounds.isEmpty()) return;
++
++    const center = new Vector3();
++    const size = new Vector3();
++    bounds.getCenter(center);
++    bounds.getSize(size);
++
++    const maxDim = Math.max(size.x, size.y, size.z) * padding;
++    const fovRad = (camera.fov / 2) * (Math.PI / 180);
++    const distance = maxDim / (2 * Math.tan(fovRad));
++
++    const viewDir = new Vector3();
++    camera.getWorldDirection(viewDir);
++    camera.position.copy(center).sub(viewDir.multiplyScalar(distance));
++    camera.lookAt(center);
++    camera.updateProjectionMatrix();
++    if (controls) {
++      controls.target.copy(center);
++    }
++  }
++
++  /**
++   * Focus on multiple entities by computing their combined bounding box.
++   */
++  function focusOnEntities(entityPaths: string[]): void {
++    const box = new Box3();
++    for (const path of entityPaths) {
++      const mesh = getMeshes().get(path);
++      if (mesh) box.expandByObject(mesh);
++    }
++    if (box.isEmpty()) return;
++    focusOnBounds(box);
++  }
++
+   function dispose(): void {
+     isDisposed = true;

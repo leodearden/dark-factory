@@ -1,0 +1,37 @@
+{
+  "diff_id": "rs_iter_vs_recurse",
+  "ground_truth": [
+    {
+      "id": "rs_iter_1",
+      "location": "crates/reify-syntax/src/ts_parser.rs:1703",
+      "category": "incorrect_algorithm",
+      "severity": "blocking",
+      "description": "lower_expr_iterative() claims to be an iterative replacement for the recursive lower_expr(), but it falls back to recursive calls for most complex cases (binary_expression calls self.lower_binary_expr which is recursive, the _ arm calls self.lower_expr which is fully recursive). This defeats the purpose of the iterative approach and provides no stack overflow protection for the cases that actually need it.",
+      "mutation_type": "iter_vs_recurse"
+    },
+    {
+      "id": "rs_iter_2",
+      "location": "crates/reify-syntax/src/ts_parser.rs:1720",
+      "category": "incorrect_traversal_order",
+      "severity": "blocking",
+      "description": "For binary_expression, the code pushes children onto the stack AND calls self.lower_binary_expr(node) which processes the same children recursively. This double-processes child nodes — once via the recursive call and again when they're popped from the stack later, producing duplicate/corrupted results.",
+      "mutation_type": "iter_vs_recurse"
+    },
+    {
+      "id": "rs_iter_3",
+      "location": "crates/reify-syntax/src/ts_parser.rs:1745",
+      "category": "incorrect_result_assembly",
+      "severity": "blocking",
+      "description": "results.into_iter().last().flatten() returns the last expression pushed, but the stack is LIFO — the root node is processed first (popped first from the initial push) and its result is pushed first into results. For a tree with children, the last result will be from the deepest leaf, not the root expression. The function returns the wrong AST node.",
+      "mutation_type": "iter_vs_recurse"
+    },
+    {
+      "id": "rs_iter_4",
+      "location": "crates/reify-syntax/src/ts_parser.rs:1703",
+      "category": "code_duplication",
+      "severity": "suggestion",
+      "description": "lower_expr_iterative() duplicates the dispatch logic from lower_expr() (matching on node.kind()) without reusing it. Any new expression types added to lower_expr() would need to be added to both functions.",
+      "mutation_type": "iter_vs_recurse"
+    }
+  ]
+}
