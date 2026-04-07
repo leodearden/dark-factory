@@ -11109,6 +11109,17 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": []
+      },
+      {
+        "id": 589,
+        "title": "Add multi-account failover configuration to reify orchestrator",
+        "description": "Reify orchestrator is configured with only 1 usage account, causing all 48 concurrent tasks to block simultaneously when that account hits its cap. On 2026-04-07 this triggered 63 level-1 escalations. Dark-factory uses 5 accounts (F→E→C→B→D for automation, A reserved for interactive). Reify needs equivalent failover routing.\\n\\n## Work Required\\n1. Locate reify's orchestrator config (filename differs from dark-factory's orchestrator.yaml — check reify project root)\\n2. Add 4+ additional account credentials/entries in the accounts/failover section, mirroring dark-factory's multi-account setup\\n3. Verify UsageGate picks up the new accounts and rotates correctly under cap conditions\\n4. Test: simulate a cap-hit and confirm reify tasks route to the next account rather than all blocking\\n\\n## memory_hints\\n- search: \\\"multi-account Max failover setup accounts F E C B D UsageGate\\\"\\n- search: \\\"reify orchestrator config filename orchestrator.yaml accounts\\\"\\n- search: \\\"UsageGate blocks all capped failover accounts\\\"\\n- entity: \\\"UsageGate\\\"",
+        "details": "",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -11120,7 +11131,8 @@
         "master"
       ],
       "created": "2026-04-07T06:15:47.627Z",
-      "description": "Tasks for master context"
+      "description": "Tasks for master context",
+      "updated": "2026-04-07T19:12:06.687Z"
     }
   }
 }
