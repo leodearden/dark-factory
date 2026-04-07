@@ -10,6 +10,7 @@ from unittest.mock import patch
 import aiosqlite
 import pytest
 
+from dashboard.config import DashboardConfig
 from dashboard.data.burndown import (
     BURNDOWN_SCHEMA,
     _count_statuses,
@@ -49,6 +50,21 @@ def _insert_snapshot(
         'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done),
     )
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def burndown_env(tmp_path):
+    """Yield (db_path, config, conn) with a fresh burndown DB and open connection."""
+    db_path = tmp_path / 'burndown.db'
+    _create_burndown_db(db_path)
+    config = DashboardConfig(project_root=tmp_path)
+    async with aiosqlite.connect(str(db_path)) as conn:
+        yield db_path, config, conn
 
 
 # ---------------------------------------------------------------------------
@@ -102,12 +118,8 @@ class TestCountStatuses:
 
 class TestCollectSnapshot:
     @pytest.mark.asyncio
-    async def test_inserts_main_project(self, tmp_path):
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
-
-        from dashboard.config import DashboardConfig
-        config = DashboardConfig(project_root=tmp_path)
+    async def test_inserts_main_project(self, burndown_env):
+        db_path, config, conn = burndown_env
 
         fake_tasks = [
             {'status': 'done'},
@@ -116,20 +128,19 @@ class TestCollectSnapshot:
             {'status': 'in-progress'},
         ]
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            with (
-                patch('dashboard.data.burndown.load_task_tree', return_value=fake_tasks),
-                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-            ):
-                await collect_snapshot(conn, config)
+        with (
+            patch('dashboard.data.burndown.load_task_tree', return_value=fake_tasks),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+        ):
+            await collect_snapshot(conn, config)
 
-            async with conn.execute('SELECT * FROM snapshots') as cur:
-                rows = list(await cur.fetchall())
+        async with conn.execute('SELECT * FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
 
         assert len(rows) == 1
         row = rows[0]
         # row: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
-        assert row[1] == str(tmp_path)  # project_id
+        assert row[1] == str(config.project_root.resolve())  # project_id
         assert row[3] == 1   # pending
         assert row[4] == 1   # in_progress
         assert row[5] == 0   # blocked
@@ -138,21 +149,26 @@ class TestCollectSnapshot:
         assert row[8] == 2   # done
 
     @pytest.mark.asyncio
-    async def test_deduplicates_main_project_from_orchestrators(self, tmp_path):
-        """If an orchestrator targets the same root, only one row is inserted."""
+    async def test_symlinked_root_deduplicates_with_orchestrator(self, tmp_path):
+        """Symlinked project_root and orchestrator resolving to real path produce only 1 row."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
-        from dashboard.config import DashboardConfig
-        config = DashboardConfig(project_root=tmp_path)
+        config = DashboardConfig(project_root=link)
 
-        fake_orchestrators = [{'prd': str(tmp_path / 'prd.md'), 'project_root': str(tmp_path)}]
+        # Orchestrator resolves the same project via _resolve_project_root to the real path
+        fake_orchestrators = [{'prd': 'fake_prd.md', 'config_path': None}]
 
         async with aiosqlite.connect(str(db_path)) as conn:
             with (
                 patch('dashboard.data.burndown.load_task_tree', return_value=[]),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
-                patch('dashboard.data.burndown._resolve_project_root', return_value=tmp_path),
+                patch('dashboard.data.burndown._resolve_project_root', return_value=real_dir.resolve()),
             ):
                 await collect_snapshot(conn, config)
 
@@ -161,20 +177,40 @@ class TestCollectSnapshot:
                 assert row is not None
                 count = row[0]
 
+        # Only 1 row — symlink and real path should deduplicate
         assert count == 1
 
     @pytest.mark.asyncio
-    async def test_snapshots_known_project_roots_when_no_orchestrators(self, tmp_path):
+    async def test_deduplicates_main_project_from_orchestrators(self, burndown_env):
+        """If an orchestrator targets the same root, only one row is inserted."""
+        db_path, config, conn = burndown_env
+
+        fake_orchestrators = [{'prd': str(config.project_root / 'prd.md'), 'project_root': str(config.project_root)}]
+
+        with (
+            patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
+            patch('dashboard.data.burndown._resolve_project_root', return_value=config.project_root),
+        ):
+            await collect_snapshot(conn, config)
+
+        async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+            row = await cur.fetchone()
+            assert row is not None
+            count = row[0]
+
+        assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_snapshots_known_project_roots_when_no_orchestrators(self, burndown_env):
         """Known roots are snapshotted even when no orchestrators are running."""
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
+        db_path, base_config, conn = burndown_env
 
         reify_root = Path('/home/leo/src/reify')
         autopilot_root = Path('/home/leo/src/autopilot-video')
 
-        from dashboard.config import DashboardConfig
         config = DashboardConfig(
-            project_root=tmp_path,
+            project_root=base_config.project_root,
             known_project_roots=[reify_root, autopilot_root],
         )
 
@@ -182,33 +218,72 @@ class TestCollectSnapshot:
         reify_tasks = [{'status': 'done'}, {'status': 'done'}]
         autopilot_tasks = [{'status': 'in-progress'}]
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            with (
-                patch('dashboard.data.burndown.load_task_tree',
-                      side_effect=[main_tasks, reify_tasks, autopilot_tasks]),
-                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-            ):
-                await collect_snapshot(conn, config)
+        # Path-keyed dispatch: asyncio.gather fires load_task_tree calls
+        # concurrently, so an ordered side_effect list can race. Look up by path.
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            reify_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': reify_tasks,
+            autopilot_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': autopilot_tasks,
+        }
 
-            async with conn.execute('SELECT project_id FROM snapshots') as cur:
-                rows = list(await cur.fetchall())
+        def fake_load(path):
+            return _tasks_map[path]
+
+        with (
+            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+        ):
+            await collect_snapshot(conn, config)
+
+        async with conn.execute('SELECT project_id FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
 
         assert len(rows) == 3
         project_ids = {row[0] for row in rows}
-        assert str(tmp_path) in project_ids
+        assert str(base_config.project_root.resolve()) in project_ids
         assert str(reify_root.resolve()) in project_ids
         assert str(autopilot_root.resolve()) in project_ids
 
     @pytest.mark.asyncio
-    async def test_dedupes_known_root_against_main_project(self, tmp_path):
+    async def test_dedupes_known_root_against_main_project(self, burndown_env):
         """If known_project_roots includes main project_root, only one row is inserted."""
+        db_path, base_config, conn = burndown_env
+
+        config = DashboardConfig(
+            project_root=base_config.project_root,
+            known_project_roots=[base_config.project_root],  # same as project_root
+        )
+
+        with (
+            patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+        ):
+            await collect_snapshot(conn, config)
+
+        async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
+                                (str(base_config.project_root.resolve()),)) as cur:
+            row = await cur.fetchone()
+            assert row is not None
+            count = row[0]
+
+        assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_symlinked_root_deduplicates_with_known_roots(self, tmp_path):
+        """If known_project_roots includes the resolved real path, it deduplicates with a symlinked project_root."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
         from dashboard.config import DashboardConfig
+        # project_root is the symlink; known_project_roots contains the resolved real path
         config = DashboardConfig(
-            project_root=tmp_path,
-            known_project_roots=[tmp_path],  # same as project_root
+            project_root=link,
+            known_project_roots=[real_dir],  # same underlying dir, unresolved
         )
 
         async with aiosqlite.connect(str(db_path)) as conn:
@@ -218,25 +293,23 @@ class TestCollectSnapshot:
             ):
                 await collect_snapshot(conn, config)
 
-            async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
-                                    (str(tmp_path),)) as cur:
+            async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
                 count = row[0]
 
+        # Only 1 row — symlink project_root and known real path deduplicate
         assert count == 1
 
     @pytest.mark.asyncio
-    async def test_dedupes_known_root_against_running_orchestrator(self, tmp_path):
+    async def test_dedupes_known_root_against_running_orchestrator(self, burndown_env):
         """If known_project_roots includes a root already discovered via orchestrator, no duplicate."""
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
+        db_path, base_config, conn = burndown_env
 
         reify_root = Path('/home/leo/src/reify')
 
-        from dashboard.config import DashboardConfig
         config = DashboardConfig(
-            project_root=tmp_path,
+            project_root=base_config.project_root,
             known_project_roots=[reify_root],
         )
 
@@ -245,31 +318,64 @@ class TestCollectSnapshot:
             {'prd': None, 'config_path': '/home/leo/src/reify/orchestrator.yaml'},
         ]
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            with (
-                patch('dashboard.data.burndown.load_task_tree',
-                      side_effect=[[], [{'status': 'done'}]]),
-                patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
-                patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
-            ):
-                await collect_snapshot(conn, config)
+        # Orchestrator discovery returns reify_root (un-resolved); dedup prevents a second
+        # load_task_tree call for the known_project_roots entry that resolves to the same root.
+        # Path-keyed dispatch because asyncio.gather fires calls concurrently —
+        # an ordered side_effect list can race on thread scheduling.
+        _tasks_map = {
+            config.tasks_json: [],
+            reify_root / '.taskmaster' / 'tasks' / 'tasks.json': [{'status': 'done'}],
+        }
 
-            async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
-                                    (str(reify_root.resolve()),)) as cur:
-                row = await cur.fetchone()
-                assert row is not None
-                count = row[0]
+        def fake_load(path):
+            return _tasks_map[path]
+
+        with (
+            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
+            patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
+        ):
+            await collect_snapshot(conn, config)
+
+        async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
+                                (str(reify_root.resolve()),)) as cur:
+            row = await cur.fetchone()
+            assert row is not None
+            count = row[0]
 
         assert count == 1  # only one row for reify, not two
 
     @pytest.mark.asyncio
-    async def test_discovers_config_flag_orchestrator(self, tmp_path):
-        """Orchestrators launched with --config (no --prd) are snapshotted."""
+    async def test_main_project_id_is_resolved_path(self, tmp_path):
+        """project_id in snapshot must be the resolved path even when project_root is a symlink."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
-        from dashboard.config import DashboardConfig
-        config = DashboardConfig(project_root=tmp_path)
+        config = DashboardConfig(project_root=link)
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+
+        assert len(rows) == 1
+        # project_id must be the resolved real path, not the symlink path
+        assert rows[0][0] == str(real_dir.resolve())
+
+    @pytest.mark.asyncio
+    async def test_discovers_config_flag_orchestrator(self, burndown_env):
+        """Orchestrators launched with --config (no --prd) are snapshotted."""
+        db_path, config, conn = burndown_env
 
         reify_root = Path('/home/leo/src/reify')
         fake_orchestrators = [
@@ -277,21 +383,30 @@ class TestCollectSnapshot:
         ]
         reify_tasks = [{'status': 'done'}, {'status': 'pending'}]
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            with (
-                patch('dashboard.data.burndown.load_task_tree', side_effect=[[], reify_tasks]),
-                patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
-                patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
-            ):
-                await collect_snapshot(conn, config)
+        # Path-keyed dispatch because asyncio.gather fires calls concurrently —
+        # an ordered side_effect list can race on thread scheduling.
+        _tasks_map = {
+            config.tasks_json: [],
+            reify_root / '.taskmaster' / 'tasks' / 'tasks.json': reify_tasks,
+        }
 
-            async with conn.execute('SELECT * FROM snapshots ORDER BY project_id') as cur:
-                rows = list(await cur.fetchall())
+        def fake_load(path):
+            return _tasks_map[path]
+
+        with (
+            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
+            patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
+        ):
+            await collect_snapshot(conn, config)
+
+        async with conn.execute('SELECT * FROM snapshots ORDER BY project_id') as cur:
+            rows = list(await cur.fetchall())
 
         assert len(rows) == 2
         ids = {row[1] for row in rows}
-        assert str(tmp_path) in ids       # main project
-        assert str(reify_root) in ids      # config-discovered project
+        assert str(config.project_root.resolve()) in ids  # main project
+        assert str(reify_root) in ids            # config-discovered project
         # Check reify row counts
         reify_row = next(r for r in rows if r[1] == str(reify_root))
         assert reify_row[3] == 1  # pending
@@ -307,7 +422,6 @@ class TestCollectSnapshot:
         root_b = Path('/fake/project/root_b')
         root_c = Path('/fake/project/root_c')
 
-        from dashboard.config import DashboardConfig
         config = DashboardConfig(
             project_root=tmp_path,
             known_project_roots=[root_a, root_b, root_c],
@@ -317,11 +431,24 @@ class TestCollectSnapshot:
         root_a_tasks = [{'status': 'done'}]
         root_c_tasks = [{'status': 'in-progress'}]
 
-        # 4 calls: main, root_a, root_b (raises), root_c
+        # Path-keyed dispatch: asyncio.gather fires load_task_tree calls
+        # concurrently, so an ordered side_effect list can race. The bad path
+        # raises PermissionError; return_exceptions=True isolates the failure.
+        bad_tasks_json = root_b.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            root_a.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': root_a_tasks,
+            root_c.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': root_c_tasks,
+        }
+
+        def fake_load(path):
+            if path == bad_tasks_json:
+                raise PermissionError('Permission denied')
+            return _tasks_map[path]
+
         async with aiosqlite.connect(str(db_path)) as conn:
             with (
-                patch('dashboard.data.burndown.load_task_tree',
-                      side_effect=[main_tasks, root_a_tasks, PermissionError('Permission denied'), root_c_tasks]),
+                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
                 await collect_snapshot(conn, config)
@@ -332,7 +459,7 @@ class TestCollectSnapshot:
         project_ids = {row[0] for row in rows}
         # main + root_a + root_c should be present
         assert len(rows) == 3
-        assert str(tmp_path) in project_ids
+        assert str(tmp_path.resolve()) in project_ids
         assert str(root_a.resolve()) in project_ids
         assert str(root_c.resolve()) in project_ids
         # root_b should NOT be present
@@ -348,18 +475,22 @@ class TestCollectSnapshot:
 
         bad_root = Path('/fake/project/bad_root')
 
-        from dashboard.config import DashboardConfig
         config = DashboardConfig(
             project_root=tmp_path,
             known_project_roots=[bad_root],
         )
 
-        main_tasks: list = []
+        bad_tasks_json = bad_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+        _tasks_map: dict = {config.tasks_json: []}
+
+        def fake_load(path):
+            if path == bad_tasks_json:
+                raise PermissionError('Permission denied')
+            return _tasks_map[path]
 
         async with aiosqlite.connect(str(db_path)) as conn:
             with (
-                patch('dashboard.data.burndown.load_task_tree',
-                      side_effect=[main_tasks, PermissionError('Permission denied')]),
+                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
                 caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
@@ -382,7 +513,6 @@ class TestCollectSnapshot:
         bad_root = Path('/fake/project/bad_root')
         good_root = Path('/fake/project/good_root')
 
-        from dashboard.config import DashboardConfig
         config = DashboardConfig(
             project_root=tmp_path,
             known_project_roots=[bad_root, good_root],
@@ -391,11 +521,20 @@ class TestCollectSnapshot:
         main_tasks = [{'status': 'pending'}]
         good_tasks = [{'status': 'done'}, {'status': 'done'}]
 
-        # 3 calls: main, bad_root (raises), good_root
+        bad_tasks_json = bad_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            good_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': good_tasks,
+        }
+
+        def fake_load(path):
+            if path == bad_tasks_json:
+                raise PermissionError('denied')
+            return _tasks_map[path]
+
         async with aiosqlite.connect(str(db_path)) as conn:
             with (
-                patch('dashboard.data.burndown.load_task_tree',
-                      side_effect=[main_tasks, PermissionError('denied'), good_tasks]),
+                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
                 await collect_snapshot(conn, config)
@@ -405,13 +544,94 @@ class TestCollectSnapshot:
 
         assert len(rows) == 2
         project_ids = {row[0] for row in rows}
-        assert str(tmp_path) in project_ids          # (a) main project row
-        assert str(good_root.resolve()) in project_ids  # (b) good_root row
-        assert str(bad_root.resolve()) not in project_ids  # (c) no bad_root row
+        assert str(tmp_path.resolve()) in project_ids        # (a) main project row
+        assert str(good_root.resolve()) in project_ids       # (b) good_root row
+        assert str(bad_root.resolve()) not in project_ids    # (c) no bad_root row
 
         good_row = next(r for r in rows if r[0] == str(good_root.resolve()))
         assert good_row[1] == 2  # done=2 for good_root
 
+    @pytest.mark.asyncio
+    async def test_orchestrator_fallback_deduplicates_against_resolved_root(self, tmp_path):
+        """When _resolve_project_root falls back to the symlinked config.project_root, it still deduplicates."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        config = DashboardConfig(project_root=link)
+
+        # PRD path lives directly under tmp_path (not under real_dir), so
+        # _resolve_project_root will walk up from tmp_path, find no .taskmaster,
+        # and fall back to config.project_root (the unresolved symlink).
+        prd_path = str(tmp_path / 'fake_prd.md')
+        fake_orchestrators = [{'prd': prd_path, 'config_path': None}]
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', return_value=[]),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
+                # _resolve_project_root is NOT mocked — it runs for real and falls
+                # back to config.project_root (the symlink) because prd_path has no
+                # .taskmaster in its ancestor chain.
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+                row = await cur.fetchone()
+                assert row is not None
+                count = row[0]
+
+        # Only 1 row — the orchestrator fallback targets the same project as the
+        # main project_root; resolved and unresolved paths must deduplicate.
+        assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_load_task_tree_calls_run_concurrently(self, tmp_path):
+        """All load_task_tree calls must run concurrently via asyncio.gather.
+
+        Uses a threading.Barrier(N) to detect concurrency: all N threads must
+        reach the barrier simultaneously. With sequential awaits, only one thread
+        is alive at a time so barrier.wait() times out (BrokenBarrierError).
+        With asyncio.gather, all N threads are live simultaneously and the
+        barrier succeeds.
+        """
+        import threading
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        reify_root = Path('/home/leo/src/reify')
+        autopilot_root = Path('/home/leo/src/autopilot-video')
+
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[reify_root, autopilot_root],
+        )
+
+        # 3 distinct roots: main project + 2 known roots (no orchestrators)
+        n_roots = 3
+        barrier = threading.Barrier(n_roots, timeout=2.0)
+
+        def fake_load(path):
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pytest.fail(
+                    'load_task_tree calls did not run concurrently '
+                    '(barrier timed out — calls appear to be sequential)'
+                )
+            return []
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                await collect_snapshot(conn, config)
 
 # ---------------------------------------------------------------------------
 # downsample
@@ -607,3 +827,25 @@ class TestGetBurndownSeries:
 
         # done values should be in timestamp order (oldest first)
         assert result['done'] == [3, 2, 1]
+
+
+# ---------------------------------------------------------------------------
+# burndown_env fixture validation
+# ---------------------------------------------------------------------------
+
+
+class TestBurndownEnvFixture:
+    @pytest.mark.asyncio
+    async def test_yields_valid_triple(self, burndown_env):
+        db_path, config, conn = burndown_env
+        # (a) db_path is a Path and exists on disk
+        assert isinstance(db_path, Path)
+        assert db_path.exists()
+        # (b) config is a DashboardConfig whose project_root is a tmp directory
+        assert isinstance(config, DashboardConfig)
+        assert db_path.parent == config.project_root
+        # (c) conn is a usable aiosqlite connection
+        async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 0
