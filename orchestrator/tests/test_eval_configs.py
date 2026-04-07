@@ -251,11 +251,9 @@ class TestVllmUrlInjection:
     """--vllm-url injection must target only vLLM configs, not cloud baselines."""
 
     _VLLM_URL = 'http://test-endpoint:8000'
-    _CLOUD_BASELINE_NAMES = {
-        'claude-opus-high', 'claude-opus-max', 'claude-sonnet-max',
-        'codex-gpt54-xhigh', 'codex-gpt54mini-xhigh',
-        'gemini-31-pro-high', 'gemini-3-flash-high',
-    }
+    _CLOUD_BASELINE_NAMES = (
+        {cfg.name for cfg in EVAL_CONFIGS} - {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+    )
 
     def test_injection_sets_base_url_on_vllm_configs(self, vllm_env_sandbox):
         """After injecting vllm_url, every vLLM config must have ANTHROPIC_BASE_URL set."""
