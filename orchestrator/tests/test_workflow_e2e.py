@@ -1063,13 +1063,13 @@ class TestPlanLockAndProvenance:
         )
 
         # Pre-create the worktree, plan.json, and plan.lock
-        worktree, base_commit = await git_ops.create_worktree(task_assignment.task_id)
-        workflow.worktree = worktree
+        worktree_info = await git_ops.create_worktree(task_assignment.task_id)
+        workflow.worktree = worktree_info.path
 
         # Write .task/ artifacts directly
         from orchestrator.artifacts import TaskArtifacts
-        arts = TaskArtifacts(worktree)
-        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=base_commit)
+        arts = TaskArtifacts(worktree_info.path)
+        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=worktree_info.base_commit)
         arts.write_plan(PLAN)
         arts.stamp_plan_provenance('pre-existing-session')
         arts.lock_plan('pre-existing-session')
@@ -1102,12 +1102,12 @@ class TestPlanLockAndProvenance:
         )
 
         # Pre-create the worktree with plan.json (valid steps) stamped with a DIFFERENT session
-        worktree, base_commit = await git_ops.create_worktree(task_assignment.task_id)
-        workflow.worktree = worktree
+        worktree_info = await git_ops.create_worktree(task_assignment.task_id)
+        workflow.worktree = worktree_info.path
 
         from orchestrator.artifacts import TaskArtifacts
-        arts = TaskArtifacts(worktree)
-        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=base_commit)
+        arts = TaskArtifacts(worktree_info.path)
+        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=worktree_info.base_commit)
         arts.write_plan(PLAN)
         original_session = 'original-owner-session'
         arts.stamp_plan_provenance(original_session)
@@ -1145,12 +1145,12 @@ class TestPlanLockAndProvenance:
         )
 
         # Pre-create the worktree with plan.json owned by a different session
-        worktree, base_commit = await git_ops.create_worktree(task_assignment.task_id)
-        workflow.worktree = worktree
+        worktree_info = await git_ops.create_worktree(task_assignment.task_id)
+        workflow.worktree = worktree_info.path
 
         from orchestrator.artifacts import TaskArtifacts
-        arts = TaskArtifacts(worktree)
-        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=base_commit)
+        arts = TaskArtifacts(worktree_info.path)
+        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=worktree_info.base_commit)
         arts.write_plan(PLAN)
         original_session = 'original-owner-session'
         arts.stamp_plan_provenance(original_session)

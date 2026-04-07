@@ -221,7 +221,9 @@ class TaskWorkflow:
             # Create worktree (captures base commit for stable diffs)
             # If worktree is already set (e.g. eval mode), skip creation
             if self.worktree is None:
-                self.worktree, base_commit = await self.git_ops.create_worktree(branch_name)
+                worktree_info = await self.git_ops.create_worktree(branch_name)
+                self.worktree = worktree_info.path
+                base_commit = worktree_info.base_commit
             else:
                 # Eval mode: worktree was pre-created, skip creation and cleanup
                 self._worktree_external = True

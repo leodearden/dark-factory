@@ -168,6 +168,17 @@ class MergeResult:
     merge_worktree: Path | None = None
 
 
+@dataclass
+class WorktreeInfo:
+    """Return value from create_worktree - captures worktree path and base commit.
+
+    The base_commit is the SHA of main at worktree creation time, pinned to
+    ensure stable diffs even if main advances during task execution.
+    """
+    path: Path
+    base_commit: str
+
+
 async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     """Run a git command and return (returncode, stdout, stderr)."""
     proc = await asyncio.create_subprocess_exec(
@@ -211,11 +222,12 @@ class GitOps:
                 return True
         return False
 
-    async def create_worktree(self, branch_name: str) -> tuple[Path, str]:
+    async def create_worktree(self, branch_name: str) -> WorktreeInfo:
         """Create a git worktree for a task branch, based off main.
 
-        Returns (worktree_path, base_commit_sha) so the base commit is
-        captured at creation time and not affected by later main movement.
+        Returns a WorktreeInfo with the worktree path and the base commit SHA
+        (main's SHA at creation time) so diffs remain stable even if main
+        advances during task execution.
 
         If the worktree/branch already exist (e.g., from a requeued task),
         reuses them instead of failing.
@@ -248,7 +260,7 @@ class GitOps:
             if await self._is_registered_worktree(worktree_path):
                 logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
                 _ensure_task_gitignore(worktree_path)
-                return worktree_path, base_sha
+                return WorktreeInfo(path=worktree_path, base_commit=base_sha)
             else:
                 logger.warning(
                     f'Directory {worktree_path} exists but is NOT a registered '
@@ -298,7 +310,7 @@ class GitOps:
                 worktree_path,
             )
 
-        return worktree_path, base_sha
+        return WorktreeInfo(path=worktree_path, base_commit=base_sha)
 
     async def commit(self, worktree: Path, message: str) -> str | None:
         """Stage all changes and commit. Returns sha or None if nothing to commit.

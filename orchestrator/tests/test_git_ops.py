@@ -6,6 +6,9 @@ from unittest.mock import patch
 
 import pytest
 
+from dataclasses import dataclass
+from pathlib import Path
+
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
 
@@ -43,13 +46,30 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
     return GitOps(git_config, git_repo)
 
 
+from orchestrator.git_ops import WorktreeInfo
+
+
 @pytest.mark.asyncio
 class TestWorktreeLifecycle:
     async def test_create_worktree(self, git_ops: GitOps):
-        worktree, base_sha = await git_ops.create_worktree('feature-1')
-        assert worktree.exists()
-        assert (worktree / 'README.md').exists()
-        assert len(base_sha) == 40
+        worktree_info = await git_ops.create_worktree('feature-1')
+        assert worktree_info.path.exists()
+        assert (worktree_info.path / 'README.md').exists()
+        assert len(worktree_info.base_commit) == 40
+
+    async def test_create_worktree_returns_worktree_info(self, git_ops: GitOps):
+        """create_worktree returns WorktreeInfo with path and base_commit."""
+        result = await git_ops.create_worktree('feature-wi')
+        assert isinstance(result, WorktreeInfo)
+        assert isinstance(result.path, Path)
+        assert result.path.exists()
+        assert (result.path / 'README.md').exists()
+        assert len(result.base_commit) == 40
+        # Assert base_commit matches main's HEAD at creation time
+        _, main_sha, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root
+        )
+        assert result.base_commit == main_sha.strip()
 
     async def test_create_worktree_replaces_stale_directory(self, git_ops: GitOps):
         """A directory that exists but is NOT a registered git worktree must be
@@ -65,82 +85,82 @@ class TestWorktreeLifecycle:
         # The directory exists but is NOT a registered git worktree
         assert worktree_path.exists()
 
-        worktree, base_sha = await git_ops.create_worktree('stale-1')
+        worktree_info = await git_ops.create_worktree('stale-1')
         # Should have created a real worktree with repo content
-        assert worktree.exists()
-        assert (worktree / 'README.md').exists()
-        assert len(base_sha) == 40
+        assert worktree_info.path.exists()
+        assert (worktree_info.path / 'README.md').exists()
+        assert len(worktree_info.base_commit) == 40
 
     async def test_create_worktree_reuses_registered_worktree(self, git_ops: GitOps):
         """A directory that IS a registered git worktree should be reused."""
-        worktree, base_sha = await git_ops.create_worktree('reuse-1')
-        assert worktree.exists()
-        assert (worktree / 'README.md').exists()
+        worktree_info = await git_ops.create_worktree('reuse-1')
+        assert worktree_info.path.exists()
+        assert (worktree_info.path / 'README.md').exists()
 
         # Call again — should reuse (not fail or recreate)
-        worktree2, base_sha2 = await git_ops.create_worktree('reuse-1')
-        assert worktree2 == worktree
-        assert (worktree2 / 'README.md').exists()
+        worktree_info2 = await git_ops.create_worktree('reuse-1')
+        assert worktree_info2.path == worktree_info.path
+        assert (worktree_info2.path / 'README.md').exists()
 
     async def test_commit_in_worktree(self, git_ops: GitOps):
-        worktree, _ = await git_ops.create_worktree('feature-2')
-        (worktree / 'new_file.py').write_text('print("hello")\n')
-        sha = await git_ops.commit(worktree, 'Add new file')
+        worktree_info = await git_ops.create_worktree('feature-2')
+        (worktree_info.path / 'new_file.py').write_text('print("hello")\n')
+        sha = await git_ops.commit(worktree_info.path, 'Add new file')
         assert sha is not None
         assert len(sha) == 40
 
     async def test_commit_nothing(self, git_ops: GitOps):
-        worktree, _ = await git_ops.create_worktree('feature-3')
-        sha = await git_ops.commit(worktree, 'Nothing')
+        worktree_info = await git_ops.create_worktree('feature-3')
+        sha = await git_ops.commit(worktree_info.path, 'Nothing')
         assert sha is None
 
     async def test_diff_from_main(self, git_ops: GitOps):
-        worktree, _ = await git_ops.create_worktree('feature-4')
-        (worktree / 'change.py').write_text('x = 1\n')
-        await git_ops.commit(worktree, 'Add change')
-        diff = await git_ops.get_diff_from_main(worktree)
+        worktree_info = await git_ops.create_worktree('feature-4')
+        (worktree_info.path / 'change.py').write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, 'Add change')
+        diff = await git_ops.get_diff_from_main(worktree_info.path)
         assert 'change.py' in diff
         assert 'x = 1' in diff
 
     async def test_diff_from_base(self, git_ops: GitOps):
-        worktree, base_sha = await git_ops.create_worktree('feature-4b')
-        (worktree / 'base_change.py').write_text('y = 2\n')
-        await git_ops.commit(worktree, 'Add base change')
-        diff = await git_ops.get_diff_from_base(worktree, base_sha)
+        worktree_info = await git_ops.create_worktree('feature-4b')
+        (worktree_info.path / 'base_change.py').write_text('y = 2\n')
+        await git_ops.commit(worktree_info.path, 'Add base change')
+        diff = await git_ops.get_diff_from_base(worktree_info.path, worktree_info.base_commit)
         assert 'base_change.py' in diff
         assert 'y = 2' in diff
 
     async def test_commit_excludes_taskmaster_tasks(self, git_ops: GitOps):
         """Files in .taskmaster/tasks/ must not be staged by commit()."""
-        worktree, _ = await git_ops.create_worktree('feature-exclude')
+        worktree_info = await git_ops.create_worktree('feature-exclude')
 
-        tasks_dir = worktree / '.taskmaster' / 'tasks'
+        tasks_dir = worktree_info.path / '.taskmaster' / 'tasks'
         tasks_dir.mkdir(parents=True, exist_ok=True)
         (tasks_dir / 'tasks.json').write_text('{"tasks": []}')
-        (worktree / 'real_change.py').write_text('x = 1\n')
+        (worktree_info.path / 'real_change.py').write_text('x = 1\n')
 
-        sha = await git_ops.commit(worktree, 'Test exclusion')
+        sha = await git_ops.commit(worktree_info.path, 'Test exclusion')
         assert sha is not None
 
         rc, files, _ = await _run(
             ['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', sha],
-            cwd=worktree,
+            cwd=worktree_info.path,
         )
         assert 'real_change.py' in files
         assert '.taskmaster/tasks/tasks.json' not in files
 
     async def test_cleanup_worktree(self, git_ops: GitOps):
-        worktree, _ = await git_ops.create_worktree('feature-5')
-        assert worktree.exists()
-        await git_ops.cleanup_worktree(worktree, 'feature-5')
-        assert not worktree.exists()
+        worktree_info = await git_ops.create_worktree('feature-5')
+        assert worktree_info.path.exists()
+        await git_ops.cleanup_worktree(worktree_info.path, 'feature-5')
+        assert not worktree_info.path.exists()
 
     async def test_merge_to_main(self, git_ops: GitOps):
-        worktree, _ = await git_ops.create_worktree('feature-6')
-        (worktree / 'merged.py').write_text('merged = True\n')
-        await git_ops.commit(worktree, 'Add merged file')
+        worktree_info = await git_ops.create_worktree('feature-6')
+        (worktree_info.path / 'merged.py').write_text('merged = True\n')
+        await git_ops.commit(worktree_info.path, 'Add merged file')
 
-        result = await git_ops.merge_to_main(worktree, 'feature-6')
+        result = await git_ops.merge_to_main(worktree_info.path, 'feature-6')
         assert result.success
         assert result.merge_commit is not None
         assert result.merge_worktree is not None
@@ -168,15 +188,15 @@ class TestWorktreeLifecycle:
     async def test_advance_main_rejects_non_ancestor(self, git_ops: GitOps):
         """advance_main rejects a SHA that isn't a descendant of main."""
         # Use a commit from a branch that hasn't been merged
-        worktree, _ = await git_ops.create_worktree('orphan')
-        (worktree / 'orphan.py').write_text('x = 1\n')
-        await git_ops.commit(worktree, 'Orphan commit')
+        worktree_info = await git_ops.create_worktree('orphan')
+        (worktree_info.path / 'orphan.py').write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, 'Orphan commit')
 
         # Advance main to a different commit first
-        worktree2, _ = await git_ops.create_worktree('advance-first')
-        (worktree2 / 'first.py').write_text('y = 1\n')
-        await git_ops.commit(worktree2, 'First commit')
-        result = await git_ops.merge_to_main(worktree2, 'advance-first')
+        worktree_info2 = await git_ops.create_worktree('advance-first')
+        (worktree_info2.path / 'first.py').write_text('y = 1\n')
+        await git_ops.commit(worktree_info2.path, 'First commit')
+        result = await git_ops.merge_to_main(worktree_info2.path, 'advance-first')
         assert result.success
         assert result.merge_commit is not None
         assert result.merge_worktree is not None
@@ -185,13 +205,13 @@ class TestWorktreeLifecycle:
 
         # Now the orphan branch's commit is NOT a descendant of new main
         _, orphan_sha, _ = await _run(
-            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
+            ['git', 'rev-parse', 'HEAD'], cwd=worktree_info.path,
         )
         assert await git_ops.advance_main(orphan_sha) == 'not_descendant'
 
     async def test_get_current_branch(self, git_ops: GitOps):
-        worktree, _ = await git_ops.create_worktree('feature-7')
-        branch = await git_ops.get_current_branch(worktree)
+        worktree_info = await git_ops.create_worktree('feature-7')
+        branch = await git_ops.get_current_branch(worktree_info.path)
         assert branch == 'task/feature-7'
 
     async def test_merge_to_main_cleans_worktree_on_cancellation(
@@ -205,9 +225,9 @@ class TestWorktreeLifecycle:
         fails with the old guard and passes with ``except BaseException:``.
         """
         # Set up a feature branch with a committed file.
-        worktree, _ = await git_ops.create_worktree('feature-cancel')
-        (worktree / 'cancel_test.py').write_text('x = 1\n')
-        await git_ops.commit(worktree, 'Add cancel test file')
+        worktree_info = await git_ops.create_worktree('feature-cancel')
+        (worktree_info.path / 'cancel_test.py').write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, 'Add cancel test file')
 
         # Patch _scrub_task_dir_from_tree to raise CancelledError, simulating
         # task cancellation at the point where the merge commit already exists
@@ -216,7 +236,7 @@ class TestWorktreeLifecycle:
             'orchestrator.git_ops._scrub_task_dir_from_tree',
             side_effect=asyncio.CancelledError,
         ), pytest.raises(asyncio.CancelledError):
-            await git_ops.merge_to_main(worktree, 'feature-cancel')
+            await git_ops.merge_to_main(worktree_info.path, 'feature-cancel')
 
         # After CancelledError, no _merge-* worktrees should be registered.
         _, worktree_list, _ = await _run(
@@ -315,18 +335,18 @@ class TestCommitTaskStatuses:
 class TestMergeConflicts:
     async def test_conflict_detection(self, git_ops: GitOps):
         # Create BOTH branches before merging either (both fork from same main)
-        wt_a, _ = await git_ops.create_worktree('branch-a')
-        wt_b, _ = await git_ops.create_worktree('branch-b')
+        wt_a_info = await git_ops.create_worktree('branch-a')
+        wt_b_info = await git_ops.create_worktree('branch-b')
 
         # Both modify same file differently
-        (wt_a / 'shared.py').write_text('value = "A"\n')
-        await git_ops.commit(wt_a, 'Branch A change')
+        (wt_a_info.path / 'shared.py').write_text('value = "A"\n')
+        await git_ops.commit(wt_a_info.path, 'Branch A change')
 
-        (wt_b / 'shared.py').write_text('value = "B"\n')
-        await git_ops.commit(wt_b, 'Branch B change')
+        (wt_b_info.path / 'shared.py').write_text('value = "B"\n')
+        await git_ops.commit(wt_b_info.path, 'Branch B change')
 
         # Merge A first — should succeed
-        result_a = await git_ops.merge_to_main(wt_a, 'branch-a')
+        result_a = await git_ops.merge_to_main(wt_a_info.path, 'branch-a')
         assert result_a.success
         assert result_a.merge_commit is not None
         assert result_a.merge_worktree is not None
@@ -334,7 +354,7 @@ class TestMergeConflicts:
         await git_ops.cleanup_merge_worktree(result_a.merge_worktree)
 
         # Merge B — should conflict (main now has "A", branch has "B")
-        result_b = await git_ops.merge_to_main(wt_b, 'branch-b')
+        result_b = await git_ops.merge_to_main(wt_b_info.path, 'branch-b')
         assert not result_b.success
         assert result_b.conflicts
         assert result_b.merge_worktree is not None
@@ -343,25 +363,25 @@ class TestMergeConflicts:
 @pytest.mark.asyncio
 class TestHasUncommittedWork:
     async def test_clean_worktree_returns_false(self, git_ops: GitOps):
-        wt, _ = await git_ops.create_worktree('clean-wt')
-        assert not await git_ops.has_uncommitted_work(wt)
+        wt_info = await git_ops.create_worktree('clean-wt')
+        assert not await git_ops.has_uncommitted_work(wt_info.path)
 
     async def test_untracked_file_returns_true(self, git_ops: GitOps):
-        wt, _ = await git_ops.create_worktree('untracked-wt')
-        (wt / 'new_file.py').write_text('x = 1\n')
-        assert await git_ops.has_uncommitted_work(wt)
+        wt_info = await git_ops.create_worktree('untracked-wt')
+        (wt_info.path / 'new_file.py').write_text('x = 1\n')
+        assert await git_ops.has_uncommitted_work(wt_info.path)
 
     async def test_modified_tracked_file_returns_true(self, git_ops: GitOps):
-        wt, _ = await git_ops.create_worktree('modified-wt')
-        (wt / 'README.md').write_text('# Changed\n')
-        assert await git_ops.has_uncommitted_work(wt)
+        wt_info = await git_ops.create_worktree('modified-wt')
+        (wt_info.path / 'README.md').write_text('# Changed\n')
+        assert await git_ops.has_uncommitted_work(wt_info.path)
 
     async def test_file_only_in_task_dir_returns_false(self, git_ops: GitOps):
-        wt, _ = await git_ops.create_worktree('taskdir-wt')
-        task_dir = wt / '.task'
+        wt_info = await git_ops.create_worktree('taskdir-wt')
+        task_dir = wt_info.path / '.task'
         task_dir.mkdir(exist_ok=True)
         (task_dir / 'plan.json').write_text('{}')
-        assert not await git_ops.has_uncommitted_work(wt)
+        assert not await git_ops.has_uncommitted_work(wt_info.path)
 
 
 @pytest.mark.asyncio
@@ -370,10 +390,10 @@ class TestWorkingTreeSync:
 
     async def _merge_and_advance(self, git_ops: GitOps, branch: str, filename: str, content: str):
         """Helper: create a file on a branch, merge it, advance main."""
-        worktree, _ = await git_ops.create_worktree(branch)
-        (worktree / filename).write_text(content)
-        await git_ops.commit(worktree, f'Add {filename}')
-        result = await git_ops.merge_to_main(worktree, branch)
+        worktree_info = await git_ops.create_worktree(branch)
+        (worktree_info.path / filename).write_text(content)
+        await git_ops.commit(worktree_info.path, f'Add {filename}')
+        result = await git_ops.merge_to_main(worktree_info.path, branch)
         assert result.success
         assert result.merge_commit is not None
         assert result.merge_worktree is not None
@@ -411,10 +431,10 @@ class TestWorkingTreeSync:
         (git_ops.project_root / 'README.md').write_text('# Local WIP edit\n')
 
         # Merge a conflicting change to README.md
-        worktree, _ = await git_ops.create_worktree('overlap-readme')
-        (worktree / 'README.md').write_text('# Merged from branch\n')
-        await git_ops.commit(worktree, 'Change README on branch')
-        merge_result = await git_ops.merge_to_main(worktree, 'overlap-readme')
+        worktree_info = await git_ops.create_worktree('overlap-readme')
+        (worktree_info.path / 'README.md').write_text('# Merged from branch\n')
+        await git_ops.commit(worktree_info.path, 'Change README on branch')
+        merge_result = await git_ops.merge_to_main(worktree_info.path, 'overlap-readme')
         assert merge_result.success
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
@@ -443,11 +463,11 @@ class TestWorkingTreeSync:
         await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
 
         # Merge a branch that also modifies README.md
-        worktree, _ = await git_ops.create_worktree('pop-recovery')
-        (worktree / 'new_file.py').write_text('x = 1\n')
-        (worktree / 'README.md').write_text('# Merged from branch\n')
-        await git_ops.commit(worktree, 'Change files on branch')
-        merge_result = await git_ops.merge_to_main(worktree, 'pop-recovery')
+        worktree_info = await git_ops.create_worktree('pop-recovery')
+        (worktree_info.path / 'new_file.py').write_text('x = 1\n')
+        (worktree_info.path / 'README.md').write_text('# Merged from branch\n')
+        await git_ops.commit(worktree_info.path, 'Change files on branch')
+        merge_result = await git_ops.merge_to_main(worktree_info.path, 'pop-recovery')
         assert merge_result.success
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
@@ -461,10 +481,10 @@ class TestWorkingTreeSync:
     async def test_pop_conflict_recovery_via_mock(self, git_ops: GitOps):
         """When stash pop fails, advance_main creates recovery branch and returns 'pop_conflict'."""
         # Create a merge commit
-        worktree, _ = await git_ops.create_worktree('pop-mock')
-        (worktree / 'pop_file.py').write_text('x = 1\n')
-        await git_ops.commit(worktree, 'Add pop file')
-        merge_result = await git_ops.merge_to_main(worktree, 'pop-mock')
+        worktree_info = await git_ops.create_worktree('pop-mock')
+        (worktree_info.path / 'pop_file.py').write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, 'Add pop file')
+        merge_result = await git_ops.merge_to_main(worktree_info.path, 'pop-mock')
         assert merge_result.success
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
@@ -494,10 +514,10 @@ class TestWorkingTreeSync:
     async def test_consecutive_advance_after_pop_conflict(self, git_ops: GitOps):
         """After pop_conflict recovery, a subsequent advance_main succeeds normally."""
         # Merge first file
-        wt1, _ = await git_ops.create_worktree('consec-1')
-        (wt1 / 'first.py').write_text('first = True\n')
-        await git_ops.commit(wt1, 'Add first')
-        merge1 = await git_ops.merge_to_main(wt1, 'consec-1')
+        wt1_info = await git_ops.create_worktree('consec-1')
+        (wt1_info.path / 'first.py').write_text('first = True\n')
+        await git_ops.commit(wt1_info.path, 'Add first')
+        merge1 = await git_ops.merge_to_main(wt1_info.path, 'consec-1')
         assert merge1.success
         assert merge1.merge_commit is not None
         assert merge1.merge_worktree is not None
@@ -527,10 +547,10 @@ class TestWorkingTreeSync:
         assert not staged.strip(), f'Staged changes after recovery: {staged}'
 
         # Second merge should succeed normally (no stash needed, tree is clean)
-        wt2, _ = await git_ops.create_worktree('consec-2')
-        (wt2 / 'second.py').write_text('second = True\n')
-        await git_ops.commit(wt2, 'Add second')
-        merge2 = await git_ops.merge_to_main(wt2, 'consec-2')
+        wt2_info = await git_ops.create_worktree('consec-2')
+        (wt2_info.path / 'second.py').write_text('second = True\n')
+        await git_ops.commit(wt2_info.path, 'Add second')
+        merge2 = await git_ops.merge_to_main(wt2_info.path, 'consec-2')
         assert merge2.success
         assert merge2.merge_commit is not None
         assert merge2.merge_worktree is not None
@@ -555,10 +575,10 @@ class TestWorkingTreeSync:
         (git_ops.project_root / 'wip_unrelated.py').write_text('wip = True\n')
 
         # Merge a different file
-        worktree, _ = await git_ops.create_worktree('disjoint')
-        (worktree / 'merged_file.py').write_text('merged = True\n')
-        await git_ops.commit(worktree, 'Add merged file')
-        merge_result = await git_ops.merge_to_main(worktree, 'disjoint')
+        worktree_info = await git_ops.create_worktree('disjoint')
+        (worktree_info.path / 'merged_file.py').write_text('merged = True\n')
+        await git_ops.commit(worktree_info.path, 'Add merged file')
+        merge_result = await git_ops.merge_to_main(worktree_info.path, 'disjoint')
         assert merge_result.success
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
@@ -602,10 +622,10 @@ class TestWorkingTreeSync:
 
         # Merge a file to main (via worktree from main)
         # Need to create worktree from main for the merge to work
-        worktree, _ = await git_ops.create_worktree('not-on-main')
-        (worktree / 'should_not_appear.py').write_text('x = 1\n')
-        await git_ops.commit(worktree, 'Add file')
-        merge_result = await git_ops.merge_to_main(worktree, 'not-on-main')
+        worktree_info = await git_ops.create_worktree('not-on-main')
+        (worktree_info.path / 'should_not_appear.py').write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, 'Add file')
+        merge_result = await git_ops.merge_to_main(worktree_info.path, 'not-on-main')
         assert merge_result.success
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
@@ -627,10 +647,10 @@ class TestWorkingTreeSync:
         )
 
         # Create a merge commit that could be advanced
-        worktree, _ = await git_ops.create_worktree('stash-fail')
-        (worktree / 'stash_fail.py').write_text('x = 1\n')
-        await git_ops.commit(worktree, 'Add file')
-        merge_result = await git_ops.merge_to_main(worktree, 'stash-fail')
+        worktree_info = await git_ops.create_worktree('stash-fail')
+        (worktree_info.path / 'stash_fail.py').write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, 'Add file')
+        merge_result = await git_ops.merge_to_main(worktree_info.path, 'stash-fail')
         assert merge_result.success
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
@@ -665,7 +685,8 @@ class TestWorkingTreeSync:
     async def test_stash_restored_on_cas_failure(self, git_ops: GitOps):
         """On CAS failure, stash is popped to restore the original working tree."""
         # Create and merge a file
-        worktree, _ = await git_ops.create_worktree('cas-stash')
+        worktree_info = await git_ops.create_worktree('cas-stash')
+        worktree = worktree_info.path
         (worktree / 'cas_file.py').write_text('cas = True\n')
         await git_ops.commit(worktree, 'Add file')
         merge_result = await git_ops.merge_to_main(worktree, 'cas-stash')
