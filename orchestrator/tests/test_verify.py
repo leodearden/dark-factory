@@ -19,7 +19,6 @@ from orchestrator.verify import (
 # _run_cmd: executable parameter
 # ---------------------------------------------------------------------------
 
-
 class TestRunCmdUseBash:
     """Verify _run_cmd passes executable='/bin/bash' to create_subprocess_shell."""
 
@@ -54,7 +53,6 @@ class TestRunCmdBashBuiltins:
 # _run_cmd: timeout handling with bash executable
 # ---------------------------------------------------------------------------
 
-
 class TestRunCmdTimeout:
     """Verify timeout handling still works correctly with bash executable."""
 
@@ -74,7 +72,6 @@ class TestRunCmdTimeout:
 # ---------------------------------------------------------------------------
 # run_verification: passes results through correctly
 # ---------------------------------------------------------------------------
-
 
 class TestRunVerification:
     """Verify run_verification aggregates _run_cmd results correctly."""
@@ -131,7 +128,6 @@ class TestRunVerification:
 # run_verification: ModuleConfig overrides
 # ---------------------------------------------------------------------------
 
-
 class TestRunVerificationModuleConfig:
     """Verify that ModuleConfig overrides the global config commands."""
 
@@ -179,7 +175,6 @@ class TestRunVerificationModuleConfig:
 # ---------------------------------------------------------------------------
 # run_verification: None commands skip (scoped mode)
 # ---------------------------------------------------------------------------
-
 
 class TestNoneCommandSkipping:
     """When ModuleConfig is provided, None commands are skipped, not global-fallback."""
@@ -233,7 +228,6 @@ class TestNoneCommandSkipping:
 # ---------------------------------------------------------------------------
 # run_scoped_verification: multi-subproject aggregation
 # ---------------------------------------------------------------------------
-
 
 class TestRunScopedVerification:
     """Tests for run_scoped_verification aggregation logic."""
@@ -293,7 +287,6 @@ class TestRunScopedVerification:
 # _scope_command: replace path args with specific files
 # ---------------------------------------------------------------------------
 
-
 class TestScopeCommand:
     """Tests for _scope_command(cmd, tool_keyword, files)."""
 
@@ -342,7 +335,6 @@ class TestScopeCommand:
 # ---------------------------------------------------------------------------
 # scope_module_config: narrow ModuleConfig commands to task files
 # ---------------------------------------------------------------------------
-
 
 class TestStripDirectoryFlag:
     """Tests for _strip_directory_flag(cmd, module_prefix)."""
@@ -450,7 +442,7 @@ class TestScopeModuleConfig:
     def test_non_py_files_excluded(self):
         """Non-.py files (yaml, json, md) are not passed to ruff/pyright/pytest."""
         mc = self._make_mc()
-        result = scope_module_config(mc, ['orchestrator/orchestrator.yaml', 'orchestrator/README.md'])
+        result = scope_module_config(mc, ['orchestrator/orchestrator.yaml', 'README.md'])
         # No .py files match → returns original
         assert result is mc
 
@@ -472,7 +464,6 @@ class TestScopeModuleConfig:
 # ---------------------------------------------------------------------------
 # _build_fallback_config: synthetic ModuleConfig from task file list
 # ---------------------------------------------------------------------------
-
 
 class TestBuildFallbackConfig:
     """Tests for _build_fallback_config(task_files)."""
@@ -522,7 +513,6 @@ class TestBuildFallbackConfig:
 # ---------------------------------------------------------------------------
 # run_scoped_verification: task_files parameter integration
 # ---------------------------------------------------------------------------
-
 
 class TestRunScopedVerificationTaskFiles:
     """Tests for run_scoped_verification with the new task_files parameter."""
