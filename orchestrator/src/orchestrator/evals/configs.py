@@ -126,13 +126,21 @@ VLLM_EVAL_CONFIGS = [
         gpu_type=RTX_PRO_6000, gpu_count=1, container_disk_gb=180,
         max_model_len=80000, gpu_memory_util=0.97,
         tool_call_parser='minimax_m2'),
-    # REAP-172B NVFP4 GB10: ~93 GB on disk, baked. Prefers 1× H200 (141 GB)
-    # but falls back to 2× RTX PRO 6000 (192 GB) when H200 fleet is sold
-    # out. TP_SIZE=2 is set automatically by _vllm_config for gpu_count>1.
+    # REAP-172B NVFP4 GB10: ~93 GB on disk, baked. 2× RTX PRO 6000 (192 GB,
+    # TP=2 set automatically by _vllm_config for gpu_count>1). Hit a silent
+    # startup hang on 2026-04-08 matrix retry #3 — vLLM worker init looked
+    # normal through NCCL handshake then produced no further stdout for
+    # 120 min. Same class of failure as minimax-m25-nvfp4-new and
+    # reap-139b-nvfp4-new: vLLM 0.19's CUDA-graph profiler reserves more
+    # memory inside the GMU budget than 0.18 did, and default
+    # max_model_len=131072 + GMU 0.95 leaves too little KV-cache headroom.
+    # Fix: same recipe as the two fixed configs above — bump GMU to 0.97
+    # and cap context at 80k (39k eval prompt + 40k tool-turn slack).
     _vllm_config('reap-172b-nvfp4-gb10-new',
         hf_model='saricles/MiniMax-M2.5-REAP-172B-A10B-NVFP4-GB10',
         image='leosiriusdawn/runpod-vllm:reap-172b-nvfp4-gb10-baked',
         gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=200,
+        max_model_len=80000, gpu_memory_util=0.97,
         tool_call_parser='minimax_m2'),
     # MiniMax-M2.5 NVFP4 (nvidia): ~131 GB on disk, baked. 1× H200.
     # KV cache budget after weights + CUDA graphs is tight on a single H200:
