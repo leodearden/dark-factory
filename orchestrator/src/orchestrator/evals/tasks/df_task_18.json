@@ -1,6 +1,7 @@
 {
   "id": "df_task_18",
   "name": "Sleep mode reconciliation system",
+  "max_review_cycles": 2,
   "project": "dark-factory",
   "project_root": "/home/leo/src/dark-factory",
   "pre_task_commit": "f30baedab0ad9c573f8e3e94f8f536d384472a31",

@@ -555,7 +555,14 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
         )
         time.sleep(3)
 
-        health_timeout = max(900, container_disk * 12)
+        # Generous health timeout: 120 min floor + 30s/GB scaling. Big
+        # models on 2× H200 can spend 30+ min on HF download alone, plus
+        # 5–15 min on vLLM startup compile. Previous formula
+        # (max(900, container_disk * 12)) gave only 48 min for 240 GB and
+        # bit us on minimax-m25-nvfp4-new and reap-172b-nvfp4-gb10-new in
+        # matrix run #2. Prefer waiting too long over false-killing a
+        # healthy slow-loading pod.
+        health_timeout = max(7200, container_disk * 30)
         log(
             f"Waiting for vLLM to load model "
             f"(timeout {health_timeout // 60} min)..."
@@ -776,6 +783,8 @@ def run_one_task(
     ]
     if orch_config is not None:
         eval_cmd.extend(["--config", str(orch_config)])
+    if args.orch_timeout_min is not None:
+        eval_cmd.extend(["--timeout", str(args.orch_timeout_min)])
 
     t0 = time.monotonic()
 
@@ -1018,7 +1027,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--task-timeout-min",
         type=int,
         default=70,
-        help="Per-task subprocess timeout in minutes",
+        help=(
+            "Outer subprocess timeout in minutes (the launcher kills the "
+            "orchestrator subprocess after this). Should be > "
+            "--orch-timeout-min so the orchestrator hits its own timeout "
+            "first and produces a clean result file."
+        ),
+    )
+
+    p.add_argument(
+        "--orch-timeout-min",
+        type=int,
+        default=None,
+        help=(
+            "Inner orchestrator-internal eval timeout in minutes (passed to "
+            "`orchestrator eval --timeout`). When unset, the orchestrator "
+            "uses the per-task spec value (default 60 min). Set this much "
+            "higher (e.g. 360) so 'would-be-done' runs have time to finish."
+        ),
     )
 
     p.add_argument(

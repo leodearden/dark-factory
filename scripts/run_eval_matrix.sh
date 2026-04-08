@@ -35,11 +35,15 @@ CONFIGS="${CONFIGS:-qwen3-coder-next-fp8-new reap-139b-nvfp4-new reap-172b-nvfp4
 TASKS="${TASKS:-df_task_12,df_task_13,df_task_18,reify_task_12,reify_task_27}"
 CONCURRENCY="${CONCURRENCY:-5}"
 VERIFY="${VERIFY:-warn}"
-# 120 min > orchestrator's own eval timeout (~60 min). The launcher's
-# per-task timeout is the outer boundary; the orchestrator has an inner
-# timeout of ~60 min. We keep the launcher generous so the inner timeout
-# is the binding one (gives a clean "timeout" result vs a hard kill).
-TIMEOUT_MIN="${TIMEOUT_MIN:-120}"
+# Inner orchestrator-internal timeout: how long the actual eval can run.
+# Default 360 min (6h) — large enough that "would-be-done" runs have time
+# to actually finish (matrix run #2 had several runs that hit tests/lint/
+# typecheck=True at the 60 min default mark and only needed more time).
+ORCH_TIMEOUT_MIN="${ORCH_TIMEOUT_MIN:-360}"
+# Outer subprocess limit: must be > ORCH_TIMEOUT_MIN so the orchestrator
+# hits its own timeout first and produces a clean result file rather than
+# a hard SIGKILL with no result.
+TIMEOUT_MIN="${TIMEOUT_MIN:-420}"
 
 mkdir -p /var/tmp/dark-factory-evals
 
@@ -56,6 +60,7 @@ for cfg in $CONFIGS; do
         --concurrency "$CONCURRENCY" \
         --verify-baseline-clean "$VERIFY" \
         --task-timeout-min "$TIMEOUT_MIN" \
+        --orch-timeout-min "$ORCH_TIMEOUT_MIN" \
         --port "$PORT" \
         --no-volume \
         > "$LOG" 2>&1 &

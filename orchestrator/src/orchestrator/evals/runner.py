@@ -90,8 +90,19 @@ def build_eval_orch_config(
     """Build an OrchestratorConfig override for this eval run.
 
     Architect always runs on Claude opus-high (constant planning).
-    Reviewers always run on Claude sonnet (consistent quality bar).
+    Reviewer is the new 1× Opus comprehensive reviewer (matches production
+    after the reviewer-panel trial replaced the 5× sonnet panel; merged
+    via 594658fbe3 / 2c26a30bca).
     Only the implementer varies per eval config.
+
+    Two task-spec knobs override the defaults below:
+      - ``max_execute_iterations``: hard ceiling on implementer iterations.
+        Eval default is 20 (was 10) so workstation-tier slow models aren't
+        capped before they finish — bumping was confirmed by user 2026-04-08.
+      - ``max_review_cycles``: how many re-plan/re-review cycles after
+        blocking issues. Eval default is 1; df_task_18 sets 2 because it
+        empirically needs a second architect→implement→debug→review pass
+        to clear all blockers.
     """
     if base_config is None:
         raise ValueError('build_eval_orch_config requires an explicit base_config')
@@ -101,7 +112,7 @@ def build_eval_orch_config(
         architect='opus',
         implementer=config.model,
         debugger=config.model,
-        reviewer='sonnet',        # sonnet to match production, save cap budget
+        reviewer='opus',          # 1× opus comprehensive reviewer (production parity)
         merger='opus',
         module_tagger='sonnet',
     )
@@ -110,7 +121,7 @@ def build_eval_orch_config(
         architect=5.0,
         implementer=config.max_budget_usd,
         debugger=config.max_budget_usd / 2,
-        reviewer=2.0,             # sonnet reviewers
+        reviewer=5.0,             # opus reviewer needs more headroom than sonnet
         merger=5.0,
         module_tagger=2.0,
     )
@@ -119,7 +130,7 @@ def build_eval_orch_config(
         architect='high',
         implementer=config.effort or 'high',
         debugger=config.effort or 'high',
-        reviewer='medium',         # sonnet reviewers (matches production)
+        reviewer='high',           # opus reviewer at high effort (matches defaults.yaml)
         merger='high',
         module_tagger='medium',
     )
@@ -133,17 +144,15 @@ def build_eval_orch_config(
         module_tagger='claude',
     )
 
-    # Create config with overrides
-    # max_review_cycles=1: one review pass, no re-architect loop
     return OrchestratorConfig(
         models=models,
         budgets=budgets,
         effort=effort,
         backends=backends,
         max_turns=base.max_turns,
-        max_execute_iterations=base.max_execute_iterations,
+        max_execute_iterations=task.get('max_execute_iterations', 20),
         max_verify_attempts=base.max_verify_attempts,
-        max_review_cycles=1,
+        max_review_cycles=task.get('max_review_cycles', 1),
         test_command=task.get('verify_commands', {}).get('test', base.test_command),
         lint_command=task.get('verify_commands', {}).get('lint', base.lint_command),
         type_check_command=task.get('verify_commands', {}).get('typecheck', base.type_check_command),
