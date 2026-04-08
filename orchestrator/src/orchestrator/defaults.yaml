@@ -19,6 +19,17 @@ max_advance_attempts: 3
 max_pre_merge_retries: 2
 inter_iteration_rebase: true
 
+# Verification timeouts
+verify_command_timeout_secs: 1800
+verify_timeout_retries: 2
+
+# Verification execution mode + environment injection
+concurrent_verify: true
+verify_env: {}
+# Task-phase verify rewrites cargo --workspace → cargo -p <crate> when
+# all task files live in one (or a few) workspace crates.
+scope_cargo: true
+
 # Steward lifecycle
 steward_lifetime_budget: 12.0
 steward_max_retries: 3

@@ -410,19 +410,30 @@ class TaskWorkflow:
                                 task_files=self._task_files,
                             )
                             if not verify.passed:
-                                logger.warning(
-                                    f'Task {self.task_id}: post-rebase verification '
-                                    f'failed: {verify.summary}'
-                                )
-                                if self.event_store:
-                                    self.event_store.emit(
-                                        EventType.waste_detected,
-                                        task_id=self.task_id, phase='merge',
-                                        data={
-                                            'waste_type': 'post_rebase_verify_fail',
-                                            'summary': verify.summary[:200],
-                                        },
+                                if verify.timed_out:
+                                    # Don't emit a waste event on timeout: this is
+                                    # infrastructure noise (cold build, contention),
+                                    # not a real code collision.  Leave
+                                    # pre_rebased=False; the merge queue will re-verify
+                                    # under its own retry schedule.
+                                    logger.warning(
+                                        f'Task {self.task_id}: post-rebase verification '
+                                        f'timed out; merge queue will retry'
                                     )
+                                else:
+                                    logger.warning(
+                                        f'Task {self.task_id}: post-rebase verification '
+                                        f'failed: {verify.summary}'
+                                    )
+                                    if self.event_store:
+                                        self.event_store.emit(
+                                            EventType.waste_detected,
+                                            task_id=self.task_id, phase='merge',
+                                            data={
+                                                'waste_type': 'post_rebase_verify_fail',
+                                                'summary': verify.summary[:200],
+                                            },
+                                        )
                                 break
                             main_after = await self.git_ops.get_main_sha()
                             if main_before == main_after:

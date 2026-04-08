@@ -241,6 +241,9 @@ class GitConfig(BaseModel):
 _OVERRIDABLE_FIELDS = frozenset({
     'test_command', 'lint_command', 'type_check_command',
     'lock_depth', 'max_per_module', 'module_overrides',
+    'verify_command_timeout_secs',
+    'concurrent_verify', 'verify_env',
+    'scope_cargo',
 })
 
 
@@ -255,6 +258,10 @@ class ModuleConfig:
     lock_depth: int | None = None
     max_per_module: int | None = None
     module_overrides: dict[str, int] | None = None
+    verify_command_timeout_secs: float | None = None
+    concurrent_verify: bool | None = None
+    verify_env: dict[str, str] | None = None
+    scope_cargo: bool | None = None
 
 
 def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
@@ -299,6 +306,23 @@ class OrchestratorConfig(BaseSettings):
     max_pre_merge_retries: int = Field(default=2)
     inter_iteration_rebase: bool = Field(default=True)
     requeue_cooldown_secs: float = Field(default=30.0)
+
+    # Verification timeouts
+    verify_command_timeout_secs: float = Field(default=1800.0)
+    verify_timeout_retries: int = Field(default=2)
+
+    # Verification execution mode + env
+    # When False, test/lint/type run sequentially within a single verify
+    # invocation.  Useful for Rust workspaces where cargo takes an advisory
+    # lock on target/ and the concurrent subcommands serialize anyway.
+    concurrent_verify: bool = Field(default=True)
+    # Extra env vars injected into verify commands (e.g. RUSTC_WRAPPER=sccache).
+    # Distinct from env_overrides, which targets agent invocations, not verify.
+    verify_env: dict[str, str] = Field(default_factory=dict)
+    # When True, task-phase verify for Rust tasks rewrites
+    # ``cargo --workspace`` → ``cargo -p <crate>`` for the touched crates.
+    # Post-merge verify always runs workspace-wide regardless.
+    scope_cargo: bool = Field(default=True)
 
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)
