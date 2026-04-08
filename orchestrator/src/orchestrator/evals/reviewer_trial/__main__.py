@@ -479,5 +479,65 @@ def full_trial(max_parallel: int, stagger: float, report_dir: Path | None) -> No
         sys.exit(130)
 
 
+# ---------------------------------------------------------------------------
+# Effort sweep: 1x opus at medium/high/max thinking
+# ---------------------------------------------------------------------------
+
+@cli.command('sweep')
+@click.option('--max-parallel', default=3, type=int, help='Max concurrent panel runs')
+@click.option('--stagger', default=2.0, type=float)
+def effort_sweep(max_parallel: int, stagger: float) -> None:
+    """Effort sweep: 1x opus at medium/high/max thinking levels."""
+
+    async def _run() -> int:
+        from .report import build_trial_report, format_markdown, save_report
+        from .runner import run_trial
+        from .scorer import score_panel_run
+        from .variants import EFFORT_SWEEP_VARIANTS
+
+        corpus = _load_corpus()
+
+        click.echo(click.style(
+            f'Effort Sweep: {len(EFFORT_SWEEP_VARIANTS)} variants x {len(corpus.diffs)} diffs',
+            bold=True,
+        ))
+        click.echo('=' * 60)
+        for v in EFFORT_SWEEP_VARIANTS:
+            effort = v.reviewers[0].effort
+            click.echo(f'  {v.name:18s} effort={effort:6s} {v.description}')
+        click.echo()
+
+        click.echo('Running panels...')
+        results = await run_trial(EFFORT_SWEEP_VARIANTS, corpus, max_parallel_panels=max_parallel)
+        click.echo(f'  Completed {len(results)} panel runs.')
+
+        click.echo('\nScoring results...')
+        scores = []
+        for result in results:
+            diff = corpus.get_diff(result.diff_id)
+            if diff is None:
+                continue
+            score = await score_panel_run(result, diff)
+            scores.append(score)
+            click.echo(f'  {result.variant_name:18s} x {result.diff_id:<25s} F1={score.f1:.3f} BR={score.blocking_recall:.3f}')
+
+        report = build_trial_report(scores, EFFORT_SWEEP_VARIANTS, corpus)
+        report_path = save_report(report, _RESULTS_DIR / 'effort_sweep_report')
+
+        click.echo()
+        click.echo(format_markdown(report))
+        click.echo(f'\nReport saved to: {report_path}')
+
+        total_cost = sum(r.total_cost_usd for r in results)
+        click.echo(f'Total panel cost: ${total_cost:.2f}')
+        return 0
+
+    try:
+        sys.exit(asyncio.run(_run()))
+    except KeyboardInterrupt:
+        click.echo('\nInterrupted.')
+        sys.exit(130)
+
+
 if __name__ == '__main__':
     cli()

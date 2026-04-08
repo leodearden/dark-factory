@@ -155,6 +155,23 @@ VARIANT_BASELINE = VariantConfig(
     ],
 )
 
+_SPEC_COMPREHENSIVE = (
+    'Comprehensive code review covering ALL of the following areas:\n\n'
+    '1. **Test coverage and quality**: Are the right behaviors tested? '
+    'Meaningful assertions? Untested failure modes? Edge cases? '
+    'Do tests test what they claim?\n\n'
+    '2. **Code reuse and duplication**: Is there code duplication? '
+    'Missed existing utilities? Unnecessary new abstractions? Over-engineering?\n\n'
+    '3. **Architecture and design coherence**: Consistent with system design? '
+    'Good naming? Correct module boundaries? SOLID principles? Pattern consistency?\n\n'
+    '4. **Performance and efficiency**: Algorithmic complexity? N+1 queries? '
+    'Unnecessary allocations? Hot path considerations? Resource cleanup?\n\n'
+    '5. **Robustness and error handling**: Error handling at boundaries? '
+    'Failure modes? Race conditions? Resource leaks? Graceful degradation?\n\n'
+    'You are responsible for ALL five areas above. Produce findings under each.'
+)
+
+
 VARIANT_A = VariantConfig(
     name='variant_a',
     description='1x opus generalist — depth replaces breadth',
@@ -162,23 +179,37 @@ VARIANT_A = VariantConfig(
         ReviewerSpec(
             name='comprehensive_reviewer',
             model='opus',
-            specialization=(
-                'Comprehensive code review covering ALL of the following areas:\n\n'
-                '1. **Test coverage and quality**: Are the right behaviors tested? '
-                'Meaningful assertions? Untested failure modes? Edge cases? '
-                'Do tests test what they claim?\n\n'
-                '2. **Code reuse and duplication**: Is there code duplication? '
-                'Missed existing utilities? Unnecessary new abstractions? Over-engineering?\n\n'
-                '3. **Architecture and design coherence**: Consistent with system design? '
-                'Good naming? Correct module boundaries? SOLID principles? Pattern consistency?\n\n'
-                '4. **Performance and efficiency**: Algorithmic complexity? N+1 queries? '
-                'Unnecessary allocations? Hot path considerations? Resource cleanup?\n\n'
-                '5. **Robustness and error handling**: Error handling at boundaries? '
-                'Failure modes? Race conditions? Resource leaks? Graceful degradation?\n\n'
-                'You are responsible for ALL five areas above. Produce findings under each.'
-            ),
+            specialization=_SPEC_COMPREHENSIVE,
             budget=5.0,
             effort='high',
+        ),
+    ],
+)
+
+VARIANT_A_MEDIUM = VariantConfig(
+    name='variant_a_medium',
+    description='1x opus generalist @ medium effort',
+    reviewers=[
+        ReviewerSpec(
+            name='comprehensive_reviewer',
+            model='opus',
+            specialization=_SPEC_COMPREHENSIVE,
+            budget=5.0,
+            effort='medium',
+        ),
+    ],
+)
+
+VARIANT_A_MAX = VariantConfig(
+    name='variant_a_max',
+    description='1x opus generalist @ max effort',
+    reviewers=[
+        ReviewerSpec(
+            name='comprehensive_reviewer',
+            model='opus',
+            specialization=_SPEC_COMPREHENSIVE,
+            budget=10.0,
+            effort='max',
         ),
     ],
 )
@@ -287,3 +318,6 @@ VARIANT_D = VariantConfig(
 )
 
 ALL_VARIANTS = [VARIANT_BASELINE, VARIANT_A, VARIANT_B, VARIANT_C, VARIANT_D]
+
+# Effort sweep — 1x opus at different thinking levels (variant_a is 'high')
+EFFORT_SWEEP_VARIANTS = [VARIANT_A_MEDIUM, VARIANT_A, VARIANT_A_MAX]

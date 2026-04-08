@@ -322,34 +322,21 @@ You MUST output ONLY valid JSON matching this schema:
     )
 
 
-REVIEWER_TEST_ANALYST = _reviewer_role(
-    'test_analyst',
-    'Test coverage and quality. Are the right behaviors tested? Meaningful assertions? '
-    'Untested failure modes? Edge cases? Do tests test what they claim?',
-)
-
-REVIEWER_REUSE_AUDITOR = _reviewer_role(
-    'reuse_auditor',
-    'Code reuse and duplication. Is there code duplication? Missed existing utilities? '
-    'Unnecessary new abstractions? Over-engineering?',
-)
-
-REVIEWER_ARCHITECT = _reviewer_role(
-    'architect_reviewer',
-    'Architecture and design coherence. Consistent with system design? Good naming? '
-    'Correct module boundaries? SOLID principles? Pattern consistency?',
-)
-
-REVIEWER_PERFORMANCE = _reviewer_role(
-    'performance',
-    'Performance and efficiency. Algorithmic complexity? N+1 queries? Unnecessary allocations? '
-    'Hot path considerations? Resource cleanup?',
-)
-
-REVIEWER_ROBUSTNESS = _reviewer_role(
-    'robustness',
-    'Robustness and error handling. Error handling at boundaries? Failure modes? '
-    'Race conditions? Resource leaks? Graceful degradation?',
+REVIEWER_COMPREHENSIVE = _reviewer_role(
+    'comprehensive',
+    'Comprehensive code review covering ALL of the following areas:\n\n'
+    '1. **Test coverage and quality**: Are the right behaviors tested? '
+    'Meaningful assertions? Untested failure modes? Edge cases? '
+    'Do tests test what they claim?\n\n'
+    '2. **Code reuse and duplication**: Is there code duplication? '
+    'Missed existing utilities? Unnecessary new abstractions? Over-engineering?\n\n'
+    '3. **Architecture and design coherence**: Consistent with system design? '
+    'Good naming? Correct module boundaries? SOLID principles? Pattern consistency?\n\n'
+    '4. **Performance and efficiency**: Algorithmic complexity? N+1 queries? '
+    'Unnecessary allocations? Hot path considerations? Resource cleanup?\n\n'
+    '5. **Robustness and error handling**: Error handling at boundaries? '
+    'Failure modes? Race conditions? Resource leaks? Graceful degradation?\n\n'
+    'You are responsible for ALL five areas above. Produce findings under each.',
 )
 
 
@@ -585,13 +572,7 @@ Use the `escalate_info` MCP tool for findings that need human judgment:
 )
 
 
-ALL_REVIEWERS = [
-    REVIEWER_TEST_ANALYST,
-    REVIEWER_REUSE_AUDITOR,
-    REVIEWER_ARCHITECT,
-    REVIEWER_PERFORMANCE,
-    REVIEWER_ROBUSTNESS,
-]
+ALL_REVIEWERS = [REVIEWER_COMPREHENSIVE]
 
 ROLES = {
     'architect': ARCHITECT,
@@ -600,9 +581,5 @@ ROLES = {
     'merger': MERGER,
     'steward': STEWARD,
     'deep_reviewer': DEEP_REVIEWER,
-    'reviewer_test_analyst': REVIEWER_TEST_ANALYST,
-    'reviewer_reuse_auditor': REVIEWER_REUSE_AUDITOR,
-    'reviewer_architect_reviewer': REVIEWER_ARCHITECT,
-    'reviewer_performance': REVIEWER_PERFORMANCE,
-    'reviewer_robustness': REVIEWER_ROBUSTNESS,
+    'reviewer_comprehensive': REVIEWER_COMPREHENSIVE,
 }

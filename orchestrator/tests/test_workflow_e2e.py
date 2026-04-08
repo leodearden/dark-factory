@@ -192,18 +192,7 @@ class AgentStub:
         if 'debugger' in system_prompt.lower() and 'You are a debugger' in system_prompt:
             return 'debugger'
         if 'code reviewer' in system_prompt.lower():
-            # Extract reviewer name from prompt
-            if 'test_analyst' in system_prompt:
-                return 'reviewer_test_analyst'
-            if 'reuse_auditor' in system_prompt:
-                return 'reviewer_reuse_auditor'
-            if 'architect_reviewer' in system_prompt:
-                return 'reviewer_architect_reviewer'
-            if 'performance' in system_prompt:
-                return 'reviewer_performance'
-            if 'robustness' in system_prompt:
-                return 'reviewer_robustness'
-            return 'reviewer_unknown'
+            return 'reviewer_comprehensive'
         if 'merge conflict resolver' in system_prompt.lower():
             return 'merger'
         # If re-planning (architect called with review feedback)
@@ -457,17 +446,10 @@ class TestHappyPath:
 
         await workflow.run()
 
-        # Expected: architect, implementer, 5 reviewers (parallel, order varies)
+        # Expected: architect, implementer, 1 comprehensive reviewer
         assert stub.calls[0] == 'architect'
         assert stub.calls[1] == 'implementer'
-        reviewer_calls = sorted(stub.calls[2:7])
-        assert reviewer_calls == sorted([
-            'reviewer_architect_reviewer',
-            'reviewer_performance',
-            'reviewer_reuse_auditor',
-            'reviewer_robustness',
-            'reviewer_test_analyst',
-        ])
+        assert stub.calls[2] == 'reviewer_comprehensive'
 
     async def test_code_appears_on_main_after_merge(
         self, config, git_ops, task_assignment, monkeypatch
@@ -533,8 +515,8 @@ class TestHappyPath:
 
         await workflow.run()
 
-        # 1 architect + 1 implementer + 5 reviewers = 7
-        assert workflow.metrics.agent_invocations == 7
+        # 1 architect + 1 implementer + 1 reviewer = 3
+        assert workflow.metrics.agent_invocations == 3
         assert workflow.metrics.total_cost_usd > 0
         assert workflow.metrics.execute_iterations == 1
 
@@ -630,8 +612,8 @@ class TestReviewLoop:
         class ReviewAgentStub(AgentStub):
             def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
                 nonlocal review_round
-                # First round: one reviewer finds blocking issue
-                if review_round == 0 and role == 'reviewer_test_analyst':
+                # First round: reviewer finds blocking issue
+                if review_round == 0 and role == 'reviewer_comprehensive':
                     review = _make_review(role, 'ISSUES_FOUND', [{
                         'severity': 'blocking',
                         'location': 'lib.py:5',
@@ -1481,7 +1463,7 @@ class TestReviewerErrors:
 
         class ErrorReviewerStub(AgentStub):
             def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
-                if role == 'reviewer_test_analyst':
+                if role == 'reviewer_comprehensive':
                     # Simulate 401 — unparseable output, no structured_output
                     return AgentResult(
                         success=False,
@@ -1565,7 +1547,7 @@ class TestReviewerErrors:
         class RetryHealStub(AgentStub):
             def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
                 call_counts[role] = call_counts.get(role, 0) + 1
-                if role == 'reviewer_robustness' and call_counts[role] <= 1:
+                if role == 'reviewer_comprehensive' and call_counts[role] <= 1:
                     # First call fails
                     return AgentResult(
                         success=False,
@@ -1595,8 +1577,8 @@ class TestReviewerErrors:
         outcome = await workflow.run()
 
         assert outcome == WorkflowOutcome.DONE
-        # robustness was called twice (initial fail + retry success)
-        assert call_counts['reviewer_robustness'] == 2
+        # comprehensive reviewer was called twice (initial fail + retry success)
+        assert call_counts['reviewer_comprehensive'] == 2
 
 
 # ---------------------------------------------------------------------------
