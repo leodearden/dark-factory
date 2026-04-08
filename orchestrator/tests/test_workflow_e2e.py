@@ -1595,7 +1595,8 @@ class TestGhostLoopGuard:
     ):
         """Reused worktree with no implementation entries → normal execution."""
         # 1. Pre-create the worktree (simulates a prior run that planned but requeued)
-        wt, _ = await git_ops.create_worktree(task_assignment.task_id)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
         task_dir = wt / '.task'
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
@@ -1629,7 +1630,8 @@ class TestGhostLoopGuard:
     ):
         """Worktree with implementer iteration entry + HEAD on main → skip."""
         # 1. Create worktree and simulate prior implementation
-        wt, _ = await git_ops.create_worktree(task_assignment.task_id)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
         task_dir = wt / '.task'
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
