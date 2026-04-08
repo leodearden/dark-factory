@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import subprocess
 import sys
 import time
@@ -56,6 +57,8 @@ from run_vllm_eval import (  # type: ignore[import-not-found]  # noqa: E402
     EvalSummary,
     PodHandle,
     TaskSpecNotFound,
+    _build_ssh_tunnel_argv,
+    _pick_free_port,
     compute_exit_code,
     find_new_result_file,
     load_task_spec,
@@ -65,6 +68,7 @@ from run_vllm_eval import (  # type: ignore[import-not-found]  # noqa: E402
     print_summary_table,
     resolve_task_ids,
     tear_down_pod,
+    wait_for_vllm,
 )
 
 # ---------------------------------------------------------------------------
@@ -433,7 +437,11 @@ def _patch_pod_infra(monkeypatch, *, vllm_healthy_first=True):
     """
     fake_client = _FakeClient()
     monkeypatch.setattr(launcher, "RunPodClient", lambda config: fake_client)
-    monkeypatch.setattr(launcher, "wait_for_vllm", lambda port, timeout=900: True)
+    monkeypatch.setattr(
+        launcher,
+        "wait_for_vllm",
+        lambda port, expected_model, timeout=900: True,
+    )
     monkeypatch.setattr(launcher, "vllm_healthy", lambda port, timeout=5: vllm_healthy_first)
 
     real_popen = subprocess.Popen
@@ -622,7 +630,11 @@ class TestPodLifecycle:
         # Patch infra so wait_for_vllm fails (simulates vLLM never becoming healthy)
         fake_client = _FakeClient()
         monkeypatch.setattr(launcher, "RunPodClient", lambda config: fake_client)
-        monkeypatch.setattr(launcher, "wait_for_vllm", lambda port, timeout=900: False)
+        monkeypatch.setattr(
+            launcher,
+            "wait_for_vllm",
+            lambda port, expected_model, timeout=900: False,
+        )
         fake_tunnel = SimpleNamespace(
             terminate=lambda: None,
             wait=lambda timeout=None: 0,
@@ -1581,3 +1593,139 @@ class TestTearDownPod:
         )
         tear_down_pod(handle)
         assert fake_client.terminate_calls == ["pod-fake-1"]
+
+
+# ---------------------------------------------------------------------------
+# Port and SSH tunnel — regression tests for the 2026-04-08 vLLM /v1/messages
+# 404 bug (ssh -L port collision + no ExitOnForwardFailure).
+# See docs/plan-vllm-404-bug-fix.md.
+# ---------------------------------------------------------------------------
+
+
+class TestPortAndTunnel:
+    def test_pick_free_port_returns_usable_port(self):
+        port = _pick_free_port()
+        assert 1024 < port < 65536
+        # Verify it's actually free right now.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", port))
+
+    def test_pick_free_port_returns_distinct_ports_under_contention(self):
+        # Hold one port so the OS must pick a different one next call.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+            held.bind(("127.0.0.1", 0))
+            held_port = held.getsockname()[1]
+            other = _pick_free_port()
+        assert other != held_port
+
+    def test_ssh_tunnel_argv_includes_exit_on_forward_failure(self):
+        argv = _build_ssh_tunnel_argv(
+            local_port=12345,
+            ssh_host="1.2.3.4",
+            ssh_port=22001,
+            ssh_key="/tmp/key",
+        )
+        # The single critical assertion for the 2026-04-08 404 bug.
+        assert "-o" in argv
+        assert "ExitOnForwardFailure=yes" in argv
+        # Sanity: port is threaded through.
+        assert "127.0.0.1:12345:127.0.0.1:8000" in argv
+        # Sanity: host + port + key flow through unchanged.
+        assert "root@1.2.3.4" in argv
+        assert "22001" in argv
+        assert "/tmp/key" in argv
+
+    def test_parse_args_default_port_is_none(self):
+        # --port not passed → argparse default is None (resolution happens
+        # in main() via _pick_free_port).
+        args = parse_args(
+            ["--config", "reap-139b-nvfp4-new", "--task", "df_task_12"]
+        )
+        assert args.port is None
+
+    def test_parse_args_explicit_port_honored(self):
+        args = parse_args(
+            [
+                "--config",
+                "reap-139b-nvfp4-new",
+                "--task",
+                "df_task_12",
+                "--port",
+                "8299",
+            ]
+        )
+        assert args.port == 8299
+
+
+class TestWaitForVllmModelCheck:
+    """Layer 3: /v1/models membership guards against sibling-tunnel bleed."""
+
+    def _fake_urlopen(
+        self,
+        responses: "dict[str, tuple[int, bytes] | Exception]",
+    ):
+        """Return a urllib.request.urlopen stub that dispatches on URL.
+
+        ``responses`` maps URL → either a ``(status, body)`` tuple or an
+        Exception instance to raise.
+        """
+
+        class _Resp:
+            def __init__(self, status: int, body: bytes):
+                self.status = status
+                self._body = body
+
+            def read(self):
+                return self._body
+
+        def _stub(url, timeout=None):
+            r = responses[url]
+            if isinstance(r, Exception):
+                raise r
+            status, body = r
+            return _Resp(status, body)
+
+        return _stub
+
+    def test_passes_when_model_served(self, monkeypatch):
+        import urllib.request
+
+        port = 19999
+        expected = "nvidia/MiniMax-M2.5-NVFP4"
+        body = json.dumps(
+            {"data": [{"id": expected}, {"id": "other/model"}]}
+        ).encode()
+        monkeypatch.setattr(
+            urllib.request,
+            "urlopen",
+            self._fake_urlopen(
+                {
+                    f"http://127.0.0.1:{port}/health": (200, b"ok"),
+                    f"http://127.0.0.1:{port}/v1/models": (200, body),
+                }
+            ),
+        )
+        assert wait_for_vllm(port, expected_model=expected, timeout=1)
+
+    def test_fails_when_sibling_serves_different_model(self, monkeypatch):
+        import urllib.request
+
+        port = 19999
+        expected = "lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4"
+        # Sibling tunnel has a different model loaded.
+        body = json.dumps(
+            {"data": [{"id": "Qwen/Qwen3-Coder-Next-FP8"}]}
+        ).encode()
+        monkeypatch.setattr(
+            urllib.request,
+            "urlopen",
+            self._fake_urlopen(
+                {
+                    f"http://127.0.0.1:{port}/health": (200, b"ok"),
+                    f"http://127.0.0.1:{port}/v1/models": (200, body),
+                }
+            ),
+        )
+        # Speed this up: patch time.sleep so the 1-second timeout trips fast.
+        monkeypatch.setattr(launcher.time, "sleep", lambda _s: None)
+        assert not wait_for_vllm(port, expected_model=expected, timeout=1)

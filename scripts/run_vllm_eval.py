@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -400,18 +401,105 @@ def preflight_baseline(
 # ---------------------------------------------------------------------------
 
 
-def wait_for_vllm(port: int, timeout: int = 900) -> bool:
-    """Poll vLLM /health until it returns 200 or *timeout* elapses."""
+def _pick_free_port() -> int:
+    """Ask the OS for a free TCP port on 127.0.0.1.
+
+    Used as the default for ``--port`` so parallel ``run_vllm_eval.py``
+    invocations don't collide on a static port. The race window between
+    closing the probe socket and ssh binding is tiny, and
+    ``ExitOnForwardFailure=yes`` on the ssh tunnel is the safety net —
+    see ``_build_ssh_tunnel_argv``.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _build_ssh_tunnel_argv(
+    *,
+    local_port: int,
+    ssh_host: str,
+    ssh_port: int,
+    ssh_key: str,
+) -> list[str]:
+    """Build the ``ssh -N -L ...`` argv for the vLLM tunnel.
+
+    ``ExitOnForwardFailure=yes`` is critical: without it, a port-bind
+    collision (two ``run_vllm_eval.py`` processes racing for the same
+    local port) leaves ssh running with no forward. The launcher's
+    subsequent ``wait_for_vllm`` probe then hits whatever else is
+    listening on that port — the winner's tunnel, in the 2026-04-08
+    matrix retry #3 failure — and reports healthy. Every
+    ``/v1/messages`` request then routes to the wrong pod and returns
+    404 "model not found". See ``docs/plan-vllm-404-bug-fix.md``.
+
+    We also bind explicitly to ``127.0.0.1`` (IPv4) and forward to the
+    pod's ``127.0.0.1:8000``. Without an explicit bind, ssh's ``-L``
+    can fall back to ``::1`` if 127.0.0.1:<port> is already in use,
+    but the launcher's health probe uses ``urllib`` which resolves
+    ``localhost`` to 127.0.0.1 first and never tries ``::1``. The
+    mismatch silently routes the health probe to whatever else is
+    listening on 127.0.0.1:<port> (e.g. the dark-factory escalation MCP
+    server, which returns 404), making vLLM look hung.
+    """
+    return [
+        "ssh",
+        "-N",
+        "-L",
+        f"127.0.0.1:{local_port}:127.0.0.1:8000",
+        "-i",
+        ssh_key,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        f"root@{ssh_host}",
+        "-p",
+        str(ssh_port),
+    ]
+
+
+def wait_for_vllm(
+    port: int,
+    expected_model: str,
+    timeout: int = 900,
+) -> bool:
+    """Poll vLLM until /health is 200 AND expected_model is in /v1/models.
+
+    The model-list check catches the case where the health probe has
+    landed on a sibling tunnel (e.g. if ``ExitOnForwardFailure=yes`` is
+    ever stripped from the ssh invocation and two parallel launchers
+    race on the same port). Without it, a sibling's pod serving a
+    different model would falsely pass the ``/health`` probe and every
+    subsequent ``/v1/messages`` request would 404. See the 2026-04-08
+    404 bug in ``docs/plan-vllm-404-bug-fix.md``.
+    """
     import urllib.request
 
-    url = f"http://127.0.0.1:{port}/health"
+    health_url = f"http://127.0.0.1:{port}/health"
+    models_url = f"http://127.0.0.1:{port}/v1/models"
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            resp = urllib.request.urlopen(url, timeout=5)
-            if resp.status == 200:
-                log(f"vLLM healthy on port {port}")
-                return True
+            if urllib.request.urlopen(health_url, timeout=5).status == 200:
+                resp = urllib.request.urlopen(models_url, timeout=5)
+                payload = json.loads(resp.read())
+                served = {m.get("id", "") for m in payload.get("data", [])}
+                if expected_model in served:
+                    log(
+                        f"vLLM healthy on port {port} "
+                        f"(serving {expected_model})"
+                    )
+                    return True
+                log(
+                    f"Port {port} reachable but /v1/models lists "
+                    f"{sorted(served)}, not {expected_model!r} — "
+                    "probable sibling-tunnel collision; continuing to wait"
+                )
         except Exception:
             pass
         time.sleep(10)
@@ -524,32 +612,12 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
 
         log(f"Starting SSH tunnel (127.0.0.1:{args.port} → pod:8000)")
         tunnel_proc = subprocess.Popen(
-            [
-                "ssh",
-                "-N",
-                # Bind explicitly to 127.0.0.1 (IPv4) and forward to the
-                # pod's 127.0.0.1:8000 (also IPv4). Without explicit binds
-                # ssh's -L can fall back to ::1 if 127.0.0.1:<port> is
-                # already in use, but the launcher's wait_for_vllm uses
-                # urllib which resolves ``localhost`` to 127.0.0.1 first
-                # via /etc/hosts and never tries ::1. The mismatch silently
-                # routes the health probe to whatever else is listening on
-                # 127.0.0.1:<port> (e.g. the dark-factory escalation MCP
-                # server, which returns 404), making vLLM look hung.
-                "-L",
-                f"127.0.0.1:{args.port}:127.0.0.1:8000",
-                "-i",
-                SSH_KEY,
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "ServerAliveInterval=30",
-                "-o",
-                "ServerAliveCountMax=3",
-                f"root@{pod.ssh_host}",
-                "-p",
-                str(pod.ssh_port),
-            ],
+            _build_ssh_tunnel_argv(
+                local_port=args.port,
+                ssh_host=pod.ssh_host,
+                ssh_port=pod.ssh_port,
+                ssh_key=SSH_KEY,
+            ),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
@@ -567,7 +635,11 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
             f"Waiting for vLLM to load model "
             f"(timeout {health_timeout // 60} min)..."
         )
-        if not wait_for_vllm(args.port, timeout=health_timeout):
+        if not wait_for_vllm(
+            args.port,
+            expected_model=hf_model,
+            timeout=health_timeout,
+        ):
             log("Health timeout — checking pod status via SSH...")
             try:
                 check = subprocess.run(
@@ -978,10 +1050,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run every df_task_*.json in evals/tasks/",
     )
 
-    # Default port avoids 8100 (dark-factory escalation MCP server) and
-    # 8002 (fused-memory). Per-pod port is collision-checked at SSH-tunnel
-    # bind time; pick a different --port if 8200 is in use.
-    p.add_argument("--port", type=int, default=8200)
+    # Default: OS-assigned free port (resolved in main() via
+    # _pick_free_port). This replaces the old hardcoded 8200 default
+    # that collided when multiple run_vllm_eval.py ran in parallel —
+    # see docs/plan-vllm-404-bug-fix.md. ``ExitOnForwardFailure=yes``
+    # on the ssh tunnel is the safety net if --port is set explicitly
+    # and collides.
+    p.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=(
+            "Local port for the ssh tunnel to vLLM. Default: an "
+            "OS-assigned free port (avoids collision when multiple "
+            "run_vllm_eval.py run in parallel)."
+        ),
+    )
     p.add_argument("--datacenter", default="US-NC-1")
     p.add_argument(
         "--no-volume",
@@ -1058,6 +1142,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    if args.port is None:
+        args.port = _pick_free_port()
+        log(f"Auto-picked local port: {args.port}")
 
     if args.concurrency < 1:
         log(f"ERROR: --concurrency must be >= 1, got {args.concurrency}")
