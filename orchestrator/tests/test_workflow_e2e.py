@@ -142,6 +142,8 @@ class AgentStub:
         judge_verdicts: list | None = None,
     ):
         self.calls: list[str] = []
+        # Last env_overrides seen per role — set by invoke_agent before dispatch.
+        self.env_overrides_by_role: dict[str, dict[str, str] | None] = {}
         self._impl_iteration = 0
         # Sequence of verify results to return (pops from front)
         self._verify_results = list(verify_results or [VerifyResult(
@@ -179,6 +181,7 @@ class AgentStub:
         """Determine role from system_prompt content, perform side effects."""
         role = self._detect_role(system_prompt)
         self.calls.append(role)
+        self.env_overrides_by_role[role] = env_overrides
 
         if role == 'architect':
             return await self._architect(cwd)
@@ -743,6 +746,49 @@ class TestCompletionJudge:
         assert workflow.metrics.judge_invocations == 0
         assert workflow.metrics.judge_early_exits == 0
         assert 'judge' not in stub.calls
+
+    async def test_judge_invocation_inherits_env_overrides(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Judge subprocess must receive config.env_overrides.
+
+        Regression: commit 065e5e97f6 added the ζ judge role but did not add it
+        to the allow-list in TaskWorkflow._invoke() that forwards env_overrides
+        to invoke_with_cap_retry. As a result, vLLM-eval runs with
+        ANTHROPIC_BASE_URL set sent implementer traffic through the bridge but
+        judge traffic straight to the real Anthropic API.
+        """
+        judge_cfg = _config_with_judge(config, enabled=True)
+        judge_cfg.env_overrides = {'ANTHROPIC_BASE_URL': 'http://127.0.0.1:9999'}
+
+        stub = AgentStub(judge_verdicts=[{
+            'complete': True,
+            'reasoning': 'diff implements plan.',
+            'uncovered_plan_steps': [],
+            'substantive_work': True,
+        }])
+        workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        # Implementer already received env_overrides pre-fix — regression guard.
+        assert stub.env_overrides_by_role.get('implementer') == {
+            'ANTHROPIC_BASE_URL': 'http://127.0.0.1:9999',
+        }
+        # The actual bug: judge must also receive env_overrides.
+        assert stub.env_overrides_by_role.get('judge') == {
+            'ANTHROPIC_BASE_URL': 'http://127.0.0.1:9999',
+        }
 
 
 # ---------------------------------------------------------------------------
