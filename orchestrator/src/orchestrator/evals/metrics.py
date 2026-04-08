@@ -19,10 +19,11 @@ logger = logging.getLogger(__name__)
 class EvalMetrics:
     """Metrics collected from a single eval run."""
 
-    # Correctness (pass/fail gate)
-    tests_pass: bool = False
-    lint_clean: bool = False
-    typecheck_clean: bool = False
+    # Correctness (pass/fail gate). ``None`` means "unknown / suspicious" —
+    # see the false-green guard at the bottom of ``collect_metrics``.
+    tests_pass: bool | None = False
+    lint_clean: bool | None = False
+    typecheck_clean: bool | None = False
     plan_completion_pct: float = 0.0
     plan_steps: int = 0
 
@@ -63,10 +64,29 @@ class EvalMetrics:
         return asdict(self)
 
 
+def _is_false_green(m: EvalMetrics, max_iterations: int) -> bool:
+    """The 404-bug signature: iteration cap hit with zero work but T/T/T.
+
+    When every agent subprocess errors at the network layer (e.g. the vLLM
+    bridge 404 bug, 2026-04-08), the workflow burns through its iteration
+    budget making no code changes, verify then runs against the untouched
+    baseline, and reports clean gates for whatever the pre-task tree already
+    passed. Cost lands at $0 because the CLI never completed a usage-tracked
+    turn. See ``docs/vllm-eval-status.md`` (2026-04-08 afternoon).
+    """
+    return (
+        bool(m.tests_pass)
+        and m.lines_changed == 0
+        and m.files_changed == 0
+        and m.iterations >= max_iterations
+        and m.cost_usd == 0.0
+    )
+
+
 def compute_composite(m: EvalMetrics) -> float:
     """Pure quality score bounded to 0..1.
 
-    - Fails tests → score 0
+    - Fails tests (or ``tests_pass=None`` from the false-green guard) → score 0
     - blocking_rate = blocking_issues / plan_steps (larger tasks tolerate more issues)
     - debug_cycles get a light penalty (the system self-correcting is good)
     - Final score = quality, clamped to [0, 1]
@@ -146,6 +166,19 @@ async def collect_metrics(
         is_local_model=is_local,
         hardware_time_seconds=round(duration_secs, 3),
     )
+    # False-green guard — catches the 404-bug signature so the same class of
+    # silent failure doesn't need manual quarantine in future runs.
+    if _is_false_green(m, workflow.config.max_execute_iterations):
+        logger.warning(
+            'False-green signature for task %s: %d iters @ cap, '
+            '$0 cost, 0 lines / 0 files changed, T/T/T — '
+            'nulling gate fields so score is 0',
+            task.get('id', '?'), m.iterations,
+        )
+        m.tests_pass = None
+        m.lint_clean = None
+        m.typecheck_clean = None
+
     m.composite_score = compute_composite(m)
     return m
 
