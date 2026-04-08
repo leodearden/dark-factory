@@ -135,10 +135,20 @@ VLLM_EVAL_CONFIGS = [
         gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=200,
         tool_call_parser='minimax_m2'),
     # MiniMax-M2.5 NVFP4 (nvidia): ~131 GB on disk, baked. 1× H200.
+    # KV cache budget after weights + CUDA graphs is tight on a single H200:
+    # at default GMU 0.95 + max_model_len 131072, vLLM 0.19 needs 15.5 GB
+    # KV pool but only ~6 GB free → crashes at startup with
+    #   ValueError: To serve at least one request with the model's max seq
+    #   len (131072), 15.5 GiB KV cache is needed, which is larger than the
+    #   available KV cache memory (5.98 GiB).
+    # Fix: same recipe as reap-139b-nvfp4-new (similar size + same hardware
+    # tier) — bump GMU to 0.97 and cap context at 80k. The eval prompt is
+    # ~39k tokens so 80k leaves ~40k of slack for tool turns.
     _vllm_config('minimax-m25-nvfp4-new',
         hf_model='nvidia/MiniMax-M2.5-NVFP4',
         image='leosiriusdawn/runpod-vllm:minimax-m25-nvfp4-baked',
         gpu_type=H200, gpu_count=1, container_disk_gb=240,
+        max_model_len=80000, gpu_memory_util=0.97,
         tool_call_parser='minimax_m2'),
     # MiniMax-M2.5 FP8 (full): ~215 GB on disk, baked. Needs >192 GB VRAM.
     # Prefers 2× H200 (282 GB); falls back to 4× RTX PRO 6000 (384 GB)
