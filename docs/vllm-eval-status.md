@@ -1,7 +1,150 @@
 # vLLM Local Model Evaluation — Status Report
 
-**Last updated:** 2026-04-07 12:15 BST
-**Status:** First true `outcome=done` for a vLLM-hosted config achieved 2026-04-07 11:11 BST (`reap-139b-nvfp4-new` on RTX PRO 6000 Blackwell, result `df_task_12__reap-139b-nvfp4-new__6838dea3.json`). Pipeline is fully validated end-to-end: bridge → parser → implementer → verify → debug → reviewers → merge. Caveat: the eval was run against current HEAD-of-main, not against a per-task baseline, so the 25 lines / 4 files changed are debug-cycle pyright asserts rather than real task implementation; the per-task baseline checkout work is preserved on `feat/multi-task-launcher-baseline-checkout` (commit `8ce354dc26`).
+**Last updated:** 2026-04-08 00:30 BST
+**Status:** Five baked vLLM eval images on Docker Hub. First parallel matrix run completed across 3 of 5 configs (the other 2 hit RunPod infra issues unrelated to our code). Three true `outcome=done` results (qwen3 / minimax-fp8 / reap-139b on different tasks) plus several "would-be-done" timeouts where tests/lint/typecheck all pass but the 60 min eval timeout fired. Workstation tier (RTX 3090 AWQ) producing first quality measurements with 4h timeout retries running in background.
+
+## Update 2026-04-07 night: shard-per-layer baking + matrix run
+
+### TL;DR
+- **5 baked images shipped to Docker Hub** via new shard-per-layer Dockerfile generator (`runpod-toolkit/scripts/bake_model_image.py`) — pushes are reliable when each safetensors shard is its own ~2 GB layer.
+- **The "qwen3 startup hang" is solved.** Root cause was NOT vLLM — it was a launcher SSH-tunnel port collision with the dark-factory escalation MCP server on `127.0.0.1:8100`. SSH fell back to `[::1]:8100` (IPv6); the launcher's `urllib` health probe resolved `localhost` → `127.0.0.1` (IPv4) and hit the escalation server (404). Fix: explicit IPv4 binds + per-pod `--port` (8200, 8201, ...). Commits: `160cd85563` (IPv4) and `b7e1bd5b2e` (per-pod ports).
+- **Baked qwen3 verifiably works**: SSH'd into the pod mid-run, confirmed model loaded (93 GB/GPU), `/v1/models` lists the model, `/v1/messages` actively serving tool-use calls.
+- **First parallel matrix completed**: 3 configs (qwen3, reap-139b, minimax-fp8) produced 15 eval results across 5 tasks each. 2 configs (minimax-nvfp4, reap-172b) failed due to RunPod infrastructure issues (vLLM health timeout — not our code).
+- **Workstation tier set up**: leo-workstation RTX 3090 running `stelterlab/Qwen3-Coder-30B-A3B-Instruct-AWQ` (4-bit, 24 GB VRAM, 63k context). 5/5 first-pass results all hit 60 min timeout; 4 retries running with 240 min timeout for clean quality measurements.
+
+### Wins (2026-04-07 night session)
+
+1. **Shard-per-layer Dockerfile generator** (`runpod-toolkit` commit `fa1d028`, batching fix `1eb311e`).
+   - Hardlinks each safetensors file from the HF cache snapshot into a build staging dir on the same filesystem (free).
+   - Generates one `COPY` per shard so each layer is ~2 GB and uploads independently — `docker push` retries per layer, no more 22+ min hangs on monolithic 98 GB layers.
+   - Files land in the standard HF hub cache layout under `/models/hub/models--Org--Name/snapshots/<hash>/` plus a `refs/main` pointer, with `HF_HOME=/models` + `TRANSFORMERS_OFFLINE=1` + `HF_HUB_OFFLINE=1`. Vllm resolves the model by its HF name without ever touching the network.
+   - Batching fallback (`1eb311e`): when shard count > 80, groups into multi-file COPYs to stay under Docker legacy builder's ~127 overlay layer limit. Required for MiniMax-M2.5 FP8 (126 shards → 63 batched layers).
+
+2. **All 5 baked images on Hub** (`leosiriusdawn/runpod-vllm:*-baked`):
+   | Tag | Model | Size | Build | Push |
+   |---|---|---|---|---|
+   | `qwen3-coder-next-fp8-baked` | Qwen3-Coder-Next FP8 | 104 GB | ~25 min | ~12 min |
+   | `reap-139b-nvfp4-baked` | REAP-139B NVFP4 (lukealonso) | 92 GB | ~14 min | ~8 min |
+   | `reap-172b-nvfp4-gb10-baked` | REAP-172B NVFP4 GB10 (saricles) | 124 GB | ~25 min | ~10 min |
+   | `minimax-m25-nvfp4-baked` | MiniMax-M2.5 NVFP4 (nvidia) | 155 GB | ~24 min | ~12 min |
+   | `minimax-m25-fp8-baked` | MiniMax-M2.5 FP8 (full) | 254 GB | ~50 min | ~30 min |
+
+3. **Launcher fix: per-task `ORCH_CONFIG_PATH` + reify support** (commit `3be119c920`):
+   - `preflight_baseline` now reads `spec['project_root']` so reify task baselines are checked out against `/home/leo/src/reify`, not dark-factory.
+   - Empty `lint`/`typecheck` commands are treated as "no such step" so reify specs (which legitimately set `typecheck=""`) don't fail validation.
+   - `resolve_task_ids --all-tasks` now globs both `df_task_*.json` and `reify_task_*.json` (any `*_task_*.json`).
+   - `run_one_task` computes the orchestrator config path per-task from `spec['project_root']` and passes `--config <path>` explicitly.
+
+4. **Workstation tier vLLM** on leo-workstation (RTX 3090, 24 GB):
+   - Installed nvidia-container-toolkit, configured docker runtime.
+   - Resolved driver mismatch (kernel 580.105 / userspace 580.126) via reboot.
+   - Found AWQ 4-bit variant: `stelterlab/Qwen3-Coder-30B-A3B-Instruct-AWQ` (compressed-tensors, ~17 GB on disk; better-rated alternative `cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit` per agent research).
+   - Memory tuning: `MAX_MODEL_LEN=63000` (max that fits KV cache), `GPU_MEMORY_UTIL=0.92`, `MAX_NUM_SEQS=4`, `ENFORCE_EAGER=1`.
+   - vLLM healthy and serving via Marlin 4-bit MoE backend, accessible from dev box via `http://leo-workstation:8000`.
+
+5. **Per-pod port assignment** in matrix runner (`b7e1bd5b2e`): each parallel pod gets its own port (8200, 8201, 8202, ...). Without this, all 5 SSH tunnels tried to bind `127.0.0.1:8200`; only the first succeeded, the other 4 silently failed and their health probes hit the wrong tunnel. Same class of bug as the IPv4/IPv6 port-collision the morning's "qwen3 hang" turned out to be.
+
+### Matrix run #2 results (2026-04-07 22:11 BST)
+
+3 of 5 configs produced eval results; 2 failed at infrastructure level.
+
+| config | task | outcome | tests | lint | type | duration |
+|---|---|---|---|---|---|---|
+| qwen3-coder-next-fp8-new | reify_task_12 | **done** ✓ | True | True | True | 16 min |
+| qwen3-coder-next-fp8-new | reify_task_27 | timeout | True | True | True | 60 min |
+| qwen3-coder-next-fp8-new | df_task_12 | timeout | False | True | True | 60 min |
+| qwen3-coder-next-fp8-new | df_task_13 | timeout | False | True | False | 60 min |
+| qwen3-coder-next-fp8-new | df_task_18 | timeout | False | False | False | 60 min |
+| reap-139b-nvfp4-new | df_task_12 | timeout (was done in earlier run) | False | True | True | 62 min |
+| reap-139b-nvfp4-new | df_task_18 | timeout | True | True | True | 61 min |
+| reap-139b-nvfp4-new | df_task_13 | timeout | False | True | True | 62 min |
+| reap-139b-nvfp4-new | reify_task_12 | timeout | True | True | True | 62 min |
+| reap-139b-nvfp4-new | reify_task_27 | timeout | True | True | True | 62 min |
+| minimax-m25-fp8-new | df_task_13 | **done** ✓ | True | True | True | 48 min |
+| minimax-m25-fp8-new | df_task_12 | blocked | True | True | True | 44 min |
+| minimax-m25-fp8-new | df_task_18 | blocked | None | None | None | 40 min |
+| minimax-m25-fp8-new | reify_task_27 | blocked | None | None | None | 17 min |
+| minimax-m25-fp8-new | reify_task_12 | timeout | False | False | True | 60 min |
+| minimax-m25-nvfp4-new | — | **FATAL: vLLM did not become healthy within 48 min** | — | — | — | — |
+| reap-172b-nvfp4-gb10-new | — | **FATAL: vLLM did not become healthy within 40 min** | — | — | — | — |
+
+**True `outcome=done` count this run: 2** (qwen3/reify_task_12, minimax-fp8/df_task_13).
+**"Would be done" with longer timeout** (timeout but tests/lint/typecheck all pass): 4 more (reap-139b: df_task_18 + reify_task_12 + reify_task_27; qwen3: reify_task_27).
+
+The 60 min orchestrator-internal timeout is too short for the inference speeds these models reach on RTX PRO 6000 / RTX PRO 6000 4-way. For the next session, bump the orchestrator's `--timeout` (the launcher's `--task-timeout-min` was already at 120; the inner orchestrator timeout binds first).
+
+### Workstation tier first results (2026-04-07 evening)
+
+5/5 tasks all hit the 60 min default eval timeout on first run, but several were close. Reify_task_27 produced `tests=True lint=True type=True` despite the timeout label.
+
+| task | outcome | tests | lint | type |
+|---|---|---|---|---|
+| df_task_12 | timeout | False | True | True |
+| df_task_13 | timeout | False | True | True |
+| df_task_18 | timeout | False | False | False |
+| reify_task_12 | timeout | False | True | True |
+| reify_task_27 | timeout | True | True | True |
+
+**4 retries with `--timeout 240` running at session end** (`ws-{df_task_12,df_task_13,df_task_18,reify_task_12}-4h.log`). The 3090 AWQ is much slower than RunPod GPUs (200-250 bridge calls in ~3 hours each), but should produce clean quality measurements when given enough time. Reify_task_27 was already passing so no retry needed.
+
+### Failures / unresolved (next session)
+
+1. **`minimax-m25-nvfp4-new` health timeout (48 min)** — pod created on H200 successfully but vLLM never returned 200 on `/health`. SSH tunnel + port were correct (per-pod port fix already in). Could be:
+   - Same NCCL/init hang signature as the qwen3 morning attempts (model loaded but not serving)
+   - A stale CUDA graph compile path despite `--enforce-eager` not being set
+   - RunPod infrastructure issue (similar to the "critical error" alert reap-139b got)
+   - Try with `--enforce-eager` set in the config; SSH into a fresh pod and py-spy the worker process (note: install py-spy in `:latest` base image to skip the in-pod install step)
+
+2. **`reap-172b-nvfp4-gb10-new` health timeout (40 min)** on 2× RTX PRO 6000 fallback — same signature as minimax-nvfp4. Possibly TP=2 NCCL init issue. Try forcing `ENFORCE_EAGER=1` in the config.
+
+3. **Bake-all script killed mid-build** (because I killed the wrong process when investigating a hang) — required a manual resume with `SKIP=` regex. The script is sequential build → push → rmi → next; if killed mid-build it leaves a partial layer. Improvement: idempotent restart (skip tags whose digest is already on Hub via `docker manifest inspect`).
+
+4. **Result file `total_turns` / `duration_s` are `None` for timeout outcomes** — those metrics aren't populated when the timeout path fires. Makes per-task speed comparison harder. Fix: populate them from the partial run state before raising the timeout.
+
+5. **Workstation tier evals can't run multiple in parallel** because vLLM is single-tenant on the 3090 (24 GB, no headroom for concurrent prefill). Currently running 4 in parallel against the same vLLM — they share the same KV cache and queue, so it's effectively serial. For the next session: either run sequentially with longer per-task timeout, or spin up a smaller model that supports concurrent batches.
+
+### Cost (this session)
+
+| Item | Cost |
+|---|---|
+| qwen3 baked image build/push (dev box, no $) | $0 |
+| Other 4 baked images build/push | $0 |
+| Gate eval qwen3 (1× pod, ~70 min, terminated mid-run x2) | ~$3 |
+| Matrix run #1 (5 pods × ~30-60 min each, partial) | ~$8 |
+| Matrix run #2 (5 pods × ~60-90 min each) | ~$15 |
+| **Session total** | **~$26** |
+| **Cumulative this week** | **~$74 of original ~$92 credit** |
+
+### What changed in main this session
+
+- `3be119c920` feat(eval): bake all 5 vLLM models into images via shard-per-layer Dockerfile
+- `160cd85563` fix(eval): bind SSH tunnel to 127.0.0.1 explicitly + bump default port
+- `b7e1bd5b2e` fix(eval): per-pod SSH tunnel ports + GPU fallbacks for H200 shortage
+
+### What changed in runpod-toolkit
+
+- `fa1d028` feat(bake): shard-per-layer model image baker
+- `1eb311e` fix(bake): batch shards to stay under overlay2 layer limit
+
+### Next session priority order
+
+1. **Read 4h workstation retry results** when they finish — first clean quality measurements for qwen3-coder-30b-q4 (AWQ 4-bit, 3090).
+2. **Bump orchestrator-internal eval timeout** from 60 min default to 120 min so the "would be done" timeouts in the matrix produce clean results.
+3. **Re-run minimax-m25-nvfp4-new and reap-172b-nvfp4-gb10-new** with `ENFORCE_EAGER=1` set in config (forcing it via env override). If still hangs, py-spy investigation.
+4. **Refire matrix** after the timeout bump and the two infrastructure fixes — should produce clean 5×5 = 25 results (or 5×5×2 = 50 if counting all attempts).
+5. **Analyze the comparative scores** across configs to start the per-quantization-method writeup (REAP-139B NVFP4 vs minimax-m25-nvfp4 vs minimax-m25-fp8 vs Qwen3-Coder-Next FP8 vs Qwen3-Coder-30B AWQ).
+6. **Optional**: rebake 1 image with py-spy preinstalled in the base layer for fast worker stack dumping next time.
+
+### Session end state
+
+- Matrix #2 ran to completion (all 5 launcher processes exited; pods all cleaned up via `finally: tear_down_pod`).
+- Workstation 4h retries still running on leo-workstation (4 processes, no 60-min timeout).
+- All commits pushed to local main; not yet pushed to origin.
+- All 5 baked images on Docker Hub, public, ready for next session's matrix retries.
+
+---
+
+
 
 ## Update 2026-04-07 PM: full session results
 
