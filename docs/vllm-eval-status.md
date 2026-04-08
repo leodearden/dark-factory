@@ -1,7 +1,157 @@
 # vLLM Local Model Evaluation — Status Report
 
-**Last updated:** 2026-04-08 00:30 BST
-**Status:** Five baked vLLM eval images on Docker Hub. First parallel matrix run completed across 3 of 5 configs (the other 2 hit RunPod infra issues unrelated to our code). Three true `outcome=done` results (qwen3 / minimax-fp8 / reap-139b on different tasks) plus several "would-be-done" timeouts where tests/lint/typecheck all pass but the 60 min eval timeout fired. Workstation tier (RTX 3090 AWQ) producing first quality measurements with 4h timeout retries running in background.
+**Last updated:** 2026-04-08 12:25 BST
+**Status:** Mid-session — second parallel matrix retry running with longer timeouts (6h orchestrator-internal / 7h subprocess), bigger iteration cap (10 → 20), and the 1× Opus comprehensive reviewer that production switched to overnight (594658fbe3 / 2c26a30bca). nvfp4 KV-cache crash fixed. fp8 retry already cold-started (4 min — RunPod image cache is now warm) and is running tasks with the new code. Preliminary report below distinguishes "would-be-done" from "blocked-by-iter-cap" and surfaces the plan-step protocol mismatch as the next structural problem to solve.
+
+## Update 2026-04-08 morning: long timeouts + opus eval reviewer + nvfp4 fix
+
+### TL;DR
+- **Timeouts and iteration caps generously bumped**: orchestrator-internal `--timeout` 60 min → 6h (via new `--orch-timeout-min` launcher flag), launcher subprocess timeout 120 → 420 min, vLLM health timeout `max(900, container_disk*12)` → `max(7200, container_disk*30)` (240 GB pods now get 120 min instead of 48), `max_execute_iterations` 10 → 20 (configurable per-task in spec). Last session's "60 min timeouts" were actually iteration cap × ~6 min/iter — the iter cap was the binding constraint, not wall clock.
+- **Eval-mode reviewer switched from 5× sonnet to 1× opus** (`runner.py:104` was lagging the merged production change in 594658fbe3). Reviewer budget 2.0 → 5.0, effort medium → high, model sonnet → opus.
+- **df_task_18 opted into `max_review_cycles=2`** (spec-level field, read by runner.py via `task.get('max_review_cycles', 1)`). Across all configs, df_task_18 reaches T/T/T at verify but gets blocked at the review cycle — exactly the case a second architect→implement→debug→review pass is meant to handle. One-off via spec field, not hardcode.
+- **`minimax-m25-nvfp4-new` KV cache crash fixed**: vLLM 0.19 + 1× H200 + default GMU 0.95 + default `max_model_len=131072` → `ValueError: 15.5 GiB KV cache needed, 5.98 GiB available`. Same class as the qwen3 morning hang and reap-139b last session — vLLM 0.19's CUDA graph profiler reserves more inside the GMU budget than 0.18 did. Fix recipe matches reap-139b: GMU 0.97 + `max_model_len=80000`.
+- **Matrix retry #3 launched** (5 configs, all with new code). 1 config (fp8) cold-started in **4 minutes** because RunPod's per-DC image cache is now warm — way faster than yesterday's 25+ min cold starts. Retries for nvfp4 (post-fix) and reap-139b (to pick up new iter cap) launched separately.
+- **Plan-step protocol mismatch surfaced as the next structural problem**: local models pass verify gates without updating plan.json's per-step `status: done`, so the workflow loops past the natural exit point and exhausts iterations as `blocked` even when the work is complete. Discussed several options (α verify-pass short-circuit / β auto-mark / γ stricter prompt / δ git-diff inference / ε drop plan_completion from score / ζ judge LLM after each iteration). Recommended bundle: ε now (5-line scoring fix), ζ next session (judge after each iteration is the structurally correct answer), skip α/β/γ/δ.
+
+### Wins (2026-04-08 morning session)
+
+1. **`scripts/run_vllm_eval.py` has a new `--orch-timeout-min` arg** that plumbs through to `orchestrator eval --timeout`. Defaulted to None so existing callers are unaffected. Matrix script passes `--orch-timeout-min 360` so the orchestrator's inner timeout binds at 6h, well above the launcher's 7h subprocess kill.
+
+2. **`scripts/run_eval_matrix.sh` cleaned up**: `TIMEOUT_MIN` 120 → 420 (subprocess), new `ORCH_TIMEOUT_MIN` 360 (inner). Comment in the file documents the relationship — outer must be > inner so the orchestrator hits its own timeout first and produces a clean result file rather than getting hard-killed with no result.
+
+3. **vLLM health timeout formula is now generous on big pods**: `max(7200, container_disk * 30)`. For `container_disk_gb=240` (most NVFP4 configs) → 120 min; for 600 GB (full FP8) → 300 min (5h). Was the binding constraint last session for minimax-m25-nvfp4-new and reap-172b-nvfp4-gb10-new which both timed out at ~40-48 min trying to load.
+
+4. **Eval-mode reviewer config in `runner.py:build_eval_orch_config`**:
+   - `models.reviewer = 'opus'` (was `'sonnet'`)
+   - `budgets.reviewer = 5.0` (was `2.0`)
+   - `effort.reviewer = 'high'` (was `'medium'`)
+   - Matches `defaults.yaml` after the 5× sonnet → 1× opus production change. The eval mode override was lagging.
+
+5. **`max_execute_iterations` and `max_review_cycles` are now spec-readable per task**:
+   ```python
+   max_execute_iterations=task.get('max_execute_iterations', 20),  # was hardcoded 10
+   max_review_cycles=task.get('max_review_cycles', 1),  # was hardcoded 1
+   ```
+   Defaults bumped (iter 10 → 20). df_task_18.json sets `max_review_cycles=2`. No code change needed for future special cases — set fields in the task spec.
+
+6. **`minimax-m25-nvfp4-new` config has KV-cache headroom**:
+   ```python
+   _vllm_config('minimax-m25-nvfp4-new', ...
+       max_model_len=80000, gpu_memory_util=0.97,
+       ...)
+   ```
+   Plus an extended comment in the file documenting the failure mode arithmetic so future agents (or future me) don't have to re-derive it from a vLLM stack trace.
+
+7. **Hijack-pod technique documented (didn't need to use it this time, but it works)**: To run new tasks against an existing live launcher's pod without waiting for fresh cold start: SIGSTOP the launcher's *python* process (not bash — bash doesn't propagate signals to children). The SSH tunnel subprocess and the pod stay up. Run new `orchestrator eval` subprocesses directly against the launcher's tunnel local port. SIGCONT the launcher when done — it tears down the pod naturally. Useful if a long-running launcher has unfinished tasks and you want to add more work to the same pod.
+
+### Matrix retry #3 — in flight (12:25 BST)
+
+Five configs launched at 10:43 BST (initial launch with old runner.py loaded mid-session for the 2 fast configs); two follow-up retries kicked off after the runner.py + nvfp4 fixes landed:
+
+| Config | Pod | Stage | Code version |
+|---|---|---|---|
+| `minimax-m25-fp8-new` (retry) | `0c813oa6og8tki` | 5/5 tasks running since 12:19 | **NEW** runner.py |
+| `minimax-m25-nvfp4-new` (post-fix retry) | `yb190afu57dbqr` | bringing up vLLM | **NEW** runner.py |
+| `reap-139b-nvfp4-new` (iter-cap retry) | `7fevwaodsejsrr` | bringing up vLLM | **NEW** runner.py |
+| `qwen3-coder-next-fp8-new` (still original) | `0ydafxslgwhbsj` | vLLM still loading from 10:56 | **NEW** runner.py (subprocesses spawn after my edit) |
+| `reap-172b-nvfp4-gb10-new` (still original) | `r64fywcfjemmzx` | vLLM still loading from 10:52 | **NEW** runner.py (subprocesses spawn after my edit) |
+
+Original-launch results from this morning that ran with **old** runner.py (sonnet reviewer, iter cap 10):
+- **reap-139b-nvfp4-new** (5/5 finished, all blocked): 2/5 with T/T/T (df_task_18, reify_task_12), 3/5 with F/T/T. Each ran ~62-65 min. Iteration-cap-bound, not timeout-bound — bumping the cap to 20 is what unlocks these.
+- **minimax-m25-fp8-new** (5/5 finished, 1 done + 4 blocked): df_task_12 done in 22 min ✓, others all blocked at ~50-65 min. **df_task_18 did NOT reach T/T/T this run** — fails F/F/F at ~65 min. **reify_task_12 reached T/T/T** but blocked. The retry running now will give us new-code numbers for direct comparison.
+
+These will be re-reviewed by the rereview tool (deferred to a separate session) once it lands.
+
+### Failures / unresolved
+
+1. **Plan-step protocol mismatch** — local models pass verify gates without updating plan.json's per-step `status: done`. Causes false-blocked outcomes (`workstation reify_task_12: T/T/T but blocked at iter=10`). Discussed at length; recommended fix bundle is ε (drop plan_completion_pct from composite_score) now + ζ (judge LLM after each iteration) next session. **Tests-pass alone is not a sufficient signal** — implementer can write trivial tests, delete failing ones, or skip plan steps that have no test signal. Plan-as-spec is what protects against this.
+
+2. **`composite_score = 0.0` for vLLM done outcomes** — `df_task_13__minimax-m25-fp8-new__e78000d4.json` is a `done` outcome with tests/lint/type all green, 50 lines changed across 1 file, 218 turns, but `plan_completion_pct=0.0` and `composite_score=0.0`. Same root cause as the protocol mismatch. ε fixes this without requiring plan-step protocol fix.
+
+3. **Two stale reify orchestrators** were running from yesterday (pids 1054318 and 1038022, ~17h elapsed each, stuck in usage-gate probe loop). User cleaned up. A single fresh reify orchestrator is now running productively (pid 319163 from 11:21 BST) — confirmed not a problem for the matrix because eval mode skips MERGE and uses separate `.eval-worktrees/` paths.
+
+4. **Codex (gpt54-xhigh, gpt54mini-xhigh) and gemini-31-pro-high are shelved** — both have tight usage caps that capped out, both produce systematically empty results. User confirmed: Anthropic Max 20× plans make Sonnet cheaper than Gemini-Flash; local models cheaper still. No reason to chase them.
+
+5. **Transient `ConnectionResetError` from RunPod's GraphQL API** caused a reap-139b retry to die during pod polling at 12:07. Pod was created and then torn down cleanly in the launcher's exception path; just had to relaunch. Worth a small follow-up patch to `runpod_toolkit/compute/runpod_client.py:get_pod` to add retry-with-backoff (3 attempts, 5s base). Not blocking right now.
+
+### Cost (this session, so far)
+
+| Item | Cost |
+|---|---|
+| Original matrix #3 launch (5 pods, mixed completion times) | ~$15 |
+| Orphan nvfp4 pod from KV cache crash (~80 min) | ~$5 |
+| nvfp4 retry pod | ~$0 (just started) |
+| reap-139b retry pod (failed once on API error, then second retry) | ~$0.50 (first attempt failed in <3 min) + new pod just started |
+| fp8 retry pod (4 min cold start, just started) | ~$0.30 cold start so far |
+| **Session total so far** | **~$21** |
+| **Remaining RunPod credit (estimated)** | **~$53** |
+
+### Next-session priority order
+
+1. **Build the rereview tool** (per the spec from this morning's conversation). The 18 detached-HEAD eval worktrees per task are intact, so reproducing the diff and running the new opus comprehensive reviewer against them is a tractable one-off operation. ~35 result files × ~$0.30 each ≈ $10 in cap budget — much cheaper than re-running implementers. Goal: normalize all existing trial results to the new opus reviewer before Elo scoring.
+2. **Wait for matrix retry #3 to finish** — should produce ~25 fresh results across 5 configs with the new code path. Plus the rereview pass on existing trials gives full coverage.
+3. **Apply ε** (drop `plan_completion_pct` from `compute_composite()` in `evals/metrics.py`) — 5-line change to unblock scoring on the existing local-model results.
+4. **Implement ζ** (judge LLM after each implementer iteration) as the structural fix for the plan-step protocol mismatch. Cleanest answer that handles "implementer wrote tests that don't match the plan" / "skipped plan steps with no test signal" / "trivially-passing tests" — none of which `verify gates pass` alone catches.
+5. **Patch `runpod_client.get_pod`** to retry on transient `ConnectionResetError`. 10 lines.
+6. **Run the post-rereview Elo quality scoring** on the normalized result corpus.
+
+---
+
+## Preliminary report — vLLM-hosted vs API baselines (2026-04-08 morning data)
+
+**Corpus:** 5 tasks × 13 configs (where data exists) = 57 unique (task, config) results in `orchestrator/src/orchestrator/evals/results/`. Numbers below are from the latest result file per (task, config) at session start (before this morning's matrix retry #3).
+**Tasks:** `df_task_{12,13,18}`, `reify_task_{12,27}`. df_18 is by far the hardest — *no* config gets all-green.
+**Notation:** T = `tests_pass`, L = `lint_clean`, Y = `typecheck_clean` (Y for "tYpecheck"). T/T/T = "all-green at verify gate."
+**Note on cost numbers for vLLM-hosted configs:** the `cost_usd` field is **phantom Sonnet-equivalent** from the Claude CLI's usage tracker, not real spend. Real cost = pod $/h × wall clock. Shown for completeness; do not compare API costs to vLLM costs directly.
+**Note on `composite_score` for vLLM done outcomes:** systematically broken — see Caveat below.
+
+### Per-config summary (latest result per task)
+
+| config | n | done | T/L/Y all-green | avg score | notes |
+|---|---:|---:|---:|---:|---|
+| **claude-opus-high** | 5 | 2 | 5/5 | **0.643** | API baseline |
+| **claude-sonnet-max** | 5 | 2 | 5/5 | **0.637** | API baseline — best $/score in API tier |
+| **claude-opus-max** | 5 | 2 | 5/5 | 0.620 | API baseline |
+| **gemini-3-flash-high** | 5 | 1 | 5/5 | 0.523 | API baseline — **5/5 all-green for $7.68 total**, striking $/score |
+| qwen3-coder-next-fp8-new | 5 | 1 | 2/5 | 0.400 | vLLM, 1× RTX PRO 6000 (older runs); 1 done + 1 timeout-but-TTT |
+| codex-gpt54-xhigh | 5 | 0 | 1/5 | 0.020 | shelved |
+| codex-gpt54mini-xhigh | 5 | 0 | 1/5 | 0.020 | shelved |
+| reap-139b-nvfp4-new | 5 | 0 | 3/5 (orig) → 2/5 (new) | 0.000 | vLLM, 1× RTX PRO 6000; **iter-cap-bound, not timeout-bound**; matrix retry #3 will give post-fix numbers |
+| minimax-m25-fp8-new | 5 | 1 | 2/5 | 0.000 | vLLM, 4× RTX PRO 6000; 1 done + 4 blocked (1 with T/T/T) |
+| qwen3-coder-30b-q4 | 5 | 0 | 2/5 | 0.000 | workstation 3090 AWQ; reify_12 T/T/T but iter-cap=10 |
+| gemini-31-pro-high | 5 | 0 | 0/5 | 0.000 | shelved (cap-out, $0 cost = no real spend) |
+| devstral-small-2505-q6 | 1 | 0 | 0/5 | 0.000 | parked |
+| qwen25-coder-32b-q4 | 1 | 0 | 0/5 | 0.000 | dropped |
+| minimax-m25-nvfp4-new | — | — | — | — | KV cache crash; fixed and retrying now |
+| reap-172b-nvfp4-gb10-new | — | — | — | — | still loading vLLM from 10:52 launch |
+
+### Headline findings
+
+1. **The Claude API baselines (opus-high, opus-max, sonnet-max) are tightly clustered around 0.62–0.64 average composite score.** All three reach 5/5 on verify gates for every task, differing only on review-cycle outcomes for the harder tasks. **Sonnet-max is the value pick**: ~same score as opus, ~36% lower API spend ($33.29 vs $52.03 across 5 tasks). With Anthropic Max 20× plans, Sonnet is also cheaper than Gemini-Flash per token.
+
+2. **gemini-3-flash-high is the cheap-baseline standout** — 5/5 verify gates, 1 done, 0.523 avg score, **$7.68 for the entire 5-task run**. ~4× cheaper than sonnet-max for ~80% of the score. Tier candidate if you ever want an under-Sonnet implementer for cheap fanout. (User has shelved it for now since Max plans make Sonnet cheaper anyway.)
+
+3. **codex configs collapse on every df_* task** — 0/5 done, only `reify_task_12` reaches T/T/T. Confirms shelving.
+
+4. **Best vLLM-hosted result so far: `qwen3-coder-next-fp8-new` on `reify_task_12`** → outcome=done, T/T/T, composite_score=1.0, 67 turns, ~16 min wall. **First vLLM eval to score parity with claude-opus-max** on any task. (opus-max scored 0.90 on the same task.) On a 1× RTX PRO 6000 Blackwell pod that's roughly $0.45/run real cost.
+
+5. **`reap-139b-nvfp4-new` is iteration-cap-bound, not timeout-bound** — yesterday and again this morning on the original launch (still old runner.py): 0 done outcomes, but **3/5 tasks reach T/T/T at the iter cap** (df_18, reify_12, reify_27). The implementer is finishing the actual work; the workflow just runs out of iterations while the verify→debug loop spins on a few residual issues. This is exactly what the new iter cap of 20 unlocks; the matrix retry running now will tell us how many of those convert to genuine `done` outcomes.
+
+6. **`minimax-m25-fp8-new` ran 5 tasks fully this morning (old code)** — 1 done (df_task_12 in 22 min), 4 blocked. Notable: `reify_task_12` reached T/T/T but blocked. df_task_18 did NOT reach T/T/T this run (F/F/F at 65 min), in contrast to opus-max which reaches T/T/T on df_18. So minimax-fp8 has a real quality gap on the hardest task. The retry running now will give us new-code numbers and confirm or refute that gap.
+
+7. **Workstation tier (`qwen3-coder-30b-q4` on 3090 AWQ) is iteration-bound** — last night's 4h retries completed normally, all 4 hit `iterations=10` and exited blocked. **One result is the most interesting datapoint of the whole workstation run**: `reify_task_12` finished with T/T/T but `plan_completion_pct=0.0` and `outcome=blocked`. The model wrote code that passes all verify gates but never marked plan steps done. **The AWQ 4-bit model can produce passing code on a Rust task** — the bottleneck is workflow-protocol vs model-behavior mismatch, not quality ceiling. Bumping the iter cap to 20 helps here too; ζ-style judge LLM is the structural fix.
+
+8. **Hardest task by far: `df_task_18`.** No config (incl. opus-max, opus-high) reaches T/T/T on it. Blocking issues + low scores across the board. Now opted into `max_review_cycles=2` for any subsequent run — we'll see if that's enough. (User remembered it taking a second full architect→implement→debug→review pass to clear historically; if 2 cycles still doesn't work, we'll know it needed interactive intervention rather than just more cycles.)
+
+9. **`reify_task_27` has a binary "did it" structure** — every config that reaches T/T/T scores ≥0.40 on it, and qwen3-coder-next-fp8-new + claude-sonnet-max both hit composite_score=1.0. Good signal-to-noise test for new configs.
+
+### Caveat — `composite_score` for vLLM runs is unreliable
+
+`composite_score = quality × plan_completion_pct` (`orchestrator/src/orchestrator/evals/metrics.py:74`). For multiple vLLM runs that show outcome=done with all verify gates green, `plan_completion_pct=0.0` so the composite is 0 even though the eval succeeded. Example: `df_task_13__minimax-m25-fp8-new__e78000d4.json` — outcome=done, T/T/T, **plan_completion_pct=0.0**, composite_score=0.0, 50 lines changed, 218 turns. The model wrote correct working code but never updated plan.json's step statuses to `done`. The metrics collector counts steps where `s.status == 'done'`, sees zero, reports 0% plan completion.
+
+**Until ε lands (drop `plan_completion_pct` from composite for `tests_pass=True`), the only trustworthy comparison signal for vLLM configs is `(outcome, tests_pass, lint_clean, typecheck_clean)`** — not `composite_score`. The rankings above use composite where it works and TTT count as the secondary.
+
+---
 
 ## Update 2026-04-07 night: shard-per-layer baking + matrix run
 
