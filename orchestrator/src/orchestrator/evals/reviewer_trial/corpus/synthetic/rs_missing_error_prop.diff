@@ -1,0 +1,34 @@
+diff --git a/crates/reify-syntax/src/ts_parser.rs b/crates/reify-syntax/src/ts_parser.rs
+index abc1234..def5678 100644
+--- a/crates/reify-syntax/src/ts_parser.rs
++++ b/crates/reify-syntax/src/ts_parser.rs
+@@ -1971,13 +1971,31 @@ impl TsParser {
+         })
+     }
+
+-    fn lower_string_literal(&self, node: tree_sitter::Node) -> Option<Expr> {
++    fn lower_string_literal(&self, node: tree_sitter::Node) -> Option<Expr> {
+         let text = self.node_text(node);
+         // Strip outer quotes safely (error recovery can produce malformed nodes)
+         let s = text
+             .strip_prefix('"')
+             .and_then(|s| s.strip_suffix('"'))
+-            .unwrap_or(text)
++            .unwrap()
++            .to_string();
++        Some(Expr {
++            kind: ExprKind::StringLiteral(s),
++            span: self.span(node),
++        })
++    }
++
++    /// Lower a single-quoted string literal.
++    fn lower_single_quoted_string(&self, node: tree_sitter::Node) -> Option<Expr> {
++        let text = self.node_text(node);
++        let s = text
++            .strip_prefix('\'')
++            .and_then(|s| s.strip_suffix('\''))
++            .unwrap()
+             .to_string();
+         Some(Expr {
+             kind: ExprKind::StringLiteral(s),

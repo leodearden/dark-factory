@@ -36,7 +36,7 @@ timeouts:
   architect: 2400
   implementer: 1200
   debugger: 1200
-  reviewer: 600
+  reviewer: 1200
   merger: 600
   steward: 900
   triage: 300
@@ -48,7 +48,7 @@ models:
   architect: "opus"
   implementer: "sonnet"
   debugger: "sonnet"
-  reviewer: "sonnet"
+  reviewer: "opus"
   merger: "opus"
   steward: "opus"
   triage: "sonnet"
@@ -60,7 +60,7 @@ budgets:
   architect: 8.0
   implementer: 10.0
   debugger: 5.0
-  reviewer: 2.0
+  reviewer: 5.0
   merger: 5.0
   steward: 5.0
   triage: 2.0
@@ -84,7 +84,7 @@ effort:
   architect: "max"
   implementer: "max"
   debugger: "max"
-  reviewer: "medium"
+  reviewer: "high"
   merger: "max"
   steward: "high"
   triage: "medium"

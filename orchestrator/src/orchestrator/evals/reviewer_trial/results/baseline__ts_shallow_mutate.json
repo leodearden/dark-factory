@@ -1,0 +1,198 @@
+{
+  "variant_name": "baseline",
+  "diff_id": "ts_shallow_mutate",
+  "reviews": {
+    "test_analyst": {
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "gui/src/stores/claudeStore.ts (tool_result case, ~line 182)",
+          "category": "untested_feature",
+          "description": "The new `resultCache` field is entirely untested. `claudeStore.test.ts` has no test that verifies `resultCache` is initialized on the first tool result, accumulates across multiple results, or is correctly read back. The feature is also susceptible to a stale-read data-loss bug: the spread is built from `state.messages[idx].resultCache` *outside* `produce`, so if two tool results for the same message are dispatched in quick succession (e.g. within the same event loop tick), both reads see the same stale cache, and the second write silently overwrites the first. No test exercises this concurrent-result scenario.",
+          "suggested_fix": "Add tests that: (1) dispatch two tool_result messages for the same assistant message and assert both entries appear in `resultCache`; (2) assert that `resultCache` is `{}` (or absent) before any results arrive; (3) assert `resultCache[tool_call_id]` contains the correct `{ output, is_error }` shape after a single result. Move the cache mutation inside the `produce` callback so it reads the draft's own `resultCache`, eliminating the stale-read window."
+        },
+        {
+          "severity": "blocking",
+          "location": "gui/src/stores/claudeStore.ts (tool_call case, ~line 152)",
+          "category": "id_uniqueness_regression",
+          "description": "The ID for each new tool call is now computed from `state.messages[idx].toolCalls.length` *outside* the `produce` callback, before the mutation is applied. Inside a `batch()`, SolidJS does not flush intermediate state between synchronous operations. If two `tool_call` messages for the same assistant message are processed in one batch, both read the same stale `.toolCalls.length` (e.g. `0`) and produce the identical ID (`${msg.id}-tc-0`). The existing 'locally-unique IDs' tests only dispatch calls sequentially and will not catch this regression.",
+          "suggested_fix": "Move the ID computation back inside the `produce` callback where `m.toolCalls.length` always reflects the draft's current length: `id: \\`${msg.id}-tc-${m.toolCalls.length}\\``. Add a test that dispatches two tool_call events synchronously (or within a batch) and asserts the resulting IDs are distinct."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/claudeStore.test.ts (tool_call handling tests)",
+          "category": "missing_assertion_new_field",
+          "description": "The `metadata` field added to each `ToolCallInfo` object is not asserted in any existing test. Tests check id, toolName, toolInput, and status, but not metadata. There is no test for the case where `msg.metadata` is present (should be forwarded) or absent/undefined (should default to `{}`).",
+          "suggested_fix": "Extend the existing tool_call tests to assert `toolCall.metadata` equals `{}` when the message has no metadata, and equals the provided value when `msg.metadata` is set. This locks in the API contract for consumers of `ToolCallInfo`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (tool_result case, ~line 185)",
+          "category": "type_contract_not_tested",
+          "description": "`resultCache` is accessed via `(state.messages[idx] as any).resultCache`, meaning it is not declared on the `AssistantMessage` type. TypeScript's structural type system provides no safety here. There is no test (even a compile-time one) that verifies `resultCache` is part of the type contract, making downstream reads of this field invisible to the type checker and untestable through normal typed assertions.",
+          "suggested_fix": "Add `resultCache?: Record<string, { output: unknown; is_error: boolean }>` to the `AssistantMessage` type, remove the `as any` cast, and update at least one test to read `resultCache` through the typed interface to catch future type regressions."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/claudeStore.test.ts (tool_result handling tests)",
+          "category": "untested_edge_case",
+          "description": "No test covers `is_error: true` in a tool result being stored in `resultCache`, nor does any test cover `msg.tool_call_id` being `undefined` or an unrecognised ID. The original code only updated the in-list `ToolCallInfo`; the new `resultCache` is a parallel structure, and its behaviour under error or missing-ID conditions is unspecified and untested.",
+          "suggested_fix": "Add test cases: (1) `is_error: true` result is stored with correct shape; (2) a tool_result with an unknown `tool_call_id` does not corrupt existing cache entries (idempotent no-op or defined error)."
+        }
+      ],
+      "reviewer": "test_analyst",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The diff introduces two new data structures \u2014 a `metadata` field on `ToolCallInfo` and a `resultCache` map on `AssistantMessage` \u2014 and moves ID generation outside the `produce` callback, but the existing test suite covers none of these changes. The most serious gap is that the `resultCache` feature is completely untested: there are no assertions for initialisation, accumulation, or correct shape, and the implementation's stale-read pattern (spreading from `state.messages[idx]` before calling `produce`) creates a real data-loss bug under concurrent tool results that no test would catch. The ID-generation move is equally risky: extracting `.toolCalls.length` outside `batch()`/`produce` can produce duplicate IDs when two tool calls are batched together, yet the existing \"locally-unique IDs\" tests only cover sequential dispatch and will not detect the regression. Two further suggestions: the `metadata` field needs at least a presence/default assertion, and `resultCache` should be added to the `AssistantMessage` type and tested through the typed interface rather than through `as any` casts."
+    },
+    "reuse_auditor": {
+      "reviewer": "reuse_auditor",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (tool_result case, ~line 182)",
+          "category": "duplication",
+          "description": "`resultCache` duplicates the existing `ToolCallInfo.result` field. `AssistantMessage` already stores each tool's output inside `toolCalls[i].result` (set by the `tool_result` handler's existing `m.toolCalls.find(...)` logic). The new parallel map `m.resultCache[tool_call_id]` stores `{ output, is_error }` for the same data, indexed differently. This creates two sources of truth for tool results with no clear benefit.",
+          "suggested_fix": "Remove the `resultCache` block entirely. If O(1) lookup by `tool_call_id` is genuinely needed, add a `tool_call_id` \u2192 index map on `AssistantMessage` that points back into the existing `toolCalls` array rather than copying the result data a second time."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (tool_call case, ~line 155)",
+          "category": "broken_existing_pattern",
+          "description": "The `toolCalls.length` read for ID generation is moved outside the `produce` callback, but the original code read it inside `produce` where it reflects the draft's current length. The new code reads from the raw (pre-batch) store snapshot, so if two `tool_call` events are processed within the same batch both will observe the same length and produce the same ID. The existing inside-`produce` pattern was correct.",
+          "suggested_fix": "Move the `toolCall` object construction back inside the `produce` callback, matching the original pattern: `m.toolCalls.push({ id: \\`${msg.id}-tc-${m.toolCalls.length}\\`, ... })`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (tool_result case, ~line 183)",
+          "category": "broken_existing_pattern",
+          "description": "`resultCache` is cloned from raw store state outside `produce` and then assigned inside it. This breaks atomicity: the snapshot is taken before the draft opens, so a race between two `tool_result` events could cause one entry to overwrite the other. The existing `tool_result` handler already correctly mutates only inside `produce`.",
+          "suggested_fix": "If `resultCache` is kept at all, move its update fully inside the `produce` callback: `m.resultCache = { ...m.resultCache, [msg.tool_call_id]: { output: msg.output, is_error: msg.is_error } }`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (tool_call ~line 157, tool_result ~line 183)",
+          "category": "bypasses_existing_types",
+          "description": "`(state.messages[idx] as any)` is used twice to access fields on a value that is already a typed `AssistantMessage`. `AssistantMessage` already declares `toolCalls: ToolCallInfo[]` so that cast is redundant. `resultCache` is not declared on `AssistantMessage` at all \u2014 adding it via `as any` creates an invisible field that TypeScript won't check or surface to consumers.",
+          "suggested_fix": "Add `resultCache?: Record<string, { output: unknown; is_error: boolean }>` to the `AssistantMessage` interface if the field is intentional, then remove both `as any` casts. The discriminated-union narrowing on `role === 'assistant'` already gives a typed `AssistantMessage`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (tool_call case, ~line 162)",
+          "category": "undeclared_field",
+          "description": "`metadata: msg.metadata || {}` is added to the pushed tool-call object but `ToolCallInfo` has no `metadata` field. The value is silently invisible to TypeScript callers; if it is consumed somewhere it is an undocumented contract, and if it is not consumed it is dead state.",
+          "suggested_fix": "Either add `metadata?: Record<string, unknown>` to the `ToolCallInfo` interface (if metadata is consumed downstream) or remove the field entirely."
+        }
+      ],
+      "summary": "The diff introduces a `resultCache` field on `AssistantMessage` that duplicates data already stored in `ToolCallInfo.result` within the existing `toolCalls` array. Two findings compound this: the cache is populated via an `as any` cast on an undeclared field, and both the cache copy and the `toolCalls.length` read for ID generation are extracted outside the `produce` callback, silently breaking the atomicity guarantees the existing code correctly relied on. A fourth `as any` cast on `toolCalls` is also unnecessary since `AssistantMessage` already types that field. Finally, a `metadata` property is pushed onto tool-call objects without being declared on `ToolCallInfo`, making it invisible to consumers. No blocking issues exist \u2014 none of these will cause crashes under normal event ordering \u2014 but the `resultCache` abstraction is pure duplication and should be removed in favour of the existing `ToolCallInfo.result` field."
+    },
+    "architect_reviewer": {
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (tool_call case, resultCache construction)",
+          "category": "dual_source_of_truth",
+          "description": "The diff introduces `resultCache` as a parallel dictionary on `AssistantMessage` that stores `{ output, is_error }` keyed by `tool_call_id`, while the existing code already stores tool results on `ToolCallInfo.result` (the `const tc = m.toolCalls.find(...)` path that follows in the `tool_result` handler). This creates two authoritative stores for the same data: `m.toolCalls[i].result` and `m.resultCache[id].output`. Downstream code must now choose which source to read, and they can diverge if one is updated but not the other.",
+          "suggested_fix": "Remove `resultCache` and do any lookup-optimization inside the existing `produce` callback by building a `Map` from the already-correct `m.toolCalls` array, or accept the O(n) linear scan which is fine for typical tool-call counts. Keep a single source of truth on `ToolCallInfo.result`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (AssistantMessage interface)",
+          "category": "missing_type_definition",
+          "description": "`resultCache` is written to and read from `AssistantMessage` objects entirely via `as any` casts, but the `AssistantMessage` interface (which defines `role`, `id`, `thinkingText`, `toolCalls`, etc.) is never updated to include this field. Every future reader of `resultCache` must also use `as any`, spreading the type hole through the codebase. The exported `AssistantMessage` type in `stores/index.ts` will remain incorrect.",
+          "suggested_fix": "If `resultCache` is kept, add `resultCache?: Record<string, { output: unknown; is_error: boolean }>` to the `AssistantMessage` interface so type checking applies at all access points."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (ToolCallInfo interface)",
+          "category": "missing_type_definition",
+          "description": "`metadata: msg.metadata || {}` is added to every pushed `ToolCallInfo` object, but the `ToolCallInfo` interface only declares `id`, `toolName`, `toolInput`, `status`, and `result?`. The `metadata` field is not declared, so it is silently dropped from the inferred object type. Any component reading `toolCall.metadata` would need an `as any` cast, and the field is invisible to autocomplete and refactoring tools.",
+          "suggested_fix": "Add `metadata?: Record<string, unknown>` to the `ToolCallInfo` interface to make the field first-class."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (tool_result case, resultCache build)",
+          "category": "pattern_consistency",
+          "description": "The `resultCache` object is assembled outside the `produce` callback by reading `state.messages[idx]` with an `as any` spread, then assigned inside `produce`. Every other mutation in this store (including the sibling `tool_call` case immediately above) performs all reads and writes entirely inside `produce`, which is the documented SolidJS pattern for safe nested mutation. This split-read/inside-write style is inconsistent and harder to reason about \u2014 especially since `state.messages[idx]` outside `produce` reflects the store snapshot while `m` inside `produce` is the Immer-style draft.",
+          "suggested_fix": "Move the resultCache initialization and mutation entirely inside the `produce` callback: `if (!m.resultCache) m.resultCache = {}; m.resultCache[msg.tool_call_id] = { output: msg.output, is_error: msg.is_error };`"
+        }
+      ],
+      "reviewer": "architect_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The diff makes two additions: a `metadata` field on tool-call objects and a `resultCache` map on assistant messages. The most significant architectural concern is that `resultCache` creates a parallel store of tool results alongside the already-existing `ToolCallInfo.result` field, violating the single-source-of-truth principle and requiring consumers to arbitrate between two representations. Both new fields (`metadata` on `ToolCallInfo` and `resultCache` on `AssistantMessage`) bypass the TypeScript type system entirely via `as any` casts rather than updating the canonical interfaces, which will propagate the type hole to every future read site. Additionally, the `resultCache` construction pattern\u2014reading the reactive state outside `produce` and writing inside it\u2014breaks from the consistent convention established by every other mutation in the file. None of these issues cause runtime errors, but they degrade architectural coherence, type safety, and long-term maintainability."
+    },
+    "performance": {
+      "reviewer": "performance",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (tool_result case, new resultCache block)",
+          "category": "quadratic_allocation",
+          "description": "The resultCache is rebuilt by spreading the entire existing cache into a new object on every tool_result event: `{ ...(state.messages[idx] as any).resultCache || {} }`. For a conversation with N tool calls this produces O(N\u00b2) total copy operations \u2014 result 1 copies 0 entries, result 2 copies 1, ..., result N copies N-1 \u2014 and allocates N intermediate objects. In long agentic sessions with dozens of tool calls this will cause measurable GC pressure and increased memory usage.",
+          "suggested_fix": "Mutate the cache directly inside the existing `produce()` callback instead of building a copy outside it. SolidJS's `produce` gives you a mutable draft, so `m.resultCache ??= {}; m.resultCache[msg.tool_call_id] = { output: msg.output, is_error: msg.is_error };` is O(1) per result with zero extra allocations and no stale-read risk."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (tool_call case, toolCall object construction)",
+          "category": "stale_read_in_hot_path",
+          "description": "The tool-call ID now uses `state.messages[idx].toolCalls.length` read from the reactive store *outside* the `produce()` callback, whereas the original code read `m.toolCalls.length` *inside* produce (from the mutable draft). If multiple `tool_call` messages are dispatched before the SolidJS reactive graph settles (e.g. from a high-frequency stream), the pre-mutation read can capture a stale length, producing duplicate IDs for tool calls within the same assistant turn. The inside-produce read is always consistent with the state as it exists at mutation time.",
+          "suggested_fix": "Remove the pre-built `toolCall` constant and move the object literal back inside `produce()` as in the original code, using `m.toolCalls.length` for the sequential suffix. The only new field added (`metadata`) can be included inline: `metadata: msg.metadata ?? {}` (or omit the key when absent)."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (tool_call case, toolCall.metadata)",
+          "category": "unnecessary_allocation",
+          "description": "`metadata: msg.metadata || {}` allocates a fresh empty object literal for every tool call where `msg.metadata` is absent or falsy. In a typical session most tool calls won't carry metadata, so this is an unconditional per-event allocation that accumulates in long sessions.",
+          "suggested_fix": "Use `metadata: msg.metadata ?? undefined` (omit the key entirely if absent) or `metadata: msg.metadata` and guard at consumption sites. If an empty-object default is truly required, hoist a `const EMPTY_METADATA = {};` module-level constant and reuse it."
+        }
+      ],
+      "summary": "The diff introduces a resultCache lookup structure for tool results, but the implementation uses an object-spread copy-on-write pattern outside of the `produce()` callback. This creates O(N\u00b2) total allocations across N tool results \u2014 each new result copies the entire existing cache before inserting one entry \u2014 turning what should be a constant-time update into a superlinear one that worsens with conversation length. The correct fix is to mutate the cache directly inside the existing `produce()` draft, which is already available. A secondary issue is that the tool-call ID calculation was moved outside `produce()` to read `state.messages[idx].toolCalls.length`, creating a potential stale-read window versus the original inside-produce read; this could yield duplicate IDs under rapid streaming. Additionally, `msg.metadata || {}` allocates a fresh empty object on every tool call without metadata, which is a minor but avoidable per-event allocation. None of these are blocking, but the quadratic allocation pattern in particular will degrade performance in long agentic conversations."
+    },
+    "robustness": {
+      "reviewer": "robustness",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "gui/src/stores/claudeStore.ts (tool_call case, toolCall object literal)",
+          "category": "type_contract_violation",
+          "description": "The new `toolCall` object adds a `metadata` field that does not exist in the `ToolCallInfo` interface (lines 10\u201316). TypeScript's excess-property check will reject `m.toolCalls.push(toolCall)` at compile time because `ToolCallInfo` has no `metadata` member. At runtime (if the build is bypassed or `as any` is added), downstream code that relies on `ToolCallInfo`'s contract will silently carry an undocumented property on every tool call.",
+          "suggested_fix": "Add `metadata?: Record<string, unknown>` to the `ToolCallInfo` interface, or remove the `metadata` field from the `toolCall` object literal if it is not needed downstream."
+        },
+        {
+          "severity": "blocking",
+          "location": "gui/src/stores/claudeStore.ts (tool_result case, m.resultCache assignment inside produce)",
+          "category": "type_contract_violation",
+          "description": "`m.resultCache = resultCache` assigns a property that does not exist on `AssistantMessage` (lines 18\u201327). TypeScript will emit a compile error here. The companion read \u2014 `(state.messages[idx] as any).resultCache` \u2014 uses `as any` to bypass this, confirming the violation is known but unaddressed. SolidJS stores proxy access to declared fields; adding an ad-hoc property via `produce` may silently succeed at runtime but the field will be invisible to TypeScript and to any serialisation/comparison code that relies on the declared type.",
+          "suggested_fix": "Add `resultCache?: Record<string, { output: unknown; is_error: boolean }>` to `AssistantMessage`, then access it without `as any` casts. If this cache is truly internal to the store and should not be part of the public type, track it in a separate parallel `Map` keyed by message ID rather than stuffing it onto the message object."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (tool_result case, resultCache construction before produce)",
+          "category": "stale_state_read_anti_pattern",
+          "description": "The `resultCache` object is built via a shallow copy of `state.messages[idx].resultCache` **outside** the `produce` callback, then assigned back inside it. Even though JavaScript is single-threaded, this is a read-modify-write pattern on state that lives outside the `produce` mutation boundary. If any future change causes the `setState` to be deferred (e.g., wrapping in an additional `batch`, using a scheduler, or moving to async store updates), two concurrent `tool_result` events for the same assistant message could both read the old `resultCache`, each add their own entry, and then the second write would clobber the first \u2014 a lost-update bug.",
+          "suggested_fix": "Move the entire cache mutation inside `produce`: `if (!m.resultCache) m.resultCache = {}; m.resultCache[msg.tool_call_id] = { output: msg.output, is_error: msg.is_error };`. This is the idiomatic SolidJS pattern and is safe regardless of scheduling changes."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (tool_call case, id computation outside produce)",
+          "category": "fragile_state_read",
+          "description": "The tool-call ID is now computed from `state.messages[idx].toolCalls.length` **before** the `produce` callback runs, whereas the original code read `m.toolCalls.length` inside `produce`. In today's synchronous, single-threaded path the values are identical, but the new code is fragile: (1) the `as any` cast disables TypeScript's guarantee that `toolCalls` is present, so if a message object were constructed without it the read would throw; (2) if the `produce` callback is ever called more than once (e.g., retry logic), the ID would be wrong because it was snapshotted before the first call ran.",
+          "suggested_fix": "Restore the ID computation to inside the `produce` callback using `m.toolCalls.length`, which is always authoritative and type-safe: `id: \\`${msg.id}-tc-${m.toolCalls.length}\\``."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts (tool_call case, metadata field)",
+          "category": "silent_default_masking_api_shape",
+          "description": "`metadata: msg.metadata || {}` silently substitutes an empty object when the server message omits the `metadata` field. If `metadata` is expected on all `tool_call` messages per the API contract, this hides malformed server payloads. Consumers that check `toolCall.metadata` will receive `{}` instead of a visible error.",
+          "suggested_fix": "If `metadata` is optional by design, document it as `metadata?: Record<string, unknown>` in both `ToolCallInfo` and assign `msg.metadata ?? undefined` (or keep the `|| {}` but comment that it is intentionally optional). If it is required, assert its presence and log a warning when missing."
+        }
+      ],
+      "summary": "The diff introduces two type-contract violations that will cause TypeScript compilation failures: (1) the `toolCall` object literal gains a `metadata` property not present in `ToolCallInfo`, and (2) `m.resultCache` is assigned inside a `produce` callback on a type (`AssistantMessage`) that has no such field \u2014 the `as any` cast used to read it back is evidence the violation is already known. Beyond the type errors, the `resultCache` construction follows a read-modify-write anti-pattern outside the `produce` boundary, which works today due to JavaScript's single-threaded event loop but would silently produce lost-update bugs if the store ever uses deferred commits. Two lower-severity concerns round out the review: moving `toolCalls.length` outside `produce` is fragile (original in-callback read was correct by construction), and `msg.metadata || {}` silently masks missing server fields rather than surfacing them."
+    }
+  },
+  "total_cost_usd": 1.3227813,
+  "wall_clock_ms": 220217,
+  "errors": []
+}

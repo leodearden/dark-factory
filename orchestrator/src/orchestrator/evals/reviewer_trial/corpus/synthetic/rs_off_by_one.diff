@@ -1,0 +1,34 @@
+diff --git a/crates/reify-constraints/src/solver.rs b/crates/reify-constraints/src/solver.rs
+index abc1234..def5678 100644
+--- a/crates/reify-constraints/src/solver.rs
++++ b/crates/reify-constraints/src/solver.rs
+@@ -457,19 +457,26 @@ fn reflect_vertex(centroid: &[f64], worst: &[f64], alpha: f64) -> Vec<f64> {
+ ///
+ /// Creates N+1 vertices: the initial point plus N perturbations
+ /// (one per dimension), each offset by a fraction of the parameter range.
+-fn build_simplex(initial: &[f64], params: &[AutoParam]) -> Vec<Vec<f64>> {
++fn build_simplex(initial: &[f64], params: &[AutoParam], scale: f64) -> Vec<Vec<f64>> {
+     let n = initial.len();
+     let mut simplex = Vec::with_capacity(n + 1);
+     simplex.push(initial.to_vec());
+
+-    for i in 0..n {
++    for i in 0..=n {
+         let mut vertex = initial.to_vec();
+         // Perturb dimension i by a fraction of the effective range
+         let (lo, hi) = effective_bounds(&params[i]);
+-        let delta = (hi - lo) * 0.1;
++        let delta = (hi - lo) * scale;
+         vertex[i] += delta;
+         vertex[i] = vertex[i].clamp(lo, hi);
+         simplex.push(vertex);
+     }
+
+     simplex
+ }
++
++/// Validate that a simplex has the correct number of vertices for N dimensions.
++fn validate_simplex(simplex: &[Vec<f64>], n: usize) -> bool {
++    simplex.len() == n + 1
++        && simplex.iter().all(|v| v.len() == n)
++}

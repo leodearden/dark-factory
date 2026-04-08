@@ -1,0 +1,21 @@
+{
+  "diff_id": "py_swapped_args",
+  "ground_truth": [
+    {
+      "id": "py_swap_1",
+      "location": "orchestrator/src/orchestrator/git_ops.py:418",
+      "category": "swapped_arguments",
+      "severity": "blocking",
+      "description": "The positional arguments to_sha and from_sha are swapped in the git diff command. The original order was 'from_sha, to_sha' but the new code passes 'to_sha, from_sha', which reverses the diff direction. This produces the inverse of the intended changeset — additions appear as deletions and vice versa.",
+      "mutation_type": "swapped_args"
+    },
+    {
+      "id": "py_swap_2",
+      "location": "orchestrator/src/orchestrator/git_ops.py:415",
+      "category": "incomplete_diff_filter",
+      "severity": "suggestion",
+      "description": "The --diff-filter flag excludes Type-change (T) files by default. While rare, symlink-to-file type changes would be silently dropped from the results.",
+      "mutation_type": "swapped_args"
+    }
+  ]
+}

@@ -1,0 +1,191 @@
+{
+  "variant_name": "baseline",
+  "diff_id": "rs_leaked_resource",
+  "reviews": {
+    "test_analyst": {
+      "reviewer": "test_analyst",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd (lines 46-81)",
+          "category": "api_contract_violation",
+          "description": "The function doc comment states 'The caller is responsible for closing the fd when done,' but the implementation transfers ownership of `fd` into `File::from_raw_fd(fd)`, which is then wrapped in a `BufWriter`. When `writer` drops at the end of the function, it drops the inner `File`, which calls `close(fd)`. The fd is therefore closed by this function \u2014 the opposite of what the contract promises. Any caller that attempts to use the fd after `export_stl_to_fd` returns has a use-after-close bug. This is an API contract violation that tests would immediately expose. Fix by wrapping the `File` in `std::mem::ManuallyDrop` (or using `BorrowedFd`/`AsFd`) so the fd is not closed on drop, then update the doc comment to match the actual behaviour.",
+          "suggested_fix": "let file = unsafe { ManuallyDrop::new(File::from_raw_fd(fd)) }; let mut writer = BufWriter::new(&mut *file); ... writer.flush()?; \u2014 The fd is not closed on drop; update the doc to say 'this function does not close the fd'."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd",
+          "category": "missing_tests",
+          "description": "The new `export_stl_to_fd` function has zero test coverage. No unit or integration test exercises it anywhere in the codebase. Three critical behaviors are therefore completely unverified: (1) the fd lifecycle (which is actively buggy \u2014 see other finding), (2) the correctness of the emitted binary STL bytes (header, triangle count field, per-triangle layout), and (3) the accuracy of the `bytes_written` return value. The existing `export_stl_returns_success` test in `write_tools_tests.rs` only exercises `export_stl` via the MCP tool layer and does not reach `export_stl_to_fd`.",
+          "suggested_fix": "Add unit tests in `mesh_export.rs` (or a new `tests/mesh_export_tests.rs`) using a Unix `pipe()` or a `memfd_create`/tempfile to capture output: (a) assert the first 80 bytes are zeroed, bytes 80-83 encode the triangle count LE, each 50-byte triangle record matches the vertex data; (b) assert `bytes_written == 84 + n_triangles * 50`; (c) assert the fd remains open after the call (read from the pipe read-end succeeds)."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd (line 58, chunks loop)",
+          "category": "untested_edge_case",
+          "description": "`triangles.len()` is assumed to be a multiple of 3 but this is never asserted or tested. If the mesh returns a malformed slice (e.g. length 7), `tri_count = (7 / 3) as u32 = 2` is written to the header, but `chunks(3)` emits 3 chunks (sizes 3, 3, 1). The final 1-element chunk writes only one vertex's worth of bytes for that triangle record, producing silent STL corruption with no error returned. A test with a non-multiple-of-3 index count would expose this and drive a decision to either assert/return an error or document the invariant.",
+          "suggested_fix": "Add `assert_eq!(triangles.len() % 3, 0, \"triangle index count must be a multiple of 3\");` (or return `Err`) at the top of the function, and add a test that supplies a triangle slice of length 7 and expects an error/panic."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd (line 60, bytes_written)",
+          "category": "unverified_return_value",
+          "description": "The `bytes_written` counter is maintained manually with hardcoded increments (`84` for the header, `50` per triangle) rather than tracking actual bytes flushed to the fd. No test validates that the return value equals the number of bytes a reader receives on the other end of the fd. A subtle change to the STL record layout (e.g. adding padding, changing attribute bytes) would leave the counter silently wrong. A test capturing output via a pipe and comparing `pipe_read_bytes == returned_bytes_written` would catch this.",
+          "suggested_fix": "Add a test: create a `pipe()`, call `export_stl_to_fd(mesh, write_fd)`, read all bytes from `read_fd`, assert `read_bytes.len() == returned_value`."
+        }
+      ],
+      "summary": "The diff introduces `export_stl_to_fd` with two blocking problems. First, there is an API contract violation: the doc comment promises the caller owns the fd and should close it, but `File::from_raw_fd(fd)` transfers ownership into the function so the fd is actually closed when the `BufWriter` drops \u2014 callers relying on the documented contract will have a use-after-close bug. Second, the function ships with zero test coverage; the binary STL format correctness, the `bytes_written` return value, and especially the fd lifecycle are entirely unexercised. Two additional suggestions cover an untested edge case (triangle index count not divisible by 3 producing silent STL corruption) and the absence of a round-trip check on the `bytes_written` return value."
+    },
+    "reuse_auditor": {
+      "reviewer": "reuse_auditor",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-runtime/src/mesh_export.rs:43-80",
+          "category": "logic_duplication",
+          "description": "The STL binary serialization logic (80-byte header, triangle count, per-triangle normal placeholder + vertex floats + attribute bytes) in `export_stl_to_fd` is a copy of the identical loop already present in `export_stl`. Both functions differ only in how they obtain the writer: one opens a `Path`, the other wraps a raw fd. The format-writing code is duplicated in full.",
+          "suggested_fix": "Extract a private `fn write_stl_binary(mesh: &Mesh, writer: &mut impl Write) -> Result<usize>` that owns the header/triangle loop. Both `export_stl` and `export_stl_to_fd` become thin wrappers that construct their respective writer and delegate:\n\n```rust\nfn write_stl_binary(mesh: &Mesh, writer: &mut impl Write) -> Result<usize> {\n    let header = [0u8; 80];\n    writer.write_all(&header)?;\n    let triangles = mesh.triangles();\n    let tri_count = (triangles.len() / 3) as u32;\n    writer.write_all(&tri_count.to_le_bytes())?;\n    let vertices = mesh.vertices();\n    let mut bytes_written: usize = 84;\n    for tri in triangles.chunks(3) {\n        writer.write_all(&[0u8; 12])?;\n        for &idx in tri {\n            let v = &vertices[idx as usize];\n            writer.write_all(&(v.x as f32).to_le_bytes())?;\n            writer.write_all(&(v.y as f32).to_le_bytes())?;\n            writer.write_all(&(v.z as f32).to_le_bytes())?;\n        }\n        writer.write_all(&0u16.to_le_bytes())?;\n        bytes_written += 50;\n    }\n    Ok(bytes_written)\n}\n```"
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-runtime/src/mesh_export.rs:43-50",
+          "category": "missed_existing_abstraction",
+          "description": "The kernel's export pipeline already accepts `&mut dyn std::io::Write` (see `GeometryKernel::export` and `OcctKernelHandle::export` in reify-kernel-occt). `export_stl_to_fd` bypasses this abstraction entirely by directly reimplementing STL serialization. If STL export is eventually wired through the kernel's `ExportFormat::Stl` arm (which is already defined in the enum), `export_stl_to_fd` will silently diverge from the canonical implementation.",
+          "suggested_fix": "Once `ExportFormat::Stl` is implemented in the kernel, `export_stl_to_fd` should delegate through the same kernel path: wrap the fd in a `File` \u2192 `BufWriter`, then call `kernel.export(handle, ExportFormat::Stl, &mut writer)`. If a kernel handle is not available at the call site, at minimum share the format-writing helper (see issue #1) so there is a single source of truth."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-runtime/src/mesh_export.rs:75",
+          "category": "fragile_derived_value",
+          "description": "`bytes_written` is manually incremented by hardcoded constants (84 for the fixed header, 50 per triangle) rather than being measured from the actual write calls. This shadow-count will silently diverge if the write loop is modified (e.g. real normals are added, replacing the 12-byte zero placeholder with computed data).",
+          "suggested_fix": "Wrap the writer in a byte-counting adapter before passing it to the shared helper, or derive the count from `tri_count` arithmetically after the fact (`84 + tri_count as usize * 50`) in one place rather than accumulating inside the loop. Either approach eliminates the need to keep the increment in sync with every `write_all` call."
+        }
+      ],
+      "summary": "The new `export_stl_to_fd` function duplicates the complete STL binary serialization loop that already exists in `export_stl` in the same file. Since the two functions differ only in writer construction (file path vs. raw fd), the format code should be extracted into a private `write_stl_binary(mesh, writer: &mut impl Write)` helper that both call. Additionally, the kernel export pipeline already defines a `&mut dyn Write`-based abstraction and an `ExportFormat::Stl` enum variant; the new function bypasses both, creating a second, divergent STL implementation that will drift from any future canonical path. The hardcoded byte-count accumulator compounds the duplication risk by requiring manual synchronization with every `write_all` call in the loop."
+    },
+    "architect_reviewer": {
+      "reviewer": "architect_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd",
+          "category": "api_contract_violation",
+          "description": "File::from_raw_fd transfers ownership of the fd into the File value. When writer (which owns file) drops at the end of the function, the fd is closed. The docstring states 'The caller is responsible for closing the fd when done,' implying the fd is still open on return \u2014 and the inline comment at the bottom explicitly acknowledges this contradiction ('But the caller expects the fd to remain open'). Any call site that follows the documented contract will experience use-after-close (EBADF) or a silent double-close. The contract as written is unrealisable with this implementation.",
+          "suggested_fix": "Use std::os::unix::io::IntoRawFd to reclaim the fd before the function exits: call writer.into_inner() to recover the File, then std::mem::ManuallyDrop::new(file) (or file.into_raw_fd() discarding the result) to prevent the drop from closing the fd. Alternatively, change the contract to match the implementation \u2014 document that the function consumes and closes the fd \u2014 and update call sites accordingly. A third option is to pass &mut impl Write instead of a raw fd, so ownership is never taken."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd",
+          "category": "missing_abstraction_boundary",
+          "description": "The STL serialization logic (80-byte header, per-triangle normal + 3\u00d7vertex + 2-byte attribute) is duplicated between export_stl and export_stl_to_fd. The module now has two functions with identical serialization bodies diverging only in their I/O sink. This violates DRY and makes the two code paths prone to diverging silently.",
+          "suggested_fix": "Extract a private fn write_stl_binary(mesh: &Mesh, writer: &mut impl Write) -> Result<usize> that contains the shared serialization logic. Both export_stl (which opens a BufWriter<File> from a Path) and export_stl_to_fd (or a higher-level caller) can delegate to it."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd",
+          "category": "inconsistent_return_type",
+          "description": "export_stl returns Result<()> while export_stl_to_fd returns Result<usize>. The bytes-written count isn't documented with a justification and is trivially computable by the caller (84 + triangles*50). The asymmetry makes the module's public surface incoherent.",
+          "suggested_fix": "If the byte count is genuinely needed by callers (e.g. for a Content-Length header), document that explicitly and consider returning it from export_stl as well for symmetry. If it is not needed, return Result<()> to match the existing function."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-runtime/src/mesh_export.rs:1",
+          "category": "platform_portability",
+          "description": "use std::os::unix::io::FromRawFd is gated to Unix targets in the standard library. Without #[cfg(unix)] (or #[cfg(target_family = \"unix\")]) on the function and its import, the file will fail to compile on Windows. No other file in the codebase uses unix-specific APIs without a cfg guard.",
+          "suggested_fix": "Annotate the import and the function with #[cfg(unix)] (or #[cfg(target_family = \"unix\")]). If the function is meant to be Unix-only by design, document that in the module-level doc comment."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd (unsafe block)",
+          "category": "incomplete_safety_contract",
+          "description": "The SAFETY comment only says 'caller guarantees fd is valid and open.' It omits the other side of the ownership transfer: that from_raw_fd takes ownership of the fd and will close it on drop. This is a critical invariant that affects the caller's ability to reason about fd lifetime, and is precisely the source of the blocking bug above.",
+          "suggested_fix": "Expand the SAFETY comment to state: 'SAFETY: caller guarantees fd is valid and open. This call transfers ownership of fd to File; the fd will be closed when the returned BufWriter (and its inner File) is dropped. Callers must not close or reuse fd after this call returns.'"
+        }
+      ],
+      "summary": "The new export_stl_to_fd function has one blocking correctness bug and four design-level issues. Most critically, File::from_raw_fd transfers ownership of the provided fd, so it is silently closed when BufWriter drops at function exit \u2014 yet the docstring claims the caller owns the fd and the inline comment explicitly acknowledges the mismatch. Any well-behaved caller will experience use-after-close. Additionally, the serialization logic is duplicated with export_stl rather than extracted into a shared writer-based helper (the natural abstraction boundary for this module), the return type is inconsistent with the existing function, the Unix-specific import lacks a #[cfg(unix)] guard, and the unsafe block's SAFETY contract is incomplete."
+    },
+    "performance": {
+      "reviewer": "performance",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd",
+          "category": "resource_lifecycle_double_close",
+          "description": "`File::from_raw_fd(fd)` transfers ownership of the OS file descriptor into the `File` value. When `BufWriter<File>` drops at function exit (after `flush()`), `File::drop` calls `close(fd)`. The doc comment claims \"The caller is responsible for closing the fd when done\" \u2014 but the fd is already closed before the function returns. Any subsequent `send`, `read`, or `close` on that fd number by the caller is a use-after-free of the fd slot: silent data loss at best, accidental reuse of an unrelated fd opened by another thread at worst.",
+          "suggested_fix": "Use `ManuallyDrop` to prevent the `File` from closing the fd, then call `writer.into_inner()` and wrap that in a `ManuallyDrop<File>` so the fd survives the function:\n```rust\nuse std::mem::ManuallyDrop;\nlet file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });\nlet mut writer = BufWriter::new(unsafe { File::from_raw_fd(fd) });\n// ... write ...\nwriter.flush()?;\nlet _ = writer.into_inner(); // flushes BufWriter; inner File::drop is NOT called because we reconstruct from fd\n```\nAlternatively, use `std::os::unix::io::BorrowedFd` / write via a raw `Write` impl over the borrowed fd (e.g. via `unsafe { &mut *(&mut writer as *mut _) }` pattern, or the `os_pipe` / `nix` crate helpers) so no ownership is taken in the first place."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd (triangle write loop)",
+          "category": "hot_path_excessive_small_writes",
+          "description": "Each triangle emits 11 separate `write_all` calls (1 normal + 3\u00d73 vertex floats + 1 attribute). For a mesh with N triangles this is 11\u00b7N BufWriter method calls. Each call does a bounds check, a potential internal flush, and a memcpy. Packing one 50-byte record per triangle into a stack buffer and issuing a single `write_all` per triangle cuts that to 1\u00b7N calls, reduces BufWriter overhead by ~10\u00d7, and improves CPU branch prediction on the hot path.",
+          "suggested_fix": "```rust\nfor tri in triangles.chunks_exact(3) {\n    let mut record = [0u8; 50];\n    // normal placeholder already 0\n    for (i, &idx) in tri.iter().enumerate() {\n        let v = &vertices[idx as usize];\n        let base = 12 + i * 12;\n        record[base..base+4].copy_from_slice(&(v.x as f32).to_le_bytes());\n        record[base+4..base+8].copy_from_slice(&(v.y as f32).to_le_bytes());\n        record[base+8..base+12].copy_from_slice(&(v.z as f32).to_le_bytes());\n    }\n    // attribute bytes already 0\n    writer.write_all(&record)?;\n    bytes_written += 50;\n}\n```"
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd (BufWriter construction)",
+          "category": "undersized_io_buffer",
+          "description": "The default `BufWriter` capacity is 8 KB (~163 triangles). Every 163 triangles the buffer spills, issuing a `write` syscall. For a typical CAD mesh of 50K\u2013500K triangles this means 300\u20133000 syscalls to the fd. A 512 KB buffer (10 K triangles per flush, ~50 flushes for a 500 K-triangle mesh) reduces syscall count by ~60\u00d7 with no other code change.",
+          "suggested_fix": "```rust\nlet mut writer = BufWriter::with_capacity(512 * 1024, file);\n```"
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd (tri_count + bytes_written)",
+          "category": "incorrect_accounting_on_malformed_input",
+          "description": "`triangles.chunks(3)` produces a partial final chunk if `triangles.len() % 3 != 0`. In that case: (a) `tri_count` in the header under-counts actual chunks written, making the STL header wrong; (b) `bytes_written` still adds 50 for the partial chunk even though fewer bytes were actually written. If `Mesh::triangles()` can ever return a non-divisible-by-3 slice (e.g. from a corrupt mesh), the returned byte count and file are silently malformed.",
+          "suggested_fix": "Use `chunks_exact(3)` (which skips the remainder entirely and matches the `tri_count = len / 3` intent) and add a debug assertion:\n```rust\ndebug_assert_eq!(triangles.len() % 3, 0, \"mesh triangle index count must be divisible by 3\");\nlet tri_count = (triangles.len() / 3) as u32;\n// ...\nfor tri in triangles.chunks_exact(3) { ... }\n```"
+        }
+      ],
+      "summary": "The new `export_stl_to_fd` function has one blocking correctness/resource bug and three performance issues. Most critically, `File::from_raw_fd(fd)` takes ownership of the file descriptor; when `BufWriter<File>` drops at function exit the fd is silently closed, contradicting the documented contract that the caller closes it \u2014 any subsequent caller use of that fd is a use-after-free. On the performance side: the inner triangle loop issues 11 separate `write_all` calls per triangle (should be 1 per 50-byte record), the `BufWriter` uses the 8 KB default buffer causing ~300\u20133000 syscalls for typical meshes (a 512 KB buffer cuts this to ~50), and using `chunks` instead of `chunks_exact` produces silent mis-accounting of both `tri_count` and `bytes_written` on non-divisible-by-3 inputs."
+    },
+    "robustness": {
+      "reviewer": "robustness",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd (end of function)",
+          "category": "resource_leak_double_close",
+          "description": "File::from_raw_fd(fd) transfers ownership of the raw fd into the File value. When the BufWriter<File> is dropped at the end of the function (both on success and on any early-return error path), the underlying fd is closed. The function's doc comment says \"The caller is responsible for closing the fd when done\", but the code closes it unconditionally \u2014 the trailing comment even acknowledges this contradiction. Every caller that uses fd after calling export_stl_to_fd will be operating on a closed file descriptor, causing EBADF, data corruption, or a double-close if the caller also closes it.",
+          "suggested_fix": "Prevent File from taking ownership of the fd by wrapping it in ManuallyDrop so the destructor never runs:\n\n```rust\nuse std::mem::ManuallyDrop;\nlet mut owned = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });\nlet mut writer = BufWriter::new(&mut *owned);\n// ... writes ...\nwriter.flush()?;\n// owned is dropped here but ManuallyDrop suppresses File::drop, so fd stays open\n```\nAlternatively, if the intent is actually to close the fd on return, update the doc comment and remove the contradictory trailing comment, and ensure callers do not attempt to use fd after the call."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd (error return paths)",
+          "category": "resource_leak_double_close",
+          "description": "Even if the fd-ownership issue above were intentional (close on success), every error return via the ? operator also drops BufWriter<File> and closes the fd. A caller that checks for Err and then attempts to close or re-use the fd will encounter EBADF or double-close. There is no way for the caller to distinguish \"fd closed by callee\" from \"fd still open\" based on the return value.",
+          "suggested_fix": "Use the ManuallyDrop pattern described above so the fd ownership policy is consistent regardless of the code path taken. If closing on error IS desired, document it explicitly and ensure no caller reuses the fd after an Err return."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd (for tri in triangles.chunks(3))",
+          "category": "data_corruption",
+          "description": "triangles.chunks(3) yields a partial last chunk when triangles.len() is not divisible by 3. The STL header declares tri_count = triangles.len() / 3 (integer division, rounds down), but chunks(3) iterates ceil(len/3) times \u2014 one more than declared. The partial chunk writes only 1 or 2 vertex records instead of 3, producing a structurally invalid STL binary that silent-corrupts downstream parsing. For example with 7 indices: header says 2 triangles, but 2 full + 1 partial-vertex triangle are written.",
+          "suggested_fix": "Replace chunks(3) with chunks_exact(3), which silently skips any partial tail and produces exactly triangles.len()/3 full chunks \u2014 consistent with the header count:\n\n```rust\nfor tri in triangles.chunks_exact(3) {\n```\nOptionally, assert or return an error if triangles.len() % 3 != 0 to catch malformed mesh data early."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd (let v = &vertices[idx as usize])",
+          "category": "panic_instead_of_error",
+          "description": "vertices[idx as usize] performs an unchecked index into the vertex array. If any triangle index is out of range (e.g., from a malformed mesh produced by the OCCT tessellator), this panics rather than returning an Err, bypassing the normal anyhow error-handling chain. This can crash the runtime thread silently from external mesh data.",
+          "suggested_fix": "Use vertices.get(idx as usize) and return an error on None:\n\n```rust\nlet v = vertices.get(idx as usize)\n    .context(\"triangle index out of range\")?;\n```"
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-runtime/src/mesh_export.rs:export_stl_to_fd (let tri_count = (triangles.len() / 3) as u32)",
+          "category": "silent_truncation",
+          "description": "Casting triangles.len() / 3 directly to u32 silently truncates for meshes with more than ~4 billion triangles. While extreme in practice today, the STL header would declare an incorrect count without any error.",
+          "suggested_fix": "Use a checked cast and return an error:\n\n```rust\nlet tri_count = u32::try_from(triangles.len() / 3)\n    .context(\"triangle count exceeds u32::MAX\")?;\n```"
+        }
+      ],
+      "summary": "The new export_stl_to_fd function has two blocking correctness bugs. First and most critically, File::from_raw_fd transfers ownership of the raw fd, so the File (and BufWriter) drop at function exit unconditionally closes the caller's fd on every code path \u2014 success and error alike \u2014 contradicting the documented ownership contract; the code's own trailing comment acknowledges the problem but does not fix it, making every caller subject to use-after-close or double-close. Second, using chunks(3) instead of chunks_exact(3) means a malformed mesh with a non-multiple-of-3 index count silently writes a partial extra triangle body after the declared count, producing corrupted STL output. Two additional suggestions: the index into the vertex array can panic on out-of-range data instead of propagating a graceful error, and the usize\u2192u32 cast for tri_count silently truncates on extremely large meshes."
+    }
+  },
+  "total_cost_usd": 1.2023573499999998,
+  "wall_clock_ms": 220318,
+  "errors": []
+}

@@ -1,0 +1,177 @@
+{
+  "variant_name": "baseline",
+  "diff_id": "py_obvious_copy",
+  "reviews": {
+    "test_analyst": {
+      "reviewer": "test_analyst",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:63-83",
+          "category": "missing_tests",
+          "description": "The entire `_count_diff_changes` function has zero unit tests. Its two parsing strategies \u2014 (a) `len(lines) - 1` for file count and (b) comma-splitting the summary for insertions/deletions \u2014 are completely unverified. The existing peer function `_git_diff_stats` also has no tests, but at least its regex approach is more self-documenting. Needed test cases: (1) normal multi-file diff output, (2) single file changed, (3) empty diff \u2192 (0, 0), (4) only deletions with no insertions, (5) binary files in `--stat` output.",
+          "suggested_fix": "Add `orchestrator/tests/test_metrics.py` with parametrized tests that feed captured `git diff --stat` stdout strings through the parsing logic. Use `unittest.mock.patch('asyncio.create_subprocess_exec')` to return a mock process with a preset `stdout`, then assert the `(total, files)` tuple. Cover at least: empty output, one file, N files, insertion-only, deletion-only, and both."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:63-83",
+          "category": "untested_failure_mode",
+          "description": "`_count_diff_changes` has no `try/except`, unlike `_git_diff_stats` which catches all exceptions and returns `(0, 0)`. Two unhandled failure paths exist: (1) `asyncio.create_subprocess_exec` raises if `git` is not on PATH \u2014 propagates to caller; (2) `int(part.split()[0])` raises `ValueError` if a comma-segment containing 'insertion' or 'deletion' doesn't begin with a digit (e.g. localized git output or unexpected format). Neither path has a test, so callers have no contract to rely on.",
+          "suggested_fix": "Add a test that mocks the subprocess to raise `FileNotFoundError` (git not found) and asserts the function returns `(0, 0)` rather than propagating. Similarly add a test with a malformed summary line. Then wrap the body in `try/except Exception: return 0, 0` to match `_git_diff_stats`'s error contract."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:75",
+          "category": "fragile_parsing_untested",
+          "description": "`files_changed = max(0, len(lines) - 1)` counts all non-summary lines as file lines. This differs from `_git_diff_stats`'s regex `r'(\\d+) files? changed'` which reads the count directly from the summary. The heuristic is silently wrong for any output where the last line is not the only summary line \u2014 e.g. `git diff --stat` on a repo with renamed files adds a secondary rename-count line (`rename A => B (95%)`), producing an off-by-one. No test exists to catch this divergence.",
+          "suggested_fix": "Add a test using a captured `--stat` output that includes at least one rename, and assert `files_changed` equals the value from the summary line. Consider replacing the heuristic with the same regex used by `_git_diff_stats` to eliminate the discrepancy."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:63-83",
+          "category": "dead_code_no_integration_test",
+          "description": "`_count_diff_changes` is not called anywhere in the codebase (neither in this diff nor in `collect_metrics`, which still calls `_git_diff_stats`). Without a call site or an integration test that exercises the function end-to-end, there is no verification that its `(total_lines_changed, file_count)` tuple semantics match the expectations of any future caller, or that it is behaviourally equivalent to `_git_diff_stats` on the same inputs.",
+          "suggested_fix": "Either wire `_count_diff_changes` into `collect_metrics` (replacing or augmenting `_git_diff_stats`) and add an integration test, or add a parity test that asserts both functions return the same result given identical git state \u2014 proving the duplication is intentional and correct."
+        }
+      ],
+      "summary": "The diff introduces `_count_diff_changes`, a git-stat parsing utility, without any accompanying tests. There are four distinct test-coverage concerns: (1) the core parsing logic (line-count heuristic for files and comma-split for insertions/deletions) is completely unexercised; (2) unlike its peer `_git_diff_stats`, the function has no exception handling and no test for failure modes like a missing git binary or a malformed summary line; (3) the `len(lines) - 1` file-count strategy diverges from the regex in `_git_diff_stats` and is known to be wrong for outputs that include rename lines, yet no test catches the divergence; and (4) the function is dead code \u2014 never called \u2014 so there is no integration path that would detect any of these gaps at runtime. All issues are flagged as suggestions rather than blocking because the function is not yet reachable from any call site and its failure modes degrade gracefully to `(0, 0)` in practice."
+    },
+    "reuse_auditor": {
+      "reviewer": "reuse_auditor",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py (new function _count_diff_changes)",
+          "category": "code_duplication",
+          "description": "`_count_diff_changes` is a near-exact duplicate of the already-existing `_git_diff_stats` function in the same file (lines 138\u2013165). Both run `git diff --stat <base> HEAD`, both return `tuple[int, int]` of (lines_changed, files_changed), and both parse the git summary line. The new function is not called anywhere \u2014 it is pure dead code on top of a duplicate.",
+          "suggested_fix": "Remove `_count_diff_changes` entirely and use the existing `_git_diff_stats`. If the intent was to replace `_git_diff_stats` (e.g., to remove the `..` range syntax in favour of two positional args), update `_git_diff_stats` in place and delete the new function."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py (_count_diff_changes)",
+          "category": "missing_error_handling",
+          "description": "`_count_diff_changes` has no `try/except` around the subprocess call and output parsing. The existing `_git_diff_stats` wraps its identical logic in `try/except Exception: return 0, 0`, preventing crashes when git is unavailable or output is malformed. The new function would raise on any subprocess failure, index error on an empty `lines` list (e.g., `lines[-1]` when `lines` is `[]`), or `ValueError` from `int(part.split()[0])` on unexpected summary text.",
+          "suggested_fix": "If `_count_diff_changes` is kept (it should not be \u2014 see above), add `try/except Exception: return 0, 0` matching the defensive pattern of `_git_diff_stats`."
+        }
+      ],
+      "summary": "The diff introduces `_count_diff_changes`, a near-identical duplicate of the existing `_git_diff_stats` function in the same file. Both functions spawn `git diff --stat`, parse the summary line, and return `(lines_changed, files_changed)` \u2014 the only differences are cosmetic (parameter names, `..` vs space between refs) and a regression: `_count_diff_changes` omits the `try/except` error guard that `_git_diff_stats` already provides. The new function is never called, making it dead code. It should be removed; any caller should use `_git_diff_stats` directly, possibly with a minor signature update if the two-arg git syntax is preferred."
+    },
+    "architect_reviewer": {
+      "reviewer": "architect_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:66-86 (new _count_diff_changes)",
+          "category": "duplicate_logic",
+          "description": "_count_diff_changes is a near-duplicate of the already-present _git_diff_stats (line 138). Both accept a (path, base_ref) pair, run `git diff --stat`, parse the summary line, and return tuple[int,int] (lines_changed, files_changed). The module now contains two private helpers with the same contract but inconsistent implementations. There is no call site for the new function anywhere in the repo, making it unreferenced dead code.",
+          "suggested_fix": "Remove _count_diff_changes entirely. If a different calling convention (positional arg name 'repo_path' rather than 'worktree') is genuinely needed, rename the parameters on _git_diff_stats instead of duplicating it. If the intent was to replace _git_diff_stats, do so explicitly and update the one call site in collect_metrics."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:66-86 (new _count_diff_changes)",
+          "category": "missing_error_handling",
+          "description": "_git_diff_stats wraps its entire body in try/except Exception, returning (0, 0) on any failure. _count_diff_changes has no error handling at all. If git is unavailable, the working directory is not a repo, or the subprocess raises, the exception will propagate uncaught, breaking the established defensive pattern for this module.",
+          "suggested_fix": "Wrap the subprocess logic in a try/except Exception block and return (0, 0) on failure, matching the existing _git_diff_stats convention."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:66-86 (new _count_diff_changes) vs 138-165 (_git_diff_stats)",
+          "category": "naming_inconsistency",
+          "description": "The two helpers represent the same logical operation but use different parameter names for identical concepts: 'worktree: Path' vs 'repo_path: Path' and 'base_commit: str' vs 'base_ref: str'. The module now has two competing vocabularies for the same domain concepts, which will confuse future callers trying to decide which helper to use.",
+          "suggested_fix": "Pick one canonical name for each concept (e.g. 'worktree' for the path and 'base_commit' for the ref, matching the existing function and the call site in collect_metrics) and apply it consistently."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:73 (new _count_diff_changes)",
+          "category": "inconsistent_git_syntax",
+          "description": "_git_diff_stats uses the two-dot range `base_commit..HEAD` (explicit ancestor\u2013to\u2013HEAD diff); _count_diff_changes passes them as separate positional args `base_ref HEAD` (space-separated). While often equivalent, the two forms differ when HEAD and base_ref have diverged on separate branches\u2014`A..B` is `^A B`, while `A B` in --stat context behaves the same but diverges from the rest of the module's established convention.",
+          "suggested_fix": "Use the `{base_ref}..HEAD` two-dot form to stay consistent with _git_diff_stats and make the intent explicit."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:72-80 (new _count_diff_changes)",
+          "category": "weaker_parsing",
+          "description": "_git_diff_stats parses the git --stat summary line with re.search / re.finditer, correctly handling 'file changed' (singular) and all pluralisation variants. _count_diff_changes uses str.split(',') + str.split()[0], which silently returns 0 if git's locale produces a differently formatted line (e.g. no comma separator, or a language other than English), and it does not handle the singular 'file changed' case.",
+          "suggested_fix": "Reuse _git_diff_stats's regex-based parsing, or extract the parsing logic into a shared helper."
+        }
+      ],
+      "summary": "The diff introduces `_count_diff_changes`, a near-duplicate of the already-present `_git_diff_stats`. Both functions accept a repo path and a base ref, shell out to `git diff --stat`, parse the summary line, and return `(lines_changed, files_changed)`. The new function is not called anywhere in the codebase (dead code), lacks the error-handling guard that the existing function provides, uses a less-robust string-split parser instead of the established regex approach, introduces inconsistent parameter names for the same concepts, and diverges from the established two-dot git range syntax. No blocking issues were found, but these five design coherence problems should be addressed before the function is wired up or shipped."
+    },
+    "performance": {
+      "reviewer": "performance",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:66-86",
+          "category": "dead_code_duplicate_subprocess",
+          "description": "`_count_diff_changes` is a near-duplicate of `_git_diff_stats` (already at line 138) and is never called anywhere in the codebase. If it is eventually wired up alongside the existing call at line 102, the same `git diff --stat` subprocess will be spawned twice per metric collection run \u2014 two separate process forks and waits for an identical computation. Subprocess creation is expensive relative to the parsing work.",
+          "suggested_fix": "Remove `_count_diff_changes` and extend `_git_diff_stats` with a parameter if a different ref format is needed (e.g., `base_ref: str` passed as individual args vs `..HEAD` range). A single subprocess result can then be shared: `lines, files = await _git_diff_stats(worktree, task['pre_task_commit'])`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:66-86",
+          "category": "missing_error_handling",
+          "description": "Unlike `_git_diff_stats` (which wraps everything in `try/except Exception: return 0, 0`), `_count_diff_changes` has no exception guard and no `proc.returncode` check. If the subprocess fails (bad ref, git unavailable, I/O error), the unhandled exception propagates to the caller. Additionally, `proc.returncode` is never inspected \u2014 a non-zero exit silently produces zeros rather than surfacing the error, which wastes the subprocess overhead with no diagnostic signal.",
+          "suggested_fix": "Wrap the function body in `try/except Exception: return 0, 0` consistent with `_git_diff_stats`, and add a `if proc.returncode != 0: return 0, 0` guard after `communicate()` completes."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:74",
+          "category": "unnecessary_allocation",
+          "description": "`stdout.decode().strip().splitlines()` materialises the entire diff-stat output as a Python list only to `len()` it. For repos with thousands of modified files, `git diff --stat` output can be large. The existing `_git_diff_stats` avoids this by parsing only the final summary line (`output.split('\\n')[-1]`) via regex, which is O(1) in file count after the initial decode.",
+          "suggested_fix": "Parse the `files changed` count from the summary line using `re.search(r'(\\d+) files? changed', summary)` (same as `_git_diff_stats`) instead of counting individual output lines with `len(lines) - 1`."
+        }
+      ],
+      "summary": "The new `_count_diff_changes` function is a near-duplicate of the existing `_git_diff_stats` helper and is currently dead code (no call sites found). The primary performance risk is that if it were wired up alongside the existing call in `collect_metrics`, two `git diff --stat` subprocesses would be spawned per metric collection run for an identical result. A secondary inefficiency is that it materialises the full stat output as a line list to count files, while the existing function extracts the file count from the summary line in O(1). The function also lacks the exception handler and returncode check present in `_git_diff_stats`, meaning failures would surface as uncaught exceptions rather than graceful `(0, 0)` returns. The right fix is to consolidate into the existing helper rather than maintaining a second implementation."
+    },
+    "robustness": {
+      "reviewer": "robustness",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:67-84 (_count_diff_changes)",
+          "category": "missing_error_handling",
+          "description": "The entire function body has no try/except. Any failure \u2014 subprocess creation failure, UnicodeDecodeError from stdout.decode(), ValueError from int(), or an IndexError \u2014 will propagate as an uncaught exception to the caller. The existing peer function _git_diff_stats (line 138) wraps its entire body in `try/except Exception: return 0, 0` precisely to prevent metrics collection from crashing on git failures. This function lacks that protection entirely.",
+          "suggested_fix": "Wrap the function body in `try/except Exception: logger.warning('_count_diff_changes failed: %s', e); return 0, 0` matching the pattern in _git_diff_stats."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:81",
+          "category": "unchecked_type_conversion",
+          "description": "`int(part.split()[0])` will raise ValueError if the first token of a comma-delimited summary segment is not a valid integer. This can happen with non-English git locales (thousand-separators, translated words), with unexpected git output formats on older/newer versions, or if git writes a warning line into stdout. Without the surrounding try/except this ValueError propagates uncaught.",
+          "suggested_fix": "Use re.search(r'(\\d+)', part) to extract the integer instead of split()[0], matching the more robust approach used in _git_diff_stats. Or rely on the outer try/except once it is added."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:74-77",
+          "category": "missing_returncode_check",
+          "description": "proc.returncode is never checked after communicate(). If git exits non-zero (invalid base_ref, not a git repo, missing commit), stdout will be empty or contain only an error message and the function silently returns (0, 0). There is no way for the caller to distinguish a successful 'no changes' from a git failure. _git_diff_stats has the same gap but is at least guarded by the outer try/except.",
+          "suggested_fix": "After communicate(), check `if proc.returncode != 0: logger.warning('git diff failed (rc=%d)', proc.returncode); return 0, 0` before attempting to parse stdout."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:74-75",
+          "category": "missing_timeout",
+          "description": "`await proc.communicate()` has no timeout. If git hangs on a locked index, a network-mounted worktree, or a large pack operation, the coroutine will block indefinitely. This is a pre-existing gap in _git_diff_stats, but introducing a second unguarded communicate() call compounds the exposure.",
+          "suggested_fix": "Use `asyncio.wait_for(proc.communicate(), timeout=30.0)` and catch asyncio.TimeoutError, killing the process and returning (0, 0)."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:67-84 (_count_diff_changes)",
+          "category": "duplicated_logic_with_weaker_implementation",
+          "description": "_count_diff_changes duplicates _git_diff_stats exactly (same git command, same parse goal, same return type) but with a weaker comma-split heuristic instead of the regex-based parsing in _git_diff_stats. The regex approach (`re.search(r'(\\d+) files? changed')` + `re.finditer(r'(\\d+) (?:insertions?|deletions?)')`) is more robust: it handles singular/plural, ignores unrelated tokens, and is locale-independent. The new function is also dead code \u2014 no call site exists in the codebase yet.",
+          "suggested_fix": "Remove _count_diff_changes and reuse _git_diff_stats, or if a different signature is needed (repo_path vs worktree, base_ref vs base_commit), rename/extend _git_diff_stats rather than duplicating it with weaker parsing."
+        }
+      ],
+      "summary": "The new `_count_diff_changes` function is a duplicate of the existing `_git_diff_stats` with two blocking robustness regressions: it has no `try/except` wrapper (the existing function wraps its entire body), and it uses `int(part.split()[0])` for parsing which will raise `ValueError` on non-standard git output or locale differences. Additionally, the function never checks `proc.returncode`, has no timeout on `communicate()`, and uses a weaker comma-split heuristic versus the regex approach already proven in `_git_diff_stats`. The function is currently dead code (no call site exists), so the blast radius is zero today, but it will crash metrics collection when wired in unless the missing error handling is added."
+    }
+  },
+  "total_cost_usd": 1.1137724999999998,
+  "wall_clock_ms": 219998,
+  "errors": []
+}
