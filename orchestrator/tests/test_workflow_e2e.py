@@ -136,7 +136,11 @@ class AgentStub:
     Tracks which roles have been invoked and their order.
     """
 
-    def __init__(self, verify_results: list[VerifyResult] | None = None):
+    def __init__(
+        self,
+        verify_results: list[VerifyResult] | None = None,
+        judge_verdicts: list | None = None,
+    ):
         self.calls: list[str] = []
         self._impl_iteration = 0
         # Sequence of verify results to return (pops from front)
@@ -144,6 +148,11 @@ class AgentStub:
             passed=True, test_output='', lint_output='', type_output='',
             summary='All checks passed',
         )])
+        # Sequence of judge verdicts to return (pops from front; last persists).
+        # Each entry may be a dict (structured verdict), an Exception to raise,
+        # None (to simulate structured_output=None), or the string 'SUCCESS_FALSE'
+        # to simulate result.success=False.
+        self._judge_verdicts = list(judge_verdicts or [])
 
     async def invoke_agent(
         self,
@@ -181,10 +190,16 @@ class AgentStub:
             return self._reviewer(role, output_schema)
         elif role == 'merger':
             return self._merger()
+        elif role == 'judge':
+            return self._judge()
         else:
             return AgentResult(success=True, output='OK')
 
     def _detect_role(self, system_prompt: str) -> str:
+        # Judge check goes first — its system prompt does not contain
+        # architect/implementer/reviewer substrings so ordering is safe.
+        if 'completion judge' in system_prompt.lower():
+            return 'judge'
         if 'TDD architect' in system_prompt:
             return 'architect'
         if 'TDD implementer' in system_prompt:
@@ -276,6 +291,40 @@ class AgentStub:
     def _merger(self) -> AgentResult:
         return AgentResult(success=True, output='Merged', cost_usd=0.20)
 
+    def _judge(self) -> AgentResult:
+        """Return the next queued judge verdict.
+
+        If the entry is an Exception, raise it (simulates invoke failure).
+        If the entry is 'SUCCESS_FALSE', return success=False.
+        If the entry is None, return success=True with structured_output=None.
+        Otherwise treat the entry as a verdict dict.
+        """
+        if not self._judge_verdicts:
+            # No verdicts queued — default: incomplete
+            verdict = {
+                'complete': False,
+                'reasoning': 'default stub verdict',
+                'uncovered_plan_steps': [],
+                'substantive_work': False,
+            }
+        elif len(self._judge_verdicts) > 1:
+            verdict = self._judge_verdicts.pop(0)
+        else:
+            verdict = self._judge_verdicts[0]
+
+        if isinstance(verdict, Exception):
+            raise verdict
+        if verdict == 'SUCCESS_FALSE':
+            return AgentResult(success=False, output='', cost_usd=0.05)
+        if verdict is None:
+            return AgentResult(success=True, output='', structured_output=None, cost_usd=0.05)
+        return AgentResult(
+            success=True,
+            output=json.dumps(verdict),
+            structured_output=verdict,
+            cost_usd=0.05,
+        )
+
     def next_verify_result(self) -> VerifyResult:
         """Pop the next verify result, or return the last one forever."""
         if len(self._verify_results) > 1:
@@ -334,6 +383,16 @@ class FakeBriefing:
         self, reviewer_type: str, diff: str, context: str | None = None
     ) -> str:
         return f'Review ({reviewer_type}): {diff[:100]}'
+
+    async def build_completion_judge_prompt(
+        self,
+        plan: dict,
+        iteration_log: list,
+        diff: str,
+        task_id: str | None = None,
+        context: str | None = None,
+    ) -> str:
+        return f'Judge task {task_id}: plan has {len(plan.get("steps", []))} steps'
 
     async def build_merger_prompt(
         self, conflicts: str, task_intent: str, context: str | None = None
@@ -519,6 +578,171 @@ class TestHappyPath:
         assert workflow.metrics.agent_invocations == 3
         assert workflow.metrics.total_cost_usd > 0
         assert workflow.metrics.execute_iterations == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: Completion Judge (ζ)
+# ---------------------------------------------------------------------------
+
+
+def _config_with_judge(config: OrchestratorConfig, enabled: bool) -> OrchestratorConfig:
+    """Return a new config identical to *config* with judge_after_each_iteration toggled."""
+    return OrchestratorConfig(
+        project_root=config.project_root,
+        max_concurrent_tasks=config.max_concurrent_tasks,
+        max_execute_iterations=config.max_execute_iterations,
+        max_verify_attempts=config.max_verify_attempts,
+        max_review_cycles=config.max_review_cycles,
+        judge_after_each_iteration=enabled,
+        git=config.git,
+    )
+
+
+@pytest.mark.asyncio
+class TestCompletionJudge:
+    """Judge-LLM early-exit hook (ζ). Exercises _execute_iterations + _run_completion_judge."""
+
+    async def test_execute_iterations_exits_early_when_judge_says_complete(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        judge_cfg = _config_with_judge(config, enabled=True)
+        stub = AgentStub(judge_verdicts=[{
+            'complete': True,
+            'reasoning': 'diff implements both plan steps end-to-end.',
+            'uncovered_plan_steps': [],
+            'substantive_work': True,
+        }])
+        workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert workflow.metrics.execute_iterations == 1
+        assert workflow.metrics.judge_invocations == 1
+        assert workflow.metrics.judge_early_exits == 1
+        assert 'judge' in stub.calls
+
+    async def test_execute_iterations_rejects_judge_complete_when_substantive_work_false(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """complete=True + substantive_work=False must NOT trigger an early exit."""
+        judge_cfg = _config_with_judge(config, enabled=True)
+        # Queue: first verdict is the dangerous one; fallback to incomplete so loop continues.
+        stub = AgentStub(judge_verdicts=[
+            {
+                'complete': True,
+                'reasoning': 'bogus — diff is empty',
+                'uncovered_plan_steps': ['step-1', 'step-2'],
+                'substantive_work': False,
+            },
+            {
+                'complete': False,
+                'reasoning': 'still nothing',
+                'uncovered_plan_steps': ['step-1', 'step-2'],
+                'substantive_work': False,
+            },
+        ])
+        workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        # The implementer still completes all plan steps in iteration 1, so the
+        # loop exits via the normal `while pending_steps` gate — NOT via judge
+        # early-exit. judge_early_exits must remain 0.
+        assert outcome == WorkflowOutcome.DONE
+        assert workflow.metrics.judge_early_exits == 0
+        assert workflow.metrics.judge_invocations >= 1
+
+    async def test_execute_iterations_continues_on_judge_exception(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """A judge invocation exception must not blow up the workflow."""
+        judge_cfg = _config_with_judge(config, enabled=True)
+        stub = AgentStub(judge_verdicts=[ConnectionError('judge backend down')])
+        workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        # Workflow still completes via normal plan-step completion path
+        assert outcome == WorkflowOutcome.DONE
+        assert workflow.metrics.judge_early_exits == 0
+
+    async def test_execute_iterations_continues_on_judge_malformed_output(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Malformed judge output (missing required keys) must fall through."""
+        judge_cfg = _config_with_judge(config, enabled=True)
+        stub = AgentStub(judge_verdicts=[
+            # Missing 'substantive_work' and 'uncovered_plan_steps'
+            {'complete': True, 'reasoning': 'incomplete verdict'},
+        ])
+        workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert workflow.metrics.judge_early_exits == 0
+        assert workflow.metrics.judge_invocations >= 1
+
+    async def test_execute_iterations_disabled_by_default(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """With judge_after_each_iteration=False (the default), judge is never called."""
+        judge_cfg = _config_with_judge(config, enabled=False)
+        stub = AgentStub()  # No verdicts queued; judge should never run
+        workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert workflow.metrics.judge_invocations == 0
+        assert workflow.metrics.judge_early_exits == 0
+        assert 'judge' not in stub.calls
 
 
 # ---------------------------------------------------------------------------

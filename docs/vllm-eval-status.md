@@ -107,6 +107,8 @@ These will be re-reviewed by the rereview tool (deferred to a separate session) 
 
 ### Per-config summary (latest result per task)
 
+**This table is a snapshot at session start** (before ε landed and before several retries completed). Kept as historical record. The post-ε re-scored table below reflects the current corpus.
+
 | config | n | done | T/L/Y all-green | avg score | notes |
 |---|---:|---:|---:|---:|---|
 | **claude-opus-high** | 5 | 2 | 5/5 | **0.643** | API baseline |
@@ -124,6 +126,31 @@ These will be re-reviewed by the rereview tool (deferred to a separate session) 
 | qwen25-coder-32b-q4 | 1 | 0 | 0/5 | 0.000 | dropped |
 | minimax-m25-nvfp4-new | — | — | — | — | KV cache crash; fixed and retrying now |
 | reap-172b-nvfp4-gb10-new | — | — | — | — | still loading vLLM from 10:52 launch |
+
+### Per-config summary — post-ε re-scored (2026-04-08 afternoon)
+
+After ε landed (`compute_composite()` no longer multiplies by `plan_completion_pct`), the existing result corpus was re-scored in place. Aggregation below is **latest result per (task, config)** over the current corpus — which now includes retries that completed after the session-start snapshot above, so `done` and T/L/Y counts may have shifted for vLLM configs where a newer retry replaced the earlier result.
+
+Biggest changes: vLLM configs that were stuck at 0.000 (because their implementers wrote correct code without updating plan.json statuses) now show meaningful scores tracking their T/L/Y all-green count. `minimax-m25-nvfp4-new` has data now (retry landed). No Claude/Gemini API scores moved — those configs already had `plan_completion_pct=1.0` so ε was a no-op for them.
+
+| config | n | done | T/L/Y all-green | avg score (post-ε) | Δ vs session start |
+|---|---:|---:|---:|---:|---|
+| **claude-opus-high** | 5 | 2 | 5/5 | **0.643** | — |
+| **claude-sonnet-max** | 5 | 2 | 5/5 | **0.637** | — |
+| **claude-opus-max** | 5 | 2 | 5/5 | 0.620 | — |
+| **minimax-m25-nvfp4-new** | 5 | 0 | 3/5 | **0.600** | new data (was KV cache crash) |
+| **qwen3-coder-next-fp8-new** | 5 | 0 | 3/5 | **0.600** | +0.200, but latest `reify_task_12` retry lost `done` |
+| **minimax-m25-fp8-new** | 5 | 1 | 3/5 | **0.570** | **+0.570** — ε unlocked this config |
+| **gemini-3-flash-high** | 5 | 1 | 5/5 | 0.523 | — |
+| reap-139b-nvfp4-new | 5 | 0 | 2/5 | **0.400** | **+0.400** — latest retries lost a T/T/T result |
+| qwen3-coder-30b-q4 | 5 | 0 | 2/5 | **0.400** | **+0.400** — workstation tier scores now tracked |
+| codex-gpt54-xhigh | 5 | 0 | 1/5 | 0.200 | +0.180 |
+| codex-gpt54mini-xhigh | 5 | 0 | 1/5 | 0.200 | +0.180 |
+| gemini-31-pro-high | 5 | 0 | 0/5 | 0.000 | — |
+| devstral-small-2505-q6 | 1 | 0 | 0/5 | 0.000 | — |
+| qwen25-coder-32b-q4 | 1 | 0 | 0/5 | 0.000 | — |
+
+**Headline flip after re-scoring:** the three top vLLM configs (`minimax-m25-nvfp4-new`, `qwen3-coder-next-fp8-new`, `minimax-m25-fp8-new`) now land in the 0.57–0.60 range — within striking distance of `gemini-3-flash-high` (0.523) and well above the ~0.40 floor set by `reap-139b-nvfp4-new` and workstation-tier `qwen3-coder-30b-q4`. They're still below the ~0.62 Claude API tier, but the gap is now about model quality, not workflow bookkeeping.
 
 ### Headline findings
 
@@ -145,11 +172,13 @@ These will be re-reviewed by the rereview tool (deferred to a separate session) 
 
 9. **`reify_task_27` has a binary "did it" structure** — every config that reaches T/T/T scores ≥0.40 on it, and qwen3-coder-next-fp8-new + claude-sonnet-max both hit composite_score=1.0. Good signal-to-noise test for new configs.
 
-### Caveat — `composite_score` for vLLM runs is unreliable
+### Caveat — `composite_score` for vLLM runs is unreliable *(resolved: ε landed 2026-04-08)*
 
-`composite_score = quality × plan_completion_pct` (`orchestrator/src/orchestrator/evals/metrics.py:74`). For multiple vLLM runs that show outcome=done with all verify gates green, `plan_completion_pct=0.0` so the composite is 0 even though the eval succeeded. Example: `df_task_13__minimax-m25-fp8-new__e78000d4.json` — outcome=done, T/T/T, **plan_completion_pct=0.0**, composite_score=0.0, 50 lines changed, 218 turns. The model wrote correct working code but never updated plan.json's step statuses to `done`. The metrics collector counts steps where `s.status == 'done'`, sees zero, reports 0% plan completion.
+**Historical context, now resolved.** `composite_score = quality × plan_completion_pct` (`orchestrator/src/orchestrator/evals/metrics.py:74`). For multiple vLLM runs that showed outcome=done with all verify gates green, `plan_completion_pct=0.0` so the composite was 0 even though the eval succeeded. Example: `df_task_13__minimax-m25-fp8-new__e78000d4.json` — outcome=done, T/T/T, **plan_completion_pct=0.0**, composite_score=0.0, 50 lines changed, 218 turns. The model wrote correct working code but never updated plan.json's step statuses to `done`. The metrics collector counts steps where `s.status == 'done'`, sees zero, reports 0% plan completion.
 
-**Until ε lands (drop `plan_completion_pct` from composite for `tests_pass=True`), the only trustworthy comparison signal for vLLM configs is `(outcome, tests_pass, lint_clean, typecheck_clean)`** — not `composite_score`. The rankings above use composite where it works and TTT count as the secondary.
+**Resolution:** ε landed 2026-04-08 afternoon. `compute_composite()` no longer multiplies by `plan_completion_pct`; the composite is now `quality` (bounded 0..1). `plan_completion_pct` is still collected as a diagnostic but does not gate the score. Existing corpus was backfilled via `orchestrator/scripts/backfill_composite_scores.py` — 26 of 102 files updated, spot-check on `df_task_13__minimax-m25-fp8-new__e78000d4.json` went from 0.0 → 0.9. See the post-ε re-scored per-config table above for updated rankings.
+
+**Still loose:** `outcome=done` vs `outcome=blocked` classification is still plan-completion-driven via `_execute_iterations()`'s `while self.artifacts.get_pending_steps()` loop. Models that skip plan.json bookkeeping still get classified as `blocked` at the iteration cap even when the code is correct. That's what ζ (completion judge LLM) addresses — next step in this workstream.
 
 ---
 

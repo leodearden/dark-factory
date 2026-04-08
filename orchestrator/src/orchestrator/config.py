@@ -113,6 +113,7 @@ class ModelsConfig(BaseModel):
     triage: str = Field(default='sonnet')
     module_tagger: str = Field(default='sonnet')
     deep_reviewer: str = Field(default='opus')
+    judge: str = Field(default='sonnet')
 
 
 class BudgetsConfig(BaseModel):
@@ -127,6 +128,7 @@ class BudgetsConfig(BaseModel):
     triage: float = Field(default=2.0)
     module_tagger: float = Field(default=2.0)
     deep_reviewer: float = Field(default=15.0)
+    judge: float = Field(default=0.50)
 
 
 class TurnsConfig(BaseModel):
@@ -141,6 +143,7 @@ class TurnsConfig(BaseModel):
     triage: int = Field(default=25)
     module_tagger: int = Field(default=30)
     deep_reviewer: int = Field(default=100)
+    judge: int = Field(default=15)
 
 
 class EffortConfig(BaseModel):
@@ -155,6 +158,7 @@ class EffortConfig(BaseModel):
     triage: str = Field(default='medium')
     module_tagger: str = Field(default='medium')
     deep_reviewer: str = Field(default='max')
+    judge: str = Field(default='medium')
 
 
 class TimeoutsConfig(BaseModel):
@@ -169,6 +173,7 @@ class TimeoutsConfig(BaseModel):
     triage: float = Field(default=300.0)
     module_tagger: float = Field(default=300.0)
     deep_reviewer: float = Field(default=2400.0)
+    judge: float = Field(default=300.0)
 
 
 class BackendsConfig(BaseModel):
@@ -183,6 +188,7 @@ class BackendsConfig(BaseModel):
     triage: str = Field(default='claude')
     module_tagger: str = Field(default='claude')
     deep_reviewer: str = Field(default='claude')
+    judge: str = Field(default='claude')
 
 
 class ReviewConfig(BaseModel):
@@ -300,6 +306,11 @@ class OrchestratorConfig(BaseSettings):
     max_review_cycles: int = Field(default=2)
     reviewer_stagger_secs: float = Field(default=2.0)
     max_reviewer_retries: int = Field(default=4)
+
+    # Completion judge — opt-in loop-exit hint after each implementer iteration.
+    # Default False: production orchestrator runs unaffected. Eval runner
+    # enables this per-task (see evals/runner.py build_eval_orch_config).
+    judge_after_each_iteration: bool = Field(default=False)
 
     # Merge conflict reduction
     max_advance_attempts: int = Field(default=3)

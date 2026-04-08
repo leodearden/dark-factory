@@ -15,12 +15,14 @@ from typing import TYPE_CHECKING, Any, Protocol
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
 
+from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
 from orchestrator.agents.invoke import AgentResult, invoke_with_cap_retry
 from orchestrator.agents.roles import (
     ALL_REVIEWERS,
     ARCHITECT,
     DEBUGGER,
     IMPLEMENTER,
+    JUDGE,
     MERGER,
     AgentRole,
 )
@@ -126,6 +128,12 @@ class WorkflowMetrics:
     total_output_tokens: int = 0
     total_cache_read_tokens: int = 0
     total_cache_create_tokens: int = 0
+    # Completion judge metrics (ζ). judge_cost_usd is a subset of total_cost_usd,
+    # not disjoint — existing budget guards/cost reports using total_cost_usd
+    # continue to work unchanged.
+    judge_invocations: int = 0
+    judge_cost_usd: float = 0.0
+    judge_early_exits: int = 0
 
 
 class TaskWorkflow:
@@ -857,7 +865,107 @@ class TaskWorkflow:
                     f'{self.metrics.execute_iterations} failed'
                 )
 
+            # --- Judge: decide whether to exit early (ζ) ---
+            # Opt-in via config.judge_after_each_iteration (default False).
+            # Eval mode flips it on per-task. Failures fall through silently
+            # to the next iteration — current behavior is preserved as worst case.
+            if self.config.judge_after_each_iteration:
+                judge_verdict = await self._run_completion_judge(iteration_log)
+                if judge_verdict is not None and judge_verdict.get('complete') is True:
+                    # Safety: reject complete=True if substantive_work=False.
+                    # An empty or trivial diff cannot be a completed task.
+                    if not judge_verdict.get('substantive_work', False):
+                        logger.warning(
+                            f'Task {self.task_id}: judge returned complete=True '
+                            f'with substantive_work=False — ignoring verdict'
+                        )
+                    else:
+                        self.metrics.judge_early_exits += 1
+                        logger.info(
+                            f'Task {self.task_id}: judge signaled completion at '
+                            f'iteration {self.metrics.execute_iterations} — '
+                            f'reasoning: {judge_verdict.get("reasoning", "")[:200]}'
+                        )
+                        self.artifacts.append_iteration_log({
+                            'iteration': self.metrics.execute_iterations,
+                            'agent': 'judge',
+                            'event': 'early_exit',
+                            'complete': True,
+                            'substantive_work': True,
+                            'uncovered_plan_steps': judge_verdict.get('uncovered_plan_steps', []),
+                            'summary': judge_verdict.get('reasoning', '')[:500],
+                            'source': 'orchestrator',
+                        })
+                        return WorkflowOutcome.DONE
+
         return WorkflowOutcome.DONE
+
+    async def _run_completion_judge(
+        self, iteration_log: list[dict]
+    ) -> dict | None:
+        """Invoke the completion judge. Returns parsed verdict dict or None on failure.
+
+        Any failure mode (exception, success=False, malformed output) returns
+        None so the caller continues the iteration loop — current behavior is
+        preserved as the worst case.
+        """
+        assert self.worktree is not None and self.artifacts is not None
+
+        base_commit = self.artifacts.read_base_commit()
+        if base_commit:
+            diff = await self.git_ops.get_diff_from_base(self.worktree, base_commit)
+        else:
+            diff = await self.git_ops.get_diff_from_main(self.worktree)
+
+        prompt = await self.briefing.build_completion_judge_prompt(
+            plan=self.plan,
+            iteration_log=iteration_log,
+            diff=diff,
+            task_id=self.task_id,
+        )
+
+        pre_cost = self.metrics.total_cost_usd
+        try:
+            result = await self._invoke(
+                JUDGE, prompt, self.worktree,
+                output_schema=COMPLETION_JUDGE_SCHEMA,
+            )
+        except Exception as exc:
+            logger.warning(
+                f'Task {self.task_id}: judge invocation raised '
+                f'{type(exc).__name__}: {exc} — continuing iteration loop'
+            )
+            return None
+
+        # judge_cost_usd is a subset of total_cost_usd (already incremented
+        # inside _invoke), tracked separately for reporting.
+        self.metrics.judge_invocations += 1
+        self.metrics.judge_cost_usd += (self.metrics.total_cost_usd - pre_cost)
+
+        if not result.success:
+            logger.warning(
+                f'Task {self.task_id}: judge invocation returned success=False — '
+                f'continuing iteration loop'
+            )
+            return None
+
+        verdict = result.structured_output
+        if not isinstance(verdict, dict):
+            logger.warning(
+                f'Task {self.task_id}: judge returned non-dict structured_output — '
+                f'continuing iteration loop'
+            )
+            return None
+
+        required = {'complete', 'reasoning', 'uncovered_plan_steps', 'substantive_work'}
+        if not required <= verdict.keys():
+            logger.warning(
+                f'Task {self.task_id}: judge verdict missing keys '
+                f'{required - verdict.keys()} — continuing iteration loop'
+            )
+            return None
+
+        return verdict
 
     async def _inter_iteration_rebase(self) -> dict | None:
         """Check if main advanced past our base; if so, rebase.
@@ -1383,9 +1491,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if self.config.sandbox.enabled and role.name in ('implementer', 'debugger'):
             sandbox_modules = self.modules
 
-        # Build MCP config — fused-memory always, escalation when available
+        # Build MCP config — fused-memory always, escalation when available.
+        # Judge gets MCP so its jcodemunch tools (in allowed_tools) actually
+        # work; it does not use escalation tools but mcp_config_json handles
+        # escalation_url=None fine.
         mcp_config = None
-        if role.name in ('architect', 'implementer', 'debugger', 'merger'):
+        if role.name in ('architect', 'implementer', 'debugger', 'merger', 'judge'):
             escalation_url = None
             if self.escalation_queue:
                 esc = self.config.escalation

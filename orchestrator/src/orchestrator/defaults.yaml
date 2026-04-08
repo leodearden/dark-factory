@@ -53,6 +53,7 @@ timeouts:
   triage: 300
   module_tagger: 300
   deep_reviewer: 2400
+  judge: 300
 
 # Models per role
 models:
@@ -65,6 +66,7 @@ models:
   triage: "sonnet"
   module_tagger: "sonnet"
   deep_reviewer: "opus"
+  judge: "sonnet"
 
 # Budget per invocation (USD)
 budgets:
@@ -77,6 +79,7 @@ budgets:
   triage: 2.0
   module_tagger: 2.0
   deep_reviewer: 15.0
+  judge: 0.50
 
 # Turn limits per invocation
 max_turns:
@@ -89,6 +92,7 @@ max_turns:
   triage: 25
   module_tagger: 30
   deep_reviewer: 100
+  judge: 15
 
 # Reasoning effort per role
 effort:
@@ -101,6 +105,7 @@ effort:
   triage: "medium"
   module_tagger: "medium"
   deep_reviewer: "max"
+  judge: "medium"
 
 # Backend CLI per role (claude, codex, gemini)
 backends:
@@ -113,6 +118,7 @@ backends:
   triage: "claude"
   module_tagger: "claude"
   deep_reviewer: "claude"
+  judge: "claude"
 
 # Review checkpoints
 review:

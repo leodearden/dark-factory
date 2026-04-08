@@ -115,6 +115,7 @@ def build_eval_orch_config(
         reviewer='opus',          # 1× opus comprehensive reviewer (production parity)
         merger='opus',
         module_tagger='sonnet',
+        judge='sonnet',           # ζ completion judge — read-only, small budget
     )
 
     budgets = BudgetsConfig(
@@ -124,6 +125,7 @@ def build_eval_orch_config(
         reviewer=5.0,             # opus reviewer needs more headroom than sonnet
         merger=5.0,
         module_tagger=2.0,
+        judge=0.50,
     )
 
     effort = EffortConfig(
@@ -133,6 +135,7 @@ def build_eval_orch_config(
         reviewer='high',           # opus reviewer at high effort (matches defaults.yaml)
         merger='high',
         module_tagger='medium',
+        judge='medium',
     )
 
     backends = BackendsConfig(
@@ -142,6 +145,7 @@ def build_eval_orch_config(
         reviewer='claude',        # reviewers always on Claude
         merger='claude',
         module_tagger='claude',
+        judge='claude',           # judge always on Claude (read-only quality call)
     )
 
     return OrchestratorConfig(
@@ -153,6 +157,7 @@ def build_eval_orch_config(
         max_execute_iterations=task.get('max_execute_iterations', 20),
         max_verify_attempts=base.max_verify_attempts,
         max_review_cycles=task.get('max_review_cycles', 1),
+        judge_after_each_iteration=task.get('judge_after_each_iteration', True),
         test_command=task.get('verify_commands', {}).get('test', base.test_command),
         lint_command=task.get('verify_commands', {}).get('lint', base.lint_command),
         type_check_command=task.get('verify_commands', {}).get('typecheck', base.type_check_command),

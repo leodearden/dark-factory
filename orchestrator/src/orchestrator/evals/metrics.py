@@ -33,6 +33,12 @@ class EvalMetrics:
     iterations: int = 0          # implementer re-invocations
     debug_cycles: int = 0        # debugger invocations
 
+    # Completion judge (ζ) — judge_cost_usd is a SUBSET of cost_usd, not
+    # disjoint. Report generators should not double-count.
+    judge_invocations: int = 0
+    judge_cost_usd: float = 0.0
+    judge_early_exits: int = 0
+
     # Token usage
     input_tokens: int = 0
     output_tokens: int = 0
@@ -58,12 +64,17 @@ class EvalMetrics:
 
 
 def compute_composite(m: EvalMetrics) -> float:
-    """Quality-weighted score normalised by task complexity.
+    """Pure quality score bounded to 0..1.
 
     - Fails tests → score 0
     - blocking_rate = blocking_issues / plan_steps (larger tasks tolerate more issues)
     - debug_cycles get a light penalty (the system self-correcting is good)
-    - Final score = quality × plan_completion_pct
+    - Final score = quality, clamped to [0, 1]
+
+    ``plan_completion_pct`` is still collected as a diagnostic signal (visible
+    in result JSON) but no longer gates the composite. It was previously a
+    multiplier, but local models that write correct code without updating
+    plan.json status fields would get score 0 despite T/T/T gates.
     """
     if not m.tests_pass:
         return 0.0
@@ -71,7 +82,8 @@ def compute_composite(m: EvalMetrics) -> float:
     blocking_rate = m.review_blocking_issues / steps
     quality = 1.0 - (blocking_rate * 2.0) - (m.debug_cycles * 0.05)
     quality = max(quality, 0.0)
-    return round(quality * m.plan_completion_pct, 4)
+    quality = min(quality, 1.0)
+    return round(quality, 4)
 
 
 async def collect_metrics(
@@ -119,6 +131,9 @@ async def collect_metrics(
         turns_used=wf_metrics.total_turns,
         iterations=wf_metrics.execute_iterations,
         debug_cycles=wf_metrics.verify_attempts,
+        judge_invocations=wf_metrics.judge_invocations,
+        judge_cost_usd=wf_metrics.judge_cost_usd,
+        judge_early_exits=wf_metrics.judge_early_exits,
         input_tokens=wf_metrics.total_input_tokens,
         output_tokens=wf_metrics.total_output_tokens,
         cache_read_tokens=wf_metrics.total_cache_read_tokens,
