@@ -359,7 +359,7 @@ async def run_eval_matrix(
             for task in done:
                 if task.cancelled():
                     exc = asyncio.CancelledError()
-                    logger.error(f'Eval cancelled: {exc}')
+                    logger.error('Eval cancelled', exc_info=exc)
                     for t in active:
                         t.cancel()
                     await asyncio.gather(*active, return_exceptions=True)
@@ -368,7 +368,7 @@ async def run_eval_matrix(
                 exc = task.exception()
                 if exc is not None:
                     if isinstance(exc, asyncio.CancelledError):
-                        logger.error(f'Eval cancelled: {exc}')
+                        logger.error('Eval cancelled', exc_info=exc)
                         for t in active:
                             t.cancel()
                         await asyncio.gather(*active, return_exceptions=True)
