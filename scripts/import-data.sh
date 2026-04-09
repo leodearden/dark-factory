@@ -45,7 +45,18 @@ if docker compose -f "$COMPOSE_FILE" ps --status running 2>/dev/null | grep -q f
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Restore FalkorDB data
+# 2. Fix Docker-owned files (containers write as root inside volumes)
+# ---------------------------------------------------------------------------
+DATA_DIR="$REPO_ROOT/fused-memory/data"
+if [ -d "$DATA_DIR" ]; then
+  # Use a throwaway container to chown — avoids needing sudo
+  docker run --rm -v "$DATA_DIR:/data" alpine chown -R "$(id -u):$(id -g)" /data 2>/dev/null && \
+    ok "Fixed ownership on fused-memory/data/" || \
+    warn "Could not fix ownership (may need: sudo chown -R $(id -u):$(id -g) $DATA_DIR)"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Restore FalkorDB data
 # ---------------------------------------------------------------------------
 info "Restoring FalkorDB data"
 
@@ -60,7 +71,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Restore Qdrant data
+# 4. Restore Qdrant data
 # ---------------------------------------------------------------------------
 info "Restoring Qdrant data"
 
@@ -75,7 +86,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Restore runtime data directories
+# 5. Restore runtime data directories
 # ---------------------------------------------------------------------------
 info "Restoring runtime data"
 
@@ -98,7 +109,7 @@ for f in "$EXPORT_DIR"/data/*.json; do
 done
 
 # ---------------------------------------------------------------------------
-# 5. Restore secrets
+# 6. Restore secrets
 # ---------------------------------------------------------------------------
 info "Restoring secrets"
 
@@ -119,7 +130,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Start services
+# 7. Start services
 # ---------------------------------------------------------------------------
 info "Starting backing stores"
 
@@ -160,7 +171,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Health checks
+# 8. Health checks
 # ---------------------------------------------------------------------------
 info "Health checks"
 
@@ -195,7 +206,7 @@ if [ -f "$RECON_DB" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 8. Verify worktrees (if repos were rsync'd)
+# 9. Verify worktrees (if repos were rsync'd)
 # ---------------------------------------------------------------------------
 info "Verifying worktrees"
 
