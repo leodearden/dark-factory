@@ -302,6 +302,7 @@ class TestVllmUrlInjection:
         from orchestrator.cli import main
 
         captured_state: dict[str, dict] = {}
+        captured_args: dict = {}
 
         def stub_run_matrix(base_config, **kwargs):
             for cfg in EVAL_CONFIGS:
@@ -316,6 +317,11 @@ class TestVllmUrlInjection:
         assert result.exit_code == 0, (
             f'CLI exited {result.exit_code}.\nOutput: {result.output}\nException: {result.exception}'
         )
+        assert 'base_config' in captured_args
+        assert captured_args['max_parallel'] is None
+        assert captured_args['trials'] == 1
+        assert captured_args['force'] is False
+        assert captured_args['timeout'] is None
         vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
         assert set(captured_state.keys()) >= vllm_names, (
             f'vLLM names missing from captured state: {vllm_names - set(captured_state.keys())}'
