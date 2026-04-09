@@ -146,7 +146,7 @@ class TestDroppedQwen25Regression:
     def test_qwen25_hf_model_not_in_any_config(self):
         """No config should reference Qwen/Qwen2.5-Coder-32B-Instruct as its model."""
         dropped_hf_id = 'Qwen/Qwen2.5-Coder-32B-Instruct'
-        for cfg in EVAL_CONFIGS + VLLM_EVAL_CONFIGS:
+        for cfg in EVAL_CONFIGS:
             assert cfg.env_overrides.get('ANTHROPIC_DEFAULT_SONNET_MODEL') != dropped_hf_id, (
                 f'{cfg.name} still references the dropped HF model'
             )
@@ -215,6 +215,20 @@ class TestEvalConfigsIncludesVllm:
             f'{[c.name for c in EVAL_CONFIGS]}'
         )
 
+    def test_cloud_baselines_equal_eval_minus_vllm(self):
+        """Cloud baselines derived by set-difference must equal the known literal set."""
+        derived = {cfg.name for cfg in EVAL_CONFIGS} - {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+        expected = {
+            'claude-opus-high', 'claude-opus-max', 'claude-sonnet-max',
+            'codex-gpt54-xhigh', 'codex-gpt54mini-xhigh',
+            'gemini-31-pro-high', 'gemini-3-flash-high',
+        }
+        assert derived == expected, (
+            f'Derived cloud baselines do not match expected set.\n'
+            f'  Extra:   {derived - expected}\n'
+            f'  Missing: {expected - derived}'
+        )
+
 
 class TestRunnerDefaultIncludesVllm:
     """run_eval_matrix must receive vLLM configs when called with its default EVAL_CONFIGS."""
@@ -237,11 +251,9 @@ class TestVllmUrlInjection:
     """--vllm-url injection must target only vLLM configs, not cloud baselines."""
 
     _VLLM_URL = 'http://test-endpoint:8000'
-    _CLOUD_BASELINE_NAMES = {
-        'claude-opus-high', 'claude-opus-max', 'claude-sonnet-max',
-        'codex-gpt54-xhigh', 'codex-gpt54mini-xhigh',
-        'gemini-31-pro-high', 'gemini-3-flash-high',
-    }
+    _CLOUD_BASELINE_NAMES = (
+        {cfg.name for cfg in EVAL_CONFIGS} - {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+    )
 
     def test_injection_sets_base_url_on_vllm_configs(self, vllm_env_sandbox):
         """After injecting vllm_url, every vLLM config must have ANTHROPIC_BASE_URL set."""
