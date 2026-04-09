@@ -13,6 +13,8 @@ from orchestrator.evals.configs import (
     get_config_by_name,
 )
 
+VLLM_NAMES = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+
 
 @pytest.fixture
 def vllm_env_sandbox(monkeypatch):
@@ -124,7 +126,7 @@ class TestVllmConfigSet:
 
     def test_vllm_config_names_are_exact_set(self):
         """VLLM_EVAL_CONFIGS names must match the canonical active set exactly."""
-        actual = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+        actual = VLLM_NAMES
         assert actual == self.EXPECTED_VLLM_NAMES, (
             f'Extra: {actual - self.EXPECTED_VLLM_NAMES}  '
             f'Missing: {self.EXPECTED_VLLM_NAMES - actual}'
@@ -136,8 +138,7 @@ class TestDroppedQwen25Regression:
 
     def test_qwen25_32b_not_in_vllm_configs(self):
         """qwen25-coder-32b-q4 must not be in VLLM_EVAL_CONFIGS."""
-        names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
-        assert 'qwen25-coder-32b-q4' not in names
+        assert 'qwen25-coder-32b-q4' not in VLLM_NAMES
 
     def test_qwen25_32b_not_found_by_name_lookup(self):
         """get_config_by_name must return None for the dropped model."""
@@ -202,9 +203,8 @@ class TestEvalConfigsIncludesVllm:
     def test_eval_configs_includes_all_vllm_configs(self):
         """Every vLLM config name must be present in EVAL_CONFIGS."""
         eval_names = {cfg.name for cfg in EVAL_CONFIGS}
-        vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
-        assert vllm_names.issubset(eval_names), (
-            f'vLLM configs missing from EVAL_CONFIGS: {vllm_names - eval_names}'
+        assert VLLM_NAMES.issubset(eval_names), (
+            f'vLLM configs missing from EVAL_CONFIGS: {VLLM_NAMES - eval_names}'
         )
 
     def test_eval_configs_total_count(self):
@@ -217,7 +217,7 @@ class TestEvalConfigsIncludesVllm:
 
     def test_cloud_baselines_equal_eval_minus_vllm(self):
         """Cloud baselines derived by set-difference must equal the known literal set."""
-        derived = {cfg.name for cfg in EVAL_CONFIGS} - {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+        derived = {cfg.name for cfg in EVAL_CONFIGS} - VLLM_NAMES
         expected = {
             'claude-opus-high', 'claude-opus-max', 'claude-sonnet-max',
             'codex-gpt54-xhigh', 'codex-gpt54mini-xhigh',
@@ -236,14 +236,12 @@ class TestRunnerDefaultIncludesVllm:
     def test_runner_module_eval_configs_includes_vllm(self):
         """The EVAL_CONFIGS bound in runner.py must include all vLLM config names."""
         from orchestrator.evals import runner as runner_module
-        from orchestrator.evals.configs import VLLM_EVAL_CONFIGS
 
         # The runner imports EVAL_CONFIGS at module level from .configs
         # After step-6 this should include all vLLM entries.
         runner_eval_names = {cfg.name for cfg in runner_module.EVAL_CONFIGS}
-        vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
-        assert vllm_names.issubset(runner_eval_names), (
-            f'Runner EVAL_CONFIGS missing vLLM configs: {vllm_names - runner_eval_names}'
+        assert VLLM_NAMES.issubset(runner_eval_names), (
+            f'Runner EVAL_CONFIGS missing vLLM configs: {VLLM_NAMES - runner_eval_names}'
         )
 
 
@@ -252,7 +250,7 @@ class TestVllmUrlInjection:
 
     _VLLM_URL = 'http://test-endpoint:8000'
     _CLOUD_BASELINE_NAMES = (
-        {cfg.name for cfg in EVAL_CONFIGS} - {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+        {cfg.name for cfg in EVAL_CONFIGS} - VLLM_NAMES
     )
 
     def test_injection_sets_base_url_on_vllm_configs(self, vllm_env_sandbox):
@@ -273,10 +271,9 @@ class TestVllmUrlInjection:
             cfg.name for cfg in EVAL_CONFIGS
             if cfg.env_overrides.get('ANTHROPIC_BASE_URL') == self._VLLM_URL
         }
-        vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
-        assert vllm_names == eval_names_with_base_url, (
+        assert VLLM_NAMES == eval_names_with_base_url, (
             f'Shared-reference invariant broken.\n'
-            f'  Expected: {vllm_names}\n'
+            f'  Expected: {VLLM_NAMES}\n'
             f'  Got ANTHROPIC_BASE_URL via EVAL_CONFIGS: {eval_names_with_base_url}'
         )
 
@@ -316,9 +313,8 @@ class TestVllmUrlInjection:
         assert result.exit_code == 0, (
             f'CLI exited {result.exit_code}.\nOutput: {result.output}\nException: {result.exception}'
         )
-        vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
-        assert set(captured_state.keys()) >= vllm_names, (
-            f'vLLM names missing from captured state: {vllm_names - set(captured_state.keys())}'
+        assert set(captured_state.keys()) >= VLLM_NAMES, (
+            f'vLLM names missing from captured state: {VLLM_NAMES - set(captured_state.keys())}'
         )
         all_eval_names = {cfg.name for cfg in EVAL_CONFIGS}
         assert set(captured_state.keys()) == all_eval_names, (
@@ -326,7 +322,7 @@ class TestVllmUrlInjection:
             f'  Extra:   {set(captured_state.keys()) - all_eval_names}\n'
             f'  Missing: {all_eval_names - set(captured_state.keys())}'
         )
-        for name in vllm_names:
+        for name in VLLM_NAMES:
             assert captured_state[name].get('ANTHROPIC_BASE_URL') == self._VLLM_URL, (
                 f'{name} missing ANTHROPIC_BASE_URL in captured env_overrides'
             )
