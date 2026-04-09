@@ -898,6 +898,7 @@ class TestDiscoverOrchestrators:
         assert len(result) == 1
         # project_root must be the resolved canonical path, not the symlink
         assert result[0]["project_root"] == str(real_dir)
+        assert result[0]["pids"] == [1234]
 
     def test_symlink_and_canonical_paths_grouped_into_single_entry(self, tmp_path):
         """Two processes whose PRDs resolve to the same project root are merged into one entry.
