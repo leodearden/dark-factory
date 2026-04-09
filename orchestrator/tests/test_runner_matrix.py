@@ -152,6 +152,62 @@ class TestRunEvalMatrixCancellation:
             )
 
 
+    async def test_siblings_cancelled_promptly_on_cancel(
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        """Slow siblings must be cancelled promptly when one eval raises CancelledError.
+
+        With asyncio.gather(return_exceptions=True) the slow sibling runs to
+        full completion (2 s) before CancelledError propagates, making total
+        elapsed ≈ 2 s.
+
+        After the asyncio.wait(FIRST_COMPLETED) refactor the monitor loop
+        cancels the slow sibling immediately, so elapsed should be well under
+        1 s (typically < 0.1 s).
+
+        This test FAILS against the current gather implementation.
+        """
+        cancel_path = tmp_path / 'task_cancel.json'
+        slow_path = tmp_path / 'task_slow.json'
+        cancel_path.touch()
+        slow_path.touch()
+
+        slow_completed = False
+
+        async def fake_run_eval(task_path: Path, config: EvalConfig, *args, **kwargs) -> EvalResult:
+            nonlocal slow_completed
+            if 'cancel' in task_path.stem:
+                raise asyncio.CancelledError('immediate cancel')
+            # Slow task: sleep 2 s then mark completion
+            await asyncio.sleep(2.0)
+            slow_completed = True
+            return EvalResult(
+                task_id='task_slow',
+                config_name=config.name,
+                outcome='success',
+                metrics={},
+                worktree_path='/tmp/stub',
+            )
+
+        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+
+        import time
+        start = time.monotonic()
+        with pytest.raises(asyncio.CancelledError):
+            await run_eval_matrix(
+                [cancel_path, slow_path],
+                [_CFG],
+                force=True,
+            )
+        elapsed = time.monotonic() - start
+
+        # (a) Slow sibling must NOT have run to completion
+        assert not slow_completed, 'Slow sibling ran to completion — siblings were not cancelled promptly'
+
+        # (b) Total elapsed must be well under 2 s (gather would take ~2 s)
+        assert elapsed < 1.0, f'Elapsed {elapsed:.2f}s ≥ 1.0s — siblings were not cancelled promptly'
+
+
 @pytest.mark.asyncio
 class TestRunEvalMatrixNonCancelPath:
     """Non-cancel exceptions must be logged and the matrix must continue."""
