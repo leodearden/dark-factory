@@ -47,7 +47,8 @@ from orchestrator.evals.configs import (
 # ---------------------------------------------------------------------------
 
 SSH_KEY = os.path.expanduser("~/.ssh/id_runpod")
-SSH_PUBKEY = open(SSH_KEY + ".pub").read().strip()
+with open(SSH_KEY + ".pub") as _fh:
+    SSH_PUBKEY = _fh.read().strip()
 
 PROJECT_ROOT = Path("/home/leo/src/dark-factory")
 ORCHESTRATOR_DIR = PROJECT_ROOT / "orchestrator"
