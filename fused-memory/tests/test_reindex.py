@@ -193,11 +193,7 @@ class TestGetEdgeText:
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
         """get_edge_text uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock([['edge-name', 'Some fact']])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.get_edge_text('edge-uuid-1', group_id='test')
-        graph.ro_query.assert_awaited_once()
-        graph.query.assert_not_awaited()
+        await assert_ro_query_only(backend, make_graph_mock, [['edge-name', 'Some fact']], 'get_edge_text', 'edge-uuid-1', group_id='test')
 
 
 # ---------------------------------------------------------------------------
@@ -310,11 +306,7 @@ class TestListIndices:
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
         """list_indices uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock([])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.list_indices(group_id='test')
-        graph.ro_query.assert_awaited_once()
-        graph.query.assert_not_awaited()
+        graph = await assert_ro_query_only(backend, make_graph_mock, [], 'list_indices', group_id='test')
         args, kwargs = graph.ro_query.call_args
         cypher = args[0] if args else kwargs.get('query', '')
         assert 'db.indexes' in cypher

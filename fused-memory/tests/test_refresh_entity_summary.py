@@ -14,7 +14,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from conftest import extract_cypher, extract_params
+from conftest import assert_ro_query_only, extract_cypher, extract_params
 
 from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
@@ -90,11 +90,7 @@ class TestResolveEntityByName:
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
         """resolve_entity_by_name uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock([['uuid-alice', 'Alice']])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.resolve_entity_by_name('Alice', group_id='test')
-        graph.ro_query.assert_awaited_once()
-        graph.query.assert_not_awaited()
+        await assert_ro_query_only(backend, make_graph_mock, [['uuid-alice', 'Alice']], 'resolve_entity_by_name', 'Alice', group_id='test')
 
 
 # ---------------------------------------------------------------------------
@@ -190,11 +186,7 @@ class TestGetValidEdgesForNode:
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
         """Uses ro_query (read-only) — graph.query must NOT be called."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock([])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
-        graph.ro_query.assert_awaited_once()
-        graph.query.assert_not_awaited()
+        await assert_ro_query_only(backend, make_graph_mock, [], 'get_valid_edges_for_node', 'node-uuid-1', group_id='test')
 
 
 # ---------------------------------------------------------------------------
