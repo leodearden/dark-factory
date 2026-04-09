@@ -211,6 +211,70 @@ class TestCapDetectionPatterns:
         gate = make_gate(['a'])
         assert gate.detect_cap_hit('', 'RESOURCE_EXHAUSTED', backend='gemini') is True
 
+    # --- Realistic cap-hit smoke tests (verbatim Claude UI strings) ---
+
+    def test_realistic_cap_hit_out_of_extra_usage(self):
+        """Verbatim: 'You're out of extra usage for this billing period.'"""
+        gate = make_gate(['a'])
+        msg = "You're out of extra usage for this billing period. Your plan resets in 3 hours."
+        assert gate.detect_cap_hit('', msg) is True
+
+    def test_realistic_cap_hit_pro_plan_date_format(self):
+        """Verbatim: 'You've hit your usage limit for Claude Pro. Your plan resets on Apr 10, 9pm (UTC).'"""
+        gate = make_gate(['a'])
+        msg = "You've hit your usage limit for Claude Pro. Your plan resets on Apr 10, 9pm (UTC)."
+        assert gate.detect_cap_hit('', msg) is True
+
+    # --- Realistic near-cap smoke tests (verbatim Claude UI strings) ---
+
+    def test_realistic_near_cap_extra_compute_credits(self):
+        """Verbatim: 'You're now using extra compute credits. Your plan resets in 4h.'"""
+        gate = make_gate(['a'])
+        msg = "You're now using extra compute credits. Your plan resets in 4h."
+        assert gate.detect_cap_hit('', msg) is True
+
+    def test_realistic_near_cap_close_to_limit(self):
+        """Verbatim: 'You're close to reaching your usage limit. Your plan resets in 1h.'"""
+        gate = make_gate(['a'])
+        msg = "You're close to reaching your usage limit. Your plan resets in 1h."
+        assert gate.detect_cap_hit('', msg) is True
+
+    # --- Parametrized realistic cap messages (one per prefix) ---
+
+    @pytest.mark.parametrize('message,expected', [
+        # CAP_HIT_PREFIXES
+        (
+            "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours.",
+            True,
+        ),
+        (
+            "You've used all available credits. Upgrade for more capacity.",
+            True,
+        ),
+        (
+            "You're out of extra usage for this billing period. Your plan resets in 2h.",
+            True,
+        ),
+        # NEAR_CAP_PREFIXES
+        (
+            "You're close to reaching your plan limit. Your plan resets in 5h.",
+            True,
+        ),
+        (
+            "You're now using extra compute credits. Your plan resets in 1h.",
+            True,
+        ),
+    ], ids=[
+        'cap_hit_prefix_hit_your',
+        'cap_hit_prefix_used',
+        'cap_hit_prefix_out_of_extra',
+        'near_cap_prefix_close_to',
+        'near_cap_prefix_now_using_extra',
+    ])
+    def test_realistic_cap_messages(self, message, expected):
+        gate = make_gate(['a'])
+        assert gate.detect_cap_hit('', message) is expected
+
 
 # =========================================================================
 # TestResetTimeParsing
