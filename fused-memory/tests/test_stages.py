@@ -1421,3 +1421,97 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
             f'Recently Completed Tasks not sorted by id desc. '
             f'positions: [10]={pos_10}, [8]={pos_8}, [5]={pos_5}, [3]={pos_3}'
         )
+
+
+# ── Tests for task 455: MemoryConsolidator filtered task tree injection ─────────
+
+
+class TestMemoryConsolidatorFilteredTaskTree:
+    """MemoryConsolidator includes/omits '### Active Task Tree' based on filtered_task_tree."""
+
+    @pytest.fixture
+    def mock_memory(self):
+        svc = AsyncMock()
+        svc.get_episodes = AsyncMock(return_value=[])
+        svc.get_status = AsyncMock(return_value={})
+        svc.mem0 = AsyncMock()
+        svc.mem0.get_all = AsyncMock(return_value={'results': []})
+        return svc
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='test_project')
+
+    def _make_active_tree(self, count: int = 3):
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+        active = [
+            {'id': i, 'title': f'Active task {i}', 'status': 'pending', 'dependencies': []}
+            for i in range(1, count + 1)
+        ]
+        return FilteredTaskTree(
+            active_tasks=active,
+            done_count=5,
+            cancelled_count=2,
+            other_count=0,
+            total_count=count + 7,
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_includes_active_task_tree_section_when_set(
+        self, mock_memory, watermark,
+    ):
+        """assemble_payload includes '### Active Task Tree' when filtered_task_tree is set."""
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator, mock_memory, None, AsyncMock(), AsyncMock(),
+        )
+        stage.project_id = 'test_project'
+        stage.episode_limit = 100
+        stage.memory_limit = 200
+        stage.filtered_task_tree = self._make_active_tree(3)
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Active Task Tree' in payload
+        assert 'Active task 1' in payload
+
+    @pytest.mark.asyncio
+    async def test_payload_omits_section_when_tree_none(self, mock_memory, watermark):
+        """assemble_payload does NOT include '### Active Task Tree' when filtered_task_tree is None."""
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator, mock_memory, None, AsyncMock(), AsyncMock(),
+        )
+        stage.project_id = 'test_project'
+        stage.episode_limit = 100
+        stage.memory_limit = 200
+        stage.filtered_task_tree = None
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Active Task Tree' not in payload
+
+    @pytest.mark.asyncio
+    async def test_format_assembled_payload_includes_tree_when_set(
+        self, mock_memory, watermark,
+    ):
+        """_format_assembled_payload includes '### Active Task Tree' when filtered_task_tree is set."""
+        from fused_memory.models.reconciliation import AssembledPayload
+
+        ap = AssembledPayload(
+            events=[],
+            context_items={},
+            total_tokens=0,
+            events_remaining=0,
+        )
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator, mock_memory, None, AsyncMock(), AsyncMock(),
+        )
+        stage.project_id = 'test_project'
+        stage.episode_limit = 100
+        stage.memory_limit = 200
+        stage.assembled_payload = ap
+        stage.filtered_task_tree = self._make_active_tree(2)
+
+        payload = await stage._format_assembled_payload(watermark)
+
+        assert '### Active Task Tree' in payload
+        assert 'Active task 1' in payload
