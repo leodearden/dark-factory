@@ -251,6 +251,39 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
 # ---------------------------------------------------------------------------
 
 
+async def assert_ro_query_only(
+    backend,
+    make_graph_mock_fn,
+    rows: list[list],
+    method_name: str,
+    *args,
+    **kwargs,
+) -> MagicMock:
+    """Assert that a backend method uses ro_query and never calls query.
+
+    Creates a graph mock via *make_graph_mock_fn*, wires it into
+    *backend._driver._get_graph*, invokes the named method, then asserts:
+      - graph.ro_query was awaited exactly once
+      - graph.query was not awaited at all
+
+    Returns the graph mock so callers can add additional assertions (e.g.
+    inspecting Cypher content via graph.ro_query.call_args).
+
+    Usage::
+
+        graph = await assert_ro_query_only(
+            backend, make_graph_mock, [['Node', 'Summary']],
+            'get_node_text', 'uuid-1', group_id='test',
+        )
+    """
+    graph = make_graph_mock_fn(rows)
+    backend._driver._get_graph = MagicMock(return_value=graph)
+    await getattr(backend, method_name)(*args, **kwargs)
+    graph.ro_query.assert_awaited_once()
+    graph.query.assert_not_awaited()
+    return graph
+
+
 def extract_cypher(call_args: Any) -> str:
     """Return the Cypher query string from a mock call_args object.
 
