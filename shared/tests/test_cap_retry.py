@@ -1166,3 +1166,65 @@ class TestCapRetryDeadline:
                 prompt='hi',
             )
         assert got.success is True
+
+
+# ===================================================================
+# TestCapRetryHeuristicGuard
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryHeuristicGuard:
+    """Heuristic cap-hit branch (zero-cost instant exit) also respects max_cap_retries."""
+
+    def _make_heuristic_result(self) -> AgentResult:
+        """Zero-cost instant exit result that triggers the heuristic branch."""
+        return AgentResult(
+            success=False,
+            output='Usage limit reached',
+            cost_usd=0.0,
+            turns=1,
+            duration_ms=100,
+        )
+
+    async def test_heuristic_raises_after_max_retries(self):
+        """Heuristic cap hits count toward max_cap_retries and raise AllAccountsCappedException."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 5),
+            detect_cap_hit=MagicMock(return_value=False),  # not caught by pattern
+            active_account_name='acct',
+        )
+        gate._handle_cap_detected = MagicMock()
+        heuristic_result = self._make_heuristic_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=heuristic_result) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            with pytest.raises(AllAccountsCappedException) as exc_info:
+                await invoke_with_cap_retry(
+                    gate, 'heuristic-task', max_cap_retries=2, prompt='hi',
+                )
+        assert exc_info.value.retries == 2
+        assert mock_inv.await_count == 2
+
+    async def test_heuristic_succeeds_before_max_retries(self):
+        """1 heuristic hit then success does not raise (under max_cap_retries=2)."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 2),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        gate._handle_cap_detected = MagicMock()
+        heuristic_result = self._make_heuristic_result()
+        ok_result = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[heuristic_result, ok_result]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', max_cap_retries=2, prompt='hi',
+            )
+        assert got.success is True
+        assert mock_inv.await_count == 2
