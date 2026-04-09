@@ -9081,56 +9081,6 @@
         }
       },
       {
-        "id": 453,
-        "title": "Complete vLLM eval Stream 3: add self-hosted backend configs and run trials",
-        "description": "Stream 3 of the vLLM coding-agent eval is in progress with RunPod volume obxma9bf1b provisioned. Remaining work before eval results are valid:\n\n1. Add self-hosted backend configs to EVAL_CONFIGS in orchestrator/src/orchestrator/evals/configs.py for the models being evaluated in Stream 3\n2. Run evals: `python -m orchestrator.evals.runner --trials 3 --max-parallel <N> --vllm-url <endpoint>` against each model config\n3. Run judge: `python -m orchestrator.evals.runner --judge` to produce Elo rankings across all trial results\n\n**memory_hints:**\n- search: \"vLLM eval Stream 3 RunPod self-hosted backend configs EVAL_CONFIGS\"\n- search: \"eval infrastructure stream 3 models evaluated\"\n- search: \"env_overrides implementer debugger roles vLLM\"\n- entity: \"vLLM eval\"\n- See docs/vllm-eval-status.md for current stream state and model list",
-        "details": "Stream 1 (dark-factory eval plumbing) and Stream 2 (runpod-toolkit Docker image) are complete. Stream 3 is the actual self-hosted eval run.\n\nKey files:\n- orchestrator/src/orchestrator/evals/configs.py — EVAL_CONFIGS dict, add entries for self-hosted models\n- orchestrator/src/orchestrator/evals/tasks/ — eval task JSON files (df_task_12/13/18, reify_task_27 — plan.task_id values fixed in commit 53486e8023)\n- docs/vllm-eval-status.md — current stream status and next steps\n\nenv_overrides constraint: only implementer and debugger roles may use vLLM endpoint; architect and reviewer must use real Claude OAuth (enforced in workflow.py since commit 53486e8023).\n\nModels: 6 active (Qwen2.5-Coder-32B dropped). See memory \"Evaluating vLLM plan with 6 active models\".",
-        "testStrategy": "",
-        "status": "done",
-        "dependencies": [
-          "457"
-        ],
-        "priority": "medium",
-        "subtasks": [],
-        "updatedAt": "2026-04-06T22:50:16.442Z",
-        "metadata": {
-          "model_count": 5,
-          "devstral_parked": true,
-          "devstral_park_reason": "inconsistent tool-call format: emits prose/XML/partial-mistral",
-          "devstral_park_date": "2026-04-06",
-          "bridge_bug_confirmed": false,
-          "primary_blocker": null,
-          "next_steps": "debug cli_invoke.py + /v1/messages shim; alternative: try reap-139b-nvfp4-new as gate eval candidate",
-          "_causation_id": "575fd7e6-9c9d-401e-9ef8-39f0159ffd6d",
-          "memory_hints": {
-            "entities": [
-              "vLLM eval Stream 3",
-              "RunPod"
-            ],
-            "queries": [
-              "first successful vLLM eval reap-139b-nvfp4 minimax_m2 parser EUR-IS-1",
-              "vLLM eval configs.py self-hosted backend EVAL_CONFIGS",
-              "env_overrides implementer debugger roles vLLM",
-              "Qwen3-Coder-Next vLLM startup hang health timeout"
-            ]
-          },
-          "blocker": null,
-          "resume_condition": "80GB+ GPU stock confirmed at alternative datacenter OR RunPod volume migrated OR tool_format_bridge_bug fixed",
-          "stage1_finding_id": "1",
-          "files": [
-            "orchestrator/src/orchestrator/evals/configs.py",
-            "docs/vllm-eval-status.md"
-          ],
-          "modules": [
-            "orchestrator/src/orchestrator/evals",
-            "docs"
-          ],
-          "unblocked_by": "task_457_done_plus_eval_success_2026-04-06",
-          "preferred_datacenter": "EUR-IS-1",
-          "qwen3_hang_blocker_task": 515
-        }
-      },
-      {
         "id": 454,
         "title": "Commit uv.lock (pytest-cov addition) to main",
         "description": "A trivial uv.lock update adding pytest-cov remains uncommitted on main. This is the only remaining open item from the FLAG-1 resolution (commit 53486e8023 covered workflow.py env_overrides scoping + 4 eval task JSON fixes). Commit the uv.lock change to close out FLAG-1 fully.",
@@ -9241,18 +9191,6 @@
           "stage2_blocker": "PERPLEXITY_API_KEY not set; prompt-based update_task unavailable; outer priority and description edits require manual intervention or API key setup"
         },
         "updatedAt": "2026-04-06T18:31:40.498Z"
-      },
-      {
-        "id": 457,
-        "title": "Fix vLLM tool-format bridge bug: cli_invoke.py + /v1/messages shim",
-        "description": "The vLLM eval tool-format bridge is broken: every tool_use response from a vLLM-backed model errors in the Claude CLI, making all vLLM-backed evals impossible. This is the primary blocker for Task 453 (Complete vLLM eval Stream 3).\n\n## Problem\ncli_invoke.py passes tool_use responses through a /v1/messages shim that Claude CLI cannot parse correctly. Every eval attempt with any self-hosted model fails at the tool_use response boundary. No vLLM-backed eval has ever produced outcome=done.\n\n## Confirmed Evidence\n- Graphiti entity: 4919b7e2-02a5-4bed-b0ee-3fe459adeff4 (tool_format_bridge_bug)\n- Graphiti edges: d6208d0e-b5e8-49f6-bbde-2bc6f6503787, a37383d4-3008-42ac-a8a0-468e3067e181\n- Episodes: 544fd5f8 (session 2026-04-06 diagnosis), 99a05c0d (bridge bug confirmation)\n- Documented in MEMORY.md: project_vllm_eval_tool_format_bridge_bug.md\n\n## Investigation Steps\n1. Read cli_invoke.py — find where tool_use responses from /v1/messages are translated\n2. Reproduce: run a minimal eval against any vLLM endpoint with a simple tool-calling task\n3. Capture the exact error from Claude CLI on tool_use response\n4. Fix the shim translation layer so tool_use blocks are formatted correctly for Claude CLI\n5. Re-run the gate eval (e.g. reap-139b-nvfp4-new) to verify outcome=done is achievable\n6. Update Task 453 status once confirmed working\n\n## memory_hints\n- entity: \"4919b7e2-02a5-4bed-b0ee-3fe459adeff4\" — tool_format_bridge_bug entity\n- search: \"vLLM tool format bridge bug cli_invoke messages shim\"\n- search: \"tool_use response Claude CLI error vLLM eval\"\n- episode: \"544fd5f8\" — session 2026-04-06 diagnosis\n- episode: \"99a05c0d\" — bridge bug confirmation",
-        "details": "",
-        "testStrategy": "",
-        "status": "done",
-        "dependencies": [],
-        "priority": "high",
-        "subtasks": [],
-        "updatedAt": "2026-04-06T18:45:54.219Z"
       },
       {
         "id": 458,
@@ -10117,33 +10055,6 @@
         }
       },
       {
-        "id": 515,
-        "title": "Investigate and fix Qwen3-Coder-Next-FP8 vLLM startup hang (health timeout)",
-        "description": "Qwen3-Coder-Next-FP8 (config: qwen3-coder-next-fp8-new) has a persistent vLLM startup hang that causes health-check timeout before the server becomes ready. This is NOT a memory issue — reproduced on both RTX PRO 6000 (96GB, EUR-IS-1) and H200 SXM (141GB). Config was migrated to H200 as a mitigation but the hang root cause remains unknown, blocking Qwen3 from being evaluated in the vLLM eval pipeline.",
-        "details": "Known context:\n- Tool-call parser for Qwen3-Coder must be qwen3_coder (hermes was prior misconfiguration, now fixed)\n- Config is in orchestrator/src/orchestrator/evals/configs.py (qwen3-coder-next-fp8-new entry)\n- Graphiti edge 85c34b19 records config migration to H200\n- Episodes from 2026-04-06 session ~20:42 document the hang\n\nInvestigation steps:\n1. Launch qwen3-coder-next-fp8-new config on an H200 pod and observe vLLM startup logs\n2. Identify exact hang point (tokenizer init / model load / CUDA graph build / etc.)\n3. Verify HF model variant compatibility with installed vLLM version\n4. Try --max-model-len, --enforce-eager, or --disable-custom-all-reduce flags as needed\n5. Fix config or add vLLM startup flags; rerun gate eval to confirm server becomes ready\n\nmemory_hints:\n- search: \"Qwen3-Coder-Next vLLM startup hang health timeout H200 RTX\"\n- search: \"vLLM eval configs.py qwen3_coder tool-call parser\"\n- entity: \"qwen3-coder-next-fp8-new\"",
-        "testStrategy": "",
-        "status": "blocked",
-        "dependencies": [],
-        "priority": "medium",
-        "subtasks": [],
-        "updatedAt": "2026-04-07T03:02:45.892Z",
-        "metadata": {
-          "memory_hints": {
-            "entities": [
-              "qwen3-coder-next-fp8-new"
-            ],
-            "queries": [
-              "Qwen3 hang port collision SSH tunnel IPv4 IPv6 escalation MCP port 8100",
-              "vLLM eval configs.py qwen3_coder tool-call parser qwen3-coder-next-fp8-new",
-              "vLLM eval tool-format bridge broken tool_use Claude CLI",
-              "qwen3-coder-next-fp8 config migration H200 startup investigation"
-            ]
-          },
-          "_causation_id": "50cd0596-7912-4809-b746-fbd02918aa1c",
-          "reconciliation_note": "2026-04-07: Task assumption invalidated by knowledge. Root cause of startup hang confirmed as port-8100 collision (not vLLM). Re-scoped by recon-stage-task_knowledge_sync."
-        }
-      },
-      {
         "id": 516,
         "title": "Add structured warning log before propagating CancelledError in rebuild_entity_summaries",
         "description": "At graphiti_client.py:1072-1074 (Pass 1 loop), add a `logger.warning` call before `raise r` that records `group_id`, `rebuilt` (so far), and `errors` (so far). When a large batch is cancelled mid-flight, the current code skips the summary log entirely and operators have no record of partial progress. The `rebuilt` and `errors` counters are already in scope at that point (initialized at the top of the method and incremented by Pass 2, but the values from any previously completed batches/groups are meaningful context).\n\nExample:\n```python\nlogger.warning(\n    'rebuild_entity_summaries: cancellation signal received group=%s '\n    'rebuilt_so_far=%d errors_so_far=%d; propagating',\n    group_id, rebuilt, errors,\n)\nraise r\n```\n\nSource: review suggestions from task 484. Rationale: operational visibility during graceful shutdowns.\n\nFiles:\n- fused-memory/src/fused_memory/backends/graphiti_client.py\n- fused-memory/tests/test_rebuild_entity_summaries.py (log assertion)",
@@ -10408,30 +10319,6 @@
         }
       },
       {
-        "id": 531,
-        "title": "Fix run_eval_matrix exception handling and add coverage",
-        "description": "In orchestrator/src/orchestrator/evals/runner.py lines 313-315, replace `isinstance(r, BaseException)` with handling that explicitly re-raises asyncio.CancelledError (or separates it from ordinary eval failures) so graceful shutdown propagates correctly. Add a test that gathers a coroutine raising asyncio.CancelledError and verifies the correct behavior (absorbed vs re-raised, per the chosen design). Also add a test that calls run_eval_matrix with a task raising asyncio.CancelledError and verifies the error is logged but the matrix call handles it gracefully.",
-        "details": "",
-        "testStrategy": "",
-        "status": "done",
-        "dependencies": [],
-        "priority": "medium",
-        "subtasks": [],
-        "updatedAt": "2026-04-07T04:42:08.335Z"
-      },
-      {
-        "id": 532,
-        "title": "Refactor TestVllmUrlInjection test fixtures for isolation and deduplication",
-        "description": "In orchestrator/tests/test_eval_configs.py, refactor TestVllmUrlInjection (lines 175-240): (1) extract the save/restore env_overrides scaffolding into a shared pytest fixture using monkeypatch or contextmanager, eliminating the 45-line copy-paste across 3 test methods; (2) use deepcopy or monkeypatch.setattr to avoid mutating module-level singletons directly. Also add at least one test that exercises the actual CLI injection path: invoke _run_single_eval or _run_matrix_cmd from cli.py with a vllm_url argument (mocked runner) and assert ANTHROPIC_BASE_URL is injected into each vLLM config's env_overrides.",
-        "details": "",
-        "testStrategy": "",
-        "status": "done",
-        "dependencies": [],
-        "priority": "medium",
-        "subtasks": [],
-        "updatedAt": "2026-04-07T04:35:30.311Z"
-      },
-      {
         "id": 533,
         "title": "Fix stale config list references and hardcoded data in tests",
         "description": "In orchestrator/tests/test_eval_configs.py: (1) line 115 — change `for cfg in EVAL_CONFIGS + VLLM_EVAL_CONFIGS:` to `for cfg in EVAL_CONFIGS:` since VLLM_EVAL_CONFIGS is already spread into EVAL_CONFIGS; (2) lines 179-183 — replace the hardcoded _CLOUD_BASELINE_NAMES set with a derived expression: `{cfg.name for cfg in EVAL_CONFIGS} - {cfg.name for cfg in VLLM_EVAL_CONFIGS}` so it stays in sync automatically when baselines are added or renamed.",
@@ -10455,56 +10342,6 @@
           },
           "_causation_id": "2f2ac841-21ef-4bb6-ae6f-d98d538127ca"
         }
-      },
-      {
-        "id": 534,
-        "title": "Remove redundant tests from test_eval_configs.py",
-        "description": "In orchestrator/tests/test_eval_configs.py: (1) remove the entire TestRunnerDefaultIncludesVllm class (lines 158-172) — it is fully subsumed by TestEvalConfigsIncludesVllm since runner_module.EVAL_CONFIGS is configs.EVAL_CONFIGS; (2) remove test_vllm_config_count_is_six (lines 84-89) — the count is implied by test_vllm_config_names_are_exact_set which already fails with a descriptive diff on any mismatch.",
-        "details": "",
-        "testStrategy": "",
-        "status": "pending",
-        "dependencies": [],
-        "priority": "medium",
-        "subtasks": [],
-        "updatedAt": "2026-04-07T04:44:54.943Z",
-        "metadata": {
-          "modules": [
-            "orchestrator/tests/test_eval_configs.py"
-          ]
-        }
-      },
-      {
-        "id": 535,
-        "title": "Add missing test coverage for create_eval_worktree API contract and runner help output",
-        "description": "Three gaps to address: (1) orchestrator/tests/ — add a test for create_eval_worktree in snapshots.py that asserts the result is a 2-tuple of (Path, str) and that run_id is an 8-character hex string; (2) orchestrator/tests/test_runner_main.py line 28 — change the weak `or` assertion to `and` and add `--vllm-url` to the checked flags; (3) orchestrator/tests/test_runner_main.py line 15 — add `timeout=30` to the subprocess.run call and catch subprocess.TimeoutExpired with a clear failure message.",
-        "details": "",
-        "testStrategy": "",
-        "status": "in-progress",
-        "dependencies": [],
-        "priority": "medium",
-        "subtasks": [],
-        "updatedAt": "2026-04-07T04:44:55.063Z",
-        "metadata": {
-          "memory_hints": {
-            "entities": [],
-            "queries": [
-              "create_eval_worktree snapshots.py vllm eval orchestrator",
-              "run_vllm_eval.py subprocess timeout test_runner_main runner help flags"
-            ]
-          },
-          "_causation_id": "2f2ac841-21ef-4bb6-ae6f-d98d538127ca"
-        }
-      },
-      {
-        "id": 536,
-        "title": "Move runner.py __main__ entry-point to evals/__main__.py",
-        "description": "In orchestrator/src/orchestrator/evals/runner.py, remove the `if __name__ == '__main__':` block (lines 383-385). Create a new file orchestrator/src/orchestrator/evals/__main__.py containing only `from orchestrator.cli import eval_cmd; eval_cmd()`. This preserves `python -m orchestrator.evals.runner` invocability while eliminating the reverse runner→cli dependency edge and keeping runner.py a pure library module.",
-        "details": "",
-        "testStrategy": "",
-        "status": "pending",
-        "dependencies": [],
-        "priority": "medium",
-        "subtasks": []
       },
       {
         "id": 537,
@@ -10603,28 +10440,6 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
-      },
-      {
-        "id": 546,
-        "title": "Rename qwen3-coder-next-fp8-new to a stable config name",
-        "description": "In orchestrator/src/orchestrator/evals/configs.py line 103, rename 'qwen3-coder-next-fp8-new' to a semantically stable alternative (e.g. 'qwen3-coder-next-fp8-v2', or simply 'qwen3-coder-next-fp8' once the old baked-image entry is retired). Update the name in test_eval_configs.py TestVllmConfigSet.EXPECTED_VLLM_NAMES and any docs or scripts that reference the old name. The two configs ('qwen3-coder-next-fp8' baked/bf16 and 'qwen3-coder-next-fp8-new' HF-FP8) should have names that describe the technical distinction, not the temporal order of introduction.\n\nFiles: orchestrator/src/orchestrator/evals/configs.py\n\nSource: review follow-up from task 515 (esc-515-67)",
-        "details": "",
-        "testStrategy": "",
-        "status": "pending",
-        "dependencies": [],
-        "priority": "medium",
-        "subtasks": []
-      },
-      {
-        "id": 547,
-        "title": "Decouple vLLM health timeout from container_disk; guard against Qwen3 hang window",
-        "description": "In scripts/run_vllm_eval.py line 172, `health_timeout = max(900, container_disk * 12)` gives only 900s (15 min) when use_volume=True (the default) because container_disk is overridden to 50. The documented Qwen3 CUDA-graph hang lasts 15-80 min, so the current default timeout exactly matches the lower bound and will spuriously kill legitimate slow startups.\n\nFix by decoupling timeout from disk size: either (a) track the original pre-volume-override disk size for the timeout calculation, (b) add a per-model health_timeout_override field to EvalConfig, or (c) apply a higher floor specifically for configs with known startup hang risk (qwen3-coder-next-fp8-new). Also note that even with --no-volume (container_disk=240 → 2880s = 48 min), the 80-min upper bound of the hang window is not covered.\n\nFiles: scripts/run_vllm_eval.py\n\nSource: review follow-up from task 515 (esc-515-67)",
-        "details": "",
-        "testStrategy": "",
-        "status": "pending",
-        "dependencies": [],
-        "priority": "medium",
         "subtasks": []
       },
       {
@@ -10999,17 +10814,6 @@
         "status": "pending",
         "dependencies": [],
         "priority": "low",
-        "subtasks": []
-      },
-      {
-        "id": 579,
-        "title": "Fix stub design and mock robustness in CLI vllm-url test",
-        "description": "In orchestrator/tests/test_eval_configs.py, test_cli_eval_injects_vllm_url_into_all_vllm_configs (lines 238-268):\n1. Change stub_run_matrix to capture the configs argument passed to it rather than reading VLLM_EVAL_CONFIGS directly: `def stub_run_matrix(base_config, configs=None, **kwargs): captured_state.update({cfg.name: dict(cfg.env_overrides) for cfg in (configs or VLLM_EVAL_CONFIGS)})`\n2. Replace `lambda *a: object()` with `lambda *a: MagicMock()` for the load_config stub (add `from unittest.mock import MagicMock` at module level)\n3. Add a pre-condition assertion before invoking CliRunner: verify none of the vLLM configs already have ANTHROPIC_BASE_URL set, to catch fixture misconfiguration early\n\nFiles: orchestrator/tests/test_eval_configs.py",
-        "details": "",
-        "testStrategy": "",
-        "status": "pending",
-        "dependencies": [],
-        "priority": "medium",
         "subtasks": []
       },
       {
