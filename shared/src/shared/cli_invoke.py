@@ -178,6 +178,8 @@ async def invoke_with_cap_retry(
     task_id: str = '',
     project_id: str = '',
     role: str = '',
+    max_cap_retries: int | None = _DEFAULT_MAX_CAP_RETRIES,
+    cap_retry_deadline_secs: float | None = _DEFAULT_CAP_RETRY_DEADLINE_SECS,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -204,6 +206,7 @@ async def invoke_with_cap_retry(
     original_prompt = invoke_kwargs.get('prompt', '')
     consecutive_cap_hits = 0
     num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
+    retry_start = time.monotonic()
     while True:
         oauth_token = None
         account_name = ''
@@ -266,6 +269,30 @@ async def invoke_with_cap_retry(
                     f'{label}: cap hit on all accounts ({consecutive_cap_hits} consecutive), '
                     f'sleeping {cooldown:.0f}s then waiting for reset ({resume_or_fresh})',
                 )
+
+            # Guard: raise before sleeping if retry limit or deadline exceeded
+            elapsed = time.monotonic() - retry_start
+            if max_cap_retries is not None and consecutive_cap_hits >= max_cap_retries:
+                logger.error(
+                    f'{label}: giving up after {consecutive_cap_hits} consecutive cap hits '
+                    f'({elapsed:.1f}s elapsed, {num_accounts} account(s))',
+                )
+                raise AllAccountsCappedException(
+                    retries=consecutive_cap_hits,
+                    elapsed_secs=elapsed,
+                    label=label,
+                )
+            if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
+                logger.error(
+                    f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
+                    f'({consecutive_cap_hits} retries, {num_accounts} account(s))',
+                )
+                raise AllAccountsCappedException(
+                    retries=consecutive_cap_hits,
+                    elapsed_secs=elapsed,
+                    label=label,
+                )
+
             await asyncio.sleep(cooldown)
             continue
 
