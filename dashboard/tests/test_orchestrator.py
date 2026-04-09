@@ -631,8 +631,6 @@ class TestDiscoverOrchestrators:
         config = DashboardConfig(project_root=tmp_path)
 
         # Create tasks.json with 5 tasks of varying statuses + a worktree task
-        tasks_dir = tmp_path / '.taskmaster' / 'tasks'
-        tasks_dir.mkdir(parents=True)
         tasks = [
             {'id': '1', 'title': 'Setup', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
             {'id': '2', 'title': 'Build', 'status': 'done', 'priority': 'high', 'dependencies': ['1'], 'metadata': {}},
@@ -641,7 +639,7 @@ class TestDiscoverOrchestrators:
             {'id': '5', 'title': 'Deploy', 'status': 'pending', 'priority': 'low', 'dependencies': ['4'], 'metadata': {}},
             {'id': '7', 'title': 'Widget', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}},
         ]
-        (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
+        _write_tasks_json(tmp_path, tasks)
 
         # Create a worktree with .task/ artifacts
         wt_dir = tmp_path / '.worktrees' / '7'
@@ -712,10 +710,8 @@ class TestDiscoverOrchestrators:
         config = DashboardConfig(project_root=tmp_path)
 
         # Create tasks.json with a task whose id matches the worktree
-        tasks_dir = tmp_path / '.taskmaster' / 'tasks'
-        tasks_dir.mkdir(parents=True)
         tasks = [{'id': '7', 'title': 'Widget', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}}]
-        (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
+        _write_tasks_json(tmp_path, tasks)
 
         # Create worktree directory using 'task-7' naming convention
         wt_dir = tmp_path / '.worktrees' / 'task-7'
@@ -748,13 +744,11 @@ class TestDiscoverOrchestrators:
         config = DashboardConfig(project_root=tmp_path)
 
         # Create tasks.json with tasks matching the worktree IDs
-        tasks_dir = tmp_path / '.taskmaster' / 'tasks'
-        tasks_dir.mkdir(parents=True)
         tasks = [
             {'id': '3', 'title': 'T3', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
             {'id': '5', 'title': 'T5', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
         ]
-        (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
+        _write_tasks_json(tmp_path, tasks)
 
         worktrees_dir = tmp_path / '.worktrees'
         worktrees_dir.mkdir()
@@ -806,12 +800,10 @@ class TestDiscoverOrchestrators:
         config = DashboardConfig(project_root=tmp_path)
 
         # Create tasks.json so the shared task tree is populated
-        tasks_dir = tmp_path / '.taskmaster' / 'tasks'
-        tasks_dir.mkdir(parents=True)
         tasks = [
             {'id': '1', 'title': 'Setup', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
         ]
-        (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
+        _write_tasks_json(tmp_path, tasks)
 
         # Create a worktree so worktrees dict is populated
         wt_dir = tmp_path / '.worktrees' / '1'
@@ -923,12 +915,9 @@ class TestDiscoverOrchestrators:
         link.symlink_to(real_dir)
 
         # Create tasks.json under the real directory
-        (real_dir / ".taskmaster" / "tasks").mkdir(parents=True)
-        (real_dir / ".taskmaster" / "tasks" / "tasks.json").write_text(
-            json.dumps({"tasks": [
-                {"id": "1", "title": "T", "status": "done", "priority": "high", "dependencies": [], "metadata": {}},
-            ]})
-        )
+        _write_tasks_json(real_dir, [
+            {"id": "1", "title": "T", "status": "done", "priority": "high", "dependencies": [], "metadata": {}},
+        ])
 
         # Config points at the symlink — __post_init__ resolves it to real_dir
         config = DashboardConfig(project_root=link)
@@ -963,12 +952,9 @@ class TestDiscoverOrchestrators:
         link_dir.symlink_to(real_dir)
 
         # Create tasks.json under the real directory
-        (real_dir / ".taskmaster" / "tasks").mkdir(parents=True)
-        (real_dir / ".taskmaster" / "tasks" / "tasks.json").write_text(
-            json.dumps({"tasks": [
-                {"id": "2", "title": "Work", "status": "in-progress", "priority": "high", "dependencies": [], "metadata": {}},
-            ]})
-        )
+        _write_tasks_json(real_dir, [
+            {"id": "2", "title": "Work", "status": "in-progress", "priority": "high", "dependencies": [], "metadata": {}},
+        ])
 
         (tmp_path / "unrelated").mkdir()
         config = DashboardConfig(project_root=tmp_path / "unrelated")
