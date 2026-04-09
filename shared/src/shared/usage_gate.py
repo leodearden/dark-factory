@@ -76,6 +76,7 @@ class AccountState:
     pause_started_at: datetime | None = None
     resume_task: asyncio.Task | None = field(default=None, repr=False)
     probe_count: int = 0
+    near_cap: bool = False
     # Probe lifecycle:
     #   probing=True  → freshly uncapped by probe, first task should claim it
     #   probe_in_flight=True → one task is testing, others must wait
@@ -254,13 +255,18 @@ class UsageGate:
                     )
                     return True
 
-        for prefixes in (CAP_HIT_PREFIXES, NEAR_CAP_PREFIXES):
-            for prefix in prefixes:
-                if prefix.lower() in combined.lower():
-                    resets_at = _parse_resets_at(combined)
-                    reason = _extract_cap_message(combined, prefix) or f'Cap detected: {prefix}'
-                    self._handle_cap_detected(reason, resets_at, oauth_token)
-                    return True
+        for prefix in CAP_HIT_PREFIXES:
+            if prefix.lower() in combined.lower():
+                resets_at = _parse_resets_at(combined)
+                reason = _extract_cap_message(combined, prefix) or f'Cap detected: {prefix}'
+                self._handle_cap_detected(reason, resets_at, oauth_token)
+                return True
+
+        for prefix in NEAR_CAP_PREFIXES:
+            if prefix.lower() in combined.lower():
+                reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
+                self._handle_near_cap_warning(reason, oauth_token)
+                return True
 
         return False
 
@@ -283,6 +289,7 @@ class UsageGate:
             return
 
         acct.capped = True
+        acct.near_cap = False
         acct.probing = False
         acct.probe_in_flight = False
         acct.resets_at = resets_at
@@ -300,6 +307,25 @@ class UsageGate:
             if self._pause_started_at is None:
                 self._pause_started_at = datetime.now(UTC)
             logger.warning(f'Usage gate PAUSED: {self._paused_reason}')
+
+    def _handle_near_cap_warning(
+        self,
+        reason: str,
+        oauth_token: str | None,
+    ) -> None:
+        """Record a near-cap warning without blocking the account."""
+        acct = self._find_account_by_token(oauth_token) if oauth_token else None
+        if acct is None:
+            for a in self._accounts:
+                if not a.capped:
+                    acct = a
+                    break
+        if acct is None:
+            logger.warning(f'Near-cap warning but no matching account: {reason}')
+            return
+
+        acct.near_cap = True
+        logger.warning(f'Account {acct.name} NEAR CAP: {reason}')
 
     def _find_account_by_token(self, token: str) -> AccountState | None:
         for acct in self._accounts:
