@@ -74,6 +74,20 @@ class TestQueryEdgesByTimeRange:
         assert cypher_params.get('start') == start
         assert cypher_params.get('end') == end
 
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """query_edges_by_time_range uses ro_query (read-only path) and never calls graph.query."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.query_edges_by_time_range(
+            start='2026-03-22T17:50:00',
+            end='2026-03-22T18:15:00',
+            group_id='test',
+        )
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # step-3: GraphitiBackend.bulk_remove_edges
