@@ -314,7 +314,7 @@ class TestVllmUrlInjection:
         result = runner.invoke(main, ['eval', '--matrix', '--vllm-url', self._VLLM_URL])
 
         assert result.exit_code == 0, (
-            f'CLI exited with code {result.exit_code}.\nOutput: {result.output}'
+            f'CLI exited {result.exit_code}.\nOutput: {result.output}\nException: {result.exception}'
         )
         vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
         assert set(captured_state.keys()) >= vllm_names, (
@@ -330,3 +330,10 @@ class TestVllmUrlInjection:
             assert captured_state[name].get('ANTHROPIC_BASE_URL') == self._VLLM_URL, (
                 f'{name} missing ANTHROPIC_BASE_URL in captured env_overrides'
             )
+        cloud_with_base_url = [
+            name for name in self._CLOUD_BASELINE_NAMES
+            if name in captured_state and 'ANTHROPIC_BASE_URL' in captured_state[name]
+        ]
+        assert not cloud_with_base_url, (
+            f'Cloud baseline configs leaked ANTHROPIC_BASE_URL via CLI path: {cloud_with_base_url}'
+        )
