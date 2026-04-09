@@ -736,7 +736,9 @@ class TestRebuildSummariesManager:
         """
         import logging
         from unittest.mock import patch
+
         from fused_memory.maintenance.rebuild_summaries import run_rebuild_summaries
+
         mock_cfg = MagicMock()
         mock_service = AsyncMock()
         mock_service.graphiti = MagicMock()
@@ -749,12 +751,11 @@ class TestRebuildSummariesManager:
             'details': [],
         })
         fake_ctx = make_fake_maintenance_service(mock_cfg, mock_service)
-        with caplog.at_level(logging.INFO, logger='fused_memory.maintenance.rebuild_summaries'):
-            with patch(
-                'fused_memory.maintenance.rebuild_summaries.maintenance_service',
-                side_effect=fake_ctx,
-            ):
-                await run_rebuild_summaries(config_path='/fake/config.yaml', group_id='test')
+        with caplog.at_level(logging.INFO, logger='fused_memory.maintenance.rebuild_summaries'), patch(
+            'fused_memory.maintenance.rebuild_summaries.maintenance_service',
+            side_effect=fake_ctx,
+        ):
+            await run_rebuild_summaries(config_path='/fake/config.yaml', group_id='test')
         matching = [r for r in caplog.records if 'run_rebuild_summaries complete' in r.message]
         assert len(matching) == 1, (
             f'Expected exactly 1 summary log from run_rebuild_summaries, got {len(matching)}: '
@@ -771,6 +772,7 @@ class TestRebuildSummariesManager:
         duplicate summary lines appearing in production logs.
         """
         import logging
+
         from fused_memory.maintenance.rebuild_summaries import RebuildSummariesManager
         mock_backend = MagicMock()
         mock_backend.rebuild_entity_summaries = AsyncMock(return_value={
