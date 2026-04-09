@@ -62,3 +62,62 @@ class TestGetAllValidEdgesDistinctRationale:
             "Docstring must mention 'self-loop' to explain when DISTINCT actually matters: "
             "only for A→A edges where both traversal directions produce identical rows"
         )
+
+
+# ---------------------------------------------------------------------------
+# step-3: Returns section must document double-attribution semantics
+# ---------------------------------------------------------------------------
+
+
+class TestGetAllValidEdgesReturnsDoubleAttribution:
+    """get_all_valid_edges docstring Returns section must document double-attribution.
+
+    Because the undirected MATCH pattern matches each directed edge from both
+    endpoints, a directed A→B edge appears in the result under both A's UUID and
+    B's UUID.  The Returns section must communicate this intentional behavior.
+
+    Asserts:
+      (a) Returns section mentions 'both' source and target (or equivalent phrasing)
+      (b) Returns section mentions 'appears' in context of the double-attribution
+          OR uses phrasing like 'twice' / 'each endpoint' to describe the behavior
+    """
+
+    def _doc(self) -> str:
+        doc = GraphitiBackend.get_all_valid_edges.__doc__
+        assert doc is not None
+        return doc
+
+    def test_returns_mentions_both_endpoints(self) -> None:
+        """Returns section must note each directed edge appears under both endpoints."""
+        doc = self._doc()
+        # Accept any phrasing that communicates the double-attribution:
+        # 'both its source and target', 'both endpoints', 'both the source', etc.
+        has_both = (
+            'both' in doc
+            or re.search(r'appear[s]?\s+\w+\s+(source|target|endpoint)', doc) is not None
+            or 'twice' in doc
+        )
+        assert has_both, (
+            "Returns section must document double-attribution: each directed edge "
+            "appears under both its source and target entity UUID"
+        )
+
+    def test_returns_section_double_attribution_in_returns_block(self) -> None:
+        """Double-attribution note must appear in or near the Returns section."""
+        doc = self._doc()
+        # Find the Returns section
+        returns_idx = doc.find('Returns:')
+        assert returns_idx != -1, "Docstring must have a Returns: section"
+        returns_text = doc[returns_idx:]
+        # The double-attribution note should be in the Returns block or nearby
+        has_note = (
+            'both' in returns_text
+            or 'twice' in returns_text
+            or 'double' in returns_text
+            or 'each endpoint' in returns_text
+            or 'source and target' in returns_text
+        )
+        assert has_note, (
+            "Double-attribution note must appear in the Returns section; "
+            "callers need to know each directed edge appears under both endpoints"
+        )
