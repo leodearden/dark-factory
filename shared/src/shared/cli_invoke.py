@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
+_DEFAULT_MAX_CAP_RETRIES = 20
+_DEFAULT_CAP_RETRY_DEADLINE_SECS = 3600.0
 CAP_HIT_RESUME_PROMPT = (
     'Your previous run was interrupted by a usage limit. '
     'Continue where you left off and complete your task.'
@@ -38,9 +40,29 @@ CAP_HIT_RESUME_PROMPT = (
 __all__ = [
     'CAP_HIT_RESUME_PROMPT',
     'AgentResult',
+    'AllAccountsCappedException',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
 ]
+
+
+class AllAccountsCappedException(Exception):
+    """Raised when the cap-hit retry loop exceeds max retries or wall-clock deadline.
+
+    Attributes:
+    - ``retries``: number of consecutive cap hits before giving up
+    - ``elapsed_secs``: wall-clock seconds elapsed since first cap hit
+    - ``label``: caller label from invoke_with_cap_retry (e.g. "Task 7 [impl]")
+    """
+
+    def __init__(self, retries: int, elapsed_secs: float, label: str) -> None:
+        self.retries = retries
+        self.elapsed_secs = elapsed_secs
+        self.label = label
+        super().__init__(
+            f'{label}: all accounts capped after {retries} retries '
+            f'({elapsed_secs:.1f}s elapsed)'
+        )
 
 
 @dataclass
