@@ -5,6 +5,39 @@ from __future__ import annotations
 import pytest
 
 
+class TestWriteTasksJsonHelper:
+    """Tests for _write_tasks_json module-level helper."""
+
+    def test_creates_directory_and_file(self, tmp_path):
+        """Creates .taskmaster/tasks/tasks.json with correct JSON content."""
+        import json
+
+        tasks = [
+            {'id': '1', 'title': 'A', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+        ]
+        _write_tasks_json(tmp_path, tasks)
+
+        tasks_json = tmp_path / '.taskmaster' / 'tasks' / 'tasks.json'
+        assert tasks_json.exists()
+        data = json.loads(tasks_json.read_text())
+        assert data == {'tasks': tasks}
+
+    def test_idempotent_when_dir_exists(self, tmp_path):
+        """Pre-created .taskmaster/tasks/ dir causes no error; file is written correctly."""
+        import json
+
+        (tmp_path / '.taskmaster' / 'tasks').mkdir(parents=True)
+        tasks = [
+            {'id': '2', 'title': 'B', 'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}},
+        ]
+        _write_tasks_json(tmp_path, tasks)
+
+        tasks_json = tmp_path / '.taskmaster' / 'tasks' / 'tasks.json'
+        assert tasks_json.exists()
+        data = json.loads(tasks_json.read_text())
+        assert data == {'tasks': tasks}
+
+
 class TestFindRunningOrchestrators:
     """Tests for find_running_orchestrators — scans ps aux for orchestrator processes."""
 
