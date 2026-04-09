@@ -693,6 +693,57 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
         raise
 
 
+def reuse_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
+    """Attach to an existing pod by ID — skip creation, skip teardown.
+
+    Fetches SSH info from the API, opens a fresh tunnel, waits for vLLM
+    healthy, and returns a PodHandle with ``pod=None`` so tear_down_pod
+    is a no-op.
+    """
+    hf_model = cfg.env_overrides["MODEL_NAME"]
+    config = RunPodConfig(api_key=_load_runpod_api_key())
+    client = RunPodClient(config)
+
+    log(f"Reusing existing pod {args.pod_id}...")
+    pod = client.get_pod(args.pod_id)
+    if pod.ssh_host is None or pod.ssh_port is None:
+        raise PodBringupFailed(
+            f"Pod {args.pod_id} has no SSH info — is it RUNNING?"
+        )
+    log(f"SSH available: {pod.ssh_host}:{pod.ssh_port}")
+
+    log(f"Starting SSH tunnel (127.0.0.1:{args.port} → pod:8000)")
+    tunnel_proc = subprocess.Popen(
+        _build_ssh_tunnel_argv(
+            local_port=args.port,
+            ssh_host=pod.ssh_host,
+            ssh_port=pod.ssh_port,
+            ssh_key=SSH_KEY,
+        ),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    time.sleep(3)
+
+    log("Waiting for vLLM health check...")
+    if not wait_for_vllm(args.port, expected_model=hf_model, timeout=60):
+        tunnel_proc.terminate()
+        raise PodBringupFailed(
+            f"vLLM not healthy on reused pod {args.pod_id}"
+        )
+
+    log(f"vLLM healthy on port {args.port} (serving {hf_model})")
+    # Return with pod=None so tear_down_pod skips termination.
+    return PodHandle(
+        pod=None,
+        tunnel_proc=tunnel_proc,
+        client=client,
+        vllm_url=f"http://127.0.0.1:{args.port}",
+        local_port=args.port,
+        config_name=cfg.name,
+    )
+
+
 def tear_down_pod(handle: PodHandle | None) -> None:
     """Idempotent pod + tunnel teardown. Safe with None or partial handles."""
     if handle is None:
@@ -1137,6 +1188,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Abort the multi-task loop on first failed task; pod still terminated",
     )
 
+    p.add_argument(
+        "--pod-id",
+        default=None,
+        help=(
+            "Reuse an existing RunPod pod instead of creating a new one. "
+            "Skips pod creation and pod termination — the pod is left "
+            "running after the eval finishes. Useful for the test-debug "
+            "cycle: kill -9 a running launcher to keep the pod alive, "
+            "then re-run with --pod-id to reattach."
+        ),
+    )
+
     return p.parse_args(argv)
 
 
@@ -1222,7 +1285,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         try:
-            handle = bring_up_pod(cfg, args)
+            if args.pod_id:
+                handle = reuse_pod(cfg, args)
+            else:
+                handle = bring_up_pod(cfg, args)
         except PodBringupFailed as e:
             log(f"FATAL: pod bringup failed: {e}")
             return 1
