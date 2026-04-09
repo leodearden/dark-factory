@@ -128,6 +128,9 @@ class TestDeleteEntityNode:
         q_args = graph.query.call_args[0]
         q_params = q_args[1] if len(q_args) > 1 else {}
         assert q_params.get('uuid') == node_uuid
+        # Exactly-once routing contract: each slot called exactly once
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_raises_node_not_found_when_missing(self, mock_config, make_backend):
@@ -139,6 +142,7 @@ class TestDeleteEntityNode:
         backend._driver._get_graph = MagicMock(return_value=graph)
         with pytest.raises(NodeNotFoundError):
             await backend.delete_entity_node('missing-uuid', group_id='test')
+        graph.ro_query.assert_awaited_once()  # pre-check ran exactly once
         graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
