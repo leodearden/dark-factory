@@ -1031,3 +1031,53 @@ class TestAllAccountsCappedException:
         assert _DEFAULT_MAX_CAP_RETRIES == 20
         assert isinstance(_DEFAULT_CAP_RETRY_DEADLINE_SECS, float)
         assert _DEFAULT_CAP_RETRY_DEADLINE_SECS == 3600.0
+
+
+# ===================================================================
+# TestCapRetryMaxRetries
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryMaxRetries:
+    """max_cap_retries guard: raise AllAccountsCappedException after N cap hits."""
+
+    async def test_raises_after_max_cap_retries(self):
+        """With max_cap_retries=3, raises AllAccountsCappedException after exactly 3 cap hits."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 10),
+            detect_cap_hit=MagicMock(return_value=True),
+            active_account_name='acct',
+        )
+        result = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            with pytest.raises(AllAccountsCappedException) as exc_info:
+                await invoke_with_cap_retry(
+                    gate, 'Task-3', max_cap_retries=3, prompt='hi',
+                )
+        assert exc_info.value.retries == 3
+        assert 'Task-3' in str(exc_info.value)
+        assert mock_inv.await_count == 3
+
+    async def test_no_exception_when_cap_hits_under_limit(self):
+        """2 cap hits with max_cap_retries=3 succeeds on the 3rd invocation."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 3),
+            detect_cap_hit=MagicMock(side_effect=[True, True, False]),
+            active_account_name='acct',
+        )
+        result = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', max_cap_retries=3, prompt='hi',
+            )
+        assert got.success is True
+        assert mock_inv.await_count == 3
