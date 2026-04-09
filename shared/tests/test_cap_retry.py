@@ -1054,11 +1054,11 @@ class TestCapRetryMaxRetries:
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(AllAccountsCappedException) as exc_info,
         ):
-            with pytest.raises(AllAccountsCappedException) as exc_info:
-                await invoke_with_cap_retry(
-                    gate, 'Task-3', max_cap_retries=3, prompt='hi',
-                )
+            await invoke_with_cap_retry(
+                gate, 'Task-3', max_cap_retries=3, prompt='hi',
+            )
         assert exc_info.value.retries == 3
         assert 'Task-3' in str(exc_info.value)
         assert mock_inv.await_count == 3
@@ -1131,14 +1131,14 @@ class TestCapRetryDeadline:
             patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', side_effect=monotonic_values),
+            pytest.raises(AllAccountsCappedException) as exc_info,
         ):
-            with pytest.raises(AllAccountsCappedException) as exc_info:
-                await invoke_with_cap_retry(
-                    gate, 'deadline-task',
-                    cap_retry_deadline_secs=3600.0,
-                    max_cap_retries=None,
-                    prompt='hi',
-                )
+            await invoke_with_cap_retry(
+                gate, 'deadline-task',
+                cap_retry_deadline_secs=3600.0,
+                max_cap_retries=None,
+                prompt='hi',
+            )
         exc = exc_info.value
         assert exc.elapsed_secs > 3600.0
         assert exc.label == 'deadline-task'
@@ -1200,11 +1200,11 @@ class TestCapRetryHeuristicGuard:
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=heuristic_result) as mock_inv,
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(AllAccountsCappedException) as exc_info,
         ):
-            with pytest.raises(AllAccountsCappedException) as exc_info:
-                await invoke_with_cap_retry(
-                    gate, 'heuristic-task', max_cap_retries=2, prompt='hi',
-                )
+            await invoke_with_cap_retry(
+                gate, 'heuristic-task', max_cap_retries=2, prompt='hi',
+            )
         assert exc_info.value.retries == 2
         assert mock_inv.await_count == 2
 
@@ -1252,14 +1252,14 @@ class TestCapRetryGuardLogging:
             patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
             caplog.at_level(logging.ERROR, logger='shared.cli_invoke'),
+            pytest.raises(AllAccountsCappedException),
         ):
-            with pytest.raises(AllAccountsCappedException):
-                await invoke_with_cap_retry(
-                    gate, 'my-label',
-                    max_cap_retries=2,
-                    cap_retry_deadline_secs=None,
-                    prompt='hi',
-                )
+            await invoke_with_cap_retry(
+                gate, 'my-label',
+                max_cap_retries=2,
+                cap_retry_deadline_secs=None,
+                prompt='hi',
+            )
         assert any(
             'my-label' in record.message and record.levelno == logging.ERROR
             for record in caplog.records
@@ -1283,14 +1283,14 @@ class TestCapRetryGuardLogging:
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
             patch('shared.cli_invoke.time.monotonic', side_effect=monotonic_values),
             caplog.at_level(logging.ERROR, logger='shared.cli_invoke'),
+            pytest.raises(AllAccountsCappedException),
         ):
-            with pytest.raises(AllAccountsCappedException):
-                await invoke_with_cap_retry(
-                    gate, 'deadline-label',
-                    max_cap_retries=None,
-                    cap_retry_deadline_secs=3600.0,
-                    prompt='hi',
-                )
+            await invoke_with_cap_retry(
+                gate, 'deadline-label',
+                max_cap_retries=None,
+                cap_retry_deadline_secs=3600.0,
+                prompt='hi',
+            )
         error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
         assert len(error_msgs) >= 1
         assert any('deadline-label' in m for m in error_msgs), (
