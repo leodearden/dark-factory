@@ -10,7 +10,6 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from shared.usage_gate import UsageGate
@@ -36,14 +35,12 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 from fused_memory.reconciliation.task_filter import FilteredTaskTree, filter_task_tree
 from fused_memory.services.memory_service import MemoryService
 
-if TYPE_CHECKING:
-    from escalation.models import Escalation
-    from escalation.queue import EscalationQueue
-
 try:
-    from escalation.models import Escalation  # noqa: F811
-    from escalation.queue import EscalationQueue  # noqa: F811
-    from escalation.server import create_server as create_escalation_server
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    from escalation.server import (  # type: ignore[import-untyped]
+        create_server as create_escalation_server,
+    )
     HAS_ESCALATION = True
 except ImportError:
     HAS_ESCALATION = False
