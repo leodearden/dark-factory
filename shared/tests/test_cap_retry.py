@@ -14,9 +14,12 @@ import pytest
 
 from shared.cli_invoke import (
     _CAP_HIT_COOLDOWN_SECS,
+    _DEFAULT_CAP_RETRY_DEADLINE_SECS,
+    _DEFAULT_MAX_CAP_RETRIES,
     _MAX_CAP_COOLDOWN_SECS,
     CAP_HIT_RESUME_PROMPT,
     AgentResult,
+    AllAccountsCappedException,
     invoke_with_cap_retry,
 )
 from shared.config_models import AccountConfig, UsageCapConfig
@@ -992,3 +995,304 @@ class TestCapRetryWithRealGate:
         # Now cumulative = 0.60 >= 0.50, so the third should raise
         with pytest.raises(SessionBudgetExhausted), patch(_INVOKE_PATCH, new_callable=AsyncMock):
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+
+# ===================================================================
+# TestAllAccountsCappedException
+# ===================================================================
+
+
+class TestAllAccountsCappedException:
+    """AllAccountsCappedException: attributes and message format."""
+
+    def test_attributes_accessible(self):
+        """Exception stores retries, elapsed_secs, label as attributes."""
+        exc = AllAccountsCappedException(retries=5, elapsed_secs=120.5, label='my-task')
+        assert exc.retries == 5
+        assert exc.elapsed_secs == 120.5
+        assert exc.label == 'my-task'
+
+    def test_message_includes_all_three(self):
+        """Exception message includes retries, elapsed_secs, and label."""
+        exc = AllAccountsCappedException(retries=20, elapsed_secs=3601.0, label='Task 7')
+        msg = str(exc)
+        assert '20' in msg
+        assert '3601' in msg
+        assert 'Task 7' in msg
+
+    def test_is_exception(self):
+        """AllAccountsCappedException is an Exception subclass."""
+        exc = AllAccountsCappedException(retries=1, elapsed_secs=0.0, label='x')
+        assert isinstance(exc, Exception)
+
+    def test_default_constants_accessible(self):
+        """Module-level defaults are accessible from cli_invoke."""
+        assert isinstance(_DEFAULT_MAX_CAP_RETRIES, int)
+        assert _DEFAULT_MAX_CAP_RETRIES == 20
+        assert isinstance(_DEFAULT_CAP_RETRY_DEADLINE_SECS, float)
+        assert _DEFAULT_CAP_RETRY_DEADLINE_SECS == 3600.0
+
+
+# ===================================================================
+# TestCapRetryMaxRetries
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryMaxRetries:
+    """max_cap_retries guard: raise AllAccountsCappedException after N cap hits."""
+
+    async def test_raises_after_max_cap_retries(self):
+        """With max_cap_retries=3, raises AllAccountsCappedException after exactly 3 cap hits."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 10),
+            detect_cap_hit=MagicMock(return_value=True),
+            active_account_name='acct',
+        )
+        result = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(AllAccountsCappedException) as exc_info,
+        ):
+            await invoke_with_cap_retry(
+                gate, 'Task-3', max_cap_retries=3, prompt='hi',
+            )
+        assert exc_info.value.retries == 3
+        assert 'Task-3' in str(exc_info.value)
+        assert mock_inv.await_count == 3
+
+    async def test_no_exception_when_cap_hits_under_limit(self):
+        """2 cap hits with max_cap_retries=3 succeeds on the 3rd invocation."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 3),
+            detect_cap_hit=MagicMock(side_effect=[True, True, False]),
+            active_account_name='acct',
+        )
+        result = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', max_cap_retries=3, prompt='hi',
+            )
+        assert got.success is True
+        assert mock_inv.await_count == 3
+
+    async def test_none_disables_max_cap_retries(self):
+        """max_cap_retries=None disables the retry count guard; 5 cap hits then success."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 6),
+            detect_cap_hit=MagicMock(side_effect=[True] * 5 + [False]),
+            active_account_name='acct',
+        )
+        result = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl',
+                max_cap_retries=None,
+                cap_retry_deadline_secs=None,
+                prompt='hi',
+            )
+        assert got.success is True
+        assert mock_inv.await_count == 6
+
+
+# ===================================================================
+# TestCapRetryDeadline
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryDeadline:
+    """cap_retry_deadline_secs guard: raise AllAccountsCappedException when elapsed exceeds limit."""
+
+    async def test_raises_when_deadline_exceeded(self):
+        """When time.monotonic exceeds deadline, raises AllAccountsCappedException."""
+        # monotonic returns 0.0 first (retry_start), then 4000.0 on the elapsed check
+        # This simulates 4000 seconds elapsed, exceeding 3600s deadline
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 5),
+            detect_cap_hit=MagicMock(return_value=True),
+            active_account_name='acct',
+        )
+        result = make_result()
+        monotonic_values = iter([0.0, 4000.0])
+
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', side_effect=monotonic_values),
+            pytest.raises(AllAccountsCappedException) as exc_info,
+        ):
+            await invoke_with_cap_retry(
+                gate, 'deadline-task',
+                cap_retry_deadline_secs=3600.0,
+                max_cap_retries=None,
+                prompt='hi',
+            )
+        exc = exc_info.value
+        assert exc.elapsed_secs > 3600.0
+        assert exc.label == 'deadline-task'
+        assert exc.retries == 1
+
+    async def test_no_exception_when_within_deadline(self):
+        """When elapsed time is well under deadline, no exception is raised."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 3),
+            detect_cap_hit=MagicMock(side_effect=[True, True, False]),
+            active_account_name='acct',
+        )
+        result = make_result()
+        # All monotonic calls return 0.0, so elapsed is always 0.0 < 3600.0
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', return_value=0.0),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl',
+                cap_retry_deadline_secs=3600.0,
+                max_cap_retries=None,
+                prompt='hi',
+            )
+        assert got.success is True
+
+
+# ===================================================================
+# TestCapRetryHeuristicGuard
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryHeuristicGuard:
+    """Heuristic cap-hit branch (zero-cost instant exit) also respects max_cap_retries."""
+
+    def _make_heuristic_result(self) -> AgentResult:
+        """Zero-cost instant exit result that triggers the heuristic branch."""
+        return AgentResult(
+            success=False,
+            output='Usage limit reached',
+            cost_usd=0.0,
+            turns=1,
+            duration_ms=100,
+        )
+
+    async def test_heuristic_raises_after_max_retries(self):
+        """Heuristic cap hits count toward max_cap_retries and raise AllAccountsCappedException."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 5),
+            detect_cap_hit=MagicMock(return_value=False),  # not caught by pattern
+            active_account_name='acct',
+        )
+        gate._handle_cap_detected = MagicMock()
+        heuristic_result = self._make_heuristic_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=heuristic_result) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(AllAccountsCappedException) as exc_info,
+        ):
+            await invoke_with_cap_retry(
+                gate, 'heuristic-task', max_cap_retries=2, prompt='hi',
+            )
+        assert exc_info.value.retries == 2
+        assert mock_inv.await_count == 2
+
+    async def test_heuristic_succeeds_before_max_retries(self):
+        """1 heuristic hit then success does not raise (under max_cap_retries=2)."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 2),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        gate._handle_cap_detected = MagicMock()
+        heuristic_result = self._make_heuristic_result()
+        ok_result = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[heuristic_result, ok_result]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', max_cap_retries=2, prompt='hi',
+            )
+        assert got.success is True
+        assert mock_inv.await_count == 2
+
+
+# ===================================================================
+# TestCapRetryGuardLogging
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryGuardLogging:
+    """Verify logger.error is emitted with diagnostic info before raising."""
+
+    async def test_error_logged_before_max_retries_raise(self, caplog):
+        """logger.error includes label, retry count, and elapsed time on max_cap_retries hit."""
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok'] * 5),
+            detect_cap_hit=MagicMock(return_value=True),
+            active_account_name='acct',
+        )
+        result = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            caplog.at_level(logging.ERROR, logger='shared.cli_invoke'),
+            pytest.raises(AllAccountsCappedException),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'my-label',
+                max_cap_retries=2,
+                cap_retry_deadline_secs=None,
+                prompt='hi',
+            )
+        assert any(
+            'my-label' in record.message and record.levelno == logging.ERROR
+            for record in caplog.records
+        ), f'Expected error log with label. Got: {[r.message for r in caplog.records]}'
+        error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_msgs) >= 1
+        assert any('2' in m for m in error_msgs), 'Error log should include retry count'
+
+    async def test_error_logged_before_deadline_raise(self, caplog):
+        """logger.error includes label and elapsed time on deadline hit."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 5),
+            detect_cap_hit=MagicMock(return_value=True),
+            active_account_name='acct',
+        )
+        result = make_result()
+        monotonic_values = iter([0.0, 4000.0])
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', side_effect=monotonic_values),
+            caplog.at_level(logging.ERROR, logger='shared.cli_invoke'),
+            pytest.raises(AllAccountsCappedException),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'deadline-label',
+                max_cap_retries=None,
+                cap_retry_deadline_secs=3600.0,
+                prompt='hi',
+            )
+        error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_msgs) >= 1
+        assert any('deadline-label' in m for m in error_msgs), (
+            f'Error log should include label. Got: {error_msgs}'
+        )

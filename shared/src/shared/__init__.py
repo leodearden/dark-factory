@@ -4,6 +4,7 @@ from shared.async_sqlite_base import AsyncSqliteBase, apply_wal_pragmas
 from shared.cli_invoke import (
     CAP_HIT_RESUME_PROMPT,
     AgentResult,
+    AllAccountsCappedException,
     invoke_claude_agent,
     invoke_with_cap_retry,
 )
@@ -18,6 +19,7 @@ __all__ = [
     'apply_wal_pragmas',
     'CAP_HIT_RESUME_PROMPT',
     'AgentResult',
+    'AllAccountsCappedException',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
     'AccountConfig',
