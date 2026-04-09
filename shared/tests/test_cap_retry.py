@@ -14,9 +14,12 @@ import pytest
 
 from shared.cli_invoke import (
     _CAP_HIT_COOLDOWN_SECS,
+    _DEFAULT_CAP_RETRY_DEADLINE_SECS,
+    _DEFAULT_MAX_CAP_RETRIES,
     _MAX_CAP_COOLDOWN_SECS,
     CAP_HIT_RESUME_PROMPT,
     AgentResult,
+    AllAccountsCappedException,
     invoke_with_cap_retry,
 )
 from shared.config_models import AccountConfig, UsageCapConfig
@@ -992,3 +995,39 @@ class TestCapRetryWithRealGate:
         # Now cumulative = 0.60 >= 0.50, so the third should raise
         with pytest.raises(SessionBudgetExhausted), patch(_INVOKE_PATCH, new_callable=AsyncMock):
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+
+# ===================================================================
+# TestAllAccountsCappedException
+# ===================================================================
+
+
+class TestAllAccountsCappedException:
+    """AllAccountsCappedException: attributes and message format."""
+
+    def test_attributes_accessible(self):
+        """Exception stores retries, elapsed_secs, label as attributes."""
+        exc = AllAccountsCappedException(retries=5, elapsed_secs=120.5, label='my-task')
+        assert exc.retries == 5
+        assert exc.elapsed_secs == 120.5
+        assert exc.label == 'my-task'
+
+    def test_message_includes_all_three(self):
+        """Exception message includes retries, elapsed_secs, and label."""
+        exc = AllAccountsCappedException(retries=20, elapsed_secs=3601.0, label='Task 7')
+        msg = str(exc)
+        assert '20' in msg
+        assert '3601' in msg
+        assert 'Task 7' in msg
+
+    def test_is_exception(self):
+        """AllAccountsCappedException is an Exception subclass."""
+        exc = AllAccountsCappedException(retries=1, elapsed_secs=0.0, label='x')
+        assert isinstance(exc, Exception)
+
+    def test_default_constants_accessible(self):
+        """Module-level defaults are accessible from cli_invoke."""
+        assert isinstance(_DEFAULT_MAX_CAP_RETRIES, int)
+        assert _DEFAULT_MAX_CAP_RETRIES == 20
+        assert isinstance(_DEFAULT_CAP_RETRY_DEADLINE_SECS, float)
+        assert _DEFAULT_CAP_RETRY_DEADLINE_SECS == 3600.0
