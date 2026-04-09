@@ -303,7 +303,14 @@ async def run_eval_matrix(
     force: bool = False,
     timeout_override: int | None = None,
 ) -> list[EvalResult]:
-    """Run all (task, config, trial) combinations with bounded concurrency."""
+    """Run all (task, config, trial) combinations with bounded concurrency.
+
+    Raises:
+        asyncio.CancelledError: if any individual eval coroutine raises
+            CancelledError, or if this coroutine itself is cancelled from
+            outside.  In either case we log, cancel any still-running
+            sibling tasks, await their cleanup, and re-raise.
+    """
     configs = configs or EVAL_CONFIGS
 
     combos = [
@@ -353,6 +360,15 @@ async def run_eval_matrix(
         for tp, cfg, t in combos
     }
     results: list[EvalResult] = []
+    # Distinguish two cancellation scenarios:
+    #   Inner-task cancellation — an individual _run_one coroutine was cancelled
+    #     or raised CancelledError.  asyncio.wait surfaces this via
+    #     task.cancelled() or task.exception() inside the monitor loop below;
+    #     we log it, cancel siblings, and re-raise to propagate.
+    #   Outer-task cancellation — run_eval_matrix itself was cancelled (e.g.
+    #     SIGINT / asyncio.wait_for timeout).  The CancelledError interrupts
+    #     the *await asyncio.wait(...)* call directly and is caught by the
+    #     outer except clause, which performs the same sibling cleanup.
     try:
         while active:
             done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
