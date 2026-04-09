@@ -929,6 +929,52 @@ class TestDiscoverOrchestrators:
         assert result[0]["project_root"] == str(real_dir)
         assert result[0]["pids"] == [1234]
 
+    def test_multi_bare_processes_grouped_under_project_root(self, tmp_path):
+        """Multiple bare processes (no prd, no config_path) sharing the same config root are merged.
+
+        When several processes have neither prd nor config_path, _resolve_root falls back to
+        config.project_root for all of them.  They should be grouped into a single entry
+        with all PIDs listed in insertion order, and the 'running' flag should be True
+        if any individual process is still running.
+        """
+        import json
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        # Set up tasks.json with two tasks of different statuses
+        (tmp_path / ".taskmaster" / "tasks").mkdir(parents=True)
+        (tmp_path / ".taskmaster" / "tasks" / "tasks.json").write_text(
+            json.dumps({"tasks": [
+                {"id": "1", "title": "Alpha", "status": "done", "priority": "high", "dependencies": [], "metadata": {}},
+                {"id": "2", "title": "Beta", "status": "in-progress", "priority": "medium", "dependencies": [], "metadata": {}},
+            ]})
+        )
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        # Three bare processes: two running, one stopped — all fall back to config.project_root
+        mock_procs = [
+            {"pid": 1001, "prd": None, "config_path": None, "running": True, "started": "Apr09"},
+            {"pid": 1002, "prd": None, "config_path": None, "running": True, "started": "Apr09"},
+            {"pid": 1003, "prd": None, "config_path": None, "running": False, "started": "Apr09"},
+        ]
+        with patch("dashboard.data.orchestrator.find_running_orchestrators", return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        # All three bare processes share the same fallback root → single grouped entry
+        assert len(result) == 1
+        assert result[0]["pids"] == [1001, 1002, 1003]
+        assert result[0]["project_root"] == str(tmp_path.resolve())
+        assert result[0]["prd"] is None
+        # Label falls back to project_root when no PRD is present
+        assert result[0]["label"] == str(tmp_path.resolve())
+        # At least one process is running → grouped entry is running
+        assert result[0]["running"] is True
+        # Summary reflects the two tasks written to tasks.json
+        assert result[0]["summary"] == {"total": 2, "done": 1, "in_progress": 1, "blocked": 0, "pending": 0}
+
     def test_symlink_and_canonical_paths_grouped_into_single_entry(self, tmp_path):
         """Two processes whose PRDs resolve to the same project root are merged into one entry.
 
