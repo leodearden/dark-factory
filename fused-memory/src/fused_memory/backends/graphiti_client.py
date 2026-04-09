@@ -405,6 +405,8 @@ class GraphitiBackend:
     ) -> list[dict]:
         """Return edges whose valid_at falls within [start, end] (ISO 8601 strings).
 
+        Uses ro_query since no writes are performed.
+
         Args:
             start: ISO 8601 string for the lower bound (inclusive).
             end: ISO 8601 string for the upper bound (inclusive).
@@ -419,7 +421,7 @@ class GraphitiBackend:
             'WHERE e.valid_at >= $start AND e.valid_at <= $end '
             'RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at'
         )
-        result = await graph.query(cypher, {'start': start, 'end': end})
+        result = await graph.ro_query(cypher, {'start': start, 'end': end})
         return [
             {
                 'uuid': row[0],
@@ -1228,10 +1230,13 @@ class GraphitiBackend:
         return [g for g in all_graphs if g != 'default_db' and not g.endswith('_db')]
 
     async def node_count(self, graph_name: str) -> int:
-        """Count nodes in a specific FalkorDB graph."""
+        """Count nodes in a specific FalkorDB graph.
+
+        Uses ro_query since no writes are performed.
+        """
         client = self._require_client()
         graph = cast(Any, client.driver)._get_graph(graph_name)
-        result = await graph.query('MATCH (n) RETURN count(n) as count')
+        result = await graph.ro_query('MATCH (n) RETURN count(n) as count')
         return result.result_set[0][0] if result.result_set else 0
 
     async def close(self) -> None:
