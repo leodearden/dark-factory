@@ -479,6 +479,10 @@ class GraphitiBackend:
             fact and name default to empty string when the property is NULL.
             Each directed edge appears under both its source and target entity UUID
             (double-attribution from the undirected MATCH pattern).
+
+        Note:
+            Using a directed pattern (n:Entity)-[e:RELATES_TO]->() would give
+            single-appearance semantics per edge if ever needed.
         """
         graph = self._graph_for(group_id)
         cypher = (
