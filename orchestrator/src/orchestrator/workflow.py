@@ -1522,7 +1522,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             effort=effort_val,
             backend=backend_val,
             timeout_seconds=timeout_val,
-            env_overrides=(self.config.env_overrides or None) if role.name in ('implementer', 'debugger', 'judge') else None,
+            # Judge always hits Claude API — propagating ANTHROPIC_BASE_URL
+            # routes it through vLLM where max_model_len causes
+            # ServerDisconnectedError after 2 tool-use rounds (3cd380a079).
+            # Cap hits on Claude API are handled by UsageGate account failover
+            # (wired in runner.py for eval mode).
+            env_overrides=(self.config.env_overrides or None) if role.name in ('implementer', 'debugger') else None,
         )
         completed_at = datetime.now(UTC).isoformat()
 

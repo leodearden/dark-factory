@@ -22,6 +22,7 @@ from orchestrator.config import (
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from shared.usage_gate import UsageGate
 
 from .configs import EVAL_CONFIGS, EvalConfig
 from .metrics import collect_metrics
@@ -223,6 +224,14 @@ async def run_eval(
         )
     logger.info(f'Using fixed plan ({len(initial_plan.get("steps", []))} steps)')
 
+    # 5b. Usage gate for account failover (judge hits Claude API, may cap)
+    usage_gate: UsageGate | None = None
+    if orch_config.usage_cap.enabled:
+        try:
+            usage_gate = UsageGate(orch_config.usage_cap)
+        except Exception as exc:
+            logger.warning(f'Failed to create UsageGate for eval: {exc} — running without failover')
+
     # 6. Run the real workflow
     workflow = TaskWorkflow(
         assignment=assignment,
@@ -232,6 +241,7 @@ async def run_eval(
         briefing=briefing,
         mcp=mcp,  # type: ignore[arg-type]
         initial_plan=initial_plan,
+        usage_gate=usage_gate,
     )
 
     # Override worktree since we created it ourselves

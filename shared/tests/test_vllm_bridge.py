@@ -6,7 +6,12 @@ import aiohttp
 import pytest
 from aiohttp import web
 
-from shared.vllm_bridge import VllmBridge, _normalize_tool_use_block, _translate_messages_response
+from shared.vllm_bridge import (
+    VllmBridge,
+    _is_pad_token_response,
+    _normalize_tool_use_block,
+    _translate_messages_response,
+)
 
 
 class TestTranslateMessagesResponseConvertsOpenAIToolCalls:
@@ -193,6 +198,160 @@ class TestNormalizeToolUseBlockJsonStringInput:
         }
         result = _normalize_tool_use_block(block)
         assert result['name'] == 'get_weather'
+
+
+# ── Pad-token (NULL byte) detection ─────────────────────────────────────────
+
+
+class TestIsPadTokenResponse:
+
+    def test_normal_text_response_returns_false(self):
+        """A response with normal text content is not a pad-token response."""
+        body = {
+            'role': 'assistant',
+            'content': [{'type': 'text', 'text': 'Hello, world!'}],
+        }
+        assert _is_pad_token_response(body) is False
+
+    def test_all_null_text_response_returns_true(self):
+        """A response with all-NULL text content is a pad-token response."""
+        body = {
+            'role': 'assistant',
+            'content': [{'type': 'text', 'text': '\x00' * 1000}],
+        }
+        assert _is_pad_token_response(body) is True
+
+    def test_mixed_response_below_threshold_returns_false(self):
+        """A response with mostly real text and some NULLs is not flagged."""
+        # 10 NULLs out of 110 chars = ~9% — well below 50%
+        body = {
+            'role': 'assistant',
+            'content': [{'type': 'text', 'text': 'A' * 100 + '\x00' * 10}],
+        }
+        assert _is_pad_token_response(body) is False
+
+    def test_mixed_response_above_threshold_returns_true(self):
+        """A response with >50% NULLs is flagged."""
+        # 80 NULLs out of 100 chars = 80%
+        body = {
+            'role': 'assistant',
+            'content': [{'type': 'text', 'text': 'A' * 20 + '\x00' * 80}],
+        }
+        assert _is_pad_token_response(body) is True
+
+    def test_response_with_tool_use_blocks_returns_false(self):
+        """A response with tool_use blocks is never flagged, even with NULL text."""
+        body = {
+            'role': 'assistant',
+            'content': [
+                {'type': 'text', 'text': '\x00' * 1000},
+                {'type': 'tool_use', 'id': 'toolu_x', 'name': 'Read', 'input': {}},
+            ],
+        }
+        assert _is_pad_token_response(body) is False
+
+    def test_empty_content_list_returns_false(self):
+        """An empty content list is not a pad-token response."""
+        body = {'role': 'assistant', 'content': []}
+        assert _is_pad_token_response(body) is False
+
+    def test_no_content_key_returns_false(self):
+        """A body with no content key is not a pad-token response."""
+        body = {'role': 'assistant'}
+        assert _is_pad_token_response(body) is False
+
+    def test_string_content_all_nulls_returns_true(self):
+        """A response with string content (not list) that is all NULLs is flagged."""
+        body = {
+            'role': 'assistant',
+            'content': '\x00' * 500,
+        }
+        assert _is_pad_token_response(body) is True
+
+    def test_string_content_normal_returns_false(self):
+        """A response with normal string content is not flagged."""
+        body = {
+            'role': 'assistant',
+            'content': 'This is a normal response.',
+        }
+        assert _is_pad_token_response(body) is False
+
+    def test_multiple_text_blocks_aggregated(self):
+        """NULL ratio is computed across all text blocks combined."""
+        # Block 1: 50 NULLs, Block 2: 50 real chars → 50% exactly, not > 50%
+        body = {
+            'role': 'assistant',
+            'content': [
+                {'type': 'text', 'text': '\x00' * 50},
+                {'type': 'text', 'text': 'A' * 50},
+            ],
+        }
+        assert _is_pad_token_response(body) is False
+
+    def test_multiple_text_blocks_over_threshold(self):
+        """Multiple text blocks with >50% NULLs overall are flagged."""
+        # Block 1: 80 NULLs, Block 2: 20 real chars → 80%
+        body = {
+            'role': 'assistant',
+            'content': [
+                {'type': 'text', 'text': '\x00' * 80},
+                {'type': 'text', 'text': 'A' * 20},
+            ],
+        }
+        assert _is_pad_token_response(body) is True
+
+
+class TestTranslateMessagesResponsePadTokenDetection:
+
+    def test_pad_token_response_converted_to_error(self):
+        """A pad-token response is transformed into an error response."""
+        body = {
+            'role': 'assistant',
+            'content': [{'type': 'text', 'text': '\x00' * 1000}],
+            'stop_reason': 'end_turn',
+        }
+        result = _translate_messages_response(body)
+        assert result['type'] == 'error'
+        assert result['error']['type'] == 'invalid_response'
+        assert 'pad tokens' in result['error']['message']
+
+    def test_pad_token_response_with_string_content(self):
+        """A pad-token response with string content is transformed to error."""
+        body = {
+            'role': 'assistant',
+            'content': '\x00' * 500,
+            'stop_reason': 'end_turn',
+        }
+        result = _translate_messages_response(body)
+        assert result['type'] == 'error'
+        assert result['error']['type'] == 'invalid_response'
+
+    def test_normal_response_not_affected(self):
+        """Normal text response passes through the pad-token check unharmed."""
+        body = {
+            'role': 'assistant',
+            'content': [{'type': 'text', 'text': 'Let me help with that.'}],
+            'stop_reason': 'end_turn',
+        }
+        result = _translate_messages_response(body)
+        assert result['role'] == 'assistant'
+        assert result['content'] == [{'type': 'text', 'text': 'Let me help with that.'}]
+        assert 'type' not in result or result.get('type') != 'error'
+
+    def test_tool_use_with_null_text_not_converted_to_error(self):
+        """A response with tool_use blocks is not converted to error even with NULL text."""
+        body = {
+            'role': 'assistant',
+            'content': [
+                {'type': 'text', 'text': '\x00' * 100},
+                {'type': 'tool_use', 'id': 'toolu_abc', 'name': 'Read', 'input': {'path': '/x'}},
+            ],
+            'stop_reason': 'tool_use',
+        }
+        result = _translate_messages_response(body)
+        assert result.get('type') != 'error'
+        assert result['role'] == 'assistant'
+        assert result['stop_reason'] == 'tool_use'
 
 
 # ── VllmBridge server lifecycle ──────────────────────────────────────────────
