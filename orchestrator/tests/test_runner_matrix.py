@@ -21,6 +21,23 @@ from orchestrator.evals.runner import EvalResult, run_eval_matrix
 _CFG = EvalConfig(name='test-cfg', backend='claude', model='sonnet', effort='high')
 
 
+def _stem_loader(path: Path) -> dict:
+    """Minimal task dict used by all matrix tests.
+
+    Safe because every caller passes ``force=True``, which skips
+    ``_result_exists`` — the only place in the non-mocked ``_run_one``
+    closure that reads ``task['id']``.  ``run_eval`` is separately
+    monkeypatched in each test, so the dict is never deeply inspected.
+    """
+    return {'id': path.stem}
+
+
+@pytest.fixture()
+def patch_load_task(monkeypatch: pytest.MonkeyPatch):
+    """Patch ``runner_mod.load_task`` with the shared _stem_loader stub."""
+    monkeypatch.setattr(runner_mod, 'load_task', _stem_loader)
+
+
 @pytest.mark.asyncio
 class TestGatherContract:
     """Documents asyncio.gather(..., return_exceptions=True) stdlib contract.
@@ -44,7 +61,10 @@ class TestGatherContract:
             return_exceptions=True,
         )
 
-        # CancelledError is placed in the result list — it does NOT propagate
+        # CancelledError is placed in the result list — it does NOT propagate.
+        # The two-coroutine form also verifies insertion-order preservation:
+        # results[0] corresponds to _raise_cancel() (first arg) and
+        # results[1] corresponds to _return_value() (second arg).
         assert isinstance(results[0], asyncio.CancelledError)
         assert results[1] == 42
 
@@ -54,7 +74,7 @@ class TestRunEvalMatrixCancellation:
     """run_eval_matrix must re-raise asyncio.CancelledError instead of swallowing it."""
 
     async def test_run_eval_matrix_reraises_cancellederror(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ):
         """CancelledError from an inner eval propagates out of run_eval_matrix.
 
@@ -65,13 +85,9 @@ class TestRunEvalMatrixCancellation:
         task_path = tmp_path / 'task_a.json'
         task_path.touch()
 
-        def fake_load_task(path: Path) -> dict:
-            return {'id': path.stem}
-
         async def fake_run_eval(*args, **kwargs):
             raise asyncio.CancelledError('simulated cancel')
 
-        monkeypatch.setattr(runner_mod, 'load_task', fake_load_task)
         monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
 
         with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'), pytest.raises(asyncio.CancelledError):
@@ -101,7 +117,7 @@ class TestRunEvalMatrixCancellation:
         )
 
     async def test_cancel_wins_over_partial_results(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ):
         """CancelledError discards any partial results — cancellation wins.
 
@@ -115,9 +131,6 @@ class TestRunEvalMatrixCancellation:
         cancel_path.touch()
         ok_path.touch()
 
-        def fake_load_task(path: Path) -> dict:
-            return {'id': path.stem}
-
         async def fake_run_eval(task_path: Path, config: EvalConfig, *args, **kwargs) -> EvalResult:
             if 'cancel' in task_path.stem:
                 raise asyncio.CancelledError('simulated cancel')
@@ -129,7 +142,6 @@ class TestRunEvalMatrixCancellation:
                 worktree_path='/tmp/stub',
             )
 
-        monkeypatch.setattr(runner_mod, 'load_task', fake_load_task)
         monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
 
         with pytest.raises(asyncio.CancelledError):
@@ -145,7 +157,7 @@ class TestRunEvalMatrixNonCancelPath:
     """Non-cancel exceptions must be logged and the matrix must continue."""
 
     async def test_run_eval_matrix_logs_exception_and_returns_other_results(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ):
         """RuntimeError from one eval is logged; results from other evals are returned.
 
@@ -156,9 +168,6 @@ class TestRunEvalMatrixNonCancelPath:
         ok_path = tmp_path / 'task_ok.json'
         fail_path.touch()
         ok_path.touch()
-
-        def fake_load_task(path: Path) -> dict:
-            return {'id': path.stem}
 
         async def fake_run_eval(task_path: Path, config: EvalConfig, *args, **kwargs) -> EvalResult:
             if 'fail' in task_path.stem:
@@ -171,7 +180,6 @@ class TestRunEvalMatrixNonCancelPath:
                 worktree_path='/tmp/stub',
             )
 
-        monkeypatch.setattr(runner_mod, 'load_task', fake_load_task)
         monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
 
         with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'):
