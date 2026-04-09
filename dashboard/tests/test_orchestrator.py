@@ -1100,18 +1100,16 @@ class TestDiscoverOrchestratorsPerProject:
 
         # Project A
         proj_a = tmp_path / 'proj_a'
-        (proj_a / '.taskmaster' / 'tasks').mkdir(parents=True)
-        (proj_a / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+        _write_tasks_json(proj_a, [
             {'id': '1', 'title': 'A1', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
             {'id': '2', 'title': 'A2', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
-        ]}))
+        ])
 
         # Project B
         proj_b = tmp_path / 'proj_b'
-        (proj_b / '.taskmaster' / 'tasks').mkdir(parents=True)
-        (proj_b / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+        _write_tasks_json(proj_b, [
             {'id': '10', 'title': 'B1', 'status': 'pending', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ]}))
+        ])
 
         mock_procs = [
             {'pid': 1000, 'prd': str(proj_a / 'docs' / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
@@ -1142,10 +1140,9 @@ class TestDiscoverOrchestratorsPerProject:
 
         config = DashboardConfig(project_root=tmp_path)
 
-        (tmp_path / '.taskmaster' / 'tasks').mkdir(parents=True)
-        (tmp_path / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+        _write_tasks_json(tmp_path, [
             {'id': '1', 'title': 'T1', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ]}))
+        ])
 
         mock_procs = [
             {'pid': 1000, 'prd': str(tmp_path / 'prd1.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
@@ -1171,20 +1168,18 @@ class TestDiscoverOrchestratorsPerProject:
 
         # Project A with worktree for task 3
         proj_a = tmp_path / 'proj_a'
-        (proj_a / '.taskmaster' / 'tasks').mkdir(parents=True)
-        (proj_a / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+        _write_tasks_json(proj_a, [
             {'id': '3', 'title': 'A-task', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ]}))
+        ])
         wt_a = proj_a / '.worktrees' / '3' / '.task'
         wt_a.mkdir(parents=True)
         (wt_a / 'plan.json').write_text(json.dumps({'steps': [{'id': 's1', 'status': 'done'}]}))
 
         # Project B with worktree for task 5
         proj_b = tmp_path / 'proj_b'
-        (proj_b / '.taskmaster' / 'tasks').mkdir(parents=True)
-        (proj_b / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+        _write_tasks_json(proj_b, [
             {'id': '5', 'title': 'B-task', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ]}))
+        ])
         wt_b = proj_b / '.worktrees' / '5' / '.task'
         wt_b.mkdir(parents=True)
         (wt_b / 'plan.json').write_text(json.dumps({'steps': [{'id': 's1', 'status': 'pending'}]}))
@@ -1212,10 +1207,9 @@ class TestDiscoverOrchestratorsPerProject:
 
         config = DashboardConfig(project_root=tmp_path)
 
-        (tmp_path / '.taskmaster' / 'tasks').mkdir(parents=True)
-        (tmp_path / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+        _write_tasks_json(tmp_path, [
             {'id': '1', 'title': 'T', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ]}))
+        ])
 
         mock_procs = [{'pid': 1000, 'prd': '/nonexistent/prd.md', 'config_path': None, 'running': True, 'started': 'Mar18'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
@@ -1238,10 +1232,9 @@ class TestDiscoverOrchestratorsPerProject:
         link.symlink_to(real_dir)
 
         # Create tasks.json under the real directory so discover_orchestrators has data to read
-        (real_dir / '.taskmaster' / 'tasks').mkdir(parents=True)
-        (real_dir / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+        _write_tasks_json(real_dir, [
             {'id': '1', 'title': 'T', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ]}))
+        ])
 
         config = DashboardConfig(project_root=link)
 
