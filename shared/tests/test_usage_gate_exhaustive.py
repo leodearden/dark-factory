@@ -307,6 +307,32 @@ class TestNearCapStateDistinction:
         assert result is True
         assert acct.capped is True
 
+    def test_near_cap_then_cap_hit_sets_capped(self):
+        """Near-cap followed by cap-hit on the same account sets capped=True, near_cap=False."""
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+
+        gate.detect_cap_hit('', "You're now using extra compute credits. Your plan resets in 4h.")
+        assert acct.near_cap is True
+        assert acct.capped is False
+
+        gate.detect_cap_hit('', "You've hit your usage limit. Your plan resets in 3h.")
+        assert acct.capped is True
+        assert acct.near_cap is False
+
+    def test_near_cap_does_not_close_gate(self):
+        """A single-account gate must remain open after a NEAR_CAP message."""
+        gate = make_gate(['a'])
+        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 1h.")
+        assert gate._open.is_set() is True
+
+    def test_near_cap_does_not_start_resume_probe(self):
+        """NEAR_CAP must NOT launch a resume probe task."""
+        gate = make_gate(['a'], wait_for_reset=True)
+        gate.detect_cap_hit('', "You're now using extra compute credits. Your plan resets in 4h.")
+        acct = gate._accounts[0]
+        assert acct.resume_task is None
+
 
 # =========================================================================
 # TestResetTimeParsing
