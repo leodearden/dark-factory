@@ -1165,3 +1165,16 @@ class TestDetailRowJournalGuard:
         html = resp.text
         assert 'data-testid="journal-badge"' not in html
         assert 'x-show="open"' not in html
+
+    def test_detail_row_emitted_when_journal_count_positive(self, client):
+        """Default MOCK_RUNS (journal_entry_count=3): detail row and hx-get endpoint are present."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-show="open"' in html
+        assert 'hx-get="/partials/recon/run/run-001"' in html
+
+    def test_detail_row_has_x_cloak_when_journal_count_positive(self, client):
+        """Default MOCK_RUNS (journal_entry_count=3): detail row carries x-cloak."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-cloak' in html
