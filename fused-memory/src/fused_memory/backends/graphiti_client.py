@@ -477,6 +477,8 @@ class GraphitiBackend:
         Returns:
             Dict mapping entity UUID → list of edge dicts with keys: uuid, fact, name.
             fact and name default to empty string when the property is NULL.
+            Each directed edge appears under both its source and target entity UUID
+            (double-attribution from the undirected MATCH pattern).
         """
         graph = self._graph_for(group_id)
         cypher = (
