@@ -287,6 +287,16 @@ class TestVllmUrlInjection:
 
     def test_injection_propagates_to_eval_configs_via_shared_references(self, vllm_env_sandbox):
         """Mutating VLLM_EVAL_CONFIGS configs is visible through EVAL_CONFIGS (same objects)."""
+        # Precondition: EVAL_CONFIGS entries for vLLM configs must be the same Python objects.
+        # If a refactor copies instead of shares, this guard fails fast with a clear message
+        # rather than letting the mutation-propagation assertion below pass vacuously.
+        vllm_id_set = {id(c) for c in VLLM_EVAL_CONFIGS}
+        assert all(
+            id(c) in vllm_id_set for c in EVAL_CONFIGS if c.name in VLLM_NAMES
+        ), (
+            'Shared-reference invariant broken: vLLM entries in EVAL_CONFIGS are copies, '
+            'not the same objects as VLLM_EVAL_CONFIGS. Mutation tests will pass vacuously.'
+        )
         self._inject_vllm_url()
         # EVAL_CONFIGS spreads the same references, so the mutation must be visible
         eval_names_with_base_url = {
