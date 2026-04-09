@@ -207,6 +207,64 @@ class TestRunEvalMatrixCancellation:
         # (b) Total elapsed must be well under 2 s (gather would take ~2 s)
         assert elapsed < 1.0, f'Elapsed {elapsed:.2f}s ≥ 1.0s — siblings were not cancelled promptly'
 
+    async def test_external_cancel_cleans_up_all_tasks(
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        """External cancellation (e.g. SIGINT / asyncio.wait_for timeout) cleans up all tasks.
+
+        Wraps run_eval_matrix in asyncio.wait_for with a 0.3s timeout while
+        all evals sleep for 10s.  Asserts that:
+        (a) asyncio.TimeoutError (which wraps CancelledError in Python 3.11+)
+            is raised — the external cancel propagates out.
+        (b) A cancellation-tracking flag confirms that all tasks received
+            cancellation before run_eval_matrix returned.
+        """
+        path1 = tmp_path / 'task_a.json'
+        path2 = tmp_path / 'task_b.json'
+        path3 = tmp_path / 'task_c.json'
+        path1.touch()
+        path2.touch()
+        path3.touch()
+
+        cancelled_count = 0
+        started_count = 0
+
+        async def fake_run_eval(task_path: Path, config: EvalConfig, *args, **kwargs) -> EvalResult:
+            nonlocal cancelled_count, started_count
+            started_count += 1
+            try:
+                await asyncio.sleep(10.0)
+            except asyncio.CancelledError:
+                cancelled_count += 1
+                raise
+            return EvalResult(
+                task_id=task_path.stem,
+                config_name=config.name,
+                outcome='success',
+                metrics={},
+                worktree_path='/tmp/stub',
+            )
+
+        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+
+        # asyncio.wait_for raises TimeoutError (Python 3.11+) or CancelledError
+        with pytest.raises((asyncio.TimeoutError, asyncio.CancelledError)):
+            await asyncio.wait_for(
+                run_eval_matrix(
+                    [path1, path2, path3],
+                    [_CFG],
+                    force=True,
+                ),
+                timeout=0.3,
+            )
+
+        # All started tasks must have received cancellation
+        assert started_count > 0, 'No tasks were started'
+        assert cancelled_count == started_count, (
+            f'Only {cancelled_count}/{started_count} tasks were cancelled — '
+            'some tasks were left as orphans after external cancellation'
+        )
+
 
 @pytest.mark.asyncio
 class TestRunEvalMatrixNonCancelPath:
