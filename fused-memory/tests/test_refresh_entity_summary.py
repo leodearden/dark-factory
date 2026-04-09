@@ -15,6 +15,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from conftest import extract_cypher, extract_params
+
 from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
     GraphitiBackend,
@@ -81,8 +83,7 @@ class TestResolveEntityByName:
         await backend.resolve_entity_by_name(entity_name, group_id='test')
         call_args = graph.ro_query.call_args
         assert call_args is not None
-        args, kwargs = call_args
-        cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        cypher_params = extract_params(call_args)
         assert cypher_params.get('name') == entity_name
         graph.query.assert_not_awaited()
 
@@ -171,7 +172,7 @@ class TestGetValidEdgesForNode:
         await backend.get_valid_edges_for_node(node_uuid, group_id='test')
         call_args = graph.ro_query.call_args
         assert call_args is not None, "graph.ro_query was not called"
-        cypher_params = call_args.args[1]
+        cypher_params = extract_params(call_args)
         assert cypher_params.get('uuid') == node_uuid
 
     @pytest.mark.asyncio
@@ -183,7 +184,7 @@ class TestGetValidEdgesForNode:
         await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
         call_args = graph.ro_query.call_args
         assert call_args is not None, "graph.ro_query was not called"
-        cypher = call_args.args[0]
+        cypher = extract_cypher(call_args)
         assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
 
     @pytest.mark.asyncio
@@ -254,7 +255,7 @@ class TestUpdateNodeSummary:
         await backend.update_node_summary(node_uuid, summary, group_id='test')
         call_args = graph.query.call_args
         assert call_args is not None, "graph.query was not called"
-        cypher_params = call_args.args[1]
+        cypher_params = extract_params(call_args)
         assert cypher_params.get('uuid') == node_uuid
         assert cypher_params.get('summary') == summary
 
@@ -267,7 +268,7 @@ class TestUpdateNodeSummary:
         await backend.update_node_summary('node-uuid-1', 'some summary', group_id='test')
         call_args = graph.query.call_args
         assert call_args is not None, "graph.query was not called"
-        cypher = call_args.args[0]
+        cypher = extract_cypher(call_args)
         assert 'SET n.summary' in cypher, f"Cypher must SET n.summary: {cypher}"
 
     @pytest.mark.asyncio
