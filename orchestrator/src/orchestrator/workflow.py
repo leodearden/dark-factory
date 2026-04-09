@@ -1604,11 +1604,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Raises ``_StewardReescalated`` if the steward re-escalated to
         level-1 (human), indicating the task should be blocked.
+
+        When no escalation queue is available (e.g. eval mode), returns
+        an empty string immediately — the caller treats this as "no
+        resolution" and the workflow proceeds to ESCALATED/BLOCKED
+        via its normal path.
         """
+        if self.escalation_queue is None:
+            logger.warning(
+                'Task %s: _wait_for_resolution called without escalation_queue '
+                '(eval mode?) — returning immediately',
+                self.task_id,
+            )
+            return ''
+
         if self._escalation_event is None:
             self._escalation_event = asyncio.Event()
-
-        assert self.escalation_queue is not None
 
         # Wait for level-0 pending escalations to clear
         while True:
