@@ -219,12 +219,10 @@ class TestEdgeDict:
         result = GraphitiBackend._edge_dict('e-1', 'Alice knows Bob', None)
         assert result == {'uuid': 'e-1', 'fact': 'Alice knows Bob', 'name': ''}
 
-    def test_preserves_non_none_values(self):
-        """Non-None fact and name values are kept as-is."""
-        result = GraphitiBackend._edge_dict('e-42', 'some fact', 'some_name')
-        assert result['uuid'] == 'e-42'
-        assert result['fact'] == 'some fact'
-        assert result['name'] == 'some_name'
+    def test_both_none_coerced_to_empty_strings(self):
+        """Both fact and name None are coerced to empty strings."""
+        result = GraphitiBackend._edge_dict('e-null', None, None)
+        assert result == {'uuid': 'e-null', 'fact': '', 'name': ''}
 
 
 # ---------------------------------------------------------------------------
