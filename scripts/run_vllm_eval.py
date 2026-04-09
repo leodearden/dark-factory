@@ -34,8 +34,8 @@ from uuid import uuid4
 
 sys.path.insert(0, "/home/leo/src/runpod-toolkit")
 sys.path.insert(0, "/home/leo/src/dark-factory/orchestrator/src")
-from runpod_toolkit.config import RunPodConfig
-from runpod_toolkit.compute import RunPodClient, PodStatus
+from runpod_toolkit.config import RunPodConfig  # type: ignore[import]
+from runpod_toolkit.compute import RunPodClient, PodStatus  # type: ignore[import]
 from orchestrator.evals.configs import (
     get_config_by_name,
     VLLM_EVAL_CONFIGS,
@@ -47,7 +47,8 @@ from orchestrator.evals.configs import (
 # ---------------------------------------------------------------------------
 
 SSH_KEY = os.path.expanduser("~/.ssh/id_runpod")
-SSH_PUBKEY = open(SSH_KEY + ".pub").read().strip()
+with open(SSH_KEY + ".pub") as _fh:
+    SSH_PUBKEY = _fh.read().strip()
 
 PROJECT_ROOT = Path("/home/leo/src/dark-factory")
 ORCHESTRATOR_DIR = PROJECT_ROOT / "orchestrator"
