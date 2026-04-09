@@ -276,7 +276,7 @@ class TestVllmUrlInjection:
             cfg.name for cfg in EVAL_CONFIGS
             if cfg.env_overrides.get('ANTHROPIC_BASE_URL') == self._VLLM_URL
         }
-        assert VLLM_NAMES == eval_names_with_base_url, (
+        assert eval_names_with_base_url == VLLM_NAMES, (
             f'Shared-reference invariant broken.\n'
             f'  Expected: {VLLM_NAMES}\n'
             f'  Got ANTHROPIC_BASE_URL via EVAL_CONFIGS: {eval_names_with_base_url}'
