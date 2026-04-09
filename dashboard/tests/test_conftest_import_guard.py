@@ -49,11 +49,8 @@ def _first_non_stdlib_import_line(tree: ast.Module) -> int | None:
                 top_level = alias.name.split(".")[0]
                 if top_level not in stdlib:
                     return node.lineno
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                top_level = node.module.split(".")[0]
-                if top_level not in stdlib:
-                    return node.lineno
+        elif isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[0] not in stdlib:
+            return node.lineno
     return None
 
 
