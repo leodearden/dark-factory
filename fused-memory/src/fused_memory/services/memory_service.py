@@ -1302,7 +1302,12 @@ class MemoryService:
                         agent_id=agent_id,
                         session_id=session_id,
                         params={'force': force, 'dry_run': dry_run},
-                        result_summary=result if success else None,
+                        result_summary={
+                            'total_entities': result.get('total_entities', 0),
+                            'stale_entities': result.get('stale_entities', 0),
+                            'rebuilt': result.get('rebuilt', 0),
+                            'errors': result.get('errors', 0),
+                        } if success else None,
                         success=success,
                         error=error_msg,
                     )

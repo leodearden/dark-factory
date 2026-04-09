@@ -459,6 +459,65 @@ class TestMemoryServiceRebuildEntitySummaries:
         # Should NOT raise — journal failure must not mask the successful operation
         assert result['total_entities'] == 5
 
+    @pytest.mark.asyncio
+    async def test_journal_result_summary_is_condensed(self, mock_config):
+        """Journal result_summary must contain only aggregate fields, not 'details'.
+
+        The full backend result includes a 'details' list (one entry per rebuilt
+        entity with uuid, name, status, old_summary, new_summary, edge_count, error).
+        Passing this verbatim bloats the journal for large graphs. The service must
+        condense result_summary to only the four aggregate fields.
+        """
+        from fused_memory.services.memory_service import MemoryService
+        svc = MemoryService(mock_config)
+        svc.graphiti = MagicMock()
+        # Backend returns a result with a non-empty 'details' list (the bloat source)
+        svc.graphiti.rebuild_entity_summaries = AsyncMock(return_value={
+            'total_entities': 10,
+            'stale_entities': 4,
+            'rebuilt': 3,
+            'skipped': 1,
+            'errors': 0,
+            'details': [
+                {
+                    'uuid': 'u1', 'name': 'Alice', 'status': 'rebuilt',
+                    'old_summary': 'old text', 'new_summary': 'new text',
+                    'edge_count': 5, 'error': None,
+                },
+                {
+                    'uuid': 'u2', 'name': 'Bob', 'status': 'rebuilt',
+                    'old_summary': 'old bob', 'new_summary': 'new bob',
+                    'edge_count': 3, 'error': None,
+                },
+            ],
+        })
+        svc.mem0 = MagicMock()
+        svc.durable_queue = MagicMock()
+        svc.durable_queue.enqueue = AsyncMock(return_value=1)
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        svc.set_write_journal(mock_journal)
+        await svc.rebuild_entity_summaries(project_id='dark_factory', agent_id='test-agent')
+        mock_journal.log_write_op.assert_awaited_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        result_summary = call_kwargs.get('result_summary')
+        assert result_summary is not None, 'result_summary must be set on success'
+        # Must contain the four aggregate fields
+        assert 'total_entities' in result_summary
+        assert 'stale_entities' in result_summary
+        assert 'rebuilt' in result_summary
+        assert 'errors' in result_summary
+        # Must NOT contain the verbose 'details' list
+        assert 'details' not in result_summary, (
+            'result_summary must not include the per-entity details list — '
+            'it bloats the journal for large graphs'
+        )
+        # Values must match the backend result
+        assert result_summary['total_entities'] == 10
+        assert result_summary['stale_entities'] == 4
+        assert result_summary['rebuilt'] == 3
+        assert result_summary['errors'] == 0
+
 
 # ---------------------------------------------------------------------------
 # step-5: MCP tool rebuild_entity_summaries
@@ -664,6 +723,75 @@ class TestRebuildSummariesManager:
         assert result.stale_entities == 3
         assert result.rebuilt == 3
         assert len(result.details) == 1
+
+    @pytest.mark.asyncio
+    async def test_run_entrypoint_emits_exactly_one_summary_log(
+        self, make_fake_maintenance_service, caplog
+    ):
+        """run_rebuild_summaries() emits exactly one 'run_rebuild_summaries complete' log.
+
+        This is a regression guard: after removing the manager's summary log, the
+        entrypoint must still emit its own single summary line (no double-logging,
+        no silent dropping).
+        """
+        import logging
+        from unittest.mock import patch
+
+        from fused_memory.maintenance.rebuild_summaries import run_rebuild_summaries
+
+        mock_cfg = MagicMock()
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+        mock_service.graphiti.rebuild_entity_summaries = AsyncMock(return_value={
+            'total_entities': 5,
+            'stale_entities': 3,
+            'rebuilt': 3,
+            'skipped': 0,
+            'errors': 0,
+            'details': [],
+        })
+        fake_ctx = make_fake_maintenance_service(mock_cfg, mock_service)
+        with caplog.at_level(logging.INFO, logger='fused_memory.maintenance.rebuild_summaries'), patch(
+            'fused_memory.maintenance.rebuild_summaries.maintenance_service',
+            side_effect=fake_ctx,
+        ):
+            await run_rebuild_summaries(config_path='/fake/config.yaml', group_id='test')
+        matching = [r for r in caplog.records if 'run_rebuild_summaries complete' in r.message]
+        assert len(matching) == 1, (
+            f'Expected exactly 1 summary log from run_rebuild_summaries, got {len(matching)}: '
+            f'{[r.message for r in matching]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_manager_does_not_emit_summary_log(self, mock_config, caplog):
+        """RebuildSummariesManager.run() must NOT emit a summary log line.
+
+        Following the CleanupManager precedent, the inner manager emits only
+        operational per-item logs. The summary line belongs exclusively in the
+        outer run_rebuild_summaries() entrypoint. This test guards against
+        duplicate summary lines appearing in production logs.
+        """
+        import logging
+
+        from fused_memory.maintenance.rebuild_summaries import RebuildSummariesManager
+        mock_backend = MagicMock()
+        mock_backend.rebuild_entity_summaries = AsyncMock(return_value={
+            'total_entities': 3,
+            'stale_entities': 1,
+            'rebuilt': 1,
+            'skipped': 0,
+            'errors': 0,
+            'details': [],
+        })
+        manager = RebuildSummariesManager(backend=mock_backend, group_id='test')
+        with caplog.at_level(logging.INFO, logger='fused_memory.maintenance.rebuild_summaries'):
+            await manager.run()
+        # The manager must NOT emit a 'run complete' summary — that belongs in
+        # the outer entrypoint run_rebuild_summaries() only.
+        matching = [r for r in caplog.records if 'RebuildSummariesManager.run complete' in r.message]
+        assert matching == [], (
+            f'RebuildSummariesManager.run() emitted an unexpected summary log: {matching}'
+        )
 
 
 # ---------------------------------------------------------------------------

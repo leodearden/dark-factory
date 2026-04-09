@@ -54,7 +54,7 @@ class RebuildSummariesManager:
             force=force,
             dry_run=dry_run,
         )
-        result = RebuildResult(
+        return RebuildResult(
             total_entities=raw.get('total_entities', 0),
             stale_entities=raw.get('stale_entities', 0),
             rebuilt=raw.get('rebuilt', 0),
@@ -62,13 +62,6 @@ class RebuildSummariesManager:
             errors=raw.get('errors', 0),
             details=raw.get('details', []),
         )
-        logger.info(
-            'RebuildSummariesManager.run complete: total=%d stale=%d rebuilt=%d '
-            'skipped=%d errors=%d dry_run=%s force=%s',
-            result.total_entities, result.stale_entities, result.rebuilt,
-            result.skipped, result.errors, dry_run, force,
-        )
-        return result
 
 
 async def run_rebuild_summaries(
