@@ -1939,3 +1939,36 @@ class TestGhostLoopGuard:
         assert outcome == WorkflowOutcome.DONE
         # The implementer must NOT have been called (ghost-loop skipped)
         assert 'implementer' not in stub.calls
+
+
+# ---------------------------------------------------------------------------
+# Tests: Protocol Conformance — _SchedulerLike test doubles
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerProtocolConformance:
+    """Verify that test doubles satisfy the _SchedulerLike Protocol."""
+
+    def test_fake_scheduler_has_status_cache(self):
+        """FakeScheduler must have _status_cache to satisfy _SchedulerLike."""
+        fake = FakeScheduler()
+        assert hasattr(fake, '_status_cache'), (
+            'FakeScheduler is missing _status_cache required by the _SchedulerLike Protocol'
+        )
+        assert isinstance(fake._status_cache, dict), (
+            '_status_cache must be a dict[str, str]'
+        )
+
+    def test_eval_scheduler_has_status_cache(self):
+        """_EvalScheduler must have _status_cache to satisfy _SchedulerLike."""
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.runner import _EvalScheduler
+
+        cfg = OrchestratorConfig()
+        sched = _EvalScheduler(cfg)
+        assert hasattr(sched, '_status_cache'), (
+            '_EvalScheduler is missing _status_cache required by the _SchedulerLike Protocol'
+        )
+        assert isinstance(sched._status_cache, dict), (
+            '_status_cache must be a dict[str, str]'
+        )
