@@ -28,7 +28,8 @@ class TestDefaults:
     def test_default_values(self, monkeypatch, tmp_path):
         """Package defaults.yaml is loaded via settings_customise_sources."""
         monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        # Ensure no external config is loaded - must unset env before instantiation
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         defaults = _load_package_defaults()
         # Values from package defaults.yaml (not Pydantic field defaults)
