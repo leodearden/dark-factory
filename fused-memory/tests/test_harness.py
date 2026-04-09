@@ -1595,6 +1595,7 @@ class TestHarnessFilteredTaskTreeWiring:
     ):
         """run_full_cycle calls _fetch_filtered_task_tree exactly once with the project_root."""
         from unittest.mock import AsyncMock
+
         from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
@@ -1617,6 +1618,7 @@ class TestHarnessFilteredTaskTreeWiring:
     ):
         """run_full_cycle passes fetched filtered_task_tree to MemoryConsolidator via _configure_consolidator."""
         from unittest.mock import AsyncMock
+
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
@@ -1649,6 +1651,7 @@ class TestHarnessFilteredTaskTreeWiring:
     ):
         """run_full_cycle sets filtered_task_tree on TaskKnowledgeSync."""
         from unittest.mock import AsyncMock
+
         from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
@@ -1681,6 +1684,7 @@ class TestHarnessFilteredTaskTreeWiring:
     ):
         """_run_remediation_pass wires filtered_task_tree to MemoryConsolidator."""
         from unittest.mock import AsyncMock
+
         from fused_memory.reconciliation.harness import TierConfig
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
@@ -1722,6 +1726,7 @@ class TestHarnessFilteredTaskTreeWiring:
     ):
         """_run_remediation_pass wires filtered_task_tree to TaskKnowledgeSync."""
         from unittest.mock import AsyncMock
+
         from fused_memory.reconciliation.harness import TierConfig
         from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
