@@ -321,6 +321,20 @@ class TestListIndices:
         cypher = graph.ro_query.call_args[0][0]
         assert 'db.indexes' in cypher
 
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_cypher_via_kwargs(self, mock_config, make_backend, make_graph_mock):
+        """Regression: Cypher extraction survives kwargs-style call_args (IndexError guard)."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.list_indices(group_id='test')
+        # Simulate an implementation that passes the query as a keyword argument.
+        # The fragile pattern call_args[0][0] would raise IndexError here.
+        from unittest.mock import call
+        graph.ro_query.call_args = call(query='CALL db.indexes() YIELD *')
+        cypher = graph.ro_query.call_args[0][0]  # fragile: raises IndexError when args=()
+        assert 'db.indexes' in cypher
+
 
 class TestDropIndex:
     """GraphitiBackend.drop_index(label, field) generates correct DROP Cypher."""
