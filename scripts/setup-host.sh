@@ -306,7 +306,27 @@ if command -v skim &>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
-# 8. Claude Code skill symlinks
+# 8. Dashboard systemd units
+# ---------------------------------------------------------------------------
+info "Installing dashboard systemd units"
+
+sed \
+  -e "s|__REPO_ROOT__|$REPO_ROOT|g" \
+  -e "s|__UV_PATH__|$UV_PATH|g" \
+  "$REPO_ROOT/scripts/dashboard.service.template" \
+  > "$UNIT_DIR/dark-factory-dashboard.service"
+
+# Watchdog service + timer (no templating needed — no repo-specific paths)
+cp "$REPO_ROOT/dashboard/dark-factory-dashboard-watchdog.service" "$UNIT_DIR/"
+cp "$REPO_ROOT/dashboard/dark-factory-dashboard-watchdog.timer" "$UNIT_DIR/"
+
+systemctl --user daemon-reload
+systemctl --user enable dark-factory-dashboard
+systemctl --user enable dark-factory-dashboard-watchdog.timer
+ok "Dashboard units installed (start manually when ready: systemctl --user start dark-factory-dashboard)"
+
+# ---------------------------------------------------------------------------
+# 9. Claude Code skill symlinks
 # ---------------------------------------------------------------------------
 info "Creating Claude Code skill symlinks"
 
@@ -317,8 +337,13 @@ declare -A SKILLS=(
   ["orchestrate.md"]="$REPO_ROOT/skills/orchestrate/SKILL.md"
   ["orchestrate-references"]="$REPO_ROOT/skills/orchestrate/references"
   ["reflect.md"]="$REPO_ROOT/skills/reflect/SKILL.md"
-  ["semantic-merge.md"]="$REPO_ROOT/skills/semantic-merge/SKILL.md"
   ["unblock.md"]="$REPO_ROOT/skills/unblock/SKILL.md"
+  ["review.md"]="$REPO_ROOT/skills/review/SKILL.md"
+  ["review-references"]="$REPO_ROOT/skills/review/references"
+  ["review-briefing.md"]="$REPO_ROOT/skills/review-briefing/SKILL.md"
+  ["review-briefing-references"]="$REPO_ROOT/skills/review-briefing/references"
+  ["escalation-watcher.md"]="$REPO_ROOT/skills/escalation-watcher/SKILL.md"
+  ["merge-queue.md"]="$REPO_ROOT/skills/merge-queue/SKILL.md"
 )
 
 for name in "${!SKILLS[@]}"; do
@@ -333,7 +358,7 @@ for name in "${!SKILLS[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# 9. Git hooks
+# 10. Git hooks
 # ---------------------------------------------------------------------------
 info "Setting up git hooks"
 
@@ -345,26 +370,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 10. Manual steps reminder
+# 11. Manual steps reminder
 # ---------------------------------------------------------------------------
 info "Manual steps (if migrating from another host)"
 echo ""
-echo "  1. Copy secrets:"
-echo "     scp laptop:~/src/dark-factory/.env $REPO_ROOT/.env"
-echo "     scp laptop:~/src/dark-factory/fused-memory/.env $REPO_ROOT/fused-memory/.env"
+echo "  On the SOURCE host, run:"
+echo "    bash ~/src/dark-factory/scripts/export-data.sh"
 echo ""
-echo "  2. Copy Claude credentials:"
-echo "     scp laptop:~/.claude/.credentials.json ~/.claude/.credentials.json"
+echo "  This exports fused-memory data, pushes all branches to remote,"
+echo "  and prints rsync commands for transferring repos + data + credentials."
 echo ""
-echo "  3. Copy Claude settings + project memory:"
-echo "     rsync -av --exclude='projects/*worktrees*' laptop:~/.claude/ ~/.claude/"
-echo ""
-echo "  4. Import data (after running export-data.sh on the source host):"
-echo "     bash $REPO_ROOT/scripts/import-data.sh <export-dir>"
+echo "  On THIS host, after rsync completes:"
+echo "    bash $REPO_ROOT/scripts/import-data.sh ~/dark-factory-export"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 11. Health checks
+# 12. Health checks
 # ---------------------------------------------------------------------------
 info "Health checks"
 
