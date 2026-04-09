@@ -198,7 +198,7 @@ class TestGetValidEdgesForNode:
 
 
 # ---------------------------------------------------------------------------
-# step-3 (task-448): GraphitiBackend._edge_dict static helper
+# GraphitiBackend._edge_dict: edge dict normalisation helper
 # ---------------------------------------------------------------------------
 
 class TestEdgeDict:
@@ -212,19 +212,17 @@ class TestEdgeDict:
     def test_none_fact_coerced_to_empty_string(self):
         """None fact is coerced to '' in the returned dict."""
         result = GraphitiBackend._edge_dict('e-1', None, 'knows')
-        assert result['fact'] == ''
+        assert result == {'uuid': 'e-1', 'fact': '', 'name': 'knows'}
 
     def test_none_name_coerced_to_empty_string(self):
         """None name is coerced to '' in the returned dict."""
         result = GraphitiBackend._edge_dict('e-1', 'Alice knows Bob', None)
-        assert result['name'] == ''
+        assert result == {'uuid': 'e-1', 'fact': 'Alice knows Bob', 'name': ''}
 
-    def test_preserves_non_none_values(self):
-        """Non-None fact and name values are kept as-is."""
-        result = GraphitiBackend._edge_dict('e-42', 'some fact', 'some_name')
-        assert result['uuid'] == 'e-42'
-        assert result['fact'] == 'some fact'
-        assert result['name'] == 'some_name'
+    def test_both_none_coerced_to_empty_strings(self):
+        """Both fact and name None are coerced to empty strings."""
+        result = GraphitiBackend._edge_dict('e-null', None, None)
+        assert result == {'uuid': 'e-null', 'fact': '', 'name': ''}
 
 
 # ---------------------------------------------------------------------------
