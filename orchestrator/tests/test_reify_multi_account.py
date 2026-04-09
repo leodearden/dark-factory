@@ -13,15 +13,12 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
-
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import AccountState, UsageGate
-
 
 # ---------------------------------------------------------------------------
 # Constants — expected reify automation account pool (F→E→C→B→D)
@@ -233,7 +230,7 @@ class TestGateFromReifyConfig:
         assert len(gate._accounts) == 5, (
             f"Expected 5 AccountState entries, got {len(gate._accounts)}"
         )
-        for state, defn in zip(gate._accounts, REIFY_ACCOUNT_DEFS):
+        for state, defn in zip(gate._accounts, REIFY_ACCOUNT_DEFS, strict=False):
             assert state.name == defn['name']
             assert state.token is not None, (
                 f"Account {state.name!r} has None token — env var not resolved"
@@ -415,7 +412,7 @@ class TestAllCappedBlockResume:
         assert not gate.is_paused
 
         # Cap accounts one by one — gate is paused only when ALL are capped
-        for i, defn in enumerate(REIFY_ACCOUNT_DEFS):
+        for i, _defn in enumerate(REIFY_ACCOUNT_DEFS):
             gate._accounts[i].capped = True
             if i < len(REIFY_ACCOUNT_DEFS) - 1:
                 assert not gate.is_paused, (
