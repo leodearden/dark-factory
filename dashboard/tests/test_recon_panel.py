@@ -1155,3 +1155,13 @@ class TestDetailRowJournalGuard:
         with _patch_recon_data(runs=runs_zero):
             html = client.get('/partials/recon').text
         assert 'x-cloak' not in html
+
+    def test_no_error_when_journal_count_missing(self, client):
+        """When journal_entry_count key is absent the template must render 200, no badge, no detail row."""
+        run_no_key = {k: v for k, v in MOCK_RUNS[0].items() if k != 'journal_entry_count'}
+        with _patch_recon_data(runs=[run_no_key]):
+            resp = client.get('/partials/recon')
+        assert resp.status_code == 200
+        html = resp.text
+        assert 'data-testid="journal-badge"' not in html
+        assert 'x-show="open"' not in html
