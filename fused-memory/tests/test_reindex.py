@@ -318,7 +318,8 @@ class TestListIndices:
         await backend.list_indices(group_id='test')
         graph.ro_query.assert_awaited_once()
         graph.query.assert_not_awaited()
-        cypher = graph.ro_query.call_args[0][0]
+        args, kwargs = graph.ro_query.call_args
+        cypher = args[0] if args else kwargs.get('query', '')
         assert 'db.indexes' in cypher
 
     @pytest.mark.asyncio
@@ -328,11 +329,12 @@ class TestListIndices:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.list_indices(group_id='test')
-        # Simulate an implementation that passes the query as a keyword argument.
-        # The fragile pattern call_args[0][0] would raise IndexError here.
-        from unittest.mock import call
-        graph.ro_query.call_args = call(query='CALL db.indexes() YIELD *')
-        cypher = graph.ro_query.call_args[0][0]  # fragile: raises IndexError when args=()
+        # Simulate a kwargs-only call_args: args=(), kwargs={'query': '...'}.
+        # This is the 2-tuple form that Mock stores internally when ro_query
+        # would be called as ro_query(query='CALL db.indexes() YIELD *').
+        graph.ro_query.call_args = ((), {'query': 'CALL db.indexes() YIELD *'})
+        args, kwargs = graph.ro_query.call_args
+        cypher = args[0] if args else kwargs.get('query', '')
         assert 'db.indexes' in cypher
 
 
