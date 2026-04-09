@@ -118,13 +118,14 @@ VLLM_EVAL_CONFIGS = [
     # cache makes second-pull TTFT ≪ HF download once warm.
     # ENFORCE_EAGER=1 retained as a belt-and-braces against the
     # CUDA-graph-capture hang (vLLM #35504).
-    # Switched from baked image to :latest + HF download 2026-04-09 because
-    # the baked image predates the ENFORCE_EAGER entrypoint hook — the env var
-    # was set but the old entrypoint ignored it, causing the CUDA-graph hang.
+    # Qwen3-Coder-Next hangs on RTX PRO 6000 (SM120) even with ENFORCE_EAGER
+    # — both TP=1 and TP=2 hang at NCCL init before weight download.
+    # Use 1× H200 (SM90, 141 GB) which has no init hang and matches the
+    # DGX Spark VRAM class. 75 GB FP8 weights fit comfortably.
     _vllm_config('qwen3-coder-next-fp8-new',
         hf_model='Qwen/Qwen3-Coder-Next-FP8',
         image='leosiriusdawn/runpod-vllm:latest',
-        gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=200,
+        gpu_type=H200, gpu_count=1, container_disk_gb=200,
         tool_call_parser='qwen3_coder',
         enforce_eager=True),
     # REAP-139B NVFP4: ~79 GB on disk, baked into the image. Fits 1× RTX
@@ -154,15 +155,15 @@ VLLM_EVAL_CONFIGS = [
     # kernels work on SM120 without the NVFP4 CUDA crash bug (vLLM #35566).
     # Primary alternative for GB10/DGX Spark target after lukealonso NVFP4
     # was confirmed broken. Quality unknown — sparse docs, no published evals.
-    # AWQ 4-bit is compact (~35-40 GB VRAM) but KV cache on single 96 GB GPU
-    # is tight: 80k context needs 18.9 GiB KV, only 14.3 GiB available at
-    # GMU 0.95. Estimated max context is ~60k. Use max_model_len=55000 with
-    # GMU 0.97 for headroom. The 39k eval prompt + ~15k tool-turn slack fits.
+    # AWQ 4-bit: ~78 GB VRAM after load. Doesn't fit 80k context on 96 GB
+    # RTX PRO 6000 even at max_num_seqs=5. Use 1× H200 (141 GB) to match
+    # the DGX Spark deployment target (128 GB). Gives full 80k context with
+    # concurrency=5 and room to spare — faithful to production scenario.
     _vllm_config('reap-139b-awq-new',
         hf_model='cyankiwi/MiniMax-M2.5-REAP-139B-A10B-AWQ-4bit',
         image='leosiriusdawn/runpod-vllm:latest',
-        gpu_type=RTX_PRO_6000, gpu_count=1, container_disk_gb=100,
-        max_model_len=55000, gpu_memory_util=0.97,
+        gpu_type=H200, gpu_count=1, container_disk_gb=100,
+        max_model_len=80000, gpu_memory_util=0.95,
         tool_call_parser='minimax_m2'),
     # REAP-139B NVFP4 GB10 (saricles): 75 GB on disk, compressed-tensors
     # format via llm-compressor. Different quant than lukealonso — quantizes
@@ -172,6 +173,11 @@ VLLM_EVAL_CONFIGS = [
     # model card: VLLM_TEST_FORCE_FP8_MARLIN=1, VLLM_USE_FLASHINFER_MOE_FP4=0.
     # Same eos_token_id bug as lukealonso — needs override.
     # 2× RTX PRO 6000 for generous VRAM headroom (192 GB for 75 GB weights).
+    # STATUS (2026-04-09): BLOCKED — marlin MoE backend on SM120 causes infinite
+    # GPU kernel hang (100% SM, 0% mem, no progress for 13+ min). The workaround
+    # for vLLM #35566 doesn't crash but also doesn't complete. Weight download
+    # never starts because workers are stuck in initialization. Needs either:
+    # (a) vLLM fix for NVFP4 MoE on SM120, or (b) a DGX Spark (SM121a) pod.
     _vllm_config('reap-139b-nvfp4-gb10-new',
         hf_model='saricles/MiniMax-M2.5-REAP-139B-A10B-NVFP4-GB10',
         image='leosiriusdawn/runpod-vllm:latest',
@@ -196,24 +202,16 @@ VLLM_EVAL_CONFIGS = [
         max_model_len=80000, gpu_memory_util=0.95,
         quantization='fp8',
         tool_call_parser='minimax_m2'),
-    # REAP-172B NVFP4 GB10: ~93 GB on disk, baked. 2× RTX PRO 6000 (192 GB,
-    # TP=2 set automatically by _vllm_config for gpu_count>1). Hit a silent
-    # startup hang on 2026-04-08 matrix retry #3 — vLLM worker init looked
-    # normal through NCCL handshake then produced no further stdout for
-    # 120 min. Same class of failure as minimax-m25-nvfp4-new and
-    # reap-139b-nvfp4-new: vLLM 0.19's CUDA-graph profiler reserves more
-    # memory inside the GMU budget than 0.18 did, and default
-    # max_model_len=131072 + GMU 0.95 leaves too little KV-cache headroom.
-    # Fix: same recipe as the two fixed configs above — bump GMU to 0.97
-    # and cap context at 80k (39k eval prompt + 40k tool-turn slack).
-    # Same ModelOpt eos_token_id bug as reap-139b — saricles variant.
-    # Switched from baked to :latest 2026-04-09 — baked image lacks
-    # OVERRIDE_GENERATION_CONFIG entrypoint hook.
+    # REAP-172B NVFP4 GB10 (saricles compressed-tensors): ~93 GB on disk.
+    # NVFP4 MoE kernels are broken on SM120 (RTX PRO 6000 Blackwell) —
+    # both native and marlin backends hang. Use 1× H200 (SM90, 141 GB)
+    # where NVFP4 MoE works. Faithful to DGX Spark (128 GB) deployment.
+    # Same eos_token_id bug as reap-139b — needs override.
     _vllm_config('reap-172b-nvfp4-gb10-new',
         hf_model='saricles/MiniMax-M2.5-REAP-172B-A10B-NVFP4-GB10',
         image='leosiriusdawn/runpod-vllm:latest',
-        gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=250,
-        max_model_len=80000, gpu_memory_util=0.97,
+        gpu_type=H200, gpu_count=1, container_disk_gb=250,
+        max_model_len=80000, gpu_memory_util=0.95,
         tool_call_parser='minimax_m2',
         override_generation_config='{"eos_token_id": 200020}'),
     # MiniMax-M2.5 NVFP4 (nvidia): ~131 GB on disk, baked. 1× H200.
@@ -226,12 +224,16 @@ VLLM_EVAL_CONFIGS = [
     # Fix: same recipe as reap-139b-nvfp4-new (similar size + same hardware
     # tier) — bump GMU to 0.97 and cap context at 80k. The eval prompt is
     # ~39k tokens so 80k leaves ~40k of slack for tool turns.
+    # KV cache was tight at max_model_len=80000 with max_num_seqs=16.
+    # Baked image has old entrypoint (default 16), so override explicitly.
+    # (:latest configs get the new default of 5 automatically.)
     _vllm_config('minimax-m25-nvfp4-new',
         hf_model='nvidia/MiniMax-M2.5-NVFP4',
         image='leosiriusdawn/runpod-vllm:minimax-m25-nvfp4-baked',
         gpu_type=H200, gpu_count=1, container_disk_gb=240,
         max_model_len=80000, gpu_memory_util=0.97,
-        tool_call_parser='minimax_m2'),
+        tool_call_parser='minimax_m2',
+        extra_env={'MAX_NUM_SEQS': '5'}),
     # MiniMax-M2.5 FP8 (full): ~215 GB on disk, baked. Needs >192 GB VRAM.
     # Prefers 2× H200 (282 GB); falls back to 4× RTX PRO 6000 (384 GB)
     # when H200 fleet is sold out. Also trying B200 (192 GB single GPU)
@@ -241,7 +243,8 @@ VLLM_EVAL_CONFIGS = [
         image='leosiriusdawn/runpod-vllm:minimax-m25-fp8-baked',
         gpu_type=RTX_PRO_6000, gpu_count=4, container_disk_gb=320,
         quantization='fp8',
-        tool_call_parser='minimax_m2'),
+        tool_call_parser='minimax_m2',
+        extra_env={'MAX_NUM_SEQS': '5'}),
 
     # ===== 3090 tier (workstation) — not RunPod, image/gpu_type left None =====
     # leo-workstation RTX 3090 (24 GB). AWQ 4-bit quantization (compressed-

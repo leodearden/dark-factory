@@ -289,36 +289,29 @@ class VllmBridge:
     # smaller models (63k context, 131k context), we need to leave most of
     # the context for the prompt.  Eval prompts are ~31-39k tokens, so
     # reserving 75% for input and 25% for output is a safe starting point.
-    # 8k output tokens is still generous for tool calls + code generation.
-    _OUTPUT_FRACTION = 0.25
-    _MIN_OUTPUT_CAP = 4096    # Never clamp below 4k
-    _DEFAULT_OUTPUT_CAP = 8000  # Fallback when max_model_len is unknown
+    # 8k output tokens is generous for tool calls + code generation while
+    # leaving the vast majority of the context window for the prompt.
+    _DEFAULT_OUTPUT_CAP = 8192
 
     def _clamp_max_tokens(self, body: dict) -> None:
         """Clamp ``max_tokens`` to avoid context-length overflow.
 
-        Strategy: if ``max_output_tokens`` was provided at init, use it
-        directly. Otherwise, if we discovered ``max_model_len`` from the
-        upstream, cap ``max_tokens`` to 25% of the context (reserving 75%
-        for the prompt). This is conservative but avoids the 500 errors
-        that occur when Claude CLI's default 32k + a 31k eval prompt
-        exceeds the model's context window.
+        We don't know the prompt token count at request time (vLLM
+        tokenizes server-side), so we can't compute the exact remaining
+        budget.  Instead, clamp to a safe fixed cap: 8192 tokens is
+        enough for any single tool-call response and leaves 46k+ tokens
+        for the prompt on a 55k context model (or 55k+ on a 63k model).
+        If ``max_output_tokens`` was provided at init, use that instead.
         """
-        cap = self._max_output_tokens
-        if cap is None and self._max_model_len is not None:
-            cap = max(
-                self._MIN_OUTPUT_CAP,
-                int(self._max_model_len * self._OUTPUT_FRACTION),
-            )
+        cap = self._max_output_tokens or self._DEFAULT_OUTPUT_CAP
 
-        if cap is not None:
-            current = body.get('max_tokens')
-            if isinstance(current, int) and current > cap:
-                logger.info(
-                    'Clamping max_tokens from %d to %d (max_model_len=%s)',
-                    current, cap, self._max_model_len,
-                )
-                body['max_tokens'] = cap
+        current = body.get('max_tokens')
+        if isinstance(current, int) and current > cap:
+            logger.info(
+                'Clamping max_tokens from %d to %d (max_model_len=%s)',
+                current, cap, self._max_model_len,
+            )
+            body['max_tokens'] = cap
 
     async def __aenter__(self) -> VllmBridge:
         await self.start()

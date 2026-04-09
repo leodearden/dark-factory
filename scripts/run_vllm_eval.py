@@ -473,8 +473,13 @@ def wait_for_vllm(
     port: int,
     expected_model: str,
     timeout: int = 900,
+    tunnel_proc: subprocess.Popen | None = None,
 ) -> bool:
     """Poll vLLM until /health is 200 AND expected_model is in /v1/models.
+
+    If *tunnel_proc* is provided, each poll iteration checks whether the
+    SSH tunnel process is still alive.  A dead tunnel means vLLM is
+    unreachable — fail fast instead of polling a dead port for hours.
 
     The model-list check catches the case where the health probe has
     landed on a sibling tunnel (e.g. if ``ExitOnForwardFailure=yes`` is
@@ -490,6 +495,13 @@ def wait_for_vllm(
     models_url = f"http://127.0.0.1:{port}/v1/models"
     deadline = time.time() + timeout
     while time.time() < deadline:
+        # Fail fast if the SSH tunnel died.
+        if tunnel_proc is not None and tunnel_proc.poll() is not None:
+            log(
+                f"SSH tunnel died (rc={tunnel_proc.returncode}) — "
+                "vLLM is unreachable, aborting health wait"
+            )
+            return False
         try:
             if urllib.request.urlopen(health_url, timeout=5).status == 200:
                 resp = urllib.request.urlopen(models_url, timeout=5)
@@ -648,6 +660,7 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
             args.port,
             expected_model=hf_model,
             timeout=health_timeout,
+            tunnel_proc=tunnel_proc,
         ):
             log("Health timeout — checking pod status via SSH...")
             try:
@@ -735,7 +748,7 @@ def reuse_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
     time.sleep(3)
 
     log("Waiting for vLLM health check...")
-    if not wait_for_vllm(args.port, expected_model=hf_model, timeout=60):
+    if not wait_for_vllm(args.port, expected_model=hf_model, timeout=60, tunnel_proc=tunnel_proc):
         tunnel_proc.terminate()
         raise PodBringupFailed(
             f"vLLM not healthy on reused pod {args.pod_id}"
@@ -909,6 +922,27 @@ def run_one_task(
     """
     task_id = spec["id"]
     config_name = cfg.name
+
+    # Fail fast if the SSH tunnel died.
+    if handle.tunnel_proc is not None and handle.tunnel_proc.poll() is not None:
+        log(
+            f"SKIP: SSH tunnel dead (rc={handle.tunnel_proc.returncode}) "
+            f"before {task_id}"
+        )
+        return EvalSummary(
+            task_id=task_id,
+            config_name=config_name,
+            status="crashed",
+            outcome=None,
+            cost_usd=None,
+            duration_s=None,
+            tests_pass=None,
+            lint_clean=None,
+            typecheck_clean=None,
+            run_id=None,
+            result_path=None,
+            error="SSH tunnel dead before task start",
+        )
 
     if not vllm_healthy(handle.local_port, base_url=handle.vllm_url):
         log(
@@ -1206,14 +1240,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--concurrency",
         type=int,
-        default=1,
+        default=5,
         help=(
-            "Number of tasks to run in parallel against the same pod (1-5 "
-            "typical, capped by vLLM's --max-num-seqs 16). NOTE: at high "
-            "concurrency the reviewer fanout (5 sonnet calls/task) becomes "
-            "the binding constraint, not vLLM. Concurrent mode redirects "
-            "per-task subprocess output to /var/tmp/dark-factory-evals/. "
-            "Ctrl-C waits for in-flight tasks to drain — use sparingly."
+            "Number of tasks to run in parallel against the same pod. "
+            "Default 5 matches MAX_NUM_SEQS=5 in the entrypoint. "
+            "Concurrent mode redirects per-task subprocess output to "
+            "/var/tmp/dark-factory-evals/. Ctrl-C waits for in-flight "
+            "tasks to drain."
         ),
     )
 
