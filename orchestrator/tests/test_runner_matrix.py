@@ -89,6 +89,56 @@ class TestRunEvalMatrixCancellation:
             f'Got: {[r.message for r in caplog.records]}'
         )
 
+        # Negative guard: ensure the elif→if regression doesn't fire the 'failed' branch too.
+        # If CancelledError were caught by the BaseException branch first, both 'cancelled'
+        # and 'failed' would appear in the logs.
+        assert not any(
+            'failed' in record.message.lower()
+            for record in caplog.records
+        ), (
+            f'Unexpected "failed" log record — elif→if routing regression detected. '
+            f'Got: {[r.message for r in caplog.records]}'
+        )
+
+    async def test_cancel_wins_over_partial_results(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        """CancelledError discards any partial results — cancellation wins.
+
+        With two tasks (one cancels, one succeeds), the gather loop raises
+        CancelledError when it reaches the cancelled result, discarding the
+        successful result that follows.  This locks in the 'cancel discards
+        everything' contract.
+        """
+        cancel_path = tmp_path / 'task_cancel.json'
+        ok_path = tmp_path / 'task_ok.json'
+        cancel_path.touch()
+        ok_path.touch()
+
+        def fake_load_task(path: Path) -> dict:
+            return {'id': path.stem}
+
+        async def fake_run_eval(task_path: Path, config: EvalConfig, *args, **kwargs) -> EvalResult:
+            if 'cancel' in task_path.stem:
+                raise asyncio.CancelledError('simulated cancel')
+            return EvalResult(
+                task_id='task_ok',
+                config_name=config.name,
+                outcome='success',
+                metrics={},
+                worktree_path='/tmp/stub',
+            )
+
+        monkeypatch.setattr(runner_mod, 'load_task', fake_load_task)
+        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+
+        with pytest.raises(asyncio.CancelledError):
+            await run_eval_matrix(
+                [cancel_path, ok_path],
+                [_CFG],
+                force=True,
+            )
+
 
 @pytest.mark.asyncio
 class TestRunEvalMatrixNonCancelPath:
