@@ -34,6 +34,7 @@ def _vllm_config(
     max_model_len: int | None = None,
     gpu_memory_util: float | None = None,
     enforce_eager: bool = False,
+    override_generation_config: str | None = None,
 ) -> EvalConfig:
     """Build an EvalConfig that routes through a vLLM-compatible endpoint."""
     env = {
@@ -55,6 +56,11 @@ def _vllm_config(
         # qwen3-coder-next-fp8 startup hang (vLLM #35504). Requires the
         # entrypoint-vllm.sh hook in runpod-toolkit to take runtime effect.
         env['ENFORCE_EAGER'] = '1'
+    if override_generation_config:
+        # Fixes models with bogus eos_token_id in config.json — e.g.
+        # lukealonso REAP NVFP4 has eos_token_id=2 from ModelOpt but
+        # the real EOS is 200020. Without this, the model never stops.
+        env['OVERRIDE_GENERATION_CONFIG'] = override_generation_config
     return EvalConfig(
         name=name, backend='claude', model='sonnet', effort=effort,
         env_overrides=env,
@@ -120,12 +126,17 @@ VLLM_EVAL_CONFIGS = [
     # is tight; GMU 0.97 → ~10 GB KV pool, cap context at 80k for
     # 40k+ tool-turn slack on the 39k-token eval prompt.
     # MiniMax M2.5 emits <minimax:tool_call> XML — must use minimax_m2 parser.
+    # REAP NVFP4 models have bogus eos_token_id=2 in config.json injected
+    # by NVIDIA ModelOpt v0.39.0. The real EOS is 200020 (generation_config).
+    # Without the override, vLLM reads eos=2, the model never generates it,
+    # and generation runs to max_model_len producing pad tokens.
     _vllm_config('reap-139b-nvfp4-new',
         hf_model='lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4',
         image='leosiriusdawn/runpod-vllm:reap-139b-nvfp4-baked',
         gpu_type=RTX_PRO_6000, gpu_count=1, container_disk_gb=180,
         max_model_len=80000, gpu_memory_util=0.97,
-        tool_call_parser='minimax_m2'),
+        tool_call_parser='minimax_m2',
+        override_generation_config='{"eos_token_id": 200020}'),
     # REAP-172B NVFP4 GB10: ~93 GB on disk, baked. 2× RTX PRO 6000 (192 GB,
     # TP=2 set automatically by _vllm_config for gpu_count>1). Hit a silent
     # startup hang on 2026-04-08 matrix retry #3 — vLLM worker init looked
@@ -136,12 +147,14 @@ VLLM_EVAL_CONFIGS = [
     # max_model_len=131072 + GMU 0.95 leaves too little KV-cache headroom.
     # Fix: same recipe as the two fixed configs above — bump GMU to 0.97
     # and cap context at 80k (39k eval prompt + 40k tool-turn slack).
+    # Same ModelOpt eos_token_id bug as reap-139b — saricles variant.
     _vllm_config('reap-172b-nvfp4-gb10-new',
         hf_model='saricles/MiniMax-M2.5-REAP-172B-A10B-NVFP4-GB10',
         image='leosiriusdawn/runpod-vllm:reap-172b-nvfp4-gb10-baked',
         gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=200,
         max_model_len=80000, gpu_memory_util=0.97,
-        tool_call_parser='minimax_m2'),
+        tool_call_parser='minimax_m2',
+        override_generation_config='{"eos_token_id": 200020}'),
     # MiniMax-M2.5 NVFP4 (nvidia): ~131 GB on disk, baked. 1× H200.
     # KV cache budget after weights + CUDA graphs is tight on a single H200:
     # at default GMU 0.95 + max_model_len 131072, vLLM 0.19 needs 15.5 GB

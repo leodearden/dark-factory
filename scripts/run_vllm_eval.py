@@ -546,6 +546,7 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
             "GPU_MEMORY_UTIL",
             "MAX_NUM_SEQS",
             "ENFORCE_EAGER",
+            "OVERRIDE_GENERATION_CONFIG",
         )
         if k in cfg.env_overrides
     }
