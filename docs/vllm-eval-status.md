@@ -1,7 +1,67 @@
 # vLLM Local Model Evaluation — Status Report
 
-**Last updated:** 2026-04-09 09:15 BST
-**Status:** NULL-byte blocker fully diagnosed and resolved. Root cause was TWO independent bugs: (1) bridge 5-min aiohttp timeout killing all single-GPU requests, (2) `lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4` is a **broken quantization** — outputs pure `\x00` pad tokens for ANY input, confirmed with trivial "Say hello" prompt on live pod. minimax-m25-fp8-new (full model, 4× GPU) confirmed working: rapid-fire 200 OK tool-call responses. Bridge timeout fixed, null-work guard deployed, judge routing fixed, `--pod-id` reuse feature landed. **reap-139b-nvfp4 (lukealonso) is dead — need alternative quantization for GB10/DGX Spark target.**
+**Last updated:** 2026-04-09 ~13:30 BST
+**Status:** Alternative REAP-139B quantizations researched and tested. AWQ confirmed working (coherent output, tool calls parse). SM120 (RTX PRO 6000 Blackwell) is broadly broken for NVFP4 MoE models — moving affected configs to H200 (SM90). Bridge max_tokens clamping, tunnel liveness detection, and concurrent task execution all fixed. minimax-m25-fp8-new and reap-139b-fp8-new running full eval sets. Workstation eval (qwen3-coder-30b-q4) had first successful tool-call turns after bridge max_tokens fix.
+
+## Update 2026-04-09 afternoon: alternative quantizations, H200 pivot, infra fixes
+
+### TL;DR
+
+- **3 alternative REAP-139B configs added** (`88ec6a3ccf`): cyankiwi AWQ-4bit, saricles NVFP4-GB10+marlin, cerebras FP8 source. AWQ confirmed working on live pod — coherent text, correct `minimax_m2` tool calls, no NULL bytes, no EOS override needed.
+- **SM120 (RTX PRO 6000 Blackwell) is broken for NVFP4 MoE** — both native and marlin backends hang or crash (vLLM #35566). Qwen3-Coder-Next also has an init hang on SM120 unrelated to CUDA graphs. All three configs moved to **1× H200 (SM90, 141 GB)** for DGX Spark fidelity.
+- **MAX_NUM_SEQS 16→5** in entrypoint default — 16 pre-allocated KV slots wasted VRAM on single-session eval pods. 5 matches realistic concurrency ceiling for tool-use workloads. This fix alone recovered enough KV budget for 80k context on configs that were crashing at the old default.
+- **Bridge max_tokens clamping** — Claude CLI sends `max_tokens=32000` by default. On tight context models (55–65k), prompt (41k) + output (32k) > context → vLLM 400 error on every first request. Fixed to clamp to 8192 (enough for any tool-call response). This was the root cause of ALL prior workstation eval failures.
+- **Tunnel liveness detection** — `wait_for_vllm()` and `run_one_task()` now check `tunnel_proc.poll()`. Dead SSH tunnels fail fast instead of polling a dead port for hours (was the most common eval failure mode this session).
+- **Default concurrency 1→5** — all 5 tasks now run in parallel against the same pod, matching MAX_NUM_SEQS=5. Previously serialized.
+- **Entrypoint quoting fix** — `exec $CMD` → `eval exec $CMD` so JSON values in `--override-generation-config` don't get word-split by bash.
+- **RunPod SDK GraphQL fix** — env var values containing JSON double quotes broke the mutation. Patched both installed copies of `pods.py`.
+- **Workstation eval first success** — qwen3-coder-30b-q4 on RTX 3090 served its first successful tool-call turns after the max_tokens clamp fix. 63k context = ~16 turns per iteration.
+- **Docker image rebuilt 3×** this session — each time layering the updated entrypoint onto `:latest`. Final digest: `sha256:2ef3572b29d9...`.
+
+### Research findings
+
+**lukealonso NVFP4 investigation**: Author acknowledged a broken initial upload (fixed Feb 22). Model only documents SGLang, not vLLM. Our config was missing `--quantization modelopt_fp4`. Quantized with dev build ModelOpt v0.39.0.dev290. Multiple vLLM issues document NVFP4 MoE failures on SM120.
+
+**Alternative REAP-139B quantizations found on HuggingFace**:
+| Variant | Disk | VRAM | SM120? |
+|---------|------|------|--------|
+| cyankiwi AWQ-4bit | ~23 GB | ~78 GB | ✅ W4A16 works |
+| saricles NVFP4-GB10 | 75 GB | ~75 GB | ❌ Hangs (marlin too) |
+| cerebras FP8 source | 131 GB | ~131 GB | ✅ on 2× GPU |
+
+### Configs amended (not yet all re-run)
+
+| Config | GPU change | Rationale |
+|--------|-----------|-----------|
+| reap-139b-awq-new | RTX PRO 6000 → **H200** | 78 GB VRAM after load; 80k context needs >96 GB |
+| reap-172b-nvfp4-gb10-new | 2× RTX PRO 6000 → **H200** | NVFP4 MoE kernel broken on SM120 |
+| qwen3-coder-next-fp8-new | 2× RTX PRO 6000 → **H200** | Init hang on SM120 even with ENFORCE_EAGER |
+| minimax-m25-nvfp4-new | H200 (unchanged) | max_model_len 80k→80k, MAX_NUM_SEQS=5 override |
+
+### Still running at session end
+
+| Config | Pod | GPU | Status |
+|--------|-----|-----|--------|
+| minimax-m25-fp8-new | jp3l5avxpfqe7s | 4× RTX PRO 6000 | Running eval tasks |
+| reap-139b-fp8-new | 1xl0cvwv5tju2a | 2× RTX PRO 6000 | Running eval tasks |
+| qwen3-coder-30b-q4 | workstation | RTX 3090 | Running (if vLLM still up) |
+
+### Commits this session
+
+| Commit | Description |
+|--------|-------------|
+| `88ec6a3ccf` | Alt REAP-139B configs, tunnel liveness, concurrent tasks, bridge max_tokens clamp |
+| runpod-toolkit `5beea4e` | MAX_NUM_SEQS 16→5, MOE_BACKEND hook, eval exec quoting fix |
+
+### Next-session priorities
+
+1. **Check results** from minimax-fp8 and reap-139b-fp8 (should have finished by then)
+2. **Launch H200 configs**: AWQ, reap-172b, qwen3-fp8, minimax-nvfp4 — all amended, ready to go
+3. **Run sonnet-max baseline** if the existing results are too stale (pre-ε/pre-ζ)
+4. **Elo tournament** once we have ≥3 clean full-set results per config
+5. **Investigate SSH tunnel stability** — tunnels dying mid-eval was the #1 failure mode
+
+---
 
 ## Update 2026-04-09 morning: NULL-byte root cause — broken quantization + bridge timeout
 
