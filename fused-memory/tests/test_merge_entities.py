@@ -142,6 +142,7 @@ class TestDeleteEntityNode:
         backend._driver._get_graph = MagicMock(return_value=graph)
         with pytest.raises(NodeNotFoundError):
             await backend.delete_entity_node('missing-uuid', group_id='test')
+        graph.ro_query.assert_awaited_once()  # pre-check ran exactly once
         graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
