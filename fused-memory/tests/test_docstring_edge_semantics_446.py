@@ -13,7 +13,6 @@ import re
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
 
-
 # ---------------------------------------------------------------------------
 # step-1: DISTINCT rationale must be corrected
 # ---------------------------------------------------------------------------
