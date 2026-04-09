@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from orchestrator.evals.metrics import (
     EvalMetrics,
     _is_false_green,
@@ -48,7 +50,7 @@ class TestFalseGreenGuard:
     """The 404-bug signature: capped iterations, $0 cost, no diff, yet T/T/T."""
 
     def _sig(self, **overrides) -> EvalMetrics:
-        base = dict(
+        base: dict[str, Any] = dict(
             tests_pass=True,
             lint_clean=True,
             typecheck_clean=True,
@@ -110,7 +112,7 @@ class TestNullWorkGuard:
     """NULL-byte implementer signature: real inference, zero code changes."""
 
     def _sig(self, **overrides) -> EvalMetrics:
-        base = dict(
+        base: dict[str, Any] = dict(
             tests_pass=True,
             lint_clean=True,
             typecheck_clean=True,
