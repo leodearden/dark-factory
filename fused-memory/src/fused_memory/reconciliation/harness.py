@@ -29,6 +29,7 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+from fused_memory.reconciliation.task_filter import FilteredTaskTree, filter_task_tree
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
@@ -154,6 +155,31 @@ class ReconciliationHarness:
         stage.cycle_fence_time = cycle_fence_time
         stage.assembled_payload = assembled_payload
         stage.remediation_findings = remediation_findings
+
+    async def _fetch_filtered_task_tree(self, project_root: str) -> FilteredTaskTree:
+        """Fetch the task tree once and return a filtered subset of active tasks.
+
+        Degrades gracefully on failure — returns an empty FilteredTaskTree so
+        stages can still do useful memory work without task data. (ref: task 455)
+
+        Args:
+            project_root: Absolute path to the project root for taskmaster.
+
+        Returns:
+            FilteredTaskTree with active tasks sorted by priority and aggregate
+            counts. Returns empty FilteredTaskTree if taskmaster is unavailable,
+            project_root is empty, or the fetch fails.
+        """
+        if not self.taskmaster or not project_root:
+            return FilteredTaskTree()
+        try:
+            tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
+            return filter_task_tree(tasks_data)
+        except Exception as exc:
+            logger.warning(
+                f'_fetch_filtered_task_tree failed for {project_root!r}: {exc}'
+            )
+            return FilteredTaskTree()
 
     # ── Stale-run recovery ─────────────────────────────────────────────
 
