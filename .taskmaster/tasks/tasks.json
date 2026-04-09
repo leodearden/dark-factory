@@ -11147,6 +11147,17 @@
           },
           "_causation_id": "50cd0596-7912-4809-b746-fbd02918aa1c"
         }
+      },
+      {
+        "id": 591,
+        "title": "Add deadline/max-retry guard to cli_invoke cap-hit retry loop",
+        "description": "The `invoke_with_cap_retry()` function in `shared/src/shared/cli_invoke.py` (~line 185) contains an unbounded `while True` loop that retries indefinitely when all accounts are capped. While mitigated by the 6-account EnvironmentFile fix (2026-04-09), this code path remains dangerous if all accounts are simultaneously capped — it would spin forever with no escape hatch.\n\nAdd an `AllAccountsCappedException` (or equivalent) and a deadline/max-retry guard: raise after N attempts or T seconds with a clear error message rather than looping forever.",
+        "details": "Implementation approach:\n1. Add a configurable `max_cap_retries` parameter (default: ~20) and optional `cap_retry_deadline_secs` (default: ~3600)\n2. Track retry count and wall-clock time in the loop\n3. Raise `AllAccountsCappedException` when either limit is hit\n4. Log clearly before raising so operators can diagnose\n5. Consider emitting a fused-memory event so reconciliation can flag the failure\n\nmemory_hints:\n- entity: \"invoke_with_cap_retry\"\n- search: \"cli_invoke cap-hit retry loop accounts capped\"\n- search: \"UsageGate blocking all accounts capped\"\n- search: \"per-task config dir account isolation\"",
+        "testStrategy": "",
+        "status": "pending",
+        "dependencies": [],
+        "priority": "medium",
+        "subtasks": []
       }
     ],
     "metadata": {
@@ -11158,7 +11169,8 @@
         "master"
       ],
       "created": "2026-04-07T19:27:08.927Z",
-      "description": "Tasks for master context"
+      "description": "Tasks for master context",
+      "updated": "2026-04-09T09:57:40.098Z"
     }
   }
 }
