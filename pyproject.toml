@@ -1,0 +1,14 @@
+[project]
+name = "dark-factory"
+version = "0.0.0"
+description = "Dark Factory workspace root — not a package, just coordinates subprojects"
+requires-python = ">=3.11,<4"
+
+[tool.uv.workspace]
+members = [
+    "dashboard",
+    "escalation",
+    "fused-memory",
+    "orchestrator",
+    "shared",
+]
