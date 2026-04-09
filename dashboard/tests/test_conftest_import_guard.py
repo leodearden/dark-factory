@@ -82,6 +82,20 @@ def test_double_dot_relative_import_detected() -> None:
     assert _first_non_stdlib_import_line(tree) == 1
 
 
+def test_stdlib_only_returns_none() -> None:
+    """A file with only stdlib imports must return None."""
+    source = "import os\nimport sys\nfrom pathlib import Path\n"
+    tree = ast.parse(source)
+    assert _first_non_stdlib_import_line(tree) is None
+
+
+def test_absolute_thirdparty_still_detected() -> None:
+    """Absolute non-stdlib import must still be detected after the refactor."""
+    source = "import os\nimport pytest\n"
+    tree = ast.parse(source)
+    assert _first_non_stdlib_import_line(tree) == 2
+
+
 def test_syspath_insert_precedes_non_stdlib_imports() -> None:
     """sys.path.insert() in conftest.py must appear before any non-stdlib import.
 
