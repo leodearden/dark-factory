@@ -351,6 +351,7 @@ class FakeScheduler:
 
     def __init__(self):
         self.statuses: dict[str, list[str]] = {}
+        self._status_cache: dict[str, str] = {}
 
     async def set_task_status(self, task_id: str, status: str) -> None:
         self.statuses.setdefault(task_id, []).append(status)
