@@ -305,6 +305,8 @@ class TestVllmUrlInjection:
         captured_args: dict = {}
 
         def stub_run_matrix(base_config, **kwargs):
+            captured_args['base_config'] = base_config
+            captured_args.update(kwargs)
             for cfg in EVAL_CONFIGS:
                 captured_state[cfg.name] = dict(cfg.env_overrides)
 
