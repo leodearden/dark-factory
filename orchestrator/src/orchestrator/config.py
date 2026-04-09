@@ -315,6 +315,7 @@ class OrchestratorConfig(BaseSettings):
     # Merge conflict reduction
     max_advance_attempts: int = Field(default=3)
     max_pre_merge_retries: int = Field(default=2)
+    max_merge_retries: int = Field(default=3)
     inter_iteration_rebase: bool = Field(default=True)
     requeue_cooldown_secs: float = Field(default=30.0)
 

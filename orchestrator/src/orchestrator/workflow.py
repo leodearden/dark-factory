@@ -366,6 +366,23 @@ class TaskWorkflow:
                                 'Steward re-escalated to human',
                                 skip_escalation=True,
                             )
+                        # If branch is already on main (e.g. steward merged
+                        # during resolution), skip re-implementation — proceed
+                        # to MERGE which will detect already_merged.
+                        _, wt_head_raw, _ = await _run(
+                            ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
+                        )
+                        esc_main_sha = await self.git_ops.get_main_sha()
+                        if await self.git_ops.is_ancestor(
+                            wt_head_raw.strip(), esc_main_sha,
+                        ):
+                            logger.info(
+                                'Task %s: branch already on main after '
+                                'escalation resolution — skipping '
+                                're-implementation', self.task_id,
+                            )
+                            break
+
                         # Resume with resolution context
                         logger.info(f'Task {self.task_id}: resuming after escalation resolution')
                         resume_prompt = await self.briefing.build_resume_prompt(
@@ -406,61 +423,83 @@ class TaskWorkflow:
                         already_merged = False
 
                     if not already_merged:
-                        # Phase 1: pre-merge rebase (no lock, no queue slot)
-                        # Rebase the task branch onto current main and re-verify
-                        # so the queued merge phase is fast/trivial.
-                        pre_rebased = False
-                        for _attempt in range(self.config.max_pre_merge_retries):
-                            main_before = await self.git_ops.get_main_sha()
-                            if not await self.git_ops.rebase_onto_main(self.worktree):
-                                break  # true conflict — queue will detect it
-                            verify = await run_scoped_verification(
-                                self.worktree, self.config, self._module_configs,
-                                task_files=self._task_files,
-                            )
-                            if not verify.passed:
-                                if verify.timed_out:
-                                    # Don't emit a waste event on timeout: this is
-                                    # infrastructure noise (cold build, contention),
-                                    # not a real code collision.  Leave
-                                    # pre_rebased=False; the merge queue will re-verify
-                                    # under its own retry schedule.
-                                    logger.warning(
-                                        f'Task {self.task_id}: post-rebase verification '
-                                        f'timed out; merge queue will retry'
-                                    )
-                                else:
-                                    logger.warning(
-                                        f'Task {self.task_id}: post-rebase verification '
-                                        f'failed: {verify.summary}'
-                                    )
-                                    if self.event_store:
-                                        self.event_store.emit(
-                                            EventType.waste_detected,
-                                            task_id=self.task_id, phase='merge',
-                                            data={
-                                                'waste_type': 'post_rebase_verify_fail',
-                                                'summary': verify.summary[:200],
-                                            },
+                        for _merge_attempt in range(self.config.max_merge_retries):
+                            # Phase 1: pre-merge rebase (no lock, no queue slot)
+                            # Rebase the task branch onto current main and re-verify
+                            # so the queued merge phase is fast/trivial.
+                            pre_rebased = False
+                            for _attempt in range(self.config.max_pre_merge_retries):
+                                main_before = await self.git_ops.get_main_sha()
+                                if not await self.git_ops.rebase_onto_main(self.worktree):
+                                    break  # true conflict — queue will detect it
+                                verify = await run_scoped_verification(
+                                    self.worktree, self.config, self._module_configs,
+                                    task_files=self._task_files,
+                                )
+                                if not verify.passed:
+                                    if verify.timed_out:
+                                        logger.warning(
+                                            f'Task {self.task_id}: post-rebase verification '
+                                            f'timed out; merge queue will retry'
                                         )
-                                break
-                            main_after = await self.git_ops.get_main_sha()
-                            if main_before == main_after:
-                                pre_rebased = True
-                                self.metrics.pre_merge_rebase_ok += 1
-                                break
-                            self.metrics.pre_merge_rebase_attempts += 1
-                            logger.info(
-                                f'Task {self.task_id}: main moved during pre-merge '
-                                f'rebase, retrying'
-                            )
+                                    else:
+                                        logger.warning(
+                                            f'Task {self.task_id}: post-rebase verification '
+                                            f'failed: {verify.summary}'
+                                        )
+                                        if self.event_store:
+                                            self.event_store.emit(
+                                                EventType.waste_detected,
+                                                task_id=self.task_id, phase='merge',
+                                                data={
+                                                    'waste_type': 'post_rebase_verify_fail',
+                                                    'summary': verify.summary[:200],
+                                                },
+                                            )
+                                    break
+                                main_after = await self.git_ops.get_main_sha()
+                                if main_before == main_after:
+                                    pre_rebased = True
+                                    self.metrics.pre_merge_rebase_ok += 1
+                                    break
+                                self.metrics.pre_merge_rebase_attempts += 1
+                                logger.info(
+                                    f'Task {self.task_id}: main moved during pre-merge '
+                                    f'rebase, retrying'
+                                )
 
-                        # Phase 2: submit to merge queue (replaces _merge_lock)
-                        merge_outcome = await self._submit_to_merge_queue(
-                            branch_name, pre_rebased=pre_rebased,
-                        )
-                        if merge_outcome != WorkflowOutcome.DONE:
-                            return merge_outcome
+                            # Phase 2: submit to merge queue (replaces _merge_lock)
+                            merge_outcome = await self._submit_to_merge_queue(
+                                branch_name, pre_rebased=pre_rebased,
+                                merge_phase=True,
+                            )
+                            if merge_outcome == WorkflowOutcome.DONE:
+                                break
+                            if merge_outcome != WorkflowOutcome.REQUEUED:
+                                # BLOCKED — steward gave up, terminal
+                                return merge_outcome
+
+                            # Steward resolved — check if branch landed on main
+                            _, bh, _ = await _run(
+                                ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
+                            )
+                            main_sha = await self.git_ops.get_main_sha()
+                            if await self.git_ops.is_ancestor(bh.strip(), main_sha):
+                                logger.info(
+                                    'Task %s: branch on main after steward '
+                                    'resolution', self.task_id,
+                                )
+                                break
+                            # Retry merge
+                            logger.info(
+                                'Task %s: retrying merge (attempt %d/%d)',
+                                self.task_id, _merge_attempt + 1,
+                                self.config.max_merge_retries,
+                            )
+                        else:
+                            return await self._mark_blocked(
+                                'Merge retries exhausted after steward resolutions'
+                            )
                     else:
                         logger.info(
                             f'Task {self.task_id}: branch already on main '
@@ -693,6 +732,14 @@ class TaskWorkflow:
 
     async def _execute_verify_review_loop(self) -> WorkflowOutcome:
         """Execute → Verify → Review loop with retry limits."""
+        # Clear stale merge-failure review from prior runs — prevents
+        # the review phase from re-surfacing resolved merge issues.
+        if self.artifacts:
+            stale_merge = self.artifacts.root / 'reviews' / 'merge.json'
+            if stale_merge.exists():
+                logger.info('Task %s: removing stale merge.json review', self.task_id)
+                stale_merge.unlink()
+
         review_cycle = 0
 
         while True:
@@ -1213,6 +1260,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
     async def _submit_to_merge_queue(
         self, branch_name: str, pre_rebased: bool = False,
+        *, merge_phase: bool = False,
     ) -> WorkflowOutcome:
         """Submit a merge request to the queue and await the result.
 
@@ -1220,6 +1268,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         advancement of main.  Conflicts are returned immediately —
         this method resolves them in the task worktree (outside the
         queue) and re-submits.
+
+        When *merge_phase* is True, escalations created by failure
+        paths suppress task-status transitions — the caller retries
+        the merge in-place instead of requeueing via the scheduler.
         """
         from orchestrator.merge_queue import MergeOutcome, MergeRequest
 
@@ -1252,6 +1304,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if result.status == 'conflict':
             return await self._resolve_and_resubmit(
                 branch_name, result.conflict_details,
+                merge_phase=merge_phase,
             )
         # blocked — infer review category from reason
         if 'verification failed' in result.reason.lower():
@@ -1261,10 +1314,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         else:
             category = 'merge_error'
         self._write_merge_failure_review(category, result.reason)
-        return await self._mark_blocked(result.reason)
+        return await self._mark_blocked(result.reason, merge_phase=merge_phase)
 
     async def _resolve_and_resubmit(
         self, branch_name: str, conflict_details: str,
+        *, merge_phase: bool = False,
     ) -> WorkflowOutcome:
         """Resolve merge conflicts in the task worktree, then re-submit.
 
@@ -1291,11 +1345,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if not merger_result.success or 'BLOCKED' in merger_result.output.upper():
             reason = f'Merger could not resolve: {merger_result.output[:200]}'
             self._write_merge_failure_review('merger_blocked', reason)
-            return await self._mark_blocked(reason)
+            return await self._mark_blocked(reason, merge_phase=merge_phase)
 
         # Re-submit to queue (now resolved, needs fresh merge)
         return await self._submit_to_merge_queue(
-            branch_name, pre_rebased=False,
+            branch_name, pre_rebased=False, merge_phase=merge_phase,
         )
 
     async def _handle_wip_conflict(
@@ -1739,6 +1793,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
     async def _mark_blocked(
         self, reason: str, *, detail: str = '',
         skip_escalation: bool = False,
+        merge_phase: bool = False,
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -1747,6 +1802,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         file; defaults to *reason* when not provided.
         *skip_escalation* suppresses escalation creation when a level-1
         escalation already exists (e.g. steward re-escalated to human).
+        *merge_phase* suppresses task-status transitions (blocked/pending)
+        when the caller will retry the merge in-place rather than requeueing
+        through the scheduler.
         """
         if self.state == WorkflowState.DONE:
             logger.warning(
@@ -1754,8 +1812,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 self.task_id, reason,
             )
             return WorkflowOutcome.DONE
-        self._enter_phase(WorkflowState.BLOCKED)
-        await self.scheduler.set_task_status(self.task_id, 'blocked')
+        if not merge_phase:
+            self._enter_phase(WorkflowState.BLOCKED)
+            await self.scheduler.set_task_status(self.task_id, 'blocked')
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
 
         if self.escalation_queue and skip_escalation:
@@ -1870,11 +1929,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             task_id=self.task_id, phase=self.state.value,
                             data={'outcome': 'requeued'},
                         )
-                    await self.scheduler.set_task_status(self.task_id, 'pending')
-                    logger.info(
-                        f'Task {self.task_id}: steward resolved blocking '
-                        f'escalation, reset to pending for re-scheduling'
-                    )
+                    if not merge_phase:
+                        await self.scheduler.set_task_status(self.task_id, 'pending')
+                        logger.info(
+                            f'Task {self.task_id}: steward resolved blocking '
+                            f'escalation, reset to pending for re-scheduling'
+                        )
+                    else:
+                        logger.info(
+                            f'Task {self.task_id}: steward resolved blocking '
+                            f'escalation, caller will retry merge in-place'
+                        )
                     return WorkflowOutcome.REQUEUED
 
         return WorkflowOutcome.BLOCKED
