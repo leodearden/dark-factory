@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 
 
 class _SchedulerLike(Protocol):
+    _status_cache: dict[str, str]
     async def set_task_status(self, task_id: str, status: str, /) -> None: ...
     async def handle_blast_radius_expansion(
         self, task_id: str, current: list[str], needed: list[str], /
@@ -89,6 +90,10 @@ class _BriefingLike(Protocol):
     ) -> str: ...
     async def build_merger_prompt(
         self, conflicts: str, task_intent: str, context: str | None = ...
+    ) -> str: ...
+    async def build_completion_judge_prompt(
+        self, plan: dict, iteration_log: list[dict], diff: str,
+        task_id: str | None = ..., context: str | None = ...,
     ) -> str: ...
 
 logger = logging.getLogger(__name__)
