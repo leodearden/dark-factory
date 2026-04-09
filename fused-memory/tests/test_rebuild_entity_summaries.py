@@ -191,10 +191,9 @@ class TestDetectStaleSummaries:
     async def test_same_facts_different_order_triggers_rebuild(self, mock_config, make_backend):
         """Identical facts in a different order flag the entity as stale.
 
-        This is expected (not a bug): canonical summary follows edge-result order,
-        so 'factB\\nfactA' != 'factA\\nfactB'. The entity is flagged stale purely
-        because the string comparison summary != canonical fails. Both lines exist
-        in valid_fact_set, so stale_line_count == 0 and duplicate_count == 0.
+        This is a known limitation of the current implementation, not a deliberate
+        design invariant: canonical summary follows edge-result order, which is
+        non-deterministic. Future work to sort facts would require updating this test.
         """
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=[
