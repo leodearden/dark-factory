@@ -1,7 +1,75 @@
 # vLLM Local Model Evaluation — Status Report
 
-**Last updated:** 2026-04-08 23:45 BST
-**Status:** Evening session — 404 bug diagnosed and fixed (port collision, `ad501d4cf2`). ε+ζ landed (`065e5e97f6`). False-green guard landed (`c9fa706347`). ζ env-propagation fix landed (`3cd380a079`). Two smoke tests run: reap-172b first-ever successful vLLM startup, reap-139b validated ζ routing through bridge. **New blocker: NULL-byte implementer responses** — vLLM emits `\u0000` pad tokens instead of tool-call content, implementer does zero useful work across all iterations. Judge hits `ServerDisconnectedError` on 3rd turn (likely context overflow). Full matrix blocked until NULL-byte bug diagnosed.
+**Last updated:** 2026-04-09 09:15 BST
+**Status:** NULL-byte blocker fully diagnosed and resolved. Root cause was TWO independent bugs: (1) bridge 5-min aiohttp timeout killing all single-GPU requests, (2) `lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4` is a **broken quantization** — outputs pure `\x00` pad tokens for ANY input, confirmed with trivial "Say hello" prompt on live pod. minimax-m25-fp8-new (full model, 4× GPU) confirmed working: rapid-fire 200 OK tool-call responses. Bridge timeout fixed, null-work guard deployed, judge routing fixed, `--pod-id` reuse feature landed. **reap-139b-nvfp4 (lukealonso) is dead — need alternative quantization for GB10/DGX Spark target.**
+
+## Update 2026-04-09 morning: NULL-byte root cause — broken quantization + bridge timeout
+
+### TL;DR
+
+- **NULL-byte root cause #1: bridge aiohttp timeout** (`62169e578c`). `ClientSession()` default `ClientTimeout(total=300)` killed every request after exactly 5 minutes. On single-GPU reap-139b (59.7 tok/s, KV cache 47.4% — plenty of headroom), the eval prompt takes >5 min to process. Fixed to 30 min; subprocess timeout is the real outer bound.
+- **NULL-byte root cause #2: `lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4` is broken** — the NVFP4 quantization via NVIDIA ModelOpt v0.39.0 produced a non-functional model. Live pod test: `curl /v1/chat/completions` with "Say hello" + `max_tokens=50` returns `finish_reason=length` and 50 `\x00` pad tokens. The model cannot generate coherent text at all. Additionally, config.json has bogus `eos_token_id=2` (ModelOpt default injection; real EOS is 200020), but fixing that on-disk didn't help — the weights themselves are corrupted.
+- **minimax-m25-fp8-new confirmed working** on live pod `a3to5vqki9gaqs` (4× RTX PRO 6000). Rapid-fire tool-call responses (200 OK, 700–10800 bytes, 2–30s per turn). Bridge timeout fix validated. But reify_task_12 still 0 lines changed after 4 iterations ($30 cost) — task difficulty, not model bug.
+- **Judge context overflow fixed** (`28bde8adcb`): removed `'judge'` from env_overrides propagation — judge now always hits Claude API instead of vLLM bridge where max_model_len caused ServerDisconnectedError. UsageGate wired into eval runner for account failover on judge cap hits.
+- **Null-work guard deployed** (`28bde8adcb`): `_is_null_work()` detects iterations>0 + cost>0 + 0 lines/files → nulls gate fields → score 0. Fired correctly on both diagnostic runs.
+- **Bridge pad-token detection deployed** (`28bde8adcb`): `_is_pad_token_response()` converts >50% NULL-byte responses to error bodies. Defense-in-depth for any future broken models.
+- **`--pod-id` pod reuse** (`a956633e62`): eliminates 5–15 min cold start on test-debug cycle. Skip create + skip terminate; SSH tunnel re-established from API-fetched pod info.
+- **EOS override config** (`b62b23634b`): `--override-generation-config '{"eos_token_id": 200020}'` wired into entrypoint + configs for REAP variants. Correct fix for the config.json bug, but moot for lukealonso since the weights are broken.
+
+### Live pod diagnostics
+
+**reap-139b-nvfp4-new** (pod `w3v97njk19tmoy`, then `qazo8u2fbtfibg`):
+- vLLM healthy, 59.7 tok/s generation, KV cache 47.4% — model IS loaded and running
+- Bridge log: `POST /v1/messages?beta=true → 504 0` at exactly 5 min (aiohttp timeout)
+- vLLM server log: continuous generation without returning responses (user observed: "just kept saying it was purely generating")
+- Direct curl with `max_tokens=50`: 50 `\x00` bytes, `finish_reason=length`, zero coherent text
+- config.json fix (remove bogus `eos_token_id=2`): no effect — weights are fundamentally broken
+- **Verdict: lukealonso NVFP4 is dead.** Not a config/parser/timeout issue.
+
+**minimax-m25-fp8-new** (pod `a3to5vqki9gaqs`):
+- vLLM healthy, interleaved prompt processing + HTTP 200 responses (user observed: "minimax-fp8 interleaved HTTP 200 responses with prompt processing and generating (~70 tok/s)")
+- 15+ minutes of continuous successful tool-call turns after bridge timeout fix
+- reify_task_12: 4 iterations, $30 cost, 0 lines changed → null-work guard fired correctly
+- **Verdict: model works, reify_task_12 is just too hard for MiniMax on this eval.**
+
+### Commits this session
+
+| Commit | Description |
+|---|---|
+| `28bde8adcb` | Bridge pad-token detection, null-work guard, judge routing fix, eval account failover |
+| `62169e578c` | Bridge aiohttp timeout 5min→30min |
+| `a956633e62` | `--pod-id` flag for pod reuse (skip cold start) |
+| `b62b23634b` | EOS override config for REAP NVFP4 variants + entrypoint hook |
+
+### Cost (this session)
+
+| Item | Cost |
+|---|---|
+| reap-139b pod #1 (`w3v97njk19tmoy`, ~30 min) | ~$0.90 |
+| reap-139b pod #2 (`qazo8u2fbtfibg`, ~20 min) | ~$0.60 |
+| minimax-fp8 pod (`a3to5vqki9gaqs`, ~25 min, 4× GPU) | ~$2.80 |
+| **Session subtotal** | **~$4.30** |
+| **Remaining RunPod credit (est.)** | **~$24** |
+
+### Path forward for REAP-139B on GB10/DGX Spark
+
+reap-139b is the highest-priority model for cost/speed because it's small (139B params, 10B active) and would be fast/cheap on GB10 or DGX Spark. The lukealonso NVFP4 variant is dead, but the model architecture itself should work — minimax-m25-fp8 (same MiniMax-M2.5 family) generates correctly.
+
+1. **Investigate lukealonso repo** — search for open issues, setup documentation, and any evidence that the model was tested by others. It's hard to believe nobody tested it. Maybe it requires specific vLLM version, quantization flags, or dtype settings we're not using. Check the model card, HF discussions, and any linked papers.
+2. **Try `saricles/MiniMax-M2.5-REAP-139B-A10B-NVFP4`** (if it exists) or other third-party NVFP4 quantizations of REAP-139B. Different quantizer implementations may produce functional weights.
+3. **Try FP8 quantization** of REAP-139B. `cerebras/MiniMax-M2.5-REAP-139B-A10B` is the source model — quantize to FP8 ourselves using vLLM's built-in FP8 quantization, or check if someone has published one. FP8 on a single 96 GB GPU should fit (139B × 10B active at FP8 ≈ 10–15 GB active weights + KV cache).
+4. **Check nvidia/MiniMax-M2.5-NVFP4** (the full model, not REAP distillation) — if nvidia's own NVFP4 works, the issue is lukealonso's quantization specifically, and the fix is to re-quantize REAP-139B using nvidia's toolchain/settings.
+
+### Next-session priorities (ranked)
+
+1. **Investigate lukealonso repo for setup docs / known issues** (step 1 above)
+2. **Run full matrix retry** with timeout fix on working configs (minimax-fp8, qwen3-fp8, minimax-nvfp4, reap-172b) — the bridge timeout was likely breaking ALL single-GPU configs, not just reap-139b
+3. **Run rereview tool** (`b037e871d2`) against existing + new results — deferred from 2026-04-08
+4. **Rebuild `:latest` docker image** with the entrypoint EOS override hook — needed for any future REAP variants
+5. **Test alternative REAP-139B quantizations** (steps 2–4 above) once image is rebuilt
+6. **Update composite scoring** if the matrix retry produces enough clean data for Elo tournament
+
+---
 
 ## Update 2026-04-08 evening: smoke tests reveal NULL-byte blocker
 
