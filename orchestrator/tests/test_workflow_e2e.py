@@ -747,16 +747,14 @@ class TestCompletionJudge:
         assert workflow.metrics.judge_early_exits == 0
         assert 'judge' not in stub.calls
 
-    async def test_judge_invocation_inherits_env_overrides(
+    async def test_judge_does_not_inherit_env_overrides(
         self, config, git_ops, task_assignment, monkeypatch
     ):
-        """Judge subprocess must receive config.env_overrides.
+        """Judge must NOT receive env_overrides (always hits Claude API).
 
-        Regression: commit 065e5e97f6 added the ζ judge role but did not add it
-        to the allow-list in TaskWorkflow._invoke() that forwards env_overrides
-        to invoke_with_cap_retry. As a result, vLLM-eval runs with
-        ANTHROPIC_BASE_URL set sent implementer traffic through the bridge but
-        judge traffic straight to the real Anthropic API.
+        Propagating ANTHROPIC_BASE_URL routes the judge through the vLLM
+        bridge where max_model_len causes ServerDisconnectedError after
+        2 tool-use rounds (~48 KB each exceed 80k context).  See 3cd380a079.
         """
         judge_cfg = _config_with_judge(config, enabled=True)
         judge_cfg.env_overrides = {'ANTHROPIC_BASE_URL': 'http://127.0.0.1:9999'}
@@ -781,14 +779,12 @@ class TestCompletionJudge:
         outcome = await workflow.run()
 
         assert outcome == WorkflowOutcome.DONE
-        # Implementer already received env_overrides pre-fix — regression guard.
+        # Implementer and debugger receive env_overrides.
         assert stub.env_overrides_by_role.get('implementer') == {
             'ANTHROPIC_BASE_URL': 'http://127.0.0.1:9999',
         }
-        # The actual bug: judge must also receive env_overrides.
-        assert stub.env_overrides_by_role.get('judge') == {
-            'ANTHROPIC_BASE_URL': 'http://127.0.0.1:9999',
-        }
+        # Judge must NOT receive env_overrides — it always uses Claude API.
+        assert stub.env_overrides_by_role.get('judge') is None
 
 
 # ---------------------------------------------------------------------------

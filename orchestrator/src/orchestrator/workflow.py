@@ -1522,7 +1522,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             effort=effort_val,
             backend=backend_val,
             timeout_seconds=timeout_val,
-            env_overrides=(self.config.env_overrides or None) if role.name in ('implementer', 'debugger', 'judge') else None,
+            # Judge always hits Claude API (not vLLM) -- propagating
+            # ANTHROPIC_BASE_URL would route it through the vLLM bridge where
+            # max_model_len causes ServerDisconnectedError after 2 tool-use
+            # rounds.  See 3cd380a079.
+            env_overrides=(self.config.env_overrides or None) if role.name in ('implementer', 'debugger') else None,
         )
         completed_at = datetime.now(UTC).isoformat()
 
