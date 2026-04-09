@@ -1228,3 +1228,71 @@ class TestCapRetryHeuristicGuard:
             )
         assert got.success is True
         assert mock_inv.await_count == 2
+
+
+# ===================================================================
+# TestCapRetryGuardLogging
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryGuardLogging:
+    """Verify logger.error is emitted with diagnostic info before raising."""
+
+    async def test_error_logged_before_max_retries_raise(self, caplog):
+        """logger.error includes label, retry count, and elapsed time on max_cap_retries hit."""
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok'] * 5),
+            detect_cap_hit=MagicMock(return_value=True),
+            active_account_name='acct',
+        )
+        result = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            caplog.at_level(logging.ERROR, logger='shared.cli_invoke'),
+        ):
+            with pytest.raises(AllAccountsCappedException):
+                await invoke_with_cap_retry(
+                    gate, 'my-label',
+                    max_cap_retries=2,
+                    cap_retry_deadline_secs=None,
+                    prompt='hi',
+                )
+        assert any(
+            'my-label' in record.message and record.levelno == logging.ERROR
+            for record in caplog.records
+        ), f'Expected error log with label. Got: {[r.message for r in caplog.records]}'
+        error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_msgs) >= 1
+        assert any('2' in m for m in error_msgs), 'Error log should include retry count'
+
+    async def test_error_logged_before_deadline_raise(self, caplog):
+        """logger.error includes label and elapsed time on deadline hit."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 5),
+            detect_cap_hit=MagicMock(return_value=True),
+            active_account_name='acct',
+        )
+        result = make_result()
+        monotonic_values = iter([0.0, 4000.0])
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', side_effect=monotonic_values),
+            caplog.at_level(logging.ERROR, logger='shared.cli_invoke'),
+        ):
+            with pytest.raises(AllAccountsCappedException):
+                await invoke_with_cap_retry(
+                    gate, 'deadline-label',
+                    max_cap_retries=None,
+                    cap_retry_deadline_secs=3600.0,
+                    prompt='hi',
+                )
+        error_msgs = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_msgs) >= 1
+        assert any('deadline-label' in m for m in error_msgs), (
+            f'Error log should include label. Got: {error_msgs}'
+        )
