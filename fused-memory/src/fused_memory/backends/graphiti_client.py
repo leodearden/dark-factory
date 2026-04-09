@@ -405,6 +405,8 @@ class GraphitiBackend:
     ) -> list[dict]:
         """Return edges whose valid_at falls within [start, end] (ISO 8601 strings).
 
+        Uses ro_query since no writes are performed.
+
         Args:
             start: ISO 8601 string for the lower bound (inclusive).
             end: ISO 8601 string for the upper bound (inclusive).
@@ -419,7 +421,7 @@ class GraphitiBackend:
             'WHERE e.valid_at >= $start AND e.valid_at <= $end '
             'RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at'
         )
-        result = await graph.query(cypher, {'start': start, 'end': end})
+        result = await graph.ro_query(cypher, {'start': start, 'end': end})
         return [
             {
                 'uuid': row[0],
