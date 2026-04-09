@@ -1268,6 +1268,44 @@ class TestCapRetryHeuristicGuard:
         assert got.success is True
         assert mock_inv.await_count == 2
 
+    async def test_heuristic_deadline_exceeded(self):
+        """Heuristic branch respects cap_retry_deadline_secs independently of max_cap_retries.
+
+        The deadline guard in the heuristic branch (cli_invoke.py:347-356) is a
+        separate code path from the pattern-match branch guard (line 285). This test
+        covers that guard — previously had zero test coverage.
+        """
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 10),
+            detect_cap_hit=MagicMock(return_value=False),  # pattern branch skipped
+            active_account_name='acct',
+        )
+        gate._handle_cap_detected = MagicMock()
+        heuristic_result = self._make_heuristic_result()
+        # First call → 0.0 (retry_start), subsequent calls → 4000.0
+        # elapsed == 4000.0 > cap_retry_deadline_secs=3600.0 after first heuristic hit
+        monotonic_values = itertools.chain([0.0], itertools.repeat(4000.0))
+
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=heuristic_result),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', side_effect=monotonic_values),
+            pytest.raises(AllAccountsCappedException) as exc_info,
+        ):
+            await invoke_with_cap_retry(
+                gate, 'heuristic-deadline-task',
+                max_cap_retries=None,
+                cap_retry_deadline_secs=3600.0,
+                prompt='hi',
+            )
+        exc = exc_info.value
+        assert exc.retries == 1, f'Expected 1 retry (deadline), got {exc.retries}'
+        assert exc.elapsed_secs > 3600.0, (
+            f'elapsed_secs should exceed 3600.0 deadline, got {exc.elapsed_secs}'
+        )
+        assert exc.label == 'heuristic-deadline-task'
+
 
 # ===================================================================
 # TestCapRetryGuardLogging
