@@ -31,6 +31,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment, files_to_modules
+from orchestrator.task_status import TERMINAL_STATUSES
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import run_scoped_verification
 
@@ -1813,12 +1814,56 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if self._steward:
                 await self._await_steward_completion()
 
+                # Guard: steward may have marked the task done (terminal).
+                # The scheduler rejects done→pending, but we must also
+                # return the correct outcome.
+                cached = self.scheduler._status_cache.get(self.task_id)
+                if cached in TERMINAL_STATUSES:
+                    logger.info(
+                        'Task %s: status is %s after steward — not re-queueing',
+                        self.task_id, cached,
+                    )
+                    if cached == 'done':
+                        self._enter_phase(WorkflowState.DONE)
+                        return WorkflowOutcome.DONE
+                    return WorkflowOutcome.BLOCKED
+
                 # If steward resolved all level-0 escalations, set task back
                 # to pending so the scheduler re-picks it on the next cycle.
                 remaining = self.escalation_queue.get_by_task(
                     self.task_id, status='pending', level=0,
                 )
                 if not remaining:
+                    # Guard: if the task's branch is already merged to
+                    # main, transition to DONE instead of re-queueing —
+                    # prevents stash_failed / advance_main ghost loops.
+                    if self.worktree and self.git_ops:
+                        try:
+                            _, wt_head, _ = await _run(
+                                ['git', 'rev-parse', 'HEAD'],
+                                cwd=self.worktree,
+                            )
+                            main_sha = await self.git_ops.get_main_sha()
+                            if await self.git_ops.is_ancestor(
+                                wt_head.strip(), main_sha,
+                            ):
+                                logger.info(
+                                    'Task %s: branch already on main — '
+                                    'completing instead of re-queueing',
+                                    self.task_id,
+                                )
+                                self._enter_phase(WorkflowState.DONE)
+                                await self.scheduler.set_task_status(
+                                    self.task_id, 'done',
+                                )
+                                return WorkflowOutcome.DONE
+                        except Exception:
+                            logger.warning(
+                                'Task %s: merge-check failed, '
+                                'proceeding with requeue',
+                                self.task_id, exc_info=True,
+                            )
+
                     if self.event_store:
                         self.event_store.emit(
                             EventType.escalation_resolved,

@@ -1,0 +1,19 @@
+{
+  "id": "esc-552-99",
+  "task_id": "552",
+  "agent_role": "orchestrator",
+  "severity": "blocking",
+  "category": "task_failure",
+  "summary": "Planning failed: architect invocation failed",
+  "detail": "Architect output:\n",
+  "suggested_action": "investigate_and_retry",
+  "timestamp": "2026-04-07T04:23:36.917464+00:00",
+  "status": "resolved",
+  "resolution": "Steward performed the merge work directly. Root cause: architect produced empty output \u2014 likely because the branch was stale (task/552 had already done an earlier resolve at 5786119aa1, but main had advanced with task 512 fixes to context_assembler.py/test_context_assembler.py that were inadvertently absent from task/552).\n\nActions taken:\n1. Re-merged current main (0acd4b091e) into task/552 via `git merge main` \u2014 clean auto-merge with ort strategy (commit 663c8900ab). This picked up task 512's CancelledError guard in context_assembler.py (13 lines) and its regression tests (103 lines) that had been missing.\n2. Verified task_filter.py and test_task_filter.py are now identical between main and task/552 (same blobs 7317a2509f... and d088d7294b...).\n3. Ran targeted tests: tests/test_task_filter.py, test_harness.py, test_context_assembler.py, test_stages.py \u2192 194 passed.\n4. Ran full fused-memory suite \u2192 1255 passed.\n\nThe `git diff main..task/552 --stat` now shows only task 455 additions (harness.py, stages/*, test_harness.py, test_stages.py) \u2014 no main content is missing. Branch is ready for merge to main; orchestrator can proceed to merge phase or re-attempt architect (which should now succeed or yield a no-op plan since the work is complete).",
+  "worktree": "/home/leo/src/dark-factory/.worktrees/552",
+  "workflow_state": "blocked",
+  "level": 0,
+  "resolved_at": "2026-04-07T04:27:32.565701+00:00",
+  "resolved_by": null,
+  "resolution_turns": null
+}

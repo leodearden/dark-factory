@@ -35,6 +35,7 @@ def _vllm_config(
     gpu_memory_util: float | None = None,
     enforce_eager: bool = False,
     override_generation_config: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> EvalConfig:
     """Build an EvalConfig that routes through a vLLM-compatible endpoint."""
     env = {
@@ -61,6 +62,8 @@ def _vllm_config(
         # lukealonso REAP NVFP4 has eos_token_id=2 from ModelOpt but
         # the real EOS is 200020. Without this, the model never stops.
         env['OVERRIDE_GENERATION_CONFIG'] = override_generation_config
+    if extra_env:
+        env.update(extra_env)
     return EvalConfig(
         name=name, backend='claude', model='sonnet', effort=effort,
         env_overrides=env,
@@ -115,10 +118,13 @@ VLLM_EVAL_CONFIGS = [
     # cache makes second-pull TTFT ≪ HF download once warm.
     # ENFORCE_EAGER=1 retained as a belt-and-braces against the
     # CUDA-graph-capture hang (vLLM #35504).
+    # Switched from baked image to :latest + HF download 2026-04-09 because
+    # the baked image predates the ENFORCE_EAGER entrypoint hook — the env var
+    # was set but the old entrypoint ignored it, causing the CUDA-graph hang.
     _vllm_config('qwen3-coder-next-fp8-new',
         hf_model='Qwen/Qwen3-Coder-Next-FP8',
-        image='leosiriusdawn/runpod-vllm:qwen3-coder-next-fp8-baked',
-        gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=180,
+        image='leosiriusdawn/runpod-vllm:latest',
+        gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=200,
         tool_call_parser='qwen3_coder',
         enforce_eager=True),
     # REAP-139B NVFP4: ~79 GB on disk, baked into the image. Fits 1× RTX
@@ -130,13 +136,66 @@ VLLM_EVAL_CONFIGS = [
     # by NVIDIA ModelOpt v0.39.0. The real EOS is 200020 (generation_config).
     # Without the override, vLLM reads eos=2, the model never generates it,
     # and generation runs to max_model_len producing pad tokens.
+    # NOTE: lukealonso NVFP4 confirmed broken 2026-04-09 — outputs pure \x00
+    # pad tokens for any input. Root cause: likely SM120 NVFP4 MoE kernel bug
+    # (vLLM #35566) AND/OR missing explicit quantization flag. Added
+    # quantization='modelopt_fp4' as a potential fix. If still broken, this
+    # config is dead — use reap-139b-awq-new instead.
     _vllm_config('reap-139b-nvfp4-new',
         hf_model='lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4',
-        image='leosiriusdawn/runpod-vllm:reap-139b-nvfp4-baked',
+        image='leosiriusdawn/runpod-vllm:latest',
         gpu_type=RTX_PRO_6000, gpu_count=1, container_disk_gb=180,
         max_model_len=80000, gpu_memory_util=0.97,
+        quantization='modelopt_fp4',
         tool_call_parser='minimax_m2',
         override_generation_config='{"eos_token_id": 200020}'),
+    # REAP-139B AWQ 4-bit: ~23 GB on disk, ~35-40 GB VRAM. Comfortably fits
+    # 1× RTX PRO 6000 (96 GB) with 50+ GB KV cache headroom. AWQ W4A16
+    # kernels work on SM120 without the NVFP4 CUDA crash bug (vLLM #35566).
+    # Primary alternative for GB10/DGX Spark target after lukealonso NVFP4
+    # was confirmed broken. Quality unknown — sparse docs, no published evals.
+    # AWQ 4-bit is compact (~35-40 GB VRAM) but KV cache on single 96 GB GPU
+    # is tight: 80k context needs 18.9 GiB KV, only 14.3 GiB available at
+    # GMU 0.95. Estimated max context is ~60k. Use max_model_len=55000 with
+    # GMU 0.97 for headroom. The 39k eval prompt + ~15k tool-turn slack fits.
+    _vllm_config('reap-139b-awq-new',
+        hf_model='cyankiwi/MiniMax-M2.5-REAP-139B-A10B-AWQ-4bit',
+        image='leosiriusdawn/runpod-vllm:latest',
+        gpu_type=RTX_PRO_6000, gpu_count=1, container_disk_gb=100,
+        max_model_len=55000, gpu_memory_util=0.97,
+        tool_call_parser='minimax_m2'),
+    # REAP-139B NVFP4 GB10 (saricles): 75 GB on disk, compressed-tensors
+    # format via llm-compressor. Different quant than lukealonso — quantizes
+    # ALL Linear layers including self_attn. Originally built for DGX Spark
+    # (GB10, SM121a). On RTX PRO 6000 (SM120), MUST use --moe-backend marlin
+    # to avoid the NVFP4 MoE CUDA crash (vLLM #35566). Env vars from saricles
+    # model card: VLLM_TEST_FORCE_FP8_MARLIN=1, VLLM_USE_FLASHINFER_MOE_FP4=0.
+    # Same eos_token_id bug as lukealonso — needs override.
+    # 2× RTX PRO 6000 for generous VRAM headroom (192 GB for 75 GB weights).
+    _vllm_config('reap-139b-nvfp4-gb10-new',
+        hf_model='saricles/MiniMax-M2.5-REAP-139B-A10B-NVFP4-GB10',
+        image='leosiriusdawn/runpod-vllm:latest',
+        gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=200,
+        max_model_len=80000, gpu_memory_util=0.95,
+        tool_call_parser='minimax_m2',
+        override_generation_config='{"eos_token_id": 200020}',
+        extra_env={
+            'MOE_BACKEND': 'marlin',
+            'VLLM_TEST_FORCE_FP8_MARLIN': '1',
+            'VLLM_USE_FLASHINFER_MOE_FP4': '0',
+        }),
+    # REAP-139B FP8 (cerebras source): 131 GB on disk, mixed BF16+F8_E4M3.
+    # Expert weights already stored as FP8 in the checkpoint. Too large for
+    # single 96 GB GPU — use 2× RTX PRO 6000 (192 GB aggregate, TP=2).
+    # This is the canonical source model; if it works well on 2× GPU, it
+    # validates REAP-139B quality independent of any quantization issues.
+    _vllm_config('reap-139b-fp8-new',
+        hf_model='cerebras/MiniMax-M2.5-REAP-139B-A10B',
+        image='leosiriusdawn/runpod-vllm:latest',
+        gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=350,
+        max_model_len=80000, gpu_memory_util=0.95,
+        quantization='fp8',
+        tool_call_parser='minimax_m2'),
     # REAP-172B NVFP4 GB10: ~93 GB on disk, baked. 2× RTX PRO 6000 (192 GB,
     # TP=2 set automatically by _vllm_config for gpu_count>1). Hit a silent
     # startup hang on 2026-04-08 matrix retry #3 — vLLM worker init looked
@@ -148,10 +207,12 @@ VLLM_EVAL_CONFIGS = [
     # Fix: same recipe as the two fixed configs above — bump GMU to 0.97
     # and cap context at 80k (39k eval prompt + 40k tool-turn slack).
     # Same ModelOpt eos_token_id bug as reap-139b — saricles variant.
+    # Switched from baked to :latest 2026-04-09 — baked image lacks
+    # OVERRIDE_GENERATION_CONFIG entrypoint hook.
     _vllm_config('reap-172b-nvfp4-gb10-new',
         hf_model='saricles/MiniMax-M2.5-REAP-172B-A10B-NVFP4-GB10',
-        image='leosiriusdawn/runpod-vllm:reap-172b-nvfp4-gb10-baked',
-        gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=200,
+        image='leosiriusdawn/runpod-vllm:latest',
+        gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=250,
         max_model_len=80000, gpu_memory_util=0.97,
         tool_call_parser='minimax_m2',
         override_generation_config='{"eos_token_id": 200020}'),

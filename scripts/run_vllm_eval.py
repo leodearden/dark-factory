@@ -91,6 +91,12 @@ GPU_TYPES = [
 # RunPod-targetable config names: those with an image set in configs.py.
 RUNPOD_CONFIG_NAMES = [c.name for c in VLLM_EVAL_CONFIGS if c.image is not None]
 
+# Workstation config names: those WITHOUT an image (no RunPod pod; direct URL).
+WORKSTATION_CONFIG_NAMES = [c.name for c in VLLM_EVAL_CONFIGS if c.image is None]
+
+# All vLLM config names (RunPod + workstation).
+ALL_VLLM_CONFIG_NAMES = [c.name for c in VLLM_EVAL_CONFIGS]
+
 
 # ---------------------------------------------------------------------------
 # Internal exceptions
@@ -506,14 +512,13 @@ def wait_for_vllm(
     return False
 
 
-def vllm_healthy(port: int, timeout: int = 5) -> bool:
+def vllm_healthy(port: int, timeout: int = 5, *, base_url: str | None = None) -> bool:
     """Single-shot health probe used at the top of each task iteration."""
     import urllib.request
 
+    url = f"{base_url}/health" if base_url else f"http://127.0.0.1:{port}/health"
     try:
-        resp = urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/health", timeout=timeout
-        )
+        resp = urllib.request.urlopen(url, timeout=timeout)
         return resp.status == 200
     except Exception:
         return False
@@ -748,6 +753,65 @@ def reuse_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
     )
 
 
+def _connect_workstation(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
+    """Connect directly to a workstation vLLM endpoint — no pod, no tunnel.
+
+    Used for workstation configs (image=None) where vLLM is already running
+    on a local or LAN machine (e.g. leo-workstation:8000). The returned
+    PodHandle has pod=None and tunnel_proc=None so tear_down_pod is a no-op.
+    """
+    import urllib.request, urllib.parse
+
+    vllm_url = args.vllm_url
+    parsed = urllib.parse.urlparse(vllm_url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 8000
+
+    # Health check
+    health_url = f"{vllm_url}/health"
+    log(f"Checking vLLM health at {health_url}...")
+    try:
+        resp = urllib.request.urlopen(health_url, timeout=10)
+        if resp.status != 200:
+            raise PodBringupFailed(f"vLLM health check returned {resp.status}")
+    except Exception as e:
+        raise PodBringupFailed(
+            f"vLLM not reachable at {health_url}: {e}"
+        ) from e
+
+    # Model check
+    hf_model = cfg.env_overrides["MODEL_NAME"]
+    models_url = f"{vllm_url}/v1/models"
+    try:
+        resp = urllib.request.urlopen(models_url, timeout=10)
+        payload = json.loads(resp.read())
+        served = {m.get("id", "") for m in payload.get("data", [])}
+        if hf_model not in served:
+            raise PodBringupFailed(
+                f"vLLM serving {sorted(served)}, expected {hf_model!r}"
+            )
+    except PodBringupFailed:
+        raise
+    except Exception as e:
+        raise PodBringupFailed(f"Could not list models at {models_url}: {e}") from e
+
+    log(f"vLLM healthy at {vllm_url} (serving {hf_model})")
+
+    # Store the port for vllm_healthy() single-shot probes during task runs.
+    # Override args.port so run_one_task's health probe uses the workstation
+    # port, not the auto-picked free port meant for SSH tunnels.
+    args.port = port
+
+    return PodHandle(
+        pod=None,
+        tunnel_proc=None,
+        client=None,  # type: ignore[arg-type]
+        vllm_url=vllm_url,
+        local_port=port,
+        config_name=cfg.name,
+    )
+
+
 def tear_down_pod(handle: PodHandle | None) -> None:
     """Idempotent pod + tunnel teardown. Safe with None or partial handles."""
     if handle is None:
@@ -846,7 +910,7 @@ def run_one_task(
     task_id = spec["id"]
     config_name = cfg.name
 
-    if not vllm_healthy(handle.local_port):
+    if not vllm_healthy(handle.local_port, base_url=handle.vllm_url):
         log(
             f"SKIP: vLLM endpoint unhealthy before {task_id} — "
             f"likely the model crashed mid-batch"
@@ -1084,7 +1148,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--config",
         required=True,
-        choices=RUNPOD_CONFIG_NAMES,
+        choices=ALL_VLLM_CONFIG_NAMES,
         help="vLLM eval config name from orchestrator.evals.configs",
     )
 
@@ -1205,6 +1269,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
 
+    p.add_argument(
+        "--vllm-url",
+        default=None,
+        help=(
+            "Direct vLLM endpoint URL (e.g. http://leo-workstation:8000). "
+            "Used for workstation configs (image=None) to bypass RunPod "
+            "pod lifecycle entirely. Required for workstation configs; "
+            "auto-detected from config name when unset."
+        ),
+    )
+
     return p.parse_args(argv)
 
 
@@ -1226,18 +1301,31 @@ def main(argv: list[str] | None = None) -> int:
             f"{args.concurrency * 5} simultaneous reviewer calls)"
         )
 
-    # Fail fast if RunPod credentials are missing — don't burn preflight time
-    # only to discover the key is unset right before pod creation.
-    try:
-        _load_runpod_api_key()
-    except RuntimeError as e:
-        log(f"ERROR: {e}")
+    cfg = get_config_by_name(args.config)
+    if cfg is None:
+        log(f"ERROR: unknown config '{args.config}'")
         return 1
 
-    cfg = get_config_by_name(args.config)
-    if cfg is None or cfg.image is None:
-        log(f"ERROR: config '{args.config}' is not a vLLM/RunPod config")
-        return 1
+    is_workstation = cfg.image is None
+
+    # Workstation configs require --vllm-url (or a sensible default).
+    if is_workstation:
+        if args.vllm_url is None:
+            log(
+                f"ERROR: config '{args.config}' is a workstation config "
+                f"(image=None) — --vllm-url is required "
+                f"(e.g. --vllm-url http://leo-workstation:8000)"
+            )
+            return 1
+        log(f"Workstation mode: direct connection to {args.vllm_url}")
+    else:
+        # Fail fast if RunPod credentials are missing — don't burn preflight
+        # time only to discover the key is unset right before pod creation.
+        try:
+            _load_runpod_api_key()
+        except RuntimeError as e:
+            log(f"ERROR: {e}")
+            return 1
 
     task_ids = resolve_task_ids(args)
     log(f"Run plan: config={args.config} tasks={task_ids}")
@@ -1290,7 +1378,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         try:
-            if args.pod_id:
+            if is_workstation:
+                handle = _connect_workstation(cfg, args)
+            elif args.pod_id:
                 handle = reuse_pod(cfg, args)
             else:
                 handle = bring_up_pod(cfg, args)

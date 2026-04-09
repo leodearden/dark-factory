@@ -202,11 +202,18 @@ class VllmBridge:
     is returned to the caller.  All other requests are piped through verbatim.
     """
 
-    def __init__(self, upstream_url: str) -> None:
+    def __init__(
+        self,
+        upstream_url: str,
+        *,
+        max_output_tokens: int | None = None,
+    ) -> None:
         self.upstream_url = upstream_url.rstrip('/')
         self.url: str = ''
         self._runner: web.AppRunner | None = None
         self._session: ClientSession | None = None
+        self._max_output_tokens = max_output_tokens
+        self._max_model_len: int | None = None
 
     async def start(self) -> None:
         """Start the bridge server and bind to a random local port."""
@@ -215,6 +222,13 @@ class VllmBridge:
         # requests at 5 min.  Use 30 min — the subprocess timeout is the real
         # outer bound.
         self._session = ClientSession(timeout=ClientTimeout(total=1800))
+
+        # Discover max_model_len from the upstream /v1/models endpoint so we
+        # can clamp max_tokens on incoming requests to avoid context-length
+        # overflow 500s.  Claude CLI defaults to max_tokens=32000 which easily
+        # exceeds smaller models (e.g. 63k context with a 31k prompt).
+        await self._discover_max_model_len()
+
         app = web.Application()
         # Specific route must be registered before catch-all
         app.router.add_post('/v1/messages', self._handle_messages)
@@ -239,6 +253,73 @@ class VllmBridge:
             session, self._session = self._session, None
             await session.close()
 
+    async def _discover_max_model_len(self) -> None:
+        """Query /v1/models to learn the model's max_model_len.
+
+        Used to clamp ``max_tokens`` on incoming requests so that the total
+        (prompt + output) doesn't exceed the model's context window.  Without
+        this, Claude CLI's default ``max_tokens=32000`` causes 500s on models
+        with smaller context windows (e.g. 63k with a 31k eval prompt).
+
+        Failures are non-fatal — the bridge falls back to the explicit
+        ``max_output_tokens`` constructor arg or no clamping at all.
+        """
+        assert self._session is not None
+        try:
+            async with self._session.get(
+                self.upstream_url + '/v1/models',
+                timeout=ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    models = data.get('data', [])
+                    if models:
+                        mml = models[0].get('max_model_len')
+                        if isinstance(mml, int) and mml > 0:
+                            self._max_model_len = mml
+                            logger.info(
+                                'Bridge discovered max_model_len=%d from upstream',
+                                mml,
+                            )
+        except Exception as e:
+            logger.warning('Bridge failed to discover max_model_len: %s', e)
+
+    # Default output token cap as a fraction of max_model_len.  Claude CLI
+    # defaults to max_tokens=32000 which assumes a 200k+ context.  For
+    # smaller models (63k context, 131k context), we need to leave most of
+    # the context for the prompt.  Eval prompts are ~31-39k tokens, so
+    # reserving 75% for input and 25% for output is a safe starting point.
+    # 8k output tokens is still generous for tool calls + code generation.
+    _OUTPUT_FRACTION = 0.25
+    _MIN_OUTPUT_CAP = 4096    # Never clamp below 4k
+    _DEFAULT_OUTPUT_CAP = 8000  # Fallback when max_model_len is unknown
+
+    def _clamp_max_tokens(self, body: dict) -> None:
+        """Clamp ``max_tokens`` to avoid context-length overflow.
+
+        Strategy: if ``max_output_tokens`` was provided at init, use it
+        directly. Otherwise, if we discovered ``max_model_len`` from the
+        upstream, cap ``max_tokens`` to 25% of the context (reserving 75%
+        for the prompt). This is conservative but avoids the 500 errors
+        that occur when Claude CLI's default 32k + a 31k eval prompt
+        exceeds the model's context window.
+        """
+        cap = self._max_output_tokens
+        if cap is None and self._max_model_len is not None:
+            cap = max(
+                self._MIN_OUTPUT_CAP,
+                int(self._max_model_len * self._OUTPUT_FRACTION),
+            )
+
+        if cap is not None:
+            current = body.get('max_tokens')
+            if isinstance(current, int) and current > cap:
+                logger.info(
+                    'Clamping max_tokens from %d to %d (max_model_len=%s)',
+                    current, cap, self._max_model_len,
+                )
+                body['max_tokens'] = cap
+
     async def __aenter__(self) -> VllmBridge:
         await self.start()
         return self
@@ -251,6 +332,8 @@ class VllmBridge:
         body = await request.json()
         # Force non-streaming so we can buffer and translate the full response
         body['stream'] = False
+        # Clamp max_tokens to avoid context-length overflow
+        self._clamp_max_tokens(body)
 
         headers = {
             k: v for k, v in request.headers.items()

@@ -153,6 +153,7 @@ class Harness:
         dry_run: bool = False,
         delay_secs: int = 0,
         force_dirty_start: bool = False,
+        retag_modules: bool = False,
     ) -> HarnessReport:
         """Execute the full orchestration pipeline.
 
@@ -272,7 +273,7 @@ class Harness:
 
             # 2b. Tag tasks with code modules for concurrency locking
             logger.info('Tagging tasks with code modules...')
-            await self._tag_task_modules()
+            await self._tag_task_modules(force=retag_modules)
 
             # 2c. Recover crashed tasks from surviving worktrees
             await self._recover_crashed_tasks()
@@ -462,28 +463,35 @@ class Harness:
         if tagged:
             logger.info(f'Tagged {tagged} tasks with PRD: {resolved_prd}')
 
-    async def _tag_task_modules(self) -> None:
+    async def _tag_task_modules(self, force: bool = False) -> None:
         """Invoke a Claude agent to tag each task with the code modules it touches.
 
         Uses structured output to get a JSON mapping of task_id → [modules],
         then persists via scheduler.update_task().
+
+        When *force* is ``True``, retag all non-done/cancelled tasks even if
+        they already have module metadata.
         """
         tasks = await self.scheduler.get_tasks()
 
-        # Filter to pending tasks that don't already have modules in metadata
-        # (done/cancelled tasks don't need module tags — they won't be executed)
+        skip_statuses = {'done', 'cancelled'}
         untagged = []
         for t in tasks:
-            if t.get('status') not in ('pending', 'in-progress'):
+            if t.get('status') in skip_statuses:
                 continue
-            metadata = t.get('metadata') or {}
-            modules = metadata.get('modules', [])
-            if not modules:
-                untagged.append(t)
+            if not force:
+                metadata = t.get('metadata') or {}
+                modules = metadata.get('modules', [])
+                if modules:
+                    continue
+            untagged.append(t)
 
         if not untagged:
-            logger.info('All tasks already have module tags — skipping')
+            logger.info('No tasks to tag — skipping')
             return
+
+        if force:
+            logger.info(f'Force-retagging {len(untagged)} tasks with module metadata')
 
         # Get top-level directory listing for context
         try:

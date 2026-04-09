@@ -1,0 +1,19 @@
+{
+  "id": "esc-514-93",
+  "task_id": "514",
+  "agent_role": "orchestrator",
+  "severity": "blocking",
+  "category": "review_issues",
+  "summary": "Review cycles exhausted with 1 blocking issue(s) and 0 suggestion(s)",
+  "detail": "# Review Feedback \u2014 Blocking Issues\n\n## [merge] merge_error\n**Location:** main\n**Issue:** advance_main failed (stash_failed) for task 514\n",
+  "suggested_action": "fix_review_issues",
+  "timestamp": "2026-04-07T03:56:27.448779+00:00",
+  "status": "resolved",
+  "resolution": "Stale duplicate of `esc-514-92` from the same in-flight review cycle (escalation IDs 92 \u2192 93 are sequential). Re-verified state:\n\n- `git merge-base --is-ancestor d7daa9841d main` \u2192 still true. Merge is landed.\n- `.task/reviews/merge.json` \u2192 still absent (the deletion from `esc-514-92` held). Remaining files are the legitimate per-reviewer artifacts.\n- Main worktree has no modified tracked files (only the usual untracked dirs).\n- Task 514 status in Taskmaster: `done` (no_op on re-set).\n\nThis escalation was queued before the `merge.json` deletion in `esc-514-92` had a chance to break the replay loop. With that file gone, future workflow cycles should not regenerate the same merge_error verdict \u2014 the merge phase will see the branch is already an ancestor of main and emit `already_merged`. Dismissing.",
+  "worktree": "/home/leo/src/dark-factory/.worktrees/514",
+  "workflow_state": "review",
+  "level": 0,
+  "resolved_at": "2026-04-07T03:58:02.020752+00:00",
+  "resolved_by": "steward",
+  "resolution_turns": 4
+}

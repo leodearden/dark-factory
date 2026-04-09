@@ -44,8 +44,10 @@ def main(verbose: bool):
                    'Escalation server starts immediately.')
 @click.option('--force-dirty-start', is_flag=True,
               help='Start even if project_root has uncommitted changes (risky)')
+@click.option('--retag-modules', is_flag=True,
+              help='Force re-tag all non-done/cancelled tasks with code modules')
 def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | None,
-        force_dirty_start: bool):
+        force_dirty_start: bool, retag_modules: bool):
     """Run the orchestrator against a PRD, or execute existing tasks if no PRD given."""
     from orchestrator.harness import Harness
 
@@ -59,6 +61,7 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
     report = asyncio.run(harness.run(
         prd, dry_run=dry_run, delay_secs=delay_secs,
         force_dirty_start=force_dirty_start,
+        retag_modules=retag_modules,
     ))
 
     click.echo(report.summary())

@@ -62,7 +62,6 @@ for cfg in $CONFIGS; do
         --task-timeout-min "$TIMEOUT_MIN" \
         --orch-timeout-min "$ORCH_TIMEOUT_MIN" \
         --port "$PORT" \
-        --no-volume \
         > "$LOG" 2>&1 &
     pid=$!
     PIDS+=("$pid")
