@@ -330,20 +330,63 @@ async def run_eval_matrix(
                 trial=trial, timeout_override=timeout_override,
             )
 
-    raw = await asyncio.gather(
-        *[_run_one(tp, cfg, t) for tp, cfg, t in combos],
-        return_exceptions=True,
-    )
-
+    # Design decision: use asyncio.wait(FIRST_COMPLETED) monitor loop instead of
+    # asyncio.gather(return_exceptions=True).
+    #
+    # asyncio.gather(return_exceptions=True) blocks until ALL tasks complete before
+    # the post-gather loop can detect CancelledError and re-raise it.  For a large
+    # matrix where one eval is cancelled early, N-1 siblings continue running their
+    # full duration — wasting CPU proportional to matrix size × timeout_minutes.
+    #
+    # asyncio.wait(FIRST_COMPLETED) lets us react to each task completion
+    # individually: on CancelledError we immediately cancel all remaining tasks and
+    # re-raise, typically within milliseconds.  Non-cancel exceptions are still
+    # logged and the loop continues — identical happy-path/error-path semantics to
+    # the previous gather loop, with strictly better cancellation behaviour.
+    #
+    # This is the same pattern used in harness.py (lines 305, 317) for managing
+    # concurrent workflow tasks.  Cleanup follows the established pattern from
+    # steward.py (lines 101-104): cancel tasks explicitly then await them with
+    # return_exceptions=True to ensure clean teardown before re-raising.
+    active: set[asyncio.Task] = {
+        asyncio.create_task(_run_one(tp, cfg, t))
+        for tp, cfg, t in combos
+    }
     results: list[EvalResult] = []
-    for r in raw:
-        if isinstance(r, asyncio.CancelledError):
-            logger.error(f'Eval cancelled: {r}')
-            raise r
-        elif isinstance(r, BaseException):
-            logger.error(f'Eval failed: {r}')
-        elif r is not None:
-            results.append(r)
+    try:
+        while active:
+            done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                if task.cancelled():
+                    exc = asyncio.CancelledError()
+                    logger.error(f'Eval cancelled: {exc}')
+                    for t in active:
+                        t.cancel()
+                    await asyncio.gather(*active, return_exceptions=True)
+                    active.clear()
+                    raise exc
+                exc = task.exception()
+                if exc is not None:
+                    if isinstance(exc, asyncio.CancelledError):
+                        logger.error(f'Eval cancelled: {exc}')
+                        for t in active:
+                            t.cancel()
+                        await asyncio.gather(*active, return_exceptions=True)
+                        active.clear()
+                        raise exc
+                    logger.error(f'Eval failed: {exc}')
+                else:
+                    r = task.result()
+                    if r is not None:
+                        results.append(r)
+    except asyncio.CancelledError:
+        # External cancellation (e.g. SIGINT / asyncio.wait_for timeout).
+        # Cancel all remaining sibling tasks and await their cleanup before
+        # re-raising so we don't leave orphaned tasks behind.
+        for t in active:
+            t.cancel()
+        await asyncio.gather(*active, return_exceptions=True)
+        raise
     return results
 
 
