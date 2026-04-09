@@ -113,9 +113,7 @@ class TestDeleteEntityNode:
         """Passes node UUID as parameter to both the pre-check and delete Cypher calls."""
         backend = make_backend(mock_config)
         node_uuid = 'my-node-uuid'
-        graph = MagicMock()
-        graph.ro_query = AsyncMock(return_value=MagicMock(result_set=[['Name', '']]))
-        graph.query = AsyncMock(return_value=MagicMock(result_set=[]))
+        graph = make_graph_mock(ro_rows=[['Name', '']], q_rows=[])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.delete_entity_node(node_uuid, group_id='test')
         # Pre-check (ro_query) should pass uuid param
@@ -131,12 +129,10 @@ class TestDeleteEntityNode:
         graph.query.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_raises_node_not_found_when_missing(self, mock_config, make_backend):
+    async def test_raises_node_not_found_when_missing(self, mock_config, make_backend, make_graph_mock):
         """Raises NodeNotFoundError when pre-check returns no rows."""
         backend = make_backend(mock_config)
-        graph = MagicMock()
-        graph.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
-        graph.query = AsyncMock(return_value=MagicMock(result_set=[]))
+        graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         with pytest.raises(NodeNotFoundError):
             await backend.delete_entity_node('missing-uuid', group_id='test')
