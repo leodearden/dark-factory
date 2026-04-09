@@ -268,3 +268,64 @@ class TestRunEvalMatrixNonCancelPath:
             f'Unexpected "cancelled" log record. '
             f'Got: {[r.message for r in caplog.records]}'
         )
+
+    async def test_normal_exception_does_not_cancel_pending_siblings(
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """RuntimeError from one eval must NOT cancel slow sibling tasks.
+
+        Three tasks: one raises RuntimeError immediately, two sleep 0.5s then
+        return results.  The monitor loop must log-and-continue for the failed
+        task and wait for both slow siblings to complete successfully.
+
+        Guards against the monitor loop accidentally cancelling siblings on
+        non-cancel exceptions.
+        """
+        fail_path = tmp_path / 'task_fail.json'
+        slow1_path = tmp_path / 'task_slow1.json'
+        slow2_path = tmp_path / 'task_slow2.json'
+        fail_path.touch()
+        slow1_path.touch()
+        slow2_path.touch()
+
+        async def fake_run_eval(task_path: Path, config: EvalConfig, *args, **kwargs) -> EvalResult:
+            if 'fail' in task_path.stem:
+                raise RuntimeError('immediate failure')
+            # Slow tasks: sleep briefly then return a result
+            await asyncio.sleep(0.1)
+            return EvalResult(
+                task_id=task_path.stem,
+                config_name=config.name,
+                outcome='success',
+                metrics={},
+                worktree_path='/tmp/stub',
+            )
+
+        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'):
+            results = await run_eval_matrix(
+                [fail_path, slow1_path, slow2_path],
+                [_CFG],
+                force=True,
+            )
+
+        # (a) Both slow tasks completed and returned results
+        result_ids = {r.task_id for r in results}
+        assert 'task_slow1' in result_ids, f'task_slow1 missing from results: {result_ids}'
+        assert 'task_slow2' in result_ids, f'task_slow2 missing from results: {result_ids}'
+
+        # (b) Exactly 2 results (failed task does not produce a result)
+        assert len(results) == 2, f'Expected 2 results, got {len(results)}: {results}'
+
+        # (c) RuntimeError was logged for the failing task
+        assert any(
+            'failed' in record.message.lower()
+            for record in caplog.records
+        ), f'Expected "failed" log record. Got: {[r.message for r in caplog.records]}'
+
+        # (d) No 'cancelled' log record
+        assert not any(
+            'cancelled' in record.message.lower()
+            for record in caplog.records
+        ), f'Unexpected "cancelled" log record. Got: {[r.message for r in caplog.records]}'
