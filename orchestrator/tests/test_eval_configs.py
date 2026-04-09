@@ -231,6 +231,23 @@ class TestEvalConfigsIncludesVllm:
             f'  Missing: {expected - derived}'
         )
 
+    def test_vllm_configs_share_identity_with_eval_configs(self):
+        """EVAL_CONFIGS entries for vLLM configs must be the exact same Python objects.
+
+        EVAL_CONFIGS is built by spreading VLLM_EVAL_CONFIGS (via *VLLM_EVAL_CONFIGS
+        in configs.py), so each vLLM entry in EVAL_CONFIGS must be the identical
+        object — not a copy. This invariant is required for env_overrides mutations
+        on VLLM_EVAL_CONFIGS to be visible through EVAL_CONFIGS.
+        """
+        vllm_id_set = {id(c) for c in VLLM_EVAL_CONFIGS}
+        non_identical = [
+            cfg.name for cfg in EVAL_CONFIGS
+            if cfg.name in VLLM_NAMES and id(cfg) not in vllm_id_set
+        ]
+        assert not non_identical, (
+            f'vLLM entries in EVAL_CONFIGS are copies, not shared references: {non_identical}'
+        )
+
 
 class TestRunnerDefaultIncludesVllm:
     """run_eval_matrix must receive vLLM configs when called with its default EVAL_CONFIGS."""
