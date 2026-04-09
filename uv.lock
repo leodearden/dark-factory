@@ -1968,7 +1968,7 @@ version = "0.1.0"
 source = { editable = "orchestrator" }
 dependencies = [
     { name = "click" },
-    { name = "dark-factory-shared" },
+    { name = "dark-factory-shared", extra = ["vllm"] },
     { name = "escalation" },
     { name = "httpx" },
     { name = "pydantic" },
@@ -1988,7 +1988,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.0" },
-    { name = "dark-factory-shared", editable = "shared" },
+    { name = "dark-factory-shared", extras = ["vllm"], editable = "shared" },
     { name = "escalation", editable = "escalation" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.7" },
