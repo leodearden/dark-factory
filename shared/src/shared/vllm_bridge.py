@@ -12,12 +12,56 @@ Provides:
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 
 from aiohttp import web
 from aiohttp.client import ClientSession
 
+logger = logging.getLogger(__name__)
+
 # ── pure translation helpers ─────────────────────────────────────────────────
+
+
+_PAD_TOKEN_RATIO_THRESHOLD = 0.5
+
+
+def _is_pad_token_response(body: dict) -> bool:
+    """Return True if the response content is predominantly NULL pad tokens.
+
+    Inspects all text content in the response body.  If there is at least some
+    text and the ratio of ``\\x00`` characters to total characters exceeds
+    ``_PAD_TOKEN_RATIO_THRESHOLD`` (50%), the response is considered a pad-token
+    response.
+
+    Responses that contain *any* ``tool_use`` blocks are never flagged — a
+    tool-call response with garbled trailing text is still actionable.
+    """
+    content = body.get('content')
+    if content is None:
+        return False
+
+    # Collect all text from the response.
+    texts: list[str] = []
+
+    if isinstance(content, str):
+        texts.append(content)
+    elif isinstance(content, list):
+        # If the response contains tool_use blocks, don't flag it.
+        if any(b.get('type') == 'tool_use' for b in content):
+            return False
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'text':
+                text = block.get('text', '')
+                if isinstance(text, str):
+                    texts.append(text)
+
+    combined = ''.join(texts)
+    if not combined:
+        return False
+
+    null_count = combined.count('\x00')
+    return (null_count / len(combined)) > _PAD_TOKEN_RATIO_THRESHOLD
 
 
 def _normalize_tool_use_block(block: dict) -> dict:
@@ -112,6 +156,23 @@ def _translate_messages_response(body: dict) -> dict:
     )
     if has_tool_use:
         result['stop_reason'] = 'tool_use'
+
+    # ── detect pad-token (NULL byte) responses ──────────────────────────────
+    if _is_pad_token_response(result):
+        logger.warning(
+            'vLLM returned pad tokens (\\x00) instead of content — '
+            'converting to error response'
+        )
+        return {
+            'type': 'error',
+            'error': {
+                'type': 'invalid_response',
+                'message': (
+                    'vLLM returned pad tokens (\\u0000) instead of content '
+                    '— likely a model/quantization issue'
+                ),
+            },
+        }
 
     return result
 
