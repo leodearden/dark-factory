@@ -353,6 +353,16 @@ class TestModuleConstants:
         )
         assert len(vllm_names) == 15, f'Expected 15 names, got {len(vllm_names)}'
 
+    def test_cli_imports_at_module_level(self):
+        """CliRunner and main must be importable as module-level names (not buried inside a test)."""
+        g = globals()
+        assert 'CliRunner' in g, (
+            'CliRunner not at module level — move `from click.testing import CliRunner` to top of file'
+        )
+        assert 'main' in g, (
+            'main not at module level — move `from orchestrator.cli import main` to top of file'
+        )
+
 
 class TestHelperMethods:
     """Structural tests: verify helper methods exist on test classes with correct behaviour."""
