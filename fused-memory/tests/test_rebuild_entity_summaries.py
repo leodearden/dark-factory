@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1213,6 +1214,41 @@ class TestRebuildEntitySummariesCancellation:
         # coroutines and that we are testing the post-gather propagation path, not a
         # pre-gather short-circuit.
         assert backend.update_node_summary.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_logs_warning_before_propagating(
+        self, two_entity_backend, caplog
+    ):
+        """A WARNING is emitted with group_id and progress counters before CancelledError propagates.
+
+        The warning must contain 'rebuild_entity_summaries', 'cancellation', and the group_id
+        so operators can identify mid-flight cancellations in logs. At the moment of the
+        warning, Pass 2 has not yet executed for this batch so rebuilt_so_far=0 and
+        errors_so_far=0.
+        """
+        backend = two_entity_backend
+        # First entity's rebuild raises CancelledError; second would succeed
+        backend.update_node_summary = AsyncMock(
+            side_effect=[asyncio.CancelledError(), None]
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'), pytest.raises(asyncio.CancelledError):
+            await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.backends.graphiti_client'
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected 1 WARNING from graphiti_client, got {len(warning_records)}: {warning_records}'
+        )
+        msg = warning_records[0].getMessage()
+        assert 'rebuild_entity_summaries' in msg
+        assert 'cancellation' in msg
+        assert 'test' in msg
+        assert 'rebuilt_so_far=0' in msg
+        assert 'errors_so_far=0' in msg
 
     @pytest.mark.asyncio
     async def test_cancelled_error_propagates_force_false(self, two_entity_backend):
