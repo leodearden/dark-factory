@@ -666,6 +666,43 @@ class TestRebuildSummariesManager:
         assert len(result.details) == 1
 
     @pytest.mark.asyncio
+    async def test_run_entrypoint_emits_exactly_one_summary_log(
+        self, make_fake_maintenance_service, caplog
+    ):
+        """run_rebuild_summaries() emits exactly one 'run_rebuild_summaries complete' log.
+
+        This is a regression guard: after removing the manager's summary log, the
+        entrypoint must still emit its own single summary line (no double-logging,
+        no silent dropping).
+        """
+        import logging
+        from unittest.mock import patch
+        from fused_memory.maintenance.rebuild_summaries import run_rebuild_summaries
+        mock_cfg = MagicMock()
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+        mock_service.graphiti.rebuild_entity_summaries = AsyncMock(return_value={
+            'total_entities': 5,
+            'stale_entities': 3,
+            'rebuilt': 3,
+            'skipped': 0,
+            'errors': 0,
+            'details': [],
+        })
+        fake_ctx = make_fake_maintenance_service(mock_cfg, mock_service)
+        with caplog.at_level(logging.INFO, logger='fused_memory.maintenance.rebuild_summaries'):
+            with patch(
+                'fused_memory.maintenance.rebuild_summaries.maintenance_service',
+                side_effect=fake_ctx,
+            ):
+                await run_rebuild_summaries(config_path='/fake/config.yaml', group_id='test')
+        matching = [r for r in caplog.records if 'run_rebuild_summaries complete' in r.message]
+        assert len(matching) == 1, (
+            f'Expected exactly 1 summary log from run_rebuild_summaries, got {len(matching)}: '
+            f'{[r.message for r in matching]}'
+        )
+
+    @pytest.mark.asyncio
     async def test_manager_does_not_emit_summary_log(self, mock_config, caplog):
         """RebuildSummariesManager.run() must NOT emit a summary log line.
 
