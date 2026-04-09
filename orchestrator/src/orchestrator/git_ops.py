@@ -786,12 +786,12 @@ class GitOps:
                 wt_dir = self.config.worktree_dir
                 _, unstaged_files, _ = await _run(
                     ['git', 'diff', '--name-only', '--',
-                     '.', f':!.task', f':!{wt_dir}'],
+                     '.', ':!.task', f':!{wt_dir}'],
                     cwd=self.project_root,
                 )
                 _, staged_files, _ = await _run(
                     ['git', 'diff', '--name-only', '--cached', '--',
-                     '.', f':!.task', f':!{wt_dir}'],
+                     '.', ':!.task', f':!{wt_dir}'],
                     cwd=self.project_root,
                 )
                 dirty_tracked = {

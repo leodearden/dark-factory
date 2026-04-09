@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, GroundTruthIssue
-from orchestrator.evals.reviewer_trial.runner import PanelRunResult
 from orchestrator.evals.reviewer_trial.scorer import (
     IssueMatch,
     ScoringResult,

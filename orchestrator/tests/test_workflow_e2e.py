@@ -1005,6 +1005,7 @@ class TestPostMergeFailure:
             )
 
         monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify_fn)
+        monkeypatch.setattr('orchestrator.merge_queue.run_scoped_verification', verify_fn)
 
         # Capture pre-merge main ref
         _, pre_merge_sha, _ = await _run(
@@ -1014,7 +1015,9 @@ class TestPostMergeFailure:
         outcome = await workflow.run()
 
         assert outcome == WorkflowOutcome.BLOCKED
-        assert scheduler.statuses['42'][-1] == 'blocked'
+        # merge_phase=True suppresses scheduler status transition —
+        # the orchestrator's outer loop handles the final status update.
+        assert scheduler.statuses['42'][-1] == 'in-progress'
 
         # Main should NOT have advanced — update-ref was never called
         _, post_sha, _ = await _run(

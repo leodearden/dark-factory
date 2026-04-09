@@ -6,11 +6,8 @@ from unittest.mock import patch
 
 import pytest
 
-from dataclasses import dataclass
-from pathlib import Path
-
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, WorktreeInfo, _run
 
 
 @pytest.fixture
@@ -45,8 +42,6 @@ def git_config() -> GitConfig:
 def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
     return GitOps(git_config, git_repo)
 
-
-from orchestrator.git_ops import WorktreeInfo
 
 
 @pytest.mark.asyncio

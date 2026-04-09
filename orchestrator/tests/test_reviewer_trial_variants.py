@@ -11,7 +11,6 @@ from orchestrator.evals.reviewer_trial.variants import (
     VARIANT_C,
     VARIANT_D,
     ReviewerSpec,
-    VariantConfig,
     build_trial_reviewer_role,
 )
 

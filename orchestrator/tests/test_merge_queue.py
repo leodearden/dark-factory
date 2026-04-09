@@ -102,7 +102,7 @@ def _mock_verify_pass():
 class TestCasUpdateRef:
     async def test_advance_main_with_expected(self, git_ops: GitOps):
         """CAS succeeds when expected_main matches actual main."""
-        worktree, _ = await git_ops.create_worktree('cas-ok')
+        worktree = (await git_ops.create_worktree('cas-ok')).path
         (worktree / 'file.py').write_text('x = 1\n')
         await git_ops.commit(worktree, 'Add file')
 
@@ -128,7 +128,7 @@ class TestCasUpdateRef:
         the new main, advance_main cannot make the commit a descendant, so
         it returns 'not_descendant' before reaching the CAS step.
         """
-        worktree, _ = await git_ops.create_worktree('cas-fail')
+        worktree = (await git_ops.create_worktree('cas-fail')).path
         (worktree / 'file.py').write_text('x = 1\n')
         await git_ops.commit(worktree, 'Add file')
 
@@ -155,7 +155,7 @@ class TestCasUpdateRef:
 
     async def test_advance_main_none_expected(self, git_ops: GitOps):
         """Backward compat: no expected_main → unconditional update-ref."""
-        worktree, _ = await git_ops.create_worktree('cas-none')
+        worktree = (await git_ops.create_worktree('cas-none')).path
         (worktree / 'file.py').write_text('x = 1\n')
         await git_ops.commit(worktree, 'Add file')
 
@@ -182,7 +182,7 @@ class TestMergeWorker:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
         """Submit a merge request → worker merges → file appears on main."""
-        worktree, _ = await git_ops.create_worktree('queue-basic')
+        worktree = (await git_ops.create_worktree('queue-basic')).path
         (worktree / 'queued.py').write_text('queued = True\n')
         await git_ops.commit(worktree, 'Add queued file')
 
@@ -215,7 +215,7 @@ class TestMergeWorker:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
         """Branch that's already on main returns already_merged."""
-        worktree, _ = await git_ops.create_worktree('already-merged')
+        worktree = (await git_ops.create_worktree('already-merged')).path
         (worktree / 'merged.py').write_text('merged = True\n')
         await git_ops.commit(worktree, 'Add merged file')
 
@@ -248,7 +248,7 @@ class TestMergeWorker:
     ):
         """Conflicting branch returns conflict status."""
         # Create worktree FIRST (from current main)
-        worktree, _ = await git_ops.create_worktree('conflict-task')
+        worktree = (await git_ops.create_worktree('conflict-task')).path
 
         # THEN advance main with conflicting change to same file
         (git_ops.project_root / 'README.md').write_text('# Main version\n')
@@ -282,7 +282,7 @@ class TestMergeWorker:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
         """CAS failure → re-enqueue at front → succeeds on retry."""
-        worktree, _ = await git_ops.create_worktree('cas-retry')
+        worktree = (await git_ops.create_worktree('cas-retry')).path
         (worktree / 'retry.py').write_text('retry = True\n')
         await git_ops.commit(worktree, 'Add retry file')
 
@@ -325,7 +325,7 @@ class TestMergeWorker:
         worker = MergeWorker(git_ops, queue)
 
         # Don't start worker yet — put items in queue, then stop
-        worktree, _ = await git_ops.create_worktree('shutdown')
+        worktree = (await git_ops.create_worktree('shutdown')).path
         req = _make_request('5', 'shutdown', worktree, config)
         await queue.put(req)
 
@@ -341,7 +341,7 @@ class TestMergeWorker:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
         """Post-merge verification failure → blocked."""
-        worktree, _ = await git_ops.create_worktree('verify-fail')
+        worktree = (await git_ops.create_worktree('verify-fail')).path
         (worktree / 'bad.py').write_text('bad = True\n')
         await git_ops.commit(worktree, 'Add bad file')
 
@@ -371,7 +371,7 @@ class TestMergeWorker:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
         """CAS failures beyond MAX_CAS_RETRIES resolve as blocked."""
-        worktree, _ = await git_ops.create_worktree('cas-limit')
+        worktree = (await git_ops.create_worktree('cas-limit')).path
         (worktree / 'limit.py').write_text('limit = True\n')
         await git_ops.commit(worktree, 'Add limit file')
 
@@ -403,7 +403,7 @@ class TestMergeWorker:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
         """Permanent not_descendant failure blocks without re-enqueue."""
-        worktree, _ = await git_ops.create_worktree('perm-fail')
+        worktree = (await git_ops.create_worktree('perm-fail')).path
         (worktree / 'perm.py').write_text('perm = True\n')
         await git_ops.commit(worktree, 'Add perm file')
 
@@ -448,7 +448,7 @@ async def _make_branch_with_file(
     content: str,
 ) -> Path:
     """Create a worktree branch with one committed file and return its path."""
-    worktree, _ = await git_ops.create_worktree(branch_name)
+    worktree = (await git_ops.create_worktree(branch_name)).path
     (worktree / filename).write_text(content)
     await git_ops.commit(worktree, f'Add {filename}')
     return worktree
@@ -695,8 +695,8 @@ class TestSpeculativeMergeWorker:
         worker = SpeculativeMergeWorker(git_ops, queue)
 
         # Don't start worker — just queue items and stop
-        wt_a, _ = await git_ops.create_worktree('shut-a')
-        wt_b, _ = await git_ops.create_worktree('shut-b')
+        wt_a = (await git_ops.create_worktree('shut-a')).path
+        wt_b = (await git_ops.create_worktree('shut-b')).path
         req_a = _make_request('shut-a', 'shut-a', wt_a, config)
         req_b = _make_request('shut-b', 'shut-b', wt_b, config)
         await queue.put(req_a)
@@ -725,7 +725,7 @@ class TestSpeculativeMergeWorker:
 
         # Create N+1 worktree from current main, then advance main via
         # a direct commit to cause a conflict on the same file.
-        wt_n1, _ = await git_ops.create_worktree('cfl-n1')
+        wt_n1 = (await git_ops.create_worktree('cfl-n1')).path
         # Write conflicting content to README.md in both main and wt_n1
         (git_ops.project_root / 'README.md').write_text('# Main conflict\n')
         await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
@@ -823,7 +823,7 @@ class TestSpeculativeMergeWorker:
             git_ops, 'am-n', 'file_am_n.py', 'am_n = 1\n',
         )
         # Create N+1 as already-merged: merge it first, then submit it
-        wt_n1, _ = await git_ops.create_worktree('am-n1')
+        wt_n1 = (await git_ops.create_worktree('am-n1')).path
         (wt_n1 / 'file_am_n1.py').write_text('am_n1 = 2\n')
         await git_ops.commit(wt_n1, 'N+1 file')
         result = await git_ops.merge_to_main(wt_n1, 'am-n1')
@@ -1678,7 +1678,7 @@ class TestSpeculativeMergeWorker:
 @pytest.mark.asyncio
 class TestSpeculativeBackwardCompat:
     async def test_basic_merge(self, git_ops: GitOps, config: OrchestratorConfig):
-        worktree, _ = await git_ops.create_worktree('compat-basic')
+        worktree = (await git_ops.create_worktree('compat-basic')).path
         (worktree / 'compat.py').write_text('compat = True\n')
         await git_ops.commit(worktree, 'Add compat file')
 
@@ -1701,7 +1701,7 @@ class TestSpeculativeBackwardCompat:
         await worker_task
 
     async def test_already_merged(self, git_ops: GitOps, config: OrchestratorConfig):
-        worktree, _ = await git_ops.create_worktree('compat-am')
+        worktree = (await git_ops.create_worktree('compat-am')).path
         (worktree / 'am.py').write_text('am = True\n')
         await git_ops.commit(worktree, 'Add am file')
 
@@ -1725,7 +1725,7 @@ class TestSpeculativeBackwardCompat:
         await worker_task
 
     async def test_verify_failure(self, git_ops: GitOps, config: OrchestratorConfig):
-        worktree, _ = await git_ops.create_worktree('compat-vf')
+        worktree = (await git_ops.create_worktree('compat-vf')).path
         (worktree / 'bad.py').write_text('bad = True\n')
         await git_ops.commit(worktree, 'Add bad file')
 

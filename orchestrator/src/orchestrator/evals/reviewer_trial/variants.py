@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 
 from orchestrator.agents.roles import AgentRole
 
-
 # ---------------------------------------------------------------------------
 # Spec + config types
 # ---------------------------------------------------------------------------

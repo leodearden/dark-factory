@@ -671,7 +671,7 @@ class TestFusedMemoryInstructionsEntityName:
         server = create_mcp_server(svc)
 
         import asyncio
-        tools = asyncio.get_event_loop().run_until_complete(server.list_tools())
+        tools = asyncio.run(server.list_tools())
         tool = next(t for t in tools if t.name == 'refresh_entity_summary')
         desc = tool.description or ''
         assert 'entity_uuid' in desc

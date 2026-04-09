@@ -111,13 +111,16 @@ def _make_args(**overrides) -> argparse.Namespace:
         all_tasks=False,
         port=8100,
         datacenter="US-NC-1",
-        no_volume=False,
+        volume=False,
         image=None,
         gpu_type=None,
-        concurrency=1,
+        concurrency=5,
         verify_baseline_clean="strict",
         task_timeout_min=70,
+        orch_timeout_min=None,
         stop_on_first_failure=False,
+        pod_id=None,
+        vllm_url=None,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -414,7 +417,7 @@ class _FakeClient:
 
 
 class _FakeTunnel:
-    """Stand-in for the SSH tunnel Popen — supports terminate/wait/kill."""
+    """Stand-in for the SSH tunnel Popen — supports terminate/wait/kill/poll."""
 
     def __init__(self):
         self.terminated = False
@@ -428,6 +431,10 @@ class _FakeTunnel:
     def kill(self):
         self.terminated = True
 
+    def poll(self):
+        """Return None (process still running) unless terminated."""
+        return 0 if self.terminated else None
+
 
 def _patch_pod_infra(monkeypatch, *, vllm_healthy_first=True):
     """Patch RunPodClient + SSH tunnel + wait_for_vllm so bring_up_pod returns fast.
@@ -440,9 +447,9 @@ def _patch_pod_infra(monkeypatch, *, vllm_healthy_first=True):
     monkeypatch.setattr(
         launcher,
         "wait_for_vllm",
-        lambda port, expected_model, timeout=900: True,
+        lambda port, expected_model, timeout=900, tunnel_proc=None: True,
     )
-    monkeypatch.setattr(launcher, "vllm_healthy", lambda port, timeout=5: vllm_healthy_first)
+    monkeypatch.setattr(launcher, "vllm_healthy", lambda port, timeout=5, base_url=None: vllm_healthy_first)
 
     real_popen = subprocess.Popen
 
@@ -568,6 +575,8 @@ class TestPodLifecycle:
                 "df_task_12,df_task_13,df_task_18",
                 "--verify-baseline-clean",
                 "skip",
+                "--concurrency",
+                "1",
             ]
         )
 
@@ -610,6 +619,8 @@ class TestPodLifecycle:
                     "df_task_12",
                     "--verify-baseline-clean",
                     "skip",
+                    "--concurrency",
+                    "1",
                 ]
             )
 
@@ -633,7 +644,7 @@ class TestPodLifecycle:
         monkeypatch.setattr(
             launcher,
             "wait_for_vllm",
-            lambda port, expected_model, timeout=900: False,
+            lambda port, expected_model, timeout=900, tunnel_proc=None: False,
         )
         fake_tunnel = SimpleNamespace(
             terminate=lambda: None,
@@ -666,6 +677,8 @@ class TestPodLifecycle:
                 "df_task_12",
                 "--verify-baseline-clean",
                 "skip",
+                "--concurrency",
+                "1",
             ]
         )
 
@@ -714,6 +727,8 @@ class TestPodLifecycle:
                 "df_task_12",
                 "--verify-baseline-clean",
                 "skip",
+                "--concurrency",
+                "1",
             ]
         )
 
@@ -835,7 +850,8 @@ class TestPerTaskLogFiles:
                 "df_task_12",
                 "--verify-baseline-clean",
                 "skip",
-                # default concurrency=1
+                "--concurrency",
+                "1",
             ]
         )
         assert rc == 0
@@ -887,6 +903,8 @@ class TestPerTaskLogFiles:
                 "df_task_12",
                 "--verify-baseline-clean",
                 "skip",
+                "--concurrency",
+                "1",
             ]
         )
         assert len(captured["summaries"]) == 1
@@ -1428,6 +1446,8 @@ class TestPreflightBaseline:
                 "df_task_12",
                 "--verify-baseline-clean",
                 "warn",
+                "--concurrency",
+                "1",
             ]
         )
         assert rc == 0
@@ -1467,6 +1487,8 @@ class TestPreflightBaseline:
                 "df_task_12",
                 "--verify-baseline-clean",
                 "skip",
+                "--concurrency",
+                "1",
             ]
         )
         assert rc == 0
@@ -1662,7 +1684,7 @@ class TestWaitForVllmModelCheck:
 
     def _fake_urlopen(
         self,
-        responses: "dict[str, tuple[int, bytes] | Exception]",
+        responses: dict[str, tuple[int, bytes] | Exception],
     ):
         """Return a urllib.request.urlopen stub that dispatches on URL.
 

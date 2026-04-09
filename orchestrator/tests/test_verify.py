@@ -176,16 +176,6 @@ class TestRunVerificationTimeoutRetry:
         config.verify_timeout_retries = 2
         mc = ModuleConfig(prefix='p', test_command='cmd')
 
-        # Per call: tuples applied to each of test/lint/type each attempt.
-        # First three calls (attempt 0: test/lint/type) → timeout; next three → success.
-        responses = [
-            (1, 'Command timed out', True),  # attempt 0 test
-            (1, 'Command timed out', True),  # attempt 0 lint (skipped — None)
-            (1, 'Command timed out', True),  # attempt 0 type (skipped — None)
-            (0, 'ok', False),                # attempt 1 test
-            (0, 'ok', False),                # attempt 1 lint
-            (0, 'ok', False),                # attempt 1 type
-        ]
         # Only test_command set → only 1 _run_cmd call per attempt
         fake, log = self._patched_run_cmd([
             (1, 'timed out', True),

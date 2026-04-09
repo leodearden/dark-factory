@@ -79,13 +79,13 @@ class TestDetectCapHit:
         result = "You've used all available tokens. Usage resets in 45m."
         assert gate.detect_cap_hit('', result, oauth_token='token-a') is True
 
-    def test_extra_usage_phrases_are_not_cap_hits(self):
-        # "extra usage" patterns were removed in e3df395c9f because extra usage
-        # is disabled on all accounts and they caused false-positive cap hits.
+    def test_extra_usage_phrases_are_cap_hits(self):
+        # "extra usage" patterns were re-added in 1e8a9b2dd0 after
+        # "You're out of extra usage" was observed as a real cap signal.
         gate = _make_gate(num_accounts=1)
         assert gate.detect_cap_hit(
             "You're out of extra usage for this period.", '', oauth_token='token-a'
-        ) is False
+        ) is True
         assert gate.detect_cap_hit(
             '', "You're now using extra usage credits.", oauth_token='token-a'
         ) is False

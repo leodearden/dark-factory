@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from shared.usage_gate import UsageGate
+
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.config import (
     BackendsConfig,
@@ -22,7 +24,6 @@ from orchestrator.config import (
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
-from shared.usage_gate import UsageGate
 
 from .configs import EVAL_CONFIGS, EvalConfig
 from .metrics import collect_metrics

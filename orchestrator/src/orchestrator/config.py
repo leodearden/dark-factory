@@ -416,7 +416,7 @@ class OrchestratorConfig(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        config_path = Path(os.environ.get('ORCH_CONFIG_PATH', 'config.yaml'))
+        config_path = Path(os.environ.get('ORCH_CONFIG_PATH', '') or 'config.yaml')
         yaml_settings = YamlSettingsSource(settings_cls, config_path)
         return (init_settings, env_settings, yaml_settings, dotenv_settings)
 
