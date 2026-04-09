@@ -97,49 +97,53 @@ class TestDeleteEntityNode:
     async def test_executes_detach_delete(self, mock_config, make_backend, make_graph_mock):
         """Issues DETACH DELETE Cypher for the given UUID."""
         backend = make_backend(mock_config)
-        # Pre-check query returns a node (row exists), then delete query
-        check_row = [['NodeName', 'some summary']]
         graph = MagicMock()
-        graph.query = AsyncMock(side_effect=[
-            MagicMock(result_set=check_row),  # pre-check: node exists
-            MagicMock(result_set=[]),           # detach delete
-        ])
+        # Pre-check uses ro_query; DETACH DELETE uses query
+        graph.ro_query = AsyncMock(return_value=MagicMock(result_set=[['NodeName', 'some summary']]))
+        graph.query = AsyncMock(return_value=MagicMock(result_set=[]))
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.delete_entity_node('node-uuid-1', group_id='test')
-        assert graph.query.await_count == 2
-        # Second call should contain DETACH DELETE
-        second_call = graph.query.call_args_list[1]
-        args = second_call[0]
+        assert graph.ro_query.await_count == 1
+        assert graph.query.await_count == 1
+        # The single query call should contain DETACH DELETE
+        args = graph.query.call_args[0]
         cypher = args[0] if args else ''
         assert 'DETACH DELETE' in cypher
 
     @pytest.mark.asyncio
     async def test_passes_uuid_as_param(self, mock_config, make_backend, make_graph_mock):
-        """Passes node UUID as parameter to the Cypher query."""
+        """Passes node UUID as parameter to both the pre-check and delete Cypher calls."""
         backend = make_backend(mock_config)
         node_uuid = 'my-node-uuid'
         graph = MagicMock()
-        graph.query = AsyncMock(side_effect=[
-            MagicMock(result_set=[['Name', '']]),  # pre-check
-            MagicMock(result_set=[]),               # delete
-        ])
+        graph.ro_query = AsyncMock(return_value=MagicMock(result_set=[['Name', '']]))
+        graph.query = AsyncMock(return_value=MagicMock(result_set=[]))
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.delete_entity_node(node_uuid, group_id='test')
-        # Both calls should pass uuid param
-        for call in graph.query.call_args_list:
-            args = call[0]
-            params = args[1] if len(args) > 1 else {}
-            assert params.get('uuid') == node_uuid
+        # Pre-check (ro_query) should pass uuid param
+        ro_args = graph.ro_query.call_args[0]
+        ro_params = ro_args[1] if len(ro_args) > 1 else {}
+        assert ro_params.get('uuid') == node_uuid
+        # Delete (query) should also pass uuid param
+        q_args = graph.query.call_args[0]
+        q_params = q_args[1] if len(q_args) > 1 else {}
+        assert q_params.get('uuid') == node_uuid
+        # Exactly-once routing contract: each slot called exactly once
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_raises_node_not_found_when_missing(self, mock_config, make_backend):
-        """Raises NodeNotFoundError when node doesn't exist."""
+        """Raises NodeNotFoundError when pre-check returns no rows."""
         backend = make_backend(mock_config)
         graph = MagicMock()
+        graph.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
         graph.query = AsyncMock(return_value=MagicMock(result_set=[]))
         backend._driver._get_graph = MagicMock(return_value=graph)
         with pytest.raises(NodeNotFoundError):
             await backend.delete_entity_node('missing-uuid', group_id='test')
+        graph.ro_query.assert_awaited_once()  # pre-check ran exactly once
+        graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):

@@ -1,0 +1,40 @@
+diff --git a/crates/reify-constraints/src/solver.rs b/crates/reify-constraints/src/solver.rs
+index abc1234..def5678 100644
+--- a/crates/reify-constraints/src/solver.rs
++++ b/crates/reify-constraints/src/solver.rs
+@@ -69,6 +69,32 @@ fn build_solved_values(params: &[AutoParam], x: &[f64]) -> HashMap<ValueCellId,
+         .collect()
+ }
+
++/// Construct a solution map from parameter specifications and their computed values.
++///
++/// Converts each auto-parameter / solution-value pair into a `(ValueCellId, Value)`
++/// entry with the appropriate SI dimension.  Panics if the input slices differ in
++/// length.
++fn create_solution_map(
++    specifications: &[AutoParam],
++    solution_values: &[f64],
++) -> HashMap<ValueCellId, Value> {
++    assert_eq!(
++        specifications.len(),
++        solution_values.len(),
++        "specifications and solution_values must have the same length",
++    );
++    specifications
++        .iter()
++        .zip(solution_values.iter())
++        .map(|(spec, &computed_val)| {
++            (
++                spec.id.clone(),
++                Value::Scalar {
++                    si_value: computed_val,
++                    dimension: dimension_of(&spec.param_type),
++                },
++            )
++        })
++        .collect()
++}
++
+ /// Build a ValueMap from a base map with trial auto-param values inserted.
+ ///
+ /// Clones the base map (O(1) via PersistentMap structural sharing) and

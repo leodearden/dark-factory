@@ -3,8 +3,8 @@
   "name": "Warm-start protocol with LRU pool",
   "project": "reify",
   "project_root": "/home/leo/src/reify",
-  "pre_task_commit": "bf7f4668b6bbb17b4d1bb86224f13adf5e93d6c9",
-  "post_task_commit": "cece16beb8459a82e2d4481e565d302782f6d5e7",
+  "pre_task_commit": "716bd33192d9605a21837306f91e5dc11ef26306",
+  "post_task_commit": "d70b78ea2ec4bfd8fc9903adbaf4257017be6eda",
   "task_definition": {
     "title": "Warm-start protocol with LRU pool",
     "description": "Implement warm-start protocol for resuming evaluation from cached intermediate states. Includes OpaqueState type, WarmStartable trait, WarmStatePool with LRU eviction and budget enforcement, and CacheStore integration via donate/retrieve helpers."
@@ -22,7 +22,7 @@
   "complexity": "high",
   "expected_files_changed": [],
   "plan": {
-    "task_id": "task_27",
+    "task_id": "reify_task_27",
     "title": "Warm-start protocol with LRU pool",
     "modules": [
       "crates/reify-types/src",

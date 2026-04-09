@@ -1,0 +1,44 @@
+{
+  "variant_name": "variant_a_max",
+  "diff_id": "rs_heavy_mutation_copy",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:72-97",
+          "category": "code_duplication",
+          "description": "`create_solution_map` is a verbatim duplicate of the existing `build_solved_values` helper (lines 55-74). Both functions take `&[AutoParam]` and `&[f64]`, assert equal lengths with the same failure message, and build a `HashMap<ValueCellId, Value>` of `Value::Scalar` entries using `dimension_of(&spec.param_type)`. The only differences are the function name, parameter identifiers (`specifications`/`solution_values` vs. `params`/`x`), and closure-local names (`spec`/`computed_val` vs. `param`/`val`). There is no behavioral difference, no new capability, and no new test coverage. This directly violates the DRY principle that `build_solved_values` was extracted to enforce (see prior task `Solver: extract build_solved_values helper to deduplicate zip-insert loop` in tasks.json).",
+          "suggested_fix": "Delete the new `create_solution_map` function entirely. If some caller needs this behavior, call the existing `build_solved_values(&problem.auto_params, &x)` \u2014 all three current call sites (lines 537, 662, 697) already use it."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:72-97",
+          "category": "dead_code_ci_failure",
+          "description": "`create_solution_map` has zero callers anywhere in the workspace (verified via grep across `crates/`, tests, and the whole repo \u2014 no hits). It is a private `fn` with no `#[allow(dead_code)]`, so Rust will emit `warning: function `create_solution_map` is never used`. Reify's lint gate is `cargo clippy --workspace -- -D warnings` (orchestrator.yaml:15, hooks/project-checks:30), which promotes warnings to hard errors. This diff will therefore fail clippy/CI the moment it lands and block the merge queue.",
+          "suggested_fix": "Remove the function. If the intent was to rename `build_solved_values` to `create_solution_map`, do the rename in place (and update the 3 call sites and 4 unit tests at lines 537, 662, 697, 2335-2464) rather than adding a second copy. But note the existing name is consistent with the sibling helper `build_trial_values`, so the rename is not recommended."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs:72-97",
+          "category": "test_coverage",
+          "description": "Even if the function were retained, it has no unit tests. The sibling `build_solved_values` is exercised by four unit tests (lines 2335, 2405, 2413, 2451) covering happy path, empty input, dimensionless types, and length-mismatch panic. A new helper with identical semantics and no tests is an inconsistency.",
+          "suggested_fix": "Delete the duplicate (preferred). If kept, add equivalent tests \u2014 but duplicating the tests would compound the duplication problem, which reinforces the primary finding: remove the function."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs:72",
+          "category": "naming_consistency",
+          "description": "The name `create_solution_map` diverges from the established naming convention in this file. The existing helpers use the `build_*_values` prefix (`build_solved_values`, `build_trial_values`), and the return type is a `HashMap<ValueCellId, Value>` \u2014 the project uses the term `ValueMap` for related types but this helper returns a `HashMap`, not a `PersistentMap`-based `ValueMap`. `create_solution_map` is both a naming-convention regression and slightly misleading about the return type.",
+          "suggested_fix": "Moot if the function is deleted as recommended. Otherwise, keep the name `build_solved_values`."
+        }
+      ],
+      "summary": "This diff adds a new private helper `create_solution_map` that is a 100% functional duplicate of the existing `build_solved_values` helper in the same file \u2014 identical signature, identical logic, identical assertion message, only local identifiers renamed. The new function has zero call sites anywhere in the workspace, which will trigger Rust's `dead_code` warning; because reify's lint gate runs `cargo clippy --workspace -- -D warnings` (orchestrator.yaml:15, hooks/project-checks:30), this diff will fail CI and cannot merge as-is. There is also no test coverage for the new helper, whereas `build_solved_values` has four dedicated unit tests. The correct fix is to delete `create_solution_map` entirely and let the three existing call sites continue using `build_solved_values`. This diff appears to undo the very deduplication that the prior task (`Solver: extract build_solved_values helper to deduplicate zip-insert loop`) was created to achieve."
+    }
+  },
+  "total_cost_usd": 0.41693725,
+  "wall_clock_ms": 107958,
+  "errors": []
+}

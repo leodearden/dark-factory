@@ -8,17 +8,21 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from shared.config_dir import TaskConfigDir
+from shared.cost_store import CostStore
 
+from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
 from orchestrator.agents.invoke import AgentResult, invoke_with_cap_retry
 from orchestrator.agents.roles import (
     ALL_REVIEWERS,
     ARCHITECT,
     DEBUGGER,
     IMPLEMENTER,
+    JUDGE,
     MERGER,
     AgentRole,
 )
@@ -27,6 +31,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment, files_to_modules
+from orchestrator.task_status import TERMINAL_STATUSES
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import run_scoped_verification
 
@@ -119,6 +124,17 @@ class WorkflowMetrics:
     pre_merge_rebase_ok: int = 0
     advance_main_retries: int = 0
     inter_iteration_rebases: int = 0
+    total_turns: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cache_read_tokens: int = 0
+    total_cache_create_tokens: int = 0
+    # Completion judge metrics (ζ). judge_cost_usd is a subset of total_cost_usd,
+    # not disjoint — existing budget guards/cost reports using total_cost_usd
+    # continue to work unchanged.
+    judge_invocations: int = 0
+    judge_cost_usd: float = 0.0
+    judge_early_exits: int = 0
 
 
 class TaskWorkflow:
@@ -139,6 +155,7 @@ class TaskWorkflow:
         steward_factory=None,
         merge_queue: asyncio.Queue | None = None,
         event_store: EventStore | None = None,
+        cost_store: CostStore | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -148,6 +165,7 @@ class TaskWorkflow:
         self.mcp = mcp
         self.merge_queue = merge_queue
         self.event_store = event_store
+        self.cost_store = cost_store
 
         self.state = WorkflowState.PLAN
         self._phase_cost_at_entry: float = 0.0
@@ -212,7 +230,9 @@ class TaskWorkflow:
             # Create worktree (captures base commit for stable diffs)
             # If worktree is already set (e.g. eval mode), skip creation
             if self.worktree is None:
-                self.worktree, base_commit = await self.git_ops.create_worktree(branch_name)
+                worktree_info = await self.git_ops.create_worktree(branch_name)
+                self.worktree = worktree_info.path
+                base_commit = worktree_info.base_commit
             else:
                 # Eval mode: worktree was pre-created, skip creation and cleanup
                 self._worktree_external = True
@@ -346,6 +366,23 @@ class TaskWorkflow:
                                 'Steward re-escalated to human',
                                 skip_escalation=True,
                             )
+                        # If branch is already on main (e.g. steward merged
+                        # during resolution), skip re-implementation — proceed
+                        # to MERGE which will detect already_merged.
+                        _, wt_head_raw, _ = await _run(
+                            ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
+                        )
+                        esc_main_sha = await self.git_ops.get_main_sha()
+                        if await self.git_ops.is_ancestor(
+                            wt_head_raw.strip(), esc_main_sha,
+                        ):
+                            logger.info(
+                                'Task %s: branch already on main after '
+                                'escalation resolution — skipping '
+                                're-implementation', self.task_id,
+                            )
+                            break
+
                         # Resume with resolution context
                         logger.info(f'Task {self.task_id}: resuming after escalation resolution')
                         resume_prompt = await self.briefing.build_resume_prompt(
@@ -386,50 +423,83 @@ class TaskWorkflow:
                         already_merged = False
 
                     if not already_merged:
-                        # Phase 1: pre-merge rebase (no lock, no queue slot)
-                        # Rebase the task branch onto current main and re-verify
-                        # so the queued merge phase is fast/trivial.
-                        pre_rebased = False
-                        for _attempt in range(self.config.max_pre_merge_retries):
-                            main_before = await self.git_ops.get_main_sha()
-                            if not await self.git_ops.rebase_onto_main(self.worktree):
-                                break  # true conflict — queue will detect it
-                            verify = await run_scoped_verification(
-                                self.worktree, self.config, self._module_configs,
-                                task_files=self._task_files,
-                            )
-                            if not verify.passed:
-                                logger.warning(
-                                    f'Task {self.task_id}: post-rebase verification '
-                                    f'failed: {verify.summary}'
+                        for _merge_attempt in range(self.config.max_merge_retries):
+                            # Phase 1: pre-merge rebase (no lock, no queue slot)
+                            # Rebase the task branch onto current main and re-verify
+                            # so the queued merge phase is fast/trivial.
+                            pre_rebased = False
+                            for _attempt in range(self.config.max_pre_merge_retries):
+                                main_before = await self.git_ops.get_main_sha()
+                                if not await self.git_ops.rebase_onto_main(self.worktree):
+                                    break  # true conflict — queue will detect it
+                                verify = await run_scoped_verification(
+                                    self.worktree, self.config, self._module_configs,
+                                    task_files=self._task_files,
                                 )
-                                if self.event_store:
-                                    self.event_store.emit(
-                                        EventType.waste_detected,
-                                        task_id=self.task_id, phase='merge',
-                                        data={
-                                            'waste_type': 'post_rebase_verify_fail',
-                                            'summary': verify.summary[:200],
-                                        },
-                                    )
-                                break
-                            main_after = await self.git_ops.get_main_sha()
-                            if main_before == main_after:
-                                pre_rebased = True
-                                self.metrics.pre_merge_rebase_ok += 1
-                                break
-                            self.metrics.pre_merge_rebase_attempts += 1
-                            logger.info(
-                                f'Task {self.task_id}: main moved during pre-merge '
-                                f'rebase, retrying'
-                            )
+                                if not verify.passed:
+                                    if verify.timed_out:
+                                        logger.warning(
+                                            f'Task {self.task_id}: post-rebase verification '
+                                            f'timed out; merge queue will retry'
+                                        )
+                                    else:
+                                        logger.warning(
+                                            f'Task {self.task_id}: post-rebase verification '
+                                            f'failed: {verify.summary}'
+                                        )
+                                        if self.event_store:
+                                            self.event_store.emit(
+                                                EventType.waste_detected,
+                                                task_id=self.task_id, phase='merge',
+                                                data={
+                                                    'waste_type': 'post_rebase_verify_fail',
+                                                    'summary': verify.summary[:200],
+                                                },
+                                            )
+                                    break
+                                main_after = await self.git_ops.get_main_sha()
+                                if main_before == main_after:
+                                    pre_rebased = True
+                                    self.metrics.pre_merge_rebase_ok += 1
+                                    break
+                                self.metrics.pre_merge_rebase_attempts += 1
+                                logger.info(
+                                    f'Task {self.task_id}: main moved during pre-merge '
+                                    f'rebase, retrying'
+                                )
 
-                        # Phase 2: submit to merge queue (replaces _merge_lock)
-                        merge_outcome = await self._submit_to_merge_queue(
-                            branch_name, pre_rebased=pre_rebased,
-                        )
-                        if merge_outcome != WorkflowOutcome.DONE:
-                            return merge_outcome
+                            # Phase 2: submit to merge queue (replaces _merge_lock)
+                            merge_outcome = await self._submit_to_merge_queue(
+                                branch_name, pre_rebased=pre_rebased,
+                                merge_phase=True,
+                            )
+                            if merge_outcome == WorkflowOutcome.DONE:
+                                break
+                            if merge_outcome != WorkflowOutcome.REQUEUED:
+                                # BLOCKED — steward gave up, terminal
+                                return merge_outcome
+
+                            # Steward resolved — check if branch landed on main
+                            _, bh, _ = await _run(
+                                ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
+                            )
+                            main_sha = await self.git_ops.get_main_sha()
+                            if await self.git_ops.is_ancestor(bh.strip(), main_sha):
+                                logger.info(
+                                    'Task %s: branch on main after steward '
+                                    'resolution', self.task_id,
+                                )
+                                break
+                            # Retry merge
+                            logger.info(
+                                'Task %s: retrying merge (attempt %d/%d)',
+                                self.task_id, _merge_attempt + 1,
+                                self.config.max_merge_retries,
+                            )
+                        else:
+                            return await self._mark_blocked(
+                                'Merge retries exhausted after steward resolutions'
+                            )
                     else:
                         logger.info(
                             f'Task {self.task_id}: branch already on main '
@@ -571,23 +641,46 @@ class TaskWorkflow:
                 plan_path.unlink()
 
         prompt = await self.briefing.build_architect_prompt(self.task, worktree=self.worktree)
-        result = await self._invoke(ARCHITECT, prompt, self.worktree)
 
-        if not result.success:
-            logger.error(f'Task {self.task_id}: architect failed: {result.output[:200]}')
-            return await self._mark_blocked(
-                'Planning failed: architect invocation failed',
-                detail=f'Architect output:\n{result.output[:2000]}',
-            )
+        for attempt in range(2):
+            result = await self._invoke(ARCHITECT, prompt, self.worktree)
 
-        # Read the plan the architect wrote
-        self.plan = self.artifacts.read_plan()
+            if not result.success:
+                logger.error(f'Task {self.task_id}: architect failed: {result.output[:200]}')
+                return await self._mark_blocked(
+                    'Planning failed: architect invocation failed',
+                    detail=f'Architect output:\n{result.output[:2000]}',
+                )
+
+            # Detect anomalous premature exit: succeeded but suspiciously
+            # few turns and low cost — likely a transient CLI issue.
+            self.plan = self.artifacts.read_plan()
+            if (
+                attempt == 0
+                and result.turns <= 2
+                and result.cost_usd < 0.20
+                and not self.plan
+            ):
+                logger.warning(
+                    f'Task {self.task_id}: architect completed anomalously '
+                    f'(turns={result.turns}, cost=${result.cost_usd:.2f}, '
+                    f'duration={result.duration_ms}ms, output_len={len(result.output)}) '
+                    f'— retrying once'
+                )
+                continue
+
+            break
 
         if not self.plan:
             logger.error(f'Task {self.task_id}: architect produced no plan.json')
             return await self._mark_blocked(
                 'Planning failed: no plan.json produced',
-                detail='Architect succeeded but did not write .task/plan.json',
+                detail=(
+                    f'Architect succeeded but did not write .task/plan.json\n'
+                    f'turns={result.turns}, cost=${result.cost_usd:.2f}, '
+                    f'duration={result.duration_ms}ms\n'
+                    f'Architect output:\n{result.output[:2000]}'
+                ),
             )
 
         if not self.plan.get('steps'):
@@ -639,6 +732,14 @@ class TaskWorkflow:
 
     async def _execute_verify_review_loop(self) -> WorkflowOutcome:
         """Execute → Verify → Review loop with retry limits."""
+        # Clear stale merge-failure review from prior runs — prevents
+        # the review phase from re-surfacing resolved merge issues.
+        if self.artifacts:
+            stale_merge = self.artifacts.root / 'reviews' / 'merge.json'
+            if stale_merge.exists():
+                logger.info('Task %s: removing stale merge.json review', self.task_id)
+                stale_merge.unlink()
+
         review_cycle = 0
 
         while True:
@@ -675,6 +776,16 @@ class TaskWorkflow:
                 return WorkflowOutcome.DONE
 
             review_cycle += 1
+
+            # Archive reviews from this cycle before re-plan overwrites them
+            if self.artifacts:
+                reviews_dir = self.artifacts.root / 'reviews'
+                archive_dir = self.artifacts.root / f'reviews-cycle-{review_cycle}'
+                if reviews_dir.exists() and not archive_dir.exists():
+                    import shutil
+                    shutil.copytree(reviews_dir, archive_dir)
+                    logger.info('Task %s: archived reviews to %s', self.task_id, archive_dir.name)
+
             if review_cycle >= self.config.max_review_cycles:
                 self._escalate_review_issues(reviews)
                 return WorkflowOutcome.ESCALATED
@@ -802,7 +913,107 @@ class TaskWorkflow:
                     f'{self.metrics.execute_iterations} failed'
                 )
 
+            # --- Judge: decide whether to exit early (ζ) ---
+            # Opt-in via config.judge_after_each_iteration (default False).
+            # Eval mode flips it on per-task. Failures fall through silently
+            # to the next iteration — current behavior is preserved as worst case.
+            if self.config.judge_after_each_iteration:
+                judge_verdict = await self._run_completion_judge(iteration_log)
+                if judge_verdict is not None and judge_verdict.get('complete') is True:
+                    # Safety: reject complete=True if substantive_work=False.
+                    # An empty or trivial diff cannot be a completed task.
+                    if not judge_verdict.get('substantive_work', False):
+                        logger.warning(
+                            f'Task {self.task_id}: judge returned complete=True '
+                            f'with substantive_work=False — ignoring verdict'
+                        )
+                    else:
+                        self.metrics.judge_early_exits += 1
+                        logger.info(
+                            f'Task {self.task_id}: judge signaled completion at '
+                            f'iteration {self.metrics.execute_iterations} — '
+                            f'reasoning: {judge_verdict.get("reasoning", "")[:200]}'
+                        )
+                        self.artifacts.append_iteration_log({
+                            'iteration': self.metrics.execute_iterations,
+                            'agent': 'judge',
+                            'event': 'early_exit',
+                            'complete': True,
+                            'substantive_work': True,
+                            'uncovered_plan_steps': judge_verdict.get('uncovered_plan_steps', []),
+                            'summary': judge_verdict.get('reasoning', '')[:500],
+                            'source': 'orchestrator',
+                        })
+                        return WorkflowOutcome.DONE
+
         return WorkflowOutcome.DONE
+
+    async def _run_completion_judge(
+        self, iteration_log: list[dict]
+    ) -> dict | None:
+        """Invoke the completion judge. Returns parsed verdict dict or None on failure.
+
+        Any failure mode (exception, success=False, malformed output) returns
+        None so the caller continues the iteration loop — current behavior is
+        preserved as the worst case.
+        """
+        assert self.worktree is not None and self.artifacts is not None
+
+        base_commit = self.artifacts.read_base_commit()
+        if base_commit:
+            diff = await self.git_ops.get_diff_from_base(self.worktree, base_commit)
+        else:
+            diff = await self.git_ops.get_diff_from_main(self.worktree)
+
+        prompt = await self.briefing.build_completion_judge_prompt(
+            plan=self.plan,
+            iteration_log=iteration_log,
+            diff=diff,
+            task_id=self.task_id,
+        )
+
+        pre_cost = self.metrics.total_cost_usd
+        try:
+            result = await self._invoke(
+                JUDGE, prompt, self.worktree,
+                output_schema=COMPLETION_JUDGE_SCHEMA,
+            )
+        except Exception as exc:
+            logger.warning(
+                f'Task {self.task_id}: judge invocation raised '
+                f'{type(exc).__name__}: {exc} — continuing iteration loop'
+            )
+            return None
+
+        # judge_cost_usd is a subset of total_cost_usd (already incremented
+        # inside _invoke), tracked separately for reporting.
+        self.metrics.judge_invocations += 1
+        self.metrics.judge_cost_usd += (self.metrics.total_cost_usd - pre_cost)
+
+        if not result.success:
+            logger.warning(
+                f'Task {self.task_id}: judge invocation returned success=False — '
+                f'continuing iteration loop'
+            )
+            return None
+
+        verdict = result.structured_output
+        if not isinstance(verdict, dict):
+            logger.warning(
+                f'Task {self.task_id}: judge returned non-dict structured_output — '
+                f'continuing iteration loop'
+            )
+            return None
+
+        required = {'complete', 'reasoning', 'uncovered_plan_steps', 'substantive_work'}
+        if not required <= verdict.keys():
+            logger.warning(
+                f'Task {self.task_id}: judge verdict missing keys '
+                f'{required - verdict.keys()} — continuing iteration loop'
+            )
+            return None
+
+        return verdict
 
     async def _inter_iteration_rebase(self) -> dict | None:
         """Check if main advanced past our base; if so, rebase.
@@ -1049,6 +1260,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
     async def _submit_to_merge_queue(
         self, branch_name: str, pre_rebased: bool = False,
+        *, merge_phase: bool = False,
     ) -> WorkflowOutcome:
         """Submit a merge request to the queue and await the result.
 
@@ -1056,6 +1268,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         advancement of main.  Conflicts are returned immediately —
         this method resolves them in the task worktree (outside the
         queue) and re-submits.
+
+        When *merge_phase* is True, escalations created by failure
+        paths suppress task-status transitions — the caller retries
+        the merge in-place instead of requeueing via the scheduler.
         """
         from orchestrator.merge_queue import MergeOutcome, MergeRequest
 
@@ -1076,6 +1292,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         result = await future
 
+        if result.status == 'wip_halted':
+            return await self._handle_wip_conflict(result, branch_name)
+        if result.status == 'done_wip_recovery':
+            return await self._handle_wip_recovery(result)
         if result.status == 'done':
             return WorkflowOutcome.DONE
         if result.status == 'already_merged':
@@ -1084,6 +1304,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if result.status == 'conflict':
             return await self._resolve_and_resubmit(
                 branch_name, result.conflict_details,
+                merge_phase=merge_phase,
             )
         # blocked — infer review category from reason
         if 'verification failed' in result.reason.lower():
@@ -1093,10 +1314,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         else:
             category = 'merge_error'
         self._write_merge_failure_review(category, result.reason)
-        return await self._mark_blocked(result.reason)
+        return await self._mark_blocked(result.reason, merge_phase=merge_phase)
 
     async def _resolve_and_resubmit(
         self, branch_name: str, conflict_details: str,
+        *, merge_phase: bool = False,
     ) -> WorkflowOutcome:
         """Resolve merge conflicts in the task worktree, then re-submit.
 
@@ -1123,12 +1345,121 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if not merger_result.success or 'BLOCKED' in merger_result.output.upper():
             reason = f'Merger could not resolve: {merger_result.output[:200]}'
             self._write_merge_failure_review('merger_blocked', reason)
-            return await self._mark_blocked(reason)
+            return await self._mark_blocked(reason, merge_phase=merge_phase)
 
         # Re-submit to queue (now resolved, needs fresh merge)
         return await self._submit_to_merge_queue(
-            branch_name, pre_rebased=False,
+            branch_name, pre_rebased=False, merge_phase=merge_phase,
         )
+
+    async def _handle_wip_conflict(
+        self, result, branch_name: str,
+    ) -> WorkflowOutcome:
+        """Handle a wip_halted merge outcome: create level-1 escalation and wait.
+
+        The merge did NOT land — WIP in project_root overlaps the merge diff.
+        After the human resolves (commits/stashes WIP), the task retries the merge.
+        """
+        overlap = result.overlap_files or []
+        detail = (
+            f'Merge for task {self.task_id} (branch {branch_name}) was blocked '
+            f'because uncommitted work in project_root overlaps the merge diff.\n\n'
+            f'Overlapping files:\n'
+            + '\n'.join(f'  - {f}' for f in overlap)
+            + '\n\nAction required: commit or stash the WIP, then resolve this '
+            'escalation to un-halt the merge queue and retry.'
+        )
+        logger.warning(f'Task {self.task_id}: WIP overlap — creating level-1 escalation')
+
+        if self.escalation_queue:
+            from escalation.models import Escalation
+
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role='orchestrator',
+                severity='blocking',
+                category='wip_conflict',
+                summary=f'WIP overlaps merge diff: {", ".join(overlap[:5])}',
+                detail=detail,
+                suggested_action='manual_intervention',
+                level=1,
+                worktree=str(self.worktree) if self.worktree else None,
+                workflow_state=self.state.value,
+            )
+            self.escalation_queue.submit(esc)
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.escalation_created,
+                    task_id=self.task_id, phase=self.state.value,
+                    data={'escalation_id': esc.id, 'category': 'wip_conflict',
+                          'severity': 'blocking', 'summary': esc.summary[:200]},
+                )
+
+            # Wait for human resolution
+            if self._escalation_event is None:
+                self._escalation_event = asyncio.Event()
+            self._escalation_event.clear()
+            await self._escalation_event.wait()
+            logger.info(f'Task {self.task_id}: WIP conflict resolved — retrying merge')
+
+        return WorkflowOutcome.REQUEUED
+
+    async def _handle_wip_recovery(self, result) -> WorkflowOutcome:
+        """Handle a done_wip_recovery merge outcome: merge landed but WIP conflicted.
+
+        The merge IS on main, but the user's stashed WIP conflicted during pop.
+        WIP has been preserved on a recovery branch. Create a level-1 escalation
+        to inform the human, then return DONE (the task's merge succeeded).
+        """
+        recovery_branch = result.recovery_branch or '(unknown)'
+        detail = (
+            f'Merge for task {self.task_id} landed on main successfully, but '
+            f'the stash pop of your uncommitted WIP produced conflicts.\n\n'
+            f'Your WIP has been preserved on branch: {recovery_branch}\n\n'
+            f'To recover:\n'
+            f'  git checkout {recovery_branch}\n'
+            f'  # Review and cherry-pick or reapply your changes\n\n'
+            f'Resolve this escalation to un-halt the merge queue.'
+        )
+        logger.warning(
+            f'Task {self.task_id}: merge landed but stash pop conflicted — '
+            f'WIP on {recovery_branch}'
+        )
+
+        if self.escalation_queue:
+            from escalation.models import Escalation
+
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role='orchestrator',
+                severity='blocking',
+                category='wip_conflict',
+                summary=f'Stash pop conflict — WIP preserved on {recovery_branch}',
+                detail=detail,
+                suggested_action='manual_intervention',
+                level=1,
+                worktree=str(self.worktree) if self.worktree else None,
+                workflow_state=self.state.value,
+            )
+            self.escalation_queue.submit(esc)
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.escalation_created,
+                    task_id=self.task_id, phase=self.state.value,
+                    data={'escalation_id': esc.id, 'category': 'wip_conflict',
+                          'severity': 'blocking', 'summary': esc.summary[:200]},
+                )
+
+            # Wait for human resolution before returning DONE
+            if self._escalation_event is None:
+                self._escalation_event = asyncio.Event()
+            self._escalation_event.clear()
+            await self._escalation_event.wait()
+            logger.info(f'Task {self.task_id}: WIP recovery escalation resolved')
+
+        return WorkflowOutcome.DONE
 
     def _write_merge_failure_review(self, category: str, detail: str) -> None:
         """Write a review-format JSON describing a merge failure to .task/reviews/.
@@ -1215,15 +1546,19 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if self.config.sandbox.enabled and role.name in ('implementer', 'debugger'):
             sandbox_modules = self.modules
 
-        # Build MCP config — fused-memory always, escalation when available
+        # Build MCP config — fused-memory always, escalation when available.
+        # Judge gets MCP so its jcodemunch tools (in allowed_tools) actually
+        # work; it does not use escalation tools but mcp_config_json handles
+        # escalation_url=None fine.
         mcp_config = None
-        if role.name in ('architect', 'implementer', 'debugger', 'merger'):
+        if role.name in ('architect', 'implementer', 'debugger', 'merger', 'judge'):
             escalation_url = None
             if self.escalation_queue:
                 esc = self.config.escalation
                 escalation_url = f'http://{esc.host}:{esc.port}/mcp'
             mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
 
+        started_at = datetime.now(UTC).isoformat()
         result = await invoke_with_cap_retry(
             usage_gate=self.usage_gate,
             label=f'Task {self.task_id} [{role.name}]',
@@ -1242,12 +1577,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             effort=effort_val,
             backend=backend_val,
             timeout_seconds=timeout_val,
+            # Judge always hits Claude API — propagating ANTHROPIC_BASE_URL
+            # routes it through vLLM where max_model_len causes
+            # ServerDisconnectedError after 2 tool-use rounds (3cd380a079).
+            # Cap hits on Claude API are handled by UsageGate account failover
+            # (wired in runner.py for eval mode).
+            env_overrides=(self.config.env_overrides or None) if role.name in ('implementer', 'debugger') else None,
         )
+        completed_at = datetime.now(UTC).isoformat()
 
         # Track metrics
         self.metrics.total_cost_usd += result.cost_usd
         self.metrics.total_duration_ms += result.duration_ms
         self.metrics.agent_invocations += 1
+        self.metrics.total_turns += result.turns
+        self.metrics.total_input_tokens += result.input_tokens or 0
+        self.metrics.total_output_tokens += result.output_tokens or 0
+        self.metrics.total_cache_read_tokens += result.cache_read_tokens or 0
+        self.metrics.total_cache_create_tokens += result.cache_create_tokens or 0
 
         logger.info(
             'Task %s [%s]: success=%s cost=$%.2f turns=%d timeout=%.0fs',
@@ -1282,6 +1629,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 },
             )
 
+        if self.cost_store:
+            try:
+                await self.cost_store.save_invocation(
+                    run_id=self.event_store.run_id if self.event_store else '',
+                    task_id=self.task_id,
+                    project_id=self.config.fused_memory.project_id,
+                    account_name=result.account_name,
+                    model=model,
+                    role=role.name,
+                    cost_usd=result.cost_usd,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    cache_read_tokens=result.cache_read_tokens,
+                    cache_create_tokens=result.cache_create_tokens,
+                    duration_ms=result.duration_ms,
+                    capped=False,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                )
+            except Exception:
+                logger.warning('Failed to save invocation cost', exc_info=True)
+
         return result
 
     def _check_escalations(self):
@@ -1295,11 +1664,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Raises ``_StewardReescalated`` if the steward re-escalated to
         level-1 (human), indicating the task should be blocked.
+
+        When no escalation queue is available (e.g. eval mode), returns
+        an empty string immediately — the caller treats this as "no
+        resolution" and the workflow proceeds to ESCALATED/BLOCKED
+        via its normal path.
         """
+        if self.escalation_queue is None:
+            logger.warning(
+                'Task %s: _wait_for_resolution called without escalation_queue '
+                '(eval mode?) — returning immediately',
+                self.task_id,
+            )
+            return ''
+
         if self._escalation_event is None:
             self._escalation_event = asyncio.Event()
-
-        assert self.escalation_queue is not None
 
         # Wait for level-0 pending escalations to clear
         while True:
@@ -1413,6 +1793,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
     async def _mark_blocked(
         self, reason: str, *, detail: str = '',
         skip_escalation: bool = False,
+        merge_phase: bool = False,
     ) -> WorkflowOutcome:
         """Mark task as blocked and optionally create an escalation entry.
 
@@ -1421,6 +1802,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         file; defaults to *reason* when not provided.
         *skip_escalation* suppresses escalation creation when a level-1
         escalation already exists (e.g. steward re-escalated to human).
+        *merge_phase* suppresses task-status transitions (blocked/pending)
+        when the caller will retry the merge in-place rather than requeueing
+        through the scheduler.
         """
         if self.state == WorkflowState.DONE:
             logger.warning(
@@ -1428,8 +1812,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 self.task_id, reason,
             )
             return WorkflowOutcome.DONE
-        self._enter_phase(WorkflowState.BLOCKED)
-        await self.scheduler.set_task_status(self.task_id, 'blocked')
+        if not merge_phase:
+            self._enter_phase(WorkflowState.BLOCKED)
+            await self.scheduler.set_task_status(self.task_id, 'blocked')
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
 
         if self.escalation_queue and skip_escalation:
@@ -1488,23 +1873,73 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if self._steward:
                 await self._await_steward_completion()
 
+                # Guard: steward may have marked the task done (terminal).
+                # The scheduler rejects done→pending, but we must also
+                # return the correct outcome.
+                cached = self.scheduler._status_cache.get(self.task_id)
+                if cached in TERMINAL_STATUSES:
+                    logger.info(
+                        'Task %s: status is %s after steward — not re-queueing',
+                        self.task_id, cached,
+                    )
+                    if cached == 'done':
+                        self._enter_phase(WorkflowState.DONE)
+                        return WorkflowOutcome.DONE
+                    return WorkflowOutcome.BLOCKED
+
                 # If steward resolved all level-0 escalations, set task back
                 # to pending so the scheduler re-picks it on the next cycle.
                 remaining = self.escalation_queue.get_by_task(
                     self.task_id, status='pending', level=0,
                 )
                 if not remaining:
+                    # Guard: if the task's branch is already merged to
+                    # main, transition to DONE instead of re-queueing —
+                    # prevents stash_failed / advance_main ghost loops.
+                    if self.worktree and self.git_ops:
+                        try:
+                            _, wt_head, _ = await _run(
+                                ['git', 'rev-parse', 'HEAD'],
+                                cwd=self.worktree,
+                            )
+                            main_sha = await self.git_ops.get_main_sha()
+                            if await self.git_ops.is_ancestor(
+                                wt_head.strip(), main_sha,
+                            ):
+                                logger.info(
+                                    'Task %s: branch already on main — '
+                                    'completing instead of re-queueing',
+                                    self.task_id,
+                                )
+                                self._enter_phase(WorkflowState.DONE)
+                                await self.scheduler.set_task_status(
+                                    self.task_id, 'done',
+                                )
+                                return WorkflowOutcome.DONE
+                        except Exception:
+                            logger.warning(
+                                'Task %s: merge-check failed, '
+                                'proceeding with requeue',
+                                self.task_id, exc_info=True,
+                            )
+
                     if self.event_store:
                         self.event_store.emit(
                             EventType.escalation_resolved,
                             task_id=self.task_id, phase=self.state.value,
                             data={'outcome': 'requeued'},
                         )
-                    await self.scheduler.set_task_status(self.task_id, 'pending')
-                    logger.info(
-                        f'Task {self.task_id}: steward resolved blocking '
-                        f'escalation, reset to pending for re-scheduling'
-                    )
+                    if not merge_phase:
+                        await self.scheduler.set_task_status(self.task_id, 'pending')
+                        logger.info(
+                            f'Task {self.task_id}: steward resolved blocking '
+                            f'escalation, reset to pending for re-scheduling'
+                        )
+                    else:
+                        logger.info(
+                            f'Task {self.task_id}: steward resolved blocking '
+                            f'escalation, caller will retry merge in-place'
+                        )
                     return WorkflowOutcome.REQUEUED
 
         return WorkflowOutcome.BLOCKED

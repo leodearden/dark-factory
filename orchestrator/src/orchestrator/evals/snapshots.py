@@ -30,13 +30,14 @@ async def create_eval_worktree(
     task_id: str,
     pre_task_commit: str,
     setup_commands: list[str] | None = None,
-) -> Path:
+) -> tuple[Path, str]:
     """Create an isolated worktree at the pre-task commit for an eval run.
 
     After checkout, runs any setup_commands (e.g. 'uv sync') to create
     an isolated environment matching the worktree's source state.
 
-    Returns the path to the new worktree.
+    Returns ``(worktree_path, run_id)`` so callers can include the run ID in
+    result filenames for multi-trial support.
     """
     project_root = Path(project_root)
     run_id = uuid4().hex[:8]
@@ -47,6 +48,16 @@ async def create_eval_worktree(
         ['git', 'worktree', 'add', '--detach', str(worktree_path), pre_task_commit],
         cwd=project_root,
     )
+
+    # Defensive: confirm the worktree HEAD actually matches the requested
+    # baseline. Catches any drift in git's worktree handling and prevents
+    # silently evaluating against the wrong commit.
+    head = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree_path)
+    if head != pre_task_commit:
+        raise RuntimeError(
+            f'create_eval_worktree: HEAD mismatch for {task_id}: '
+            f'expected {pre_task_commit}, got {head}'
+        )
 
     logger.info(f'Created eval worktree: {worktree_path} at {pre_task_commit[:10]}')
 
@@ -70,7 +81,7 @@ async def create_eval_worktree(
             else:
                 logger.info(f'Setup command OK: {cmd_str}')
 
-    return worktree_path
+    return worktree_path, run_id
 
 
 async def cleanup_eval_worktree(
@@ -109,3 +120,13 @@ async def get_diff(worktree_path: Path) -> str:
         except Exception:
             pass
     return await _run(['git', 'diff', 'HEAD'], cwd=worktree_path)
+
+
+async def get_diff_between_commits(
+    project_root: Path, base_commit: str, target_commit: str,
+) -> str:
+    """Get diff between two commits directly (no worktree needed)."""
+    return await _run(
+        ['git', 'diff', f'{base_commit}..{target_commit}'],
+        cwd=project_root,
+    )

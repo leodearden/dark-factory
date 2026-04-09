@@ -26,6 +26,8 @@ def _resolve_project_root(prd: str, default_root: Path) -> Path:
     Looks for a ``.taskmaster/`` directory starting from the PRD's parent.
     Falls back to *default_root* (the dashboard's own project root) if no
     ``.taskmaster/`` is found or the PRD path is relative.
+
+    The returned Path is always canonical (symlinks resolved).
     """
     p = Path(prd)
     if not p.is_absolute():
@@ -35,7 +37,7 @@ def _resolve_project_root(prd: str, default_root: Path) -> Path:
     for ancestor in p.parents:
         if (ancestor / '.taskmaster').is_dir():
             return ancestor
-    return default_root
+    return default_root.resolve()
 
 
 def _read_project_root_from_config(config_path: str) -> Path | None:
@@ -168,7 +170,7 @@ def load_task_tree(tasks_json_path: Path) -> list[dict]:
     """
     try:
         raw = tasks_json_path.read_text()
-    except FileNotFoundError:
+    except OSError:
         return []
 
     try:
@@ -343,7 +345,7 @@ def discover_orchestrators(config: DashboardConfig) -> list[dict]:
             'pids': [p['pid'] for p in group],
             'prd': prd,
             'label': label,
-            'project_root': str(project_root),
+            'project_root': str(project_root.resolve()),
             'running': any(p['running'] for p in group),
             'started': group[0]['started'],
             'tasks': tasks,

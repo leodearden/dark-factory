@@ -1,0 +1,33 @@
+[Unit]
+Description=Fused Memory MCP Server (dark-factory)
+Documentation=file://__REPO_ROOT__/DESIGN.md
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO_ROOT__
+ExecStart=__UV_PATH__ run --project fused-memory \
+  python -m fused_memory.server.main \
+  --transport http \
+  --config __REPO_ROOT__/fused-memory/config/config.yaml
+
+# Environment: secrets loaded by dotenv from fused-memory/.env
+# These are the non-secret vars the config.yaml ${} expansion needs
+Environment=CONFIG_PATH=__REPO_ROOT__/fused-memory/config/config.yaml
+Environment=PROJECT_ROOT=__REPO_ROOT__
+Environment=TASKMASTER_DIR=__REPO_ROOT__/taskmaster-ai
+
+# Restart policy: always restart on failure, back off up to 60s
+Restart=on-failure
+RestartSec=5
+RestartMaxDelaySec=60
+
+# Give it time to shut down gracefully (async cleanup)
+TimeoutStopSec=30
+
+# Logging goes to journalctl --user -u fused-memory
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,58 @@
+{
+  "variant_name": "variant_a",
+  "diff_id": "py_real_01",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:255-286",
+          "category": "false_positive_risk",
+          "description": "The heuristic safety net treats any zero-cost, instant, \u22641-turn failure as a cap hit, but legitimate quick failures can match these conditions too \u2014 e.g. invalid config_dir, missing Claude binary, permission denied, or malformed JSON in the prompt. These would produce `success=False`, zero cost, 0 turns, and sub-5s duration. A false positive causes the retry loop to burn through exponential backoff and possibly exhaust all accounts before surfacing the real error.",
+          "suggested_fix": "Add a guard that limits heuristic retries (e.g. max 2-3 heuristic cap-hit retries before giving up and returning the result). Alternatively, inspect `result.subtype` or `result.stderr` for known non-cap-hit error signatures (e.g. 'error_empty_output', 'ENOENT') and exclude them."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:206-248 vs 272-286",
+          "category": "code_duplication",
+          "description": "The cooldown calculation (consecutive_cap_hits increment, full_cycles derivation, exponential min with _MAX_CAP_COOLDOWN_SECS) and the sleep-then-continue pattern are duplicated between the pattern-matching cap-hit block and the heuristic cap-hit block. This is fragile: a future change to the backoff formula must be applied in two places.",
+          "suggested_fix": "Extract a helper (e.g. `_compute_cap_cooldown(consecutive_cap_hits, num_accounts) -> float`) and/or refactor both branches to share the common tail (increment, compute cooldown, log, sleep, continue)."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:267",
+          "category": "encapsulation_violation",
+          "description": "`usage_gate._handle_cap_detected(...)` is a private method being called from outside the class. The existing public interface is `detect_cap_hit()`, which operates on text matching. Calling the private method directly couples `invoke_with_cap_retry` to UsageGate's internal implementation.",
+          "suggested_fix": "Consider adding a public method on UsageGate like `mark_cap_hit(reason: str, oauth_token: str | None)` that wraps `_handle_cap_detected` with `resets_at=None`, giving `cli_invoke` a stable public API for heuristic cap hits."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/tests/",
+          "category": "test_coverage",
+          "description": "Neither the heuristic cap-hit detection logic (the new zero-cost/instant-exit branch) nor the `is_error` override in `_parse_claude_output` have any test coverage. Grepping for 'heuristic', 'is_error', 'zero.cost', 'instant.exit' across the test directory yields zero matches. These are both critical correctness fixes that prevent silent data loss.",
+          "suggested_fix": "Add tests for: (1) `_parse_claude_output` returns `success=False` when `is_error=True` even with `subtype='success'` and returncode 0. (2) `invoke_with_cap_retry` triggers heuristic retry when result matches the zero-cost/instant-exit pattern. (3) Heuristic path does NOT trigger for a legitimate quick failure (e.g. when usage_gate is None, or when cost > 0)."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:255-260",
+          "category": "robustness",
+          "description": "The heuristic check uses `result.cost_usd == 0` (exact float comparison). If the CLI ever returns a tiny non-zero cost (e.g. due to prompt caching or a partial turn), the heuristic would not trigger for what is still effectively a cap hit.",
+          "suggested_fix": "Use a small epsilon: `result.cost_usd < 0.001` instead of `== 0`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:214-225 (absent in heuristic block)",
+          "category": "inconsistent_behavior",
+          "description": "The pattern-matching cap-hit block explicitly records to `cost_store.save_account_event()` with the caller's `label` as details. The heuristic block relies solely on `_handle_cap_detected`'s internal `_fire_cost_event`, which records a different payload shape (`{'reason': ...}`) and uses a different code path. This means cost analytics see inconsistent event formats for the same logical event type.",
+          "suggested_fix": "Add the same `cost_store.save_account_event(...)` call to the heuristic block for consistency, or remove the explicit call from the pattern-matching block since `_handle_cap_detected` already records it (the pattern-matching path currently double-records via both `detect_cap_hit` \u2192 `_handle_cap_detected` and the explicit `save_account_event`)."
+        }
+      ],
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "summary": "This diff makes three related changes to harden cap-hit detection: (1) adds \"You're out of extra usage\" to the known prefix list, (2) uses the `is_error` JSON field as an authoritative override so `subtype='success'` + `is_error=true` correctly produces `success=False`, and (3) adds a heuristic safety net in the retry loop that treats zero-cost, near-instant, \u22641-turn failures as cap hits. All three changes address a real production problem (silent false-success on unrecognized cap hits) and the logic is sound. However, there are no tests for either the `is_error` override or the heuristic path, the cooldown calculation is duplicated between two branches, the heuristic calls a private method on UsageGate, and the heuristic has false-positive risk for legitimate quick failures (bad config, missing binary, etc.) with no retry limit. None of these are blocking \u2014 the code will work correctly for the targeted cap-hit scenario \u2014 but they should be addressed to prevent maintenance burden and edge-case regressions."
+    }
+  },
+  "total_cost_usd": 0.43611479999999997,
+  "wall_clock_ms": 119884,
+  "errors": []
+}

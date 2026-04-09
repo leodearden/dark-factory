@@ -1,0 +1,177 @@
+{
+  "variant_name": "baseline",
+  "diff_id": "py_real_01",
+  "reviews": {
+    "test_analyst": {
+      "reviewer": "test_analyst",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:_parse_claude_output",
+          "category": "missing_unit_tests",
+          "description": "The `is_error` override (`is_success = ... and not is_error`) has zero test coverage. `_parse_claude_output` is not tested directly anywhere \u2014 searching for `_parse_claude_output` across the test suite returns no matches. The specific scenario this fix addresses (CLI emits `{\"subtype\": \"success\", \"is_error\": true}` for a cap hit) is entirely untested, as is the inverse (`is_error` absent or `false` leaves success detection unchanged). The `_successful_json_output()` fixture in `test_cli_invoke.py` doesn't include an `is_error` field, so no existing test exercises the new branch.",
+          "suggested_fix": "Add a `TestParseClaudeOutput` class (or extend `test_cli_invoke.py`) with: (1) `is_error=True` + `subtype='success'` \u2192 `success=False`; (2) `is_error=True` + `returncode=0` \u2192 `success=False`; (3) `is_error=False` (explicit) \u2192 existing success logic unchanged; (4) `is_error` absent \u2192 existing success logic unchanged. Use `_SubprocessResult` (already imported) and `_parse_claude_output` (add to import list) to test the function directly."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:invoke_with_cap_retry (heuristic block)",
+          "category": "missing_unit_tests",
+          "description": "The new heuristic zero-cost detection block has zero test coverage. Searching for 'heuristic', 'zero_cost', 'zero.cost', 'suspicious', and 'instant.exit' in the test suite returns no matches. The ~50 tests in `test_cap_retry.py` all use `make_result(cost_usd=0.5)` (non-zero cost) and never construct an `AgentResult` with `success=False, cost_usd=0, turns<=1, duration_ms<5000`. Untested scenarios include: (1) all five conditions met \u2192 triggers heuristic retry; (2) any single condition relaxed (turns==2, cost_usd>0.0, duration_ms==5000, success=True, usage_gate=None) \u2192 heuristic does NOT fire; (3) `_handle_cap_detected` is called with the synthetic reason string and `oauth_token`; (4) retry correctly uses original_prompt (not resume) since session_id is irrelevant; (5) `consecutive_cap_hits` increments correctly so backoff doubles as expected.",
+          "suggested_fix": "Add a `TestHeuristicCapDetection` class in `test_cap_retry.py`. Key tests: `test_heuristic_triggers_on_zero_cost_instant_failure` (all five conditions met \u2192 `_handle_cap_detected` called, loop retries), `test_heuristic_no_trigger_when_success_true`, `test_heuristic_no_trigger_when_cost_nonzero`, `test_heuristic_no_trigger_when_turns_two`, `test_heuristic_no_trigger_when_duration_at_boundary` (5000ms), `test_heuristic_no_trigger_without_usage_gate`, and `test_heuristic_uses_original_prompt_not_resume`. Spy on `gate._handle_cap_detected` with `MagicMock` to verify the call without triggering real account logic."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:invoke_with_cap_retry (heuristic block)",
+          "category": "behavioral_asymmetry_untested",
+          "description": "The heuristic path does not call `cost_store.save_account_event('cap_hit')` directly, unlike the regular cap-hit path (which does). Instead, the heuristic relies on `usage_gate._handle_cap_detected()` calling `self._fire_cost_event` using whatever cost_store was passed to `UsageGate` at construction \u2014 a different object than the `cost_store` kwarg of `invoke_with_cap_retry`. If a caller passes `cost_store=my_store` to `invoke_with_cap_retry` but constructed `UsageGate` without one, the heuristic cap event is silently unrecorded. The existing `test_save_account_event_on_cap_hit` test covers only the normal cap path, leaving this gap invisible.",
+          "suggested_fix": "Add `test_heuristic_does_not_double_record_cap_event` and `test_heuristic_cap_event_via_gate_cost_store` to document and verify the intended recording path. If the design intent is that `invoke_with_cap_retry`'s own `cost_store` should also record heuristic cap events (matching the normal path), add the missing `save_account_event` call before the `continue` statement and add a test for it."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/tests/test_usage_gate_exhaustive.py:TestCapDetectionPatterns.test_cap_hit_prefix_detected",
+          "category": "weak_test_assertion",
+          "description": "The `@pytest.mark.parametrize('prefix', CAP_HIT_PREFIXES)` test auto-generates a case for the new `\"You're out of extra usage\"` prefix, but the generated test string is `\"You're out of extra usage usage limit. Your plan resets in 5h.\"` \u2014 an unnatural sentence with \"usage\" repeated. While `detect_cap_hit` only requires the prefix to appear (no secondary keyword check), there is no test using a realistic real-world message such as `\"You're out of extra usage for Claude claude-opus-4-5. Your extra usage resets on May 1.\"`. A false-negative on variations of the real format (e.g., different punctuation around the prefix) would not be caught.",
+          "suggested_fix": "Add a dedicated `test_extra_usage_prefix_realistic_message` in `TestCapDetectionPatterns` with the actual observed error text (referenced in the feedback note `project_extra_usage_cap_detection.md`), e.g. `\"You're out of extra usage for Claude. resets on...\"`. This supplements the parametrize coverage without replacing it."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:invoke_with_cap_retry (heuristic block) + _parse_claude_output",
+          "category": "missing_integration_test",
+          "description": "The heuristic block requires `not result.success`, and for the primary scenario being fixed (cap hit with `subtype='success'` but `is_error=true`), the `_parse_claude_output` is_error fix (Fix 2) is what makes `result.success=False`. There is no end-to-end test that chains both fixes: a JSON payload with `{\"subtype\": \"success\", \"is_error\": true, \"cost_usd\": 0, \"num_turns\": 1, \"duration_ms\": 2000}` flowing through `_parse_claude_output` (yielding `success=False`) and then through the heuristic block in `invoke_with_cap_retry` (triggering a retry). Without this, a regression in either fix could leave the other silently broken.",
+          "suggested_fix": "Add `test_is_error_true_enables_heuristic_detection` in `test_cap_retry.py` or `test_cli_invoke.py`. Mock `invoke_claude_agent` to return an `AgentResult` with `success=False, cost_usd=0, turns=1, duration_ms=2000` (as `_parse_claude_output` would produce from an `is_error=true` JSON response) and verify the heuristic retry fires."
+        }
+      ],
+      "summary": "The diff introduces three behavioral changes: (1) a new `is_error` field override in `_parse_claude_output` that ensures cap-hit responses with `subtype='success'` are correctly marked as failures; (2) a heuristic fallback block in `invoke_with_cap_retry` that treats zero-cost, near-instant, single-turn failures as cap hits when a usage gate is present; (3) a new `\"You're out of extra usage\"` prefix in `CAP_HIT_PREFIXES`. The new prefix receives automatic parametric coverage via the existing exhaustive test suite (though only with an awkward synthetic string). However, the `_parse_claude_output` `is_error` fix has zero direct test coverage \u2014 the function is never tested in isolation and the `_successful_json_output()` fixture doesn't include `is_error`. More critically, the entire heuristic block (~30 lines of new retry logic) is completely untested: none of the ~50 tests in `test_cap_retry.py` construct a zero-cost failed result, no boundary tests exist for any of the five trigger conditions, and the behavioral asymmetry between the heuristic and normal cap paths (the heuristic skips `cost_store.save_account_event`) is unverified. The two fixes are also tightly coupled \u2014 the `is_error` fix is what causes `result.success=False` for cap-hit responses, enabling the heuristic to trigger \u2014 but no test chains both mechanisms together."
+    },
+    "reuse_auditor": {
+      "reviewer": "reuse_auditor",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:272-277",
+          "category": "duplicated_logic",
+          "description": "The cooldown computation block is copy-pasted verbatim from the primary cap-hit path (lines 206-211). Both instances do `consecutive_cap_hits += 1` then `full_cycles = (consecutive_cap_hits - 1) // num_accounts` then `cooldown = min(_CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles), _MAX_CAP_COOLDOWN_SECS)`. A third cap-hit path added in the future will copy it a third time.",
+          "suggested_fix": "Extract a module-level helper: `def _compute_cap_cooldown(consecutive: int, num_accounts: int) -> float: full_cycles = (consecutive - 1) // num_accounts; return min(_CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles), _MAX_CAP_COOLDOWN_SECS)`. Call it from both paths."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:267-271",
+          "category": "private_method_access_across_modules",
+          "description": "`cli_invoke.py` calls `usage_gate._handle_cap_detected(...)` \u2014 a name-mangled private method of `UsageGate` \u2014 directly from an external module. This couples the caller to internal implementation details and breaks encapsulation. The existing public surface (`detect_cap_hit`) doesn't cover the heuristic case, so the new code had to reach inside.",
+          "suggested_fix": "Add a public method to `UsageGate`, e.g. `def record_heuristic_cap(self, message: str, oauth_token: str | None) -> None`, that wraps `_handle_cap_detected`. Callers never need to know about the internal method."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:255-286",
+          "category": "behavioral_inconsistency_between_parallel_paths",
+          "description": "The primary cap-hit path (lines 213-225) saves a `cap_hit` event to the externally-passed `cost_store` (with rich context: `project_id`, `run_id`, `details=label`). The new heuristic path only calls `_handle_cap_detected`, which fires `_fire_cost_event` to `usage_gate._cost_store`. If `cost_store` passed to `invoke_with_cap_retry` and `usage_gate._cost_store` are different instances (or `usage_gate` was constructed without a `cost_store`), heuristic cap hits are silently under-recorded in the external cost database.",
+          "suggested_fix": "Add the same `cost_store.save_account_event(...)` guard to the heuristic path that exists in the primary cap-hit path (lines 214-225), so both paths produce identical accounting records."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:247,285",
+          "category": "minor_duplication",
+          "description": "`await asyncio.sleep(cooldown); continue` appears as the closing two statements of both cap-hit branches. This is minor but is structural evidence that the two branches should be unified.",
+          "suggested_fix": "If the cooldown helper is extracted and both branches are unified into a shared `_handle_cap_retry(...)` helper or refactored so both branches `continue` through a single sleep point, the duplication disappears naturally."
+        }
+      ],
+      "summary": "The diff introduces a heuristic fallback cap-hit detection path in `invoke_with_cap_retry` and a new pattern in `CAP_HIT_PREFIXES`. The logic is correct but the heuristic block is almost entirely a copy of the existing cap-hit path: the 3-line exponential-backoff cooldown computation is duplicated verbatim, the `await asyncio.sleep(cooldown); continue` tail is repeated, and the `invoke_kwargs` reset-to-fresh pattern appears for a third time. Additionally, the heuristic path reaches into the private `_handle_cap_detected` method of `UsageGate` rather than through a public API, and it skips the explicit `cost_store.save_account_event()` call that the primary path makes \u2014 creating a behavioral inconsistency in cost recording whenever the externally-passed `cost_store` differs from the one held inside `UsageGate`. None of these are runtime errors, but the duplicated cooldown formula is the clearest candidate for extraction into a small helper."
+    },
+    "architect_reviewer": {
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py (heuristic cap-hit block, ~line 267)",
+          "category": "encapsulation_violation",
+          "description": "The heuristic block calls `usage_gate._handle_cap_detected(...)` directly \u2014 a private method \u2014 from outside the `UsageGate` class. This breaks the encapsulation boundary that `detect_cap_hit()` (the public API) is meant to enforce. The pattern-based path goes through the public `detect_cap_hit()` which internally calls `_handle_cap_detected`; the heuristic path bypasses that contract entirely. If `_handle_cap_detected` is ever renamed, reordered, or its signature changes, this call site will break silently.",
+          "suggested_fix": "Add a public method to `UsageGate`, e.g. `report_heuristic_cap_hit(reason: str, oauth_token: str | None) -> None`, that wraps `_handle_cap_detected`. The heuristic block then calls `usage_gate.report_heuristic_cap_hit(...)`, which keeps `_handle_cap_detected` fully private and makes the intent explicit in the public API."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py (both cap-hit handling blocks)",
+          "category": "dry_violation",
+          "description": "The exponential-backoff cooldown computation, logging, prompt reset, sleep, and `continue` are copy-pasted between the pattern-based cap-hit block and the new heuristic block. The two paths share exactly: `consecutive_cap_hits += 1`, `full_cycles = (consecutive_cap_hits - 1) // num_accounts`, `cooldown = min(_CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles), _MAX_CAP_COOLDOWN_SECS)`, prompt-reset logic, `logger.warning(...)`, and `await asyncio.sleep(cooldown)`. Any future change to the backoff formula must be applied in two places.",
+          "suggested_fix": "Extract a private helper such as `_compute_cap_cooldown(consecutive_cap_hits: int, num_accounts: int) -> float` for the math, and optionally a broader `_apply_cap_retry(...)` helper that also handles the prompt-reset and sleep. Both paths call the helper, eliminating the duplication."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py (heuristic cap-hit block, cost_store section)",
+          "category": "behavioral_inconsistency",
+          "description": "The pattern-based cap-hit path records a `cap_hit` event to `cost_store.save_account_event(...)` (with `account_name`, `event_type='cap_hit'`, `project_id`, `run_id`, `details=label`). The new heuristic path increments `consecutive_cap_hits` and calls `_handle_cap_detected` but never saves a `cap_hit` event to the cost store. Heuristic cap hits are therefore invisible in cost dashboards and audit logs, creating silent gaps in the cost accounting record.",
+          "suggested_fix": "Add the same `cost_store.save_account_event(...)` call (inside a `try/except`) to the heuristic block, mirroring the pattern-based path. Since both paths now contain duplicated retry logic, the cleanest fix is to extract the shared helper (see previous issue) and include the cost-store recording inside it."
+        }
+      ],
+      "reviewer": "architect_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The diff adds a heuristic safety net for unrecognised cap-hit messages (zero-cost, near-instant exits) and fixes `is_success` to honour the CLI's `is_error` flag. Both changes are logically sound and address real failure modes. The `is_error` fix and the `CAP_HIT_PREFIXES` addition are clean and consistent with the existing design. However, the heuristic block introduces three design concerns: it calls the private `_handle_cap_detected` method directly from outside `UsageGate` (bypassing the public `detect_cap_hit` contract), it copy-pastes the exponential-backoff cooldown computation and retry mechanics that already exist in the pattern-based path, and it omits the `cost_store.save_account_event` recording that the pattern-based path performs \u2014 making heuristic cap hits invisible in cost dashboards. All three are suggestions rather than blocking issues; the code will function correctly as written."
+    },
+    "performance": {
+      "reviewer": "performance",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:251-291",
+          "category": "unbounded_retry_loop",
+          "description": "The heuristic cap-hit check fires on any zero-cost, sub-5s, \u22641-turn failure \u2014 a superset of genuine cap hits that includes subprocess crashes, config errors, auth failures, and any other fast-exit error. When such a genuine non-cap failure triggers the heuristic, `_handle_cap_detected` marks the current account as capped and launches a probe loop. The probe will eventually uncap the account (the real Claude quota is fine), `before_invoke()` unblocks, the same fresh prompt is retried, hits the same genuine error, and the cycle repeats indefinitely at up to 300 s intervals per iteration. There is no max-retry counter or circuit-breaker on the heuristic path, so a persistent non-cap fast-fail will cycle forever, burning wall time and repeatedly spawning subprocesses. Given this codebase's existing livelock history (plan-phase ghost loop, backlog iterator livelock), this is a pattern to guard against.",
+          "suggested_fix": "Add a `consecutive_heuristic_hits` counter (separate from `consecutive_cap_hits`). After N consecutive heuristic triggers without a confirmed cap hit from pattern matching, break out of the loop and either raise or return the error result. Alternatively, check whether `detect_cap_hit` would have caught the same message before calling `_handle_cap_detected`; if the output text contains no known cap indicators at all, consider skipping the heuristic treatment and returning the failure directly."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:272-277",
+          "category": "duplicated_computation",
+          "description": "The four-line cooldown calculation (`consecutive_cap_hits += 1`, `full_cycles = ...`, `cooldown = min(...)`) is copied verbatim from the existing cap-hit block at lines 206-211. Two identical computations that can drift independently are a future maintenance hazard and make the function harder to follow.",
+          "suggested_fix": "Extract a small helper: `def _compute_cooldown(consecutive: int, num_accounts: int) -> float: full_cycles = (consecutive - 1) // num_accounts; return min(_CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles), _MAX_CAP_COOLDOWN_SECS)`. Both code paths call it after incrementing `consecutive_cap_hits`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:262-265",
+          "category": "eager_string_evaluation_in_log",
+          "description": "`logger.warning(f'... Output: {result.output[:200]!r}')` \u2014 the f-string (including the slice and `repr()`) is evaluated eagerly before the logging framework checks whether the WARNING level is active. For a warning that can fire in loops this adds a small but unnecessary allocation per call.",
+          "suggested_fix": "Use lazy %-formatting: `logger.warning('%s: suspicious zero-cost instant exit ... Output: %.200r', label, result.output)`. The slice can be avoided entirely; `%.200r` truncates the repr to 200 chars inside the logging machinery only if the message is actually emitted."
+        }
+      ],
+      "summary": "The diff introduces a heuristic safety net that treats zero-cost, sub-5-second, \u22641-turn failures as unrecognised cap hits. The `is_error` override in `_parse_claude_output` and the new `CAP_HIT_PREFIXES` entry are straightforward and correct. The main performance concern is in the heuristic retry path: because the trigger conditions are broad enough to match genuine non-cap failures (auth errors, subprocess crashes, bad configs), the `while True` loop has no exit mechanism for this case \u2014 `_handle_cap_detected` marks the account as capped, the probe eventually uncaps it, `before_invoke` unblocks, the same error repeats, and the cycle continues indefinitely at up to 300 s intervals per iteration with no max-retry guard. A secondary issue is that the four-line cooldown calculation is duplicated verbatim from the existing cap-hit block rather than extracted to a helper, creating a future divergence risk."
+    },
+    "robustness": {
+      "reviewer": "robustness",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:255-286",
+          "category": "infinite_retry_on_non_cap_errors",
+          "description": "The heuristic triggers on any fast, zero-cost, non-success exit \u2014 including persistent non-cap-hit failures such as invalid OAuth tokens, misconfigured `--config` directories, malformed prompts, or network errors that cause an instant exit. All of these produce `cost_usd=0`, `turns\u22641`, `duration_ms<5000`, and `success=False`. Once triggered, the function calls `_handle_cap_detected` which marks accounts capped and eventually blocks on `_open.wait()` indefinitely. There is no escape hatch: unlike the existing `detect_cap_hit` path (which requires a recognisable output pattern), the heuristic cannot distinguish a genuine infrastructure error from a cap hit. A misconfiguration would cause the caller to wait forever rather than failing fast.",
+          "suggested_fix": "Add a separate counter for consecutive *heuristic* cap hits and raise (or break with a failed result) after a small bound (e.g. 3-5 heuristic retries). Alternatively, log a clear error and fall through to the bottom of the loop (`break`) rather than `continue` once the heuristic has fired more than N times without a successful invoke, so the caller sees a real failure instead of hanging."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:259",
+          "category": "over_broad_heuristic_condition",
+          "description": "`result.turns <= 1` includes 1-turn exits where the agent actually ran and may have produced a `session_id`. The comment in the code says 'Cannot resume a session that never ran', but that justification only holds for `turns == 0`. For a 1-turn exit the agent did execute; if it produced a `session_id` the partial session is silently abandoned rather than resumed. More importantly, using `<= 1` widens the false-positive surface: a legitimate agent that fails quickly on its first turn (e.g., a structured-output validation failure returning an error JSON) will be misidentified as a cap hit.",
+          "suggested_fix": "Change the condition to `result.turns == 0`. A cap hit that blocks before any turn executes will always produce `turns == 0`. A 1-turn failure is better handled by the existing resume-fallback logic below."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:267-271",
+          "category": "private_api_bypass",
+          "description": "The heuristic directly calls `usage_gate._handle_cap_detected(...)` \u2014 a name-mangled private method \u2014 rather than going through any public interface. The existing cap-hit path properly calls `detect_cap_hit()` which internally calls `_handle_cap_detected`. Calling the private method from outside the class creates a tight coupling: any refactoring of `_handle_cap_detected`'s signature (e.g., adding a required parameter, renaming it) will silently break this callsite at runtime. It also bypasses any precondition guards that `detect_cap_hit` or future public wrappers might add.",
+          "suggested_fix": "Either (a) expose a `force_cap_hit(token, reason)` public method on `UsageGate` that encapsulates the pattern, or (b) call `detect_cap_hit` with a synthetic message string that matches a known `CAP_HIT_PREFIXES` entry so the existing public path handles account marking and cost recording consistently."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:255-286",
+          "category": "asymmetric_cost_event_recording",
+          "description": "The regular cap-hit path (line 214-225) explicitly awaits `cost_store.save_account_event(event_type='cap_hit')` on the *outer* `cost_store` parameter. The heuristic path omits this call entirely and instead relies on `_handle_cap_detected` to fire via `usage_gate._cost_store` (a fire-and-forget `loop.create_task`). These are potentially different objects: `usage_gate` may be constructed with a different `CostStore` instance than what is passed as `cost_store` to `invoke_with_cap_retry`, or `usage_gate._cost_store` may be `None` while the outer `cost_store` is set. In that configuration, heuristic cap hits are invisible to cost dashboards and account-event queries. Additionally, `_fire_cost_event` failures are silently swallowed with only a `logger.warning`, while the outer path wraps the await in a try/except and logs properly.",
+          "suggested_fix": "After the `_handle_cap_detected` call, add the same `cost_store.save_account_event` block that the regular cap-hit path uses (lines 214-225), guarded by `if cost_store:`. Use the already-captured `account_name` variable (not `usage_gate.active_account_name`) to record the account that was actually used for the failed invocation."
+        }
+      ],
+      "summary": "The diff adds two defensible improvements \u2014 an `is_error` override in `_parse_claude_output` and a new prefix in `CAP_HIT_PREFIXES` \u2014 and a heuristic safety net that catches unrecognised cap hits by their structural signature (zero-cost, near-instant, \u22641-turn, non-success). The heuristic plugs a real gap (as evidenced by the `[project_extra_usage_cap_detection.md]` history), but introduces four robustness concerns. Most critically, the heuristic has no retry bound: any persistent non-cap error whose shape matches (network failure, bad config, auth error) silently enters the same infinite backoff loop as genuine cap hits, blocking the caller indefinitely instead of propagating a real failure. The `turns <= 1` condition is also slightly over-broad; `turns == 0` is the correct invariant for \"session never ran\". Additionally, the heuristic calls a private `_handle_cap_detected` method directly (bypassing the public API and risking silent breakage on refactor), and skips the awaited `cost_store.save_account_event` call that the regular cap-hit path uses, creating an asymmetry in cost-event recording when `usage_gate._cost_store` differs from the outer `cost_store` parameter. None of these are immediately crash-inducing but the unbounded retry risk is the most operationally hazardous."
+    }
+  },
+  "total_cost_usd": 1.6098807,
+  "wall_clock_ms": 243486,
+  "errors": []
+}

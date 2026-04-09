@@ -1,0 +1,54 @@
+diff --git a/gui/src/stores/claudeStore.ts b/gui/src/stores/claudeStore.ts
+index abc1234..def5678 100644
+--- a/gui/src/stores/claudeStore.ts
++++ b/gui/src/stores/claudeStore.ts
+@@ -152,18 +152,25 @@ function createClaudeStore() {
+         break;
+       }
+
+       case 'tool_call': {
+         const idx = findAssistantIdx(msg.id);
+         if (idx === -1) break;
+         batch(() => {
+           setState('sessionStatus', 'tool-calling');
++          // Build tool call object with metadata from the message
++          const toolCall = {
++            id: `${msg.id}-tc-${state.messages[idx]?.role === 'assistant' ? (state.messages[idx] as any).toolCalls.length : 0}`,
++            toolName: msg.tool_name,
++            toolInput: msg.tool_input,
++            status: 'pending' as const,
++            metadata: msg.metadata || {},
++          };
+           setState(
+             'messages',
+             idx,
+             produce((m: ChatMessage) => {
+               if (m.role !== 'assistant') return;
+-              m.toolCalls.push({
+-                id: `${msg.id}-tc-${m.toolCalls.length}`,
+-                toolName: msg.tool_name,
+-                toolInput: msg.tool_input,
+-                status: 'pending',
+-              });
++              m.toolCalls.push(toolCall);
+             }),
+           );
+         });
+@@ -175,6 +182,25 @@ function createClaudeStore() {
+         const idx = findAssistantIdx(msg.id);
+         if (idx === -1) break;
++        // Cache tool results for quick lookup
++        const resultCache = state.messages[idx]?.role === 'assistant'
++          ? { ...(state.messages[idx] as any).resultCache || {} }
++          : {};
++        resultCache[msg.tool_call_id] = {
++          output: msg.output,
++          is_error: msg.is_error,
++        };
+         setState(
+           'messages',
+           idx,
+           produce((m: ChatMessage) => {
+             if (m.role !== 'assistant') return;
++            m.resultCache = resultCache;
+             const tc = m.toolCalls.find(

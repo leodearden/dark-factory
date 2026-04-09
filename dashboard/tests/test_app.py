@@ -111,10 +111,14 @@ class TestIdiomorphExtension:
 class TestMorphSwap:
     """Tests that polling sections use the correct swap strategy."""
 
-    # Sections that keep morph:innerHTML (no Alpine toggle state)
+    # Sections that keep morph:innerHTML (no Alpine toggle state, no charts)
     MORPH_SECTIONS = (
         "/partials/memory",
         "/partials/recon",
+    )
+
+    # Sections that use plain innerHTML (chart partials need script re-execution)
+    INNERHTML_SECTIONS = (
         "/partials/performance",
         "/partials/memory-graphs",
     )
@@ -124,6 +128,13 @@ class TestMorphSwap:
         html = client.get('/').text
         window = _get_section_window(html, partial_url)
         assert 'hx-swap="morph:innerHTML"' in window
+
+    @pytest.mark.parametrize('partial_url', INNERHTML_SECTIONS)
+    def test_chart_section_uses_innerhtml_swap(self, client, partial_url):
+        """Chart sections use plain innerHTML so scripts re-execute after swap."""
+        html = client.get('/').text
+        window = _get_section_window(html, partial_url)
+        assert 'hx-swap="innerHTML"' in window
 
     def test_orchestrators_uses_innerhtml_swap(self, client):
         """Orchestrators uses plain innerHTML to preserve Alpine x-show state."""

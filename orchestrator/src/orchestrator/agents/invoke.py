@@ -151,6 +151,7 @@ async def invoke_agent(
     resume_session_id: str | None = None,
     timeout_seconds: float | None = None,
     config_dir: Path | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
 
@@ -159,6 +160,7 @@ async def invoke_agent(
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
     *resume_session_id*, when set, resumes an existing Claude session.
     *timeout_seconds*, when set, kills the subprocess after this many seconds.
+    *env_overrides*, when set, are merged into the subprocess environment.
     """
     if backend == 'claude':
         return await _invoke_claude_with_sandbox(
@@ -171,6 +173,7 @@ async def invoke_agent(
             resume_session_id=resume_session_id,
             timeout_seconds=timeout_seconds,
             config_dir=config_dir,
+            env_overrides=env_overrides,
         )
     elif backend == 'codex':
         return await _invoke_codex(
@@ -212,6 +215,7 @@ async def _invoke_claude_with_sandbox(
     resume_session_id: str | None = None,
     timeout_seconds: float | None = None,
     config_dir: Path | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI with optional bwrap sandboxing.
 
@@ -264,6 +268,8 @@ async def _invoke_claude_with_sandbox(
             cmd = build_bwrap_command(cmd, cwd, sandbox_modules)
 
             env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+            if env_overrides:
+                env.update(env_overrides)
             if oauth_token:
                 env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
             if config_dir:
@@ -287,6 +293,7 @@ async def _invoke_claude_with_sandbox(
         permission_mode=permission_mode, effort=effort,
         oauth_token=oauth_token, resume_session_id=resume_session_id,
         timeout_seconds=timeout_seconds, config_dir=config_dir,
+        env_overrides=env_overrides,
     )
 
 

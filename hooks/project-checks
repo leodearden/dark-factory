@@ -16,7 +16,7 @@ for pkg in "${ALL_PACKAGES[@]}"; do
 done
 
 # ruff check (runs from repo root, all packages at once)
-if ! ruff check --quiet "${DIRS[@]}"; then
+if ! uv run ruff check --quiet "${DIRS[@]}"; then
     echo "pre-commit: ruff check failed. Fix lint errors before committing to main."
     exit 1
 fi

@@ -1,0 +1,72 @@
+{
+  "variant_name": "variant_a_max",
+  "diff_id": "py_deep_shallow",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/config.py:36",
+          "category": "robustness/data_corruption",
+          "description": "`merged = base` removes the previous `base.copy()`, so `_deep_merge` now mutates the caller's `base` dict in place. Top-level assignments (`merged[key] = value`) write directly into the caller's dict, and the recursive branch likewise mutates nested dicts because no copy is ever made on the way down. This is a silent state-corruption regression: any caller that reuses `base` after calling `_deep_merge` will see it polluted with values from `override`. The damage compounds in `_merge_env_overrides`, which calls `_deep_merge` on long-lived env-override dicts (the codebase already uses `copy.deepcopy(cfg.env_overrides)` defensively in `orchestrator/tests/test_eval_configs.py:27`, confirming these dicts are shared module-level state).",
+          "suggested_fix": "Restore `merged = base.copy()` (or, better, fix the long-standing shallow-copy gap by writing `merged: dict[str, Any] = {}` and copying values explicitly, or using `copy.deepcopy(base)` if nested-dict isolation is required). The shallow copy at minimum restores the documented contract."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/config.py:33-36",
+          "category": "documentation/contract_violation",
+          "description": "The new docstring explicitly states 'The caller's *base* dict is never mutated \u2014 we work on a copy', but the code below it does `merged = base` (no copy). The docstring is now actively lying about the function's behavior, which is worse than the previous shorter docstring because it will mislead future maintainers and reviewers into trusting an invariant that no longer holds.",
+          "suggested_fix": "Either (a) restore the copy so the docstring is true, or (b) if non-mutation is intentionally being abandoned, rewrite the docstring to say so plainly. Option (a) is the correct fix \u2014 see the data-corruption finding above."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/tests/test_config.py:214-218",
+          "category": "test_failure",
+          "description": "The existing `test_deep_merge_does_not_mutate_base` test explicitly asserts `base == {'a': {'x': 1}}` after merging, and will fail with the new code: `merged = base` means the recursive call mutates `base['a']` to `{'x': 1, 'y': 2}`. The diff makes a behavior change without updating the test that locks in the previous behavior, so CI will (correctly) fail. This is a clear signal the change is wrong, not that the test needs updating.",
+          "suggested_fix": "Do NOT update the test \u2014 fix `_deep_merge` instead. The test encodes the right invariant; the change to the production code violates it."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/config.py:44-48",
+          "category": "robustness/silent_data_loss",
+          "description": "`_merge_env_overrides` filters out empty-string values *after* the merge with `{k: v for k, v in result.items() if v}`. This silently drops legitimate values: if `base_env` has `FOO=real_value` and `extra` has `FOO=''` (e.g. an env-var the caller wanted to clear), the merged `FOO` becomes `''` and is then stripped \u2014 yielding no `FOO` key at all. Equally, if `base_env` already has an empty string (perhaps as a sentinel), the function silently removes it. The docstring only promises 'extra winning on conflict' and says nothing about empty-value stripping, so callers cannot reasonably anticipate this behavior. Combined with the in-place mutation of `base_env`, this means a caller can pass in `{FOO: 'real'}`, get back `{}`, AND find that their original `base_env` is now `{FOO: ''}`.",
+          "suggested_fix": "Either (a) drop the empty-value filter entirely and let callers handle empty strings, or (b) apply the filter only to `extra` (not the merged result) so existing values in `base_env` are preserved, or (c) document the filter explicitly and add a test asserting that `FOO=''` in extra clears `FOO` from base. Also fix the underlying `_deep_merge` mutation bug \u2014 see above."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/config.py:42-48",
+          "category": "code_reuse/over_engineering",
+          "description": "`_merge_env_overrides` uses `_deep_merge` to combine two `dict[str, str]` mappings, but env-var dicts are flat string\u2192string and the recursive branch in `_deep_merge` (which checks `isinstance(merged[key], dict)`) can never fire. `{**base_env, **extra}` is the idiomatic one-liner for this and would also sidestep the mutation bug entirely. Routing through `_deep_merge` adds complexity, couples this function to `_deep_merge`'s correctness, and obscures intent.",
+          "suggested_fix": "Replace the body with `result = {**base_env, **extra}` and then apply whatever filtering policy is desired. This is shorter, faster, type-safe, and immune to the `_deep_merge` regression."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/config.py:42-48",
+          "category": "test_coverage",
+          "description": "`_merge_env_overrides` is added without any tests. There is no coverage for: (a) basic merge with extra winning, (b) empty-string stripping behavior, (c) the (currently buggy) non-mutation contract on `base_env`, or (d) the interaction with `None`/missing keys. The absence of tests is how the empty-value-stripping and base-mutation issues slipped through.",
+          "suggested_fix": "Add tests in `orchestrator/tests/test_config.py` covering: precedence (extra wins), non-mutation of `base_env`, the empty-value behavior (whatever it ends up being), and a round-trip test asserting that calling the function twice with the same `base_env` produces identical results."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/config.py:42-48",
+          "category": "architecture/dead_code",
+          "description": "`_merge_env_overrides` has no callers anywhere in the codebase. Env-var merging is currently done inline in `shared/src/shared/cli_invoke.py:391-394` as `env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}; env.update(env_overrides)`. The new helper duplicates that intent but is never invoked, so it's dead code that will rot. If the intent is to migrate `cli_invoke.py` (and `OrchestratorConfig.env_overrides` consumers) to this helper, that migration should happen in the same diff so the helper has actual users \u2014 and so any behavior differences (e.g. the empty-value filter) are noticed.",
+          "suggested_fix": "Either delete `_merge_env_overrides` and add it back when there's a real consumer, or include the wiring (update `cli_invoke.py` and any other env-merge call sites) in this diff so the helper is exercised. Also reconsider whether this belongs in `orchestrator/config.py` or in `shared/` alongside the existing env-handling code, since the behavior is shared between orchestrator and the CLI invoker."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/config.py:48",
+          "category": "documentation",
+          "description": "The comment `# Strip empty values \u2014 some tools choke on FOO=\"\"` is vague. Which tools? Under what circumstances? Without a concrete reference (an issue number, a tool name, a reproducer), future maintainers won't know if the filter is still needed and will be reluctant to remove it. This is a maintenance hazard.",
+          "suggested_fix": "Either name the offending tool(s) and link to a bug/issue, or remove the filter and let the empty value pass through. Most subprocess-launching tools accept `FOO=\"\"` fine \u2014 Bash, Python's `os.environ`, and `subprocess.Popen` all handle it without complaint, so the premise of the comment is questionable."
+        }
+      ],
+      "summary": "The diff has a critical regression: `_deep_merge` now does `merged = base` instead of `merged = base.copy()`, silently mutating the caller's dict \u2014 directly contradicting both the new docstring and the existing `test_deep_merge_does_not_mutate_base` test (which will fail in CI). The new `_merge_env_overrides` helper inherits this bug and compounds it by passing long-lived env-override dicts (which the codebase already defends against mutation via `copy.deepcopy` in test fixtures) into the broken merger. On top of the mutation bug, `_merge_env_overrides` silently drops empty-string values after merging \u2014 meaning a caller's real value can be clobbered to empty by `extra` and then disappear entirely from the result. The helper is also dead code (no callers), uses `_deep_merge` where a simple dict-spread would suffice, and ships without tests. Fix `_deep_merge` to restore the copy, replace `_merge_env_overrides`'s body with `{**base_env, **extra}`, decide explicitly on the empty-value policy (and document it), add tests for both functions, and either wire up the new helper or delete it."
+    }
+  },
+  "total_cost_usd": 0.74882975,
+  "wall_clock_ms": 212910,
+  "errors": []
+}

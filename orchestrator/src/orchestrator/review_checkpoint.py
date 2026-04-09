@@ -15,6 +15,8 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import VerifyResult, run_full_verification
 
 if TYPE_CHECKING:
+    from shared.cost_store import CostStore
+
     from orchestrator.mcp_lifecycle import McpLifecycle
     from orchestrator.usage_gate import UsageGate
 
@@ -50,6 +52,8 @@ class ReviewCheckpoint:
         self.config = config
         self.mcp = mcp
         self.usage_gate = usage_gate
+        self.cost_store: CostStore | None = None
+        self.run_id: str = ''
 
         self._merge_count = 0
         self._last_review_at_merge = 0
@@ -128,6 +132,7 @@ class ReviewCheckpoint:
         mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
 
         logger.info('Review [%s]: Phase 2+3 — invoking deep reviewer agent', review_id)
+        started_at = datetime.now(UTC).isoformat()
         result = await invoke_with_cap_retry(
             usage_gate=self.usage_gate,
             label=f'Review checkpoint [{review_id}]',
@@ -143,8 +148,32 @@ class ReviewCheckpoint:
             effort=getattr(self.config.effort, 'deep_reviewer', 'max'),
             backend=getattr(self.config.backends, 'deep_reviewer', 'claude'),
         )
+        completed_at = datetime.now(UTC).isoformat()
 
         elapsed_ms = int((time.monotonic() - start) * 1000)
+
+        if self.cost_store:
+            try:
+                model_name = getattr(self.config.models, 'deep_reviewer', 'opus')
+                await self.cost_store.save_invocation(
+                    run_id=self.run_id,
+                    task_id=None,
+                    project_id=self.config.fused_memory.project_id,
+                    account_name=result.account_name,
+                    model=model_name,
+                    role='deep_reviewer',
+                    cost_usd=result.cost_usd,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    cache_read_tokens=result.cache_read_tokens,
+                    cache_create_tokens=result.cache_create_tokens,
+                    duration_ms=elapsed_ms,
+                    capped=False,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                )
+            except Exception:
+                logger.warning('Failed to save review invocation cost', exc_info=True)
 
         # Parse agent output for task creation info
         tasks_created: list[str] = []

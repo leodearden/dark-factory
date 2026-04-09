@@ -79,11 +79,22 @@ class TestResolveEntityByName:
         backend._driver._get_graph = MagicMock(return_value=graph)
         entity_name = 'Alice'
         await backend.resolve_entity_by_name(entity_name, group_id='test')
-        call_args = graph.query.call_args
+        call_args = graph.ro_query.call_args
         assert call_args is not None
         args, kwargs = call_args
         cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
         assert cypher_params.get('name') == entity_name
+        graph.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """resolve_entity_by_name uses ro_query (read-only path) and never calls graph.query."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([['uuid-alice', 'Alice']])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.resolve_entity_by_name('Alice', group_id='test')
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +140,28 @@ class TestGetValidEdgesForNode:
             await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
 
     @pytest.mark.asyncio
+    async def test_null_fact_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
+        """Rows with NULL fact field (row[1] is None) yield fact='' in result dict."""
+        backend = make_backend(mock_config)
+        rows = [['edge-1', None, 'knows']]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
+        assert len(result) == 1
+        assert result[0]['fact'] == ''
+
+    @pytest.mark.asyncio
+    async def test_null_name_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
+        """Rows with NULL name field (row[2] is None) yield name='' in result dict."""
+        backend = make_backend(mock_config)
+        rows = [['edge-1', 'Alice knows Bob', None]]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
+        assert len(result) == 1
+        assert result[0]['name'] == ''
+
+    @pytest.mark.asyncio
     async def test_passes_uuid_to_query(self, mock_config, make_backend, make_graph_mock):
         """Passes node UUID as parameter to the Cypher query."""
         backend = make_backend(mock_config)
@@ -136,10 +169,9 @@ class TestGetValidEdgesForNode:
         backend._driver._get_graph = MagicMock(return_value=graph)
         node_uuid = 'my-node-uuid'
         await backend.get_valid_edges_for_node(node_uuid, group_id='test')
-        call_args = graph.query.call_args
-        assert call_args is not None
-        args, kwargs = call_args
-        cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        call_args = graph.ro_query.call_args
+        assert call_args is not None, "graph.ro_query was not called"
+        cypher_params = call_args.args[1]
         assert cypher_params.get('uuid') == node_uuid
 
     @pytest.mark.asyncio
@@ -149,10 +181,50 @@ class TestGetValidEdgesForNode:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
-        call_args = graph.query.call_args
-        args, kwargs = call_args
-        cypher = args[0] if args else kwargs.get('query', '')
-        assert 'invalid_at IS NULL' in cypher
+        call_args = graph.ro_query.call_args
+        assert call_args is not None, "graph.ro_query was not called"
+        cypher = call_args.args[0]
+        assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """Uses ro_query (read-only) — graph.query must NOT be called."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# step-3 (task-448): GraphitiBackend._edge_dict static helper
+# ---------------------------------------------------------------------------
+
+class TestEdgeDict:
+    """GraphitiBackend._edge_dict(uuid, fact, name) returns a normalised edge dict."""
+
+    def test_returns_dict_with_correct_keys(self):
+        """Returns dict with keys uuid, fact, name for normal (non-None) values."""
+        result = GraphitiBackend._edge_dict('e-1', 'Alice knows Bob', 'knows')
+        assert result == {'uuid': 'e-1', 'fact': 'Alice knows Bob', 'name': 'knows'}
+
+    def test_none_fact_coerced_to_empty_string(self):
+        """None fact is coerced to '' in the returned dict."""
+        result = GraphitiBackend._edge_dict('e-1', None, 'knows')
+        assert result['fact'] == ''
+
+    def test_none_name_coerced_to_empty_string(self):
+        """None name is coerced to '' in the returned dict."""
+        result = GraphitiBackend._edge_dict('e-1', 'Alice knows Bob', None)
+        assert result['name'] == ''
+
+    def test_preserves_non_none_values(self):
+        """Non-None fact and name values are kept as-is."""
+        result = GraphitiBackend._edge_dict('e-42', 'some fact', 'some_name')
+        assert result['uuid'] == 'e-42'
+        assert result['fact'] == 'some fact'
+        assert result['name'] == 'some_name'
 
 
 # ---------------------------------------------------------------------------
@@ -181,8 +253,8 @@ class TestUpdateNodeSummary:
         summary = 'Alice knows Bob.'
         await backend.update_node_summary(node_uuid, summary, group_id='test')
         call_args = graph.query.call_args
-        args, kwargs = call_args
-        cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        assert call_args is not None, "graph.query was not called"
+        cypher_params = call_args.args[1]
         assert cypher_params.get('uuid') == node_uuid
         assert cypher_params.get('summary') == summary
 
@@ -194,9 +266,9 @@ class TestUpdateNodeSummary:
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.update_node_summary('node-uuid-1', 'some summary', group_id='test')
         call_args = graph.query.call_args
-        args, kwargs = call_args
-        cypher = args[0] if args else kwargs.get('query', '')
-        assert 'SET n.summary' in cypher
+        assert call_args is not None, "graph.query was not called"
+        cypher = call_args.args[0]
+        assert 'SET n.summary' in cypher, f"Cypher must SET n.summary: {cypher}"
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
@@ -281,6 +353,30 @@ class TestRefreshEntitySummary:
         backend.update_node_summary = AsyncMock()
         result = await backend.refresh_entity_summary('node-uuid-2', group_id='test')
         assert result['old_summary'] == 'prior summary text'
+
+    @pytest.mark.asyncio
+    async def test_refresh_entity_summary_with_empty_old_summary_and_name(
+        self, mock_config, make_backend
+    ):
+        """Empty-string old_summary is a valid production value (list_entity_nodes normalizes
+        NULL→'') and must not trigger the guard that raises ValueError.  When name and
+        old_summary are both provided, get_node_text is skipped entirely."""
+        backend = make_backend(mock_config)
+        backend.get_node_text = AsyncMock()
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e1', 'fact': 'Alice knows Bob', 'name': 'knows'},
+        ])
+        backend.update_node_summary = AsyncMock()
+        result = await backend.refresh_entity_summary(
+            'node-uuid-1', group_id='test', name='Alice', old_summary=''
+        )
+        backend.get_node_text.assert_not_awaited()
+        assert result['old_summary'] == ''
+        assert result['name'] == 'Alice'
+        assert result['uuid'] == 'node-uuid-1'
+        assert result['new_summary'] == 'Alice knows Bob'
+        assert result['edge_count'] == 1
+        backend.update_node_summary.assert_awaited_once_with('node-uuid-1', 'Alice knows Bob', group_id='test')
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +671,7 @@ class TestFusedMemoryInstructionsEntityName:
         server = create_mcp_server(svc)
 
         import asyncio
-        tools = asyncio.get_event_loop().run_until_complete(server.list_tools())
+        tools = asyncio.run(server.list_tools())
         tool = next(t for t in tools if t.name == 'refresh_entity_summary')
         desc = tool.description or ''
         assert 'entity_uuid' in desc

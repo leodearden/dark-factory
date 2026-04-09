@@ -1,0 +1,21 @@
+{
+  "diff_id": "py_deep_shallow",
+  "ground_truth": [
+    {
+      "id": "py_shallow_1",
+      "location": "orchestrator/src/orchestrator/config.py:24",
+      "category": "shallow_copy_mutation",
+      "severity": "blocking",
+      "description": "Changed 'merged = base.copy()' to 'merged = base' (removed the copy). This means _deep_merge now mutates the original base dict passed by the caller. Since the function modifies 'merged' in-place via merged[key] = value, every call to _deep_merge will permanently alter the input base dict. This causes config contamination — loading config with overrides will permanently modify the defaults dict, affecting all subsequent loads.",
+      "mutation_type": "deep_shallow_copy"
+    },
+    {
+      "id": "py_shallow_2",
+      "location": "orchestrator/src/orchestrator/config.py:22",
+      "category": "misleading_docstring",
+      "severity": "suggestion",
+      "description": "The updated docstring claims 'The caller's base dict is never mutated — we work on a copy' but the implementation now assigns merged = base directly (no copy), contradicting the documented behavior.",
+      "mutation_type": "deep_shallow_copy"
+    }
+  ]
+}

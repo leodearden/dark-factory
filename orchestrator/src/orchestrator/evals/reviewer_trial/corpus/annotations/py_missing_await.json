@@ -1,0 +1,21 @@
+{
+  "diff_id": "py_missing_await",
+  "ground_truth": [
+    {
+      "id": "py_await_1",
+      "location": "orchestrator/src/orchestrator/evals/metrics.py:94",
+      "category": "missing_await",
+      "severity": "blocking",
+      "description": "run_verification() is an async function but the await keyword was removed. The variable 'verify' will be a coroutine object, not the result. All subsequent accesses to verify.passed, verify.lint_output, etc. will either AttributeError (coroutine has no 'passed' attribute) or always be truthy (coroutine object is truthy), producing incorrect metrics.",
+      "mutation_type": "missing_await"
+    },
+    {
+      "id": "py_await_2",
+      "location": "orchestrator/src/orchestrator/evals/metrics.py:113",
+      "category": "coroutine_truthiness",
+      "severity": "suggestion",
+      "description": "The new logging block accesses verify.passed etc. which will silently succeed if verify is a coroutine (coroutines are truthy), producing misleading log output rather than an error.",
+      "mutation_type": "missing_await"
+    }
+  ]
+}

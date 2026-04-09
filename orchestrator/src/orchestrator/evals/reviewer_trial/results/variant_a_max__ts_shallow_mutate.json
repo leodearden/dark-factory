@@ -1,0 +1,79 @@
+{
+  "variant_name": "variant_a_max",
+  "diff_id": "ts_shallow_mutate",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "gui/src/stores/claudeStore.ts:~161 (tool_call case)",
+          "category": "type_error_nonexistent_field",
+          "description": "The new code reads `msg.metadata`, but the `ToolCall` interface in `gui/sidecar/src/types.ts` only declares `type`, `id`, `tool_name`, `tool_input`. There is no `metadata` field on the wire protocol, so this is always `undefined` at runtime and a TypeScript compile error under strict checking. The fallback `msg.metadata || {}` silently swallows the bug and stores `{}` for every tool call.",
+          "suggested_fix": "Either (a) drop the `metadata` field entirely from this change, or (b) first add `metadata?: Record<string, unknown>` to the `ToolCall` interface in `sidecar/src/types.ts` AND have the sidecar emit it before consuming it on the GUI side."
+        },
+        {
+          "severity": "blocking",
+          "location": "gui/src/stores/claudeStore.ts:~165 (tool_call case)",
+          "category": "type_error_struct_mismatch",
+          "description": "The new `toolCall` object literal includes a `metadata` field, but `ToolCallInfo` (lines 10-16 of the same file) declares only `id`, `toolName`, `toolInput`, `status`, `result`. Pushing this object into `m.toolCalls` is a TypeScript error and the field will never be accessible to consumers.",
+          "suggested_fix": "Add `metadata?: Record<string, unknown>` to `ToolCallInfo` if metadata is genuinely needed by the UI, or remove the field. Do not add data members that no consumer reads."
+        },
+        {
+          "severity": "blocking",
+          "location": "gui/src/stores/claudeStore.ts:~185-191 (tool_result case)",
+          "category": "type_error_nonexistent_field",
+          "description": "The new code references `msg.tool_call_id`, `msg.output`, and `msg.is_error`. The `ToolResult` interface in `sidecar/src/types.ts` (lines 47-52) declares only `type`, `id`, `tool_name`, `result`. None of those three field names exist on the wire format, so at runtime: `resultCache[undefined] = { output: undefined, is_error: undefined }` \u2014 every tool result overwrites the same `\"undefined\"` key with an empty payload.",
+          "suggested_fix": "Use the correct existing fields (`msg.tool_name` and `msg.result`) and key the cache by something locally meaningful (e.g. the synthesized tool-call id), or extend the wire protocol in `sidecar/src/types.ts` to actually carry `tool_call_id`, `output`, and `is_error` and update the sidecar emitters to populate them."
+        },
+        {
+          "severity": "blocking",
+          "location": "gui/src/stores/claudeStore.ts:~188 (tool_result case)",
+          "category": "type_error_undeclared_field",
+          "description": "`m.resultCache = resultCache` writes to a property that does not exist on the `AssistantMessage` interface (lines 18-27 of this file). This is a TypeScript compile error and creates an untyped, untracked field on the store that no consumer can safely read.",
+          "suggested_fix": "Either add `resultCache?: Record<string, { output: unknown; is_error: boolean }>` to `AssistantMessage` (and to a corresponding renderer that actually uses it), or \u2014 preferably \u2014 remove `resultCache` entirely (see duplication finding below)."
+        },
+        {
+          "severity": "blocking",
+          "location": "gui/src/stores/claudeStore.ts:~177-191 (tool_result case)",
+          "category": "data_duplication",
+          "description": "`ToolCallInfo.result` already stores the tool result on the matching tool call (the unchanged code below the diff still does `tc.result = msg.result`). Introducing a second `resultCache` map duplicates this information, creates two sources of truth that can drift, and bloats every assistant message with redundant payloads. There is no consumer of `resultCache` anywhere in the GUI tree (verified by search) \u2014 this is dead state from the moment it lands.",
+          "suggested_fix": "Drop the `resultCache` addition. If a quick lookup by id is needed, expose a derived selector that builds it lazily from `toolCalls`, or memoize one if profiling shows the linear scan matters."
+        },
+        {
+          "severity": "blocking",
+          "location": "gui/src/stores/claudeStore.ts:~158-173 (tool_call case)",
+          "category": "off_by_one_id_collision_risk",
+          "description": "The original code computed `${msg.id}-tc-${m.toolCalls.length}` inside `produce`, where `m.toolCalls` is the up-to-date draft. The new code reads the length from `state.messages[idx]` BEFORE any setState in this call, then assigns it to a const captured in the closure. For a single message this is equivalent, but the change loses the invariant that the index is computed against the actual array being mutated. Combined with the `(state.messages[idx] as any).toolCalls.length` cast, any future refactor that batches multiple tool_call messages together will produce duplicate ids \u2014 and `tool_result FIFO matching` test in `__tests__/claudeStore.test.ts:278-298` asserts ids are unique. Reverting to the in-`produce` computation is both shorter and safer.",
+          "suggested_fix": "Compute the id inside the `produce` callback: `m.toolCalls.push({ id: `${msg.id}-tc-${m.toolCalls.length}`, ... })` \u2014 exactly as the original did. This eliminates the cast and the redundant role re-check."
+        },
+        {
+          "severity": "blocking",
+          "location": "gui/src/__tests__/claudeStore.test.ts (no changes)",
+          "category": "missing_test_coverage",
+          "description": "No tests cover the new `metadata` propagation or `resultCache` population. The existing `tool_result FIFO matching` suite (lines 205-355) would not catch any of the type errors above because it uses `as OutboundMessage` casts that bypass type checking. If the new behavior were genuinely intended, it should be exercised by tests; the absence of tests is consistent with this being incomplete or accidental code.",
+          "suggested_fix": "If `metadata`/`resultCache` are dropped (recommended), no new tests are needed. If they are kept, add tests asserting `metadata` survives a roundtrip and that `resultCache` is keyed/populated correctly \u2014 and remove the `as OutboundMessage` casts from those tests so type errors actually surface."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts:~159, ~183",
+          "category": "anti_pattern_solid_store",
+          "description": "Reading `state.messages[idx]` outside `produce()` and then writing the result inside is an anti-pattern with Solid's mutable-draft store. The whole point of `produce` is that you can mutate the draft directly; pre-computing a fresh object via spread allocates redundantly and makes future readers wonder whether the precomputed value can drift from the draft. The surrounding handlers (`text_delta`, `done`, `error`) all mutate inside `produce`.",
+          "suggested_fix": "Move the cache build inside the `produce` callback and mutate `m.resultCache` (if kept) directly, e.g. `m.resultCache ??= {}; m.resultCache[key] = value;`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/stores/claudeStore.ts:~159-160, ~183-185",
+          "category": "code_smell_as_any",
+          "description": "Both new blocks use `(state.messages[idx] as any).toolCalls` / `.resultCache` even though `findAssistantIdx` already guarantees the message is an assistant. The `as any` casts are how the type errors above slip past tsc \u2014 they hide the very mismatch a reviewer or compiler would otherwise catch.",
+          "suggested_fix": "Use a typed narrowing (`const m = state.messages[idx]; if (m?.role !== 'assistant') break;`) or do all access inside `produce`, where `m` is already `ChatMessage` and the existing `if (m.role !== 'assistant') return;` guard narrows it correctly."
+        }
+      ],
+      "summary": "The diff introduces a `metadata` field on tool calls and a `resultCache` map on assistant messages, but every new field references wire-protocol or domain-type members that do not exist (`msg.metadata`, `msg.tool_call_id`, `msg.output`, `msg.is_error`, `AssistantMessage.resultCache`, `ToolCallInfo.metadata`). The `as any` casts mask the type errors at compile time but at runtime the new code would silently store `undefined`-keyed empty payloads in `resultCache` and unreachable `metadata: {}` on every tool call. `resultCache` also duplicates information already on `ToolCallInfo.result`, has no GUI consumer (verified by repo-wide search), and is never tested. The pre-`produce` state reads are an anti-pattern relative to the surrounding handlers. Recommended fix: revert both blocks to the original in-`produce` mutation pattern and only reintroduce `metadata`/`resultCache` after extending the sidecar wire types and the `ChatMessage`/`ToolCallInfo` interfaces, with consumers and tests landing in the same change."
+    }
+  },
+  "total_cost_usd": 0.93733175,
+  "wall_clock_ms": 250115,
+  "errors": []
+}

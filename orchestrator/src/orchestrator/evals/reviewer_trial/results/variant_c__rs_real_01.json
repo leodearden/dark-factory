@@ -1,0 +1,93 @@
+{
+  "variant_name": "variant_c",
+  "diff_id": "rs_real_01",
+  "reviews": {
+    "opus_strategic": {
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:18-29",
+          "category": "design_coherence",
+          "description": "When a duplicate template name is detected, the function emits an error diagnostic but continues building the adjacency graph and running Tarjan's SCC. The duplicate template (second occurrence) will still appear in the `templates` slice and get an adjacency entry, but its name won't be in `name_to_idx`, so other templates referencing it by name won't create edges to it. This is acceptable for error recovery, but the diagnostic message exposes internal indices (\"indices 0 and 3\") which are meaningless to an end user. Consider reporting source locations or file paths instead.",
+          "suggested_fix": "If template has source location info, attach it via `Diagnostic::error(...).with_label(...)` to point at both definition sites, consistent with how function-signature duplicates are reported in lib.rs."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:18-29",
+          "category": "code_reuse",
+          "description": "Duplicate-name detection for templates is structurally identical to the existing duplicate function-signature detection in lib.rs (lines ~4055-4067): iterate, check HashMap for existing entry, emit error diagnostic, keep first. This is a recurring pattern that could be extracted into a shared utility, though at only two call sites it's not urgent.",
+          "suggested_fix": "No immediate action needed. If more duplicate-detection sites appear, consider a helper like `fn insert_unique<'a>(map: &mut HashMap<&'a str, usize>, key: &'a str, idx: usize, diags: &mut Vec<Diagnostic>, context: &str)`."
+        }
+      ],
+      "reviewer": "opus_strategic",
+      "verdict": "PASS",
+      "summary": "The change correctly replaces a silent HashMap overwrite with explicit duplicate template name detection, emitting an error diagnostic while preserving the first entry. This is architecturally consistent with the compiler's existing error-recovery pattern (emit diagnostic, continue processing) seen in function-signature duplicate detection. The adjacency graph remains valid for all non-duplicate templates, and Tarjan's SCC runs correctly on the resulting graph. The change is well-scoped, has test coverage, and introduces no new abstractions. Two minor suggestions: improve diagnostic message quality by replacing internal indices with source locations, and note the emerging pattern of duplicate-name detection that could eventually be extracted into a shared utility."
+    },
+    "sonnet_test_analyst": {
+      "reviewer": "sonnet_test_analyst",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:358-373",
+          "category": "incomplete_assertion",
+          "description": "The `duplicate_template_names_emits_diagnostic` test only checks that the message string contains 'duplicate' (case-insensitive). It does not assert that the diagnostic severity is `Error`. The new code explicitly calls `Diagnostic::error(...)`, but if that were accidentally changed to `Diagnostic::warning(...)`, the test would still pass. Severity is a meaningful part of the API contract here \u2014 an error should block compilation, a warning would not.",
+          "suggested_fix": "Add `assert!(duplicate_diags.iter().any(|d| d.severity == reify_types::Severity::Error), ...)` alongside the existing non-empty assertion."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:358-373",
+          "category": "untested_behavior",
+          "description": "The 'prev wins' semantic \u2014 the comment 'Keep the first entry (prev wins) \u2014 don't overwrite' \u2014 is not exercised by any test. Both templates in the test are created via `minimal_template(\"A\")` which have identical empty `sub_components`, so it doesn't matter which index is kept. A case where the two duplicate templates differ in their sub-component edges (e.g., only the second 'A' has a self-edge) would verify that the first occurrence governs the adjacency graph, not the second.",
+          "suggested_fix": "Add a test: two templates share name 'A', the second has a self-referencing sub_component, the first does not. Assert that `is_recursive == false` (since index 0 wins and has no self-edge) and that exactly one duplicate-error diagnostic is emitted."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:358-373",
+          "category": "missing_edge_case",
+          "description": "No test covers three or more templates sharing the same name. The loop logic should emit N-1 error diagnostics (one for each occurrence after the first). With only two templates in the existing test, the count is trivially 1 and the multi-duplicate path is uncovered.",
+          "suggested_fix": "Add a test with `vec![minimal_template(\"A\"), minimal_template(\"A\"), minimal_template(\"A\")]` and assert that `duplicate_diags.len() == 2`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:358-373",
+          "category": "missing_interaction_test",
+          "description": "There is no test verifying that non-duplicate templates continue to be processed correctly when duplicate names are also present. After emitting the duplicate error the function does not short-circuit \u2014 Tarjan's algorithm still runs. A test mixing one duplicate pair alongside a genuine two-node cycle would confirm that the cycle is still detected and the duplicate error is also present in the same diagnostic list.",
+          "suggested_fix": "Add a test with templates [A, A(dup), B, C] where B\u2194C form a cycle. Assert: one duplicate-error for 'A', one cycle-warning for B\u2194C, and both B and C have `is_recursive == true`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:358-373",
+          "category": "untested_message_format",
+          "description": "The diagnostic message format is `\"duplicate template name '{}': indices {} and {}\"`, embedding both index values. The test only checks for the substring 'duplicate'. If the format string drifts (e.g., wrong indices, missing the name, altered punctuation), no test will catch it.",
+          "suggested_fix": "Assert the message contains the template name and the two index values, e.g., `d.message.contains(\"'A'\") && d.message.contains(\"0\") && d.message.contains(\"1\")`."
+        }
+      ],
+      "summary": "The diff adds duplicate-template-name detection to `detect_recursive_structures`, replacing a silent `.collect()` overwrite with an explicit loop that emits `Diagnostic::error(...)` and keeps the first entry. A unit test `duplicate_template_names_emits_diagnostic` was added, but its coverage of the new behaviour is shallow. The test uses two structurally identical `minimal_template(\"A\")` instances, so it never exercises the 'prev wins' semantics; it checks only for a 'duplicate' substring in the message, leaving severity unasserted; and it does not test three-or-more duplicates, the diagnostic message's embedded index values, or the interaction between duplicate detection and cycle detection running on the remaining templates in the same call. None of these gaps cause incorrect runtime behaviour \u2014 the implementation itself is correct \u2014 but they leave meaningful regression surface uncovered for future changes to this code path."
+    },
+    "sonnet_robustness": {
+      "reviewer": "sonnet_robustness",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:detect_recursive_structures (post-duplicate-check)",
+          "category": "degraded-output-on-error",
+          "description": "After emitting an error diagnostic for a duplicate template name, the function does not return early. It continues building the adjacency list and running Tarjan's SCC on a graph that is structurally incomplete: the duplicate template (second occurrence) is excluded from `name_to_idx`, so any sub-component referencing that name resolves to the *first* template's index instead. This means the orphaned duplicate's self-references are silently re-routed to a different node, cycles that exist only through the duplicate will be missed, and `check_recursive_termination` is subsequently called with a `cyclic_sccs` result that does not reflect the true structure. Since the error diagnostic is already emitted, the compiled module is in an invalid state, but the caller has no signal that the cycle results are unreliable beyond 'some errors exist'.",
+          "suggested_fix": "After the duplicate-detection loop, check whether any error diagnostics were added and return early with an empty `cyclic_sccs` vec if so (or track a `had_duplicate` flag). This makes the failure mode explicit \u2014 callers already abort on errors, so the lost cycle information is irrelevant, and it avoids confusing spurious or incomplete cycle warnings being emitted alongside the duplicate-name errors."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:detect_recursive_structures duplicate diagnostic message",
+          "category": "diagnostic-quality",
+          "description": "The error message `\"duplicate template name '{}': indices {} and {}\"` exposes compiler-internal array indices to the end user. These indices carry no semantic meaning outside the compiler's internal slice layout and will change as templates are added or reordered, making the message hard to act on.",
+          "suggested_fix": "Omit the internal indices from the user-facing message. If source spans are available on `TopologyTemplate`, emit them instead (e.g. 'first defined at <loc>, redefined at <loc>'). If not, a simpler `\"duplicate template name '{}'\"` is cleaner and less misleading."
+        }
+      ],
+      "summary": "The diff is a clear robustness improvement: it replaces a silent `HashMap::collect()` that would silently overwrite duplicate template names (corrupting the adjacency graph without any indication) with an explicit loop that detects duplicates, reports an error diagnostic, and preserves the first entry. No new panics or resource leaks are introduced. The two issues are suggestion-level. First: after emitting the duplicate error the function continues running Tarjan on an incomplete graph (the duplicate template is orphaned from `name_to_idx`), so the returned `cyclic_sccs` can be incomplete or mis-attributed; an early return on duplicate detection would make the failure mode cleaner and prevent `check_recursive_termination` from operating on unreliable cycle data. Second: the diagnostic message includes compiler-internal array indices that are meaningless to users and could be simplified or replaced with source location information if available."
+    }
+  },
+  "total_cost_usd": 0.74433695,
+  "wall_clock_ms": 133654,
+  "errors": []
+}

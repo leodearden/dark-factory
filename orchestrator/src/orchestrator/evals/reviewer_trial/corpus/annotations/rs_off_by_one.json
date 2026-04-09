@@ -1,0 +1,29 @@
+{
+  "diff_id": "rs_off_by_one",
+  "ground_truth": [
+    {
+      "id": "rs_obo_1",
+      "location": "crates/reify-constraints/src/solver.rs:468",
+      "category": "off_by_one",
+      "severity": "blocking",
+      "description": "Changed loop from '0..n' to '0..=n' (inclusive range). This iterates n+1 times instead of n, creating n+2 vertices instead of the documented n+1. On the last iteration (i=n), params[i] will panic with index-out-of-bounds since params has length n (indices 0..n-1). Even if it didn't panic, the simplex would have the wrong dimensionality for Nelder-Mead.",
+      "mutation_type": "off_by_one"
+    },
+    {
+      "id": "rs_obo_2",
+      "location": "crates/reify-constraints/src/solver.rs:469",
+      "category": "index_out_of_bounds",
+      "severity": "blocking",
+      "description": "With the inclusive range 0..=n, when i=n the expression 'params[i]' accesses index n in a slice of length n, causing a panic. The original 0..n range correctly limited i to 0..n-1.",
+      "mutation_type": "off_by_one"
+    },
+    {
+      "id": "rs_obo_3",
+      "location": "crates/reify-constraints/src/solver.rs:480",
+      "category": "unused_function",
+      "severity": "suggestion",
+      "description": "validate_simplex() is defined but never called. If it were used to validate the output of build_simplex, it would catch the off-by-one bug at runtime.",
+      "mutation_type": "off_by_one"
+    }
+  ]
+}

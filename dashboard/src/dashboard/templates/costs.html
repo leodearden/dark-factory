@@ -51,7 +51,7 @@
       hx-get="/costs/partials/by-project"
       hx-trigger="load, every 60s, costs-window-changed"
       hx-vals='js:{window: Alpine.store("costs").window}'
-      hx-swap="morph:innerHTML"
+      hx-swap="innerHTML"
       hx-sync="this:abort"
       hx-request='{"timeout": 10000}'
       aria-live="polite"
@@ -68,7 +68,7 @@
       hx-get="/costs/partials/by-account"
       hx-trigger="load, every 60s, costs-window-changed"
       hx-vals='js:{window: Alpine.store("costs").window}'
-      hx-swap="morph:innerHTML"
+      hx-swap="innerHTML"
       hx-sync="this:abort"
       hx-request='{"timeout": 10000}'
       aria-live="polite"
@@ -85,7 +85,7 @@
       hx-get="/costs/partials/by-role"
       hx-trigger="load, every 60s, costs-window-changed"
       hx-vals='js:{window: Alpine.store("costs").window}'
-      hx-swap="morph:innerHTML"
+      hx-swap="innerHTML"
       hx-sync="this:abort"
       hx-request='{"timeout": 10000}'
       aria-live="polite"
@@ -102,7 +102,7 @@
       hx-get="/costs/partials/trend"
       hx-trigger="load, every 60s, costs-window-changed"
       hx-vals='js:{window: Alpine.store("costs").window}'
-      hx-swap="morph:innerHTML"
+      hx-swap="innerHTML"
       hx-sync="this:abort"
       hx-request='{"timeout": 10000}'
       aria-live="polite"

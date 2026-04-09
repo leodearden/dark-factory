@@ -37,7 +37,10 @@ logger = logging.getLogger(__name__)
 
 # Return type for advance_main — lets callers distinguish transient
 # (CAS) failures from permanent ones (not-a-descendant, contamination).
-AdvanceResult = Literal['advanced', 'cas_failed', 'not_descendant', 'contaminated', 'stash_failed']
+AdvanceResult = Literal[
+    'advanced', 'cas_failed', 'not_descendant', 'contaminated',
+    'stash_failed', 'wip_overlap', 'pop_conflict',
+]
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +168,17 @@ class MergeResult:
     merge_worktree: Path | None = None
 
 
+@dataclass
+class WorktreeInfo:
+    """Return value from create_worktree - captures worktree path and base commit.
+
+    The base_commit is the SHA of main at worktree creation time, pinned to
+    ensure stable diffs even if main advances during task execution.
+    """
+    path: Path
+    base_commit: str
+
+
 async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     """Run a git command and return (returncode, stdout, stderr)."""
     proc = await asyncio.create_subprocess_exec(
@@ -208,11 +222,12 @@ class GitOps:
                 return True
         return False
 
-    async def create_worktree(self, branch_name: str) -> tuple[Path, str]:
+    async def create_worktree(self, branch_name: str) -> WorktreeInfo:
         """Create a git worktree for a task branch, based off main.
 
-        Returns (worktree_path, base_commit_sha) so the base commit is
-        captured at creation time and not affected by later main movement.
+        Returns a WorktreeInfo with the worktree path and the base commit SHA
+        (main's SHA at creation time) so diffs remain stable even if main
+        advances during task execution.
 
         If the worktree/branch already exist (e.g., from a requeued task),
         reuses them instead of failing.
@@ -245,7 +260,7 @@ class GitOps:
             if await self._is_registered_worktree(worktree_path):
                 logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
                 _ensure_task_gitignore(worktree_path)
-                return worktree_path, base_sha
+                return WorktreeInfo(path=worktree_path, base_commit=base_sha)
             else:
                 logger.warning(
                     f'Directory {worktree_path} exists but is NOT a registered '
@@ -295,7 +310,7 @@ class GitOps:
                 worktree_path,
             )
 
-        return worktree_path, base_sha
+        return WorktreeInfo(path=worktree_path, base_commit=base_sha)
 
     async def commit(self, worktree: Path, message: str) -> str | None:
         """Stage all changes and commit. Returns sha or None if nothing to commit.
@@ -418,12 +433,21 @@ class GitOps:
         )
         return [f for f in output.strip().splitlines() if f.strip()]
 
-    async def merge_to_main(self, worktree: Path, branch: str) -> MergeResult:
+    async def merge_to_main(
+        self,
+        worktree: Path,
+        branch: str,
+        base_sha: str | None = None,
+    ) -> MergeResult:
         """Merge a task branch into main using a temporary merge worktree.
 
         Creates a disposable worktree, performs the merge there, and returns
         the result.  The caller is responsible for calling :meth:`advance_main`
         after verification and :meth:`cleanup_merge_worktree` when done.
+
+        When *base_sha* is provided the merge worktree is created at that
+        commit rather than current main HEAD.  This supports speculative
+        merges where N+1 is merged against N's merge commit SHA.
 
         Never touches ``project_root``'s working tree or index.
         Called by the MergeWorker (serialized via the merge queue).
@@ -432,7 +456,7 @@ class GitOps:
         merge_wt: Path | None = None
 
         try:
-            merge_wt, pre_merge_sha = await self._create_merge_worktree()
+            merge_wt, pre_merge_sha = await self._create_merge_worktree(base_sha)
 
             # Pre-merge cleanup: remove .task/ from filesystem if inherited
             # from a contaminated main.  This is NOT sufficient on its own
@@ -483,40 +507,52 @@ class GitOps:
                 merge_worktree=merge_wt,
             )
 
-        except Exception:
+        except BaseException:
             if merge_wt:
                 await self.cleanup_merge_worktree(merge_wt)
             raise
 
-    async def _create_merge_worktree(self) -> tuple[Path, str]:
-        """Create a temporary detached worktree at main HEAD for merging."""
+    async def _create_merge_worktree(
+        self, base_sha: str | None = None,
+    ) -> tuple[Path, str]:
+        """Create a temporary detached worktree at *base_sha* (or main HEAD).
+
+        When *base_sha* is None the worktree is created at current main HEAD
+        (normal case).  When *base_sha* is provided the worktree is created
+        at that exact commit, supporting speculative merges where N+1 is
+        merged against N's merge commit.
+        """
         import uuid
         merge_id = uuid.uuid4().hex[:8]
         merge_wt = self.worktree_base / f'_merge-{merge_id}'
         merge_wt.parent.mkdir(parents=True, exist_ok=True)
 
-        # Fetch latest (best-effort — no remote in tests)
-        await _run(
-            ['git', 'fetch', self.config.remote, self.config.main_branch],
-            cwd=self.project_root,
-        )
-
-        # Capture current main SHA
-        _, pre_merge_sha, _ = await _run(
-            ['git', 'rev-parse', self.config.main_branch],
-            cwd=self.project_root,
-        )
+        if base_sha is None:
+            # Fetch latest (best-effort — no remote in tests)
+            await _run(
+                ['git', 'fetch', self.config.remote, self.config.main_branch],
+                cwd=self.project_root,
+            )
+            # Capture current main SHA
+            _, pre_merge_sha, _ = await _run(
+                ['git', 'rev-parse', self.config.main_branch],
+                cwd=self.project_root,
+            )
+            checkout_ref = self.config.main_branch
+        else:
+            pre_merge_sha = base_sha
+            checkout_ref = base_sha.strip()
 
         # Detached worktree avoids "branch already checked out" error
         rc, _, err = await _run(
-            ['git', 'worktree', 'add', '--detach', str(merge_wt), self.config.main_branch],
+            ['git', 'worktree', 'add', '--detach', str(merge_wt), checkout_ref],
             cwd=self.project_root,
         )
         if rc != 0:
             raise RuntimeError(f'Failed to create merge worktree: {err}')
 
         logger.info(f'Created merge worktree at {merge_wt} (HEAD={pre_merge_sha[:8]})')
-        return merge_wt, pre_merge_sha
+        return merge_wt, pre_merge_sha.strip()
 
     async def cleanup_merge_worktree(self, merge_wt: Path) -> None:
         """Remove a temporary merge worktree."""
@@ -738,20 +774,70 @@ class GitOps:
                 cwd=self.project_root,
             )
             if porcelain.strip():
-                stash_rc, _, stash_err = await _run(
-                    ['git', 'stash', 'push', '-m',
-                     f'merge-queue: pre-advance for {branch or merge_sha[:8]}'],
+                # ── WIP overlap check ────────────────────────────────
+                # Before stashing, check if dirty tracked files overlap
+                # with the merge diff.  If they do, abort the advance
+                # to prevent stash-pop conflicts that destroy WIP.
+                #
+                # Use git diff to get tracked dirty filenames reliably.
+                # Porcelain parsing is fragile because _run strips stdout,
+                # which eats the leading space from " M filename" status.
+                # Exclude .task/ (ephemeral) and the worktree dir (managed by git).
+                wt_dir = self.config.worktree_dir
+                _, unstaged_files, _ = await _run(
+                    ['git', 'diff', '--name-only', '--',
+                     '.', ':!.task', f':!{wt_dir}'],
                     cwd=self.project_root,
                 )
-                if stash_rc != 0:
-                    logger.error(
-                        'CRITICAL: git stash push failed before advance_main '
-                        '— halting merge to prevent code loss. error=%s',
-                        stash_err,
+                _, staged_files, _ = await _run(
+                    ['git', 'diff', '--name-only', '--cached', '--',
+                     '.', ':!.task', f':!{wt_dir}'],
+                    cwd=self.project_root,
+                )
+                dirty_tracked = {
+                    f.strip() for f in
+                    (unstaged_files + '\n' + staged_files).splitlines()
+                    if f.strip()
+                }
+                if dirty_tracked:
+                    _, merge_diff_files, _ = await _run(
+                        ['git', 'diff', '--name-only',
+                         await self.get_main_sha(), merge_sha],
+                        cwd=self.project_root,
                     )
-                    return 'stash_failed'
-                did_stash = True
-                logger.info('Stashed uncommitted changes before advance_main')
+                    merge_files = {
+                        f.strip() for f in merge_diff_files.splitlines() if f.strip()
+                    }
+                    overlap = dirty_tracked & merge_files
+                    if overlap:
+                        self._last_overlap_files = sorted(overlap)
+                        logger.warning(
+                            'WIP overlap detected: %d file(s) overlap merge diff '
+                            'for %s — aborting advance to prevent stash-pop '
+                            'conflict. Overlapping: %s',
+                            len(overlap), branch or merge_sha[:8],
+                            ', '.join(sorted(overlap)[:10]),
+                        )
+                        return 'wip_overlap'
+
+                # Only stash if there are tracked dirty files.  Untracked-only
+                # (??) entries survive read-tree without conflict — stashing
+                # them risks spurious pop failures (e.g. .worktrees/).
+                if dirty_tracked:
+                    stash_rc, _, stash_err = await _run(
+                        ['git', 'stash', 'push', '-m',
+                         f'merge-queue: pre-advance for {branch or merge_sha[:8]}'],
+                        cwd=self.project_root,
+                    )
+                    if stash_rc != 0:
+                        logger.error(
+                            'CRITICAL: git stash push failed before advance_main '
+                            '— halting merge to prevent code loss. error=%s',
+                            stash_err,
+                        )
+                        return 'stash_failed'
+                    did_stash = True
+                    logger.info('Stashed uncommitted changes before advance_main')
 
         # All checks passed — advance the ref (CAS when expected_main provided)
         update_cmd = [
@@ -796,15 +882,66 @@ class GitOps:
                     cwd=self.project_root,
                 )
                 if pop_rc != 0:
-                    # Conflicts expected when user's WIP touches merged files.
-                    # The session will see conflict markers and resolve them.
-                    logger.warning(
-                        'Stash pop produced conflicts after merge advance '
-                        '(task %s). Active session should resolve: %s',
-                        branch or merge_sha[:8], pop_err,
+                    # Pop conflict: merge landed but WIP conflicts with it.
+                    # Preserve WIP on a recovery branch, clean up working tree.
+                    recovery = await self._create_recovery_branch_from_stash(
+                        branch or merge_sha[:8],
                     )
+                    self._last_recovery_branch = recovery
+                    logger.warning(
+                        'Stash pop conflicted after merge advance (task %s). '
+                        'WIP preserved on recovery branch: %s',
+                        branch or merge_sha[:8], recovery,
+                    )
+                    return 'pop_conflict'
 
         return 'advanced'
+
+    async def _create_recovery_branch_from_stash(self, label: str) -> str:
+        """Create a branch from the current stash to preserve WIP, then clean up.
+
+        1. Create a deterministic branch name.
+        2. ``git branch <name> stash@{0}`` — makes the stash commit reachable.
+        3. ``git stash drop`` — safe now (WIP reachable via branch).
+        4. ``git read-tree -u --reset HEAD`` — clean working tree (removes
+           conflict markers and UU state).
+
+        Returns the recovery branch name.
+        """
+        from datetime import UTC, datetime
+
+        iso = datetime.now(UTC).strftime('%Y%m%dT%H%M%S')
+        name = f'wip/recovery-{label}-{iso}'
+
+        # Create branch pointing at the stash commit
+        await _run(
+            ['git', 'branch', name, 'stash@{0}'],
+            cwd=self.project_root,
+        )
+        # Drop the stash entry (WIP is now reachable via the branch)
+        await _run(['git', 'stash', 'drop'], cwd=self.project_root)
+        # Reset working tree to HEAD (removes conflict markers / UU state)
+        await _run(
+            ['git', 'read-tree', '-u', '--reset', 'HEAD'],
+            cwd=self.project_root,
+        )
+        return name
+
+    async def has_dirty_working_tree(self) -> str:
+        """Return names of tracked dirty files, or empty string if clean.
+
+        Excludes .task/ (ephemeral scratch) and untracked files.
+        """
+        _, unstaged, _ = await _run(
+            ['git', 'diff', '--name-only', '--', '.', ':!.task'],
+            cwd=self.project_root,
+        )
+        _, staged, _ = await _run(
+            ['git', 'diff', '--name-only', '--cached', '--', '.', ':!.task'],
+            cwd=self.project_root,
+        )
+        files = {f.strip() for f in (unstaged + '\n' + staged).splitlines() if f.strip()}
+        return '\n'.join(sorted(files))
 
     async def get_conflict_details(self, cwd: Path) -> str:
         """Parse conflict markers and return structured description."""

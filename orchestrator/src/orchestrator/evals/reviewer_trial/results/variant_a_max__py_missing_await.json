@@ -1,0 +1,58 @@
+{
+  "variant_name": "variant_a_max",
+  "diff_id": "py_missing_await",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:94",
+          "category": "async_correctness",
+          "description": "The `await` keyword was removed from `run_verification(worktree, workflow.config)`, but `run_verification` is defined as `async def` in orchestrator/src/orchestrator/verify.py:188. Calling it without `await` returns a coroutine object rather than the `VerifyResult` dataclass. The function body never executes \u2014 the subprocess calls that actually run tests, lint, and typecheck are silently skipped. Python will emit a `RuntimeWarning: coroutine 'run_verification' was never awaited`, and downstream attribute access on `verify` will crash.",
+          "suggested_fix": "Restore the `await`: `verify = await run_verification(worktree, workflow.config)`. The enclosing `collect_metrics` is already `async def`, so there is no reason to drop the await."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:112-114",
+          "category": "runtime_error",
+          "description": "Because `verify` is now an unawaited coroutine object (not a `VerifyResult`), the expressions `verify.passed`, `verify.lint_output`, and `verify.type_output` raise `AttributeError: 'coroutine' object has no attribute 'passed'` (etc.). The `if verify else False` guard does not protect against this \u2014 a coroutine object is truthy, so the left branch is always taken. Metric collection will crash at this point, breaking the entire eval pipeline.",
+          "suggested_fix": "Fixing the missing `await` at line 94 resolves this. The `if verify else False` fallback is dead code in practice (the async function either returns a `VerifyResult` or raises) and could be simplified, but that is secondary."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:111-120",
+          "category": "runtime_error",
+          "description": "The new debug-logging block accesses `verify.passed`, `verify.lint_output`, and `verify.type_output` on the coroutine object \u2014 same failure mode as above, and it now crashes *before* the `EvalMetrics` constructor, so the error location is shifted. The `if verify else 'N/A'` guards do not help for the same reason (coroutine objects are truthy).",
+          "suggested_fix": "Fix the missing `await` so `verify` is a `VerifyResult`. Additionally, consider dropping the `if verify else 'N/A'` since `run_verification` never returns None \u2014 the ternary implies defensive handling of a case that cannot occur and will mislead future readers."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:80",
+          "category": "lint_suppression",
+          "description": "A `# noqa: C901` (cyclomatic complexity suppression) was added to the `collect_metrics` signature, but the function is only ~50 lines of mostly-linear attribute wiring with no deep branching. C901 does not appear to actually fire for this function, and silencing rules without a demonstrated trigger hides future legitimate warnings. Lint suppressions should be accompanied by the actual warning text in a comment and/or a reason.",
+          "suggested_fix": "Remove the `# noqa: C901` unless ruff is actually flagging C901 here. If it is flagged, add a short justification comment (e.g. `# noqa: C901 - linear metric wiring, refactor deferred`) or \u2014 better \u2014 extract the verification/review/git blocks into helpers to reduce the complexity score legitimately."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:111-120",
+          "category": "duplication",
+          "description": "The three boolean expressions in the new log statement (`verify.passed`, `not verify.lint_output`, `not verify.type_output`) duplicate the exact logic used a few lines later in the `EvalMetrics(...)` constructor. Any future change to how these are derived has to be made in two places. Since `EvalMetrics` already captures these fields, log the constructed `m` (e.g. `logger.info('Metrics for task %s: tests=%s lint=%s types=%s plan=%.1f%%', task.get('id','?'), m.tests_pass, m.lint_clean, m.typecheck_clean, m.plan_completion_pct*100)`) *after* construction to eliminate the duplication.",
+          "suggested_fix": "Move the log statement to immediately after `m = EvalMetrics(...)` and read the values from `m` rather than recomputing from `verify`. This also ensures log output matches the values that will actually be persisted."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py (tests)",
+          "category": "test_coverage",
+          "description": "There is no unit/integration test exercising `collect_metrics` end-to-end (no hits in `orchestrator/tests/` for `collect_metrics` outside the reviewer-trial corpus artifacts). A smoke test with a fake `TaskWorkflow` and a monkey-patched `run_verification` would have caught this regression instantly \u2014 dropping an `await` on an async call is exactly the kind of bug a single-happy-path test detects. Consider adding at least one test that constructs an `EvalMetrics` via `collect_metrics` and asserts the async contract.",
+          "suggested_fix": "Add `tests/test_eval_metrics.py` with a test that stubs `workflow.artifacts`, stubs `run_verification` with an `AsyncMock` returning a `VerifyResult`, and asserts the returned `EvalMetrics` has the expected `tests_pass`, `lint_clean`, `typecheck_clean`, `composite_score`. The async stub will fail loudly if `await` is ever dropped again."
+        }
+      ],
+      "summary": "The diff contains a critical regression: `await` was removed from the `run_verification(worktree, workflow.config)` call, but `run_verification` is an `async def` function (verify.py:188). This turns `verify` into an unawaited coroutine, so (a) tests/lint/typecheck are silently never executed, (b) every subsequent access \u2014 both in the new log statement and the `EvalMetrics(...)` constructor \u2014 raises `AttributeError` on the coroutine object, crashing metric collection for every eval run, and (c) Python emits a `RuntimeWarning: coroutine was never awaited`. The `if verify else ...` guards provide no protection because coroutine objects are truthy. Secondary concerns: the new `# noqa: C901` is added without a demonstrated trigger and should be removed or justified; the new log statement duplicates the exact boolean logic used in the `EvalMetrics(...)` constructor and should read from `m` after construction; and there is no unit test exercising `collect_metrics` to catch await-regressions like this one. The async-correctness issue is blocking and must be fixed before merge."
+    }
+  },
+  "total_cost_usd": 0.57610725,
+  "wall_clock_ms": 128566,
+  "errors": []
+}

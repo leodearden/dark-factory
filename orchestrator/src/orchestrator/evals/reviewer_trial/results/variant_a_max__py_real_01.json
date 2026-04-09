@@ -1,0 +1,72 @@
+{
+  "variant_name": "variant_a_max",
+  "diff_id": "py_real_01",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "shared/tests/test_cli_invoke.py (missing test for shared/src/shared/cli_invoke.py:478-479)",
+          "category": "test_coverage",
+          "description": "The new is_error override in _parse_claude_output has zero test coverage. This is the linchpin of the entire diff: the heuristic safety net comment explicitly says 'is_error=true \u2192 success=False after fix 2', so if _parse_claude_output ever regresses on is_error handling, the heuristic silently stops working too. A grep for 'is_error' across shared/tests/ returns no matches in test_cli_invoke.py \u2014 _parse_claude_output is not unit-tested at all today.",
+          "suggested_fix": "Add a TestParseClaudeOutput class in test_cli_invoke.py. Make _parse_claude_output and _SubprocessResult importable (they're already imported by other tests). Cases: (1) {subtype:'success', is_error:true, returncode:0} \u2192 success=False; (2) {subtype:'success', is_error:false, returncode:0} \u2192 success=True (regression guard); (3) is_error key absent \u2192 existing behavior preserved; (4) {subtype:'error', is_error:true} \u2192 success=False; (5) {subtype:'error', returncode:0, is_error:false} \u2192 success=True (the path that previously over-classified errors as success when subtype was non-success but returncode was 0 \u2014 confirm new code keeps it consistent)."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/tests/test_cli_invoke.py (missing test for shared/src/shared/cli_invoke.py:250-286)",
+          "category": "test_coverage",
+          "description": "The new heuristic safety net (~37 LOC) has no tests. This is a behavior-changing branch that can mark any account as capped, mutate invoke_kwargs, and trigger backoff sleeps \u2014 exactly the kind of code path that needs a regression net. Without tests, it's also impossible to verify the false-positive guards (the four AND conditions) hold over time.",
+          "suggested_fix": "Add a TestHeuristicCapHit class with at least: (1) trigger when AgentResult has success=False, cost_usd=0, turns=1, duration_ms=2000 \u2192 second invoke_claude_agent call observed and asyncio.sleep called with base cooldown; (2) DOES NOT trigger when usage_gate=None; (3) DOES NOT trigger when result.success=True; (4) DOES NOT trigger when cost_usd>0; (5) DOES NOT trigger when duration_ms>=5000; (6) DOES NOT trigger when turns>1; (7) heuristic-triggered cap also pops resume_session_id and resets prompt to original_prompt; (8) heuristic-triggered cap counts toward consecutive_cap_hits backoff escalation."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:267-271",
+          "category": "encapsulation",
+          "description": "The heuristic reaches into UsageGate and calls the private method _handle_cap_detected directly. This violates encapsulation \u2014 the leading underscore is the project's signal that callers outside the module shouldn't depend on this surface \u2014 and introduces tight coupling between cli_invoke and usage_gate's internal cap-marking logic. If usage_gate's internals change (e.g. the signature of _handle_cap_detected, or the sequence of state mutations it performs), cli_invoke breaks silently.",
+          "suggested_fix": "Add a public method on UsageGate, e.g. mark_cap_heuristic(oauth_token: str | None, reason: str) -> None, that wraps _handle_cap_detected with explicit semantics for the heuristic case (resets_at=None, treats current account as capped). Then call usage_gate.mark_cap_heuristic(oauth_token, reason) from the heuristic block. This also gives the heuristic a single public seam to mock in tests."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:255-261",
+          "category": "robustness",
+          "description": "The heuristic conditions (cost_usd==0, turns<=1, duration_ms<5000) will fire on legitimate vLLM bridge failures. orchestrator/workflow.py:1403 passes env_overrides (which sets ANTHROPIC_BASE_URL for vLLM) AND a usage_gate to invoke_with_cap_retry for implementer/debugger roles. Per project memory (project_vllm_eval_tool_format_bridge_bug.md): 'Model serves OK but Claude CLI errors on every tool_use response' \u2014 vLLM-backed runs return failed results with cost_usd=0 (no cost reporting from vLLM), turns can be 0 or 1, and the failure mode is fast. The heuristic would then incorrectly mark Claude OAuth accounts as capped even though the failure is unrelated to Claude usage limits, causing thrash across all accounts when vLLM is enabled. Recovery is automatic via the probe loop, but it produces noisy false-cap telemetry and wasted account capacity.",
+          "suggested_fix": "Skip the heuristic entirely when env_overrides is set (or specifically when ANTHROPIC_BASE_URL is in env_overrides) \u2014 vLLM failures are not Claude cap hits and should not poison the gate. Threading env_overrides into invoke_with_cap_retry as a flag is straightforward since the kwargs are already forwarded via **invoke_kwargs. Alternative: gate the heuristic on whether the bridge is in use by checking the AgentResult's account or the invoke_kwargs."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:213-225 vs 267-271",
+          "category": "consistency",
+          "description": "The explicit cap-hit branch saves a 'cap_hit' event via the cost_store parameter passed to invoke_with_cap_retry, with details=label. The heuristic branch saves the cap_hit event via _handle_cap_detected \u2192 _fire_cost_event, which uses the gate's internal self._cost_store with details=json.dumps({'reason': reason}). These are inconsistent in two ways: (1) the two cost_store references may be different instances in some test/embedding scenarios, leading to events recorded in different stores; (2) the details payload is a string in one path and a JSON-encoded dict in the other, so any downstream parser/dashboard has to special-case the format.",
+          "suggested_fix": "Have the heuristic also call await cost_store.save_account_event(event_type='cap_hit_heuristic', details=label, ...) using the same cost_store path as the explicit branch, and either remove or normalize the _fire_cost_event call inside _handle_cap_detected for this code path (e.g. via a flag suppress_cost_event=True). Alternatively, pick one source of truth and use it from both branches."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:272-286 (vs. 206-247)",
+          "category": "duplication",
+          "description": "The heuristic block re-implements the cooldown calculation, the pop/reset of resume_session_id and prompt, the consecutive_cap_hits arithmetic, the active_account_name logging, and the asyncio.sleep+continue pattern that already exist in the explicit cap-hit branch above. Two near-identical multi-line blocks for the same control flow are easy to drift apart on future edits (e.g. changing the backoff curve only in one branch).",
+          "suggested_fix": "Extract a private helper async def _enter_cap_backoff(self_state, label, account_name, reason, resume=False) -> None (or similar) that updates consecutive_cap_hits, computes cooldown, mutates invoke_kwargs, logs, and sleeps. Call it from both the explicit and heuristic branches. The branches then differ only in (a) how they detected the cap and (b) whether resume is attempted."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:259",
+          "category": "robustness",
+          "description": "turns <= 1 is satisfied whenever turns is 0, and _parse_claude_output defaults turns to 0 when the JSON envelope has no num_turns field. This means a partially-parsed or malformed CLI response (e.g. an unrecognised JSON shape with no num_turns) will satisfy this condition even when turns is 'unknown' rather than 'really 0 or 1'. Combined with cost_usd defaulting similarly to 0 when no cost field exists, the heuristic could fire on parser-shape mismatches rather than the targeted is_error=true case.",
+          "suggested_fix": "Either (a) tighten by requiring is_error=true explicitly: thread is_error through AgentResult so the heuristic can check it directly instead of inferring via the success-cost-turns conjunction, or (b) require turns == 1 (not <= 1) so the 'we don't know' / 'parser failed' case isn't auto-treated as a cap hit. Option (a) is more honest about what the heuristic is actually catching."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:478 and shared/tests/test_usage_gate_exhaustive.py:81",
+          "category": "test_coverage",
+          "description": "The new CAP_HIT_PREFIXES entry 'You\\'re out of extra usage' is automatically picked up by the parametrized test_cap_hit_prefix_detected, which is good. However, the test pads the prefix with '... usage limit. Your plan resets in 5h.' so the test text becomes 'You\\'re out of extra usage usage limit. Your plan resets in 5h.' \u2014 that doesn't match the real Claude CLI message format for this error (see project_extra_usage_cap_detection.md). A targeted test using a realistic message string would catch any real-world mismatch (e.g. punctuation, casing, or wording variants the real CLI uses).",
+          "suggested_fix": "Add a non-parametrized test in TestCapDetectionPatterns that uses the actual error message string the CLI emits for this case (capture from a real cap event log), e.g. 'You\\'re out of extra usage. Your usage limit will reset at 9pm (US/Pacific).' and assert detect_cap_hit returns True. This locks in the real-world wording, not just a synthetic prefix."
+        }
+      ],
+      "summary": "The diff makes three correct, narrowly-scoped fixes: (1) trusting is_error in _parse_claude_output to override success=true on cap-hit responses, (2) adding a heuristic safety net for unrecognized cap-hit message formats, and (3) adding 'You're out of extra usage' to CAP_HIT_PREFIXES. The CAP_HIT_PREFIXES addition is auto-tested by the existing parametrized fixture, but the other two fixes have zero unit-test coverage despite being the load-bearing logic (the heuristic comment explicitly says it depends on the is_error fix). The heuristic also has design issues: it calls a private UsageGate method (_handle_cap_detected) directly, duplicates ~15 lines of cooldown/retry logic from the explicit cap-hit branch, records cost events through a different code path with a different details format, and \u2014 most concerningly \u2014 will misfire on vLLM bridge failures (which return cost=0, turns\u22641, fast duration with success=False) because workflow.py:1403 passes both usage_gate and env_overrides for implementer/debugger roles. Misfires are recoverable via the probe loop but will cause noisy false-cap telemetry and wasted Claude account capacity in the documented vLLM-broken scenario. None of these are blocking \u2014 the changes don't corrupt data or violate API contracts, and the heuristic recovers gracefully \u2014 but the test coverage gap and the vLLM interaction should be addressed before this lands in production traffic."
+    }
+  },
+  "total_cost_usd": 2.0757774999999996,
+  "wall_clock_ms": 383899,
+  "errors": []
+}

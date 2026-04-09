@@ -83,7 +83,7 @@ reconciliation:
   agent_max_steps: 50
   tool_timeout_seconds: ${RECON_TOOL_TIMEOUT:120}
   stage_timeout_seconds: ${RECON_STAGE_TIMEOUT:3600}
-  cycle_timeout_seconds: ${RECON_CYCLE_TIMEOUT:21600}
+  cycle_timeout_seconds: ${RECON_CYCLE_TIMEOUT:86400}
   judge_enabled: true
   judge_llm_provider: "claude_cli"
   judge_llm_model: "sonnet"

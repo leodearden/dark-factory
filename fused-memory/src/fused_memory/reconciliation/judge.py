@@ -289,7 +289,7 @@ Review this run and provide your verdict as JSON.
     async def _check_error_trends(self, project_id: str, verdicts: list[JudgeVerdict]) -> None:
         """Detect rising error rates across recent runs."""
         recent = verdicts[-10:]
-        non_ok = [v for v in recent if v.severity != 'ok']
+        non_ok = [v for v in recent if v.severity in ('moderate', 'serious')]
         if len(non_ok) >= 5 and self.config.halt_on_judge_serious:
                 self._halted_projects.add(project_id)
                 logger.error(

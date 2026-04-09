@@ -3,7 +3,7 @@
 import re
 from pathlib import Path
 
-from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
+from dashboard.config import DEFAULT_FUSED_MEMORY_URLS, DashboardConfig
 
 
 class TestConfigDefaults:
@@ -14,17 +14,21 @@ class TestConfigDefaults:
         assert DEFAULT_FUSED_MEMORY_URLS == ('http://localhost:8002',)
 
     def test_config_defaults(self):
-        from dashboard.config import DashboardConfig
-
         cfg = DashboardConfig()
         assert cfg.host == '127.0.0.1'
         assert cfg.port == 8080
         assert cfg.project_root == Path('/home/leo/src/dark-factory')
         assert cfg.fused_memory_urls == list(DEFAULT_FUSED_MEMORY_URLS)
 
-    def test_config_derived_paths(self):
-        from dashboard.config import DashboardConfig
+    def test_known_project_roots_default_empty_list(self):
+        cfg = DashboardConfig()
+        assert cfg.known_project_roots == []
 
+    def test_known_project_roots_is_list_not_tuple(self):
+        cfg = DashboardConfig()
+        assert isinstance(cfg.known_project_roots, list)
+
+    def test_config_derived_paths(self):
         cfg = DashboardConfig()
         root = cfg.project_root
         assert (
@@ -42,8 +46,6 @@ class TestConfigDefaults:
 
 class TestConfigEnvOverrides:
     def test_env_overrides(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_HOST', '0.0.0.0')
         monkeypatch.setenv('DASHBOARD_PORT', '9090')
         monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', '/tmp/test')
@@ -56,36 +58,68 @@ class TestConfigEnvOverrides:
         assert cfg.fused_memory_urls == list(DEFAULT_FUSED_MEMORY_URLS)
 
     def test_fused_memory_urls_comma_separated(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_FUSED_MEMORY_URLS', 'http://a:1, http://b:2 ')
         cfg = DashboardConfig.from_env()
         assert cfg.fused_memory_urls == ['http://a:1', 'http://b:2']
 
     def test_fused_memory_urls_single(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_FUSED_MEMORY_URLS', 'http://localhost:9000')
         cfg = DashboardConfig.from_env()
         assert cfg.fused_memory_urls == ['http://localhost:9000']
 
     def test_fused_memory_urls_empty_string(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_FUSED_MEMORY_URLS', '')
         cfg = DashboardConfig.from_env()
         assert cfg.fused_memory_urls == []
 
     def test_fused_memory_urls_extra_commas(self, monkeypatch):
-        from dashboard.config import DashboardConfig
-
         monkeypatch.setenv('DASHBOARD_FUSED_MEMORY_URLS', ',http://a:1,,http://b:2,')
         cfg = DashboardConfig.from_env()
         assert cfg.fused_memory_urls == ['http://a:1', 'http://b:2']
 
-    def test_env_derived_paths_update(self, monkeypatch):
+    def test_known_project_roots_single(self, monkeypatch):
+        monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', '/home/leo/src/reify')
+        cfg = DashboardConfig.from_env()
+        assert cfg.known_project_roots == [Path('/home/leo/src/reify')]
+
+    def test_known_project_roots_comma_separated(self, monkeypatch):
+        monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', '/a,/b')
+        cfg = DashboardConfig.from_env()
+        assert cfg.known_project_roots == [Path('/a'), Path('/b')]
+
+    def test_known_project_roots_extra_commas_and_whitespace(self, monkeypatch):
+        monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', ' ,/a, , /b , ')
+        cfg = DashboardConfig.from_env()
+        assert cfg.known_project_roots == [Path('/a'), Path('/b')]
+
+    def test_known_project_roots_empty_string(self, monkeypatch):
+        monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', '')
+        cfg = DashboardConfig.from_env()
+        assert cfg.known_project_roots == []
+
+    def test_from_env_resolves_known_project_roots(self, monkeypatch, tmp_path):
+        """from_env() must resolve symlinked paths in DASHBOARD_KNOWN_PROJECT_ROOTS."""
         from dashboard.config import DashboardConfig
 
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', str(link))
+        cfg = DashboardConfig.from_env()
+        # known_project_roots must contain the resolved real path, not the symlink
+        assert cfg.known_project_roots == [real_dir.resolve()]
+
+    def test_known_project_roots_unset_preserves_default(self, monkeypatch):
+        monkeypatch.setenv('DASHBOARD_HOST', '0.0.0.0')
+        # DASHBOARD_KNOWN_PROJECT_ROOTS is intentionally NOT set
+        cfg = DashboardConfig.from_env()
+        assert cfg.known_project_roots == []
+        # verify other overrides still apply
+        assert cfg.host == '0.0.0.0'
+
+    def test_env_derived_paths_update(self, monkeypatch):
         monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', '/tmp/test')
         cfg = DashboardConfig.from_env()
         assert cfg.reconciliation_db == Path(
@@ -224,3 +258,47 @@ class TestStaticFiles:
         resp = client.get('/static/tailwind.css')
         assert resp.status_code == 200
         assert 'text/css' in resp.headers['content-type']
+
+
+class TestPostInit:
+    """Unit tests for DashboardConfig.__post_init__ path normalization invariant.
+
+    These tests exercise the invariant directly on DashboardConfig construction
+    (not through burndown consumer logic), so they remain valid even if consumer
+    code is later refactored.
+    """
+
+    def test_resolves_project_root_symlink(self, tmp_path):
+        """DashboardConfig must resolve a symlinked project_root in __post_init__."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        cfg = DashboardConfig(project_root=link)
+        assert cfg.project_root == real_dir.resolve()
+
+    def test_resolves_known_project_roots_symlinks(self, tmp_path):
+        """DashboardConfig must resolve symlinks in known_project_roots in __post_init__."""
+        real1 = tmp_path / 'real1'
+        real1.mkdir()
+        link1 = tmp_path / 'link1'
+        link1.symlink_to(real1)
+
+        real2 = tmp_path / 'real2'
+        real2.mkdir()
+        link2 = tmp_path / 'link2'
+        link2.symlink_to(real2)
+
+        cfg = DashboardConfig(project_root=tmp_path, known_project_roots=[link1, link2])
+        assert cfg.known_project_roots == [real1.resolve(), real2.resolve()]
+
+    def test_tasks_json_derived_from_resolved_root(self, tmp_path):
+        """tasks_json must be derived from the resolved project_root, not the symlink path."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        cfg = DashboardConfig(project_root=link)
+        assert cfg.tasks_json == real_dir.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'

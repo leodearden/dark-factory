@@ -1,6 +1,22 @@
 .env
 .mcp.json
 
+# ── Runtime data — SQLite DBs, escalation queue, burndown snapshots ──
+# These are live state managed by fused-memory / orchestrator / dashboard.
+# Tracked accidentally; removed from index in commit XXXX.
+data/
+
+# ── Worktrees — orchestrator task branches and eval runs ─────────────
+# Git worktree directories contain .git files pointing to the main repo.
+# Tracking them creates gitlink (160000) entries that conflict with
+# checkout, stash, and merge operations.
+.worktrees/
+.eval-worktrees/
+.claude/worktrees/
+
+# ── Taskmaster — managed by fused-memory MCP ─────────────────────────
+.taskmaster/
+
 # ── .task/ — orchestrator scratch directory ──────────────────────────
 # DO NOT REMOVE THIS LINE.
 #

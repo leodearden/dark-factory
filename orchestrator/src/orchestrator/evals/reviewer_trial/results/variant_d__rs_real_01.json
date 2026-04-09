@@ -1,0 +1,93 @@
+{
+  "variant_name": "variant_d",
+  "diff_id": "rs_real_01",
+  "reviews": {
+    "sonnet_test_analyst": {
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:357-373",
+          "category": "incomplete_assertion",
+          "description": "The `duplicate_template_names_emits_diagnostic` test only checks that *some* diagnostic contains the word \"duplicate\" \u2014 it does not assert the severity is `Error`. The new code explicitly calls `Diagnostic::error(...)`, but the test filter uses `d.message.to_lowercase().contains(\"duplicate\")` without inspecting `d.severity`. A regression that accidentally switches the call to `Diagnostic::warning(...)` would pass this test undetected.",
+          "suggested_fix": "Add an assertion that all matched diagnostics have `severity == reify_types::Severity::Error`, e.g.:\n```rust\nassert!(duplicate_diags.iter().all(|d| d.severity == reify_types::Severity::Error),\n    \"duplicate template name diagnostic must be Error severity\");\n```"
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:357-373",
+          "category": "untested_behavioral_contract",
+          "description": "The comment in the new code says \"Keep the first entry (prev wins) \u2014 don't overwrite\". This is an explicit behavioral choice that affects which sub_components are used to build the adjacency graph when duplicates exist. No test verifies that the first template's edges are used and the second template's edges are ignored for cycle detection. A future refactor swapping \"prev wins\" to \"last wins\" would not be caught.",
+          "suggested_fix": "Add a test where the two duplicate templates have different sub_components: the first references a third template (creating a potential cycle), the second does not. Assert that cycle detection uses the first template's sub_components (i.e., the cycle/is_recursive state matches the first definition's edges)."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:357-373",
+          "category": "missing_side_effect_assertion",
+          "description": "The duplicate-names test does not assert the return value (`cyclic_sccs`) or the `is_recursive` state on the templates after the call. Two non-self-referencing templates with the same name should return an empty `cyclic_sccs` and leave both `is_recursive = false`. Without these checks, the test only validates that a diagnostic was emitted but not that cycle detection stayed correct.",
+          "suggested_fix": "Capture the return value and assert it's empty, and assert `templates[0].is_recursive == false && templates[1].is_recursive == false`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:357-373",
+          "category": "missing_edge_case",
+          "description": "Only the 2-duplicate case is tested. The loop emits a diagnostic for each duplicate past the first, so 3+ templates sharing a name should emit N-1 errors with consecutive index pairs. No test exercises this, meaning an off-by-one in index reporting or a loop termination bug would go unnoticed.",
+          "suggested_fix": "Add a test with three templates named \"A\" (indices 0, 1, 2), assert exactly 2 error diagnostics whose messages reference the correct index pairs (\"0 and 1\", \"0 and 2\")."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/tests/recursive_detection_tests.rs",
+          "category": "missing_integration_test",
+          "description": "There is no integration-level test covering duplicate template names. All duplicate-name coverage lives in the `scc.rs` unit test module. An integration test would verify that the duplicate diagnostic propagates correctly through the full `detect_recursive_structures` \u2192 `check_recursive_termination` pipeline without corrupting cycle detection for the remaining (non-duplicated) templates in the same compile unit.",
+          "suggested_fix": "Add an integration test to `recursive_detection_tests.rs` that compiles a source containing two identically-named structures alongside other valid structures, and asserts: (a) the duplicate error is present, (b) cycle detection still correctly identifies cycles among the non-duplicate structures."
+        }
+      ],
+      "reviewer": "sonnet_test_analyst",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The diff adds duplicate-template-name detection to `detect_recursive_structures`, and a corresponding unit test (`duplicate_template_names_emits_diagnostic`) does exist. However, the test has several coverage gaps: it does not assert the diagnostic's severity (`Error` vs `Warning`), does not validate the critical \"first wins\" behavioral contract for adjacency building, omits assertions on the return value and `is_recursive` side-effects, and only tests exactly two duplicates. There is also no integration-level test confirming that duplicate errors propagate correctly through the full compile pipeline without corrupting cycle detection for unaffected templates. All findings are suggestions; none prevent the feature from working correctly today, but they leave meaningful regression surface uncovered."
+    },
+    "sonnet_bug_hunter": {
+      "reviewer": "sonnet_bug_hunter",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:29",
+          "category": "error_path_correctness",
+          "description": "After emitting a duplicate-name error diagnostic, the function does not early-return \u2014 it continues building the adjacency graph and running Tarjan's SCC algorithm on a partially-constructed `name_to_idx`. Duplicate templates (index `i`) are absent from `name_to_idx`, so they become isolated nodes with no inbound edges in the reference graph. This means `is_recursive` tags and cycle diagnostics produced in this error scenario can be misleading (e.g., a template is falsely not tagged as recursive because the duplicate shadowed a necessary edge). Since compilation will already fail due to the error diagnostic, the downstream `check_recursive_termination` pass operates on unreliable data.",
+          "suggested_fix": "After the name-building loop, check whether any error-severity diagnostics were added and early-return `Vec::new()` (or skip SCC analysis) if so. Alternatively, document explicitly in a comment that the SCC results are best-effort in the presence of duplicate errors and that callers must check for prior errors before acting on the returned cyclic_sccs."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:84",
+          "category": "performance_unnecessary_allocation",
+          "description": "`scc_set: HashSet<usize>` is allocated twice per cyclic SCC: once on line 84 for the source-label loop, and again inside `reconstruct_scc_cycle` at line 205 of the full file. For programs with many large SCCs this doubles the allocation and hashing work in what is already a diagnostics-heavy path.",
+          "suggested_fix": "Build `scc_set` once before the `if is_cycle` block and pass it as a parameter to `reconstruct_scc_cycle`, replacing its internal construction. The function signature would become `fn reconstruct_scc_cycle(scc: &[usize], scc_set: &HashSet<usize>, adjacency: &[Vec<usize>], templates: &[TopologyTemplate]) -> String`."
+        }
+      ],
+      "summary": "The duplicate-name detection change is logically correct and safe: it correctly uses first-wins semantics, emits an error diagnostic for each duplicate, and the duplicated templates become isolated nodes in the reference graph (no inbound edges possible since they are absent from `name_to_idx`), so no spurious cycles or out-of-bounds accesses can result. Two suggestions worth addressing: (1) the function continues through the full SCC analysis even after emitting error diagnostics, producing potentially misleading `is_recursive` flags and cycle warnings that downstream passes (`check_recursive_termination`) will consume despite the graph being incomplete \u2014 an early-return or explicit \"results are best-effort after errors\" contract would make this safer; (2) `scc_set` is constructed twice per cyclic SCC (once in the cycle-detection loop, once inside `reconstruct_scc_cycle`), a minor redundancy that could be eliminated by threading the pre-built set into the reconstruction helper."
+    },
+    "sonnet_design_critic": {
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:21-24",
+          "category": "diagnostic_message_consistency",
+          "description": "The error message `\"duplicate template name '{}': indices {} and {}\"` exposes internal array indices, which are an implementation detail of the SCC pass and not actionable to users. The established style in `lib.rs` for duplicate-name diagnostics is `\"duplicate entity definition '{}'\"` \u2014 name only. Leaking indices is inconsistent with that pattern and creates a confusing user-facing message.",
+          "suggested_fix": "Use `format!(\"duplicate template name '{}'\", t.name)` to match the existing diagnostic style, or if location info is needed attach two `DiagnosticLabel`s (if `TopologyTemplate` gains a name span). Internal indices should not appear in user-facing error text."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:14-29",
+          "category": "structural_separation_of_concerns",
+          "description": "`detect_recursive_structures` now has two distinct responsibilities: (1) validating that template names are unique, and (2) detecting recursive cycles via SCC. Duplicate-name validation is a precondition check; it is architecturally inconsistent to bury it inside an SCC-specific function. The `lib.rs` compilation pipeline already performs duplicate-name checks for entity definitions before reaching this pass. Adding a second, disjoint duplicate check inside the SCC helper fragments the validation logic across files.",
+          "suggested_fix": "Move the duplicate template name check into the compilation pipeline in `lib.rs`, alongside the existing duplicate entity definition checks, before `detect_recursive_structures` is called. `detect_recursive_structures` can then accept the name index as a parameter (or trust the invariant holds) and focus solely on cycle detection. If the check must stay here for defensive correctness, add a comment noting it is a compiler-invariant guard, not a user-input validation."
+        }
+      ],
+      "reviewer": "sonnet_design_critic",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The change is correct and well-motivated \u2014 replacing silent HashMap overwriting with explicit duplicate detection prevents adjacency-graph corruption. However, two design issues surface. First, the error message exposes internal array indices (`indices {} and {}`), which are not actionable for users and are inconsistent with the existing duplicate-name diagnostic style in `lib.rs` that only includes the conflicting name. Second, the change mixes a validation concern (name uniqueness) into a function whose sole responsibility should be cycle detection; `lib.rs` already performs analogous duplicate-name checks for entity definitions earlier in the pipeline, and this new check is architecturally detached from those. Neither issue is blocking \u2014 the logic is sound \u2014 but both affect long-term maintainability and diagnostic UX."
+    }
+  },
+  "total_cost_usd": 0.8408981500000001,
+  "wall_clock_ms": 181922,
+  "errors": []
+}

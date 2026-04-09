@@ -1,0 +1,58 @@
+{
+  "variant_name": "variant_b",
+  "diff_id": "py_missing_await",
+  "reviews": {
+    "opus_bug_hunter": {
+      "reviewer": "opus_bug_hunter",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:94",
+          "category": "missing_await_on_coroutine",
+          "description": "The diff removes `await` from `run_verification(worktree, workflow.config)`, but `run_verification` is declared as `async def` in orchestrator/verify.py. Without `await`, `verify` will be a coroutine object (always truthy), not a `VerifyResult`. The subsequent `verify.passed` access (both in the new logging block and in the EvalMetrics constructor) will raise `AttributeError` because coroutine objects have no `.passed` attribute. This also leaks the coroutine (RuntimeWarning: coroutine was never awaited).",
+          "suggested_fix": "Restore the `await`: `verify = await run_verification(worktree, workflow.config)`"
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:115",
+          "category": "confusing_log_semantics",
+          "description": "The log message labels are `lint=` and `types=` but the values are `not verify.lint_output` and `not verify.type_output` (booleans meaning 'is clean'). A reader seeing `lint=True` in logs might think lint found issues. Consider labeling them `lint_clean=` and `types_clean=` to match the EvalMetrics field names and avoid ambiguity.",
+          "suggested_fix": "Change log format to: `'Metrics for task %s: tests=%s lint_clean=%s types_clean=%s plan=%.1f%%'`"
+        }
+      ],
+      "summary": "The diff contains a critical bug: the `await` keyword was removed from a call to `run_verification`, which is an `async def` function. This means `verify` will hold a coroutine object instead of a `VerifyResult`, causing an `AttributeError` at runtime when any attribute (`.passed`, `.lint_output`, `.type_output`) is accessed. The new logging block and the existing EvalMetrics construction will both fail. The logging addition itself is a good idea for debugging eval failures, but the await must be restored."
+    },
+    "opus_design_critic": {
+      "reviewer": "opus_design_critic",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:94",
+          "category": "async_contract_violation",
+          "description": "run_verification is defined as `async def run_verification(...)` in verify.py, and all other call sites use `await`. This diff removes the `await`, which means `verify` will be assigned a coroutine object instead of a VerifyResult. Subsequent accesses like `verify.passed` will not raise immediately (coroutine objects have arbitrary attributes via __getattr__ in some contexts), but the verification will never actually execute, and the metrics will silently be wrong or raise AttributeError at runtime.",
+          "suggested_fix": "Keep the original `await`: `verify = await run_verification(worktree, workflow.config)`"
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:77",
+          "category": "suppressed_complexity",
+          "description": "Adding `# noqa: C901` suppresses the complexity warning rather than addressing it. The function is growing (this diff adds another 8 lines of logging), and suppressing the linter hides the signal that the function should be decomposed.",
+          "suggested_fix": "Consider extracting verification collection and logging into a helper (e.g., `_collect_verification_metrics`) to reduce cyclomatic complexity instead of suppressing the warning."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:111-119",
+          "category": "logging_design",
+          "description": "The log line uses `not verify.lint_output` and `not verify.type_output` to infer lint/type cleanliness. This duplicates the boolean inversion logic already applied when constructing EvalMetrics a few lines below (`lint_clean=(not verify.lint_output)`). If that logic ever changes (e.g., a dedicated `lint_passed` field on VerifyResult), the log statement will drift out of sync.",
+          "suggested_fix": "Log after constructing EvalMetrics and use its fields directly (e.g., `m.tests_pass`, `m.lint_clean`, `m.typecheck_clean`) to keep a single source of truth, or extract the boolean computations into local variables used by both the log and the dataclass constructor."
+        }
+      ],
+      "summary": "The diff contains one blocking defect: the `await` keyword was removed from the `run_verification` call, but the function is `async def`. This means the coroutine will never execute and the resulting metrics will be silently wrong or crash at runtime. The two remaining suggestions address growing complexity (suppressed via noqa rather than refactored) and duplicated boolean-inversion logic between the new log statement and the EvalMetrics constructor, which creates a maintenance hazard."
+    }
+  },
+  "total_cost_usd": 0.39283495,
+  "wall_clock_ms": 53039,
+  "errors": []
+}

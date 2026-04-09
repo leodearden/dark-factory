@@ -29,7 +29,7 @@
       hx-get="/burndown/partials/charts"
       hx-trigger="load, every 60s, burndown-window-changed"
       hx-vals='js:{window: Alpine.store("burndown").window}'
-      hx-swap="morph:innerHTML"
+      hx-swap="innerHTML"
       hx-sync="this:abort"
       hx-request='{"timeout": 10000}'
       aria-live="polite"

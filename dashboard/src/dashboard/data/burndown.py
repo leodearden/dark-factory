@@ -10,11 +10,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import aiosqlite
 
 from dashboard.config import DashboardConfig
 from dashboard.data.orchestrator import (
+    _read_project_root_from_config,
     _resolve_project_root,
     find_running_orchestrators,
     load_task_tree,
@@ -67,52 +69,77 @@ async def collect_snapshot(
 ) -> None:
     """Discover projects and insert one snapshot row per project."""
     now = datetime.now(UTC).isoformat()
+    # config.project_root is already resolved by DashboardConfig.__post_init__
+    resolved_root = str(config.project_root)
 
-    # Always snapshot the main project.
-    seen_roots: set[str] = {str(config.project_root)}
-    tasks = await asyncio.to_thread(load_task_tree, config.tasks_json)
-    counts = _count_statuses(tasks)
-    await conn.execute(
-        'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        (
-            str(config.project_root),
-            now,
-            counts['pending'],
-            counts['in_progress'],
-            counts['blocked'],
-            counts['deferred'],
-            counts['cancelled'],
-            counts['done'],
-        ),
-    )
+    # Phase 1 — Discovery (sequential, in-memory):
+    # Build the ordered list of (project_id_str, tasks_json_path) tuples to snapshot.
+    # Main project is always first; seen_roots dedup is preserved exactly.
+    # project_root is already canonical (symlink-resolved) so a symlinked
+    # project_root deduplicates correctly against orchestrator /
+    # known_project_roots entries that surface the real path.
+    roots_to_snapshot: list[tuple[str, Path]] = []
+    seen_roots: set[str] = {resolved_root}
+    roots_to_snapshot.append((resolved_root, config.tasks_json))
 
-    # Snapshot any additional projects discovered from running orchestrators.
     orchestrators = await asyncio.to_thread(find_running_orchestrators)
     for proc in orchestrators:
-        root = proc.get('project_root') or proc.get('prd')
-        if not root:
+        if proc.get('prd'):
+            project_root = _resolve_project_root(proc['prd'], config.project_root)
+        elif proc.get('config_path'):
+            resolved = _read_project_root_from_config(proc['config_path'])
+            if resolved is None:
+                continue
+            project_root = resolved
+        else:
             continue
-        project_root = _resolve_project_root(root, config.project_root)
-        root_str = str(project_root)
+        root_str = str(project_root.resolve())
         if root_str in seen_roots:
             continue
         seen_roots.add(root_str)
-        tasks_json = project_root / '.taskmaster' / 'tasks' / 'tasks.json'
-        extra_tasks = await asyncio.to_thread(load_task_tree, tasks_json)
-        extra_counts = _count_statuses(extra_tasks)
+        roots_to_snapshot.append((root_str, project_root / '.taskmaster' / 'tasks' / 'tasks.json'))
+
+    for known_root in config.known_project_roots:
+        # known_root is already resolved by DashboardConfig.__post_init__,
+        # so .resolve() is unnecessary here.  Per-root error isolation for
+        # load failures (PermissionError, etc.) is handled by Phase 2's
+        # return_exceptions=True and Phase 3's exception check below.
+        root_str = str(known_root)
+        if root_str in seen_roots:
+            continue
+        seen_roots.add(root_str)
+        roots_to_snapshot.append((root_str, known_root / '.taskmaster' / 'tasks' / 'tasks.json'))
+
+    # Phase 2 — Parallel read:
+    # All load_task_tree calls are independent (separate files), so run them concurrently.
+    # load_task_tree catches OSError internally and returns [] for unreadable files,
+    # but we pass return_exceptions=True as defense-in-depth so a single failing read
+    # cannot sink the entire cycle and drop all snapshots before commit.
+    all_tasks = await asyncio.gather(
+        *(asyncio.to_thread(load_task_tree, tasks_json) for _, tasks_json in roots_to_snapshot),
+        return_exceptions=True,
+    )
+
+    # Phase 3 — Sequential insert:
+    # aiosqlite serialises writes on a single connection; keep inserts sequential.
+    # Skip any roots whose load raised — log and continue so other snapshots commit.
+    for (root_str, _), tasks in zip(roots_to_snapshot, all_tasks, strict=True):
+        if isinstance(tasks, BaseException):
+            logger.warning('Failed to load tasks for %s', root_str, exc_info=tasks)
+            continue
+        counts = _count_statuses(tasks)
         await conn.execute(
             'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 root_str,
                 now,
-                extra_counts['pending'],
-                extra_counts['in_progress'],
-                extra_counts['blocked'],
-                extra_counts['deferred'],
-                extra_counts['cancelled'],
-                extra_counts['done'],
+                counts['pending'],
+                counts['in_progress'],
+                counts['blocked'],
+                counts['deferred'],
+                counts['cancelled'],
+                counts['done'],
             ),
         )
 

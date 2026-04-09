@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from shared.cost_store import CostStore
+
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_with_cap_retry
 from orchestrator.config import OrchestratorConfig
@@ -23,7 +25,7 @@ from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 if TYPE_CHECKING:
-    from orchestrator.merge_queue import MergeWorker
+    from orchestrator.merge_queue import MergeWorker, SpeculativeMergeWorker
 
 try:
     from escalation.queue import EscalationQueue
@@ -136,17 +138,22 @@ class Harness:
 
         # Merge queue — single worker owns all main-branch advancement
         self._merge_queue: asyncio.Queue = asyncio.Queue()
-        self._merge_worker: MergeWorker | None = None  # lazy import
+        self._merge_worker: MergeWorker | SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
 
         # Event store — created at run start with a generated run_id
         self.event_store: EventStore | None = None
+
+        # Cost store — per-invocation cost tracking (shares runs.db)
+        self.cost_store: CostStore | None = None
 
     async def run(
         self,
         prd_path: Path | None = None,
         dry_run: bool = False,
         delay_secs: int = 0,
+        force_dirty_start: bool = False,
+        retag_modules: bool = False,
     ) -> HarnessReport:
         """Execute the full orchestration pipeline.
 
@@ -160,12 +167,30 @@ class Harness:
         import uuid
 
         run_id = f'run-{uuid.uuid4().hex[:12]}'
+        db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
         try:
-            db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
             self.event_store = EventStore(db_path, run_id)
             self.scheduler.event_store = self.event_store
         except Exception:
             logger.warning('Failed to create event store', exc_info=True)
+
+        # 0b. Create cost store (shares runs.db with EventStore/RunStore)
+        try:
+            self.cost_store = CostStore(db_path)
+            await self.cost_store.open()
+        except Exception:
+            logger.warning('Failed to create cost store', exc_info=True)
+
+        # Wire cost store into usage gate for cap/failover/resume events
+        if self.usage_gate and self.cost_store:
+            self.usage_gate._cost_store = self.cost_store
+            self.usage_gate._project_id = self.config.fused_memory.project_id
+            self.usage_gate._run_id = run_id
+
+        # Wire cost store into review checkpoint for review invocation costs
+        if self.review_checkpoint and self.cost_store:
+            self.review_checkpoint.cost_store = self.cost_store
+            self.review_checkpoint.run_id = run_id
 
         # 1. Start fused-memory HTTP server
         logger.info('Starting fused-memory HTTP server...')
@@ -176,6 +201,19 @@ class Harness:
 
         # 1b2. Start merge worker
         await self._start_merge_worker()
+
+        # 1b3. Refuse to start with dirty working tree (unless forced)
+        if not force_dirty_start:
+            dirty = await self.git_ops.has_dirty_working_tree()
+            if dirty:
+                await self._stop_merge_worker()
+                await self._stop_escalation_server()
+                await self.mcp.stop()
+                raise RuntimeError(
+                    'Refusing to start: project_root has uncommitted tracked changes. '
+                    'Commit or stash your work first, or pass --force-dirty-start to override.\n'
+                    f'Dirty files:\n{dirty}'
+                )
 
         try:
             # 1c. Dismiss stale escalations from prior runs (non-fatal)
@@ -235,7 +273,7 @@ class Harness:
 
             # 2b. Tag tasks with code modules for concurrency locking
             logger.info('Tagging tasks with code modules...')
-            await self._tag_task_modules()
+            await self._tag_task_modules(force=retag_modules)
 
             # 2c. Recover crashed tasks from surviving worktrees
             await self._recover_crashed_tasks()
@@ -366,6 +404,8 @@ class Harness:
                     self.report.paused_for_cap = True
                     self.report.cap_pause_duration_secs = self.usage_gate.total_pause_secs
                 await self.usage_gate.shutdown()
+            if self.cost_store:
+                await self.cost_store.close()
             await self._stop_merge_worker()
             await self._stop_escalation_server()
             await self.mcp.stop()
@@ -423,28 +463,35 @@ class Harness:
         if tagged:
             logger.info(f'Tagged {tagged} tasks with PRD: {resolved_prd}')
 
-    async def _tag_task_modules(self) -> None:
+    async def _tag_task_modules(self, force: bool = False) -> None:
         """Invoke a Claude agent to tag each task with the code modules it touches.
 
         Uses structured output to get a JSON mapping of task_id → [modules],
         then persists via scheduler.update_task().
+
+        When *force* is ``True``, retag all non-done/cancelled tasks even if
+        they already have module metadata.
         """
         tasks = await self.scheduler.get_tasks()
 
-        # Filter to pending tasks that don't already have modules in metadata
-        # (done/cancelled tasks don't need module tags — they won't be executed)
+        skip_statuses = {'done', 'cancelled'}
         untagged = []
         for t in tasks:
-            if t.get('status') not in ('pending', 'in-progress'):
+            if t.get('status') in skip_statuses:
                 continue
-            metadata = t.get('metadata') or {}
-            modules = metadata.get('modules', [])
-            if not modules:
-                untagged.append(t)
+            if not force:
+                metadata = t.get('metadata') or {}
+                modules = metadata.get('modules', [])
+                if modules:
+                    continue
+            untagged.append(t)
 
         if not untagged:
-            logger.info('All tasks already have module tags — skipping')
+            logger.info('No tasks to tag — skipping')
             return
+
+        if force:
+            logger.info(f'Force-retagging {len(untagged)} tasks with module metadata')
 
         # Get top-level directory listing for context
         try:
@@ -684,7 +731,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 esc_q = self._escalation_queue  # capture for closure (narrows type)
 
                 def _make_steward(worktree: Path, config_dir=None, *, _assign=assignment) -> TaskSteward:  # type: ignore[name-defined]
-                    return TaskSteward(
+                    return TaskSteward(  # type: ignore[reportPossiblyUnbound]
                         task_id=_assign.task_id,
                         task=_assign.task,
                         worktree=worktree,
@@ -712,6 +759,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 steward_factory=steward_factory,
                 merge_queue=self._merge_queue,
                 event_store=self.event_store,
+                cost_store=self.cost_store,
             )
 
             if self.event_store:
@@ -897,16 +945,20 @@ Output JSON matching the schema. Every task must appear in the output.
             logger.warning('Failed to save HarnessReport: %s', e)
 
     async def _start_merge_worker(self) -> None:
-        """Start the merge queue worker as a background asyncio task."""
-        from orchestrator.merge_queue import MergeWorker
+        """Start the merge queue worker as a background asyncio task.
 
-        self._merge_worker = MergeWorker(
+        Uses SpeculativeMergeWorker (two-coroutine pipeline) by default.
+        MergeWorker (serial) is preserved but deprecated.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        self._merge_worker = SpeculativeMergeWorker(
             self.git_ops, self._merge_queue, event_store=self.event_store,
         )
         self._merge_worker_task = asyncio.create_task(
             self._merge_worker.run(), name='merge-worker',
         )
-        logger.info('Merge worker started')
+        logger.info('Speculative merge worker started')
 
     async def _stop_merge_worker(self) -> None:
         """Stop the merge worker gracefully."""
@@ -991,3 +1043,12 @@ Output JSON matching the schema. Every task must appear in the output.
         event = self._escalation_events.get(escalation.task_id)
         if event:
             event.set()
+
+        # Un-halt merge queue when a wip_conflict escalation is resolved
+        if (
+            getattr(escalation, 'category', None) == 'wip_conflict'
+            and self._merge_worker is not None
+            and self._merge_worker.is_wip_halted
+        ):
+            self._merge_worker.unhalt_wip()
+            logger.info('Merge queue un-halted: wip_conflict escalation resolved')

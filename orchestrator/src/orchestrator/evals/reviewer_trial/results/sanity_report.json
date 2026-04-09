@@ -1,0 +1,141 @@
+{
+  "summaries": [
+    {
+      "name": "baseline",
+      "description": "Production panel: 5x sonnet specialists",
+      "num_reviewers": 5,
+      "mean_recall": 0.0,
+      "mean_precision": 0.0,
+      "mean_f1": 0.0,
+      "mean_blocking_recall": 0.0,
+      "total_cost_usd": 17.69,
+      "mean_wall_clock_ms": 207094.0,
+      "by_language": {
+        "python": {
+          "recall": 0.0,
+          "precision": 0.0,
+          "f1": 0.0,
+          "blocking_recall": 0.0
+        },
+        "rust": {
+          "recall": 0.0,
+          "precision": 0.0,
+          "f1": 0.0,
+          "blocking_recall": 0.0
+        },
+        "typescript": {
+          "recall": 0.0,
+          "precision": 0.0,
+          "f1": 0.0,
+          "blocking_recall": 0.0
+        }
+      },
+      "by_source": {
+        "synthetic": {
+          "recall": 0.0,
+          "precision": 0.0,
+          "f1": 0.0,
+          "blocking_recall": 0.0
+        },
+        "real_world": {
+          "recall": 0.0,
+          "precision": 0.0,
+          "f1": 0.0,
+          "blocking_recall": 0.0
+        }
+      },
+      "f1_per_dollar": 0.0,
+      "blocking_recall_per_dollar": 0.0
+    }
+  ],
+  "head_to_heads": [],
+  "missed_by_all": [
+    "py_await_1",
+    "py_await_2",
+    "py_copy_1",
+    "py_copy_2",
+    "py_pass_1",
+    "py_pass_2",
+    "py_pass_3",
+    "py_real_cap_1",
+    "py_real_cap_2",
+    "py_real_cap_3",
+    "py_shallow_1",
+    "py_shallow_2",
+    "py_swap_1",
+    "py_swap_2",
+    "rs_copy_1",
+    "rs_copy_2",
+    "rs_err_1",
+    "rs_err_2",
+    "rs_err_3",
+    "rs_iter_1",
+    "rs_iter_2",
+    "rs_iter_3",
+    "rs_iter_4",
+    "rs_leak_1",
+    "rs_leak_2",
+    "rs_leak_3",
+    "rs_obo_1",
+    "rs_obo_2",
+    "rs_obo_3",
+    "rs_real_dup_1",
+    "rs_real_dup_2",
+    "ts_copy_1",
+    "ts_copy_2",
+    "ts_copy_3",
+    "ts_real_goto_1",
+    "ts_real_goto_2",
+    "ts_shallow_1",
+    "ts_shallow_2",
+    "ts_shallow_3"
+  ],
+  "per_diff_scores": {
+    "py_missing_await": {
+      "baseline": 0.0
+    },
+    "py_swapped_args": {
+      "baseline": 0.0
+    },
+    "py_always_passes": {
+      "baseline": 0.0
+    },
+    "py_obvious_copy": {
+      "baseline": 0.0
+    },
+    "py_deep_shallow": {
+      "baseline": 0.0
+    },
+    "py_real_01": {
+      "baseline": 0.0
+    },
+    "rs_off_by_one": {
+      "baseline": 0.0
+    },
+    "rs_leaked_resource": {
+      "baseline": 0.0
+    },
+    "rs_heavy_mutation_copy": {
+      "baseline": 0.0
+    },
+    "rs_iter_vs_recurse": {
+      "baseline": 0.0
+    },
+    "rs_missing_error_prop": {
+      "baseline": 0.0
+    },
+    "rs_real_01": {
+      "baseline": 0.0
+    },
+    "ts_shallow_mutate": {
+      "baseline": 0.0
+    },
+    "ts_obvious_copy": {
+      "baseline": 0.0
+    },
+    "ts_real_01": {
+      "baseline": 0.0
+    }
+  },
+  "total_cost_usd": 17.69
+}

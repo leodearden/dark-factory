@@ -13,6 +13,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+# VllmBridge depends on aiohttp, which is not installed in every consumer
+# environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
+# that never set ANTHROPIC_BASE_URL can still import shared.cli_invoke.
+try:
+    from shared.vllm_bridge import VllmBridge
+except ImportError:  # pragma: no cover - exercised only when aiohttp absent
+    VllmBridge = None  # type: ignore[assignment,misc]
+
 if TYPE_CHECKING:
     from shared.config_dir import TaskConfigDir
     from shared.cost_store import CostStore
@@ -112,6 +120,7 @@ async def invoke_claude_agent(
     timeout_seconds: float | None = None,
     resume_session_id: str | None = None,
     config_dir: Path | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
@@ -121,6 +130,9 @@ async def invoke_claude_agent(
     *resume_session_id*, when set, resumes an existing session via
     ``--resume <id>`` instead of starting a new one.  The system prompt is
     skipped on resume (it was already set in the initial session).
+
+    *env_overrides*, when set, are merged into the subprocess environment.
+    Used to point Claude Code at a vLLM endpoint via ``ANTHROPIC_BASE_URL``.
     """
     return await _invoke_claude(
         prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
@@ -130,6 +142,7 @@ async def invoke_claude_agent(
         permission_mode=permission_mode, effort=effort,
         oauth_token=oauth_token, timeout_seconds=timeout_seconds,
         resume_session_id=resume_session_id, config_dir=config_dir,
+        env_overrides=env_overrides,
     )
 
 
@@ -234,6 +247,44 @@ async def invoke_with_cap_retry(
             await asyncio.sleep(cooldown)
             continue
 
+        # Heuristic safety net: a zero-cost, near-instant, ≤1-turn result
+        # that wasn't caught by pattern matching is almost certainly a cap
+        # hit with an unrecognised message format.  Treat it as a cap hit so
+        # the retry loop can wait / fail over instead of silently returning a
+        # useless "success" to the caller.
+        if (
+            usage_gate
+            and not result.success  # is_error=true → success=False after fix 2
+            and result.cost_usd == 0
+            and result.turns <= 1
+            and result.duration_ms < 5000
+        ):
+            logger.warning(
+                f'{label}: suspicious zero-cost instant exit (turns={result.turns}, '
+                f'duration={result.duration_ms}ms) — treating as cap hit. '
+                f'Output: {result.output[:200]!r}',
+            )
+            usage_gate._handle_cap_detected(
+                f'Heuristic cap: zero-cost instant exit — {result.output[:120]}',
+                None,
+                oauth_token,
+            )
+            consecutive_cap_hits += 1
+            full_cycles = (consecutive_cap_hits - 1) // num_accounts
+            cooldown = min(
+                _CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles),
+                _MAX_CAP_COOLDOWN_SECS,
+            )
+            # Cannot resume a session that never ran
+            invoke_kwargs.pop('resume_session_id', None)
+            invoke_kwargs['prompt'] = original_prompt
+            acct_name = usage_gate.active_account_name
+            logger.warning(
+                f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
+            )
+            await asyncio.sleep(cooldown)
+            continue
+
         # Non-cap-hit failure while resuming → fall back to fresh invocation
         if not result.success and invoke_kwargs.get('resume_session_id'):
             logger.warning(
@@ -291,6 +342,7 @@ async def _invoke_claude(
     timeout_seconds: float | None = None,
     resume_session_id: str | None = None,
     config_dir: Path | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     cmd = ['claude', '--print', '--output-format', 'json']
@@ -337,6 +389,9 @@ async def _invoke_claude(
 
     # Strip ANTHROPIC_API_KEY so `claude` falls back to OAuth
     env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+    # Merge caller-supplied overrides (e.g. ANTHROPIC_BASE_URL for vLLM)
+    if env_overrides:
+        env.update(env_overrides)
     # Multi-account failover: inject per-invocation OAuth token
     if oauth_token:
         env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
@@ -344,12 +399,33 @@ async def _invoke_claude(
     if config_dir:
         env['CLAUDE_CONFIG_DIR'] = str(config_dir)
 
+    # Start a per-invocation vLLM bridge when ANTHROPIC_BASE_URL is set so that
+    # Claude CLI talks to the local bridge (which translates vLLM tool_use format)
+    # rather than the upstream endpoint directly.
+    # NOTE: sentinel must be declared BEFORE the try block so the finally clause
+    # has the variable in scope.  Instantiation and start() happen INSIDE the try
+    # so that if start() raises mid-init (e.g. AppRunner setup succeeds but
+    # TCPSite.start() fails), the finally clause still calls stop() to release
+    # any partially-initialised AppRunner resources.
+    bridge: VllmBridge | None = None
     try:
+        if env_overrides and env_overrides.get('ANTHROPIC_BASE_URL'):
+            if VllmBridge is None:
+                raise RuntimeError(
+                    'ANTHROPIC_BASE_URL is set but aiohttp is not installed; '
+                    'install dark-factory-shared with the vllm extras to use VllmBridge.'
+                )
+            bridge = VllmBridge(upstream_url=env_overrides['ANTHROPIC_BASE_URL'])
+            await bridge.start()
+            env['ANTHROPIC_BASE_URL'] = bridge.url
+
         result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data)
         return _parse_claude_output(result)
     finally:
         for path in temp_files:
             Path(path).unlink(missing_ok=True)
+        if bridge is not None:
+            await bridge.stop()
 
 
 def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
@@ -397,7 +473,10 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
                         parts.append(block)
         output_text = '\n'.join(parts)
 
-    is_success = subtype == 'success' or result.returncode == 0
+    # The CLI may report subtype='success' even when is_error is true (e.g.
+    # usage cap hit).  Trust is_error as an authoritative override.
+    is_error = data.get('is_error', False)
+    is_success = (subtype == 'success' or result.returncode == 0) and not is_error
 
     return AgentResult(
         success=is_success,
@@ -491,7 +570,16 @@ async def _run_subprocess(
     if stderr_text:
         logger.info(f'Agent stderr (last 1000): {stderr_text[-1000:]}')
     logger.info(f'Agent exit code: {proc.returncode}')
-    logger.info(f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout.decode()[:500]}')
+    stdout_text_for_log = stdout.decode()
+    if proc.returncode != 0:
+        # On failure, dump the full stdout so downstream debugging can see
+        # the actual messages array (tool_use blocks, error details) instead
+        # of only the truncated result envelope.
+        logger.info(
+            f'Agent stdout length: {len(stdout)} bytes (full, returncode={proc.returncode}):\n{stdout_text_for_log}'
+        )
+    else:
+        logger.info(f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout_text_for_log[:500]}')
 
     return _SubprocessResult(
         stdout=stdout.decode(),

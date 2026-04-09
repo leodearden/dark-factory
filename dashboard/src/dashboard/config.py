@@ -23,6 +23,18 @@ class DashboardConfig:
     port: int = 8080
     project_root: Path = field(default_factory=lambda: Path('/home/leo/src/dark-factory'))
     fused_memory_urls: list[str] = field(default_factory=lambda: list(DEFAULT_FUSED_MEMORY_URLS))
+    known_project_roots: list[Path] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Normalize all Path fields to their canonical (symlink-resolved) forms.
+
+        This invariant ensures that every construction path — direct kwargs,
+        from_env(), dataclass.replace(), test fixtures — produces a config
+        whose Path fields are already canonicalized.  Consumers never need to
+        call .resolve() on config paths.
+        """
+        self.project_root = self.project_root.resolve()
+        self.known_project_roots = [p.resolve() for p in self.known_project_roots]
 
     @property
     def reconciliation_db(self) -> Path:
@@ -68,4 +80,6 @@ class DashboardConfig:
             kwargs['project_root'] = Path(root)
         if (urls := os.environ.get('DASHBOARD_FUSED_MEMORY_URLS')) is not None:
             kwargs['fused_memory_urls'] = [u.strip() for u in urls.split(',') if u.strip()]
+        if (roots := os.environ.get('DASHBOARD_KNOWN_PROJECT_ROOTS')) is not None:
+            kwargs['known_project_roots'] = [Path(p.strip()) for p in roots.split(',') if p.strip()]
         return cls(**kwargs)

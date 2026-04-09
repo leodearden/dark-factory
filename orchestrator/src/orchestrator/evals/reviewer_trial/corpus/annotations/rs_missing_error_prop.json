@@ -1,0 +1,29 @@
+{
+  "diff_id": "rs_missing_error_prop",
+  "ground_truth": [
+    {
+      "id": "rs_err_1",
+      "location": "crates/reify-syntax/src/ts_parser.rs:1978",
+      "category": "unwrap_instead_of_error_handling",
+      "severity": "blocking",
+      "description": "Changed .unwrap_or(text) to .unwrap(). The original code gracefully handled malformed string nodes (from error recovery) by falling back to the raw text. The .unwrap() will panic on any string that doesn't have matching double quotes — this includes error-recovery nodes, single-quoted strings, and template literals that reach this codepath.",
+      "mutation_type": "missing_error_propagation"
+    },
+    {
+      "id": "rs_err_2",
+      "location": "crates/reify-syntax/src/ts_parser.rs:1987",
+      "category": "unwrap_instead_of_error_handling",
+      "severity": "blocking",
+      "description": "lower_single_quoted_string() uses .unwrap() on the quote-stripping chain. If the tree-sitter node text doesn't have matching single quotes (e.g., unterminated string literal), this will panic. Should use .unwrap_or(text) or return None for graceful degradation.",
+      "mutation_type": "missing_error_propagation"
+    },
+    {
+      "id": "rs_err_3",
+      "location": "crates/reify-syntax/src/ts_parser.rs:1984",
+      "category": "missing_dispatch",
+      "severity": "suggestion",
+      "description": "lower_single_quoted_string() is defined but there's no corresponding case in the lower_expr() match dispatch for single-quoted strings. The function will never be called from the main lowering path.",
+      "mutation_type": "missing_error_propagation"
+    }
+  ]
+}

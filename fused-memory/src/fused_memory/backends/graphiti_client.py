@@ -5,7 +5,7 @@ import contextlib
 import logging
 from collections import Counter
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
@@ -22,6 +22,19 @@ from graphiti_core.nodes import EpisodeType, EpisodicNode
 from fused_memory.config.schema import FusedMemoryConfig
 
 logger = logging.getLogger(__name__)
+
+
+class StaleSummaryResult(NamedTuple):
+    """Structured return type for _detect_stale_summaries_with_edges.
+
+    Inherits from tuple for full backward-compatibility: callers using
+    ``stale, all_edges, total = await self._detect_stale_summaries_with_edges(...)``
+    continue to work unchanged.
+    """
+
+    stale: list[dict]
+    all_edges: dict[str, list[dict]]
+    total_count: int
 
 
 class NodeNotFoundError(Exception):
@@ -437,21 +450,19 @@ class GraphitiBackend:
             'WHERE e.invalid_at IS NULL '
             'RETURN DISTINCT e.uuid, e.fact, e.name'
         )
-        result = await graph.query(cypher, {'uuid': node_uuid})
+        result = await graph.ro_query(cypher, {'uuid': node_uuid})
         return [
-            {
-                'uuid': row[0],
-                'fact': row[1] or '',
-                'name': row[2] or '',
-            }
+            self._edge_dict(row[0], row[1], row[2])
             for row in (result.result_set or [])
         ]
 
     async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[dict]]:
-        """Return all currently-valid RELATES_TO edges, grouped by entity UUID.
+        """Return all currently-valid RELATES_TO edges grouped by entity UUID.
 
-        Issues a single bulk Cypher query rather than one query per entity,
-        eliminating the O(N) round-trips in detect_stale_summaries.
+        Bulk variant of get_valid_edges_for_node that issues a single Cypher query
+        instead of O(N) per-entity round-trips.  The undirected MATCH pattern can
+        produce duplicate rows; RETURN DISTINCT is used defensively, matching the
+        pattern in get_valid_edges_for_node.
 
         Uses ro_query since no writes are performed.
 
@@ -459,9 +470,8 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            Dict keyed by entity UUID; each value is a list of edge dicts
-            with keys: uuid, fact, name.  Same edge shape as
-            get_valid_edges_for_node output.
+            Dict mapping entity UUID → list of edge dicts with keys: uuid, fact, name.
+            fact and name default to empty string when the property is NULL.
         """
         graph = self._graph_for(group_id)
         cypher = (
@@ -473,12 +483,7 @@ class GraphitiBackend:
         grouped: dict[str, list[dict]] = {}
         for row in (result.result_set or []):
             entity_uuid = row[0]
-            edge = {
-                'uuid': row[1],
-                'fact': row[2] or '',
-                'name': row[3] or '',
-            }
-            grouped.setdefault(entity_uuid, []).append(edge)
+            grouped.setdefault(entity_uuid, []).append(self._edge_dict(row[1], row[2], row[3]))
         return grouped
 
     async def bulk_remove_edges(self, uuids: list[str], *, group_id: str) -> int:
@@ -685,6 +690,8 @@ class GraphitiBackend:
         """Delete an Entity node and all remaining relationships.
 
         Validates that the node exists first, then issues DETACH DELETE.
+        Pre-check uses ro_query since it performs no writes; the DETACH DELETE
+        itself uses graph.query.
 
         Args:
             uuid: UUID of the Entity node to delete.
@@ -695,8 +702,8 @@ class GraphitiBackend:
             RuntimeError: if the backend is not initialized.
         """
         graph = self._graph_for(group_id)
-        # Pre-check: verify node exists before deleting
-        check_result = await graph.query(
+        # Pre-check: verify node exists before deleting (read-only)
+        check_result = await graph.ro_query(
             'MATCH (n:Entity {uuid: $uuid}) RETURN n.name, n.summary',
             {'uuid': uuid},
         )
@@ -711,6 +718,8 @@ class GraphitiBackend:
     async def get_node_text(self, uuid: str, *, group_id: str) -> tuple[str, str]:
         """Return (name, summary) for the Entity node with the given UUID.
 
+        Uses ro_query since no writes are performed.
+
         Raises:
             NodeNotFoundError: if no node with that UUID exists.
         """
@@ -719,7 +728,7 @@ class GraphitiBackend:
             'MATCH (n:Entity {uuid: $uuid}) '
             'RETURN n.name, n.summary'
         )
-        result = await graph.query(cypher, {'uuid': uuid})
+        result = await graph.ro_query(cypher, {'uuid': uuid})
         if not result.result_set:
             raise NodeNotFoundError(f'Entity node not found: {uuid}')
         row = result.result_set[0]
@@ -727,6 +736,8 @@ class GraphitiBackend:
 
     async def resolve_entity_by_name(self, name: str, *, group_id: str) -> str:
         """Resolve an entity name to its UUID via an exact Cypher lookup.
+
+        Uses ro_query since no writes are performed.
 
         Args:
             name: Exact name of the Entity node to resolve.
@@ -743,7 +754,7 @@ class GraphitiBackend:
         """
         graph = self._graph_for(group_id)
         cypher = 'MATCH (n:Entity {name: $name}) RETURN n.uuid, n.name'
-        result = await graph.query(cypher, {'name': name})
+        result = await graph.ro_query(cypher, {'name': name})
         rows = result.result_set
         if not rows:
             raise NodeNotFoundError(f'No entity found with name: {name!r}')
@@ -754,7 +765,40 @@ class GraphitiBackend:
             )
         return rows[0][0]
 
-    async def refresh_entity_summary(self, node_uuid: str, *, group_id: str) -> dict:
+    @staticmethod
+    def _edge_dict(uuid: str, fact: str | None, name: str | None) -> dict:
+        """Build a normalised edge dict, coercing NULL fact/name to empty string.
+
+        Args:
+            uuid: Edge UUID.
+            fact: Edge fact text, or None when the property is NULL in the graph.
+            name: Edge name, or None when the property is NULL in the graph.
+
+        Returns:
+            Dict with keys: uuid, fact, name. fact and name default to '' when None.
+        """
+        return {'uuid': uuid, 'fact': fact or '', 'name': name or ''}
+
+    @staticmethod
+    def _canonical_facts(edges: list[dict]) -> list[str]:
+        """Deduplicate edge facts preserving insertion order, skipping missing/falsy values.
+
+        Args:
+            edges: List of edge dicts, each optionally containing a 'fact' key.
+
+        Returns:
+            List of unique non-empty fact strings in their first-seen order.
+        """
+        return list(dict.fromkeys(e['fact'] for e in edges if (e.get('fact') or '').strip()))
+
+    async def refresh_entity_summary(
+        self,
+        node_uuid: str,
+        *,
+        group_id: str,
+        name: str | None = None,
+        old_summary: str | None = None,
+    ) -> dict[str, Any]:
         """Regenerate an Entity node's summary from its currently-valid edges.
 
         Fetches the node's current name and summary, queries all valid
@@ -767,19 +811,29 @@ class GraphitiBackend:
 
         Args:
             node_uuid: UUID of the Entity node to refresh.
+            group_id: Project graph to target.
+            name: Optional entity name (must be paired with old_summary). When
+                both are supplied, get_node_text is skipped — useful when the
+                caller already has this data (e.g. _rebuild_entity_from_edges).
+            old_summary: Optional current summary text (must be paired with name).
 
         Returns:
             Dict with keys: uuid, name, old_summary, new_summary, edge_count.
+
+        Raises:
+            ValueError: if exactly one of name/old_summary is provided.
         """
-        name, old_summary = await self.get_node_text(node_uuid, group_id=group_id)
+        if (name is None) != (old_summary is None):
+            raise ValueError('name and old_summary must both be provided or both omitted')
+        if name is None:
+            name, old_summary = await self.get_node_text(node_uuid, group_id=group_id)
         edges = await self.get_valid_edges_for_node(node_uuid, group_id=group_id)
-        # Deduplicate facts while preserving insertion order
-        facts = list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
+        facts = self._canonical_facts(edges)
         new_summary = '\n'.join(facts)
         await self.update_node_summary(node_uuid, new_summary, group_id=group_id)
         logger.info(
             'refresh_entity_summary: node=%s name=%r edges=%d old_len=%d new_len=%d',
-            node_uuid, name, len(edges), len(old_summary), len(new_summary),
+            node_uuid, name, len(edges), len(old_summary or ''), len(new_summary),
         )
         return {
             'uuid': node_uuid,
@@ -817,8 +871,8 @@ class GraphitiBackend:
 
     async def _detect_stale_summaries_with_edges(
         self, *, group_id: str
-    ) -> tuple[list[dict], dict[str, list[dict]], int]:
-        """Internal: detect stale summaries and return (stale_list, all_edges_dict, total_count).
+    ) -> StaleSummaryResult:
+        """Internal: detect stale summaries and return a StaleSummaryResult.
 
         Shared by detect_stale_summaries (public API) and rebuild_entity_summaries
         to avoid a duplicate bulk edge fetch when both are needed.
@@ -827,8 +881,10 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            Tuple of (stale_list, all_edges_dict, total_entity_count) where
-            all_edges_dict is keyed by entity UUID.
+            StaleSummaryResult with fields:
+              .stale       - list of stale entity dicts
+              .all_edges   - dict[uuid, list[dict]] of valid edges for all entities
+              .total_count - total number of entity nodes scanned
         """
         entities = await self.list_entity_nodes(group_id=group_id)
         all_edges = await self.get_all_valid_edges(group_id=group_id)
@@ -839,8 +895,7 @@ class GraphitiBackend:
                 # Empty summary — not stale by definition
                 continue
             edges = all_edges.get(entity['uuid'], [])
-            # Canonical (deduped) facts
-            valid_facts = list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
+            valid_facts = self._canonical_facts(edges)
             canonical = '\n'.join(valid_facts)
             if summary == canonical:
                 continue  # Already up-to-date
@@ -856,12 +911,13 @@ class GraphitiBackend:
             stale.append({
                 'uuid': entity['uuid'],
                 'name': entity['name'],
+                'summary': summary,
                 'duplicate_count': duplicate_count,
                 'stale_line_count': stale_line_count,
                 'valid_fact_count': len(valid_facts),
                 'summary_line_count': len(summary_lines),
             })
-        return stale, all_edges, len(entities)
+        return StaleSummaryResult(stale=stale, all_edges=all_edges, total_count=len(entities))
 
     async def detect_stale_summaries(self, *, group_id: str) -> list[dict]:
         """Identify Entity nodes whose summary is out of sync with valid edge facts.
@@ -889,28 +945,39 @@ class GraphitiBackend:
             duplicate_count, stale_line_count, valid_fact_count,
             summary_line_count.
         """
-        stale, _, _ = await self._detect_stale_summaries_with_edges(group_id=group_id)
-        return stale
+        result = await self._detect_stale_summaries_with_edges(group_id=group_id)
+        return result.stale
 
     async def _rebuild_entity_from_edges(
-        self, uuid: str, name: str, edges: list[dict], *, group_id: str
-    ) -> dict:
+        self, uuid: str, name: str, edges: list[dict], *, group_id: str,
+        old_summary: str,
+    ) -> dict[str, Any]:
         """Rebuild one Entity node's summary from pre-fetched edges.
 
         Accepts the edges already fetched by the bulk call, avoiding a
         per-entity get_valid_edges_for_node round-trip.
+
+        .. note:: TOCTOU / eventual-consistency risk:
+            The ``edges`` argument is pre-fetched by the caller in a single
+            bulk query.  By the time this method runs (potentially after a
+            concurrency gap), the graph may have changed — new edges added,
+            existing edges invalidated.  Summaries written here therefore
+            reflect a snapshot, not necessarily the current DB state.  This
+            is an accepted trade-off: callers that require stronger consistency
+            should re-fetch edges per entity via ``refresh_entity_summary``.
 
         Args:
             uuid: Entity UUID.
             name: Entity name (for logging / result dict).
             edges: Pre-fetched valid edge dicts (uuid, fact, name).
             group_id: Graph to update.
+            old_summary: Current summary text (caller must supply — avoids
+                per-entity ``get_node_text`` DB round-trip).
 
         Returns:
             Dict with keys: uuid, name, old_summary, new_summary, edge_count.
         """
-        _, old_summary = await self.get_node_text(uuid, group_id=group_id)
-        facts = list(dict.fromkeys(e['fact'] for e in edges if e.get('fact')))
+        facts = self._canonical_facts(edges)
         new_summary = '\n'.join(facts)
         await self.update_node_summary(uuid, new_summary, group_id=group_id)
         logger.info(
@@ -931,7 +998,7 @@ class GraphitiBackend:
         group_id: str,
         force: bool = False,
         dry_run: bool = False,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Batch-rebuild Entity node summaries from their current valid edges.
 
         When ``force=False`` (default), only entities identified by
@@ -957,14 +1024,24 @@ class GraphitiBackend:
             - ``errors``: number of per-entity refresh failures.
             - ``details``: list of per-entity result dicts.
         """
+        # Declare before if/else for explicit scoping — all branches assign these.
+        targets: list[dict] = []
+        all_edges: dict[str, list[dict]] = {}
+        total_entities: int = 0
+
         if force:
             all_entities = await self.list_entity_nodes(group_id=group_id)
-            all_edges = await self.get_all_valid_edges(group_id=group_id)
-            targets = [{'uuid': e['uuid'], 'name': e['name']} for e in all_entities]
+            targets = [{'uuid': e['uuid'], 'name': e['name'], 'old_summary': e['summary']} for e in all_entities]
             total_entities = len(all_entities)
+            # Only fetch edges when we will actually use them (not in dry_run)
+            if not dry_run:
+                all_edges = await self.get_all_valid_edges(group_id=group_id)
         else:
-            stale, all_edges, total_entities = await self._detect_stale_summaries_with_edges(group_id=group_id)
-            targets = [{'uuid': s['uuid'], 'name': s['name']} for s in stale]
+            result = await self._detect_stale_summaries_with_edges(group_id=group_id)
+            stale = result.stale
+            all_edges = result.all_edges
+            total_entities = result.total_count
+            targets = [{'uuid': s['uuid'], 'name': s['name'], 'old_summary': s['summary']} for s in stale]
 
         stale_entities = len(targets)
         rebuilt = 0
@@ -983,15 +1060,31 @@ class GraphitiBackend:
                 async with sem:
                     edges = all_edges.get(t['uuid'], [])
                     return await self._rebuild_entity_from_edges(
-                        t['uuid'], t['name'], edges, group_id=group_id
+                        t['uuid'], t['name'], edges, group_id=group_id,
+                        old_summary=t['old_summary'],
                     )
 
             results = await asyncio.gather(
                 *(_rebuild_one(t) for t in targets), return_exceptions=True
             )
 
+            # Two-tier check — mirrors the convention in MemoryService.get_entity
+            # (memory_service.py:1000-1013).
+            # Pass 1: propagate structured-cancellation signals immediately.
+            # asyncio.gather(return_exceptions=True) captures *all* BaseException
+            # subclasses, including CancelledError (a BaseException but NOT an Exception
+            # in Python 3.8+).  Re-raising here preserves the structured-cancellation
+            # contract and prevents callers from silently ignoring shutdown signals.
+            for r in results:
+                if isinstance(r, BaseException) and not isinstance(r, Exception):
+                    raise r
+
+            # Pass 2: per-entity accumulation.  Using isinstance(r, Exception) instead
+            # of BaseException ensures that only application-level failures (RuntimeError,
+            # etc.) are recorded as error detail entries.  CancelledError is already
+            # handled above.
             for t, r in zip(targets, results, strict=True):
-                if isinstance(r, BaseException):
+                if isinstance(r, Exception):
                     errors += 1
                     logger.error(
                         'rebuild_entity_summaries: failed to rebuild node=%s name=%r: %s',
@@ -1005,6 +1098,7 @@ class GraphitiBackend:
                     })
                 else:
                     rebuilt += 1
+                    assert isinstance(r, dict)
                     details.append({
                         'uuid': t['uuid'],
                         'name': t['name'],
@@ -1047,6 +1141,8 @@ class GraphitiBackend:
     async def get_edge_text(self, uuid: str, *, group_id: str) -> tuple[str, str]:
         """Return (name, fact) for the RELATES_TO edge with the given UUID.
 
+        Uses ro_query since no writes are performed.
+
         Raises:
             EdgeNotFoundError: if no edge with that UUID exists.
         """
@@ -1055,7 +1151,7 @@ class GraphitiBackend:
             'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
             'RETURN e.name, e.fact'
         )
-        result = await graph.query(cypher, {'uuid': uuid})
+        result = await graph.ro_query(cypher, {'uuid': uuid})
         if not result.result_set:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
         row = result.result_set[0]
@@ -1082,10 +1178,12 @@ class GraphitiBackend:
     async def list_indices(self, *, group_id: str) -> list[dict]:
         """Return parsed index records from the graph.
 
+        Uses ro_query since no writes are performed.
+
         Each record is a dict with keys: label, field, type, entity_type.
         """
         graph = self._graph_for(group_id)
-        result = await graph.query('CALL db.indexes()')
+        result = await graph.ro_query('CALL db.indexes()')
         indices = []
         for row in (result.result_set or []):
             indices.append({

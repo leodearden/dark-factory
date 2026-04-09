@@ -1,0 +1,44 @@
+{
+  "variant_name": "variant_a",
+  "diff_id": "py_missing_await",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:94",
+          "category": "runtime_error_unawaited_coroutine",
+          "description": "The `await` was removed from `run_verification(worktree, workflow.config)`, but `run_verification` is an `async def` function (defined in orchestrator/src/orchestrator/verify.py:188). Without `await`, the call returns a coroutine object rather than a `VerifyResult`. The coroutine is truthy, so the subsequent `verify.passed if verify else False` branch will attempt `coroutine.passed`, raising an `AttributeError` at runtime. The new logging block (lines 111-118) will hit the same crash before the `EvalMetrics` constructor is ever reached.",
+          "suggested_fix": "Restore the `await`: `verify = await run_verification(worktree, workflow.config)`. If the intent was to make `run_verification` synchronous, then the function definition in `verify.py` must be changed as well and all other callers (e.g. tests using `asyncio.run()`) updated."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:77",
+          "category": "code_quality_suppressed_warning",
+          "description": "Adding `# noqa: C901` suppresses the cyclomatic-complexity lint for `collect_metrics`. While expedient, the function is already fairly long (~60 lines) and this suppression removes the signal that it may benefit from decomposition in the future.",
+          "suggested_fix": "Consider extracting the verification + logging block and/or the plan-completion calculation into small helper functions to reduce complexity organically, rather than suppressing the lint."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:114-116",
+          "category": "logging_clarity",
+          "description": "The log line prints `not verify.lint_output` (a bool) labeled as `lint=` and `not verify.type_output` labeled as `types=`. Logging the negation of a string-as-bool is correct (matches `lint_clean` / `typecheck_clean` semantics) but may confuse readers of the logs because `True` means 'clean' not 'has output'. Consider labeling them `lint_clean=` and `types_clean=` for self-documenting log output.",
+          "suggested_fix": "Change the format string to: `'Metrics for task %s: tests_pass=%s lint_clean=%s types_clean=%s plan=%.1f%%'`"
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:111-118",
+          "category": "test_coverage",
+          "description": "No tests cover the new logging block. If `verify` is `None` (verification could not run), the log line uses `'N/A'` strings mixed with `%.1f` for `plan_completion`. While this won't crash, it means the log output is untested for both the happy path and the `verify is None` path.",
+          "suggested_fix": "Add a unit test for `collect_metrics` that asserts the expected log messages are emitted (e.g. via `caplog` in pytest) for both successful verification and when verification returns None."
+        }
+      ],
+      "summary": "The diff contains one blocking bug: the removal of `await` from the `run_verification()` call, which is an async function. This will cause `verify` to hold a coroutine object instead of a `VerifyResult`, leading to an `AttributeError` at runtime when `.passed`, `.lint_output`, or `.type_output` is accessed. The new debug logging is a useful addition but will never execute due to this crash. Additionally, the `# noqa: C901` suppression and the slightly ambiguous log labels are minor quality concerns worth addressing."
+    }
+  },
+  "total_cost_usd": 0.30102959999999995,
+  "wall_clock_ms": 74634,
+  "errors": []
+}

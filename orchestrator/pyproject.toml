@@ -21,8 +21,8 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-escalation = { path = "../escalation", editable = true }
-dark-factory-shared = { path = "../shared", editable = true }
+escalation = { workspace = true }
+dark-factory-shared = { workspace = true }
 
 [project.scripts]
 orchestrator = "orchestrator.cli:main"
