@@ -215,6 +215,8 @@ class TestDetectStaleSummaries:
         assert entity['stale_line_count'] == 0
         # No duplicate lines → duplicate_count == 0
         assert entity['duplicate_count'] == 0
+        # 2 edges with facts 'factA' and 'factB' were consulted
+        assert entity['valid_fact_count'] == 2
         # Entity is stale due to order mismatch (summary != canonical), not content issues
 
     @pytest.mark.asyncio
