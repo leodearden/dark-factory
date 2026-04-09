@@ -253,10 +253,14 @@ class TestVllmUrlInjection:
         {cfg.name for cfg in EVAL_CONFIGS} - VLLM_NAMES
     )
 
-    def test_injection_sets_base_url_on_vllm_configs(self, vllm_env_sandbox):
-        """After injecting vllm_url, every vLLM config must have ANTHROPIC_BASE_URL set."""
+    def _inject_vllm_url(self):
+        """Set ANTHROPIC_BASE_URL on every vLLM config's env_overrides."""
         for cfg in VLLM_EVAL_CONFIGS:
             cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
+
+    def test_injection_sets_base_url_on_vllm_configs(self, vllm_env_sandbox):
+        """After injecting vllm_url, every vLLM config must have ANTHROPIC_BASE_URL set."""
+        self._inject_vllm_url()
         for cfg in VLLM_EVAL_CONFIGS:
             assert cfg.env_overrides.get('ANTHROPIC_BASE_URL') == self._VLLM_URL, (
                 f'{cfg.name} missing ANTHROPIC_BASE_URL after injection'
@@ -264,8 +268,7 @@ class TestVllmUrlInjection:
 
     def test_injection_propagates_to_eval_configs_via_shared_references(self, vllm_env_sandbox):
         """Mutating VLLM_EVAL_CONFIGS configs is visible through EVAL_CONFIGS (same objects)."""
-        for cfg in VLLM_EVAL_CONFIGS:
-            cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
+        self._inject_vllm_url()
         # EVAL_CONFIGS spreads the same references, so the mutation must be visible
         eval_names_with_base_url = {
             cfg.name for cfg in EVAL_CONFIGS
@@ -279,8 +282,7 @@ class TestVllmUrlInjection:
 
     def test_cloud_baselines_never_get_base_url(self, vllm_env_sandbox):
         """Cloud baseline configs must not have ANTHROPIC_BASE_URL after vllm injection."""
-        for cfg in VLLM_EVAL_CONFIGS:
-            cfg.env_overrides['ANTHROPIC_BASE_URL'] = self._VLLM_URL
+        self._inject_vllm_url()
         cloud_configs_with_base_url = [
             cfg.name for cfg in EVAL_CONFIGS
             if cfg.name in self._CLOUD_BASELINE_NAMES
