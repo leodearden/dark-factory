@@ -735,7 +735,6 @@ class TestDiscoverOrchestrators:
 
     def test_non_task_worktree_dirs_excluded(self, tmp_path):
         """Non-task directories (e.g. 'tmp-backup') are excluded; plain and 'task-' numeric dirs included."""
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -791,7 +790,6 @@ class TestDiscoverOrchestrators:
 
     def test_same_prd_grouped_into_single_entry(self, tmp_path):
         """Two processes with the same PRD path are merged into one entry with both PIDs."""
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -903,7 +901,6 @@ class TestDiscoverOrchestrators:
         str(project_root.resolve()).  This test confirms the full bare-fallback pipeline
         produces a canonical project_root in the result.
         """
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -940,7 +937,6 @@ class TestDiscoverOrchestrators:
         ancestor.  The grouping dict uses resolved Path objects as keys, so both
         processes map to the same key and appear in a single entry with both PIDs.
         """
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -1090,7 +1086,6 @@ class TestDiscoverOrchestratorsPerProject:
 
     def test_different_projects_get_own_tasks(self, tmp_path):
         """Two orchestrators in different projects each see their own task tree."""
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -1132,7 +1127,6 @@ class TestDiscoverOrchestratorsPerProject:
 
     def test_same_project_prds_merged_into_single_entry(self, tmp_path):
         """Two PRDs in the same project are merged into one entry (grouped by project root)."""
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -1199,7 +1193,6 @@ class TestDiscoverOrchestratorsPerProject:
 
     def test_fallback_to_config_project_root(self, tmp_path):
         """When PRD path has no .taskmaster/ ancestor, falls back to config project_root."""
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -1220,7 +1213,6 @@ class TestDiscoverOrchestratorsPerProject:
 
     def test_project_root_in_result_is_resolved_when_config_root_is_symlink(self, tmp_path):
         """project_root in result dict is canonicalised even when config.project_root is a symlink."""
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
