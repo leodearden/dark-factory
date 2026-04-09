@@ -1,12 +1,20 @@
-"""Shared test fixtures."""
+"""Shared test fixtures and test helper utilities."""
 
 import os
+import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+# Make this file directly importable by test modules via `from conftest import ...`.
+# Needed because the tests/ directory has __init__.py (package layout), so pytest
+# adds fused-memory/ (the parent) to sys.path rather than tests/ itself.
+_tests_dir = os.path.dirname(os.path.abspath(__file__))
+if _tests_dir not in sys.path:
+    sys.path.insert(0, _tests_dir)
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.config.schema import (
@@ -203,3 +211,41 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
             data_dir=str(tmp_path / 'queue'),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# call_args extraction helpers (task-435)
+#
+# Graph query methods (graph.query / graph.ro_query) may be called with the
+# Cypher string and params dict either positionally or as keyword arguments.
+# These two helpers extract the relevant value from a mock call_args object
+# regardless of calling convention, eliminating fragile bare args[N] accesses
+# that throw opaque IndexError when the implementation switches to keyword-passing.
+#
+# Usage in tests:
+#   call_args = graph.ro_query.call_args
+#   cypher = extract_cypher(call_args)   # str
+#   params = extract_params(call_args)   # dict
+# ---------------------------------------------------------------------------
+
+
+def extract_cypher(call_args: Any) -> str:
+    """Return the Cypher query string from a mock call_args object.
+
+    Checks positional args[0] first, then falls back to the 'query' keyword
+    argument. Returns '' if neither is present.
+    """
+    if call_args.args:
+        return call_args.args[0]
+    return call_args.kwargs.get('query', '')
+
+
+def extract_params(call_args: Any) -> dict:
+    """Return the Cypher params dict from a mock call_args object.
+
+    Checks positional args[1] first, then falls back to the 'params' keyword
+    argument. Returns {} if neither is present.
+    """
+    if len(call_args.args) > 1:
+        return call_args.args[1]
+    return call_args.kwargs.get('params', {})
