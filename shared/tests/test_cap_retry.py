@@ -6,6 +6,7 @@ Covers every branch in shared.cli_invoke.invoke_with_cap_retry (lines 136-274).
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
@@ -1125,7 +1126,9 @@ class TestCapRetryDeadline:
             active_account_name='acct',
         )
         result = make_result()
-        monotonic_values = iter([0.0, 4000.0])
+        # itertools.chain+repeat is resilient: first call → 0.0, all subsequent → 4000.0
+        # so future extra monotonic() calls won't exhaust the iterator (unlike iter([...]))
+        monotonic_values = itertools.chain([0.0], itertools.repeat(4000.0))
 
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
@@ -1277,7 +1280,8 @@ class TestCapRetryGuardLogging:
             active_account_name='acct',
         )
         result = make_result()
-        monotonic_values = iter([0.0, 4000.0])
+        # Resilient: first call → 0.0, all subsequent → 4000.0 (never exhausted)
+        monotonic_values = itertools.chain([0.0], itertools.repeat(4000.0))
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
             patch(_SLEEP_PATCH, new_callable=AsyncMock),
