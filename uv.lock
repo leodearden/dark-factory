@@ -681,14 +681,19 @@ name = "dark-factory-shared"
 version = "0.1.0"
 source = { editable = "shared" }
 dependencies = [
-    { name = "aiohttp" },
     { name = "aiosqlite" },
     { name = "pydantic" },
     { name = "pyyaml" },
 ]
 
+[package.optional-dependencies]
+vllm = [
+    { name = "aiohttp" },
+]
+
 [package.dev-dependencies]
 dev = [
+    { name = "aiohttp" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -697,14 +702,16 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiohttp", specifier = ">=3.9" },
+    { name = "aiohttp", marker = "extra == 'vllm'", specifier = ">=3.9" },
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
+provides-extras = ["vllm"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "aiohttp", specifier = ">=3.9" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
     { name = "pytest-cov", specifier = ">=7.1.0" },
