@@ -340,7 +340,7 @@ class TestVllmUrlInjection:
             )
         cloud_with_base_url = [
             name for name in self._CLOUD_BASELINE_NAMES
-            if name in captured_state and 'ANTHROPIC_BASE_URL' in captured_state[name]
+            if 'ANTHROPIC_BASE_URL' in captured_state[name]
         ]
         assert not cloud_with_base_url, (
             f'Cloud baseline configs leaked ANTHROPIC_BASE_URL via CLI path: {cloud_with_base_url}'
