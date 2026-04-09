@@ -927,7 +927,8 @@ class TestDiscoverOrchestrators:
             ]})
         )
 
-        config = DashboardConfig(project_root=tmp_path)
+        (tmp_path / "unrelated").mkdir()
+        config = DashboardConfig(project_root=tmp_path / "unrelated")
 
         # Process A: PRD under the symlink — _resolve_project_root resolves it to real_dir
         prd_via_symlink = str(link_dir / "docs" / "prd.md")
