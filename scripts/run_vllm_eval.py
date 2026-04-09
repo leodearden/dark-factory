@@ -534,7 +534,7 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
     gpu_count = cfg.gpu_count
     container_disk = cfg.container_disk_gb
     hf_model = cfg.env_overrides["MODEL_NAME"]
-    use_volume = not args.no_volume
+    use_volume = args.volume
 
     extra_env = {
         k: cfg.env_overrides[k]
@@ -547,17 +547,20 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
             "MAX_NUM_SEQS",
             "ENFORCE_EAGER",
             "OVERRIDE_GENERATION_CONFIG",
+            "MOE_BACKEND",
+            "VLLM_TEST_FORCE_FP8_MARLIN",
+            "VLLM_USE_FLASHINFER_MOE_FP4",
         )
         if k in cfg.env_overrides
     }
 
     if use_volume:
         volume_id = "obxma9bf1b"
-        datacenter = "US-NC-1"
+        datacenter = args.datacenter or "US-NC-1"  # volume is in US-NC-1
         container_disk = 50
     else:
         volume_id = None
-        datacenter = None
+        datacenter = args.datacenter  # None = any DC
 
     if args.gpu_type:
         gpu_types_to_try = [args.gpu_type]
@@ -1118,11 +1121,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "run_vllm_eval.py run in parallel)."
         ),
     )
-    p.add_argument("--datacenter", default="US-NC-1")
+    p.add_argument("--datacenter", default=None,
+                   help="RunPod datacenter id (default: any available)")
     p.add_argument(
-        "--no-volume",
+        "--volume",
         action="store_true",
-        help="Use baked Docker image instead of volume",
+        help="Attach the shared network volume (locks DC to US-NC-1 unless --datacenter overrides)",
     )
     p.add_argument(
         "--image",
