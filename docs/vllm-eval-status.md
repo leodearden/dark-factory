@@ -1,7 +1,148 @@
 # vLLM Local Model Evaluation — Status Report
 
-**Last updated:** 2026-04-08 12:25 BST
-**Status:** Mid-session — second parallel matrix retry running with longer timeouts (6h orchestrator-internal / 7h subprocess), bigger iteration cap (10 → 20), and the 1× Opus comprehensive reviewer that production switched to overnight (594658fbe3 / 2c26a30bca). nvfp4 KV-cache crash fixed. fp8 retry already cold-started (4 min — RunPod image cache is now warm) and is running tasks with the new code. Preliminary report below distinguishes "would-be-done" from "blocked-by-iter-cap" and surfaces the plan-step protocol mismatch as the next structural problem to solve.
+**Last updated:** 2026-04-08 23:45 BST
+**Status:** Evening session — 404 bug diagnosed and fixed (port collision, `ad501d4cf2`). ε+ζ landed (`065e5e97f6`). False-green guard landed (`c9fa706347`). ζ env-propagation fix landed (`3cd380a079`). Two smoke tests run: reap-172b first-ever successful vLLM startup, reap-139b validated ζ routing through bridge. **New blocker: NULL-byte implementer responses** — vLLM emits `\u0000` pad tokens instead of tool-call content, implementer does zero useful work across all iterations. Judge hits `ServerDisconnectedError` on 3rd turn (likely context overflow). Full matrix blocked until NULL-byte bug diagnosed.
+
+## Update 2026-04-08 evening: smoke tests reveal NULL-byte blocker
+
+### TL;DR
+
+- **404 bug fixed** (`ad501d4cf2`): auto-picked free ports + `ExitOnForwardFailure=yes`. Confirmed working in both smoke tests.
+- **ε+ζ landed** (`065e5e97f6`): composite score no longer multiplied by `plan_completion_pct`; completion judge runs after each iteration.
+- **False-green guard landed** (`c9fa706347`): detects the 404-bug garbage signature (T/T/T, 0 lines, 0 cost, iterations≥cap) and nulls gate fields. 15 unit tests.
+- **ζ env-propagation fix landed** (`3cd380a079`): judge subprocess now inherits `ANTHROPIC_BASE_URL` from `config.env_overrides`, routing through the vLLM bridge instead of hitting Claude Max directly.
+- **reap-172b-nvfp4-gb10-new first successful vLLM startup ever**: pod `zmvlzbvm1juutf` (2× RTX PRO 6000 Blackwell), vLLM healthy in 82s after SSH tunnel, serving `saricles/MiniMax-M2.5-REAP-172B-A10B-NVFP4-GB10`. KV-headroom fix (`0b89050de1`, `max_model_len=80000, gpu_memory_util=0.97`) validated. Run crashed when disk filled (unrelated host issue), result file was 0-byte — deleted.
+- **reap-139b-nvfp4-new ζ smoke completed**: pod `uey7hu3gno85zk` (1× RTX PRO 6000 Blackwell), 61 min total, `judge_invocations=5` (all routed through bridge). But **all 5 judge calls hit `ServerDisconnectedError` on 3rd turn** and all 6 implementer iterations produced NULL-byte `result` fields with 0 lines changed.
+- **NEW BLOCKER: NULL-byte implementer responses.** vLLM returns `\u0000\u0000\u0000...` (thousands of pad tokens) in the `result` field. Implementer reports `success=True cost=$0.36 turns=1` but makes no code changes. Systematic across all 6 iterations. Likely a tool-call parser or detokenizer issue on `lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4` with the `minimax_m2` parser.
+- **NEW BLOCKER: Judge `ServerDisconnectedError`.** Every judge invocation completes 2 bridge turns (200 OK, ~48 KB each) then crashes on the 3rd: `aiohttp.client_exceptions.ServerDisconnectedError` in `vllm_bridge.py:195` → 500 response → `judge: success=False`. Likely context exceeds `max_model_len` after 2 tool-use rounds.
+- **Full matrix retry blocked** until NULL-byte bug diagnosed. Cost saved by not running a blind matrix: ~$15.
+
+### Smoke test #1 — reap-172b-nvfp4-gb10-new × reify_task_12
+
+| Metric | Value |
+|---|---|
+| Pod | `zmvlzbvm1juutf` (2× RTX PRO 6000 Blackwell) |
+| Boot time | Pod created → SSH: 31 min, SSH → vLLM healthy: 82s |
+| Image | `:reap-172b-nvfp4-gb10-baked` (124 GB) |
+| Port | Auto-picked 50125 (404 fix active) |
+| Outcome | Crashed — host disk full mid-run, result file 0-byte |
+| Real cost | ~31 min boot + ~8 min running = ~$2.20 |
+
+**Significant finding:** reap-172b KV-headroom fix works. First time this config's vLLM has ever reached healthy state. Switch to `:latest` + HF download (93 GB weights) would cut boot from ~31 min to ~12 min.
+
+### Smoke test #2 — reap-139b-nvfp4-new × reify_task_12
+
+| Metric | Value |
+|---|---|
+| Pod | `uey7hu3gno85zk` (1× RTX PRO 6000 Blackwell) |
+| Boot time | Pod created → SSH: 14.6 min, SSH → vLLM healthy: 44s |
+| Image | `:latest` + HF download |
+| Port | Auto-picked 54677 |
+| Outcome | `timeout` at 60 min |
+| Tests/Lint/Type | True/True/True (against unchanged baseline) |
+| lines_changed / files_changed | 0 / 0 |
+| iterations | 6 |
+| judge_invocations | 5 (all routed through bridge ✓) |
+| judge_early_exits | 0 (all failed with ServerDisconnectedError) |
+| cost_usd | $2.18 (phantom sonnet-equivalent); real: ~$1.72 |
+
+**Pattern per iteration (all 6 identical):**
+1. Implementer invocation: 2 bridge turns (200 OK, ~48 KB response body), `success=True cost=$0.36 turns=1`, result is `\u0000\u0000...` pad tokens
+2. Judge invocation: 2 bridge turns (200 OK), 3rd turn → `ServerDisconnectedError` → `500 0` → `judge: success=False`
+3. Loop continues
+
+### The NULL-byte bug — brief
+
+vLLM serves `lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4` with `--tool-call-parser minimax_m2`. The model responds with a ~48 KB body that the bridge proxies successfully (200 OK), but the content is thousands of pad tokens (`\u0000`) rather than a tool-call or code. The Claude CLI treats it as a successful turn (`is_error: false, subtype: success`) but there's no tool execution — `turns=1, cost=$0.36`. The implementer exits having done nothing.
+
+**Not the 404 bug** — that was zero cost, instant failure, config-systemic. This is real inference time (~4 min/iteration), real cost, model-level failure. Different class entirely.
+
+### Cost (evening session)
+
+| Item | Cost |
+|---|---|
+| reap-172b smoke pod (31 min boot + 8 min running) | ~$2.20 |
+| reap-139b smoke pod (15 min boot + 61 min running) | ~$2.15 |
+| **Evening subtotal** | **~$4.35** |
+| **Session total (morning + afternoon + evening)** | **~$46** |
+| **Remaining RunPod credit (est.)** | **~$28** |
+
+### Next-session unblock plan (5 steps)
+
+1. **Diagnose the NULL-byte bug** on a live pod. SSH in, `curl http://localhost:8000/v1/messages` with a minimal tool-use prompt, inspect raw response. If pad tokens are at the protocol level → vLLM detokenizer/parser. If only in CLI `result` field → bridge or CLI. Budget: ≤ $2 pod time.
+2. **If parser issue**, try alternative `--tool-call-parser` values (`mistral`, `hermes`, or no parser). This was the exact 2026-04-06 root cause class — cheap to re-test.
+3. **Test if reap-139b-specific** by smoke-testing `minimax-m25-fp8-new` × `reify_task_12`. The afternoon data shows minimax-fp8 does real work on other tasks but hit the 404 bug on reify_task_12. If minimax-fp8 also NULL-bytes → reify-prompt-specific. If it works → reap-139b model/parser issue.
+4. **Address judge context overflow** separately — reduce judge prompt size, or bump `max_model_len` to 131072 if KV cache can afford it.
+5. **Extend false-green guard** for the "implementer spun but did nothing" signature (`iterations > 0 AND lines_changed == 0 AND files_changed == 0 AND cost_usd > 0`). Different class from the 404 guard.
+
+---
+
+## Update 2026-04-08 afternoon: matrix retry #3 complete, 404 bug surfaced
+
+### TL;DR
+
+- **Only 1 of 5 configs in matrix retry #3 produced usable data.** `minimax-m25-fp8-new` finished all 5 tasks with real implementer work on 4 of them. The other 4 configs either hit the 404 bug systemically (3 configs → 9 quarantined result files) or failed to start (reap-172b's vLLM never came healthy in 120 min).
+- **New bug: `/v1/messages?beta=true` 404.** Claude CLI invocations against the vLLM endpoint return 404 immediately on every iteration. Runs for 20 iterations, makes 0 code changes, verify passes against the unchanged clean baseline, result JSON records **false** `tests_pass=True lint_clean=True typecheck_clean=True` with `$0 cost, 0 lines, 20 iters`. Hit 3 entire configs (reap-139b, minimax-nvfp4, qwen3-fp8) AND intermittently hit `minimax-m25-fp8-new` on `reify_task_12` only — after the other 4 tasks on the same pod worked with real work. **Intermittency rules out config-systemic hypotheses.** See `docs/plan-vllm-404-bug-diagnosis.md`.
+- **9 garbage result files quarantined** to `orchestrator/src/orchestrator/evals/results/_quarantine_404_bug/` (with README) before the ε scoring fix rescores them to `composite_score=1.0` and contaminates the rereview corpus. Signature: `tests_pass=True AND lines_changed=0 AND files_changed=0 AND iterations≥20 AND cost_usd=0.0`. The 6 matching `df_task_12`/`df_task_13` files are score-safe because their baselines naturally have `tests=False`.
+- **`reap-172b-nvfp4-gb10-new` config patched** — commit `0b89050de1` adds `max_model_len=80000, gpu_memory_util=0.97` mirroring the `minimax-m25-nvfp4-new` fix from this morning (`e8367f8967`). Same vLLM 0.19 CUDA-graph-profiler budget class of failure — silent worker-init hang with default GMU+context on 2× RTX PRO 6000.
+- **Pod leak recovered.** `r64fywcfjemmzx` (reap-172b) leaked ~3h50m after DNS resolution failed on the launcher's `finally: terminate_pod` at 12:52 (matrix log printed "MANUAL CLEANUP NEEDED"). Burned ~$13 at $3.38/h × 2 GPUs. Terminated via runpod-toolkit `list_pods()`+`terminate_pod()` at 14:33 BST. The runpod retry work (in a parallel session) would have fixed the root cause — the terminate attempt should have retried on DNS gaierror.
+- **3 plan prompt files written** for delegated work: `docs/plan-scoring-and-judge.md` (ε+ζ, in-progress parallel session, visible as uncommitted `M orchestrator/src/orchestrator/evals/metrics.py`), `docs/plan-runpod-retry.md` (done parallel session using the already-present `backoff` v2.2.1 dep), `docs/plan-vllm-404-bug-diagnosis.md` (not yet started).
+- **rereview tool landed** (commit `b037e871d2`) — waiting for ε + 404 fix before running against the corpus.
+
+### Matrix retry #3 — final results
+
+All 5 pods completed or terminated. Useful data only from `minimax-m25-fp8-new`.
+
+| Config | Outcome | Real work? |
+|---|---|---|
+| `minimax-m25-fp8-new` | 5/5 completed (12:19–13:53 BST) | ✅ 4 of 5 real: df_task_12 T/T/T blocked ($10.94, 18m), df_task_13 T/T/T blocked ($21.46, 35m), reify_task_27 blocked (22m), df_task_18 F/F/F after real 2695-line / 15-file change ($10.69, 71m). ❌ reify_task_12 hit 404 bug (0 lines / 139 turns / $29.30 / 90m / F/F/T — score-safe under ε) |
+| `reap-139b-nvfp4-new` | 5/5 in ~9m each, $0.00 total | ❌ All zero-work (404 bug systemic). 3 of 5 results quarantined, 2 protected by tests=False baseline |
+| `minimax-m25-nvfp4-new` | 5/5 in ~7m each, $0.00 total | ❌ All zero-work (404 bug systemic). 3 quarantined, 2 protected |
+| `qwen3-coder-next-fp8-new` | 5/5 in ~9m each, $0.00 total | ❌ All zero-work (404 bug systemic). 3 quarantined, 2 protected |
+| `reap-172b-nvfp4-gb10-new` | FATAL at 12:52 — vLLM never healthy in 120m | ❌ Silent startup hang; config fix landed in `0b89050de1` |
+
+### The `/v1/messages?beta=true` 404 bug — brief
+
+Symptom pattern (from per-iteration eval logs in `/var/tmp/dark-factory-evals/`):
+
+```
+[shared.cli_invoke] Command: claude --print --output-format json --model sonnet ...
+[aiohttp.access] 127.0.0.1 ... "HEAD / HTTP/1.1" 404 131 "-" "Bun/1.3.11"
+[aiohttp.access] 127.0.0.1 ... "POST /v1/messages?beta=true HTTP/1.1" 404 307 "-" "claude-cli/2.1.96"
+[shared.cli_invoke] Agent exit code: 1
+{"result":"There's an issue with the selected model (<upstream HF model name>).
+ It may not exist or you may not have access to it.",...}
+```
+
+Two mysteries:
+1. **Command says `--model sonnet` but the CLI error references the upstream HF model name** (e.g. `lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4`). Possibly from a `/v1/models` fallback query when `sonnet` resolution fails against the upstream.
+2. **The bridge (`shared/src/shared/vllm_bridge.py`) is running and logging the request, returning 404 with a 307-byte body.** Not a bridge crash, not a tunnel issue. Route handler isn't matching `/v1/messages?beta=true` — or the bridge is forwarding and the upstream is rejecting.
+
+**The fp8 intermittent case is the diagnostic jackpot.** Log at
+`/var/tmp/dark-factory-evals/eval-minimax-m25-fp8-new-reify_task_12-20260408-121929-b7b5f2.log`
+— 4 tasks on the same pod with real implementer work, then a transition to 20 straight failed iterations on the 5th task. Same pod, same bridge binary. The transition point is the key to diagnosis.
+
+Full investigation plan with ranked hypotheses and reproduction steps: `docs/plan-vllm-404-bug-diagnosis.md`. Budget ceiling: ≤ $3 pod time, ≤ 2h dev time.
+
+### Cost (afternoon)
+
+| Item | Cost |
+|---|---|
+| Matrix retry #3 pod spend (5 configs) | ~$8 |
+| **reap-172b pod leak (3h50m × $3.38/h)** | **~$13** |
+| **Afternoon subtotal** | **~$21** |
+| **Session total (morning + afternoon)** | **~$42** |
+| **Remaining RunPod credit (est.)** | **~$32** |
+
+### Revised next-session priority order (status as of 2026-04-08 evening)
+
+1. ~~**Diagnose the 404 bug**~~ ✅ DONE — root cause was port collision (`ad501d4cf2`). See `docs/plan-vllm-404-bug-fix.md`.
+2. ~~**Finish ε+ζ**~~ ✅ DONE — `065e5e97f6`. ζ env-propagation fix also landed (`3cd380a079`).
+3. ~~**Apply the false-green guard**~~ ✅ DONE — `c9fa706347`. 15 unit tests.
+4. **Rerun the matrix** — BLOCKED on NULL-byte implementer bug (see evening update above). Unblock plan: 5 steps in evening session notes.
+5. **Run rereview tool** (landed `b037e871d2`) — blocked on #4.
+
+---
 
 ## Update 2026-04-08 morning: long timeouts + opus eval reviewer + nvfp4 fix
 
