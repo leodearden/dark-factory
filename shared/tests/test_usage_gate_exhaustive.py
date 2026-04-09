@@ -277,6 +277,38 @@ class TestCapDetectionPatterns:
 
 
 # =========================================================================
+# TestNearCapStateDistinction
+# =========================================================================
+
+
+class TestNearCapStateDistinction:
+    """Behavioral tests that distinguish NEAR_CAP from CAP_HIT state transitions.
+
+    Step 4 (spec-first): test_near_cap_does_not_set_capped_true FAILS until
+    step-5 implementation adds _handle_near_cap_warning and near_cap field.
+    """
+
+    def test_near_cap_does_not_set_capped_true(self):
+        """NEAR_CAP message must NOT set acct.capped=True; must set acct.near_cap=True."""
+        gate = make_gate(['a'])
+        msg = "You're now using extra compute credits. Your plan resets in 4h."
+        result = gate.detect_cap_hit('', msg)
+        acct = gate._accounts[0]
+        assert result is True               # detection must still return True
+        assert acct.capped is False         # account is NOT blocked
+        assert acct.near_cap is True        # but the near-cap warning flag is set
+
+    def test_cap_hit_still_sets_capped_true(self):
+        """CAP_HIT message must still set acct.capped=True (existing behavior preserved)."""
+        gate = make_gate(['a'])
+        msg = "You've hit your usage limit. Your plan resets in 3h."
+        result = gate.detect_cap_hit('', msg)
+        acct = gate._accounts[0]
+        assert result is True
+        assert acct.capped is True
+
+
+# =========================================================================
 # TestResetTimeParsing
 # =========================================================================
 
