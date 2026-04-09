@@ -16,8 +16,8 @@ _tests_dir = os.path.dirname(os.path.abspath(__file__))
 if _tests_dir not in sys.path:
     sys.path.insert(0, _tests_dir)
 
-from fused_memory.backends.graphiti_client import GraphitiBackend
-from fused_memory.config.schema import (
+from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: E402
+from fused_memory.config.schema import (  # noqa: E402
     EmbedderConfig,
     EmbedderProvidersConfig,
     FusedMemoryConfig,
