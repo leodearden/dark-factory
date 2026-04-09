@@ -565,6 +565,7 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
             "TOOL_CALL_PARSER",
             "QUANTIZATION",
             "TP_SIZE",
+            "PP_SIZE",
             "MAX_MODEL_LEN",
             "GPU_MEMORY_UTIL",
             "MAX_NUM_SEQS",

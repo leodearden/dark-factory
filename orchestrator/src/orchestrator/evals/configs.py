@@ -35,6 +35,7 @@ def _vllm_config(
     gpu_memory_util: float | None = None,
     enforce_eager: bool = False,
     override_generation_config: str | None = None,
+    pp_size: int | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> EvalConfig:
     """Build an EvalConfig that routes through a vLLM-compatible endpoint."""
@@ -62,6 +63,8 @@ def _vllm_config(
         # lukealonso REAP NVFP4 has eos_token_id=2 from ModelOpt but
         # the real EOS is 200020. Without this, the model never stops.
         env['OVERRIDE_GENERATION_CONFIG'] = override_generation_config
+    if pp_size and pp_size > 1:
+        env['PP_SIZE'] = str(pp_size)
     if extra_env:
         env.update(extra_env)
     return EvalConfig(
@@ -165,6 +168,17 @@ VLLM_EVAL_CONFIGS = [
         gpu_type=H200, gpu_count=1, container_disk_gb=100,
         max_model_len=80000, gpu_memory_util=0.95,
         tool_call_parser='minimax_m2'),
+    # REAP-139B AWQ on 2× RTX PRO 6000 via pipeline parallelism (PP=2).
+    # SM120 TP=2 hangs at NCCL all-reduce init (observed with both AWQ and
+    # qwen3). PP splits by layers instead — each GPU gets ~39 GB of AWQ
+    # weights, fitting in 96 GB with room for KV cache. TP stays at 1.
+    _vllm_config('reap-139b-awq-pp2-rtxpro',
+        hf_model='cyankiwi/MiniMax-M2.5-REAP-139B-A10B-AWQ-4bit',
+        image='leosiriusdawn/runpod-vllm:pp-test',
+        gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=100,
+        max_model_len=80000, gpu_memory_util=0.95,
+        tool_call_parser='minimax_m2',
+        pp_size=2),
     # REAP-139B NVFP4 GB10 (saricles): 75 GB on disk, compressed-tensors
     # format via llm-compressor. Different quant than lukealonso — quantizes
     # ALL Linear layers including self_attn. Originally built for DGX Spark
