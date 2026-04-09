@@ -331,6 +331,30 @@ async def invoke_with_cap_retry(
             logger.warning(
                 f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
             )
+
+            # Guard: raise before sleeping if retry limit or deadline exceeded
+            elapsed = time.monotonic() - retry_start
+            if max_cap_retries is not None and consecutive_cap_hits >= max_cap_retries:
+                logger.error(
+                    f'{label}: giving up after {consecutive_cap_hits} consecutive heuristic cap hits '
+                    f'({elapsed:.1f}s elapsed, {num_accounts} account(s))',
+                )
+                raise AllAccountsCappedException(
+                    retries=consecutive_cap_hits,
+                    elapsed_secs=elapsed,
+                    label=label,
+                )
+            if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
+                logger.error(
+                    f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
+                    f'(heuristic branch, {consecutive_cap_hits} retries, {num_accounts} account(s))',
+                )
+                raise AllAccountsCappedException(
+                    retries=consecutive_cap_hits,
+                    elapsed_secs=elapsed,
+                    label=label,
+                )
+
             await asyncio.sleep(cooldown)
             continue
 
