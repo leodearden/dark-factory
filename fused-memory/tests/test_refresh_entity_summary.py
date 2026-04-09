@@ -217,7 +217,7 @@ class TestEdgeDict:
     def test_none_name_coerced_to_empty_string(self):
         """None name is coerced to '' in the returned dict."""
         result = GraphitiBackend._edge_dict('e-1', 'Alice knows Bob', None)
-        assert result['name'] == ''
+        assert result == {'uuid': 'e-1', 'fact': 'Alice knows Bob', 'name': ''}
 
     def test_preserves_non_none_values(self):
         """Non-None fact and name values are kept as-is."""
