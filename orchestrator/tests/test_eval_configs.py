@@ -304,7 +304,7 @@ class TestVllmUrlInjection:
         captured_state: dict[str, dict] = {}
 
         def stub_run_matrix(base_config, **kwargs):
-            for cfg in VLLM_EVAL_CONFIGS:
+            for cfg in EVAL_CONFIGS:
                 captured_state[cfg.name] = dict(cfg.env_overrides)
 
         monkeypatch.setattr('orchestrator.cli._run_matrix_cmd', stub_run_matrix)
@@ -314,13 +314,26 @@ class TestVllmUrlInjection:
         result = runner.invoke(main, ['eval', '--matrix', '--vllm-url', self._VLLM_URL])
 
         assert result.exit_code == 0, (
-            f'CLI exited with code {result.exit_code}.\nOutput: {result.output}'
+            f'CLI exited {result.exit_code}.\nOutput: {result.output}\nException: {result.exception}'
         )
         vllm_names = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
-        assert captured_state.keys() == vllm_names, (
-            f'Captured state keys {set(captured_state.keys())} != vLLM names {vllm_names}'
+        assert set(captured_state.keys()) >= vllm_names, (
+            f'vLLM names missing from captured state: {vllm_names - set(captured_state.keys())}'
         )
-        for name, overrides in captured_state.items():
-            assert overrides.get('ANTHROPIC_BASE_URL') == self._VLLM_URL, (
+        all_eval_names = {cfg.name for cfg in EVAL_CONFIGS}
+        assert set(captured_state.keys()) == all_eval_names, (
+            f'Captured state keys do not match all EVAL_CONFIGS names.\n'
+            f'  Extra:   {set(captured_state.keys()) - all_eval_names}\n'
+            f'  Missing: {all_eval_names - set(captured_state.keys())}'
+        )
+        for name in vllm_names:
+            assert captured_state[name].get('ANTHROPIC_BASE_URL') == self._VLLM_URL, (
                 f'{name} missing ANTHROPIC_BASE_URL in captured env_overrides'
             )
+        cloud_with_base_url = [
+            name for name in self._CLOUD_BASELINE_NAMES
+            if name in captured_state and 'ANTHROPIC_BASE_URL' in captured_state[name]
+        ]
+        assert not cloud_with_base_url, (
+            f'Cloud baseline configs leaked ANTHROPIC_BASE_URL via CLI path: {cloud_with_base_url}'
+        )
