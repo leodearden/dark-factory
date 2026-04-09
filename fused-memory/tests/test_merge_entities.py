@@ -97,10 +97,8 @@ class TestDeleteEntityNode:
     async def test_executes_detach_delete(self, mock_config, make_backend, make_graph_mock):
         """Issues DETACH DELETE Cypher for the given UUID."""
         backend = make_backend(mock_config)
-        graph = MagicMock()
         # Pre-check uses ro_query; DETACH DELETE uses query
-        graph.ro_query = AsyncMock(return_value=MagicMock(result_set=[['NodeName', 'some summary']]))
-        graph.query = AsyncMock(return_value=MagicMock(result_set=[]))
+        graph = make_graph_mock(ro_rows=[['NodeName', 'some summary']], q_rows=[])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.delete_entity_node('node-uuid-1', group_id='test')
         assert graph.ro_query.await_count == 1
