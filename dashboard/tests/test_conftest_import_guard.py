@@ -54,6 +54,27 @@ def _first_non_stdlib_import_line(tree: ast.Module) -> int | None:
     return None
 
 
+def test_relative_import_detected_as_non_stdlib() -> None:
+    """from . import helpers — level>0, module=None — must be returned as non-stdlib."""
+    source = "import os\nfrom . import helpers\n"
+    tree = ast.parse(source)
+    assert _first_non_stdlib_import_line(tree) == 2
+
+
+def test_dotted_relative_import_detected_as_non_stdlib() -> None:
+    """from .utils import helper — level=1, module='utils' — must be returned as non-stdlib."""
+    source = "import sys\nfrom .utils import helper\n"
+    tree = ast.parse(source)
+    assert _first_non_stdlib_import_line(tree) == 2
+
+
+def test_double_dot_relative_import_detected() -> None:
+    """from .. import config — level=2, module=None — must be returned as non-stdlib."""
+    source = "from .. import config\n"
+    tree = ast.parse(source)
+    assert _first_non_stdlib_import_line(tree) == 1
+
+
 def test_syspath_insert_precedes_non_stdlib_imports() -> None:
     """sys.path.insert() in conftest.py must appear before any non-stdlib import.
 
