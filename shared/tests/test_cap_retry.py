@@ -1147,6 +1147,42 @@ class TestCapRetryDeadline:
         assert exc.label == 'deadline-task'
         assert exc.retries == 1
 
+    async def test_deadline_fires_before_max_retries(self):
+        """Deadline fires after 1 cap hit even when max_cap_retries=100 is far from exhausted.
+
+        The deadline guard (cli_invoke.py:285) is checked independently from the
+        max_cap_retries guard (cli_invoke.py:275), so whichever limit triggers first
+        wins.  This test covers the interaction where deadline fires first.
+        """
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 10),
+            detect_cap_hit=MagicMock(return_value=True),
+            active_account_name='acct',
+        )
+        result = make_result()
+        # First call returns 0.0 (retry_start), all subsequent calls return 15.0
+        # so elapsed == 15.0 > cap_retry_deadline_secs=10.0 after the very first hit
+        monotonic_values = itertools.chain([0.0], itertools.repeat(15.0))
+
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', side_effect=monotonic_values),
+            pytest.raises(AllAccountsCappedException) as exc_info,
+        ):
+            await invoke_with_cap_retry(
+                gate, 'deadline-first-task',
+                cap_retry_deadline_secs=10.0,
+                max_cap_retries=100,
+                prompt='hi',
+            )
+        exc = exc_info.value
+        # Deadline fires after 1 retry, not after 100
+        assert exc.retries == 1, f'Expected 1 retry (deadline), got {exc.retries}'
+        assert exc.elapsed_secs > 10.0, f'elapsed_secs should exceed deadline, got {exc.elapsed_secs}'
+        assert exc.label == 'deadline-first-task'
+
     async def test_no_exception_when_within_deadline(self):
         """When elapsed time is well under deadline, no exception is raised."""
         gate = _mock_gate(
