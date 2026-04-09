@@ -1136,3 +1136,22 @@ class TestRunPanelAlpineComponent:
         # Ensure delete this.dataset.loading appears near the after-request handler
         segment = html[after_req_idx:after_req_idx + 200]
         assert 'delete this.dataset.loading' in segment
+
+
+class TestDetailRowJournalGuard:
+    """Tests that the detail <tr> row is guarded by journal_entry_count > 0."""
+
+    def test_detail_row_not_emitted_when_journal_count_zero(self, client):
+        """When journal_entry_count=0 the detail <tr x-show="open"> must not be emitted."""
+        runs_zero = [{**MOCK_RUNS[0], 'journal_entry_count': 0}]
+        with _patch_recon_data(runs=runs_zero):
+            html = client.get('/partials/recon').text
+        assert 'x-show="open"' not in html
+        assert 'hx-get="/partials/recon/run/' not in html
+
+    def test_no_orphaned_x_cloak_when_journal_count_zero(self, client):
+        """When journal_entry_count=0 there must be no x-cloak on orphaned detail row."""
+        runs_zero = [{**MOCK_RUNS[0], 'journal_entry_count': 0}]
+        with _patch_recon_data(runs=runs_zero):
+            html = client.get('/partials/recon').text
+        assert 'x-cloak' not in html
