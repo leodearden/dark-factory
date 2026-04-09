@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
+
+
+def _write_tasks_json(root: Path, tasks: list[dict]) -> None:
+    """Create .taskmaster/tasks/tasks.json under *root* with the given tasks list."""
+    tasks_dir = root / '.taskmaster' / 'tasks'
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
 
 
 class TestWriteTasksJsonHelper:
