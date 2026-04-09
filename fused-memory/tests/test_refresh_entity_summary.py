@@ -198,7 +198,7 @@ class TestGetValidEdgesForNode:
 
 
 # ---------------------------------------------------------------------------
-# step-3 (task-448): GraphitiBackend._edge_dict static helper
+# GraphitiBackend._edge_dict: edge dict normalisation helper
 # ---------------------------------------------------------------------------
 
 class TestEdgeDict:
