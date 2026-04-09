@@ -1230,10 +1230,13 @@ class GraphitiBackend:
         return [g for g in all_graphs if g != 'default_db' and not g.endswith('_db')]
 
     async def node_count(self, graph_name: str) -> int:
-        """Count nodes in a specific FalkorDB graph."""
+        """Count nodes in a specific FalkorDB graph.
+
+        Uses ro_query since no writes are performed.
+        """
         client = self._require_client()
         graph = cast(Any, client.driver)._get_graph(graph_name)
-        result = await graph.query('MATCH (n) RETURN count(n) as count')
+        result = await graph.ro_query('MATCH (n) RETURN count(n) as count')
         return result.result_set[0][0] if result.result_set else 0
 
     async def close(self) -> None:
