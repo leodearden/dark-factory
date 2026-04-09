@@ -143,6 +143,7 @@ class ReconciliationHarness:
         cycle_fence_time: datetime | None = None,
         assembled_payload: AssembledPayload | None = None,
         remediation_findings: list[dict] | None = None,
+        filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
         """Apply tier limits and mode-specific attributes to MemoryConsolidator.
 
@@ -155,6 +156,7 @@ class ReconciliationHarness:
         stage.cycle_fence_time = cycle_fence_time
         stage.assembled_payload = assembled_payload
         stage.remediation_findings = remediation_findings
+        stage.filtered_task_tree = filtered_task_tree
 
     async def _fetch_filtered_task_tree(self, project_root: str) -> FilteredTaskTree:
         """Fetch the task tree once and return a filtered subset of active tasks.
@@ -511,6 +513,9 @@ class ReconciliationHarness:
         # Load prior S3 findings from last completed run (backstop for normal pass)
         prior_s3_findings = await self._get_prior_s3_findings(project_id)
 
+        # Fetch filtered task tree once for the whole cycle (ref: task 455)
+        filtered_task_tree = await self._fetch_filtered_task_tree(project_root)
+
         current_stage_name: str | None = None
         cycle_start_time = datetime.now(UTC)
         stages = self._make_stages()
@@ -521,14 +526,19 @@ class ReconciliationHarness:
                 stage.project_id = project_id
                 stage.project_root = project_root
 
-                # Apply tier limits, prior S3 findings, and cycle fence to Stage 1
+                # Apply tier limits, prior S3 findings, cycle fence, and task tree to Stage 1
                 if isinstance(stage, MemoryConsolidator):
                     self._configure_consolidator(
                         stage, tier,
                         prior_s3_findings=prior_s3_findings,
                         cycle_fence_time=cycle_start_time,
                         assembled_payload=assembled_payload,
+                        filtered_task_tree=filtered_task_tree,
                     )
+
+                # Wire harness-fetched task tree into Stage 2 (ref: task 455)
+                if isinstance(stage, TaskKnowledgeSync):
+                    stage.filtered_task_tree = filtered_task_tree
 
                 report = await stage.run(
                     events, watermark, reports, run_id, model=tier.model,
@@ -727,6 +737,9 @@ class ReconciliationHarness:
             },
         )
 
+        # Fetch filtered task tree once for the remediation cycle (ref: task 455)
+        filtered_task_tree = await self._fetch_filtered_task_tree(project_root)
+
         current_stage_name: str | None = None
         stages = self._make_stages()
         try:
@@ -736,9 +749,12 @@ class ReconciliationHarness:
             assert isinstance(stage1, MemoryConsolidator)
             assert isinstance(stage2, TaskKnowledgeSync)
             self._configure_consolidator(
-                stage1, tier, remediation_findings=findings,
+                stage1, tier,
+                remediation_findings=findings,
+                filtered_task_tree=filtered_task_tree,
             )
             stage2.remediation_mode = True
+            stage2.filtered_task_tree = filtered_task_tree
 
             watermark = await self.journal.get_watermark(project_id)
             reports = []
