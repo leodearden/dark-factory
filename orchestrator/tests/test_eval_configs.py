@@ -5,7 +5,9 @@ from __future__ import annotations
 import copy
 
 import pytest
+from click.testing import CliRunner
 
+from orchestrator.cli import main
 from orchestrator.evals.configs import (
     EVAL_CONFIGS,
     VLLM_EVAL_CONFIGS,
@@ -296,10 +298,6 @@ class TestVllmUrlInjection:
         self, vllm_env_sandbox, monkeypatch
     ):
         """CLI `eval --matrix --vllm-url` must inject ANTHROPIC_BASE_URL into every vLLM config."""
-        from click.testing import CliRunner
-
-        from orchestrator.cli import main
-
         captured_state: dict[str, dict] = {}
 
         def stub_run_matrix(base_config, **kwargs):
