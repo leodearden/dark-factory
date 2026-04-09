@@ -22,6 +22,7 @@ from fused_memory.reconciliation.prompts import (
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.task_filter import (
+    FilteredTaskTree,
     filter_task_tree,
     format_filtered_task_tree,
     format_task_list,
@@ -33,6 +34,9 @@ class TaskKnowledgeSync(BaseStage):
 
     # Remediation support — set by harness for second pass
     remediation_mode: bool = False
+
+    # Active task tree — set by harness before run() (task 455)
+    filtered_task_tree: FilteredTaskTree | None = None
 
     # Minimum number of tasks to proactively spot-check each run
     MIN_TASK_SAMPLE: int = 5
@@ -51,19 +55,36 @@ class TaskKnowledgeSync(BaseStage):
     ) -> str:
         stage1_report = prior_reports[0] if prior_reports else None
 
-        # Get task tree
-        tasks_data: dict = {}
-        if self.taskmaster:
-            try:
-                tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
-            except Exception:
-                tasks_data = {}
+        # Dual-path: use harness-injected tree or self-fetch (task 455)
+        if self.filtered_task_tree is not None:
+            # Harness path: tree already fetched and filtered before run()
+            filtered = self.filtered_task_tree
+            # Use active_tasks for proactive sample (no done/cancelled in the list)
+            sample_pool: list[dict] = filtered.active_tasks
+        else:
+            # Fallback path: self-fetch via taskmaster
+            tasks_data: dict = {}
+            if self.taskmaster:
+                try:
+                    tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
+                except Exception:
+                    tasks_data = {}
+            filtered = filter_task_tree(tasks_data)
+            all_tasks: list = tasks_data.get('tasks', [])
+            if not isinstance(all_tasks, list):
+                all_tasks = []
+            sample_pool = all_tasks
 
-        # Delegate all filtering, partitioning, and sorting to task_filter
-        filtered = filter_task_tree(tasks_data)
-        all_tasks = tasks_data.get('tasks', [])
-        if not isinstance(all_tasks, list):
-            all_tasks = []
+        # Render "Recently Completed Tasks" section
+        if filtered.done_tasks:
+            recently_completed_text = format_task_list(filtered.done_tasks[:30])
+        elif filtered.done_count > 0:
+            recently_completed_text = (
+                f'{filtered.done_count} tasks completed recently '
+                f'(details omitted — too many to list).'
+            )
+        else:
+            recently_completed_text = format_task_list([])  # 'No tasks.'
 
         remediation_note = ''
         if self.remediation_mode:
@@ -75,7 +96,7 @@ class TaskKnowledgeSync(BaseStage):
 
         proactive_sample_section = ''
         if not self.remediation_mode:
-            sample = _select_proactive_sample(all_tasks, self.MIN_TASK_SAMPLE)
+            sample = _select_proactive_sample(sample_pool, self.MIN_TASK_SAMPLE)
             proactive_sample_section = (
                 f'\n### Proactive Task Sample ({len(sample)} tasks)\n'
                 f'{format_task_list(sample)}\n'
@@ -93,7 +114,7 @@ class TaskKnowledgeSync(BaseStage):
 {format_filtered_task_tree(filtered)}
 
 ### Recently Completed Tasks
-{format_task_list(filtered.done_tasks[:30])}{proactive_sample_section}
+{recently_completed_text}{proactive_sample_section}
 
 ## Your Task
 Reconcile task state against memory:
