@@ -350,3 +350,19 @@ class TestModuleConstants:
             'VLLM_NAMES does not match the set comprehension'
         )
         assert len(vllm_names) == 15, f'Expected 15 names, got {len(vllm_names)}'
+
+
+class TestHelperMethods:
+    """Structural tests: verify helper methods exist on test classes with correct behaviour."""
+
+    def test_inject_vllm_url_helper_exists_and_works(self, vllm_env_sandbox):
+        """_inject_vllm_url must exist on TestVllmUrlInjection and set ANTHROPIC_BASE_URL on all vLLM configs."""
+        assert hasattr(TestVllmUrlInjection, '_inject_vllm_url'), (
+            'TestVllmUrlInjection._inject_vllm_url helper does not exist'
+        )
+        instance = TestVllmUrlInjection()
+        instance._inject_vllm_url()
+        for cfg in VLLM_EVAL_CONFIGS:
+            assert cfg.env_overrides.get('ANTHROPIC_BASE_URL') == TestVllmUrlInjection._VLLM_URL, (
+                f'{cfg.name} missing ANTHROPIC_BASE_URL after _inject_vllm_url()'
+            )
