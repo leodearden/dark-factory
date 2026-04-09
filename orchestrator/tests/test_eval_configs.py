@@ -337,3 +337,20 @@ class TestVllmUrlInjection:
         assert not cloud_with_base_url, (
             f'Cloud baseline configs leaked ANTHROPIC_BASE_URL via CLI path: {cloud_with_base_url}'
         )
+
+
+class TestModuleConstants:
+    """Structural tests: verify module-level constants exist with correct types and values."""
+
+    def test_vllm_names_module_constant_matches_comprehension(self):
+        """VLLM_NAMES must be a module-level set constant equal to the name comprehension."""
+        g = globals()
+        assert 'VLLM_NAMES' in g, 'VLLM_NAMES not defined at module level'
+        vllm_names = g['VLLM_NAMES']
+        assert isinstance(vllm_names, set), (
+            f'VLLM_NAMES must be a set, got {type(vllm_names)}'
+        )
+        assert vllm_names == {cfg.name for cfg in VLLM_EVAL_CONFIGS}, (
+            'VLLM_NAMES does not match the set comprehension'
+        )
+        assert len(vllm_names) == 15, f'Expected 15 names, got {len(vllm_names)}'
