@@ -121,3 +121,47 @@ class TestGetAllValidEdgesReturnsDoubleAttribution:
             "Double-attribution note must appear in the Returns section; "
             "callers need to know each directed edge appears under both endpoints"
         )
+
+
+# ---------------------------------------------------------------------------
+# step-5: docstring must note the directed MATCH alternative
+# ---------------------------------------------------------------------------
+
+
+class TestGetAllValidEdgesDirectedMatchNote:
+    """get_all_valid_edges docstring must mention the directed MATCH alternative.
+
+    A Note section should inform future maintainers that using
+    (n:Entity)-[e:RELATES_TO]->() (directed arrow) would give single-appearance
+    semantics per edge if ever needed.
+
+    Asserts:
+      (a) docstring contains the directed arrow syntax '-[e:RELATES_TO]->'
+      (b) docstring mentions 'single-appearance' or 'single appearance' as the
+          alternative semantics
+    """
+
+    def _doc(self) -> str:
+        doc = GraphitiBackend.get_all_valid_edges.__doc__
+        assert doc is not None
+        return doc
+
+    def test_directed_arrow_syntax_present(self) -> None:
+        """Docstring must mention the directed MATCH pattern with arrow syntax."""
+        doc = self._doc()
+        assert '-[e:RELATES_TO]->' in doc, (
+            "Docstring must include '-[e:RELATES_TO]->' to document the directed "
+            "MATCH alternative that gives single-appearance semantics"
+        )
+
+    def test_single_appearance_semantics_mentioned(self) -> None:
+        """Docstring must describe the directed alternative as single-appearance."""
+        doc = self._doc()
+        has_single = (
+            'single-appearance' in doc
+            or 'single appearance' in doc
+        )
+        assert has_single, (
+            "Docstring must mention 'single-appearance' or 'single appearance' "
+            "to describe the semantics of the directed MATCH alternative"
+        )
