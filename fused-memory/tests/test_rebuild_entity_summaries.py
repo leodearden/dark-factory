@@ -665,6 +665,36 @@ class TestRebuildSummariesManager:
         assert result.rebuilt == 3
         assert len(result.details) == 1
 
+    @pytest.mark.asyncio
+    async def test_manager_does_not_emit_summary_log(self, mock_config, caplog):
+        """RebuildSummariesManager.run() must NOT emit a summary log line.
+
+        Following the CleanupManager precedent, the inner manager emits only
+        operational per-item logs. The summary line belongs exclusively in the
+        outer run_rebuild_summaries() entrypoint. This test guards against
+        duplicate summary lines appearing in production logs.
+        """
+        import logging
+        from fused_memory.maintenance.rebuild_summaries import RebuildSummariesManager
+        mock_backend = MagicMock()
+        mock_backend.rebuild_entity_summaries = AsyncMock(return_value={
+            'total_entities': 3,
+            'stale_entities': 1,
+            'rebuilt': 1,
+            'skipped': 0,
+            'errors': 0,
+            'details': [],
+        })
+        manager = RebuildSummariesManager(backend=mock_backend, group_id='test')
+        with caplog.at_level(logging.INFO, logger='fused_memory.maintenance.rebuild_summaries'):
+            await manager.run()
+        # The manager must NOT emit a 'run complete' summary — that belongs in
+        # the outer entrypoint run_rebuild_summaries() only.
+        matching = [r for r in caplog.records if 'RebuildSummariesManager.run complete' in r.message]
+        assert matching == [], (
+            f'RebuildSummariesManager.run() emitted an unexpected summary log: {matching}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # N+1 fix step-5: GraphitiBackend.get_all_valid_edges (bulk fetch)
