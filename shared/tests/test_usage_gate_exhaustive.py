@@ -342,6 +342,14 @@ class TestNearCapStateDistinction:
             gate.detect_cap_hit('', msg)
         mock_fire.assert_called_once()
 
+    def test_near_cap_no_cost_event_without_cost_store(self):
+        """_handle_near_cap_warning must NOT fire a cost event when cost_store is None."""
+        gate = make_gate(['a'], cost_store=None)
+        msg = "You're now using extra compute credits. Your plan resets in 4h."
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate.detect_cap_hit('', msg)
+        mock_fire.assert_not_called()
+
 
 # =========================================================================
 # TestResetTimeParsing
