@@ -15,7 +15,7 @@ import json
 import logging
 import uuid
 
-from aiohttp import web
+from aiohttp import ClientTimeout, web
 from aiohttp.client import ClientSession
 
 logger = logging.getLogger(__name__)
@@ -210,7 +210,11 @@ class VllmBridge:
 
     async def start(self) -> None:
         """Start the bridge server and bind to a random local port."""
-        self._session = ClientSession()
+        # vLLM inference on large prompts (~39k tokens) can take 5-10+ min on
+        # single-GPU configs.  aiohttp's default ClientTimeout(total=300) kills
+        # requests at 5 min.  Use 30 min — the subprocess timeout is the real
+        # outer bound.
+        self._session = ClientSession(timeout=ClientTimeout(total=1800))
         app = web.Application()
         # Specific route must be registered before catch-all
         app.router.add_post('/v1/messages', self._handle_messages)
