@@ -53,11 +53,11 @@ if TYPE_CHECKING:
 
 
 class _SchedulerLike(Protocol):
-    _status_cache: dict[str, str]
     async def set_task_status(self, task_id: str, status: str, /) -> None: ...
     async def handle_blast_radius_expansion(
         self, task_id: str, current: list[str], needed: list[str], /
     ) -> bool: ...
+    def get_cached_status(self, task_id: str, /) -> str | None: ...
 
 
 class _McpLike(Protocol):
@@ -1882,7 +1882,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # Guard: steward may have marked the task done (terminal).
                 # The scheduler rejects done→pending, but we must also
                 # return the correct outcome.
-                cached = self.scheduler._status_cache.get(self.task_id)
+                cached = self.scheduler.get_cached_status(self.task_id)
                 if cached in TERMINAL_STATUSES:
                     logger.info(
                         'Task %s: status is %s after steward — not re-queueing',
