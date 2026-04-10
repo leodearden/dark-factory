@@ -24,6 +24,8 @@ import pytest_asyncio
 import redis
 from falkordb.asyncio import FalkorDB
 
+from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
+
 FALKOR_HOST: str = os.environ.get('FALKOR_HOST', 'localhost')
 FALKOR_PORT: int = int(os.environ.get('FALKOR_PORT', '6379'))
 TEST_GRAPH: str = '_test_530_list_indices_integration'
@@ -83,3 +85,37 @@ class TestCallDbIndexesOverRoQuery:
         assert len(result.result_set) >= 1
         # The first (and only) index should be on label Entity
         assert result.result_set[0][0] == 'Entity'
+
+
+class TestBackendListIndicesLive:
+    """Pin the end-to-end GraphitiBackend.list_indices() row-parsing path against live FalkorDB.
+
+    Complements TestCallDbIndexesOverRoQuery: while that class verifies RPC-level acceptance,
+    this class verifies the full path consumed by drop_vector_indices() — that list_indices()
+    correctly parses the [label, field, type, entity_type] column layout from a live response.
+
+    Task 530 / esc-486-49.  See also: tests/test_reindex.py::TestListIndices for unit tests.
+    """
+
+    @pytest.mark.asyncio
+    async def test_list_indices_returns_records_live(self, mock_config, live_test_graph):
+        """GraphitiBackend.list_indices() parses live FalkorDB index records correctly."""
+        backend = GraphitiBackend(mock_config)
+        # Inject a real driver directly — list_indices only needs _driver, not a full
+        # Graphiti client stack (see _require_driver vs _require_client in graphiti_client.py).
+        # _MultiTenantFalkorDriver suppresses auto-indexing so the fixture graph is undisturbed.
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            records = await backend.list_indices(group_id=TEST_GRAPH)
+            assert len(records) >= 1
+            for rec in records:
+                assert set(rec.keys()) >= {'label', 'field', 'type', 'entity_type'}
+            # At least one record should be the Entity.name index we created in the fixture.
+            # Note: FalkorDB returns field names as a list (e.g. ['name']), not a bare string.
+            entity_records = [r for r in records if r['label'] == 'Entity']
+            assert len(entity_records) >= 1
+            # The field value is a list of indexed property names
+            field_val = entity_records[0]['field']
+            assert 'name' in field_val if isinstance(field_val, list) else field_val == 'name'
+        finally:
+            await backend.close()
