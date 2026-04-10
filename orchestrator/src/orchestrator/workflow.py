@@ -648,6 +648,7 @@ class TaskWorkflow:
 
         prompt = await self.briefing.build_architect_prompt(self.task, worktree=self.worktree)
 
+        result: AgentResult | None = None
         for attempt in range(2):
             result = await self._invoke(ARCHITECT, prompt, self.worktree)
 
@@ -679,6 +680,7 @@ class TaskWorkflow:
 
         if not self.plan:
             logger.error(f'Task {self.task_id}: architect produced no plan.json')
+            assert result is not None  # range(2) is always non-empty; loop always assigns result
             return await self._mark_blocked(
                 'Planning failed: no plan.json produced',
                 detail=(

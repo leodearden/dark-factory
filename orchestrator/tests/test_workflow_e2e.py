@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from orchestrator.evals.runner import _EvalScheduler as _ES
     from orchestrator.workflow import _SchedulerLike
 
-    _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()  # type: ignore[name-defined]
+    _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()  # type: ignore[name-defined]  # noqa: F821
     _eval_scheduler_conforms: _SchedulerLike = _ES(OrchestratorConfig())
 
 # ---------------------------------------------------------------------------
