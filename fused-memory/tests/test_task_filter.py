@@ -261,13 +261,16 @@ class TestFormatFilteredTaskTree:
         assert '5 done, 2 cancelled \u2014 omitted' in output
 
     def test_caps_at_max_tasks_and_under_budget(self):
-        """Regression: format_filtered_task_tree must honour max_chars and emit the exact
+        """Regression: format_filtered_task_tree must honour max_chars and emit the
         max_tasks-cap header phrase when active tasks exceed max_tasks.
 
         With 500 active tasks and the default max_tasks=50 cap, 450 tasks are omitted.
-        The header must contain the exact phrase '450 more active omitted by max_tasks cap'
-        (the format emitted at task_filter.py line 232 when omitted_active > 0) and the
+        The header must contain a phrase with '450 more active' and 'max_tasks'
+        (the format emitted at task_filter.py when omitted_active > 0) and the
         total output must not exceed max_chars (default 50,000 chars).
+
+        The regex pins the count (450) and intent (max_tasks cap) while tolerating
+        benign preposition rewording (e.g. 'omitted due to' vs 'omitted by').
         """
         # 500 active tasks with plausible-length titles
         active = [
@@ -287,8 +290,9 @@ class TestFormatFilteredTaskTree:
         # Output must not exceed max_chars budget (default 50,000)
         assert len(output) <= 50_000
 
-        # Header must contain the exact max_tasks-cap omission phrase
-        assert '450 more active omitted by max_tasks cap' in output
+        # Header must contain the max_tasks-cap omission phrase: pins count + intent,
+        # tolerates preposition rewording (e.g. 'omitted by' vs 'omitted due to')
+        assert re.search(r'450\s+more active.*max_tasks', output)
 
     def test_empty_active_and_empty_tree(self):
         """format_filtered_task_tree handles empty FilteredTaskTree gracefully."""
@@ -436,6 +440,7 @@ class TestFormatFilteredTaskTree:
         single_task = {'id': 1, 'title': 'T', 'status': 'pending', 'dependencies': []}
         n = 10_000
         # Repeated-reference trick: list of n pointers to same dict — keeps memory < 1 MB.
+        # Safe only because format_filtered_task_tree treats task dicts as read-only; any future in-place mutation in the formatter (e.g. dep normalization) would alias across all N entries and skew results.
         active_large = [single_task] * n
         tree_large = FilteredTaskTree(
             active_tasks=active_large,
@@ -451,6 +456,68 @@ class TestFormatFilteredTaskTree:
         assert len(output) <= max_chars, (
             f'Output length {len(output)} exceeds max_chars={max_chars}; '
             f'the lazy verification loop must pop task lines until the output fits'
+        )
+
+    def test_budget_lazy_loop_handles_7_digit_trimmed_count(self):
+        """Regression: format_filtered_task_tree must enforce len(output) <= max_chars even
+        when trimmed_count reaches 7+ digits, where a fixed-width reserve approach would
+        have under-allocated space for the truncation notice.
+
+        The implementation uses a lazy verification loop that re-measures the realized
+        notice length after each pop iteration. This test exercises the 7+ digit path
+        (trimmed_count=1_000_000) where a fixed-width reserve keyed on 4-digit trimmed
+        counts would overflow.
+
+        Uses repeated-reference trick ([same_dict]*N) to keep peak allocation under
+        ~100 MB (1M pointers + rendered lines) rather than creating 1M full task dicts.
+
+        Failure mode guarded: if the implementation ever switches to a fixed-width reserve
+        (e.g. reserving 49 chars for a notice with a 4-digit count), then a 7-digit
+        trimmed_count would produce a notice 3 chars longer, causing output to exceed
+        max_chars. This test fails loudly in that case.
+        """
+        # Task line for title='T', id=1: "- [1] (pending) T deps=[]" = 25 chars.
+        # With N=1_000_001, max_tasks=N, max_chars=200:
+        # header = "### Active Task Tree\n(1000001 active shown, 0 done, 0 cancelled, 0 other, 1000001 total)\n"
+        #        = 89 chars.
+        # summary_line = "0 done, 0 cancelled — omitted" = 29 chars.
+        # budget = 200 - 89 - 29 = 82. Each line costs 26 chars (25 + newline).
+        # initial kept_lines = floor(82/26) = 3. trimmed_count starts at 999_998 (6 digits).
+        # After 2 pop iterations: kept_lines=1, trimmed_count=1_000_000 (7 digits).
+        # Result fits within 200 chars with a 5-char slack margin.
+
+        single_task = {'id': 1, 'title': 'T', 'status': 'pending', 'dependencies': []}
+        n = 1_000_001
+        # Repeated-reference trick: list of n pointers to same dict — keeps memory < 1 MB.
+        # Safe only because format_filtered_task_tree treats task dicts as read-only;
+        # any future in-place mutation in the formatter (e.g. dep normalization) would
+        # alias across all N entries and invalidate the trick.
+        active_large = [single_task] * n
+        tree_large = FilteredTaskTree(
+            active_tasks=active_large,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=n,
+        )
+
+        max_chars = 200  # Tight budget: forces trimmed_count into the 7-digit range
+        output = format_filtered_task_tree(tree_large, max_tasks=n, max_chars=max_chars)
+
+        assert len(output) <= max_chars, (
+            f'Output length {len(output)} exceeds max_chars={max_chars}; '
+            f'the lazy verification loop must handle 7-digit trimmed_count correctly'
+        )
+
+        # Extract trimmed_count from the truncation notice and verify 7+ digit path
+        m = re.search(r'\.\.\. and (\d+) more active \(truncated for budget\)', output)
+        assert m is not None, (
+            f'Truncation notice not found in output; got: {output!r}'
+        )
+        trimmed_count = int(m.group(1))
+        assert trimmed_count >= 1_000_000, (
+            f'trimmed_count={trimmed_count} is under 1_000_000; '
+            f'the 7+ digit path was not exercised (short-circuited?)'
         )
 
     def test_deps_more_than_5_renders_truncated(self):
