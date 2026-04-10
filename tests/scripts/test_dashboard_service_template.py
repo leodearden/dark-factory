@@ -11,6 +11,9 @@ See also:
   - dashboard/src/dashboard/config.py line 84  — COMMA-separated split
 """
 import pathlib
+import re
+
+import pytest
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 TEMPLATE = REPO_ROOT / "scripts" / "dashboard.service.template"
@@ -40,6 +43,33 @@ def test_hardcoded_service_file_sets_known_project_roots() -> None:
         f"Expected line not found in {HARDCODED}:\n  {EXPECTED_ENV_LINE!r}\n"
         "Add it to the [Service] section after the ExecStart block."
     )
+
+
+def test_comma_separator_helper_detects_colon_in_any_position(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_assert_known_project_roots_comma_separated must catch colons in any position.
+
+    The narrow old guard (looking for '/home/leo/src/dark-factory:') fails when the
+    first root is not dark-factory or the colon appears between the second and third
+    roots.  This test exercises the case that the old guard cannot see.
+    """
+    # Bad: colon between second and third roots (old guard misses this)
+    bad_file = tmp_path / "bad.service"
+    bad_file.write_text(
+        "[Service]\nEnvironment=DASHBOARD_KNOWN_PROJECT_ROOTS=/a,/b:/c\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _assert_known_project_roots_comma_separated(bad_file)
+
+    # Good: all commas, helper must not raise
+    good_file = tmp_path / "good.service"
+    good_file.write_text(
+        "[Service]\nEnvironment=DASHBOARD_KNOWN_PROJECT_ROOTS=/a,/b,/c\n",
+        encoding="utf-8",
+    )
+    _assert_known_project_roots_comma_separated(good_file)
 
 
 def test_known_project_roots_uses_comma_separator_not_colon() -> None:
