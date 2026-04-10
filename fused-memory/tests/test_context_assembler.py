@@ -642,9 +642,8 @@ class TestContextAssemblerCancellation:
         ]
         watermark = _make_watermark()
 
-        with patch.object(assembler, '_fetch_context', new=patched_fetch_context):
-            with pytest.raises(asyncio.CancelledError):
-                await assembler.assemble(events, watermark, 'test-project')
+        with patch.object(assembler, '_fetch_context', new=patched_fetch_context), pytest.raises(asyncio.CancelledError):
+            await assembler.assemble(events, watermark, 'test-project')
 
         assert call_count >= 11, (
             'first batch (calls 1-10) must complete before the second batch '
