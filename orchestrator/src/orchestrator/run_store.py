@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from orchestrator.harness import HarnessReport
+    from orchestrator.harness import HarnessReport, TaskReport
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,105 @@ class RunStore:
             conn.executescript(_SCHEMA)
         finally:
             conn.close()
+
+    def start_run(
+        self,
+        run_id: str,
+        project_id: str,
+        started_at: str,
+        prd_path: str | None = None,
+    ) -> None:
+        """Insert an initial runs row at orchestrator startup.
+
+        The row is updated with final aggregates via :meth:`finish_run`
+        when the run completes.
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(
+                'INSERT OR IGNORE INTO runs '
+                '(run_id, project_id, prd_path, started_at) '
+                'VALUES (?, ?, ?, ?)',
+                (run_id, project_id, prd_path, started_at),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        logger.info(f'Started run {run_id} for project {project_id}')
+
+    def save_task_result(
+        self,
+        run_id: str,
+        task_report: TaskReport,
+        project_id: str,
+    ) -> None:
+        """Persist a single TaskReport row immediately on task completion."""
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(
+                'INSERT OR REPLACE INTO task_results '
+                '(run_id, task_id, project_id, title, outcome, '
+                ' cost_usd, duration_ms, agent_invocations, '
+                ' execute_iterations, verify_attempts, review_cycles, '
+                ' steward_cost_usd, steward_invocations, completed_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (
+                    run_id,
+                    task_report.task_id,
+                    project_id,
+                    task_report.title,
+                    task_report.outcome.value,
+                    task_report.cost_usd,
+                    task_report.duration_ms,
+                    task_report.agent_invocations,
+                    task_report.execute_iterations,
+                    task_report.verify_attempts,
+                    task_report.review_cycles,
+                    task_report.steward_cost_usd,
+                    task_report.steward_invocations,
+                    task_report.completed_at,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        logger.debug(
+            f'Persisted task result {task_report.task_id} '
+            f'({task_report.outcome.value}) for run {run_id}'
+        )
+
+    def finish_run(
+        self,
+        run_id: str,
+        report: HarnessReport,
+    ) -> None:
+        """Update the runs row with final aggregates at shutdown."""
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(
+                'UPDATE runs SET '
+                'completed_at = ?, total_tasks = ?, completed = ?, '
+                'blocked = ?, escalated = ?, total_cost_usd = ?, '
+                'paused_for_cap = ?, cap_pause_secs = ? '
+                'WHERE run_id = ?',
+                (
+                    report.completed_at,
+                    report.total_tasks,
+                    report.completed,
+                    report.blocked,
+                    report.escalated,
+                    report.total_cost_usd,
+                    int(report.paused_for_cap),
+                    report.cap_pause_duration_secs,
+                    run_id,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        logger.info(
+            f'Finished run {run_id}: {len(report.task_reports)} task results'
+        )
 
     def save_run(
         self,

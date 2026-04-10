@@ -38,6 +38,34 @@ def patch_load_task(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(runner_mod, 'load_task', _stem_loader)
 
 
+@pytest.fixture()
+def single_cancel_matrix_case(
+    patch_load_task,  # noqa: ARG001 — applied for side-effect (load_task stub)
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Shared setup for single-task cancel-path tests.
+
+    Creates a single task file at ``tmp_path / 'task_a.json'`` and returns
+    ``(task_path, run_matrix_helper)``.
+
+    ``run_matrix_helper(fake_run_eval)`` monkeypatches ``runner_mod.run_eval``
+    with *fake_run_eval* and awaits
+    ``run_eval_matrix([task_path], [_CFG], force=True)``.
+
+    Depends on ``patch_load_task`` so ``runner_mod.load_task`` is already
+    stubbed before the helper runs — callers do not need to patch it separately.
+    """
+    task_path = tmp_path / 'task_a.json'
+    task_path.touch()
+
+    async def run_matrix_helper(fake_run_eval):
+        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+        return await run_eval_matrix([task_path], [_CFG], force=True)
+
+    return task_path, run_matrix_helper
+
+
 @pytest.mark.asyncio
 class TestGatherContract:
     """Documents asyncio.gather(..., return_exceptions=True) stdlib contract.
@@ -74,7 +102,7 @@ class TestRunEvalMatrixCancellation:
     """run_eval_matrix must re-raise asyncio.CancelledError instead of swallowing it."""
 
     async def test_run_eval_matrix_reraises_cancellederror(
-        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, single_cancel_matrix_case, caplog: pytest.LogCaptureFixture
     ):
         """CancelledError from an inner eval propagates out of run_eval_matrix.
 
@@ -82,20 +110,13 @@ class TestRunEvalMatrixCancellation:
         ``isinstance(r, BaseException)`` branch logs 'Eval failed' and then
         discards the exception; pytest.raises(CancelledError) never sees it.
         """
-        task_path = tmp_path / 'task_a.json'
-        task_path.touch()
+        _task_path, run_matrix = single_cancel_matrix_case
 
         async def fake_run_eval(*args, **kwargs):
             raise asyncio.CancelledError('simulated cancel')
 
-        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
-
         with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'), pytest.raises(asyncio.CancelledError):
-            await run_eval_matrix(
-                [task_path],
-                [_CFG],
-                force=True,
-            )
+            await run_matrix(fake_run_eval)
 
         assert any(
             'cancelled' in record.message.lower()
@@ -266,6 +287,123 @@ class TestRunEvalMatrixCancellation:
         )
 
 
+    async def test_cancelled_error_log_carries_exc_info(
+        self, single_cancel_matrix_case, caplog: pytest.LogCaptureFixture
+    ):
+        """CancelledError log record must carry exc_info (traceback attached).
+
+        The message should be stable ('Eval cancelled') rather than including
+        the f-string repr of the exception, so that it is useful even when
+        str(CancelledError) is empty.
+
+        This test would FAIL without the exc_info fix because the old
+        ``logger.error(f'Eval cancelled: {r}')`` call did not set exc_info.
+        """
+        _task_path, run_matrix = single_cancel_matrix_case
+
+        async def fake_run_eval(*args, **kwargs):
+            raise asyncio.CancelledError('simulated cancel')
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'), pytest.raises(asyncio.CancelledError):
+            await run_matrix(fake_run_eval)
+
+        cancel_records = [r for r in caplog.records if 'cancelled' in r.message.lower()]
+        assert cancel_records, (
+            f'Expected at least one log record containing "cancelled". '
+            f'Got: {[r.message for r in caplog.records]}'
+        )
+        record = cancel_records[0]
+
+        # (a) Message must be exactly 'Eval cancelled' — no f-string interpolation
+        assert record.message == 'Eval cancelled', (
+            f"Expected message 'Eval cancelled', got {record.message!r}"
+        )
+
+        # (b) exc_info must be a 3-tuple (type, value, traceback) — not None
+        assert isinstance(record.exc_info, tuple) and len(record.exc_info) == 3, (
+            f'Expected exc_info to be a 3-tuple, got {record.exc_info!r}'
+        )
+        exc_type, exc_val, exc_tb = record.exc_info
+        assert exc_type is asyncio.CancelledError, (
+            f'Expected exc_type to be CancelledError, got {exc_type!r}'
+        )
+        assert isinstance(exc_val, asyncio.CancelledError), (
+            f'Expected exc_val to be CancelledError instance, got {exc_val!r}'
+        )
+
+    async def test_multiple_simultaneous_cancellederrors_all_logged(
+        self,
+        patch_load_task,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Both CancelledErrors must be logged when two tasks cancel in the same done batch.
+
+        With asyncio.wait(FIRST_COMPLETED), multiple tasks can complete in the
+        same event-loop iteration and land in the same ``done`` set.  The prior
+        implementation raised on the first cancelled task encountered, silently
+        discarding any subsequent cancellations in the batch.
+
+        The gate synchronisation forces both fake_run_eval coroutines to raise
+        CancelledError in the same event-loop iteration so they land in the same
+        ``done`` batch — exercising the multi-cancel code path deterministically.
+        Without the gate, the two coroutines might raise in separate iterations
+        and each hit the single-cancel path, passing against buggy code.
+
+        This test FAILS against the current implementation, which only logs the
+        first cancel before raising (Task 586).
+        """
+        path_a = tmp_path / 'task_a.json'
+        path_b = tmp_path / 'task_b.json'
+        path_a.touch()
+        path_b.touch()
+
+        gate = asyncio.Event()
+        arrival_count = 0
+
+        async def fake_run_eval(*args, **kwargs):
+            nonlocal arrival_count
+            arrival_count += 1
+            if arrival_count == 2:
+                # Second arrival sets the gate; this schedules the first
+                # coroutine's continuation via call_soon so both raise in the
+                # same event-loop iteration and land in the same done batch.
+                gate.set()
+            await gate.wait()
+            raise asyncio.CancelledError('simulated multi-cancel')
+
+        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'), pytest.raises(asyncio.CancelledError):
+            await run_eval_matrix(
+                [path_a, path_b],
+                [_CFG],
+                force=True,
+            )
+
+        cancel_records = [r for r in caplog.records if r.message == 'Eval cancelled']
+
+        # (a) Exactly two 'Eval cancelled' records — one per cancelled task
+        assert len(cancel_records) == 2, (
+            f'Expected 2 "Eval cancelled" log records, got {len(cancel_records)}. '
+            f'All records: {[r.message for r in caplog.records]}'
+        )
+
+        # (b) Each record must carry a 3-tuple exc_info with CancelledError
+        for i, record in enumerate(cancel_records):
+            assert isinstance(record.exc_info, tuple) and len(record.exc_info) == 3, (
+                f'Record {i}: expected exc_info to be a 3-tuple, got {record.exc_info!r}'
+            )
+            exc_type, exc_val, exc_tb = record.exc_info
+            assert exc_type is asyncio.CancelledError, (
+                f'Record {i}: expected exc_type to be CancelledError, got {exc_type!r}'
+            )
+            assert isinstance(exc_val, asyncio.CancelledError), (
+                f'Record {i}: expected exc_val to be CancelledError instance, got {exc_val!r}'
+            )
+
+
 @pytest.mark.asyncio
 class TestRunEvalMatrixNonCancelPath:
     """Non-cancel exceptions must be logged and the matrix must continue."""
@@ -387,3 +525,63 @@ class TestRunEvalMatrixNonCancelPath:
             'cancelled' in record.message.lower()
             for record in caplog.records
         ), f'Unexpected "cancelled" log record. Got: {[r.message for r in caplog.records]}'
+
+    async def test_failed_error_log_carries_exc_info(
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """Non-cancel RuntimeError log record must carry exc_info (traceback attached).
+
+        The message should be stable ('Eval failed') rather than including the
+        f-string repr of the exception, so that it is useful even when
+        str(exc) is empty.
+
+        This test would FAIL against the old code because
+        ``logger.error(f'Eval failed: {exc}')`` does not set exc_info and
+        embeds the exception message in the log string instead.
+        """
+        task_path = tmp_path / 'task_a.json'
+        task_path.touch()
+
+        async def fake_run_eval(*args, **kwargs):
+            raise RuntimeError('simulated failure')
+
+        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'):
+            await run_eval_matrix(
+                [task_path],
+                [_CFG],
+                force=True,
+            )
+
+        failed_records = [r for r in caplog.records if 'failed' in r.message.lower()]
+        assert failed_records, (
+            f'Expected at least one log record containing "failed". '
+            f'Got: {[r.message for r in caplog.records]}'
+        )
+        record = failed_records[0]
+
+        # (a) Message must be exactly 'Eval failed' — no f-string interpolation
+        assert record.message == 'Eval failed', (
+            f"Expected message 'Eval failed', got {record.message!r}"
+        )
+
+        # (b) exc_info must be a 3-tuple (type, value, traceback) — not None
+        assert isinstance(record.exc_info, tuple) and len(record.exc_info) == 3, (
+            f'Expected exc_info to be a 3-tuple, got {record.exc_info!r}'
+        )
+        exc_type, exc_val, exc_tb = record.exc_info
+
+        # (c) exc_type must be RuntimeError
+        assert exc_type is RuntimeError, (
+            f'Expected exc_type to be RuntimeError, got {exc_type!r}'
+        )
+
+        # (d) exc_val must be a RuntimeError instance
+        assert isinstance(exc_val, RuntimeError), (
+            f'Expected exc_val to be RuntimeError instance, got {exc_val!r}'
+        )
+
+        # (e) exc_tb must be present — the whole point of exc_info is to preserve
+        #     the traceback for post-mortem debugging
+        assert exc_tb is not None, 'Expected traceback to be attached to the RuntimeError'

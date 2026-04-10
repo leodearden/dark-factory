@@ -303,7 +303,14 @@ async def run_eval_matrix(
     force: bool = False,
     timeout_override: int | None = None,
 ) -> list[EvalResult]:
-    """Run all (task, config, trial) combinations with bounded concurrency."""
+    """Run all (task, config, trial) combinations with bounded concurrency.
+
+    Raises:
+        asyncio.CancelledError: if any individual eval coroutine raises
+            CancelledError, or if this coroutine itself is cancelled from
+            outside.  In either case we log, cancel any still-running
+            sibling tasks, await their cleanup, and re-raise.
+    """
     configs = configs or EVAL_CONFIGS
 
     combos = [
@@ -353,28 +360,50 @@ async def run_eval_matrix(
         for tp, cfg, t in combos
     }
     results: list[EvalResult] = []
+    # Distinguish two cancellation scenarios:
+    #   Inner-task cancellation — an individual _run_one coroutine was cancelled
+    #     or raised CancelledError.  asyncio.wait surfaces this via
+    #     task.cancelled() or task.exception() inside the monitor loop below;
+    #     we log it, cancel siblings, and re-raise to propagate.
+    #   Outer-task cancellation — run_eval_matrix itself was cancelled (e.g.
+    #     SIGINT / asyncio.wait_for timeout).  The CancelledError interrupts
+    #     the *await asyncio.wait(...)* call directly and is caught by the
+    #     outer except clause, which performs the same sibling cleanup.
     try:
         while active:
             done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+            # Task 586: scan the full done batch for ALL CancelledErrors before
+            # processing any results.  Multiple tasks can complete in the same
+            # event-loop iteration and land in the same done set (e.g. when a
+            # shutdown signal fires while two evals are parked at the same
+            # await point).  The old code raised on the first cancel it saw,
+            # silently discarding subsequent cancels in the batch.
+            cancel_errors: list[asyncio.CancelledError] = []
             for task in done:
                 if task.cancelled():
-                    exc = asyncio.CancelledError()
-                    logger.error(f'Eval cancelled: {exc}')
-                    for t in active:
-                        t.cancel()
-                    await asyncio.gather(*active, return_exceptions=True)
-                    active.clear()
-                    raise exc
+                    # task.cancel() was called and the coroutine propagated it.
+                    cancel_errors.append(asyncio.CancelledError())
+                else:
+                    exc = task.exception()
+                    if isinstance(exc, asyncio.CancelledError):
+                        # Defensive branch: coroutine raised CancelledError
+                        # internally without task.cancel() being called first.
+                        cancel_errors.append(exc)
+            if cancel_errors:
+                for ce in cancel_errors:
+                    logger.error('Eval cancelled', exc_info=ce)
+                for t in active:
+                    t.cancel()
+                await asyncio.gather(*active, return_exceptions=True)
+                active.clear()
+                raise cancel_errors[0]
+            # No cancellations in this batch — handle results and non-cancel
+            # exceptions.  task.cancelled() is False for all remaining tasks so
+            # task.exception() / task.result() are safe to call.
+            for task in done:
                 exc = task.exception()
                 if exc is not None:
-                    if isinstance(exc, asyncio.CancelledError):
-                        logger.error(f'Eval cancelled: {exc}')
-                        for t in active:
-                            t.cancel()
-                        await asyncio.gather(*active, return_exceptions=True)
-                        active.clear()
-                        raise exc
-                    logger.error(f'Eval failed: {exc}')
+                    logger.error('Eval failed', exc_info=exc)
                 else:
                     r = task.result()
                     if r is not None:
@@ -431,6 +460,7 @@ class _EvalScheduler:
 
     def __init__(self, config: OrchestratorConfig):
         self.config = config
+        self._status_cache: dict[str, str] = {}
 
     async def get_tasks(self):
         return []

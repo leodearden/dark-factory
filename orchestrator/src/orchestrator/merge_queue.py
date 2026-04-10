@@ -254,10 +254,11 @@ class MergeWorker:
             )
             if not verify.passed:
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
-                return MergeOutcome(
-                    'blocked',
-                    reason=f'Post-merge verification failed: {verify.summary}',
-                )
+                detail = verify.failure_report()
+                reason = f'Post-merge verification failed: {verify.summary}'
+                if detail:
+                    reason = f'{reason}\n\n{detail}'
+                return MergeOutcome('blocked', reason=reason)
 
         # 5. CAS advance_main
         assert merge_result.merge_commit is not None
@@ -900,9 +901,12 @@ class SpeculativeMergeWorker:
             if not verify.passed:
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if not req.result.done():
+                    detail = verify.failure_report()
+                    reason = f'Post-merge verification failed: {verify.summary}'
+                    if detail:
+                        reason = f'{reason}\n\n{detail}'
                     req.result.set_result(MergeOutcome(
-                        'blocked',
-                        reason=f'Post-merge verification failed: {verify.summary}',
+                        'blocked', reason=reason,
                     ))
                 return False
         else:

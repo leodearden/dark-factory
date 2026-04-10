@@ -32,6 +32,11 @@ class DashboardConfig:
         from_env(), dataclass.replace(), test fixtures — produces a config
         whose Path fields are already canonicalized.  Consumers never need to
         call .resolve() on config paths.
+
+        Note: Path.resolve() follows all existing symlink segments, but any trailing
+        path components that do not yet exist on disk are appended verbatim (absolute
+        but not symlink-canonicalized).  If such components are later created as
+        symlinks, the stored path will not reflect their targets.
         """
         self.project_root = self.project_root.resolve()
         self.known_project_roots = [p.resolve() for p in self.known_project_roots]

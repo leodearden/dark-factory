@@ -91,9 +91,9 @@ Analyze these pending escalations for shared root causes.
 After cross-escalation analysis, separate escalations by level. Escalations have a `level` field: 0 = agent-to-steward, 1 = steward-to-human.
 
 - **Level 1**: handle according to the category rules below. This is the skill's primary job.
-- **Level 0**: these should have been handled by the task steward. If level-0 escalations are sitting pending, it means the steward isn't processing them — likely because the orchestrator isn't running. Flag this to the human: "N level-0 escalations are pending, which suggests the steward/orchestrator isn't active." Don't handle level-0 escalations yourself unless the human explicitly asks you to.
+- **Level 0**: these are handled by the task steward automatically — this typically takes a few minutes. **Leave them alone.** They are included in cross-escalation analysis (above) so you can spot patterns, but do not flag them as problems and do not handle them yourself. If the cross-escalation analysis reveals a cluster of L0 escalations sharing a root cause, report the pattern to the human as useful context — but don't treat the individual L0 escalations as action items.
 
-Include any cluster analysis results when reporting level-0 escalations to the human — "4 of the 6 level-0 escalations share a root cause: bad merge resolution lost geometric type code" is far more actionable than listing them individually.
+**Exception:** if the human explicitly asks you to process everything (all levels), then handle L0 escalations using the same category rules as L1.
 
 ### Starting the watcher
 

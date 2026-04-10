@@ -2,11 +2,16 @@
 
 Reads from data/orchestrator/runs.db (invocations and account_events tables
 written by CostStore) to produce per-project and per-account cost statistics.
+
+When multiple project roots are configured, the ``aggregate_*`` functions
+query each project's runs.db in parallel and merge the results.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -375,19 +380,33 @@ async def get_run_cost_breakdown(
     since = _cutoff(days)
 
     async def _query(db: aiosqlite.Connection) -> list[dict]:
-        rows = await db.execute_fetchall(
-            'SELECT i.run_id, i.project_id, i.task_id, '
-            '       tr.title, '
-            '       i.model, i.role, i.cost_usd, '
-            '       i.account_name, i.duration_ms, i.capped '
-            '  FROM invocations i '
-            '  LEFT JOIN task_results tr '
-            '    ON i.run_id = tr.run_id AND i.task_id = tr.task_id '
-            ' WHERE i.completed_at >= ? '
-            ' ORDER BY i.run_id, i.task_id, i.id'
-            ' LIMIT ?',
-            (since, limit),
-        )
+        try:
+            rows = await db.execute_fetchall(
+                'SELECT i.run_id, i.project_id, i.task_id, '
+                '       tr.title, '
+                '       i.model, i.role, i.cost_usd, '
+                '       i.account_name, i.duration_ms, i.capped '
+                '  FROM invocations i '
+                '  LEFT JOIN task_results tr '
+                '    ON i.run_id = tr.run_id AND i.task_id = tr.task_id '
+                ' WHERE i.completed_at >= ? '
+                ' ORDER BY i.run_id, i.task_id, i.id'
+                ' LIMIT ?',
+                (since, limit),
+            )
+        except sqlite3.OperationalError:
+            # task_results table may not exist in all project DBs
+            rows = await db.execute_fetchall(
+                'SELECT run_id, project_id, task_id, '
+                '       NULL AS title, '
+                '       model, role, cost_usd, '
+                '       account_name, duration_ms, capped '
+                '  FROM invocations '
+                ' WHERE completed_at >= ? '
+                ' ORDER BY run_id, task_id, id'
+                ' LIMIT ?',
+                (since, limit),
+            )
 
         # Build nested structure: run_id → task_id → invocations
         runs: dict[str, dict] = {}
@@ -437,3 +456,155 @@ async def get_run_cost_breakdown(
         return result
 
     return await with_db(db, _query, [])
+
+
+# ===========================================================================
+# Multi-DB aggregation
+# ===========================================================================
+
+
+async def aggregate_cost_summary(
+    dbs: list[aiosqlite.Connection | None],
+    *,
+    days: int = 7,
+) -> dict[str, dict]:
+    """Merge :func:`get_cost_summary` results from multiple databases."""
+    results = await asyncio.gather(*(get_cost_summary(db, days=days) for db in dbs))
+    merged: dict[str, dict] = {}
+    for result in results:
+        for pid, info in result.items():
+            if pid not in merged:
+                merged[pid] = dict(info)
+            else:
+                m = merged[pid]
+                m['total_spend'] += info['total_spend']
+                m['task_count'] += info['task_count']
+                m['active_accounts'] += info['active_accounts']
+                m['cap_events'] += info['cap_events']
+                tc = m['task_count']
+                m['avg_cost_per_task'] = m['total_spend'] / tc if tc else 0.0
+    return merged
+
+
+async def aggregate_cost_by_project(
+    dbs: list[aiosqlite.Connection | None],
+    *,
+    days: int = 7,
+) -> dict[str, list[dict]]:
+    """Merge :func:`get_cost_by_project` results from multiple databases."""
+    results = await asyncio.gather(*(get_cost_by_project(db, days=days) for db in dbs))
+    merged: dict[str, list[dict]] = {}
+    for result in results:
+        for pid, models in result.items():
+            if pid not in merged:
+                merged[pid] = list(models)
+            else:
+                merged[pid].extend(models)
+    return merged
+
+
+async def aggregate_cost_by_account(
+    dbs: list[aiosqlite.Connection | None],
+    *,
+    days: int = 7,
+) -> dict[str, dict]:
+    """Merge :func:`get_cost_by_account` across databases.
+
+    Accounts are shared across projects, so spend/invocations/cap_events are
+    summed.  Status uses a conservative one-way latch: ``'capped'`` if *any*
+    source reports capped (the per-DB function doesn't expose the resumed
+    timestamp, so we can't determine global ordering).
+    ``last_cap`` takes the most recent timestamp.
+    """
+    results = await asyncio.gather(*(get_cost_by_account(db, days=days) for db in dbs))
+    merged: dict[str, dict] = {}
+    for result in results:
+        for acct, info in result.items():
+            if acct not in merged:
+                merged[acct] = dict(info)
+            else:
+                m = merged[acct]
+                m['spend'] += info['spend']
+                m['invocations'] += info['invocations']
+                m['cap_events'] += info['cap_events']
+                if info['last_cap'] and (not m['last_cap'] or info['last_cap'] > m['last_cap']):
+                    m['last_cap'] = info['last_cap']
+                if info['status'] == 'capped':
+                    m['status'] = 'capped'
+    return merged
+
+
+async def aggregate_cost_by_role(
+    dbs: list[aiosqlite.Connection | None],
+    *,
+    days: int = 7,
+) -> dict[str, dict]:
+    """Merge :func:`get_cost_by_role` results from multiple databases."""
+    results = await asyncio.gather(*(get_cost_by_role(db, days=days) for db in dbs))
+    merged: dict[str, dict] = {}
+    for result in results:
+        for pid, roles in result.items():
+            if pid not in merged:
+                merged[pid] = {}
+            for role, models in roles.items():
+                if role not in merged[pid]:
+                    merged[pid][role] = {}
+                for model, total in models.items():
+                    merged[pid][role][model] = merged[pid][role].get(model, 0.0) + total
+    return merged
+
+
+async def aggregate_cost_trend(
+    dbs: list[aiosqlite.Connection | None],
+    *,
+    days: int = 7,
+) -> dict[str, list[dict]]:
+    """Merge :func:`get_cost_trend` results from multiple databases."""
+    results = await asyncio.gather(*(get_cost_trend(db, days=days) for db in dbs))
+    merged: dict[str, list[dict]] = {}
+    for result in results:
+        for pid, series in result.items():
+            if pid not in merged:
+                merged[pid] = list(series)
+            else:
+                existing = {e['day']: e for e in merged[pid]}
+                for entry in series:
+                    if entry['day'] in existing:
+                        existing[entry['day']]['total'] += entry['total']
+                    else:
+                        existing[entry['day']] = dict(entry)
+                merged[pid] = sorted(existing.values(), key=lambda e: e['day'])
+    return merged
+
+
+async def aggregate_account_events(
+    dbs: list[aiosqlite.Connection | None],
+    *,
+    days: int = 7,
+    limit: int = 200,
+) -> list[dict]:
+    """Merge :func:`get_account_events` from multiple databases."""
+    results = await asyncio.gather(
+        *(get_account_events(db, days=days, limit=limit) for db in dbs),
+    )
+    combined: list[dict] = []
+    for result in results:
+        combined.extend(result)
+    combined.sort(key=lambda e: e['created_at'], reverse=True)
+    return combined[:limit]
+
+
+async def aggregate_run_cost_breakdown(
+    dbs: list[aiosqlite.Connection | None],
+    *,
+    days: int = 7,
+    limit: int = 500,
+) -> list[dict]:
+    """Merge :func:`get_run_cost_breakdown` from multiple databases."""
+    results = await asyncio.gather(
+        *(get_run_cost_breakdown(db, days=days, limit=limit) for db in dbs),
+    )
+    combined: list[dict] = []
+    for result in results:
+        combined.extend(result)
+    return combined

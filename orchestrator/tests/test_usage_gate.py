@@ -84,11 +84,13 @@ class TestDetectCapHit:
         # "You're out of extra usage" was observed as a real cap signal.
         gate = _make_gate(num_accounts=1)
         assert gate.detect_cap_hit(
-            "You're out of extra usage for this period.", '', oauth_token='token-a'
+            "You're out of extra usage for this period. Your plan resets in 1h.", '', oauth_token='token-a'
         ) is True
-        assert gate.detect_cap_hit(
-            '', "You're now using extra usage credits.", oauth_token='token-a'
-        ) is False
+        # "You're now using extra" is a CAP_HIT (overage billing started)
+        gate2 = _make_gate(num_accounts=1)
+        assert gate2.detect_cap_hit(
+            '', "You're now using extra usage credits. Your plan resets in 1h.", oauth_token='token-a'
+        ) is True
 
     def test_detects_near_cap_close_to(self):
         gate = _make_gate(num_accounts=1)
@@ -102,7 +104,7 @@ class TestDetectCapHit:
 
     def test_case_insensitive(self):
         gate = _make_gate(num_accounts=1)
-        assert gate.detect_cap_hit("YOU'VE HIT YOUR limit", '', oauth_token='token-a') is True
+        assert gate.detect_cap_hit("YOU'VE HIT YOUR usage limit resets in 3h", '', oauth_token='token-a') is True
 
 
 # --- Reset time parsing ---
@@ -442,11 +444,11 @@ class TestThreeAccountFailover:
         token = await gate.before_invoke()
         assert token == 'token-a'
 
-        gate.detect_cap_hit("You've hit your limit", '', 'claude', 'token-a')
+        gate.detect_cap_hit("You've hit your usage limit resets in 3h", '', 'claude', 'token-a')
         token = await gate.before_invoke()
         assert token == 'token-b'
 
-        gate.detect_cap_hit("You've hit your limit", '', 'claude', 'token-b')
+        gate.detect_cap_hit("You've hit your usage limit resets in 3h", '', 'claude', 'token-b')
         token = await gate.before_invoke()
         assert token == 'token-c'
 
@@ -755,7 +757,7 @@ class TestSingleAccountUnifiedPath:
     @pytest.mark.asyncio
     async def test_cap_hit_marks_single_account(self):
         gate = _make_gate(num_accounts=1)
-        gate.detect_cap_hit("You've hit your limit", '', 'claude', 'token-a')
+        gate.detect_cap_hit("You've hit your usage limit resets in 3h", '', 'claude', 'token-a')
         assert gate._accounts[0].capped is True
         assert gate.is_paused
         assert not gate._open.is_set()
@@ -1286,7 +1288,7 @@ class TestNoCostStore:
 
         # Cap A via detect_cap_hit (cap_hit path)
         await gate.before_invoke()  # sets last_account_name = max-a
-        gate.detect_cap_hit("You've hit your limit", '', 'claude', 'token-a')
+        gate.detect_cap_hit("You've hit your usage limit resets in 3h", '', 'claude', 'token-a')
         await asyncio.sleep(0)
 
         # Failover to B

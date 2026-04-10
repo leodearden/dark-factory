@@ -1,0 +1,105 @@
+"""File-content tests for the dark-factory-dashboard systemd service files.
+
+These tests read the source-controlled service definition files directly —
+no systemd runtime is required.  They guard against drift between the
+template (scripts/dashboard.service.template, the true source of truth used
+by setup-host.sh) and the checked-in hardcoded copy
+(dashboard/dark-factory-dashboard.service).
+
+See also:
+  - tests/scripts/test_run_vllm_eval_lint.py  — pattern reference
+  - dashboard/src/dashboard/config.py line 84  — COMMA-separated split
+"""
+import pathlib
+
+REPO_ROOT = pathlib.Path(__file__).parents[2]
+TEMPLATE = REPO_ROOT / "scripts" / "dashboard.service.template"
+HARDCODED = REPO_ROOT / "dashboard" / "dark-factory-dashboard.service"
+
+TEMPLATE_EXPECTED_ENV_LINE = (
+    "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS="
+    "__REPO_ROOT__,"
+    "/home/leo/src/reify,"
+    "/home/leo/src/autopilot-video"
+)
+
+HARDCODED_EXPECTED_ENV_LINE = (
+    "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS="
+    "/home/leo/src/dark-factory,"
+    "/home/leo/src/reify,"
+    "/home/leo/src/autopilot-video"
+)
+
+
+def test_template_sets_known_project_roots() -> None:
+    """scripts/dashboard.service.template must declare DASHBOARD_KNOWN_PROJECT_ROOTS with __REPO_ROOT__ sentinel."""
+    content = TEMPLATE.read_text(encoding="utf-8")
+    assert TEMPLATE_EXPECTED_ENV_LINE in content, (
+        f"Expected line not found in {TEMPLATE}:\n  {TEMPLATE_EXPECTED_ENV_LINE!r}\n"
+        "The template must use __REPO_ROOT__ as the self entry, not a hardcoded path. "
+        "Add it to the [Service] section after the ExecStart block."
+    )
+
+
+def test_hardcoded_service_file_sets_known_project_roots() -> None:
+    """dashboard/dark-factory-dashboard.service must declare DASHBOARD_KNOWN_PROJECT_ROOTS with literal path."""
+    content = HARDCODED.read_text(encoding="utf-8")
+    assert HARDCODED_EXPECTED_ENV_LINE in content, (
+        f"Expected line not found in {HARDCODED}:\n  {HARDCODED_EXPECTED_ENV_LINE!r}\n"
+        "Add it to the [Service] section after the ExecStart block."
+    )
+
+
+def test_known_project_roots_uses_comma_separator_not_colon() -> None:
+    """Both service files must use commas (not colons) to separate project roots.
+
+    The consumer code is ``roots.split(',')`` — a colon-separated value would
+    be parsed as a single path literal and silently aggregate nothing.
+
+    Two colon patterns are checked:
+    - The literal-path form (guards both files)
+    - The sentinel form (guards the template against accidental colon use after
+      __REPO_ROOT__ is substituted back in)
+    """
+    literal_colon_pattern = (
+        "DASHBOARD_KNOWN_PROJECT_ROOTS="
+        "/home/leo/src/dark-factory:"
+    )
+    sentinel_colon_pattern = (
+        "DASHBOARD_KNOWN_PROJECT_ROOTS="
+        "__REPO_ROOT__:"
+    )
+    for path in (TEMPLATE, HARDCODED):
+        content = path.read_text(encoding="utf-8")
+        assert literal_colon_pattern not in content, (
+            f"Colon-separated DASHBOARD_KNOWN_PROJECT_ROOTS (literal path) found in {path}. "
+            "Use commas — the parser at dashboard/src/dashboard/config.py:84 "
+            "calls roots.split(',')."
+        )
+        assert sentinel_colon_pattern not in content, (
+            f"Colon-separated DASHBOARD_KNOWN_PROJECT_ROOTS (__REPO_ROOT__ sentinel) found in {path}. "
+            "Use commas — the parser at dashboard/src/dashboard/config.py:84 "
+            "calls roots.split(',')."
+        )
+
+
+def test_comment_warns_about_systemd_space_handling() -> None:
+    """Both service files must carry the systemd-aware comment for DASHBOARD_KNOWN_PROJECT_ROOTS.
+
+    The old wording 'comma-separated, no spaces' was misleading — the Python parser
+    tolerates whitespace around commas.  The real hazard is systemd: spaces inside
+    an Environment= value are treated as separators between variable assignments.
+    The updated comment makes this explicit so future editors understand why spaces
+    are forbidden.
+    """
+    expected_comment = (
+        "# Multi-project cost aggregation "
+        "(comma-separated; avoid spaces inside the value \u2014 "
+        "systemd would treat them as assignment separators)"
+    )
+    for path in (TEMPLATE, HARDCODED):
+        content = path.read_text(encoding="utf-8")
+        assert expected_comment in content, (
+            f"Systemd-aware comment not found in {path}:\n  {expected_comment!r}\n"
+            "Update the comment above the Environment=DASHBOARD_KNOWN_PROJECT_ROOTS line."
+        )

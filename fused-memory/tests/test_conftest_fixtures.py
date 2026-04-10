@@ -93,6 +93,11 @@ class TestExtractCypher:
         call_args = call(query='MATCH (n) RETURN n')
         assert extract_cypher(call_args) == 'MATCH (n) RETURN n'
 
+    def test_keyword_query_returns_query_among_other_kwargs(self):
+        """When 'query' kwarg is passed alongside other kwargs, returns the 'query' value specifically, not an arbitrary kwarg value."""
+        call_args = call(query='MATCH (n) RETURN n', params={'uuid': 'x'})
+        assert extract_cypher(call_args) == 'MATCH (n) RETURN n'
+
     def test_empty_call_returns_empty_string(self):
         """When neither positional nor keyword query is present, returns empty string."""
         call_args = call()

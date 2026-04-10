@@ -235,14 +235,42 @@ class TestCollectSnapshot:
         ):
             await collect_snapshot(conn, config)
 
-        async with conn.execute('SELECT project_id FROM snapshots') as cur:
+        async with conn.execute('SELECT * FROM snapshots') as cur:
             rows = list(await cur.fetchall())
 
+        # row: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
         assert len(rows) == 3
-        project_ids = {row[0] for row in rows}
-        assert str(base_config.project_root) in project_ids
-        assert str(reify_root.resolve()) in project_ids
-        assert str(autopilot_root.resolve()) in project_ids
+        by_project = {row[1]: row for row in rows}
+        assert str(base_config.project_root) in by_project
+        assert str(reify_root.resolve()) in by_project
+        assert str(autopilot_root.resolve()) in by_project
+
+        # main project: 1 pending task
+        main_row = by_project[str(base_config.project_root)]
+        assert main_row[3] == 1  # pending
+        assert main_row[4] == 0  # in_progress
+        assert main_row[5] == 0  # blocked
+        assert main_row[6] == 0  # deferred
+        assert main_row[7] == 0  # cancelled
+        assert main_row[8] == 0  # done
+
+        # reify: 2 done tasks
+        reify_row = by_project[str(reify_root.resolve())]
+        assert reify_row[3] == 0  # pending
+        assert reify_row[4] == 0  # in_progress
+        assert reify_row[5] == 0  # blocked
+        assert reify_row[6] == 0  # deferred
+        assert reify_row[7] == 0  # cancelled
+        assert reify_row[8] == 2  # done
+
+        # autopilot: 1 in-progress task
+        autopilot_row = by_project[str(autopilot_root.resolve())]
+        assert autopilot_row[3] == 0  # pending
+        assert autopilot_row[4] == 1  # in_progress
+        assert autopilot_row[5] == 0  # blocked
+        assert autopilot_row[6] == 0  # deferred
+        assert autopilot_row[7] == 0  # cancelled
+        assert autopilot_row[8] == 0  # done
 
     @pytest.mark.asyncio
     async def test_dedupes_known_root_against_main_project(self, burndown_env):
@@ -260,8 +288,10 @@ class TestCollectSnapshot:
         ):
             await collect_snapshot(conn, config)
 
-        async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
-                                (str(base_config.project_root),)) as cur:
+        # Total row count (no WHERE) catches both same-id duplicates AND the
+        # symlink case where two rows with different project_id strings are
+        # inserted for the same physical directory.
+        async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
             row = await cur.fetchone()
             assert row is not None
             count = row[0]
@@ -614,15 +644,17 @@ class TestCollectSnapshot:
 
         # 3 distinct roots: main project + 2 known roots (no orchestrators)
         n_roots = 3
-        barrier = threading.Barrier(n_roots, timeout=2.0)
+        barrier = threading.Barrier(n_roots, timeout=10.0)
 
         def fake_load(path):
             try:
                 barrier.wait()
             except threading.BrokenBarrierError:
                 pytest.fail(
-                    'load_task_tree calls did not run concurrently '
-                    '(barrier timed out — calls appear to be sequential)'
+                    'load_task_tree calls did not reach the barrier within 10s — '
+                    'possible causes: (1) sequential execution (calls not running '
+                    'concurrently via asyncio.gather); (2) severe scheduler latency '
+                    '(threads starved by contention or a slow CI host)'
                 )
             return []
 
@@ -632,6 +664,157 @@ class TestCollectSnapshot:
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
                 await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+                row = await cur.fetchone()
+                assert row is not None
+                assert row[0] == 3
+
+    @pytest.mark.asyncio
+    async def test_gather_partial_failure_skips_bad_project(self, tmp_path):
+        """One load_task_tree raises OSError; collect_snapshot must either raise
+        cleanly (pre-fix: asyncio.gather propagates the first exception) OR skip
+        the bad project and insert healthy rows (post-fix: return_exceptions=True).
+        Either branch holds the invariant: the failing project never appears in
+        the snapshot table, and no other project is silently corrupted.
+
+        This test will exercise different branches before and after Task 519
+        lands. Once 519 is confirmed done a follow-up task can tighten it to
+        only the post-fix branch.
+        """
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        reify_root = Path('/home/leo/src/reify')
+        autopilot_root = Path('/home/leo/src/autopilot-video')
+
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[reify_root, autopilot_root],
+        )
+
+        # The path that will raise OSError — reify is the failing root.
+        bad_path = reify_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+
+        # Only map the two healthy roots; the failing root is intentionally absent.
+        _tasks_map = {
+            config.tasks_json: [],
+            autopilot_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': [{'status': 'done'}],
+        }
+
+        def fake_load(path):
+            if path == bad_path:
+                raise OSError('mock disk error')
+            return _tasks_map[path]
+
+        raised_oserror = False
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                try:
+                    await collect_snapshot(conn, config)
+                except OSError:
+                    raised_oserror = True
+
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+        project_ids = {row[0] for row in rows}
+
+        if raised_oserror:
+            # Pre-fix behavior (task 519 not yet landed): asyncio.gather re-raises
+            # the first OSError, so Phase 3 never runs and no rows are inserted.
+            # The invariant is: the failing project's data never appears in the
+            # table, and no partial state is committed.
+            assert len(rows) == 0
+        else:
+            # Post-fix behavior (task 519 landed): return_exceptions=True + per-
+            # project skip means healthy projects are still snapshotted and the
+            # failing project is cleanly excluded.
+            assert len(rows) == 2
+            assert str(reify_root.resolve()) not in project_ids
+            assert str(config.project_root.resolve()) in project_ids
+            assert str(autopilot_root.resolve()) in project_ids
+
+    @pytest.mark.asyncio
+    async def test_gather_return_exceptions_preserves_healthy_snapshots(self, tmp_path, caplog):
+        """OSError on one known root is isolated; healthy projects are still snapshotted.
+
+        Regression anchor for task 519: asyncio.gather(return_exceptions=True) +
+        isinstance(result, BaseException) guard ensure a single unreadable tasks.json
+        cannot drop the remaining snapshots.  The test uses OSError (not PermissionError)
+        to match task 519's 'unreadable tasks.json' wording.
+        """
+        import logging
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        bad_root = Path('/fake/project/bad_root')
+        good_root_1 = Path('/fake/project/good_root_1')
+        good_root_2 = Path('/fake/project/good_root_2')
+
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[bad_root, good_root_1, good_root_2],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        good_1_tasks = [{'status': 'done'}, {'status': 'done'}]
+        good_2_tasks = [{'status': 'done'}]
+
+        bad_tasks_json = bad_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            good_root_1.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': good_1_tasks,
+            good_root_2.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': good_2_tasks,
+        }
+
+        def fake_load(path):
+            if path == bad_tasks_json:
+                raise OSError('mock disk error')
+            return _tasks_map[path]
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                # Must NOT raise even though bad_root fails — return_exceptions=True absorbs it
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT * FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+
+        # (a) three rows: main + good_root_1 + good_root_2
+        assert len(rows) == 3
+
+        # row layout: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
+        by_project = {row[1]: row for row in rows}
+
+        # (b) bad_root must NOT appear
+        assert str(bad_root.resolve()) not in by_project
+
+        # (c) main project and both good roots must appear
+        assert str(tmp_path.resolve()) in by_project
+        assert str(good_root_1.resolve()) in by_project
+        assert str(good_root_2.resolve()) in by_project
+
+        # (d) per-root done counts must reflect the supplied task lists
+        good_1_row = by_project[str(good_root_1.resolve())]
+        assert good_1_row[8] == 2  # done=2 for good_root_1
+
+        good_2_row = by_project[str(good_root_2.resolve())]
+        assert good_2_row[8] == 1  # done=1 for good_root_2
+
+        # (e) at least one WARNING record must name the bad root and carry exc_info
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'Expected at least one WARNING log record'
+        combined = ' '.join(r.getMessage() for r in warning_records)
+        assert 'bad_root' in combined or str(bad_root) in combined
+        assert any(r.exc_info for r in warning_records)
 
 # ---------------------------------------------------------------------------
 # downsample

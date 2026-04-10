@@ -128,24 +128,46 @@ def make_backend():
 
 @pytest.fixture
 def make_graph_mock():
-    """Factory fixture: returns a callable(rows) -> MagicMock graph with AsyncMock queries.
+    """Factory fixture: returns a callable(rows, *, ro_rows, q_rows) -> MagicMock graph.
 
-    The returned mock has both .query and .ro_query as AsyncMocks returning a result
-    object whose .result_set is *rows*.  This is a superset of the helpers in
-    test_reindex.py and test_cleanup_stale_edges.py.
+    The returned mock has both .query and .ro_query as AsyncMocks.
 
-    Usage::
+    Basic usage (backward-compatible): both .query and .ro_query return the same
+    result whose .result_set is *rows*::
 
-        def test_foo(self, make_graph_mock):
-            graph = make_graph_mock([['uuid-1', 'label']])
-            cast_target._get_graph.return_value = graph
+        graph = make_graph_mock([['uuid-1', 'label']])
+
+    Split usage: supply *ro_rows* and/or *q_rows* to give each path a distinct
+    result_set.  This is useful when ro_query and query must return different data
+    (e.g. delete_entity_node: pre-check returns a row, DETACH DELETE returns [])::
+
+        graph = make_graph_mock(ro_rows=[['NodeName', 'summary']], q_rows=[])
+
+    The returned graph mock can be wired up as::
+
+        backend._driver._get_graph = MagicMock(return_value=graph)
     """
-    def _factory(rows: list[list]) -> MagicMock:
-        result = MagicMock()
-        result.result_set = rows
+    def _factory(
+        rows: list[list] | None = None,
+        *,
+        ro_rows: list[list] | None = None,
+        q_rows: list[list] | None = None,
+    ) -> MagicMock:
+        if ro_rows is not None or q_rows is not None:
+            # Split mode: create separate result objects for each path.
+            ro_result = MagicMock()
+            ro_result.result_set = ro_rows if ro_rows is not None else (rows or [])
+            q_result = MagicMock()
+            q_result.result_set = q_rows if q_rows is not None else (rows or [])
+        else:
+            # Shared mode (backward-compatible): both paths use the same result.
+            ro_result = MagicMock()
+            ro_result.result_set = rows if rows is not None else []
+            q_result = ro_result
+
         graph_mock = MagicMock()
-        graph_mock.query = AsyncMock(return_value=result)
-        graph_mock.ro_query = AsyncMock(return_value=result)
+        graph_mock.query = AsyncMock(return_value=q_result)
+        graph_mock.ro_query = AsyncMock(return_value=ro_result)
         return graph_mock
 
     return _factory
@@ -227,6 +249,39 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
 #   cypher = extract_cypher(call_args)   # str
 #   params = extract_params(call_args)   # dict
 # ---------------------------------------------------------------------------
+
+
+async def assert_ro_query_only(
+    backend,
+    make_graph_mock_fn,
+    rows: list[list],
+    method_name: str,
+    *args,
+    **kwargs,
+) -> MagicMock:
+    """Assert that a backend method uses ro_query and never calls query.
+
+    Creates a graph mock via *make_graph_mock_fn*, wires it into
+    *backend._driver._get_graph*, invokes the named method, then asserts:
+      - graph.ro_query was awaited exactly once
+      - graph.query was not awaited at all
+
+    Returns the graph mock so callers can add additional assertions (e.g.
+    inspecting Cypher content via graph.ro_query.call_args).
+
+    Usage::
+
+        graph = await assert_ro_query_only(
+            backend, make_graph_mock, [['Node', 'Summary']],
+            'get_node_text', 'uuid-1', group_id='test',
+        )
+    """
+    graph = make_graph_mock_fn(rows)
+    backend._driver._get_graph = MagicMock(return_value=graph)
+    await getattr(backend, method_name)(*args, **kwargs)
+    graph.ro_query.assert_awaited_once()
+    graph.query.assert_not_awaited()
+    return graph
 
 
 def extract_cypher(call_args: Any) -> str:

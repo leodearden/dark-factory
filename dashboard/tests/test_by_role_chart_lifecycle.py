@@ -21,7 +21,7 @@ _MOCK_BY_ROLE = {
 
 def _patch_by_role(return_value=_MOCK_BY_ROLE):
     return patch(
-        'dashboard.app.get_cost_by_role',
+        'dashboard.app.aggregate_cost_by_role',
         new_callable=AsyncMock,
         return_value=return_value,
     )

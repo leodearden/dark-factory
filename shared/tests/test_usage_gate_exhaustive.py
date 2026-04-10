@@ -227,12 +227,6 @@ class TestCapDetectionPatterns:
 
     # --- Realistic near-cap smoke tests (verbatim Claude UI strings) ---
 
-    def test_realistic_near_cap_extra_compute_credits(self):
-        """Verbatim: 'You're now using extra compute credits. Your plan resets in 4h.'"""
-        gate = make_gate(['a'])
-        msg = "You're now using extra compute credits. Your plan resets in 4h."
-        assert gate.detect_cap_hit('', msg) is True
-
     def test_realistic_near_cap_close_to_limit(self):
         """Verbatim: 'You're close to reaching your usage limit. Your plan resets in 1h.'"""
         gate = make_gate(['a'])
@@ -255,21 +249,21 @@ class TestCapDetectionPatterns:
             "You're out of extra usage for this billing period. Your plan resets in 2h.",
             True,
         ),
+        (
+            "You're now using extra compute credits. Your plan resets in 1h.",
+            True,
+        ),
         # NEAR_CAP_PREFIXES
         (
             "You're close to reaching your plan limit. Your plan resets in 5h.",
-            True,
-        ),
-        (
-            "You're now using extra compute credits. Your plan resets in 1h.",
             True,
         ),
     ], ids=[
         'cap_hit_prefix_hit_your',
         'cap_hit_prefix_used',
         'cap_hit_prefix_out_of_extra',
+        'cap_hit_prefix_now_using_extra',
         'near_cap_prefix_close_to',
-        'near_cap_prefix_now_using_extra',
     ])
     def test_realistic_cap_messages(self, message, expected):
         gate = make_gate(['a'])
@@ -291,7 +285,7 @@ class TestNearCapStateDistinction:
     def test_near_cap_does_not_set_capped_true(self):
         """NEAR_CAP message must NOT set acct.capped=True; must set acct.near_cap=True."""
         gate = make_gate(['a'])
-        msg = "You're now using extra compute credits. Your plan resets in 4h."
+        msg = "You're close to reaching your usage limit. Your plan resets in 4h."
         result = gate.detect_cap_hit('', msg)
         acct = gate._accounts[0]
         assert result is True               # detection must still return True
@@ -312,7 +306,7 @@ class TestNearCapStateDistinction:
         gate = make_gate(['a'])
         acct = gate._accounts[0]
 
-        gate.detect_cap_hit('', "You're now using extra compute credits. Your plan resets in 4h.")
+        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 4h.")
         assert acct.near_cap is True
         assert acct.capped is False
 
@@ -329,9 +323,156 @@ class TestNearCapStateDistinction:
     def test_near_cap_does_not_start_resume_probe(self):
         """NEAR_CAP must NOT launch a resume probe task."""
         gate = make_gate(['a'], wait_for_reset=True)
-        gate.detect_cap_hit('', "You're now using extra compute credits. Your plan resets in 4h.")
+        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 4h.")
         acct = gate._accounts[0]
         assert acct.resume_task is None
+
+    def test_near_cap_fires_cost_event_with_cost_store(self):
+        """_handle_near_cap_warning must fire a cost event when cost_store is set."""
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['a'], cost_store=cost_store)
+        msg = "You're close to reaching your usage limit. Your plan resets in 4h."
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate.detect_cap_hit('', msg)
+        mock_fire.assert_called_once()
+
+    def test_near_cap_no_cost_event_without_cost_store(self):
+        """_handle_near_cap_warning must NOT fire a cost event when cost_store is None."""
+        gate = make_gate(['a'], cost_store=None)
+        msg = "You're close to reaching your usage limit. Your plan resets in 4h."
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate.detect_cap_hit('', msg)
+        mock_fire.assert_not_called()
+
+
+# =========================================================================
+# TestCapHitNowUsingExtraSemantics
+# =========================================================================
+
+
+class TestCapHitNowUsingExtraSemantics:
+    """Behavioral tests asserting 'You're now using extra' triggers CAP_HIT, not NEAR_CAP.
+
+    'You're now using extra compute credits' means the account has crossed the
+    base plan's hard cap and is billing overage — semantically equivalent to a
+    cap hit, not merely a warning. These tests FAIL until step-3 moves the
+    prefix from NEAR_CAP_PREFIXES to CAP_HIT_PREFIXES.
+    """
+
+    # All messages include 'resets' as a secondary keyword so they remain valid
+    # through the step-6 CAP_CONFIRM_KEYWORDS enforcement.
+
+    _MSG = "You're now using extra compute credits. Your plan resets in 4h."
+
+    def test_now_using_extra_sets_capped_true(self):
+        """'You're now using extra' must set acct.capped=True (CAP_HIT routing)."""
+        gate = make_gate(['a'])
+        gate.detect_cap_hit('', self._MSG)
+        acct = gate._accounts[0]
+        assert acct.capped is True
+
+    def test_now_using_extra_does_not_set_near_cap(self):
+        """'You're now using extra' must leave acct.near_cap=False (not NEAR_CAP routing)."""
+        gate = make_gate(['a'])
+        gate.detect_cap_hit('', self._MSG)
+        acct = gate._accounts[0]
+        assert acct.near_cap is False
+
+    def test_now_using_extra_routes_to_handle_cap_detected(self):
+        """Only _handle_cap_detected must be called, not _handle_near_cap_warning."""
+        gate = make_gate(['a'])
+        with patch.object(gate, '_handle_cap_detected') as mock_cap, \
+                patch.object(gate, '_handle_near_cap_warning') as mock_near:
+            gate.detect_cap_hit('', self._MSG)
+        mock_cap.assert_called_once()
+        mock_near.assert_not_called()
+
+    def test_now_using_extra_closes_gate_when_single_account(self):
+        """A single-account gate must close (_open cleared) after a cap hit."""
+        gate = make_gate(['a'])
+        gate.detect_cap_hit('', self._MSG)
+        assert gate._open.is_set() is False
+
+    def test_now_using_extra_parses_resets_at_from_message(self):
+        """_handle_cap_detected must parse 'resets in 4h' and set acct.resets_at ~4h ahead."""
+        gate = make_gate(['a'])
+        before = datetime.now(UTC)
+        gate.detect_cap_hit('', self._MSG)
+        acct = gate._accounts[0]
+        assert acct.resets_at is not None
+        expected = before + timedelta(hours=4)
+        assert abs((acct.resets_at - expected).total_seconds()) < 5
+
+
+# =========================================================================
+# TestCapConfirmKeywordEnforcement
+# =========================================================================
+
+
+class TestCapConfirmKeywordEnforcement:
+    """Tests asserting CAP_CONFIRM_KEYWORDS secondary check is required.
+
+    detect_cap_hit must require BOTH a matching prefix AND at least one of
+    ['resets', 'usage limit', 'upgrade'] in the combined text, for both
+    CAP_HIT_PREFIXES and NEAR_CAP_PREFIXES (Claude backend). These tests FAIL
+    until step-6 enforces the guard in detect_cap_hit.
+    """
+
+    def test_cap_hit_prefix_without_confirm_keyword_returns_false(self):
+        """Prefix match alone must not trigger detection when no secondary keyword present."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit('', "You've used all the air in the room")
+        acct = gate._accounts[0]
+        assert result is False
+        assert acct.capped is False
+
+    def test_near_cap_prefix_without_confirm_keyword_returns_false(self):
+        """NEAR_CAP prefix alone must not trigger detection when no secondary keyword present."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit('', "You're close to the finish line")
+        acct = gate._accounts[0]
+        assert result is False
+        assert acct.near_cap is False
+
+    def test_cap_hit_prefix_with_resets_keyword_returns_true(self):
+        """Prefix + 'resets' secondary keyword must trigger CAP_HIT detection."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit('', "You've hit your quota. resets in 3h.")
+        acct = gate._accounts[0]
+        assert result is True
+        assert acct.capped is True
+
+    def test_cap_hit_prefix_with_usage_limit_keyword_returns_true(self):
+        """Prefix + 'usage limit' secondary keyword must trigger CAP_HIT detection."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit('', "You've hit your usage limit")
+        acct = gate._accounts[0]
+        assert result is True
+        assert acct.capped is True
+
+    def test_cap_hit_prefix_with_upgrade_keyword_returns_true(self):
+        """Prefix + 'upgrade' secondary keyword must trigger CAP_HIT detection."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit('', "You've used all credits. Upgrade for more.")
+        acct = gate._accounts[0]
+        assert result is True
+        assert acct.capped is True
+
+    def test_near_cap_prefix_with_confirm_keyword_returns_true(self):
+        """NEAR_CAP prefix + secondary keyword must trigger near-cap detection."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit('', "You're close to your usage limit")
+        acct = gate._accounts[0]
+        assert result is True
+        assert acct.near_cap is True
+
+    def test_confirm_keyword_without_prefix_returns_false(self):
+        """Confirm keyword alone (no matching prefix) must not trigger detection."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit(
+            '', 'Your test run resets the state and the upgrade worked',
+        )
+        assert result is False
 
 
 # =========================================================================
@@ -682,6 +823,31 @@ class TestRefreshCappedAccounts:
         assert all(not a.capped for a in gate._accounts)
         assert gate._open.is_set() is True
 
+    # --- near_cap clearing on uncap ---
+
+    async def test_clears_near_cap_on_uncap(self):
+        # near_cap AND capped: when reset time passes, uncap should also clear near_cap.
+        gate = make_gate(['a'])
+        gate._accounts[0].capped = True
+        gate._accounts[0].near_cap = True
+        gate._accounts[0].resets_at = datetime.now(UTC) - timedelta(minutes=1)
+        gate._accounts[0].pause_started_at = datetime.now(UTC) - timedelta(minutes=5)
+        result = await gate._refresh_capped_accounts()
+        assert result is True
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[0].near_cap is False
+
+    async def test_does_not_clear_near_cap_when_still_capped(self):
+        # Regression guard: near_cap must NOT be touched when account stays capped.
+        gate = make_gate(['a'])
+        gate._accounts[0].capped = True
+        gate._accounts[0].near_cap = True
+        gate._accounts[0].resets_at = datetime.now(UTC) + timedelta(hours=2)
+        result = await gate._refresh_capped_accounts()
+        assert result is False
+        assert gate._accounts[0].capped is True
+        assert gate._accounts[0].near_cap is True
+
 
 # =========================================================================
 # TestBeforeInvokeCore
@@ -867,6 +1033,40 @@ class TestConfirmAccountOk:
         gate._accounts.clear()
         gate.confirm_account_ok('any-token')
         # No crash
+
+    # --- near_cap clearing ---
+
+    def test_clears_near_cap_with_probe_in_flight(self):
+        gate = make_gate(['a'])
+        gate._accounts[0].near_cap = True
+        gate._accounts[0].probe_in_flight = True
+        gate.confirm_account_ok(gate._accounts[0].token)
+        assert gate._accounts[0].near_cap is False
+
+    def test_clears_near_cap_without_probe_in_flight(self):
+        # Happy-path bug: near_cap set, billing reset, no full cap hit, probe never ran.
+        gate = make_gate(['a'])
+        gate._accounts[0].near_cap = True
+        gate._accounts[0].probe_in_flight = False
+        gate._accounts[0].probe_count = 3
+        gate._open.clear()
+        gate.confirm_account_ok(gate._accounts[0].token)
+        assert gate._accounts[0].near_cap is False
+        # probe_count and gate should NOT change (only near_cap is cleared in this branch)
+        assert gate._accounts[0].probe_count == 3
+        assert gate._open.is_set() is False
+
+    def test_does_not_clear_near_cap_with_none_token(self):
+        gate = make_gate(['a'])
+        gate._accounts[0].near_cap = True
+        gate.confirm_account_ok(None)
+        assert gate._accounts[0].near_cap is True
+
+    def test_does_not_clear_near_cap_with_unknown_token(self):
+        gate = make_gate(['a'])
+        gate._accounts[0].near_cap = True
+        gate.confirm_account_ok('completely-unknown-token')
+        assert gate._accounts[0].near_cap is True
 
 
 # =========================================================================
