@@ -241,6 +241,178 @@ class TestDetectStaleSummaries:
         assert entity['duplicate_count'] == 0
         assert entity['summary_line_count'] == 2
 
+
+# ---------------------------------------------------------------------------
+# task-526: GraphitiBackend._detect_stale_summaries_dry_run (cheap probe)
+# ---------------------------------------------------------------------------
+
+class TestDetectStaleSummariesDryRun:
+    """Unit tests for GraphitiBackend._detect_stale_summaries_dry_run.
+
+    This private method is the memory-cheaper alternative to
+    ``_detect_stale_summaries_with_edges`` used by the force=False, dry_run=True
+    code path in ``rebuild_entity_summaries``.
+
+    Unlike the bulk variant, this probe issues up-to-N targeted
+    ``get_valid_edges_for_node`` calls (one per non-empty-summary entity)
+    and never materialises the O(E) all-edges dict.  The stale dict schema
+    it produces is identical to ``_detect_stale_summaries_with_edges`` so
+    that downstream consumers (e.g. the result['details'] field) see no
+    surface-level change.
+
+    These tests live in test_rebuild_entity_summaries.py (the canonical file
+    for rebuild_entity_summaries coverage) rather than in
+    test_graphiti_quality_433.py (task-433 quality improvements) per the
+    established layout where each backend method gets a dedicated test class.
+    See task 526 for the full design rationale.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_stale_list_and_total_count(self, mock_config, make_backend):
+        """Returns a (list, int) tuple where int is the total entity count.
+
+        Three entities:
+        - Alice: stale (summary != canonical)
+        - Bob: clean (summary matches canonical)
+        - Charlie: empty summary (cheap-skipped)
+
+        Expected: stale_list has 1 entry (Alice), total_count == 3.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-alice', 'name': 'Alice', 'summary': 'old fact'},
+            {'uuid': 'uuid-bob', 'name': 'Bob', 'summary': 'current fact'},
+            {'uuid': 'uuid-charlie', 'name': 'Charlie', 'summary': ''},
+        ])
+
+        def edges_for_node(node_uuid, *, group_id):
+            if node_uuid == 'uuid-alice':
+                return [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]
+            if node_uuid == 'uuid-bob':
+                return [{'uuid': 'e2', 'fact': 'current fact', 'name': 'edge2'}]
+            return []
+
+        backend.get_valid_edges_for_node = AsyncMock(side_effect=edges_for_node)
+
+        result = await backend._detect_stale_summaries_dry_run(group_id='test')
+
+        assert isinstance(result, tuple)
+        stale_list, total_count = result
+        assert isinstance(stale_list, list)
+        assert isinstance(total_count, int)
+        assert total_count == 3
+        assert len(stale_list) == 1
+        assert stale_list[0]['uuid'] == 'uuid-alice'
+
+    @pytest.mark.asyncio
+    async def test_flags_stale_entity_with_diagnostic_counts(self, mock_config, make_backend):
+        """Stale entity dict has the same schema as _detect_stale_summaries_with_edges.
+
+        Keys: uuid, name, summary, duplicate_count, stale_line_count,
+              valid_fact_count, summary_line_count.
+        """
+        backend = make_backend(mock_config)
+        # Summary has 'factA' duplicated and 'old' which is not a valid edge fact.
+        # valid edges: factA only.
+        # duplicate_count=1 ('factA' appears twice → 2-1=1 extra)
+        # stale_line_count=1 ('old' is not in valid_fact_set, 'factA' appears twice
+        #   but the duplicate is also 'factA' which IS in valid_fact_set, so only 'old' is stale)
+        # valid_fact_count=1 ('factA')
+        # summary_line_count=3 ('factA', 'factA', 'old')
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA\nfactA\nold'},
+        ])
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'},
+        ])
+
+        stale_list, total_count = await backend._detect_stale_summaries_dry_run(group_id='test')
+
+        assert total_count == 1
+        assert len(stale_list) == 1
+        entity = stale_list[0]
+
+        # Schema keys must exactly match _detect_stale_summaries_with_edges output
+        expected_keys = {
+            'uuid', 'name', 'summary',
+            'duplicate_count', 'stale_line_count', 'valid_fact_count', 'summary_line_count',
+        }
+        assert set(entity.keys()) == expected_keys
+
+        assert entity['uuid'] == 'uuid-1'
+        assert entity['name'] == 'Alice'
+        assert entity['summary'] == 'factA\nfactA\nold'
+        assert entity['duplicate_count'] == 1   # 'factA' appears twice → 1 extra
+        assert entity['stale_line_count'] == 1  # 'old' not in valid_fact_set
+        assert entity['valid_fact_count'] == 1  # deduped: only 'factA'
+        assert entity['summary_line_count'] == 3
+
+    @pytest.mark.asyncio
+    async def test_skips_clean_entity(self, mock_config, make_backend):
+        """Entity whose summary exactly matches canonical facts is not flagged as stale.
+
+        Summary 'current fact' matches the single valid edge fact → clean.
+        stale_list should be empty, but total_count is still 1.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'current fact'},
+        ])
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'},
+        ])
+
+        stale_list, total_count = await backend._detect_stale_summaries_dry_run(group_id='test')
+
+        assert stale_list == []
+        assert total_count == 1
+
+    @pytest.mark.asyncio
+    async def test_does_not_call_get_all_valid_edges(self, mock_config, make_backend):
+        """The dry_run probe never awaits get_all_valid_edges.
+
+        This is the defining property of the cheap probe: it fetches edges
+        per-entity via get_valid_edges_for_node rather than materialising the
+        O(E) bulk all-edges dict.  The assertion style follows the project's
+        AsyncMock convention (assert_not_awaited, not assert_not_called) as
+        enforced by TestEdgeFetchGuardAssertionStyle in test_graphiti_quality_433.py.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale fact'},
+        ])
+        backend.get_all_valid_edges = AsyncMock()
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'},
+        ])
+
+        await backend._detect_stale_summaries_dry_run(group_id='test')
+
+        backend.get_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_empty_summary_entity_without_edge_query(self, mock_config, make_backend):
+        """Empty-summary entities are cheap-skipped: no get_valid_edges_for_node call.
+
+        Empty summaries are 'not stale by definition' (matches the semantics
+        of _detect_stale_summaries_with_edges at graphiti_client.py:905-907).
+        The probe additionally saves the edge query for those entities.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Charlie', 'summary': ''},
+        ])
+        backend.get_valid_edges_for_node = AsyncMock()
+
+        stale_list, total_count = await backend._detect_stale_summaries_dry_run(group_id='test')
+
+        # Empty summary is not stale
+        assert stale_list == []
+        assert total_count == 1
+        # get_valid_edges_for_node must NOT have been called for the empty-summary entity
+        backend.get_valid_edges_for_node.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # step-3: GraphitiBackend.rebuild_entity_summaries
 # ---------------------------------------------------------------------------
