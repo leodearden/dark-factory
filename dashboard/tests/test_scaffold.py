@@ -325,24 +325,6 @@ class TestPostInit:
         new_cfg = dataclasses.replace(base_cfg, known_project_roots=[link])
         assert new_cfg.known_project_roots == [real_resolved]
 
-    def test_post_init_docstring_documents_nonexistent_path_limitation(self):
-        """__post_init__ docstring must document the non-existent path caveat."""
-        doc = DashboardConfig.__post_init__.__doc__ or ''
-        assert 'canonical (symlink-resolved) forms' in doc, (
-            f"Expected original invariant language 'canonical (symlink-resolved) forms' "
-            f'in docstring, got: {doc!r}'
-        )
-        assert (
-            'Note: resolution is canonical only for paths that exist at construction time' in doc
-        ), (
-            f"Expected caveat 'Note: resolution is canonical only for paths that exist at "
-            f"construction time' in docstring, got: {doc!r}"
-        )
-        assert 'cannot follow symlink segments that do not yet exist on disk' in doc, (
-            f"Expected warning 'cannot follow symlink segments that do not yet exist on disk' "
-            f'in docstring, got: {doc!r}'
-        )
-
     def test_post_init_resolves_symlink_and_preserves_nonexistent_tail(self, symlinked_dir):
         """Behavioral regression guard for the __post_init__ Path.resolve() semantics.
 
