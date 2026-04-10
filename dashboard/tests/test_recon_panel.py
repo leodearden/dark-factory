@@ -1236,3 +1236,18 @@ class TestMockRunsFactory:
         first = mock_runs()
         first[0]['events_processed'] = 999
         assert mock_runs()[0]['events_processed'] == 7
+
+    def test_mock_runs_no_journal_returns_fresh_copy_each_call(self):
+        """mock_runs_no_journal() must allocate new list and new inner dict objects on every call."""
+        # Distinct list identity
+        assert mock_runs_no_journal() is not mock_runs_no_journal()
+        # Distinct inner-dict identity
+        assert mock_runs_no_journal()[0] is not mock_runs_no_journal()[0]
+        # Mutation of one call's result must not affect the next call
+        first = mock_runs_no_journal()
+        first[0]['events_processed'] = 999
+        assert mock_runs_no_journal()[0]['events_processed'] == 7
+
+    def test_mock_runs_no_journal_has_zero_journal_entry_count(self):
+        """mock_runs_no_journal()[0]['journal_entry_count'] must be 0."""
+        assert mock_runs_no_journal()[0]['journal_entry_count'] == 0
