@@ -632,7 +632,7 @@ class TestRenderTaskLineAndFormatTaskList:
         """_render_task_line truncates deps to first 5 items with '...' suffix."""
         task = {'id': 2, 'status': 'in-progress', 'title': 'Y', 'dependencies': list(range(1, 9))}
         result = _render_task_line(task)
-        assert 'deps=[1, 2, 3, 4, 5]...' in result
+        assert result.endswith('deps=[1, 2, 3, 4, 5]...')
 
     def test_render_task_line_deps_none_normalized(self):
         """_render_task_line treats deps=None as empty list."""
