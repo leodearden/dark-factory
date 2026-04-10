@@ -758,6 +758,59 @@ class TestHandleCapDetected:
 
 
 # =========================================================================
+# TestResolveAccount
+# =========================================================================
+
+
+class TestResolveAccount:
+    """_resolve_account: token-match with uncapped-fallback."""
+
+    def test_resolves_by_token(self):
+        gate = make_gate(['a', 'b'])
+        token_b = gate._accounts[1].token
+        acct = gate._resolve_account(token_b)
+        assert acct is gate._accounts[1]
+
+    def test_unknown_token_falls_back_to_first_uncapped(self):
+        gate = make_gate(['a', 'b'])
+        acct = gate._resolve_account('unknown-token')
+        assert acct is gate._accounts[0]
+
+    def test_none_token_falls_back_to_first_uncapped(self):
+        gate = make_gate(['a', 'b'])
+        acct = gate._resolve_account(None)
+        assert acct is gate._accounts[0]
+
+    def test_fallback_skips_capped(self):
+        gate = make_gate(['a', 'b'])
+        gate._accounts[0].capped = True
+        acct = gate._resolve_account('unknown-token')
+        assert acct is gate._accounts[1]
+
+    def test_all_capped_unknown_token_returns_none(self):
+        gate = make_gate(['a', 'b'])
+        gate._accounts[0].capped = True
+        gate._accounts[1].capped = True
+        acct = gate._resolve_account('unknown-token')
+        assert acct is None
+
+    def test_empty_accounts_returns_none(self):
+        gate = make_gate(['a'])
+        gate._accounts.clear()
+        acct = gate._resolve_account('any-token')
+        assert acct is None
+
+    def test_token_match_preferred_even_when_capped(self):
+        """Token match wins over the uncapped-fallback, even if matched acct is capped."""
+        gate = make_gate(['a', 'b'])
+        gate._accounts[0].capped = True
+        token_a = gate._accounts[0].token
+        acct = gate._resolve_account(token_a)
+        # _find_account_by_token found accounts[0] by token; fallback does NOT apply
+        assert acct is gate._accounts[0]
+
+
+# =========================================================================
 # TestRefreshCappedAccounts
 # =========================================================================
 
