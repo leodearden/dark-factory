@@ -560,3 +560,92 @@ class TestContextAssemblerCancellation:
                 'mixed-batch scenario requires both tasks to dispatch — '
                 'the RuntimeError/CancelledError ordering premise was not exercised'
             )
+
+    @pytest.mark.asyncio
+    async def test_exception_only_batch_does_not_propagate(self, mock_memory):
+        """Plain RuntimeErrors must be caught by Pass 2, not re-raised by Pass 1.
+
+        Task 575 — guards the ``and not isinstance(ctx_result, Exception)`` clause
+        in the Pass 1 propagation check (context_assembler.py:134).  If that clause
+        were dropped (or the check widened to bare ``isinstance(ctx_result,
+        BaseException)``), a RuntimeError would be re-raised by Pass 1 instead of
+        being swallowed by Pass 2 and degraded to an event-only entry.
+
+        Directly patches assembler._fetch_context — bypassing _fetch_context's own
+        ``except Exception`` wrapper (lines 221-225) — so the RuntimeError lands in
+        batch_contexts exactly as the Pass 1 guard sees it.  assemble() must return
+        normally with all events present in degraded event-only mode and no context
+        items.
+        """
+        call_count = 0
+
+        async def patched_fetch_context(event, project_id):
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError('per-event failure')
+
+        assembler = _make_assembler(memory_service=mock_memory)
+
+        events = [
+            _make_event(
+                event_type=EventType.memory_added,
+                payload={'content_preview': f'event {i}'},
+            )
+            for i in range(3)
+        ]
+        watermark = _make_watermark()
+
+        with patch.object(assembler, '_fetch_context', new=patched_fetch_context):
+            result = await assembler.assemble(events, watermark, 'test-project')
+
+        assert len(result.events) == 3, 'all events must appear in degraded event-only payload'
+        assert len(result.context_items) == 0, 'no context items expected when every fetch fails'
+        assert call_count == 3, 'patched _fetch_context must be called once per event'
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates_from_second_batch(self, mock_memory):
+        """CancelledError raised on the second batch iteration must still propagate.
+
+        Task 575 — guards the while-loop structure in assemble()
+        (context_assembler.py:113-166).  The Pass 1 propagation check runs inside
+        the loop body on every iteration; this test forces two loop iterations and
+        verifies that Pass 1 fires on the second one.  A regression such as an
+        early-continue that skips the propagation check on subsequent iterations
+        would cause assemble() to return normally instead of raising.
+
+        Uses context_fetch_batch_size=10 with 12 events so that the first batch
+        (calls 1-10) succeeds and the CancelledError is raised on call 11 — the
+        first call of the second batch.
+
+        Sister test: test_cancelled_error_propagates_from_context_fetch (single-batch
+        variant) and test_cancelled_error_propagates_alongside_exception (mixed-batch
+        variant in the first batch).
+        """
+        call_count = 0
+
+        async def patched_fetch_context(event, project_id):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 11:
+                raise asyncio.CancelledError()
+            return []
+
+        config = _make_config(context_fetch_batch_size=10)
+        assembler = _make_assembler(memory_service=mock_memory, config=config)
+
+        events = [
+            _make_event(
+                event_type=EventType.memory_added,
+                payload={'content_preview': f'event {i}'},
+            )
+            for i in range(12)
+        ]
+        watermark = _make_watermark()
+
+        with patch.object(assembler, '_fetch_context', new=patched_fetch_context), pytest.raises(asyncio.CancelledError):
+            await assembler.assemble(events, watermark, 'test-project')
+
+        assert call_count >= 11, (
+            'first batch (calls 1-10) must complete before the second batch '
+            'dispatches and triggers the CancelledError on call 11'
+        )
