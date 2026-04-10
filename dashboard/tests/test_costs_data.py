@@ -1428,3 +1428,233 @@ class TestRunCostBreakdownLimit:
         assert total_invocations == 4, (
             f"expected 4 invocations with default limit, got {total_invocations}"
         )
+
+
+# ===========================================================================
+# Multi-DB aggregation tests
+# ===========================================================================
+
+# Minimal schema — invocations + account_events only (no runs/task_results).
+# Matches DBs like dark-factory and reify that never used RunStore.
+MINIMAL_SCHEMA = """\
+CREATE TABLE invocations (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id              TEXT NOT NULL,
+    task_id             TEXT,
+    project_id          TEXT NOT NULL,
+    account_name        TEXT NOT NULL,
+    model               TEXT NOT NULL,
+    role                TEXT NOT NULL,
+    cost_usd            REAL NOT NULL DEFAULT 0.0,
+    input_tokens        INTEGER,
+    output_tokens       INTEGER,
+    cache_read_tokens   INTEGER,
+    cache_create_tokens INTEGER,
+    duration_ms         INTEGER NOT NULL DEFAULT 0,
+    capped              INTEGER NOT NULL DEFAULT 0,
+    started_at          TEXT NOT NULL,
+    completed_at        TEXT NOT NULL
+);
+CREATE TABLE account_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_name TEXT NOT NULL,
+    event_type   TEXT NOT NULL,
+    project_id   TEXT,
+    run_id       TEXT,
+    details      TEXT,
+    created_at   TEXT NOT NULL
+);
+"""
+
+from dashboard.data.costs import (  # noqa: E402
+    aggregate_account_events,
+    aggregate_cost_by_account,
+    aggregate_cost_by_project,
+    aggregate_cost_by_role,
+    aggregate_cost_summary,
+    aggregate_cost_trend,
+    aggregate_run_cost_breakdown,
+)
+
+
+@pytest.fixture()
+def two_project_dbs(tmp_path):
+    """Two separate SQLite DBs with different project_ids and a shared account."""
+    now = datetime.now(UTC)
+
+    # --- DB A: dark_factory (full schema with task_results) ---
+    db_a = tmp_path / 'a.db'
+    conn = sqlite3.connect(str(db_a))
+    conn.executescript(COSTS_SCHEMA)
+    conn.execute(
+        'INSERT INTO runs (run_id, project_id, started_at) VALUES (?, ?, ?)',
+        ('run-a1', 'dark_factory', now.isoformat()),
+    )
+    conn.execute(
+        'INSERT INTO task_results (run_id, task_id, project_id, title, outcome) '
+        'VALUES (?, ?, ?, ?, ?)',
+        ('run-a1', '10', 'dark_factory', 'Task A', 'done'),
+    )
+    conn.executemany(
+        'INSERT INTO invocations '
+        '(run_id, task_id, project_id, account_name, model, role, '
+        ' cost_usd, capped, started_at, completed_at) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [
+            ('run-a1', '10', 'dark_factory', 'max-a', 'opus', 'implementer',
+             2.0, 0, (now - timedelta(hours=1)).isoformat(), now.isoformat()),
+            ('run-a1', '10', 'dark_factory', 'max-a', 'sonnet', 'reviewer',
+             0.5, 0, (now - timedelta(minutes=30)).isoformat(), now.isoformat()),
+        ],
+    )
+    conn.execute(
+        'INSERT INTO account_events '
+        '(account_name, event_type, project_id, run_id, details, created_at) '
+        'VALUES (?, ?, ?, ?, ?, ?)',
+        ('max-a', 'cap_hit', 'dark_factory', 'run-a1', None, now.isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+    # --- DB B: reify (minimal schema — no task_results) ---
+    db_b = tmp_path / 'b.db'
+    conn = sqlite3.connect(str(db_b))
+    conn.executescript(MINIMAL_SCHEMA)
+    conn.executemany(
+        'INSERT INTO invocations '
+        '(run_id, task_id, project_id, account_name, model, role, '
+        ' cost_usd, capped, started_at, completed_at) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [
+            ('run-b1', '20', 'reify', 'max-a', 'opus', 'implementer',
+             3.0, 0, (now - timedelta(hours=2)).isoformat(), now.isoformat()),
+            ('run-b1', '21', 'reify', 'max-b', 'sonnet', 'reviewer',
+             1.0, 0, (now - timedelta(hours=1)).isoformat(), now.isoformat()),
+        ],
+    )
+    conn.execute(
+        'INSERT INTO account_events '
+        '(account_name, event_type, project_id, run_id, details, created_at) '
+        'VALUES (?, ?, ?, ?, ?, ?)',
+        ('max-a', 'resumed', 'reify', 'run-b1', None,
+         (now + timedelta(minutes=5)).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+    return db_a, db_b
+
+
+@pytest.fixture()
+async def two_conns(two_project_dbs):
+    db_a, db_b = two_project_dbs
+    async with aiosqlite.connect(str(db_a)) as a, aiosqlite.connect(str(db_b)) as b:
+        a.row_factory = aiosqlite.Row
+        b.row_factory = aiosqlite.Row
+        yield [a, b]
+
+
+class TestAggregateCostSummary:
+    @pytest.mark.asyncio
+    async def test_merges_two_projects(self, two_conns):
+        result = await aggregate_cost_summary(two_conns, days=30)
+        assert 'dark_factory' in result
+        assert 'reify' in result
+        assert result['dark_factory']['total_spend'] == pytest.approx(2.5)
+        assert result['reify']['total_spend'] == pytest.approx(4.0)
+
+    @pytest.mark.asyncio
+    async def test_empty_list(self):
+        result = await aggregate_cost_summary([], days=7)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_none_connections(self):
+        result = await aggregate_cost_summary([None, None], days=7)
+        assert result == {}
+
+
+class TestAggregateCostByAccount:
+    @pytest.mark.asyncio
+    async def test_shared_account_summed(self, two_conns):
+        result = await aggregate_cost_by_account(two_conns, days=30)
+        # max-a appears in both DBs — spend should be summed
+        assert 'max-a' in result
+        assert result['max-a']['spend'] == pytest.approx(2.0 + 0.5 + 3.0)
+        assert result['max-a']['invocations'] == 3
+
+    @pytest.mark.asyncio
+    async def test_cap_status_conservative_latch(self, two_conns):
+        """If any source reports capped, merged status is capped (conservative).
+
+        The per-DB function doesn't expose the resumed timestamp, so the merge
+        can't determine global event ordering — it latches on capped.
+        """
+        result = await aggregate_cost_by_account(two_conns, days=30)
+        assert result['max-a']['status'] == 'capped'
+        assert result['max-a']['cap_events'] == 1
+
+    @pytest.mark.asyncio
+    async def test_unique_account(self, two_conns):
+        result = await aggregate_cost_by_account(two_conns, days=30)
+        assert 'max-b' in result
+        assert result['max-b']['spend'] == pytest.approx(1.0)
+
+
+class TestAggregateAccountEvents:
+    @pytest.mark.asyncio
+    async def test_merged_sorted_and_limited(self, two_conns):
+        result = await aggregate_account_events(two_conns, days=30, limit=1)
+        assert len(result) == 1
+        # Most recent event should come first (resumed from DB B)
+        assert result[0]['event_type'] == 'resumed'
+
+    @pytest.mark.asyncio
+    async def test_all_events_present(self, two_conns):
+        result = await aggregate_account_events(two_conns, days=30)
+        assert len(result) == 2
+
+
+class TestAggregateRunCostBreakdown:
+    @pytest.mark.asyncio
+    async def test_runs_from_both_dbs(self, two_conns):
+        result = await aggregate_run_cost_breakdown(two_conns, days=30)
+        run_ids = {r['run_id'] for r in result}
+        assert 'run-a1' in run_ids
+        assert 'run-b1' in run_ids
+
+    @pytest.mark.asyncio
+    async def test_missing_task_results_table(self, two_conns):
+        """DB B lacks task_results — query should still succeed with title=None."""
+        result = await aggregate_run_cost_breakdown(two_conns, days=30)
+        reify_runs = [r for r in result if r['project_id'] == 'reify']
+        assert len(reify_runs) == 1
+        for task in reify_runs[0]['tasks']:
+            assert task['title'] is None
+
+
+class TestAggregateCostByProject:
+    @pytest.mark.asyncio
+    async def test_both_projects(self, two_conns):
+        result = await aggregate_cost_by_project(two_conns, days=30)
+        assert 'dark_factory' in result
+        assert 'reify' in result
+
+
+class TestAggregateCostByRole:
+    @pytest.mark.asyncio
+    async def test_roles_by_project(self, two_conns):
+        result = await aggregate_cost_by_role(two_conns, days=30)
+        assert 'implementer' in result['dark_factory']
+        assert 'reviewer' in result['reify']
+
+
+class TestAggregateCostTrend:
+    @pytest.mark.asyncio
+    async def test_both_projects_have_series(self, two_conns):
+        result = await aggregate_cost_trend(two_conns, days=7)
+        assert 'dark_factory' in result
+        assert 'reify' in result
+        # Each project should have 7 days of data (gap-filled)
+        assert len(result['dark_factory']) == 7
+        assert len(result['reify']) == 7

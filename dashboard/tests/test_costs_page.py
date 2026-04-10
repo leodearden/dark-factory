@@ -194,7 +194,7 @@ _MOCK_SUMMARY = {
 
 def _patch_summary(return_value=_MOCK_SUMMARY):
     return patch(
-        'dashboard.app.get_cost_summary',
+        'dashboard.app.aggregate_cost_summary',
         new_callable=AsyncMock,
         return_value=return_value,
     )
@@ -269,7 +269,7 @@ _MOCK_BY_PROJECT = {
 
 def _patch_by_project(return_value=_MOCK_BY_PROJECT):
     return patch(
-        'dashboard.app.get_cost_by_project',
+        'dashboard.app.aggregate_cost_by_project',
         new_callable=AsyncMock,
         return_value=return_value,
     )
@@ -335,7 +335,7 @@ _MOCK_BY_ROLE = {
 
 def _patch_by_role(return_value=_MOCK_BY_ROLE):
     return patch(
-        'dashboard.app.get_cost_by_role',
+        'dashboard.app.aggregate_cost_by_role',
         new_callable=AsyncMock,
         return_value=return_value,
     )
@@ -411,7 +411,7 @@ _MOCK_TREND = {
 
 def _patch_trend(return_value=_MOCK_TREND):
     return patch(
-        'dashboard.app.get_cost_trend',
+        'dashboard.app.aggregate_cost_trend',
         new_callable=AsyncMock,
         return_value=return_value,
     )
@@ -492,7 +492,7 @@ _MOCK_EVENTS = [
 
 def _patch_events(return_value=_MOCK_EVENTS):
     return patch(
-        'dashboard.app.get_account_events',
+        'dashboard.app.aggregate_account_events',
         new_callable=AsyncMock,
         return_value=return_value,
     )
@@ -597,7 +597,7 @@ _MOCK_RUNS = [
 
 def _patch_runs(return_value=_MOCK_RUNS):
     return patch(
-        'dashboard.app.get_run_cost_breakdown',
+        'dashboard.app.aggregate_run_cost_breakdown',
         new_callable=AsyncMock,
         return_value=return_value,
     )
@@ -752,43 +752,43 @@ class TestPartialFailureResilience:
     """Test that partial routes return 200 even when data functions raise."""
 
     def test_summary_returns_200_on_data_error(self, client):
-        with _patch_raises('dashboard.app.get_cost_summary'):
+        with _patch_raises('dashboard.app.aggregate_cost_summary'):
             resp = client.get('/costs/partials/summary')
         assert resp.status_code == 200
 
     def test_summary_shows_fallback_content_on_error(self, client):
         """On error, summary should render the empty-data fallback message."""
-        with _patch_raises('dashboard.app.get_cost_summary'):
+        with _patch_raises('dashboard.app.aggregate_cost_summary'):
             html = client.get('/costs/partials/summary').text
         assert 'No cost data available for this window.' in html
 
     def test_by_project_returns_200_on_data_error(self, client):
-        with _patch_raises('dashboard.app.get_cost_by_project'):
+        with _patch_raises('dashboard.app.aggregate_cost_by_project'):
             resp = client.get('/costs/partials/by-project')
         assert resp.status_code == 200
 
     def test_by_account_returns_200_on_data_error(self, client):
-        with _patch_raises('dashboard.app.get_cost_by_account'):
+        with _patch_raises('dashboard.app.aggregate_cost_by_account'):
             resp = client.get('/costs/partials/by-account')
         assert resp.status_code == 200
 
     def test_by_role_returns_200_on_data_error(self, client):
-        with _patch_raises('dashboard.app.get_cost_by_role'):
+        with _patch_raises('dashboard.app.aggregate_cost_by_role'):
             resp = client.get('/costs/partials/by-role')
         assert resp.status_code == 200
 
     def test_trend_returns_200_on_data_error(self, client):
-        with _patch_raises('dashboard.app.get_cost_trend'):
+        with _patch_raises('dashboard.app.aggregate_cost_trend'):
             resp = client.get('/costs/partials/trend')
         assert resp.status_code == 200
 
     def test_events_returns_200_on_data_error(self, client):
-        with _patch_raises('dashboard.app.get_account_events'):
+        with _patch_raises('dashboard.app.aggregate_account_events'):
             resp = client.get('/costs/partials/events')
         assert resp.status_code == 200
 
     def test_runs_returns_200_on_data_error(self, client):
-        with _patch_raises('dashboard.app.get_run_cost_breakdown'):
+        with _patch_raises('dashboard.app.aggregate_run_cost_breakdown'):
             resp = client.get('/costs/partials/runs')
         assert resp.status_code == 200
 
@@ -817,7 +817,7 @@ _MOCK_BY_ACCOUNT = {
 
 def _patch_by_account(return_value=_MOCK_BY_ACCOUNT):
     return patch(
-        'dashboard.app.get_cost_by_account',
+        'dashboard.app.aggregate_cost_by_account',
         new_callable=AsyncMock,
         return_value=return_value,
     )
@@ -1063,7 +1063,7 @@ class TestByRoleCanvasIds:
     def test_by_role_canvas_ids_use_project_key(self, client):
         """Canvas IDs must be derived from project key: costByRoleChart_dark_factory etc."""
         with patch(
-            'dashboard.app.get_cost_by_role',
+            'dashboard.app.aggregate_cost_by_role',
             new_callable=AsyncMock,
             return_value=_MOCK_BY_ROLE_TWO_PROJECTS,
         ):
@@ -1074,7 +1074,7 @@ class TestByRoleCanvasIds:
     def test_by_role_canvas_ids_no_positional_index(self, client):
         """Canvas IDs must NOT use positional index (costByRoleChart_1 etc.)."""
         with patch(
-            'dashboard.app.get_cost_by_role',
+            'dashboard.app.aggregate_cost_by_role',
             new_callable=AsyncMock,
             return_value=_MOCK_BY_ROLE_TWO_PROJECTS,
         ):
@@ -1094,7 +1094,7 @@ class TestByRoleJsUsesProjectKey:
     def test_by_role_js_uses_data_attribute_not_index(self, client):
         """The rendered by-role partial JS must use data-project-id lookup, not positional index."""
         with patch(
-            'dashboard.app.get_cost_by_role',
+            'dashboard.app.aggregate_cost_by_role',
             new_callable=AsyncMock,
             return_value=_MOCK_BY_ROLE_TWO_PROJECTS,
         ):
@@ -1108,7 +1108,7 @@ class TestByRoleJsUsesProjectKey:
     def test_by_role_js_has_find_project_canvas(self, client):
         """The rendered by-role partial JS must define a findProjectCanvas() helper."""
         with patch(
-            'dashboard.app.get_cost_by_role',
+            'dashboard.app.aggregate_cost_by_role',
             new_callable=AsyncMock,
             return_value=_MOCK_BY_ROLE_TWO_PROJECTS,
         ):
@@ -1126,7 +1126,7 @@ class TestByRoleJsUsesProjectKey:
             },
         }
         with patch(
-            'dashboard.app.get_cost_by_role',
+            'dashboard.app.aggregate_cost_by_role',
             new_callable=AsyncMock,
             return_value=colliding_data,
         ):
