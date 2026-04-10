@@ -127,6 +127,29 @@ class TestAddMemory:
         )
 
     @pytest.mark.asyncio
+    async def test_mem0_add_called_with_scope(self, service):
+        """mem0.add must be called with correct scope and metadata kwargs."""
+        from fused_memory.models.scope import Scope
+
+        await service.add_memory(
+            content='Always use type hints',
+            category='preferences_and_norms',
+            project_id='test',
+            agent_id='a1',
+            session_id='s1',
+        )
+
+        service.mem0.add.assert_called_once()
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['content'] == 'Always use type hints'
+        scope: Scope = call_kwargs['scope']
+        assert scope.project_id == 'test'
+        assert scope.agent_id == 'a1'
+        assert scope.session_id == 's1'
+        metadata = call_kwargs['metadata']
+        assert metadata.get('category') == 'preferences_and_norms'
+
+    @pytest.mark.asyncio
     async def test_mem0_direct_error_surfaced_in_response(self, service):
         """Mem0 direct-call errors must appear in the response message."""
         service.mem0.add = AsyncMock(
