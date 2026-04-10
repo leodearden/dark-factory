@@ -613,7 +613,12 @@ class UsageGate:
         (no cap detected). Allows other tasks to use this account.
         """
         acct = self._find_account_by_token(oauth_token) if oauth_token else None
-        if acct and acct.probe_in_flight:
+        if acct is None:
+            return
+        # A successful invocation proves the account is healthy — clear stale
+        # near_cap regardless of whether a probe cycle was in progress.
+        acct.near_cap = False
+        if acct.probe_in_flight:
             acct.probe_in_flight = False
             acct.probe_count = 0
             logger.info(f'Account {acct.name}: probe confirmed OK — opening to all tasks')
