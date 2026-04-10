@@ -420,3 +420,40 @@ class TestAllCappedBlockResume:
                 )
             else:
                 assert gate.is_paused, "Gate should be paused when all 5 accounts are capped"
+
+
+# ---------------------------------------------------------------------------
+# Unknown-token fallback: _handle_cap_detected with a token that matches no account
+# ---------------------------------------------------------------------------
+
+
+class TestCapDetectedUnknownToken:
+    """Characterizes the best-guess fallback in _handle_cap_detected.
+
+    When oauth_token does not match any configured account,
+    _handle_cap_detected walks _accounts and picks the first non-capped
+    account as the victim (usage_gate.py ~line 283).  If all accounts are
+    already capped it logs a warning and returns without mutating state.
+    """
+
+    def test_unknown_token_falls_back_to_first_uncapped_account(self):
+        """Unknown token causes _handle_cap_detected to cap the first uncapped account."""
+        gate = _make_reify_gate()  # all 5 accounts uncapped
+
+        gate._handle_cap_detected(
+            reason='unknown-token-cap',
+            resets_at=datetime.now(UTC) + timedelta(hours=1),
+            oauth_token='not-a-real-token',
+        )
+
+        # max-f (index 0) is the first uncapped account — it becomes the victim
+        assert gate._accounts[0].capped, "max-f should be capped (best-guess fallback victim)"
+        # The remaining 4 accounts should be untouched
+        for acct in gate._accounts[1:]:
+            assert not acct.capped, (
+                f"{acct.name} should still be uncapped after unknown-token fallback"
+            )
+        # Gate is not paused because 4 accounts remain available
+        assert not gate.is_paused, (
+            "Gate should not be paused: 4 of 5 accounts are still available"
+        )
