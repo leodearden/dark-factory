@@ -556,3 +556,7 @@ class TestContextAssemblerCancellation:
 
         with pytest.raises(asyncio.CancelledError):
             await assembler.assemble(events, watermark, 'test-project')
+        assert call_count == 2, (
+            'mixed-batch scenario requires both tasks to dispatch — '
+            'the RuntimeError/CancelledError ordering premise was not exercised'
+        )
