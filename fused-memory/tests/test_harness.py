@@ -1852,6 +1852,46 @@ class TestHarnessFilteredTaskTreeWiring:
         assert call['filtered_task_tree'] is expected_tree
         assert call['remediation_mode'] is True
 
+    @pytest.mark.asyncio
+    async def test_run_remediation_pass_accepts_prefetched_tree(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """_run_remediation_pass uses a supplied filtered_task_tree and skips _fetch_filtered_task_tree."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.reconciliation.harness import TierConfig
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        stages = harness._make_stages()
+        harness._make_stages = lambda: stages
+
+        # Pre-fetched tree passed by caller — fetch should NOT be called
+        prefetched_tree = self._make_tree()
+        harness._fetch_filtered_task_tree = AsyncMock(return_value=self._make_tree())
+
+        captured: dict = {}
+
+        async def capture_s1(stage):
+            captured['s1_tree'] = stage.filtered_task_tree
+
+        async def capture_s2(stage):
+            captured['s2_tree'] = stage.filtered_task_tree
+
+        _mock_stage_run(stages[0], before_return=capture_s1)
+        _mock_stage_run(stages[1], before_return=capture_s2)
+        _mock_stage_run(stages[2])
+
+        findings = [_make_s3_findings()[0]]
+        tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+        await harness._run_remediation_pass(
+            'test-project', '/my/project', 'parent-run-id', findings, tier,
+            filtered_task_tree=prefetched_tree,
+        )
+
+        harness._fetch_filtered_task_tree.assert_not_called()  # type: ignore[attr-defined]
+        assert captured.get('s1_tree') is prefetched_tree
+        assert captured.get('s2_tree') is prefetched_tree
+
 
 class TestConfigureTaskSync:
     """Unit tests for the _configure_task_sync staticmethod on ReconciliationHarness."""

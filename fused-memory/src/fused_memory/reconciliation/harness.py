@@ -727,8 +727,16 @@ class ReconciliationHarness:
         parent_run_id: str,
         findings: list[dict],
         tier: TierConfig,
+        *,
+        filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
-        """Run a focused S1→S2→S3 pass to remediate actionable findings."""
+        """Run a focused S1→S2→S3 pass to remediate actionable findings.
+
+        If filtered_task_tree is provided it is used directly; otherwise a fresh
+        tree is fetched via _fetch_filtered_task_tree.  Callers that already hold
+        a fetched tree (e.g. run_full_cycle) should pass it through to avoid a
+        redundant taskmaster round-trip.
+        """
         run_id = str(uuid4())
         run = ReconciliationRun(
             id=run_id,
@@ -752,8 +760,12 @@ class ReconciliationHarness:
             },
         )
 
-        # Fetch filtered task tree once for the remediation cycle (ref: task 455)
-        filtered_task_tree = await self._fetch_filtered_task_tree(project_root)
+        # Use caller-supplied tree if available; otherwise fetch (ref: task 455, task 478)
+        remediation_tree = (
+            filtered_task_tree
+            if filtered_task_tree is not None
+            else await self._fetch_filtered_task_tree(project_root)
+        )
 
         current_stage_name: str | None = None
         stages = self._make_stages()
@@ -766,9 +778,9 @@ class ReconciliationHarness:
             self._configure_consolidator(
                 stage1, tier,
                 remediation_findings=findings,
-                filtered_task_tree=filtered_task_tree,
+                filtered_task_tree=remediation_tree,
             )
-            self._configure_task_sync(stage2, filtered_task_tree=filtered_task_tree, remediation_mode=True)
+            self._configure_task_sync(stage2, filtered_task_tree=remediation_tree, remediation_mode=True)
 
             watermark = await self.journal.get_watermark(project_id)
             reports = []
