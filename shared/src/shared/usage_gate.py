@@ -343,6 +343,28 @@ class UsageGate:
                 return acct
         return None
 
+    def _resolve_account(self, oauth_token: str | None) -> AccountState | None:
+        """Look up an account by token, falling back to the first uncapped account.
+
+        Steps:
+        1. If ``oauth_token`` is provided, try an exact token match via
+           ``_find_account_by_token``.
+        2. If no account was found (unknown token or ``None`` token), iterate
+           ``_accounts`` and return the first account that is not capped.
+        3. Return ``None`` if neither step resolves an account.
+
+        The caller is responsible for emitting any 'no matching account' warning
+        and for deciding the appropriate early-return behaviour.  This helper
+        intentionally does not log.
+        """
+        acct = self._find_account_by_token(oauth_token) if oauth_token else None
+        if acct is None:
+            for a in self._accounts:
+                if not a.capped:
+                    acct = a
+                    break
+        return acct
+
     def _start_account_resume_probe(self, acct: AccountState) -> None:
         """Start an async resume probe for a specific account."""
         if not self._config.wait_for_reset:
