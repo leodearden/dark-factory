@@ -633,8 +633,8 @@ class TestCollectSnapshot:
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
-        reify_root = Path('/home/leo/src/reify')
-        autopilot_root = Path('/home/leo/src/autopilot-video')
+        reify_root = tmp_path / 'reify'
+        autopilot_root = tmp_path / 'autopilot'
 
         config = DashboardConfig(
             project_root=tmp_path,
