@@ -316,12 +316,7 @@ class UsageGate:
         oauth_token: str | None,
     ) -> None:
         """Record a near-cap warning without blocking the account."""
-        acct = self._find_account_by_token(oauth_token) if oauth_token else None
-        if acct is None:
-            for a in self._accounts:
-                if not a.capped:
-                    acct = a
-                    break
+        acct = self._resolve_account(oauth_token)
         if acct is None:
             logger.warning(f'Near-cap warning but no matching account: {reason}')
             return
