@@ -885,6 +885,40 @@ class TestConfirmAccountOk:
         gate.confirm_account_ok('any-token')
         # No crash
 
+    # --- near_cap clearing ---
+
+    def test_clears_near_cap_with_probe_in_flight(self):
+        gate = make_gate(['a'])
+        gate._accounts[0].near_cap = True
+        gate._accounts[0].probe_in_flight = True
+        gate.confirm_account_ok(gate._accounts[0].token)
+        assert gate._accounts[0].near_cap is False
+
+    def test_clears_near_cap_without_probe_in_flight(self):
+        # Happy-path bug: near_cap set, billing reset, no full cap hit, probe never ran.
+        gate = make_gate(['a'])
+        gate._accounts[0].near_cap = True
+        gate._accounts[0].probe_in_flight = False
+        gate._accounts[0].probe_count = 3
+        gate._open.clear()
+        gate.confirm_account_ok(gate._accounts[0].token)
+        assert gate._accounts[0].near_cap is False
+        # probe_count and gate should NOT change (only near_cap is cleared in this branch)
+        assert gate._accounts[0].probe_count == 3
+        assert gate._open.is_set() is False
+
+    def test_does_not_clear_near_cap_with_none_token(self):
+        gate = make_gate(['a'])
+        gate._accounts[0].near_cap = True
+        gate.confirm_account_ok(None)
+        assert gate._accounts[0].near_cap is True
+
+    def test_does_not_clear_near_cap_with_unknown_token(self):
+        gate = make_gate(['a'])
+        gate._accounts[0].near_cap = True
+        gate.confirm_account_ok('completely-unknown-token')
+        assert gate._accounts[0].near_cap is True
+
 
 # =========================================================================
 # TestProperties
