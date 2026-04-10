@@ -944,8 +944,9 @@ class TestWorkingTreeSync:
             f'Cascade failure: second advance returned {result2!r} '
             f'(tree was not cleaned by recovery helper)'
         )
-        assert result2 in ('advanced', 'cas_failed'), (
-            f'Unexpected result: {result2!r}'
+        assert result2 == 'advanced', (
+            f'Unexpected result: {result2!r} (fully controlled path: no CAS injection, '
+            f'no mocks, no dirty WIP \u2014 cas_failed indicates an environmental regression)'
         )
 
 
