@@ -1806,6 +1806,52 @@ class TestHarnessFilteredTaskTreeWiring:
         assert call['filtered_task_tree'] is expected_tree
         assert call['remediation_mode'] is False
 
+    @pytest.mark.asyncio
+    async def test_remediation_uses_configure_task_sync_for_stage2(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """_run_remediation_pass calls _configure_task_sync with remediation_mode=True for Stage 2."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.reconciliation.harness import ReconciliationHarness, TierConfig
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        stages = harness._make_stages()
+        harness._make_stages = lambda: stages
+
+        expected_tree = self._make_tree()
+        harness._fetch_filtered_task_tree = AsyncMock(return_value=expected_tree)
+
+        spy_calls: list = []
+        real_helper = ReconciliationHarness._configure_task_sync
+
+        def spy(stage, *, filtered_task_tree=None, remediation_mode=False):
+            spy_calls.append({'stage': stage, 'filtered_task_tree': filtered_task_tree, 'remediation_mode': remediation_mode})
+            real_helper(stage, filtered_task_tree=filtered_task_tree, remediation_mode=remediation_mode)
+
+        ReconciliationHarness._configure_task_sync = staticmethod(spy)  # type: ignore[method-assign]
+        try:
+            _mock_stage_run(stages[0])
+            _mock_stage_run(stages[1])
+            _mock_stage_run(stages[2])
+
+            findings = [_make_s3_findings()[0]]
+            tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+            await harness._run_remediation_pass(
+                'test-project', '/my/project', 'parent-run-id', findings, tier,
+            )
+        finally:
+            ReconciliationHarness._configure_task_sync = staticmethod(real_helper)  # type: ignore[method-assign]
+
+        assert len(spy_calls) == 1, f"Expected _configure_task_sync called once, got {len(spy_calls)}"
+        call = spy_calls[0]
+        stage2 = stages[1]
+        assert isinstance(stage2, TaskKnowledgeSync)
+        assert call['stage'] is stage2
+        assert call['filtered_task_tree'] is expected_tree
+        assert call['remediation_mode'] is True
+
 
 class TestConfigureTaskSync:
     """Unit tests for the _configure_task_sync staticmethod on ReconciliationHarness."""

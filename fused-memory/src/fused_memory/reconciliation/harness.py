@@ -768,8 +768,7 @@ class ReconciliationHarness:
                 remediation_findings=findings,
                 filtered_task_tree=filtered_task_tree,
             )
-            stage2.remediation_mode = True
-            stage2.filtered_task_tree = filtered_task_tree
+            self._configure_task_sync(stage2, filtered_task_tree=filtered_task_tree, remediation_mode=True)
 
             watermark = await self.journal.get_watermark(project_id)
             reports = []
