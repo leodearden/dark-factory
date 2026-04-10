@@ -372,24 +372,37 @@ async def run_eval_matrix(
     try:
         while active:
             done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+            # Task 586: scan the full done batch for ALL CancelledErrors before
+            # processing any results.  Multiple tasks can complete in the same
+            # event-loop iteration and land in the same done set (e.g. when a
+            # shutdown signal fires while two evals are parked at the same
+            # await point).  The old code raised on the first cancel it saw,
+            # silently discarding subsequent cancels in the batch.
+            cancel_errors: list[asyncio.CancelledError] = []
             for task in done:
                 if task.cancelled():
-                    exc = asyncio.CancelledError()
-                    logger.error('Eval cancelled', exc_info=exc)
-                    for t in active:
-                        t.cancel()
-                    await asyncio.gather(*active, return_exceptions=True)
-                    active.clear()
-                    raise exc
+                    # task.cancel() was called and the coroutine propagated it.
+                    cancel_errors.append(asyncio.CancelledError())
+                else:
+                    exc = task.exception()
+                    if isinstance(exc, asyncio.CancelledError):
+                        # Defensive branch: coroutine raised CancelledError
+                        # internally without task.cancel() being called first.
+                        cancel_errors.append(exc)
+            if cancel_errors:
+                for ce in cancel_errors:
+                    logger.error('Eval cancelled', exc_info=ce)
+                for t in active:
+                    t.cancel()
+                await asyncio.gather(*active, return_exceptions=True)
+                active.clear()
+                raise cancel_errors[0]
+            # No cancellations in this batch — handle results and non-cancel
+            # exceptions.  task.cancelled() is False for all remaining tasks so
+            # task.exception() / task.result() are safe to call.
+            for task in done:
                 exc = task.exception()
                 if exc is not None:
-                    if isinstance(exc, asyncio.CancelledError):
-                        logger.error('Eval cancelled', exc_info=exc)
-                        for t in active:
-                            t.cancel()
-                        await asyncio.gather(*active, return_exceptions=True)
-                        active.clear()
-                        raise exc
                     logger.error(f'Eval failed: {exc}')
                 else:
                     r = task.result()
