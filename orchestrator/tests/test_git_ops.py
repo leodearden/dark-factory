@@ -711,6 +711,77 @@ class TestWorkingTreeSync:
         )
         assert stash_list.strip() == ''
 
+    async def test_advance_main_halts_on_preexisting_unmerged_state(
+        self, git_ops: GitOps,
+    ):
+        """advance_main returns 'unmerged_state' immediately when project_root has UU markers.
+
+        No stash must be created and main ref must not advance.
+        """
+        import subprocess
+
+        # Step 1: prepare a valid merge commit via a clean worktree
+        wt = await git_ops.create_worktree('uu-guard-advance')
+        (wt.path / 'new_feature.py').write_text('feature = True\n')
+        await git_ops.commit(wt.path, 'Add new_feature')
+        merge_result = await git_ops.merge_to_main(wt.path, 'uu-guard-advance')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Record state before injecting UU markers
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        _, stash_before, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+
+        # Step 2: inject unmerged (stage 1/2/3) entries into the index without
+        # doing an actual merge commit or setting MERGE_HEAD.
+        def _run_sync(cmd, **kwargs):
+            return subprocess.run(
+                cmd, cwd=str(git_ops.project_root), capture_output=True, **kwargs,
+            )
+
+        h1 = _run_sync(
+            ['git', 'hash-object', '-w', '--stdin'], input=b'version base\n',
+        ).stdout.decode().strip()
+        h2 = _run_sync(
+            ['git', 'hash-object', '-w', '--stdin'], input=b'version ours\n',
+        ).stdout.decode().strip()
+        h3 = _run_sync(
+            ['git', 'hash-object', '-w', '--stdin'], input=b'version theirs\n',
+        ).stdout.decode().strip()
+
+        index_info = (
+            f'100644 {h1} 1\tuu_conflict_test.py\n'
+            f'100644 {h2} 2\tuu_conflict_test.py\n'
+            f'100644 {h3} 3\tuu_conflict_test.py\n'
+        )
+        _run_sync(['git', 'update-index', '--index-info'], input=index_info.encode())
+
+        # Verify the UU state is detectable
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert len(unmerged) >= 1, f'Expected unmerged paths after index surgery, got: {unmerged}'
+
+        # Step 3: advance_main must detect UU state and halt without touching main
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+        assert result == 'unmerged_state'
+
+        # Main ref must NOT have moved
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip()
+
+        # No stash was created during the halted advance attempt
+        _, stash_after, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_before.strip() == stash_after.strip()
+
 
 @pytest.mark.asyncio
 class TestUnmergedDetection:

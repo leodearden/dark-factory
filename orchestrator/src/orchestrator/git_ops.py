@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 AdvanceResult = Literal[
     'advanced', 'cas_failed', 'not_descendant', 'contaminated',
     'stash_failed', 'wip_overlap', 'pop_conflict',
+    'unmerged_state',
 ]
 
 
@@ -650,6 +651,11 @@ class GitOps:
           (permanent; stop retrying).
         * ``'stash_failed'`` — ``git stash push`` failed before the advance
           (permanent; halt merge to prevent code loss).
+        * ``'unmerged_state'`` — ``project_root`` already has unresolved merge
+          conflicts in its index (UU/AA/DD paths detected via
+          ``git status --porcelain``).  Halts immediately; manual cleanup of
+          the conflict markers is required before retrying.  Routes to a
+          human-level escalation, not the steward corrective loop.
 
         When *branch* is provided and a rebase fails, the method will abort
         the rebase, reset to current main, and re-merge *branch* before
@@ -753,6 +759,24 @@ class GitOps:
                 f'{self.config.main_branch}'
             )
             return 'not_descendant'
+
+        # ── Pre-advance unmerged state guard ────────────────────────
+        # Belt-and-braces: reject immediately if project_root already has
+        # unresolved merge conflicts in the index.  Any git stash push in
+        # this state would fail with "fatal: needs merge", producing
+        # 'stash_failed' and hiding the real problem.  Detecting here
+        # produces a distinct 'unmerged_state' code that routes to a
+        # human-escalation path instead of the steward corrective loop.
+        _unmerged_entry_paths = await self._detect_unmerged_paths(self.project_root)
+        if _unmerged_entry_paths:
+            logger.critical(
+                'CRITICAL: project_root has %d pre-existing unresolved merge '
+                'conflict(s) (%s) — halting advance_main to prevent data loss. '
+                'Manual cleanup required before retrying.',
+                len(_unmerged_entry_paths),
+                ', '.join(_unmerged_entry_paths[:10]),
+            )
+            return 'unmerged_state'
 
         # ── Working-tree protection ──────────────────────────────────
         # When project_root has main checked out, update-ref will desync
