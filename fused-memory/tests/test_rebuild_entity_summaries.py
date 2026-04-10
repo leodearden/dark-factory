@@ -1109,14 +1109,12 @@ class TestRebuildEntitySummariesParallel:
     """rebuild_entity_summaries uses _rebuild_entity_from_edges (no re-fetch) + asyncio.gather."""
 
     @pytest.mark.asyncio
-    async def test_non_force_does_not_call_get_valid_edges_for_node(self, mock_config, make_backend):
+    async def test_non_force_does_not_call_get_valid_edges_for_node(self, mock_config, make_backend, make_edge_backend):
         """Non-force path: get_valid_edges_for_node is never called (edges come from bulk fetch)."""
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
         })
@@ -1130,15 +1128,13 @@ class TestRebuildEntitySummariesParallel:
 
     @pytest.mark.asyncio
     async def test_force_calls_get_all_valid_edges_once_not_refresh_entity_summary(
-        self, mock_config, make_backend
+        self, mock_config, make_backend, make_edge_backend
     ):
         """Force path: get_all_valid_edges called once; refresh_entity_summary never called."""
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'ok'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'also ok'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
         })
@@ -1154,7 +1150,7 @@ class TestRebuildEntitySummariesParallel:
 
     @pytest.mark.asyncio
     async def test_force_list_entity_nodes_called_exactly_once(
-        self, mock_config, make_backend
+        self, mock_config, make_backend, make_edge_backend
     ):
         """Force path: list_entity_nodes is awaited exactly once (single bulk fetch).
 
@@ -1162,13 +1158,11 @@ class TestRebuildEntitySummariesParallel:
         uuid-1 data for every call would produce incorrect per-entity summaries and
         fail the final per-uuid assertions.
         """
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'summary-1'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'summary-2'},
             {'uuid': 'uuid-3', 'name': 'Carol', 'summary': 'summary-3'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact-1', 'name': 'rel-1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact-2', 'name': 'rel-2'}],
             'uuid-3': [{'uuid': 'e3', 'fact': 'fact-3', 'name': 'rel-3'}],
@@ -1191,7 +1185,7 @@ class TestRebuildEntitySummariesParallel:
         assert by_uuid['uuid-3']['new_summary'] == 'fact-3'
 
     @pytest.mark.asyncio
-    async def test_concurrent_all_five_entities_processed(self, mock_config, make_backend):
+    async def test_concurrent_all_five_entities_processed(self, mock_config, make_backend, make_edge_backend):
         """With 5 target entities, all 5 get update_node_summary calls (parallel processing)."""
         n = 5
         entities = [
@@ -1202,9 +1196,7 @@ class TestRebuildEntitySummariesParallel:
             f'uuid-{i}': [{'uuid': f'e{i}', 'fact': f'current{i}', 'name': 'edge'}]
             for i in range(n)
         }
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=entities)
-        backend.get_all_valid_edges = AsyncMock(return_value=edges)
+        backend = make_edge_backend(make_backend(mock_config), nodes=entities, edges=edges)
         backend.update_node_summary = AsyncMock()
 
         result = await backend.rebuild_entity_summaries(group_id='test')
@@ -1215,16 +1207,14 @@ class TestRebuildEntitySummariesParallel:
 
     @pytest.mark.asyncio
     async def test_force_path_passes_old_summary_no_get_node_text(
-        self, mock_config, make_backend
+        self, mock_config, make_backend, make_edge_backend
     ):
         """Force path: old_summary from list_entity_nodes is passed to
         _rebuild_entity_from_edges and get_node_text is never called."""
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'alice summary'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'bob summary'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
         })
@@ -1294,19 +1284,17 @@ class TestRebuildEntitySummariesParallel:
 
     @pytest.mark.asyncio
     async def test_partial_failure_in_update_does_not_cancel_others(
-        self, mock_config, make_backend
+        self, mock_config, make_backend, make_edge_backend
     ):
         """If update_node_summary fails for one entity, others still complete.
 
         asyncio.gather with return_exceptions=True ensures partial failures are
         captured rather than propagated, so the gather completes for all entities.
         """
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
         })
