@@ -36,6 +36,21 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 _MOCK_TYPES = (AsyncMock, MagicMock)
 
 
+def _extract_section(payload: str, header: str) -> str:
+    """Return the body of *header* up to the next '\\n#' boundary, or '' if absent.
+
+    Locates *header* in *payload*, then slices from that position to the start
+    of the next markdown header (any level) or end-of-string, whichever comes first.
+    """
+    if header not in payload:
+        return ''
+    start = payload.index(header)
+    end = payload.find('\n#', start + 1)
+    if end == -1:
+        end = len(payload)
+    return payload[start:end]
+
+
 class TestMockTypesConstant:
     """Validate the _MOCK_TYPES constant that TestProjectIdValidation depends on."""
 
