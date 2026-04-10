@@ -125,16 +125,12 @@ class TestConfigEnvOverrides:
         # known_project_roots must contain the resolved real path, not the symlink
         assert cfg.known_project_roots == [real_resolved]
 
-    def test_from_env_resolves_project_root_symlink(self, monkeypatch, tmp_path):
+    def test_from_env_resolves_project_root_symlink(self, monkeypatch, symlinked_dir):
         """from_env() must resolve a symlinked path in DASHBOARD_PROJECT_ROOT."""
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
-
+        link, real_resolved = symlinked_dir
         monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', str(link))
         cfg = DashboardConfig.from_env()
-        assert cfg.project_root == real_dir.resolve()
+        assert cfg.project_root == real_resolved
 
     def test_known_project_roots_unset_preserves_default(self, monkeypatch):
         monkeypatch.setenv('DASHBOARD_HOST', '0.0.0.0')
