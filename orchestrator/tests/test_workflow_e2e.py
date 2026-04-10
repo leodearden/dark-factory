@@ -1973,3 +1973,25 @@ class TestSchedulerProtocolConformance:
         assert isinstance(sched._status_cache, dict), (
             '_status_cache must be a dict[str, str]'
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: FakeScheduler.get_cached_status
+# ---------------------------------------------------------------------------
+
+
+class TestFakeSchedulerCachedStatus:
+    """FakeScheduler.get_cached_status returns the last status set for a task."""
+
+    def test_get_cached_status_returns_none_before_any_set(self):
+        """Before any set_task_status call, get_cached_status returns None."""
+        fake = FakeScheduler()
+        assert fake.get_cached_status('x') is None
+
+    @pytest.mark.asyncio
+    async def test_get_cached_status_returns_last_set_status(self):
+        """get_cached_status returns the most recent status after multiple sets."""
+        fake = FakeScheduler()
+        await fake.set_task_status('x', 'in-progress')
+        await fake.set_task_status('x', 'done')
+        assert fake.get_cached_status('x') == 'done'
