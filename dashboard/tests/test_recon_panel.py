@@ -258,6 +258,11 @@ MOCK_RUNS = [
     }
 ]
 
+def mock_runs_no_journal() -> list[dict]:
+    """Return a fresh list with a fresh dict (journal_entry_count=0) on each call."""
+    return [{**mock_runs()[0], 'journal_entry_count': 0}]
+
+
 MOCK_RUNS_NO_JOURNAL = [{**MOCK_RUNS[0], 'journal_entry_count': 0}]
 
 MOCK_LAST_ATTEMPTED = {
