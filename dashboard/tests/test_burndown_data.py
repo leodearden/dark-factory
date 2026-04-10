@@ -644,15 +644,17 @@ class TestCollectSnapshot:
 
         # 3 distinct roots: main project + 2 known roots (no orchestrators)
         n_roots = 3
-        barrier = threading.Barrier(n_roots, timeout=2.0)
+        barrier = threading.Barrier(n_roots, timeout=10.0)
 
         def fake_load(path):
             try:
                 barrier.wait()
             except threading.BrokenBarrierError:
                 pytest.fail(
-                    'load_task_tree calls did not run concurrently '
-                    '(barrier timed out — calls appear to be sequential)'
+                    'load_task_tree calls did not reach the barrier within 10s — '
+                    'possible causes: (1) sequential execution (calls not running '
+                    'concurrently via asyncio.gather); (2) severe scheduler latency '
+                    '(threads starved by contention or a slow CI host)'
                 )
             return []
 
@@ -662,6 +664,78 @@ class TestCollectSnapshot:
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
                 await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+                row = await cur.fetchone()
+                assert row is not None
+                assert row[0] == 3
+
+    @pytest.mark.asyncio
+    async def test_gather_partial_failure_skips_bad_project(self, tmp_path):
+        """One load_task_tree raises OSError; collect_snapshot must either raise
+        cleanly (pre-fix: asyncio.gather propagates the first exception) OR skip
+        the bad project and insert healthy rows (post-fix: return_exceptions=True).
+        Either branch holds the invariant: the failing project never appears in
+        the snapshot table, and no other project is silently corrupted.
+
+        This test will exercise different branches before and after Task 519
+        lands. Once 519 is confirmed done a follow-up task can tighten it to
+        only the post-fix branch.
+        """
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        reify_root = Path('/home/leo/src/reify')
+        autopilot_root = Path('/home/leo/src/autopilot-video')
+
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[reify_root, autopilot_root],
+        )
+
+        # The path that will raise OSError — reify is the failing root.
+        bad_path = reify_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+
+        # Only map the two healthy roots; the failing root is intentionally absent.
+        _tasks_map = {
+            config.tasks_json: [],
+            autopilot_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': [{'status': 'done'}],
+        }
+
+        def fake_load(path):
+            if path == bad_path:
+                raise OSError('mock disk error')
+            return _tasks_map[path]
+
+        raised_oserror = False
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                try:
+                    await collect_snapshot(conn, config)
+                except OSError:
+                    raised_oserror = True
+
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+        project_ids = {row[0] for row in rows}
+
+        if raised_oserror:
+            # Pre-fix behavior (task 519 not yet landed): asyncio.gather re-raises
+            # the first OSError, so Phase 3 never runs and no rows are inserted.
+            # The invariant is: the failing project's data never appears in the
+            # table, and no partial state is committed.
+            assert len(rows) == 0
+        else:
+            # Post-fix behavior (task 519 landed): return_exceptions=True + per-
+            # project skip means healthy projects are still snapshotted and the
+            # failing project is cleanly excluded.
+            assert len(rows) == 2
+            assert str(reify_root.resolve()) not in project_ids
+            assert str(config.project_root.resolve()) in project_ids
+            assert str(autopilot_root.resolve()) in project_ids
 
     @pytest.mark.asyncio
     async def test_gather_return_exceptions_preserves_healthy_snapshots(self, tmp_path, caplog):

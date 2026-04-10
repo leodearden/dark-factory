@@ -4,7 +4,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from conftest import assert_ro_query_only
+from conftest import assert_ro_query_only, extract_cypher
 
 from fused_memory.backends.graphiti_client import (
     EdgeNotFoundError,
@@ -307,8 +307,7 @@ class TestListIndices:
         """list_indices uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
         graph = await assert_ro_query_only(backend, make_graph_mock, [], 'list_indices', group_id='test')
-        args, kwargs = graph.ro_query.call_args
-        cypher = args[0] if args else next(iter(kwargs.values()), '')
+        cypher = extract_cypher(graph.ro_query.call_args)
         assert 'db.indexes' in cypher
 
 

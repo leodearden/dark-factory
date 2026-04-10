@@ -44,14 +44,16 @@ CAP_HIT_PREFIXES = [
     "You've hit your",
     "You've used",
     "You're out of extra",
+    "You're now using extra",
 ]
-# Secondary confirmation — must also appear in the same text
+# Secondary confirmation — at least one of these keywords must also appear in
+# the same text for a CAP_HIT or NEAR_CAP prefix match to be accepted
+# (defense-in-depth against ambiguous prefix false positives).
 CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade"]
 
 # Patterns for near-cap warnings (pause proactively)
 NEAR_CAP_PREFIXES = [
     "You're close to",
-    "You're now using extra",
 ]
 
 # Codex (OpenAI) cap-hit patterns
@@ -255,18 +257,24 @@ class UsageGate:
                     )
                     return True
 
-        for prefix in CAP_HIT_PREFIXES:
-            if prefix.lower() in combined.lower():
-                resets_at = _parse_resets_at(combined)
-                reason = _extract_cap_message(combined, prefix) or f'Cap detected: {prefix}'
-                self._handle_cap_detected(reason, resets_at, oauth_token)
-                return True
+        # Claude cap/near-cap detection: require both a prefix match AND a
+        # secondary confirmation keyword (defence against false positives on
+        # generic prefixes like "You've used" or "You're close to").
+        combined_lower = combined.lower()
+        has_confirm_keyword = any(kw in combined_lower for kw in CAP_CONFIRM_KEYWORDS)
+        if has_confirm_keyword:
+            for prefix in CAP_HIT_PREFIXES:
+                if prefix.lower() in combined_lower:
+                    resets_at = _parse_resets_at(combined)
+                    reason = _extract_cap_message(combined, prefix) or f'Cap detected: {prefix}'
+                    self._handle_cap_detected(reason, resets_at, oauth_token)
+                    return True
 
-        for prefix in NEAR_CAP_PREFIXES:
-            if prefix.lower() in combined.lower():
-                reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
-                self._handle_near_cap_warning(reason, oauth_token)
-                return True
+            for prefix in NEAR_CAP_PREFIXES:
+                if prefix.lower() in combined_lower:
+                    reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
+                    self._handle_near_cap_warning(reason, oauth_token)
+                    return True
 
         return False
 
