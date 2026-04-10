@@ -3,7 +3,7 @@
 import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -540,19 +540,23 @@ class TestContextAssemblerCancellation:
             raise asyncio.CancelledError()
 
         assembler = _make_assembler(memory_service=mock_memory)
-        assembler._fetch_context = patched_fetch_context
 
-        events = [
-            _make_event(
-                event_type=EventType.memory_added,
-                payload={'content_preview': 'event one'},
-            ),
-            _make_event(
-                event_type=EventType.memory_added,
-                payload={'content_preview': 'event two'},
-            ),
-        ]
-        watermark = _make_watermark()
+        with patch.object(assembler, '_fetch_context', new=patched_fetch_context):
+            events = [
+                _make_event(
+                    event_type=EventType.memory_added,
+                    payload={'content_preview': 'event one'},
+                ),
+                _make_event(
+                    event_type=EventType.memory_added,
+                    payload={'content_preview': 'event two'},
+                ),
+            ]
+            watermark = _make_watermark()
 
-        with pytest.raises(asyncio.CancelledError):
-            await assembler.assemble(events, watermark, 'test-project')
+            with pytest.raises(asyncio.CancelledError):
+                await assembler.assemble(events, watermark, 'test-project')
+            assert call_count == 2, (
+                'mixed-batch scenario requires both tasks to dispatch — '
+                'the RuntimeError/CancelledError ordering premise was not exercised'
+            )
