@@ -15,7 +15,7 @@ from orchestrator.evals.configs import (
     get_config_by_name,
 )
 
-VLLM_NAMES = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+VLLM_NAMES: frozenset[str] = frozenset(cfg.name for cfg in VLLM_EVAL_CONFIGS)
 
 
 @pytest.fixture
