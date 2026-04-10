@@ -146,6 +146,10 @@ class ReconciliationHarness:
 
         Shared between run_full_cycle and _run_remediation_pass to prevent
         attribute-configuration divergence.
+
+        Note: filtered_task_tree here applies only to Stage 1 (MemoryConsolidator).
+        Stage 2 (TaskKnowledgeSync) wiring is handled by the symmetric
+        _configure_task_sync helper.
         """
         stage.episode_limit = tier.episode_limit
         stage.memory_limit = tier.memory_limit

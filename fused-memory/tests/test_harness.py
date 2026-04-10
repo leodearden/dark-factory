@@ -1770,7 +1770,7 @@ class TestHarnessFilteredTaskTreeWiring:
         self, journal, event_buffer, mock_memory_service,
     ):
         """run_full_cycle calls _configure_task_sync (not naked assignment) for Stage-2 wiring."""
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import AsyncMock
 
         from fused_memory.reconciliation.harness import ReconciliationHarness
         from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
@@ -1917,6 +1917,35 @@ class TestHarnessFilteredTaskTreeWiring:
             f"remediation pass, got {harness._fetch_filtered_task_tree.call_count}. "  # type: ignore[attr-defined]
             "run_full_cycle must thread its pre-fetched tree into _maybe_remediate."
         )
+
+    @pytest.mark.asyncio
+    async def test_remediation_falls_back_to_fetch_when_tree_is_none(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """_run_remediation_pass calls _fetch_filtered_task_tree exactly once when no tree supplied."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.reconciliation.harness import TierConfig
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        stages = harness._make_stages()
+        harness._make_stages = lambda: stages
+
+        expected_tree = self._make_tree()
+        harness._fetch_filtered_task_tree = AsyncMock(return_value=expected_tree)
+
+        _mock_stage_run(stages[0])
+        _mock_stage_run(stages[1])
+        _mock_stage_run(stages[2])
+
+        findings = [_make_s3_findings()[0]]
+        tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+        # No filtered_task_tree kwarg — method must fall back to _fetch_filtered_task_tree
+        await harness._run_remediation_pass(
+            'test-project', '/my/project', 'parent-run-id', findings, tier,
+        )
+
+        harness._fetch_filtered_task_tree.assert_called_once_with('/my/project')  # type: ignore[attr-defined]
 
 
 class TestConfigureTaskSync:
