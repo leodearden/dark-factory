@@ -305,7 +305,7 @@ def discover_orchestrators(config: DashboardConfig) -> list[dict]:
             root = _read_project_root_from_config(proc['config_path'])
             if root is not None:
                 return root
-        return config.project_root
+        return config.project_root.resolve()
 
     # Group processes by resolved project root — multiple PIDs targeting the
     # same project are merged into a single entry with a 'pids' list.
