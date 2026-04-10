@@ -344,6 +344,39 @@ class TestNearCapStateDistinction:
             gate.detect_cap_hit('', msg)
         mock_fire.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_near_cap_round_trip_via_probe_loop(self):
+        """Round-trip: near_cap set → capped → probe succeeds → near_cap cleared → re-detected.
+
+        This FAILS before the fix (probe loop doesn't clear near_cap) and PASSES after
+        ``acct.near_cap = False`` is added to ``_account_resume_probe_loop``'s success branch.
+        """
+        gate = make_gate(['a'], probe_interval_secs=0, max_probe_interval_secs=0)
+        acct = gate._accounts[0]
+
+        # (1) Set near_cap via detect_cap_hit with a NEAR_CAP message
+        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 1h.")
+        assert acct.near_cap is True
+        assert acct.capped is False
+
+        # (2) Mark account capped with a past resets_at (so probe loop skips sleeping)
+        acct.capped = True
+        acct.resets_at = datetime.now(UTC) - timedelta(minutes=1)
+
+        # (3) Override _run_probe to return success immediately
+        gate._run_probe = AsyncMock(return_value=True)
+
+        # (4) Run the probe loop — it should detect resets_at in the past, fire probe, succeed
+        await asyncio.wait_for(gate._account_resume_probe_loop(acct), timeout=5)
+
+        # (5) Account must be uncapped AND near_cap must be cleared — FAIL-BEFORE-FIX assertion
+        assert acct.capped is False
+        assert acct.near_cap is False  # This fails until the fix is applied
+
+        # (6) Re-detect near_cap — proves the flag can be set again after the clear
+        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 2h.")
+        assert acct.near_cap is True
+
 
 # =========================================================================
 # TestCapHitNowUsingExtraSemantics
