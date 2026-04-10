@@ -211,7 +211,7 @@ class TestGateFromReifyConfig:
         assert len(gate._accounts) == 5, (
             f"Expected 5 AccountState entries, got {len(gate._accounts)}"
         )
-        for state, defn in zip(gate._accounts, REIFY_ACCOUNT_DEFS, strict=False):
+        for state, defn in zip(gate._accounts, REIFY_ACCOUNT_DEFS, strict=True):
             assert state.name == defn['name']
             assert state.token is not None, (
                 f"Account {state.name!r} has None token — env var not resolved"
