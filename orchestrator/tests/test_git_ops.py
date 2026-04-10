@@ -881,6 +881,102 @@ class TestWorkingTreeSync:
         )
         assert stash_before.strip() == stash_after.strip()
 
+    async def test_advance_main_halts_on_preexisting_unmerged_state_speculative_shape(
+        self, git_ops: GitOps,
+    ):
+        """advance_main with full speculative-worker call shape returns 'unmerged_state' without stash.
+
+        Mirrors the real caller in merge_queue.py:265-270:
+            result = await self._git_ops.advance_main(
+                merge_result.merge_commit, merge_wt,
+                branch=req.branch, max_attempts=..., expected_main=main_sha,
+            )
+
+        Using a real expected_main (current main SHA) so that -- without the guard --
+        the full happy path (update-ref, read-tree, stash-pop) would succeed.
+        Dirties README.md so the stash path is armed; 'stash list unchanged' proves
+        the guard short-circuited before any stash creation.
+        """
+        import subprocess
+
+        # Step 1: prepare a valid merge commit via a clean worktree
+        wt = await git_ops.create_worktree('uu-guard-spec')
+        (wt.path / 'new_spec_feature.py').write_text('spec_feature = True\n')
+        await git_ops.commit(wt.path, 'Add new_spec_feature')
+        merge_result = await git_ops.merge_to_main(wt.path, 'uu-guard-spec')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Record state before injecting UU markers and dirtying the tree
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        _, stash_before, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+
+        # Step 2: dirty a tracked file so the working-tree protection block
+        # would attempt a stash if the unmerged guard were not present.
+        # Uses a DIFFERENT path (README.md) from the UU injection below so
+        # 'dirty file' and 'unmerged index entry' are independent states.
+        (git_ops.project_root / 'README.md').write_text('# WIP speculative guard test\n')
+
+        # Step 3: inject unmerged (stage 1/2/3) entries on 'uu_conflict_spec.py'
+        # via index surgery -- no real conflicting merge needed.
+        def _run_sync(cmd, **kwargs):
+            return subprocess.run(
+                cmd, cwd=str(git_ops.project_root), capture_output=True, **kwargs,
+            )
+
+        h1 = _run_sync(
+            ['git', 'hash-object', '-w', '--stdin'], input=b'version base spec\n',
+        ).stdout.decode().strip()
+        h2 = _run_sync(
+            ['git', 'hash-object', '-w', '--stdin'], input=b'version ours spec\n',
+        ).stdout.decode().strip()
+        h3 = _run_sync(
+            ['git', 'hash-object', '-w', '--stdin'], input=b'version theirs spec\n',
+        ).stdout.decode().strip()
+
+        index_info = (
+            f'100644 {h1} 1\tuu_conflict_spec.py\n'
+            f'100644 {h2} 2\tuu_conflict_spec.py\n'
+            f'100644 {h3} 3\tuu_conflict_spec.py\n'
+        )
+        _run_sync(['git', 'update-index', '--index-info'], input=index_info.encode())
+
+        # Precondition: confirm injected UU state is detectable
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert len(unmerged) >= 1, f'Expected unmerged paths after index surgery, got: {unmerged}'
+
+        # Step 4: call advance_main with the full speculative-worker call shape.
+        # expected_main is the REAL current main SHA -- without the guard the CAS
+        # would succeed and the ref would advance.  A passing test therefore certifies
+        # the guard fires BEFORE the entire happy path, not just before CAS.
+        result = await git_ops.advance_main(
+            merge_result.merge_commit,
+            merge_result.merge_worktree,
+            branch='uu-guard-spec',
+            expected_main=main_before.strip(),
+        )
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result == 'unmerged_state'
+
+        # Main ref must NOT have moved
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip()
+
+        # No stash was created -- load-bearing assertion: proves the guard fired
+        # BEFORE the working-tree protection block attempted any stash.
+        _, stash_after, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_before.strip() == stash_after.strip()
+
     async def test_cas_failure_pop_conflict_does_not_cascade_to_stash_failed(
         self, git_ops: GitOps,
     ):
