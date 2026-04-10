@@ -1,6 +1,7 @@
 """pytest configuration — ensure local src takes precedence over installed package."""
 import asyncio
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -19,7 +20,7 @@ from shared.usage_gate import AccountState, UsageGate  # noqa: E402
 
 def build_usage_gate(
     account_configs: list[AccountConfig],
-    tokens: list[str | None],
+    tokens: Sequence[str | None],
     *,
     wait_for_reset: bool = False,
     session_budget_usd: float | None = None,
