@@ -1618,11 +1618,12 @@ class TestHarnessFilteredTaskTreeWiring:
     async def test_run_full_cycle_invokes_get_tasks_exactly_once(
         self, journal, event_buffer, mock_memory_service,
     ):
-        """Single-fetch invariant: taskmaster.get_tasks is called exactly once per run_full_cycle.
+        """Regression guard: run_full_cycle issues exactly one taskmaster.get_tasks call via
+        _fetch_filtered_task_tree.
 
-        Unlike sibling tests in this class, _fetch_filtered_task_tree is NOT mocked here —
-        it runs the real implementation.  This verifies that no stage bypasses the helper
-        and calls taskmaster.get_tasks directly.  A regression would surface as call_count > 1.
+        Stages are mocked, so this covers the harness-level orchestration path (including that
+        remediation reuses the pre-fetched tree rather than re-fetching), not stage-internal
+        bypasses.
         """
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
