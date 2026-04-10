@@ -351,22 +351,21 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_dry_run_returns_stale_without_rebuilding(self, mock_config, make_backend):
-        """With dry_run=True, detects stale entities but does not call _rebuild_entity_from_edges.
+        """With dry_run=True, detects stale entities but does not call update_node_summary.
 
         Alice has summary='stale fact' while her edge canonical is 'current fact' → stale.
-        _detect_stale_summaries_with_edges runs naturally and flags Alice.
+        Detection runs naturally via list_entity_nodes and get_all_valid_edges.
         Explicitly mocks update_node_summary to document that the dry_run
         guarantee holds even if rebuild_entity_summaries were refactored
         to bypass _rebuild_entity_from_edges and call those methods directly.
         """
         backend = make_backend(mock_config)
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=StaleSummaryResult(
-            stale=[{'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale',
-                    'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
-                    'summary_line_count': 1}],
-            all_edges={'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
-            total_count=1,
-        ))
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale fact'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
+        })
         backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test', dry_run=True)
         assert result['stale_entities'] == 1
@@ -374,6 +373,8 @@ class TestRebuildEntitySummaries:
         assert result['skipped'] == 1
         backend.update_node_summary.assert_not_awaited()
         assert result['details'][0]['status'] == 'skipped_dry_run'
+        backend.list_entity_nodes.assert_awaited_once_with(group_id='test')
+        backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
 
 
 # ---------------------------------------------------------------------------
