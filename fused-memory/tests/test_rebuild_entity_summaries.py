@@ -87,27 +87,23 @@ class TestDetectStaleSummaries:
     """GraphitiBackend.detect_stale_summaries() flags entities with stale summaries."""
 
     @pytest.mark.asyncio
-    async def test_clean_entity_not_flagged(self, mock_config, make_backend):
+    async def test_clean_entity_not_flagged(self, mock_config, make_backend, make_edge_backend):
         """Entity whose summary exactly matches deduped valid edge facts is not returned."""
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'Alice knows Bob'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'Alice knows Bob', 'name': 'knows'}],
         })
         result = await backend.detect_stale_summaries(group_id='test')
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_duplicate_lines_detected(self, mock_config, make_backend):
+    async def test_duplicate_lines_detected(self, mock_config, make_backend, make_edge_backend):
         """Entity with duplicate summary lines is flagged with correct duplicate_count."""
-        backend = make_backend(mock_config)
         # Summary has 'A\nA\nB' — 'A' appears twice → duplicate_count=1
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA\nfactA\nfactB'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [
                 {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'},
                 {'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'},
@@ -119,14 +115,12 @@ class TestDetectStaleSummaries:
         assert result[0]['duplicate_count'] == 1
 
     @pytest.mark.asyncio
-    async def test_stale_lines_detected(self, mock_config, make_backend):
+    async def test_stale_lines_detected(self, mock_config, make_backend, make_edge_backend):
         """Entity with lines not in any valid edge fact is flagged with stale_line_count."""
-        backend = make_backend(mock_config)
         # 'old stale fact' is in summary but NOT a valid edge
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'current fact\nold stale fact'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
         })
         result = await backend.detect_stale_summaries(group_id='test')
@@ -135,14 +129,12 @@ class TestDetectStaleSummaries:
         assert result[0]['valid_fact_count'] == 1
 
     @pytest.mark.asyncio
-    async def test_mixed_staleness(self, mock_config, make_backend):
+    async def test_mixed_staleness(self, mock_config, make_backend, make_edge_backend):
         """Entity with both duplicates and stale lines reports both counts."""
-        backend = make_backend(mock_config)
         # 'factA' duplicated (1 extra), 'old' is stale
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA\nfactA\nold'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'}],
         })
         result = await backend.detect_stale_summaries(group_id='test')
@@ -153,54 +145,46 @@ class TestDetectStaleSummaries:
         assert result[0]['stale_line_count'] == 1
 
     @pytest.mark.asyncio
-    async def test_empty_summary_not_flagged(self, mock_config, make_backend):
+    async def test_empty_summary_not_flagged(self, mock_config, make_backend, make_edge_backend):
         """Entity with empty summary is not flagged as stale."""
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': ''},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={})
+        ], edges={})
         result = await backend.detect_stale_summaries(group_id='test')
         assert result == []
         # get_all_valid_edges still called once (before the loop), even if no edges
         backend.get_all_valid_edges.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_no_entities_returns_empty(self, mock_config, make_backend):
+    async def test_no_entities_returns_empty(self, mock_config, make_backend, make_edge_backend):
         """Empty graph returns empty stale list."""
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[])
-        backend.get_all_valid_edges = AsyncMock(return_value={})
+        backend = make_edge_backend(make_backend(mock_config), nodes=[], edges={})
         result = await backend.detect_stale_summaries(group_id='test')
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_result_includes_summary_line_count(self, mock_config, make_backend):
+    async def test_result_includes_summary_line_count(self, mock_config, make_backend, make_edge_backend):
         """Stale entity dict includes summary_line_count."""
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'lineA\nlineB\nlineC'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'lineA', 'name': 'edge1'}],
         })
         result = await backend.detect_stale_summaries(group_id='test')
         assert result[0]['summary_line_count'] == 3
 
     @pytest.mark.asyncio
-    async def test_same_facts_different_order_triggers_rebuild(self, mock_config, make_backend):
+    async def test_same_facts_different_order_triggers_rebuild(self, mock_config, make_backend, make_edge_backend):
         """Identical facts in a different order flag the entity as stale.
 
         This is a known limitation of the current implementation, not a deliberate
         design invariant: canonical summary follows edge-result order, which is
         non-deterministic. Future work to sort facts would require updating this test.
         """
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factB\nfactA'},
-        ])
         # Edges return factA first, factB second → canonical = 'factA\nfactB'
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factB\nfactA'},
+        ], edges={
             'uuid-1': [
                 {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'},
                 {'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'},
@@ -219,7 +203,7 @@ class TestDetectStaleSummaries:
         # Entity is stale due to order mismatch (summary != canonical), not content issues
 
     @pytest.mark.asyncio
-    async def test_entity_with_zero_valid_edges_flagged_stale(self, mock_config, make_backend):
+    async def test_entity_with_zero_valid_edges_flagged_stale(self, mock_config, make_backend, make_edge_backend):
         """Entity with non-empty summary but zero valid edges is flagged stale.
 
         When get_all_valid_edges returns no edges for the entity, the canonical
@@ -227,11 +211,9 @@ class TestDetectStaleSummaries:
         All summary lines are counted as stale_line_count because none appear
         in the empty valid_fact_set. valid_fact_count=0, duplicate_count=0.
         """
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old fact A\nold fact B'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={})
+        ], edges={})
         result = await backend.detect_stale_summaries(group_id='test')
         assert len(result) == 1
         entity = result[0]
