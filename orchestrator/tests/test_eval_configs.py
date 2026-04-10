@@ -326,8 +326,11 @@ class TestVllmUrlInjection:
     ):
         """CLI `eval --matrix --vllm-url` must inject ANTHROPIC_BASE_URL into every vLLM config."""
         captured_state: dict[str, dict] = {}
+        captured_args: dict = {}
 
         def stub_run_matrix(base_config, **kwargs):
+            captured_args['base_config'] = base_config
+            captured_args.update(kwargs)
             for cfg in EVAL_CONFIGS:
                 captured_state[cfg.name] = dict(cfg.env_overrides)
 
@@ -340,6 +343,11 @@ class TestVllmUrlInjection:
         assert result.exit_code == 0, (
             f'CLI exited {result.exit_code}.\nOutput: {result.output}\nException: {result.exception}'
         )
+        assert 'base_config' in captured_args
+        assert captured_args['max_parallel'] is None
+        assert captured_args['trials'] == 1
+        assert captured_args['force'] is False
+        assert captured_args['timeout'] is None
         assert set(captured_state.keys()) >= VLLM_NAMES, (
             f'vLLM names missing from captured state: {VLLM_NAMES - set(captured_state.keys())}'
         )
@@ -355,7 +363,7 @@ class TestVllmUrlInjection:
             )
         cloud_with_base_url = [
             name for name in self._CLOUD_BASELINE_NAMES
-            if name in captured_state and 'ANTHROPIC_BASE_URL' in captured_state[name]
+            if 'ANTHROPIC_BASE_URL' in captured_state[name]
         ]
         assert not cloud_with_base_url, (
             f'Cloud baseline configs leaked ANTHROPIC_BASE_URL via CLI path: {cloud_with_base_url}'
