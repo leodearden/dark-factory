@@ -1257,6 +1257,28 @@ class TestRebuildEntitySummariesParallel:
         backend.get_node_text.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_force_path_passes_empty_string_old_summary(
+        self, mock_config, make_backend, make_edge_backend
+    ):
+        """Force path: old_summary='' (FalkorDB NULL→'' normalisation) is passed
+        as empty string — NOT None — to _rebuild_entity_from_edges."""
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': ''},
+        ], edges={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'new fact', 'name': 'edge1'}],
+        })
+        backend.get_node_text = AsyncMock()
+        backend.update_node_summary = AsyncMock()
+
+        captured_calls, _ = _make_rebuild_spy(backend)
+
+        result = await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+        assert result['rebuilt'] == 1
+        assert captured_calls[0]['old_summary'] == ''
+        backend.get_node_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_non_force_path_passes_old_summary_no_get_node_text(
         self, mock_config, make_backend
     ):
