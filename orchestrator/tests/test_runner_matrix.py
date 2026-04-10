@@ -39,12 +39,12 @@ def patch_load_task(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture()
-def single_cancel_matrix_case(
+def single_task_matrix_case(
     patch_load_task,  # noqa: ARG001 — applied for side-effect (load_task stub)
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
-    """Shared setup for single-task cancel-path tests.
+    """Shared setup for single-task run_eval_matrix tests.
 
     Creates a single task file at ``tmp_path / 'task_a.json'`` and returns
     ``(task_path, run_matrix_helper)``.
@@ -102,7 +102,7 @@ class TestRunEvalMatrixCancellation:
     """run_eval_matrix must re-raise asyncio.CancelledError instead of swallowing it."""
 
     async def test_run_eval_matrix_reraises_cancellederror(
-        self, single_cancel_matrix_case, caplog: pytest.LogCaptureFixture
+        self, single_task_matrix_case, caplog: pytest.LogCaptureFixture
     ):
         """CancelledError from an inner eval propagates out of run_eval_matrix.
 
@@ -110,7 +110,7 @@ class TestRunEvalMatrixCancellation:
         ``isinstance(r, BaseException)`` branch logs 'Eval failed' and then
         discards the exception; pytest.raises(CancelledError) never sees it.
         """
-        _task_path, run_matrix = single_cancel_matrix_case
+        _task_path, run_matrix = single_task_matrix_case
 
         async def fake_run_eval(*args, **kwargs):
             raise asyncio.CancelledError('simulated cancel')
@@ -288,7 +288,7 @@ class TestRunEvalMatrixCancellation:
 
 
     async def test_cancelled_error_log_carries_exc_info(
-        self, single_cancel_matrix_case, caplog: pytest.LogCaptureFixture
+        self, single_task_matrix_case, caplog: pytest.LogCaptureFixture
     ):
         """CancelledError log record must carry exc_info (traceback attached).
 
@@ -299,7 +299,7 @@ class TestRunEvalMatrixCancellation:
         This test would FAIL without the exc_info fix because the old
         ``logger.error(f'Eval cancelled: {r}')`` call did not set exc_info.
         """
-        _task_path, run_matrix = single_cancel_matrix_case
+        _task_path, run_matrix = single_task_matrix_case
 
         async def fake_run_eval(*args, **kwargs):
             raise asyncio.CancelledError('simulated cancel')
@@ -527,7 +527,7 @@ class TestRunEvalMatrixNonCancelPath:
         ), f'Unexpected "cancelled" log record. Got: {[r.message for r in caplog.records]}'
 
     async def test_failed_error_log_carries_exc_info(
-        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, single_task_matrix_case, caplog: pytest.LogCaptureFixture
     ):
         """Non-cancel RuntimeError log record must carry exc_info (traceback attached).
 
@@ -539,24 +539,17 @@ class TestRunEvalMatrixNonCancelPath:
         ``logger.error(f'Eval failed: {exc}')`` does not set exc_info and
         embeds the exception message in the log string instead.
         """
-        task_path = tmp_path / 'task_a.json'
-        task_path.touch()
+        _task_path, run_matrix = single_task_matrix_case
 
         async def fake_run_eval(*args, **kwargs):
             raise RuntimeError('simulated failure')
 
-        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
-
         with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'):
-            await run_eval_matrix(
-                [task_path],
-                [_CFG],
-                force=True,
-            )
+            await run_matrix(fake_run_eval)
 
-        failed_records = [r for r in caplog.records if 'failed' in r.message.lower()]
+        failed_records = [r for r in caplog.records if r.message == 'Eval failed']
         assert failed_records, (
-            f'Expected at least one log record containing "failed". '
+            f'Expected at least one log record with message == "Eval failed". '
             f'Got: {[r.message for r in caplog.records]}'
         )
         record = failed_records[0]
