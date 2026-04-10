@@ -20,8 +20,6 @@ class TestWriteTasksJsonHelper:
 
     def test_creates_directory_and_file(self, tmp_path):
         """Creates .taskmaster/tasks/tasks.json with correct JSON content."""
-        import json
-
         tasks = [
             {'id': '1', 'title': 'A', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
         ]
