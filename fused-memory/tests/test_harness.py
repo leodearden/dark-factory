@@ -1763,3 +1763,65 @@ class TestHarnessFilteredTaskTreeWiring:
             f"got {captured.get('filtered_task_tree')!r}. "
             "_run_remediation_pass must set stage.filtered_task_tree on TaskKnowledgeSync instances."
         )
+
+
+class TestConfigureTaskSync:
+    """Unit tests for the _configure_task_sync staticmethod on ReconciliationHarness."""
+
+    def _make_tree(self):
+        """Return a small FilteredTaskTree for assertions."""
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+        return FilteredTaskTree(
+            active_tasks=[
+                {'id': 2, 'title': 'T2', 'status': 'in-progress', 'dependencies': []},
+            ],
+            done_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            total_count=1,
+        )
+
+    def test_configure_task_sync_sets_filtered_task_tree(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """_configure_task_sync applies filtered_task_tree and remediation_mode=False to stage2."""
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        stage2 = harness.stages[1]
+        assert isinstance(stage2, TaskKnowledgeSync)
+
+        tree = self._make_tree()
+        ReconciliationHarness._configure_task_sync(stage2, filtered_task_tree=tree, remediation_mode=False)
+
+        assert stage2.filtered_task_tree is tree
+        assert stage2.remediation_mode is False
+
+    def test_configure_task_sync_sets_remediation_mode(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """_configure_task_sync applies remediation_mode=True to stage2."""
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        stage2 = harness.stages[1]
+        assert isinstance(stage2, TaskKnowledgeSync)
+
+        tree = self._make_tree()
+        ReconciliationHarness._configure_task_sync(stage2, filtered_task_tree=tree, remediation_mode=True)
+
+        assert stage2.remediation_mode is True
+        assert stage2.filtered_task_tree is tree
+
+    def test_configure_task_sync_is_staticmethod(self):
+        """_configure_task_sync must be declared as a @staticmethod."""
+        import inspect
+
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+
+        assert isinstance(
+            inspect.getattr_static(ReconciliationHarness, '_configure_task_sync'),
+            staticmethod,
+        ), "_configure_task_sync must be a @staticmethod on ReconciliationHarness"

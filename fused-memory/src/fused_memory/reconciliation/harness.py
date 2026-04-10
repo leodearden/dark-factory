@@ -155,6 +155,24 @@ class ReconciliationHarness:
         stage.remediation_findings = remediation_findings
         stage.filtered_task_tree = filtered_task_tree
 
+    @staticmethod
+    def _configure_task_sync(
+        stage: TaskKnowledgeSync,
+        *,
+        filtered_task_tree: FilteredTaskTree | None = None,
+        remediation_mode: bool = False,
+    ) -> None:
+        """Apply Stage-2 attributes to TaskKnowledgeSync.
+
+        Mirrors _configure_consolidator for Stage 1 — both full-cycle and
+        remediation paths use this helper to keep attribute wiring symmetric
+        and discoverable. Stage-2-specific attributes (filtered_task_tree,
+        remediation_mode) are set here; Stage-1 wiring is handled by
+        _configure_consolidator.
+        """
+        stage.filtered_task_tree = filtered_task_tree
+        stage.remediation_mode = remediation_mode
+
     async def _fetch_filtered_task_tree(self, project_root: str) -> FilteredTaskTree:
         """Fetch the task tree once and return a filtered subset of active tasks.
 
