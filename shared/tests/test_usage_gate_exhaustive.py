@@ -1101,6 +1101,21 @@ class TestConfirmAccountOk:
         gate.confirm_account_ok('completely-unknown-token')
         assert gate._accounts[0].near_cap is True
 
+    def test_confirm_account_ok_on_capped_account(self):
+        """confirm_account_ok clears near_cap even when the account is capped.
+
+        Regression guard: a successful invocation proves the account is healthy, so
+        near_cap must be cleared unconditionally on any token-matched account — the
+        method does not guard against the capped state, and capped remains unchanged.
+        """
+        gate = make_gate(['a'])
+        gate._accounts[0].capped = True
+        gate._accounts[0].near_cap = True
+        gate._accounts[0].probe_in_flight = False
+        gate.confirm_account_ok(gate._accounts[0].token)
+        assert gate._accounts[0].near_cap is False   # cleared unconditionally
+        assert gate._accounts[0].capped is True      # capped state is untouched
+
 
 # =========================================================================
 # TestProperties
