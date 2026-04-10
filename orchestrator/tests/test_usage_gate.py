@@ -1302,3 +1302,56 @@ class TestNoCostStore:
         acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
         await gate._account_resume_probe_loop(acct)
         assert acct.capped is False
+
+
+# --- build_usage_gate helper ---
+
+
+from tests.conftest import build_usage_gate  # noqa: E402  (import at use-site for clarity)
+
+
+class TestBuildUsageGateHelper:
+    """Tests for the shared build_usage_gate() helper in conftest.py."""
+
+    def test_build_usage_gate_returns_usage_gate_instance(self):
+        """build_usage_gate with 1 account returns a UsageGate instance."""
+        acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
+        gate = build_usage_gate(acct_cfgs, ['tok-a'])
+        assert isinstance(gate, UsageGate)
+
+    def test_build_usage_gate_injects_tokens_without_env_lookup(self):
+        """Tokens are taken from the parallel list, not from os.environ."""
+        acct_cfgs = [
+            AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A'),
+            AccountConfig(name='test-b', oauth_token_env='TEST_TOKEN_B'),
+        ]
+        gate = build_usage_gate(acct_cfgs, ['tok-a', 'tok-b'])
+        assert len(gate._accounts) == 2
+        assert gate._accounts[0].name == 'test-a'
+        assert gate._accounts[0].token == 'tok-a'
+        assert gate._accounts[1].name == 'test-b'
+        assert gate._accounts[1].token == 'tok-b'
+
+    def test_build_usage_gate_open_event_starts_set(self):
+        """The gate's _open event is set (unpaused) immediately after construction."""
+        acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
+        gate = build_usage_gate(acct_cfgs, ['tok-a'])
+        assert gate._open.is_set()
+
+    def test_build_usage_gate_applies_wait_for_reset(self):
+        """wait_for_reset=True is reflected in gate._config.wait_for_reset."""
+        acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
+        gate = build_usage_gate(acct_cfgs, ['tok-a'], wait_for_reset=True)
+        assert gate._config.wait_for_reset is True
+
+    def test_build_usage_gate_applies_session_budget_usd(self):
+        """session_budget_usd is reflected in gate._config.session_budget_usd."""
+        acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
+        gate = build_usage_gate(acct_cfgs, ['tok-a'], session_budget_usd=7.5)
+        assert gate._config.session_budget_usd == pytest.approx(7.5)
+
+    def test_build_usage_gate_raises_on_length_mismatch(self):
+        """ValueError is raised when account_configs and tokens have different lengths."""
+        acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
+        with pytest.raises(ValueError, match='length'):
+            build_usage_gate(acct_cfgs, ['tok-a', 'tok-b'])  # 1 cfg, 2 tokens
