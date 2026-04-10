@@ -663,6 +663,85 @@ class TestCollectSnapshot:
             ):
                 await collect_snapshot(conn, config)
 
+    @pytest.mark.asyncio
+    async def test_gather_return_exceptions_preserves_healthy_snapshots(self, tmp_path, caplog):
+        """OSError on one known root is isolated; healthy projects are still snapshotted.
+
+        Regression anchor for task 519: asyncio.gather(return_exceptions=True) +
+        isinstance(result, BaseException) guard ensure a single unreadable tasks.json
+        cannot drop the remaining snapshots.  The test uses OSError (not PermissionError)
+        to match task 519's 'unreadable tasks.json' wording.
+        """
+        import logging
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        bad_root = Path('/fake/project/bad_root')
+        good_root_1 = Path('/fake/project/good_root_1')
+        good_root_2 = Path('/fake/project/good_root_2')
+
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[bad_root, good_root_1, good_root_2],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        good_1_tasks = [{'status': 'done'}, {'status': 'done'}]
+        good_2_tasks = [{'status': 'done'}]
+
+        bad_tasks_json = bad_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            good_root_1.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': good_1_tasks,
+            good_root_2.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': good_2_tasks,
+        }
+
+        def fake_load(path):
+            if path == bad_tasks_json:
+                raise OSError('mock disk error')
+            return _tasks_map[path]
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                # Must NOT raise even though bad_root fails — return_exceptions=True absorbs it
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT * FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+
+        # (a) three rows: main + good_root_1 + good_root_2
+        assert len(rows) == 3
+
+        # row layout: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
+        by_project = {row[1]: row for row in rows}
+
+        # (b) bad_root must NOT appear
+        assert str(bad_root.resolve()) not in by_project
+
+        # (c) main project and both good roots must appear
+        assert str(tmp_path.resolve()) in by_project
+        assert str(good_root_1.resolve()) in by_project
+        assert str(good_root_2.resolve()) in by_project
+
+        # (d) per-root done counts must reflect the supplied task lists
+        good_1_row = by_project[str(good_root_1.resolve())]
+        assert good_1_row[8] == 2  # done=2 for good_root_1
+
+        good_2_row = by_project[str(good_root_2.resolve())]
+        assert good_2_row[8] == 1  # done=1 for good_root_2
+
+        # (e) at least one WARNING record must name the bad root and carry exc_info
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'Expected at least one WARNING log record'
+        combined = ' '.join(r.getMessage() for r in warning_records)
+        assert 'bad_root' in combined or str(bad_root) in combined
+        assert any(r.exc_info for r in warning_records)
+
 # ---------------------------------------------------------------------------
 # downsample
 # ---------------------------------------------------------------------------
