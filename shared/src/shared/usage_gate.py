@@ -411,6 +411,7 @@ class UsageGate:
             if acct.resets_at is not None and now >= acct.resets_at:
                 logger.info(f'Account {acct.name}: reset time passed — uncapping (probing)')
                 acct.capped = False
+                acct.near_cap = False
                 acct.probing = True  # gate: one task confirms before opening to all
                 if acct.pause_started_at:
                     self._total_pause_secs += (now - acct.pause_started_at).total_seconds()
