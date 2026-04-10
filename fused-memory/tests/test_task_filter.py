@@ -77,6 +77,34 @@ class TestFilterTaskTree:
         assert result.other_count == 1
         assert result.total_count == 1
 
+        # Non-dict top-level inputs
+        result = filter_task_tree(None)
+        assert result.active_tasks == []
+        assert result.done_tasks == []
+        assert result.cancelled_tasks == []
+        assert result.done_count == 0
+        assert result.cancelled_count == 0
+        assert result.other_count == 0
+        assert result.total_count == 0
+
+        result = filter_task_tree([{'id': 1, 'status': 'pending'}])
+        assert result.active_tasks == []
+        assert result.done_tasks == []
+        assert result.cancelled_tasks == []
+        assert result.done_count == 0
+        assert result.cancelled_count == 0
+        assert result.other_count == 0
+        assert result.total_count == 0
+
+        result = filter_task_tree('bad')
+        assert result.active_tasks == []
+        assert result.done_tasks == []
+        assert result.cancelled_tasks == []
+        assert result.done_count == 0
+        assert result.cancelled_count == 0
+        assert result.other_count == 0
+        assert result.total_count == 0
+
     def test_done_tasks_field_defaults_to_empty_list(self):
         """FilteredTaskTree.done_tasks defaults to [] and is independent per instance."""
         tree1 = FilteredTaskTree()
