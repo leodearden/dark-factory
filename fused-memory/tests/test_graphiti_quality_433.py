@@ -483,6 +483,49 @@ class TestRebuildEntitySummariesDataFlow:
 
         backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
 
+    @pytest.mark.asyncio
+    async def test_force_false_dry_run_fetches_edges_per_entity(self, mock_config, make_backend):
+        """force=False, dry_run=True: get_valid_edges_for_node awaited once per non-empty-summary entity (post-526).
+
+        Positive complement to test_force_false_dry_run_does_not_fetch_edge_map.
+        Task 526 introduced _detect_stale_summaries_dry_run which fetches edges
+        per-entity via get_valid_edges_for_node rather than the bulk
+        get_all_valid_edges.  This test pins the positive claim in the updated
+        docstring: with two non-empty-summary entities, the probe must issue
+        exactly two get_valid_edges_for_node awaits — one per entity.
+
+        Regression guard: a future refactor that accidentally short-circuited
+        _detect_stale_summaries_dry_run into a no-op (returning an empty stale
+        list without ever querying edges) would pass the existing negative test
+        but fail here, surfacing the regression immediately.
+
+        This is a characterization test — assertions match current production
+        behaviour and should pass on first run with no production changes.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'some summary 1'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'some summary 2'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        # Per-entity probe returns no edges → summaries are stale (non-empty summary,
+        # canonical facts = '', summary != canonical).
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        result = await backend.rebuild_entity_summaries(
+            group_id='test', force=False, dry_run=True
+        )
+
+        # Positive: per-entity fetch ran for each non-empty-summary entity
+        assert backend.get_valid_edges_for_node.await_count == 2
+        backend.get_valid_edges_for_node.assert_any_await('u1', group_id='test')
+        backend.get_valid_edges_for_node.assert_any_await('u2', group_id='test')
+        # Negative: bulk fetch was NOT issued (post-526 invariant)
+        backend.get_all_valid_edges.assert_not_awaited()
+        # Result reflects dry_run short-circuit: both stale entities skipped, none rebuilt
+        assert result['total_entities'] == 2
+        assert result['rebuilt'] == 0
+
 
 # ---------------------------------------------------------------------------
 # step-5 (task 443): error-accumulation path in rebuild_entity_summaries
