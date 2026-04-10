@@ -86,9 +86,11 @@ class TestDetectCapHit:
         assert gate.detect_cap_hit(
             "You're out of extra usage for this period.", '', oauth_token='token-a'
         ) is True
-        assert gate.detect_cap_hit(
+        # Near-cap warnings also return True (proactive pause via NEAR_CAP_PREFIXES)
+        gate2 = _make_gate(num_accounts=1)
+        assert gate2.detect_cap_hit(
             '', "You're now using extra usage credits.", oauth_token='token-a'
-        ) is False
+        ) is True
 
     def test_detects_near_cap_close_to(self):
         gate = _make_gate(num_accounts=1)
