@@ -356,7 +356,14 @@ class TestAllCappedBlockResume:
         assert gate.is_paused, "Expected gate to be paused when all accounts are capped"
         assert not gate._open.is_set(), "Expected _open event to be cleared when all capped"
 
-        # Uncap max-e and signal the gate to open
+        # TEST SHORTCUT — bypasses the real production resume path.
+        # In production, accounts are uncapped in one of two ways:
+        #   (a) _refresh_capped_accounts() wakes periodically and checks whether
+        #       resets_at has elapsed, then clears `capped` and calls _open.set(); or
+        #   (b) _account_resume_probe_loop() fires a successful probe via _run_probe()
+        #       and calls _open.set() itself after clearing `capped`.
+        # Here we mutate `capped` and set the event directly so the test stays fast
+        # and synchronous without needing to run background tasks or mock the clock.
         gate._accounts[1].capped = False  # max-e is index 1
         gate._open.set()
 
