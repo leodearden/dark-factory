@@ -311,15 +311,12 @@ class TestPostInit:
         cfg = DashboardConfig(project_root=tmp_path, known_project_roots=[link1, link2])
         assert cfg.known_project_roots == [real1.resolve(), real2.resolve()]
 
-    def test_tasks_json_derived_from_resolved_root(self, tmp_path):
+    def test_tasks_json_derived_from_resolved_root(self, symlinked_dir):
         """tasks_json must be derived from the resolved project_root, not the symlink path."""
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
+        link, real_resolved = symlinked_dir
 
         cfg = DashboardConfig(project_root=link)
-        assert cfg.tasks_json == real_dir.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+        assert cfg.tasks_json == real_resolved / '.taskmaster' / 'tasks' / 'tasks.json'
 
     def test_replace_resolves_known_project_roots_symlinks(self, tmp_path):
         """dataclasses.replace() must resolve symlinks in known_project_roots via __post_init__.
