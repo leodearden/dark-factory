@@ -110,6 +110,23 @@ class TestAddMemory:
         # Should auto-classify — with heuristic-only config, entities_and_relations
         assert result.category is not None
 
+    @pytest.mark.asyncio
+    async def test_mem0_primary_returns_memory_ids(self, service):
+        """add_memory must return the server-assigned Mem0 IDs synchronously.
+
+        The fixture has svc.mem0.add returning {'results': [{'id': 'mem0-1'}]}.
+        After the fix (direct synchronous call instead of durable-queue enqueue),
+        result.memory_ids must be ['mem0-1'].
+        """
+        result = await service.add_memory(
+            content='Always use type hints',
+            category='preferences_and_norms',
+            project_id='test',
+        )
+        assert result.memory_ids == ['mem0-1'], (
+            f'Expected memory_ids=[\'mem0-1\'], got {result.memory_ids!r}. '
+            'The Mem0 write path must be synchronous so IDs are available to the caller.'
+        )
 
     @pytest.mark.asyncio
     async def test_mem0_enqueue_error_surfaced_in_response(self, service):
