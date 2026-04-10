@@ -1753,3 +1753,26 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         assert '[2]' not in recently_section, (
             "Active task id=2 should NOT be in Recently Completed section"
         )
+
+
+class TestExtractSectionHelper:
+    """Unit tests for the _extract_section module-level helper."""
+
+    def test_extracts_section_bounded_by_next_header(self):
+        """Helper returns content from header up to (not including) the next '\\n#' boundary."""
+        payload = '### First Section\nline one\nline two\n### Second Section\nother content'
+        result = _extract_section(payload, '### First Section')
+        assert result == '### First Section\nline one\nline two'
+        assert '### Second Section' not in result
+
+    def test_extracts_section_to_eof_when_no_next_header(self):
+        """When no subsequent '#' header exists, helper returns from header through end-of-string."""
+        payload = '### Only Section\nsome content here\nmore lines'
+        result = _extract_section(payload, '### Only Section')
+        assert result == '### Only Section\nsome content here\nmore lines'
+
+    def test_returns_empty_string_when_header_absent(self):
+        """When the header does not appear in payload, helper returns ''."""
+        payload = '### Other Section\nsome content'
+        result = _extract_section(payload, '### Missing Header')
+        assert result == ''
