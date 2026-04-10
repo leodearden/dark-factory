@@ -289,15 +289,12 @@ class TestPostInit:
     code is later refactored.
     """
 
-    def test_resolves_project_root_symlink(self, tmp_path):
+    def test_resolves_project_root_symlink(self, symlinked_dir):
         """DashboardConfig must resolve a symlinked project_root in __post_init__."""
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
+        link, real_resolved = symlinked_dir
 
         cfg = DashboardConfig(project_root=link)
-        assert cfg.project_root == real_dir.resolve()
+        assert cfg.project_root == real_resolved
 
     def test_resolves_known_project_roots_symlinks(self, tmp_path):
         """DashboardConfig must resolve symlinks in known_project_roots in __post_init__."""
