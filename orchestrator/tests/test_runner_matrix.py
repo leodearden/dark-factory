@@ -266,6 +266,62 @@ class TestRunEvalMatrixCancellation:
         )
 
 
+    async def test_cancelled_error_log_carries_exc_info(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """CancelledError log record must carry exc_info (traceback attached).
+
+        The message should be stable ('Eval cancelled') rather than including
+        the f-string repr of the exception, so that it is useful even when
+        str(CancelledError) is empty.
+
+        This test FAILS against the current code because
+        ``logger.error(f'Eval cancelled: {r}')`` does not set exc_info.
+        """
+        task_path = tmp_path / 'task_a.json'
+        task_path.touch()
+
+        def fake_load_task(path: Path) -> dict:
+            return {'id': path.stem}
+
+        async def fake_run_eval(*args, **kwargs):
+            raise asyncio.CancelledError('simulated cancel')
+
+        monkeypatch.setattr(runner_mod, 'load_task', fake_load_task)
+        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'), pytest.raises(asyncio.CancelledError):
+            await run_eval_matrix(
+                [task_path],
+                [_CFG],
+                force=True,
+            )
+
+        cancel_records = [r for r in caplog.records if 'cancelled' in r.message.lower()]
+        assert cancel_records, (
+            f'Expected at least one log record containing "cancelled". '
+            f'Got: {[r.message for r in caplog.records]}'
+        )
+        record = cancel_records[0]
+
+        # (a) Message must be exactly 'Eval cancelled' — no f-string interpolation
+        assert record.message == 'Eval cancelled', (
+            f"Expected message 'Eval cancelled', got {record.message!r}"
+        )
+
+        # (b) exc_info must be a 3-tuple (type, value, traceback) — not None
+        assert isinstance(record.exc_info, tuple) and len(record.exc_info) == 3, (
+            f'Expected exc_info to be a 3-tuple, got {record.exc_info!r}'
+        )
+        exc_type, exc_val, exc_tb = record.exc_info
+        assert exc_type is asyncio.CancelledError, (
+            f'Expected exc_type to be CancelledError, got {exc_type!r}'
+        )
+        assert isinstance(exc_val, asyncio.CancelledError), (
+            f'Expected exc_val to be CancelledError instance, got {exc_val!r}'
+        )
+
+
 @pytest.mark.asyncio
 class TestRunEvalMatrixNonCancelPath:
     """Non-cancel exceptions must be logged and the matrix must continue."""
