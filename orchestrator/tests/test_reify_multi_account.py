@@ -457,3 +457,52 @@ class TestCapDetectedUnknownToken:
         assert not gate.is_paused, (
             "Gate should not be paused: 4 of 5 accounts are still available"
         )
+
+    def test_unknown_token_when_all_capped_is_noop(self):
+        """Unknown token with all accounts capped is a no-op (logs warning, no state change)."""
+        gate = _make_reify_gate()
+
+        # Cap all 5 accounts using the same loop pattern as test_gate_blocks_while_all_capped
+        future_reset = datetime.now(UTC) + timedelta(hours=1)
+        for defn in REIFY_ACCOUNT_DEFS:
+            gate._handle_cap_detected(
+                reason=f'cap-{defn["name"]}',
+                resets_at=future_reset,
+                oauth_token=f'token-{defn["name"]}',
+            )
+
+        assert gate.is_paused, "Gate should be paused after capping all 5 accounts"
+
+        # Snapshot the state of all 5 accounts before the unknown-token call
+        snapshot = [
+            (a.name, a.capped, a.resets_at)
+            for a in gate._accounts
+        ]
+
+        # Call with an unknown token — should be a no-op since no uncapped account exists
+        gate._handle_cap_detected(
+            reason='stray-token-cap',
+            resets_at=None,
+            oauth_token='not-a-real-token',
+        )
+
+        # All 5 accounts must still be capped
+        assert len(gate._accounts) == 5
+        for acct in gate._accounts:
+            assert acct.capped, (
+                f"{acct.name} should still be capped after noop unknown-token call"
+            )
+
+        # No account state was mutated: compare against snapshot
+        for i, (name, was_capped, was_resets_at) in enumerate(snapshot):
+            acct = gate._accounts[i]
+            assert acct.name == name
+            assert acct.capped == was_capped, (
+                f"{name}: capped changed unexpectedly"
+            )
+            assert acct.resets_at == was_resets_at, (
+                f"{name}: resets_at changed unexpectedly"
+            )
+
+        # Gate remains paused
+        assert gate.is_paused, "Gate must remain paused after noop unknown-token call"
