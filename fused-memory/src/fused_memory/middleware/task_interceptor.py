@@ -251,6 +251,14 @@ class TaskInterceptor:
         tag: str | None = None,
     ) -> dict:
         tm = await self._ensure_taskmaster()
+
+        # Pre-snapshot: capture the task tree before Taskmaster generates tasks
+        try:
+            pre_snapshot = await tm.get_tasks(project_root)
+        except Exception as pre_exc:
+            logger.warning('bulk_dedup: pre-snapshot failed for parse_prd: %s', pre_exc)
+            pre_snapshot = None
+
         result = await tm.parse_prd(
             input_path, project_root, num_tasks=num_tasks, tag=tag
         )
@@ -261,6 +269,20 @@ class TaskInterceptor:
         )
         await self.buffer.push(event)
         await self._await_commit(project_root, 'parse_prd')
+
+        # Post-hoc dedup: remove newly-created tasks that duplicate pre-existing ones
+        try:
+            if pre_snapshot is not None:
+                dedup = await self._dedupe_bulk_created(project_root, pre_snapshot)
+            else:
+                dedup = {
+                    'removed': [], 'kept': [], 'errors': [],
+                    'skipped_reason': 'pre_snapshot_failed',
+                }
+            result['dedup'] = dedup
+        except Exception as dedup_exc:
+            logger.warning('bulk_dedup: dedup block failed for parse_prd: %s', dedup_exc)
+            result['dedup'] = {'skipped_reason': f'exception: {dedup_exc}'}
 
         if self.reconciler:
             task = asyncio.create_task(
