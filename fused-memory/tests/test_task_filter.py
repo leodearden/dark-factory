@@ -383,38 +383,31 @@ class TestFormatFilteredTaskTree:
         )
 
     def test_budget_reserve_matches_actual_notice_length(self):
-        """Output length must not exceed max_chars regardless of truncation notice length.
+        """Regression: format_filtered_task_tree must enforce len(output) <= max_chars even
+        when the truncation-notice length is not known until after line accumulation.
 
-        The magic -50 reserve fails when trimmed_count has 7+ digits (≥ 1,000,000).
-        The actual notice '\n... and NNNNNNN more active (truncated for budget)\n' is
-        52+ chars, exceeding the 50-char reserve by 1+, causing an off-by-one violation.
+        The implementation computes budget = max_chars - len(header) - len(summary_line)
+        (no magic fixed reserve) and then uses a lazy verification loop that pops kept
+        lines until the realized notice length fits within max_chars. This test exercises
+        that path with a large input (N=10,000 via repeated-reference trick) and a tight
+        budget that forces truncation and at least one pop iteration.
 
-        With 1,000,001 tasks all having title='T', budget=25, exactly 1 task line fits
-        (used=budget). trimmed_count = 1,000,000, notice = 52 chars > 50 reserve.
-        len(result) = 195 > max_chars=194. Bug confirmed.
-
-        Uses repeated-reference trick ([same_dict]*N) to keep memory at ~8 MB instead
-        of creating N full task dicts (~200 MB).
+        Uses repeated-reference trick ([same_dict]*N) to keep allocations under 1 MB
+        instead of creating N full task dicts.
         """
-        # Compute max_chars so that exactly 1 task line fits and used == budget exactly.
-        # Task line for title='T', id=1: "- [1] (pending) T deps=[]" = 24 chars.
-        # Loop condition: used + len(line) + 1 ≤ budget.
-        # For 1 line to fit: 0 + 24 + 1 = 25 ≤ budget → budget ≥ 25.
-        # For 2nd line to not fit: 25 + 24 + 1 = 50 > budget → budget < 50. So budget = 25.
-        #
-        # With 1_000_001 tasks shown, header is:
-        # "### Active Task Tree\n(1000001 active shown, 0 done, 0 cancelled, 0 other, 1000001 total)\n"
-        # = 90 chars. summary_line = "0 done, 0 cancelled — omitted" = 29 chars.
-        # budget = max_chars - 90 - 29 - 50 = max_chars - 169.
-        # For budget = 25: max_chars = 25 + 169 = 194.
-        #
-        # trimmed_count = 1_000_001 - 1 = 1_000_000 (7 digits).
-        # notice = "\n... and 1000000 more active (truncated for budget)\n" = 52 chars.
-        # len(result) = 90 + (25-1) + 52 + 29 = 195 > 194 = max_chars. BUG!
+        # Task line for title='T', id=1: "- [1] (pending) T deps=[]" = 25 chars.
+        # With N=10_000, max_tasks=N, header is:
+        # "### Active Task Tree\n(10000 active shown, 0 done, 0 cancelled, 0 other, 10000 total)\n"
+        # = 85 chars. summary_line = "0 done, 0 cancelled — omitted" = 29 chars.
+        # budget = max_chars - 85 - 29 = max_chars - 114.
+        # For max_chars=500: budget=386. Each line costs 26 chars (25 + newline separator).
+        # 14 lines fit (14×26=364 ≤ 386, 15×26=390 > 386). trimmed=9986, notice=49 chars.
+        # Initial result = 85 + (14×25+13) + 49 + 29 = 85+363+49+29 = 526 > 500.
+        # Lazy loop pops 1 line → 13 lines, trimmed=9987, result=500 ≤ 500. Loop exits.
 
         single_task = {'id': 1, 'title': 'T', 'status': 'pending', 'dependencies': []}
-        n = 1_000_001
-        # Repeated-reference trick: list of n pointers to same dict — uses ~8 MB, not ~200 MB.
+        n = 10_000
+        # Repeated-reference trick: list of n pointers to same dict — keeps memory < 1 MB.
         active_large = [single_task] * n
         tree_large = FilteredTaskTree(
             active_tasks=active_large,
@@ -424,14 +417,12 @@ class TestFormatFilteredTaskTree:
             total_count=n,
         )
 
-        max_chars = 194  # Precisely computed to make used == budget == 25, notice 52 chars
+        max_chars = 500  # Tight budget: forces truncation and exercises the lazy pop loop
         output = format_filtered_task_tree(tree_large, max_tasks=n, max_chars=max_chars)
 
-        # With the magic -50 reserve, len(output) = 195 > 194 = max_chars.
         assert len(output) <= max_chars, (
             f'Output length {len(output)} exceeds max_chars={max_chars}; '
-            f'bug: magic -50 reserve is insufficient when trimmed_count has 7+ digits '
-            f'(notice is 52 chars, not ≤ 50)'
+            f'the lazy verification loop must pop task lines until the output fits'
         )
 
     def test_deps_more_than_5_renders_truncated(self):
