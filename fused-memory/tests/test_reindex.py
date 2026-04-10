@@ -269,7 +269,14 @@ class TestUpdateEdgeEmbedding:
 # ---------------------------------------------------------------------------
 
 class TestListIndices:
-    """GraphitiBackend.list_indices() returns parsed index records."""
+    """GraphitiBackend.list_indices() returns parsed index records.
+
+    These unit tests pin the Cypher string and ro_query usage with a mocked
+    FalkorDB graph.  The empirical verification that FalkorDB actually accepts
+    ``CALL db.indexes()`` on the ``GRAPH.RO_QUERY`` path lives in
+    ``fused-memory/tests/test_list_indices_integration.py``
+    (Task 530 / esc-486-49).
+    """
 
     @pytest.mark.asyncio
     async def test_returns_index_list(self, mock_config, make_backend, make_graph_mock):
