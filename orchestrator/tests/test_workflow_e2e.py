@@ -361,6 +361,10 @@ class FakeScheduler:
     ) -> bool:
         return True
 
+    def get_cached_status(self, task_id: str) -> str | None:
+        history = self.statuses.get(task_id)
+        return history[-1] if history else None
+
     def release(self, task_id: str) -> None:
         pass
 
