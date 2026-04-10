@@ -352,6 +352,65 @@ class TestNearCapStateDistinction:
 
 
 # =========================================================================
+# TestCapHitNowUsingExtraSemantics
+# =========================================================================
+
+
+class TestCapHitNowUsingExtraSemantics:
+    """Behavioral tests asserting 'You're now using extra' triggers CAP_HIT, not NEAR_CAP.
+
+    'You're now using extra compute credits' means the account has crossed the
+    base plan's hard cap and is billing overage — semantically equivalent to a
+    cap hit, not merely a warning. These tests FAIL until step-3 moves the
+    prefix from NEAR_CAP_PREFIXES to CAP_HIT_PREFIXES.
+    """
+
+    # All messages include 'resets' as a secondary keyword so they remain valid
+    # through the step-6 CAP_CONFIRM_KEYWORDS enforcement.
+
+    _MSG = "You're now using extra compute credits. Your plan resets in 4h."
+
+    def test_now_using_extra_sets_capped_true(self):
+        """'You're now using extra' must set acct.capped=True (CAP_HIT routing)."""
+        gate = make_gate(['a'])
+        gate.detect_cap_hit('', self._MSG)
+        acct = gate._accounts[0]
+        assert acct.capped is True
+
+    def test_now_using_extra_does_not_set_near_cap(self):
+        """'You're now using extra' must leave acct.near_cap=False (not NEAR_CAP routing)."""
+        gate = make_gate(['a'])
+        gate.detect_cap_hit('', self._MSG)
+        acct = gate._accounts[0]
+        assert acct.near_cap is False
+
+    def test_now_using_extra_routes_to_handle_cap_detected(self):
+        """Only _handle_cap_detected must be called, not _handle_near_cap_warning."""
+        gate = make_gate(['a'])
+        with patch.object(gate, '_handle_cap_detected') as mock_cap, \
+                patch.object(gate, '_handle_near_cap_warning') as mock_near:
+            gate.detect_cap_hit('', self._MSG)
+        mock_cap.assert_called_once()
+        mock_near.assert_not_called()
+
+    def test_now_using_extra_closes_gate_when_single_account(self):
+        """A single-account gate must close (_open cleared) after a cap hit."""
+        gate = make_gate(['a'])
+        gate.detect_cap_hit('', self._MSG)
+        assert gate._open.is_set() is False
+
+    def test_now_using_extra_parses_resets_at_from_message(self):
+        """_handle_cap_detected must parse 'resets in 4h' and set acct.resets_at ~4h ahead."""
+        gate = make_gate(['a'])
+        before = datetime.now(UTC)
+        gate.detect_cap_hit('', self._MSG)
+        acct = gate._accounts[0]
+        assert acct.resets_at is not None
+        expected = before + timedelta(hours=4)
+        assert abs((acct.resets_at - expected).total_seconds()) < 5
+
+
+# =========================================================================
 # TestResetTimeParsing
 # =========================================================================
 
