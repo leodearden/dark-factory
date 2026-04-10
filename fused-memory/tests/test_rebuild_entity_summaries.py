@@ -250,7 +250,7 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_rebuilds_only_stale_entities(self, mock_config, make_backend):
-        """Only rebuilds entities flagged as stale by _detect_stale_summaries_with_edges.
+        """Only stale entities are rebuilt; clean entities are skipped.
 
         Alice has summary='stale fact' but her only valid edge has fact='current fact',
         so the canonical is 'current fact' != 'stale fact' → stale.
@@ -258,19 +258,23 @@ class TestRebuildEntitySummaries:
         Total entities=2, stale=1, rebuilt=1.
         """
         backend = make_backend(mock_config)
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=StaleSummaryResult(
-            stale=[{'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale',
-                    'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
-                    'summary_line_count': 1}],
-            all_edges={'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
-            total_count=2,
-        ))
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale fact'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'current fact'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current fact', 'name': 'edge2'}],
+        })
         backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test')
         assert result['total_entities'] == 2
         assert result['stale_entities'] == 1
         assert result['rebuilt'] == 1
-        backend.update_node_summary.assert_awaited_once()
+        backend.update_node_summary.assert_awaited_once_with('uuid-1', ANY, group_id='test')
+        backend.list_entity_nodes.assert_awaited_once_with(group_id='test')
+        backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
+        assert result['details'][0]['old_summary'] == 'stale fact'
 
     @pytest.mark.asyncio
     async def test_force_rebuilds_all(self, mock_config, make_backend):
