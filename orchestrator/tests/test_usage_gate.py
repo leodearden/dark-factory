@@ -1348,3 +1348,9 @@ class TestBuildUsageGateHelper:
         )
         assert gate._config.probe_interval_secs == 7
         assert gate._config.max_probe_interval_secs == 42
+
+    def test_build_usage_gate_run_probe_is_asyncmock(self):
+        """gate._run_probe is an AsyncMock so tests don't spawn real claude processes."""
+        acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
+        gate = build_usage_gate(acct_cfgs, ['tok-a'])
+        assert isinstance(gate._run_probe, AsyncMock)
