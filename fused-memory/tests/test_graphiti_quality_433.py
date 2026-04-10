@@ -394,18 +394,20 @@ class TestRebuildEntitySummariesDataFlow:
 
     @pytest.mark.asyncio
     async def test_force_false_dry_run_total_entities_from_detect(self, mock_config, make_backend):
-        """force=False, dry_run=True: total_entities still comes from detect step."""
-        from fused_memory.backends.graphiti_client import StaleSummaryResult
+        """force=False, dry_run=True: total_entities flows from the cheap dry_run probe (task-526).
 
+        After task-526 the force=False dry_run=True path routes through
+        _detect_stale_summaries_dry_run (not _detect_stale_summaries_with_edges).
+        The probe returns a plain (stale_list, total_count) tuple; total_entities
+        in the final result must still come from total_count, not from len(stale_list).
+        """
         backend = make_backend(mock_config)
         stale_list = [
             {'uuid': 'u1', 'name': 'Alice', 'summary': 'old A'},
             {'uuid': 'u2', 'name': 'Bob', 'summary': 'old B'},
         ]
-        detect_result = StaleSummaryResult(
-            stale=stale_list, all_edges={}, total_count=7
-        )
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
+        # Mock the new cheap-probe directly: (stale_list, total_count)
+        backend._detect_stale_summaries_dry_run = AsyncMock(return_value=(stale_list, 7))
 
         result = await backend.rebuild_entity_summaries(
             group_id='test', force=False, dry_run=True
@@ -439,6 +441,33 @@ class TestRebuildEntitySummariesDataFlow:
         await backend.rebuild_entity_summaries(group_id='test', force=False, dry_run=True)
 
         backend.get_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_force_false_no_dry_run_still_fetches_edge_map(self, mock_config, make_backend):
+        """force=False, dry_run=False: get_all_valid_edges IS awaited (positive contrast).
+
+        Positive-contrast companion to test_force_false_dry_run_does_not_fetch_edge_map.
+        When dry_run=False the force=False path still routes through
+        _detect_stale_summaries_with_edges, which needs the full edge map for the
+        actual rebuild (edges are passed into _rebuild_entity_from_edges).
+
+        Guards against a future refactor that accidentally routes ALL force=False
+        calls through the cheap dry_run probe — the non-dry-run path must still
+        call get_all_valid_edges to obtain the edges used for rebuilding.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'some summary'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        backend._rebuild_entity_from_edges = AsyncMock(return_value={
+            'uuid': 'u1', 'name': 'Alice',
+            'old_summary': 'some summary', 'new_summary': '', 'edge_count': 0,
+        })
+
+        await backend.rebuild_entity_summaries(group_id='test', force=False, dry_run=False)
+
+        backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
 
 
 # ---------------------------------------------------------------------------
