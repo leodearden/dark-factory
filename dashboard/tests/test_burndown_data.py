@@ -289,15 +289,24 @@ class TestCollectSnapshot:
         ):
             await collect_snapshot(conn, config)
 
-        # Total row count (no WHERE) catches both same-id duplicates AND the
-        # symlink case where two rows with different project_id strings are
-        # inserted for the same physical directory.
+        # PRIMARY: exact-key invariant — this project_id has exactly one row.
+        # Catches bugs where the main-project row is omitted while a differently-
+        # keyed row (e.g. non-resolved path, trailing slash) is inserted instead.
+        async with conn.execute(
+            'SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
+            (str(base_config.project_root),),
+        ) as cur:
+            row = await cur.fetchone()
+            assert row is not None
+            assert row[0] == 1
+
+        # SECONDARY: total row count (no WHERE) catches both same-id duplicates
+        # AND the symlink case where two rows with different project_id strings
+        # are inserted for the same physical directory.
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
             row = await cur.fetchone()
             assert row is not None
-            count = row[0]
-
-        assert count == 1
+            assert row[0] == 1
 
     @pytest.mark.asyncio
     async def test_symlinked_root_deduplicates_with_known_roots(self, tmp_path):
