@@ -1012,9 +1012,11 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            List of dicts (one per stale entity) with keys: uuid, name,
+            List of dicts (one per stale entity) with keys: uuid, name, summary,
             duplicate_count, stale_line_count, valid_fact_count,
-            summary_line_count.
+            summary_line_count. The ``summary`` key holds the current
+            (pre-rebuild) entity summary text so callers can diff it against
+            the canonical fact set without a second DB query.
         """
         result = await self._detect_stale_summaries_with_edges(group_id=group_id)
         return result.stale
