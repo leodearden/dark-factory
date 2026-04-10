@@ -81,3 +81,25 @@ def test_known_project_roots_uses_comma_separator_not_colon() -> None:
             "Use commas — the parser at dashboard/src/dashboard/config.py:84 "
             "calls roots.split(',')."
         )
+
+
+def test_comment_warns_about_systemd_space_handling() -> None:
+    """Both service files must carry the systemd-aware comment for DASHBOARD_KNOWN_PROJECT_ROOTS.
+
+    The old wording 'comma-separated, no spaces' was misleading — the Python parser
+    tolerates whitespace around commas.  The real hazard is systemd: spaces inside
+    an Environment= value are treated as separators between variable assignments.
+    The updated comment makes this explicit so future editors understand why spaces
+    are forbidden.
+    """
+    expected_comment = (
+        "# Multi-project cost aggregation "
+        "(comma-separated; avoid spaces inside the value \u2014 "
+        "systemd would treat them as assignment separators)"
+    )
+    for path in (TEMPLATE, HARDCODED):
+        content = path.read_text(encoding="utf-8")
+        assert expected_comment in content, (
+            f"Systemd-aware comment not found in {path}:\n  {expected_comment!r}\n"
+            "Update the comment above the Environment=DASHBOARD_KNOWN_PROJECT_ROOTS line."
+        )
