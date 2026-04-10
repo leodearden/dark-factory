@@ -9,7 +9,6 @@ import os
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
-
 from conftest import extract_cypher, extract_params
 
 # ---------------------------------------------------------------------------

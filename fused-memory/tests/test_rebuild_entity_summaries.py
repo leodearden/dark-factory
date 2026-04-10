@@ -1387,7 +1387,7 @@ class TestRebuildEntitySummariesCancellation:
     """
 
     @pytest.fixture
-    def two_entity_backend(self, mock_config, make_backend):
+    def two_entity_backend(self, mock_config, make_backend, make_edge_backend):
         """Shared backend pre-configured with the canonical Alice/Bob two-entity setup.
 
         Provides:
@@ -1402,16 +1402,13 @@ class TestRebuildEntitySummariesCancellation:
         Tests supply their own update_node_summary side_effect to exercise the specific
         scenario under test.
         """
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        return make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
         })
-        return backend
 
     @pytest.mark.asyncio
     async def test_cancelled_error_propagates(self, two_entity_backend):
