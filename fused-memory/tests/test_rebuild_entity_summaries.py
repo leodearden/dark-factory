@@ -307,30 +307,20 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_partial_failure_continues(self, mock_config, make_backend):
-        """If one entity's rebuild fails, continues with remaining and reports error in results.
+        """Both entities are detected stale because their summaries differ from the canonical facts derived from their valid edges.
 
-        Alice has summary='stale1' while her edge canonical is 'current1' → stale.
-        Bob has summary='stale2' while his edge canonical is 'current2' → stale.
-        Both are detected stale by _detect_stale_summaries_with_edges naturally.
         Alice's update_node_summary raises RuntimeError; Bob's succeeds.
         """
         backend = make_backend(mock_config)
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=StaleSummaryResult(
-            stale=[
-                {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1',
-                 'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
-                 'summary_line_count': 1},
-                {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2',
-                 'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
-                 'summary_line_count': 1},
-            ],
-            all_edges={
-                'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
-                'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
-            },
-            total_count=2,
-        ))
-        # Entity 1 fails at update_node_summary; entity 2 succeeds
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
+        })
+        # side_effect order matches list_entity_nodes return order: Alice first, Bob second
         backend.update_node_summary = AsyncMock(side_effect=[
             RuntimeError('FalkorDB timeout'),
             None,
@@ -341,6 +331,9 @@ class TestRebuildEntitySummaries:
         assert len(result['details']) == 2
         error_detail = next(d for d in result['details'] if d['status'] == 'error')
         assert 'FalkorDB timeout' in error_detail['error']
+        assert error_detail['uuid'] == 'uuid-1'
+        backend.list_entity_nodes.assert_awaited_once_with(group_id='test')
+        backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
 
     @pytest.mark.asyncio
     async def test_empty_graph_returns_zero_counts(self, mock_config, make_backend):
