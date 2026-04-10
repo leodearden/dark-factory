@@ -527,7 +527,7 @@ class TestRunEvalMatrixNonCancelPath:
         ), f'Unexpected "cancelled" log record. Got: {[r.message for r in caplog.records]}'
 
     async def test_failed_error_log_carries_exc_info(
-        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, single_task_matrix_case, caplog: pytest.LogCaptureFixture
     ):
         """Non-cancel RuntimeError log record must carry exc_info (traceback attached).
 
@@ -539,20 +539,13 @@ class TestRunEvalMatrixNonCancelPath:
         ``logger.error(f'Eval failed: {exc}')`` does not set exc_info and
         embeds the exception message in the log string instead.
         """
-        task_path = tmp_path / 'task_a.json'
-        task_path.touch()
+        _task_path, run_matrix = single_task_matrix_case
 
         async def fake_run_eval(*args, **kwargs):
             raise RuntimeError('simulated failure')
 
-        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
-
         with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'):
-            await run_eval_matrix(
-                [task_path],
-                [_CFG],
-                force=True,
-            )
+            await run_matrix(fake_run_eval)
 
         failed_records = [r for r in caplog.records if 'failed' in r.message.lower()]
         assert failed_records, (
