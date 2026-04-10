@@ -535,7 +535,7 @@ class TestContextAssemblerCancellation:
         async def patched_fetch_context(event, project_id):
             nonlocal call_count
             call_count += 1
-            if call_count == 1:
+            if event.payload['content_preview'] == 'event one':
                 raise RuntimeError('per-event failure')
             raise asyncio.CancelledError()
 
