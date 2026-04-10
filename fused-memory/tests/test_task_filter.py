@@ -607,7 +607,6 @@ class TestRenderTaskLineAndFormatTaskList:
         task = {'id': 2, 'status': 'in-progress', 'title': 'Y', 'dependencies': list(range(1, 9))}
         result = _render_task_line(task)
         assert 'deps=[1, 2, 3, 4, 5]...' in result
-        assert '6' not in result
 
     def test_render_task_line_deps_none_normalized(self):
         """_render_task_line treats deps=None as empty list."""

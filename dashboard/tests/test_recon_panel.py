@@ -1178,3 +1178,17 @@ class TestDetailRowJournalGuard:
         with _patch_recon_data():
             html = client.get('/partials/recon').text
         assert 'x-cloak' in html
+
+    def test_mixed_journal_counts_emit_detail_only_for_positive_counts(self, client):
+        """Mixed journal counts [3, 0, 1]: detail rows emitted only for runs with count > 0."""
+        mixed_runs = [
+            {**MOCK_RUNS[0], 'id': 'run-mix-a', 'journal_entry_count': 3},
+            {**MOCK_RUNS[0], 'id': 'run-mix-b', 'journal_entry_count': 0},
+            {**MOCK_RUNS[0], 'id': 'run-mix-c', 'journal_entry_count': 1},
+        ]
+        with _patch_recon_data(runs=mixed_runs):
+            html = client.get('/partials/recon').text
+        assert 'hx-get="/partials/recon/run/run-mix-a"' in html
+        assert 'hx-get="/partials/recon/run/run-mix-c"' in html
+        assert 'hx-get="/partials/recon/run/run-mix-b"' not in html
+        assert html.count('x-show="open"') == 2

@@ -485,7 +485,7 @@ class TestStewardUnifiedRole:
             await steward._handle_escalation(esc)
             assert mock_invoke.call_args.kwargs['cwd'] == worktree
 
-    async def test_suggestions_use_project_root_cwd(self, steward, mock_config):
+    async def test_suggestions_use_worktree_cwd(self, steward, worktree):
         esc = _make_escalation(category='review_suggestions', severity='info', detail='[]')
         steward.escalation_queue.get.return_value = _make_escalation(
             category='review_suggestions', status='resolved', resolution='triaged',
@@ -493,7 +493,7 @@ class TestStewardUnifiedRole:
         with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
             mock_invoke.return_value = _make_result()
             await steward._handle_escalation(esc)
-            assert mock_invoke.call_args.kwargs['cwd'] == mock_config.project_root
+            assert mock_invoke.call_args.kwargs['cwd'] == worktree
 
     async def test_same_role_for_all_escalation_types(self, steward):
         from orchestrator.agents.roles import STEWARD

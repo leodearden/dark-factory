@@ -47,8 +47,9 @@ def service(mock_config, write_journal):
 async def test_add_memory_logs_write_op_with_causation(service, write_journal):
     """MCP path: add_memory logs Layer 1 with causation_id.
 
-    Layer 2 backend_op is logged later when the queue worker processes the
-    item, so we only check Layer 1 here (Mem0 writes are now durable/deferred).
+    Mem0 writes are now synchronous direct calls (not deferred via queue),
+    so both Layer 1 (write_op) and Layer 2 (backend_op) are logged before
+    add_memory returns.
     """
     cid = str(uuid.uuid4())
     await service.add_memory(
@@ -63,9 +64,10 @@ async def test_add_memory_logs_write_op_with_causation(service, write_journal):
     assert write_ops[0]['operation'] == 'add_memory'
     assert write_ops[0]['success'] == 1
 
-    # Verify causation_id was passed through to queue payload for deferred logging
-    payload = service.durable_queue.enqueue.call_args[1]['payload']
-    assert payload['_causation_id'] == cid
+    # Mem0 now calls directly — no queue item enqueued
+    service.durable_queue.enqueue.assert_not_called()
+    # mem0.add was called synchronously
+    service.mem0.add.assert_called_once()
 
 
 @pytest.mark.asyncio

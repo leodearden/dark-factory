@@ -691,8 +691,10 @@ async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_ser
         run_full_cycle_called.append(args)
         return await original_rfc(*args, **kwargs)
 
-    # Also make _recover_stale_runs a no-op
+    # Also make _recover_stale_runs and escalation server no-ops
     harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
 
     with patch.object(harness, 'run_full_cycle', side_effect=spy_rfc), contextlib.suppress(TimeoutError):
         # Run loop for one sleep cycle (loop sleeps 5s; we wait 0.2s — enough for 1 iteration)

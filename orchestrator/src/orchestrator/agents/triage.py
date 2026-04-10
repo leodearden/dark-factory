@@ -40,6 +40,13 @@ review suggestions and classify each as ACCEPT or SKIP.
 When in doubt, ACCEPT. The cost of a small unnecessary task is low;
 the cost of missing a real issue compounds.
 
+## Deduplication check
+
+Before classifying, call `get_tasks` with the project root to retrieve existing
+tasks.  SKIP any suggestion that duplicates an existing pending or in-progress
+task — same module and same fix intent counts as a duplicate even if the wording
+differs.  Cite the existing task ID in your skip reason.
+
 After classifying, group related accepted suggestions into logical task groups.
 Each group should be a single coherent follow-up task.
 

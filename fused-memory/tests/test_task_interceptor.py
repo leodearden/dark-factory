@@ -395,7 +395,7 @@ async def test_background_tasks_retained_during_reconciliation(taskmaster, recon
     """Background task should be in _background_tasks while running, removed after completion."""
     # Use a future to control when reconcile_task finishes
     started = asyncio.Event()
-    done_future: asyncio.Future = asyncio.get_event_loop().create_future()
+    done_future: asyncio.Future = asyncio.Future()
 
     async def slow_reconcile(**kwargs):
         started.set()
@@ -425,7 +425,7 @@ async def test_background_tasks_retained_during_reconciliation(taskmaster, recon
 async def test_background_tasks_retained_for_bulk_operations(taskmaster, reconciler, event_buffer):
     """Background task from expand_task should be in _background_tasks during execution."""
     started = asyncio.Event()
-    done_future: asyncio.Future = asyncio.get_event_loop().create_future()
+    done_future: asyncio.Future = asyncio.Future()
 
     async def slow_bulk_reconcile(**kwargs):
         started.set()

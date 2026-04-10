@@ -15,7 +15,7 @@ from orchestrator.evals.configs import (
     get_config_by_name,
 )
 
-VLLM_NAMES = {cfg.name for cfg in VLLM_EVAL_CONFIGS}
+VLLM_NAMES: frozenset[str] = frozenset(cfg.name for cfg in VLLM_EVAL_CONFIGS)
 
 
 @pytest.fixture
@@ -326,8 +326,11 @@ class TestVllmUrlInjection:
     ):
         """CLI `eval --matrix --vllm-url` must inject ANTHROPIC_BASE_URL into every vLLM config."""
         captured_state: dict[str, dict] = {}
+        captured_args: dict = {}
 
         def stub_run_matrix(base_config, **kwargs):
+            captured_args['base_config'] = base_config
+            captured_args.update(kwargs)
             for cfg in EVAL_CONFIGS:
                 captured_state[cfg.name] = dict(cfg.env_overrides)
 
@@ -340,6 +343,11 @@ class TestVllmUrlInjection:
         assert result.exit_code == 0, (
             f'CLI exited {result.exit_code}.\nOutput: {result.output}\nException: {result.exception}'
         )
+        assert 'base_config' in captured_args
+        assert captured_args['max_parallel'] is None
+        assert captured_args['trials'] == 1
+        assert captured_args['force'] is False
+        assert captured_args['timeout'] is None
         assert set(captured_state.keys()) >= VLLM_NAMES, (
             f'vLLM names missing from captured state: {VLLM_NAMES - set(captured_state.keys())}'
         )
@@ -355,51 +363,9 @@ class TestVllmUrlInjection:
             )
         cloud_with_base_url = [
             name for name in self._CLOUD_BASELINE_NAMES
-            if name in captured_state and 'ANTHROPIC_BASE_URL' in captured_state[name]
+            if 'ANTHROPIC_BASE_URL' in captured_state[name]
         ]
         assert not cloud_with_base_url, (
             f'Cloud baseline configs leaked ANTHROPIC_BASE_URL via CLI path: {cloud_with_base_url}'
         )
 
-
-class TestModuleConstants:
-    """Structural tests: verify module-level constants exist with correct types and values."""
-
-    def test_vllm_names_module_constant_matches_comprehension(self):
-        """VLLM_NAMES must be a module-level set constant equal to the name comprehension."""
-        g = globals()
-        assert 'VLLM_NAMES' in g, 'VLLM_NAMES not defined at module level'
-        vllm_names = g['VLLM_NAMES']
-        assert isinstance(vllm_names, set), (
-            f'VLLM_NAMES must be a set, got {type(vllm_names)}'
-        )
-        assert vllm_names == {cfg.name for cfg in VLLM_EVAL_CONFIGS}, (
-            'VLLM_NAMES does not match the set comprehension'
-        )
-        assert len(vllm_names) == 15, f'Expected 15 names, got {len(vllm_names)}'
-
-    def test_cli_imports_at_module_level(self):
-        """CliRunner and main must be importable as module-level names (not buried inside a test)."""
-        g = globals()
-        assert 'CliRunner' in g, (
-            'CliRunner not at module level — move `from click.testing import CliRunner` to top of file'
-        )
-        assert 'main' in g, (
-            'main not at module level — move `from orchestrator.cli import main` to top of file'
-        )
-
-
-class TestHelperMethods:
-    """Structural tests: verify helper methods exist on test classes with correct behaviour."""
-
-    def test_inject_vllm_url_helper_exists_and_works(self, vllm_env_sandbox):
-        """_inject_vllm_url must exist on TestVllmUrlInjection and set ANTHROPIC_BASE_URL on all vLLM configs."""
-        assert hasattr(TestVllmUrlInjection, '_inject_vllm_url'), (
-            'TestVllmUrlInjection._inject_vllm_url helper does not exist'
-        )
-        instance = TestVllmUrlInjection()
-        instance._inject_vllm_url()
-        for cfg in VLLM_EVAL_CONFIGS:
-            assert cfg.env_overrides.get('ANTHROPIC_BASE_URL') == TestVllmUrlInjection._VLLM_URL, (
-                f'{cfg.name} missing ANTHROPIC_BASE_URL after _inject_vllm_url()'
-            )

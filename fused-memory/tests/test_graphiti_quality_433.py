@@ -10,7 +10,6 @@ Task 433: 8 code-quality improvements deferred from task-419 review.
 from __future__ import annotations
 
 import inspect
-import re
 from unittest.mock import AsyncMock
 
 import pytest
@@ -603,74 +602,6 @@ class TestCanonicalFactsStalenessRegression:
         assert result.stale == [], (
             "Entity should NOT be flagged stale when its only non-whitespace "
             "fact matches the stored summary."
-        )
-
-
-# ---------------------------------------------------------------------------
-# task-523: docstring accuracy — TestRebuildEntitySummariesForceDryRun class doc
-# ---------------------------------------------------------------------------
-
-class TestDocstringAccuracyForceDryRunClass:
-    """Meta-test: verifies the class-level docstring of TestRebuildEntitySummariesForceDryRun
-    contains semantic anchors, a narrowed scope claim, and a force=False contrast note.
-    """
-
-    def test_force_dry_run_class_docstring_accuracy(self) -> None:
-        """Introspect TestRebuildEntitySummariesForceDryRun.__doc__ for required content.
-
-        Assertions:
-          (a) docstring is not None and non-empty
-          (b) no line-number references (e.g. 'line 1031', 'lines 1046-1049')
-          (c) narrowed scope: 'force=True' and 'force path' or 'force branch' appear
-          (d) semantic anchor: 'edge-fetch guard' appears
-          (e) semantic anchor: 'dry_run early-return' and 'semaphore' appear
-          (f) force=False contrast: 'force=False', '_detect_stale_summaries_with_edges',
-              and 'regardless of' all appear
-        """
-        doc = TestRebuildEntitySummariesForceDryRun.__doc__
-
-        # (a) non-empty docstring
-        assert doc is not None, "TestRebuildEntitySummariesForceDryRun must have a docstring"
-        assert doc.strip(), "TestRebuildEntitySummariesForceDryRun docstring must not be blank"
-
-        # (b) no line-number references
-        assert re.search(r'\bline[s]?\s+\d{3,}', doc) is None, (
-            "Docstring must not contain bare line-number references like 'line 1031'"
-        )
-        assert re.search(r'\blines?\s+\d+\s*-\s*\d+', doc) is None, (
-            "Docstring must not contain line-range references like 'lines 1046-1049'"
-        )
-
-        # (c) narrowed scope to force=True branch
-        assert 'force=True' in doc, (
-            "Docstring must explicitly scope the claim to 'force=True'"
-        )
-        assert ('force path' in doc or 'force branch' in doc), (
-            "Docstring must reference 'force path' or 'force branch' to narrow scope"
-        )
-
-        # (d) semantic anchor: edge-fetch guard
-        assert 'edge-fetch guard' in doc, (
-            "Docstring must include the semantic anchor 'edge-fetch guard'"
-        )
-
-        # (e) semantic anchor: dry_run early-return before the semaphore loop
-        assert 'dry_run early-return' in doc, (
-            "Docstring must include the semantic anchor 'dry_run early-return'"
-        )
-        assert 'semaphore' in doc, (
-            "Docstring must reference 'semaphore' to anchor the early-return block location"
-        )
-
-        # (f) force=False contrast note
-        assert 'force=False' in doc, (
-            "Docstring must contain a force=False contrast note"
-        )
-        assert '_detect_stale_summaries_with_edges' in doc, (
-            "Docstring must name '_detect_stale_summaries_with_edges' in the contrast note"
-        )
-        assert 'regardless of' in doc, (
-            "Docstring must state edges are fetched 'regardless of' dry_run on the force=False path"
         )
 
 

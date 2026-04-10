@@ -187,3 +187,130 @@ class TestRunStore:
         ).fetchone()[0]
         assert task_count == 6  # 3 per run
         conn.close()
+
+
+class TestIncrementalPersistence:
+    """Tests for start_run / save_task_result / finish_run lifecycle."""
+
+    def test_start_creates_runs_row(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-abc', 'proj', '2026-04-10T00:00:00+00:00', 'prd.md')
+
+        conn = sqlite3.connect(str(tmp_path / 'runs.db'))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute('SELECT * FROM runs WHERE run_id = ?', ('run-abc',)).fetchone()
+        conn.close()
+        assert row is not None
+        assert row['project_id'] == 'proj'
+        assert row['completed_at'] is None
+        assert row['total_tasks'] == 0
+
+    def test_save_task_result_persists_immediately(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-abc', 'proj', '2026-04-10T00:00:00+00:00')
+
+        tr = TaskReport(
+            task_id='7',
+            title='Add widget',
+            outcome=WorkflowOutcome.DONE,
+            cost_usd=1.23,
+            duration_ms=5000,
+            agent_invocations=3,
+            execute_iterations=1,
+            verify_attempts=1,
+            review_cycles=0,
+            completed_at='2026-04-10T00:05:00+00:00',
+        )
+        store.save_task_result('run-abc', tr, 'proj')
+
+        conn = sqlite3.connect(str(tmp_path / 'runs.db'))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            'SELECT * FROM task_results WHERE run_id = ? AND task_id = ?',
+            ('run-abc', '7'),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row['outcome'] == 'done'
+        assert row['cost_usd'] == pytest.approx(1.23)
+
+    def test_finish_run_updates_aggregates(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-abc', 'proj', '2026-04-10T00:00:00+00:00')
+
+        report = _sample_report()
+        report.completed_at = '2026-04-10T01:00:00+00:00'
+        store.finish_run('run-abc', report)
+
+        conn = sqlite3.connect(str(tmp_path / 'runs.db'))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute('SELECT * FROM runs WHERE run_id = ?', ('run-abc',)).fetchone()
+        conn.close()
+        assert row['completed_at'] == '2026-04-10T01:00:00+00:00'
+        assert row['total_tasks'] == 3
+        assert row['completed'] == 2
+        assert row['blocked'] == 1
+        assert row['total_cost_usd'] == pytest.approx(1.50)
+
+    def test_full_incremental_lifecycle(self, tmp_path):
+        """Simulate the real harness flow: start → task results → finish."""
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-xyz', 'dark_factory', '2026-04-10T00:00:00+00:00')
+
+        report = _sample_report()
+
+        # Write each task result as it completes
+        for tr in report.task_reports:
+            store.save_task_result('run-xyz', tr, 'dark_factory')
+
+        # Finalize the run
+        report.completed_at = '2026-04-10T00:30:00+00:00'
+        store.finish_run('run-xyz', report)
+
+        conn = sqlite3.connect(str(tmp_path / 'runs.db'))
+        conn.row_factory = sqlite3.Row
+
+        run_row = conn.execute('SELECT * FROM runs WHERE run_id = ?', ('run-xyz',)).fetchone()
+        assert run_row['completed_at'] == '2026-04-10T00:30:00+00:00'
+        assert run_row['completed'] == 2
+
+        results = conn.execute(
+            'SELECT * FROM task_results WHERE run_id = ? ORDER BY task_id',
+            ('run-xyz',),
+        ).fetchall()
+        assert len(results) == 3
+        assert results[0]['task_id'] == '101'
+        assert results[1]['task_id'] == '102'
+        assert results[2]['task_id'] == '103'
+        conn.close()
+
+    def test_task_results_survive_without_finish(self, tmp_path):
+        """If the orchestrator crashes before finish_run, task results are still there."""
+        store = RunStore(tmp_path / 'runs.db')
+        store.start_run('run-crash', 'proj', '2026-04-10T00:00:00+00:00')
+
+        tr = TaskReport(
+            task_id='42',
+            title='Do thing',
+            outcome=WorkflowOutcome.DONE,
+            cost_usd=0.50,
+            duration_ms=3000,
+            completed_at='2026-04-10T00:02:00+00:00',
+        )
+        store.save_task_result('run-crash', tr, 'proj')
+
+        # Simulate crash — no finish_run called. Open fresh connection.
+        conn = sqlite3.connect(str(tmp_path / 'runs.db'))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            'SELECT * FROM task_results WHERE run_id = ? AND task_id = ?',
+            ('run-crash', '42'),
+        ).fetchone()
+        assert row is not None
+        assert row['outcome'] == 'done'
+
+        run_row = conn.execute(
+            'SELECT * FROM runs WHERE run_id = ?', ('run-crash',),
+        ).fetchone()
+        assert run_row['completed_at'] is None  # never finalized
+        conn.close()
