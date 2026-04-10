@@ -227,12 +227,6 @@ class TestCapDetectionPatterns:
 
     # --- Realistic near-cap smoke tests (verbatim Claude UI strings) ---
 
-    def test_realistic_near_cap_extra_compute_credits(self):
-        """Verbatim: 'You're now using extra compute credits. Your plan resets in 4h.'"""
-        gate = make_gate(['a'])
-        msg = "You're now using extra compute credits. Your plan resets in 4h."
-        assert gate.detect_cap_hit('', msg) is True
-
     def test_realistic_near_cap_close_to_limit(self):
         """Verbatim: 'You're close to reaching your usage limit. Your plan resets in 1h.'"""
         gate = make_gate(['a'])
@@ -255,21 +249,21 @@ class TestCapDetectionPatterns:
             "You're out of extra usage for this billing period. Your plan resets in 2h.",
             True,
         ),
+        (
+            "You're now using extra compute credits. Your plan resets in 1h.",
+            True,
+        ),
         # NEAR_CAP_PREFIXES
         (
             "You're close to reaching your plan limit. Your plan resets in 5h.",
-            True,
-        ),
-        (
-            "You're now using extra compute credits. Your plan resets in 1h.",
             True,
         ),
     ], ids=[
         'cap_hit_prefix_hit_your',
         'cap_hit_prefix_used',
         'cap_hit_prefix_out_of_extra',
+        'cap_hit_prefix_now_using_extra',
         'near_cap_prefix_close_to',
-        'near_cap_prefix_now_using_extra',
     ])
     def test_realistic_cap_messages(self, message, expected):
         gate = make_gate(['a'])
