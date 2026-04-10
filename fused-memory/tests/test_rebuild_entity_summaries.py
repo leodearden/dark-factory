@@ -1345,6 +1345,7 @@ class TestRebuildEntityFromEdgesOldSummary:
         assert result['new_summary'] == 'current fact'
         assert result['uuid'] == 'uuid-1'
         assert result['name'] == 'Alice'
+        assert result['edge_count'] == 1
         backend.get_node_text.assert_not_awaited()
 
     @pytest.mark.asyncio
