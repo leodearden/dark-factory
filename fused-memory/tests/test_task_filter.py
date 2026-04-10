@@ -440,6 +440,7 @@ class TestFormatFilteredTaskTree:
         single_task = {'id': 1, 'title': 'T', 'status': 'pending', 'dependencies': []}
         n = 10_000
         # Repeated-reference trick: list of n pointers to same dict — keeps memory < 1 MB.
+        # Safe only because format_filtered_task_tree treats task dicts as read-only; any future in-place mutation in the formatter (e.g. dep normalization) would alias across all N entries and skew results.
         active_large = [single_task] * n
         tree_large = FilteredTaskTree(
             active_tasks=active_large,
