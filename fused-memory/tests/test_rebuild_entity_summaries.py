@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -422,7 +422,7 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_rebuilds_only_stale_entities(self, mock_config, make_backend):
-        """Only rebuilds entities flagged as stale by _detect_stale_summaries_with_edges.
+        """Only stale entities are rebuilt; clean entities are skipped.
 
         Alice has summary='stale fact' but her only valid edge has fact='current fact',
         so the canonical is 'current fact' != 'stale fact' → stale.
@@ -430,19 +430,23 @@ class TestRebuildEntitySummaries:
         Total entities=2, stale=1, rebuilt=1.
         """
         backend = make_backend(mock_config)
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=StaleSummaryResult(
-            stale=[{'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale',
-                    'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
-                    'summary_line_count': 1}],
-            all_edges={'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
-            total_count=2,
-        ))
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale fact'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'current fact'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current fact', 'name': 'edge2'}],
+        })
         backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test')
         assert result['total_entities'] == 2
         assert result['stale_entities'] == 1
         assert result['rebuilt'] == 1
-        backend.update_node_summary.assert_awaited_once()
+        backend.update_node_summary.assert_awaited_once_with('uuid-1', ANY, group_id='test')
+        backend.list_entity_nodes.assert_awaited_once_with(group_id='test')
+        backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
+        assert result['details'][0]['old_summary'] == 'stale fact'
 
     @pytest.mark.asyncio
     async def test_force_rebuilds_all(self, mock_config, make_backend):
@@ -475,30 +479,20 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_partial_failure_continues(self, mock_config, make_backend):
-        """If one entity's rebuild fails, continues with remaining and reports error in results.
+        """Both entities are detected stale because their summaries differ from the canonical facts derived from their valid edges.
 
-        Alice has summary='stale1' while her edge canonical is 'current1' → stale.
-        Bob has summary='stale2' while his edge canonical is 'current2' → stale.
-        Both are detected stale by _detect_stale_summaries_with_edges naturally.
         Alice's update_node_summary raises RuntimeError; Bob's succeeds.
         """
         backend = make_backend(mock_config)
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=StaleSummaryResult(
-            stale=[
-                {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1',
-                 'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
-                 'summary_line_count': 1},
-                {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2',
-                 'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
-                 'summary_line_count': 1},
-            ],
-            all_edges={
-                'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
-                'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
-            },
-            total_count=2,
-        ))
-        # Entity 1 fails at update_node_summary; entity 2 succeeds
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={
+            'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
+        })
+        # side_effect order matches list_entity_nodes return order: Alice first, Bob second
         backend.update_node_summary = AsyncMock(side_effect=[
             RuntimeError('FalkorDB timeout'),
             None,
@@ -509,6 +503,9 @@ class TestRebuildEntitySummaries:
         assert len(result['details']) == 2
         error_detail = next(d for d in result['details'] if d['status'] == 'error')
         assert 'FalkorDB timeout' in error_detail['error']
+        assert error_detail['uuid'] == 'uuid-1'
+        backend.list_entity_nodes.assert_awaited_once_with(group_id='test')
+        backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
 
     @pytest.mark.asyncio
     async def test_empty_graph_returns_zero_counts(self, mock_config, make_backend):
@@ -526,7 +523,7 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_dry_run_returns_stale_without_rebuilding(self, mock_config, make_backend):
-        """With dry_run=True, detects stale entities but does not call _rebuild_entity_from_edges.
+        """With dry_run=True, detects stale entities but does not call update_node_summary.
 
         Alice has summary='stale fact' while her edge canonical is 'current fact' → stale.
         force=False + dry_run=True routes through _detect_stale_summaries_dry_run
@@ -549,6 +546,9 @@ class TestRebuildEntitySummaries:
         assert result['skipped'] == 1
         backend.update_node_summary.assert_not_awaited()
         assert result['details'][0]['status'] == 'skipped_dry_run'
+        # task 526 refactor: dry_run path no longer calls list_entity_nodes /
+        # get_all_valid_edges directly; assert group_id propagates to the probe instead.
+        backend._detect_stale_summaries_dry_run.assert_awaited_once_with(group_id='test')
 
 
 # ---------------------------------------------------------------------------
