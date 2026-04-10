@@ -55,15 +55,29 @@ def test_known_project_roots_uses_comma_separator_not_colon() -> None:
 
     The consumer code is ``roots.split(',')`` — a colon-separated value would
     be parsed as a single path literal and silently aggregate nothing.
+
+    Two colon patterns are checked:
+    - The literal-path form (guards both files)
+    - The sentinel form (guards the template against accidental colon use after
+      __REPO_ROOT__ is substituted back in)
     """
-    colon_pattern = (
+    literal_colon_pattern = (
         "DASHBOARD_KNOWN_PROJECT_ROOTS="
         "/home/leo/src/dark-factory:"
     )
+    sentinel_colon_pattern = (
+        "DASHBOARD_KNOWN_PROJECT_ROOTS="
+        "__REPO_ROOT__:"
+    )
     for path in (TEMPLATE, HARDCODED):
         content = path.read_text(encoding="utf-8")
-        assert colon_pattern not in content, (
-            f"Colon-separated DASHBOARD_KNOWN_PROJECT_ROOTS found in {path}. "
+        assert literal_colon_pattern not in content, (
+            f"Colon-separated DASHBOARD_KNOWN_PROJECT_ROOTS (literal path) found in {path}. "
+            "Use commas — the parser at dashboard/src/dashboard/config.py:84 "
+            "calls roots.split(',')."
+        )
+        assert sentinel_colon_pattern not in content, (
+            f"Colon-separated DASHBOARD_KNOWN_PROJECT_ROOTS (__REPO_ROOT__ sentinel) found in {path}. "
             "Use commas — the parser at dashboard/src/dashboard/config.py:84 "
             "calls roots.split(',')."
         )
