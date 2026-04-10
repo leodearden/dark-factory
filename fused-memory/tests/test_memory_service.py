@@ -208,6 +208,51 @@ class TestAddMemory:
             f'but got success={call_kwargs["success"]}'
         )
 
+    @pytest.mark.asyncio
+    async def test_memory_ids_logged_to_write_journal(self, service):
+        """write_journal.log_write_op result_summary must contain the real memory_ids."""
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        mock_journal.log_backend_op = AsyncMock()
+        service._write_journal = mock_journal
+
+        await service.add_memory(
+            content='Always use type hints',
+            category='preferences_and_norms',
+            project_id='test',
+        )
+
+        mock_journal.log_write_op.assert_called_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs['result_summary']['memory_ids'] == ['mem0-1'], (
+            f'Expected memory_ids=[\'mem0-1\'] in write journal, '
+            f'got {call_kwargs["result_summary"]["memory_ids"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_memory_ids_emitted_in_reconciliation_event(self, service):
+        """ReconciliationEvent payload must include the real memory_ids."""
+        pushed_events: list = []
+
+        class FakeBuffer:
+            async def push(self, event):
+                pushed_events.append(event)
+
+        service.set_event_buffer(FakeBuffer())
+
+        await service.add_memory(
+            content='Always use type hints',
+            category='preferences_and_norms',
+            project_id='test',
+        )
+
+        assert len(pushed_events) == 1, f'Expected 1 event, got {len(pushed_events)}'
+        event = pushed_events[0]
+        assert event.payload['memory_ids'] == ['mem0-1'], (
+            f'Expected memory_ids=[\'mem0-1\'] in reconciliation event, '
+            f'got {event.payload["memory_ids"]!r}'
+        )
+
 
 class TestAddEpisode:
     @pytest.mark.asyncio
@@ -288,6 +333,23 @@ class TestDurableWriteDispatcher:
             'content': 'Always use type hints',
             'metadata': {'category': 'preferences_and_norms'},
             'project_id': 'test',
+        }
+        await service._execute_durable_write('mem0_add', payload)
+        service.mem0.add.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_mem0_add_queue_operation_still_dispatches(self, service):
+        """Backward-compat: in-flight 'mem0_add' queue items must still drain.
+
+        The add_memory() path no longer enqueues 'mem0_add', but items
+        written to the queue before this fix must still execute correctly
+        so no data is lost on restart.
+        """
+        payload = {
+            'content': 'Legacy queued content',
+            'metadata': {'category': 'preferences_and_norms'},
+            'project_id': 'test',
+            'agent_id': 'legacy-agent',
         }
         await service._execute_durable_write('mem0_add', payload)
         service.mem0.add.assert_called_once()
