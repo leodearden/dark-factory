@@ -8,7 +8,7 @@ by setup-host.sh) and the checked-in hardcoded copy
 
 See also:
   - tests/scripts/test_run_vllm_eval_lint.py  — pattern reference
-  - dashboard/src/dashboard/config.py line 84  — COMMA-separated split
+  - dashboard/src/dashboard/config.py — DashboardConfig.from_env handling of DASHBOARD_KNOWN_PROJECT_ROOTS (COMMA-separated split)
 """
 import pathlib
 import re
