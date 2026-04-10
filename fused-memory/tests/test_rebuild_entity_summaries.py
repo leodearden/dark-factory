@@ -529,19 +529,19 @@ class TestRebuildEntitySummaries:
         """With dry_run=True, detects stale entities but does not call _rebuild_entity_from_edges.
 
         Alice has summary='stale fact' while her edge canonical is 'current fact' → stale.
-        _detect_stale_summaries_with_edges runs naturally and flags Alice.
+        force=False + dry_run=True routes through _detect_stale_summaries_dry_run
+        (task 526: the cheap per-entity probe that avoids the O(E) bulk edge fetch).
+        Mocks that probe directly so the data-flow assertion holds without requiring
+        a real graph driver.
         Explicitly mocks update_node_summary to document that the dry_run
         guarantee holds even if rebuild_entity_summaries were refactored
         to bypass _rebuild_entity_from_edges and call those methods directly.
         """
         backend = make_backend(mock_config)
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=StaleSummaryResult(
-            stale=[{'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale',
-                    'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
-                    'summary_line_count': 1}],
-            all_edges={'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
-            total_count=1,
-        ))
+        stale_list = [{'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale',
+                       'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
+                       'summary_line_count': 1}]
+        backend._detect_stale_summaries_dry_run = AsyncMock(return_value=(stale_list, 1))
         backend.update_node_summary = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test', dry_run=True)
         assert result['stale_entities'] == 1
