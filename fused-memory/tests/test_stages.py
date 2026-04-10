@@ -1745,11 +1745,13 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
 
         # (d) Active-task ids must NOT appear inside the Recently Completed section —
         #     cross-validates that section extraction is correctly bounded.
-        #     Use bracket-id form '[1]'/[2]' which avoids substring collision with '[10]'/'[11]'.
-        assert '[1]' not in recently_section, (
+        #     Anchored to the rendered task-line prefix '- [N] ' (matches
+        #     _render_task_line format '- [{tid}] ({status}) {title} deps=...')
+        #     to avoid false negatives from 'deps=[1]' or similar substrings.
+        assert '- [1] ' not in recently_section, (
             "Active task id=1 should NOT be in Recently Completed section"
         )
-        assert '[2]' not in recently_section, (
+        assert '- [2] ' not in recently_section, (
             "Active task id=2 should NOT be in Recently Completed section"
         )
 
