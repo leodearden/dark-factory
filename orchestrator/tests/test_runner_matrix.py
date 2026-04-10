@@ -547,9 +547,9 @@ class TestRunEvalMatrixNonCancelPath:
         with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'):
             await run_matrix(fake_run_eval)
 
-        failed_records = [r for r in caplog.records if 'failed' in r.message.lower()]
+        failed_records = [r for r in caplog.records if r.message == 'Eval failed']
         assert failed_records, (
-            f'Expected at least one log record containing "failed". '
+            f'Expected at least one log record with message == "Eval failed". '
             f'Got: {[r.message for r in caplog.records]}'
         )
         record = failed_records[0]
