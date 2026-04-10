@@ -308,7 +308,7 @@ class TestListIndices:
         backend = make_backend(mock_config)
         graph = await assert_ro_query_only(backend, make_graph_mock, [], 'list_indices', group_id='test')
         args, kwargs = graph.ro_query.call_args
-        cypher = args[0] if args else kwargs.get('query', '')
+        cypher = args[0] if args else next(iter(kwargs.values()), '')
         assert 'db.indexes' in cypher
 
 
