@@ -1,0 +1,5 @@
+# Scripts orchestrator configuration
+# Scopes verification to tests/scripts/ — the Python test suite for this module.
+# Bash scripts (verify-migration.sh, migrate.sh, etc.) are not linted here.
+
+test_command: "pytest tests/scripts/ --tb=short -q"

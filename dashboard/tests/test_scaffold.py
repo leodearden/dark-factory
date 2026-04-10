@@ -1,9 +1,27 @@
 """Tests for dashboard scaffold: config, app, and fixtures."""
 
+import dataclasses
 import re
 from pathlib import Path
 
+import pytest
+
 from dashboard.config import DEFAULT_FUSED_MEMORY_URLS, DashboardConfig
+
+
+@pytest.fixture
+def symlinked_dir(tmp_path):
+    """Create a `link -> real` symlink in tmp_path.
+
+    Returns `(link, real.resolve())` so tests can pass `link` to production code
+    and assert against the pre-resolved real path, eliminating the 4-line
+    setup boilerplate that was previously duplicated across 5 tests.
+    """
+    real = tmp_path / 'real'
+    real.mkdir()
+    link = tmp_path / 'link'
+    link.symlink_to(real)
+    return link, real.resolve()
 
 
 class TestConfigDefaults:
@@ -31,15 +49,9 @@ class TestConfigDefaults:
     def test_config_derived_paths(self):
         cfg = DashboardConfig()
         root = cfg.project_root
-        assert (
-            cfg.reconciliation_db
-            == root / 'data' / 'reconciliation' / 'reconciliation.db'
-        )
+        assert cfg.reconciliation_db == root / 'data' / 'reconciliation' / 'reconciliation.db'
         assert cfg.write_queue_db == root / 'data' / 'queue' / 'write_queue.db'
-        assert (
-            cfg.write_journal_db
-            == root / 'data' / 'reconciliation' / 'write_journal.db'
-        )
+        assert cfg.write_journal_db == root / 'data' / 'reconciliation' / 'write_journal.db'
         assert cfg.tasks_json == root / '.taskmaster' / 'tasks' / 'tasks.json'
         assert cfg.worktrees_dir == root / '.worktrees'
 
@@ -97,19 +109,22 @@ class TestConfigEnvOverrides:
         cfg = DashboardConfig.from_env()
         assert cfg.known_project_roots == []
 
-    def test_from_env_resolves_known_project_roots(self, monkeypatch, tmp_path):
+    def test_from_env_resolves_known_project_roots(self, monkeypatch, symlinked_dir):
         """from_env() must resolve symlinked paths in DASHBOARD_KNOWN_PROJECT_ROOTS."""
         from dashboard.config import DashboardConfig
 
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
-
+        link, real_resolved = symlinked_dir
         monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', str(link))
         cfg = DashboardConfig.from_env()
         # known_project_roots must contain the resolved real path, not the symlink
-        assert cfg.known_project_roots == [real_dir.resolve()]
+        assert cfg.known_project_roots == [real_resolved]
+
+    def test_from_env_resolves_project_root_symlink(self, monkeypatch, symlinked_dir):
+        """from_env() must resolve a symlinked path in DASHBOARD_PROJECT_ROOT."""
+        link, real_resolved = symlinked_dir
+        monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', str(link))
+        cfg = DashboardConfig.from_env()
+        assert cfg.project_root == real_resolved
 
     def test_known_project_roots_unset_preserves_default(self, monkeypatch):
         monkeypatch.setenv('DASHBOARD_HOST', '0.0.0.0')
@@ -122,9 +137,7 @@ class TestConfigEnvOverrides:
     def test_env_derived_paths_update(self, monkeypatch):
         monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', '/tmp/test')
         cfg = DashboardConfig.from_env()
-        assert cfg.reconciliation_db == Path(
-            '/tmp/test/data/reconciliation/reconciliation.db'
-        )
+        assert cfg.reconciliation_db == Path('/tmp/test/data/reconciliation/reconciliation.db')
         assert cfg.worktrees_dir == Path('/tmp/test/.worktrees')
 
 
@@ -268,15 +281,12 @@ class TestPostInit:
     code is later refactored.
     """
 
-    def test_resolves_project_root_symlink(self, tmp_path):
+    def test_resolves_project_root_symlink(self, symlinked_dir):
         """DashboardConfig must resolve a symlinked project_root in __post_init__."""
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
+        link, real_resolved = symlinked_dir
 
         cfg = DashboardConfig(project_root=link)
-        assert cfg.project_root == real_dir.resolve()
+        assert cfg.project_root == real_resolved
 
     def test_resolves_known_project_roots_symlinks(self, tmp_path):
         """DashboardConfig must resolve symlinks in known_project_roots in __post_init__."""
@@ -293,12 +303,42 @@ class TestPostInit:
         cfg = DashboardConfig(project_root=tmp_path, known_project_roots=[link1, link2])
         assert cfg.known_project_roots == [real1.resolve(), real2.resolve()]
 
-    def test_tasks_json_derived_from_resolved_root(self, tmp_path):
+    def test_tasks_json_derived_from_resolved_root(self, symlinked_dir):
         """tasks_json must be derived from the resolved project_root, not the symlink path."""
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
+        link, real_resolved = symlinked_dir
 
         cfg = DashboardConfig(project_root=link)
-        assert cfg.tasks_json == real_dir.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+        assert cfg.tasks_json == real_resolved / '.taskmaster' / 'tasks' / 'tasks.json'
+
+    def test_replace_resolves_known_project_roots_symlinks(self, tmp_path, symlinked_dir):
+        """dataclasses.replace() must resolve symlinks in known_project_roots via __post_init__.
+
+        Validates the __post_init__ docstring contract that dataclasses.replace() is a
+        covered construction path: 'every construction path — direct kwargs, from_env(),
+        dataclass.replace(), test fixtures'.  dataclasses.replace() internally calls
+        __init__ which triggers __post_init__, so the invariant must hold.
+        """
+        base_cfg = DashboardConfig(project_root=tmp_path)
+
+        link, real_resolved = symlinked_dir
+
+        new_cfg = dataclasses.replace(base_cfg, known_project_roots=[link])
+        assert new_cfg.known_project_roots == [real_resolved]
+
+    def test_post_init_docstring_documents_nonexistent_path_limitation(self):
+        """__post_init__ docstring must document the non-existent path caveat."""
+        doc = DashboardConfig.__post_init__.__doc__ or ''
+        assert 'canonical (symlink-resolved) forms' in doc, (
+            f"Expected original invariant language 'canonical (symlink-resolved) forms' "
+            f'in docstring, got: {doc!r}'
+        )
+        assert (
+            'Note: resolution is canonical only for paths that exist at construction time' in doc
+        ), (
+            f"Expected caveat 'Note: resolution is canonical only for paths that exist at "
+            f"construction time' in docstring, got: {doc!r}"
+        )
+        assert 'cannot follow symlink segments that do not yet exist on disk' in doc, (
+            f"Expected warning 'cannot follow symlink segments that do not yet exist on disk' "
+            f'in docstring, got: {doc!r}'
+        )

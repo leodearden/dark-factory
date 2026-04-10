@@ -32,6 +32,10 @@ class DashboardConfig:
         from_env(), dataclass.replace(), test fixtures — produces a config
         whose Path fields are already canonicalized.  Consumers never need to
         call .resolve() on config paths.
+
+        Note: resolution is canonical only for paths that exist at construction time.
+        Python's Path.resolve() on non-existent paths returns an absolute form but
+        cannot follow symlink segments that do not yet exist on disk.
         """
         self.project_root = self.project_root.resolve()
         self.known_project_roots = [p.resolve() for p in self.known_project_roots]

@@ -4,7 +4,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from conftest import assert_ro_query_only
+from conftest import assert_ro_query_only, extract_cypher
 
 from fused_memory.backends.graphiti_client import (
     EdgeNotFoundError,
@@ -307,24 +307,9 @@ class TestListIndices:
         """list_indices uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
         graph = await assert_ro_query_only(backend, make_graph_mock, [], 'list_indices', group_id='test')
-        args, kwargs = graph.ro_query.call_args
-        cypher = args[0] if args else kwargs.get('query', '')
+        cypher = extract_cypher(graph.ro_query.call_args)
         assert 'db.indexes' in cypher
 
-    @pytest.mark.asyncio
-    async def test_uses_ro_query_cypher_via_kwargs(self, mock_config, make_backend, make_graph_mock):
-        """Regression: Cypher extraction survives kwargs-style call_args (IndexError guard)."""
-        backend = make_backend(mock_config)
-        graph = make_graph_mock([])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.list_indices(group_id='test')
-        # Simulate a kwargs-only call_args: args=(), kwargs={'query': '...'}.
-        # This is the 2-tuple form that Mock stores internally when ro_query
-        # would be called as ro_query(query='CALL db.indexes() YIELD *').
-        graph.ro_query.call_args = ((), {'query': 'CALL db.indexes() YIELD *'})
-        args, kwargs = graph.ro_query.call_args
-        cypher = args[0] if args else kwargs.get('query', '')
-        assert 'db.indexes' in cypher
 
 
 class TestDropIndex:

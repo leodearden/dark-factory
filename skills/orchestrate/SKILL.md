@@ -249,6 +249,44 @@ If any tasks are blocked, jump to [Resolve Blocks](#resolve-blocks).
 
 ---
 
+## Stop Orchestrator
+
+To stop a running orchestrator gracefully, send SIGTERM to the **python3 orchestrator process** — not the bash wrapper or the `uv` process.
+
+### Find the right PID
+
+```bash
+# List orchestrator processes with their configs
+pgrep -af 'orchestrator run --config'
+```
+
+Look for the `python3` (or `orchestrator`) process whose `--config` matches your target. The output shows a chain like `bash → uv → orchestrator`; you want the innermost `orchestrator` PID.
+
+### Send SIGTERM
+
+```bash
+kill <orchestrator_pid>
+```
+
+The orchestrator handles SIGTERM gracefully:
+1. The main loop is interrupted
+2. In-flight agent tasks are cancelled
+3. The `finally` block runs: metrics are finalized, MCP server is stopped, merge worker and escalation server are shut down
+4. Process exits
+
+Task results are persisted **incrementally** as each task completes (not batched at the end), so completed work is never lost even on ungraceful termination.
+
+### Verify shutdown
+
+```bash
+# Confirm the process tree is gone
+pgrep -af 'orchestrator run --config' | grep "$TARGET_CONFIG"
+```
+
+If children (agent subprocesses) are orphaned, kill them by PID. Do **not** use `pkill` with broad patterns — it may hit other projects' orchestrators.
+
+---
+
 ## Check Status
 
 Identify the target project first (see [Critical: identify the target project FIRST](#critical-identify-the-target-project-first)), then query its status. The `status` subcommand also requires `--config` (or `ORCH_CONFIG_PATH`):

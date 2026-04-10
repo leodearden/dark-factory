@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import signal
 import sys
 from pathlib import Path
 
@@ -57,6 +58,12 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
     except ConfigRequiredError as e:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
+    # Convert SIGTERM to KeyboardInterrupt so the finally block in
+    # harness.run() executes (persists metrics, stops subprocesses).
+    def _sigterm(signum, frame):
+        raise KeyboardInterrupt('SIGTERM received')
+    signal.signal(signal.SIGTERM, _sigterm)
+
     harness = Harness(config)
     report = asyncio.run(harness.run(
         prd, dry_run=dry_run, delay_secs=delay_secs,
