@@ -270,39 +270,23 @@ class TestCollectSnapshot:
         async with conn.execute('SELECT * FROM snapshots') as cur:
             rows = list(await cur.fetchall())
 
-        # row: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
         assert len(rows) == 3
-        by_project = {row[1]: row for row in rows}
+        by_project = {row['project_id']: row for row in rows}
         assert str(base_config.project_root) in by_project
         assert str(reify_root.resolve()) in by_project
         assert str(autopilot_root.resolve()) in by_project
 
         # main project: 1 pending task
         main_row = by_project[str(base_config.project_root)]
-        assert main_row[3] == 1  # pending
-        assert main_row[4] == 0  # in_progress
-        assert main_row[5] == 0  # blocked
-        assert main_row[6] == 0  # deferred
-        assert main_row[7] == 0  # cancelled
-        assert main_row[8] == 0  # done
+        _assert_snapshot_counts(main_row, pending=1)
 
         # reify: 2 done tasks
         reify_row = by_project[str(reify_root.resolve())]
-        assert reify_row[3] == 0  # pending
-        assert reify_row[4] == 0  # in_progress
-        assert reify_row[5] == 0  # blocked
-        assert reify_row[6] == 0  # deferred
-        assert reify_row[7] == 0  # cancelled
-        assert reify_row[8] == 2  # done
+        _assert_snapshot_counts(reify_row, done=2)
 
         # autopilot: 1 in-progress task
         autopilot_row = by_project[str(autopilot_root.resolve())]
-        assert autopilot_row[3] == 0  # pending
-        assert autopilot_row[4] == 1  # in_progress
-        assert autopilot_row[5] == 0  # blocked
-        assert autopilot_row[6] == 0  # deferred
-        assert autopilot_row[7] == 0  # cancelled
-        assert autopilot_row[8] == 0  # done
+        _assert_snapshot_counts(autopilot_row, in_progress=1)
 
     @pytest.mark.asyncio
     async def test_dedupes_known_root_against_main_project(self, burndown_env):
