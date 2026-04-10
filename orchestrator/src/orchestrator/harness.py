@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING
 
 from shared.cost_store import CostStore
 
@@ -42,6 +44,43 @@ except ImportError:
     HAS_STEWARD = False
 
 logger = logging.getLogger(__name__)
+
+
+def _acquire_project_lock(project_root: Path) -> IO:
+    """Acquire an exclusive flock on a per-project lockfile.
+
+    Returns the open file object — caller must keep a reference to it
+    (closing or GC releases the lock).  Raises ``SystemExit(1)`` if
+    another orchestrator instance already holds the lock.
+    """
+    lock_path = project_root / 'data' / 'orchestrator' / 'orchestrator.lock'
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lock_file = open(lock_path, 'w')  # noqa: SIM115
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # Another instance holds the lock — read its diagnostic info
+        try:
+            with open(lock_path) as f:
+                info = f.read().strip()
+        except OSError:
+            info = '(unknown)'
+        logger.error(
+            'Another orchestrator is already running for this project.\n'
+            f'  Lock holder: {info}\n'
+            f'  Lock file:   {lock_path}\n'
+            'Kill the existing instance first, or wait for it to finish.'
+        )
+        lock_file.close()
+        raise SystemExit(1) from None
+
+    # Write diagnostic info for anyone who tries to acquire next
+    lock_file.truncate(0)
+    lock_file.seek(0)
+    lock_file.write(f'PID {os.getpid()} started {datetime.now(UTC).isoformat()}')
+    lock_file.flush()
+    return lock_file
 
 
 @dataclass
@@ -152,6 +191,9 @@ class Harness:
         # Cost store — per-invocation cost tracking (shares runs.db)
         self.cost_store: CostStore | None = None
 
+        # Singleton lock — held for the duration of run()
+        self._lock_file: IO | None = None
+
     async def run(
         self,
         prd_path: Path | None = None,
@@ -168,7 +210,10 @@ class Harness:
         """
         self.report.started_at = datetime.now(UTC).isoformat()
 
-        # 0. Create event store and run store for this run
+        # 0. Singleton lock — prevent concurrent orchestrators on same project
+        self._lock_file = _acquire_project_lock(self.config.project_root)
+
+        # 0a. Create event store and run store for this run
         import uuid
 
         run_id = f'run-{uuid.uuid4().hex[:12]}'
@@ -211,23 +256,13 @@ class Harness:
             self.review_checkpoint.cost_store = self.cost_store
             self.review_checkpoint.run_id = run_id
 
-        # 1. Start fused-memory HTTP server
-        logger.info('Starting fused-memory HTTP server...')
-        await self.mcp.start()
-
-        # 1b. Start escalation server
-        await self._start_escalation_server()
-
-        # 1b2. Start merge worker
-        await self._start_merge_worker()
-
-        # 1b3. Refuse to start with dirty working tree (unless forced)
+        # 0c. Refuse to start with dirty working tree (unless forced).
+        # Checked before any servers start to avoid zombie processes on failure.
         if not force_dirty_start:
             dirty = await self.git_ops.has_dirty_working_tree()
             if dirty:
-                await self._stop_merge_worker()
-                await self._stop_escalation_server()
-                await self.mcp.stop()
+                self._lock_file.close()
+                self._lock_file = None
                 raise RuntimeError(
                     'Refusing to start: project_root has uncommitted tracked changes. '
                     'Commit or stash your work first, or pass --force-dirty-start to override.\n'
@@ -235,6 +270,16 @@ class Harness:
                 )
 
         try:
+            # 1. Start fused-memory HTTP server
+            logger.info('Starting fused-memory HTTP server...')
+            await self.mcp.start()
+
+            # 1b. Start escalation server
+            await self._start_escalation_server()
+
+            # 1b2. Start merge worker
+            await self._start_merge_worker()
+
             # 1c. Dismiss stale escalations from prior runs (non-fatal)
             try:
                 await self._dismiss_stale_escalations()
@@ -423,6 +468,11 @@ class Harness:
             await self._stop_merge_worker()
             await self._stop_escalation_server()
             await self.mcp.stop()
+
+            # Release singleton lock
+            if self._lock_file is not None:
+                self._lock_file.close()
+                self._lock_file = None
 
         logger.info(self.report.summary())
         return self.report
@@ -1014,21 +1064,24 @@ Output JSON matching the schema. Every task must appear in the output.
         port = self.config.escalation.port
 
         async def _serve():
-            try:
-                import uvicorn
-                app = mcp_server.http_app()
-                uv_config = uvicorn.Config(
-                    app, host=host, port=port, log_level='warning',
-                )
-                server = uvicorn.Server(uv_config)
-                await server.serve()
-            except Exception as e:
-                logger.error(f'Escalation server error: {e}')
+            import uvicorn
+            app = mcp_server.http_app()
+            uv_config = uvicorn.Config(
+                app, host=host, port=port, log_level='warning',
+            )
+            server = uvicorn.Server(uv_config)
+            await server.serve()
 
         self._escalation_task = asyncio.create_task(_serve(), name='escalation-server')
         logger.info(f'Escalation MCP server starting on {host}:{port}')
-        # Give the server a moment to bind
+        # Give the server a moment to bind, then verify it didn't crash
         await asyncio.sleep(0.5)
+        if self._escalation_task.done():
+            exc = self._escalation_task.exception()
+            if exc:
+                raise RuntimeError(
+                    f'Escalation server failed to start on {host}:{port}: {exc}'
+                ) from exc
 
     async def _dismiss_stale_escalations(self) -> None:
         """Dismiss all pending escalations left over from prior orchestrator runs.
@@ -1053,7 +1106,7 @@ Output JSON matching the schema. Every task must appear in the output.
         """Stop the escalation server."""
         if self._escalation_task is not None:
             self._escalation_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._escalation_task
             self._escalation_task = None
             logger.info('Escalation server stopped')
