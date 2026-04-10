@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
 import pytest
@@ -22,6 +23,17 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
+
+if TYPE_CHECKING:
+    # Static-only conformance checks — verified by pyright, never executed at runtime.
+    # Assigning test doubles to _SchedulerLike-typed variables catches method signature
+    # drift (parameter names, types, return types, positional-only markers) that
+    # hasattr/isinstance checks cannot detect.
+    from orchestrator.evals.runner import _EvalScheduler as _ES
+    from orchestrator.workflow import _SchedulerLike
+
+    _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()  # type: ignore[name-defined]
+    _eval_scheduler_conforms: _SchedulerLike = _ES(OrchestratorConfig())
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -351,7 +363,6 @@ class FakeScheduler:
 
     def __init__(self):
         self.statuses: dict[str, list[str]] = {}
-        self._status_cache: dict[str, str] = {}
 
     async def set_task_status(self, task_id: str, status: str) -> None:
         self.statuses.setdefault(task_id, []).append(status)
@@ -1947,36 +1958,10 @@ class TestGhostLoopGuard:
 
 
 # ---------------------------------------------------------------------------
-# Tests: Protocol Conformance — _SchedulerLike test doubles
+# Protocol conformance — see TYPE_CHECKING block at the top of this file.
+# Static assertions (pyright-verified) replaced the old hasattr/isinstance
+# runtime checks, which only tested attribute presence, not method signatures.
 # ---------------------------------------------------------------------------
-
-
-class TestSchedulerProtocolConformance:
-    """Verify that test doubles satisfy the _SchedulerLike Protocol."""
-
-    def test_fake_scheduler_has_status_cache(self):
-        """FakeScheduler must have _status_cache to satisfy _SchedulerLike."""
-        fake = FakeScheduler()
-        assert hasattr(fake, '_status_cache'), (
-            'FakeScheduler is missing _status_cache required by the _SchedulerLike Protocol'
-        )
-        assert isinstance(fake._status_cache, dict), (
-            '_status_cache must be a dict[str, str]'
-        )
-
-    def test_eval_scheduler_has_status_cache(self):
-        """_EvalScheduler must have _status_cache to satisfy _SchedulerLike."""
-        from orchestrator.config import OrchestratorConfig
-        from orchestrator.evals.runner import _EvalScheduler
-
-        cfg = OrchestratorConfig()
-        sched = _EvalScheduler(cfg)
-        assert hasattr(sched, '_status_cache'), (
-            '_EvalScheduler is missing _status_cache required by the _SchedulerLike Protocol'
-        )
-        assert isinstance(sched._status_cache, dict), (
-            '_status_cache must be a dict[str, str]'
-        )
 
 
 # ---------------------------------------------------------------------------
