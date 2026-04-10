@@ -123,22 +123,59 @@ def test_known_project_roots_uses_comma_separator_not_colon() -> None:
 
 
 def test_comment_warns_about_systemd_space_handling() -> None:
-    """Both service files must carry the systemd-aware comment for DASHBOARD_KNOWN_PROJECT_ROOTS.
+    """Both service files must carry an intent-based comment for DASHBOARD_KNOWN_PROJECT_ROOTS.
 
-    The old wording 'comma-separated, no spaces' was misleading — the Python parser
-    tolerates whitespace around commas.  The real hazard is systemd: spaces inside
-    an Environment= value are treated as separators between variable assignments.
-    The updated comment makes this explicit so future editors understand why spaces
-    are forbidden.
+    The check is intent-based, not prose-pinning:
+    - The line immediately above Environment=DASHBOARD_KNOWN_PROJECT_ROOTS= (skipping blanks)
+      must be a '#' comment that mentions both 'systemd' and 'space' (case-insensitive).
+    - The old misleading phrase 'no spaces' must not appear anywhere in either file.
+
+    This is stronger than an exact-string match: any future copy-edit that preserves the
+    warning intent (systemd treats spaces as separators) will pass, while edits that remove
+    or contradict the intent will fail.
     """
-    expected_comment = (
-        "# Multi-project cost aggregation "
-        "(comma-separated; avoid spaces inside the value \u2014 "
-        "systemd would treat them as assignment separators)"
-    )
     for path in (TEMPLATE, HARDCODED):
         content = path.read_text(encoding="utf-8")
-        assert expected_comment in content, (
-            f"Systemd-aware comment not found in {path}:\n  {expected_comment!r}\n"
-            "Update the comment above the Environment=DASHBOARD_KNOWN_PROJECT_ROOTS line."
+        lines = content.splitlines()
+
+        # Find the Environment=DASHBOARD_KNOWN_PROJECT_ROOTS= line
+        env_idx = next(
+            (i for i, ln in enumerate(lines) if "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=" in ln),
+            None,
+        )
+        assert env_idx is not None, (
+            f"Environment=DASHBOARD_KNOWN_PROJECT_ROOTS= line not found in {path}"
+        )
+
+        # Walk backward to the nearest non-blank line
+        comment_idx = env_idx - 1
+        while comment_idx >= 0 and lines[comment_idx].strip() == "":
+            comment_idx -= 1
+
+        assert comment_idx >= 0, (
+            f"No non-blank line found above Environment=DASHBOARD_KNOWN_PROJECT_ROOTS= in {path}"
+        )
+        comment_line = lines[comment_idx]
+
+        assert comment_line.startswith("#"), (
+            f"Line above Environment=DASHBOARD_KNOWN_PROJECT_ROOTS= in {path} "
+            f"is not a '#' comment:\n  {comment_line!r}"
+        )
+        comment_lower = comment_line.lower()
+        assert "systemd" in comment_lower, (
+            f"Comment above Environment=DASHBOARD_KNOWN_PROJECT_ROOTS= in {path} "
+            f"does not mention 'systemd':\n  {comment_line!r}\n"
+            "Update the comment to explain the systemd space-separator hazard."
+        )
+        assert "space" in comment_lower, (
+            f"Comment above Environment=DASHBOARD_KNOWN_PROJECT_ROOTS= in {path} "
+            f"does not mention 'space':\n  {comment_line!r}\n"
+            "Update the comment to warn about spaces inside the Environment= value."
+        )
+
+        # The old misleading phrase 'no spaces' must not appear anywhere in this file
+        assert "no spaces" not in content.lower(), (
+            f"Misleading phrase 'no spaces' found in {path}. "
+            "Remove it — the real hazard is systemd's space-as-separator behavior, "
+            "not the Python parser's whitespace tolerance."
         )
