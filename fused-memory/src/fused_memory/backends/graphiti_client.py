@@ -462,9 +462,12 @@ class GraphitiBackend:
         """Return all currently-valid RELATES_TO edges grouped by entity UUID.
 
         Bulk variant of get_valid_edges_for_node that issues a single Cypher query
-        instead of O(N) per-entity round-trips.  The undirected MATCH pattern can
-        produce duplicate rows; RETURN DISTINCT is used defensively, matching the
-        pattern in get_valid_edges_for_node.
+        instead of O(N) per-entity round-trips.  The undirected MATCH pattern causes
+        each directed edge to appear under both its source and target entity: for a
+        directed A→B edge, traversal matches it from A's side (row: A.uuid, e.uuid)
+        and from B's side (row: B.uuid, e.uuid) — two genuinely distinct rows because
+        n.uuid differs.  RETURN DISTINCT guards only against self-loop duplicates
+        (A→A edges, where both traversal directions yield identical rows).
 
         Uses ro_query since no writes are performed.
 
@@ -474,6 +477,12 @@ class GraphitiBackend:
         Returns:
             Dict mapping entity UUID → list of edge dicts with keys: uuid, fact, name.
             fact and name default to empty string when the property is NULL.
+            Each directed edge appears under both its source and target entity UUID
+            (double-attribution from the undirected MATCH pattern).
+
+        Note:
+            Using a directed pattern (n:Entity)-[e:RELATES_TO]->() would give
+            single-appearance semantics per edge if ever needed.
         """
         graph = self._graph_for(group_id)
         cypher = (
