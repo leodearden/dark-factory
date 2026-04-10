@@ -347,16 +347,34 @@ class TaskInterceptor:
         _walk(tasks_data.get('tasks', []))
         return result
 
+    @staticmethod
+    def _build_pre_title_index(
+        pre_flattened: list[tuple[str, str, str]],
+    ) -> dict[str, tuple[str, str]]:
+        """Build hash→(task_id, title) index from a flattened pre-snapshot.
+
+        Used to detect exact-title duplicates among newly-created tasks.
+        First occurrence wins when the same normalized title appears multiple times.
+        """
+        index: dict[str, tuple[str, str]] = {}
+        for tid, title, _ in pre_flattened:
+            if title:
+                h = hashlib.sha256(title.encode()).hexdigest()[:16]
+                index.setdefault(h, (tid, title))
+        return index
+
     async def _dedupe_bulk_created(
         self,
         project_root: str,
         pre_snapshot: dict,
         parent_task_id: str | None = None,
     ) -> dict:
-        """Post-hoc dedup after a bulk task-creation operation (Layer 1: title hash).
+        """Post-hoc dedup after a bulk task-creation operation.
 
-        Reads the current task tree, diffs it against pre_snapshot, and removes
-        any new tasks whose normalized title matches a pre-existing one.
+        Reads the current task tree, diffs it against pre_snapshot, removes any
+        new tasks whose normalized title matches a pre-existing one (Layer 1: hash)
+        or is semantically similar to one (Layer 2: Qdrant vector), then records
+        survivors in both dedup stores for future protection.
 
         Returns {'removed': [...], 'kept': [...], 'errors': []}
         """
@@ -365,16 +383,14 @@ class TaskInterceptor:
         errors: list[dict] = []
 
         tm = await self._ensure_taskmaster()
+        project_id = resolve_project_id(project_root)
 
-        # Build pre-snapshot index
+        # Build pre-snapshot index (step-4: extracted into _build_pre_title_index)
         pre_flattened = self._flatten_tasks(pre_snapshot)
         pre_ids = {tid for tid, _, _ in pre_flattened}
-        pre_title_index: dict[str, str] = {}
-        for tid, title, _ in pre_flattened:
-            if title:
-                pre_title_index.setdefault(self._title_hash(title), tid)
+        pre_title_index = self._build_pre_title_index(pre_flattened)
 
-        # Get post-snapshot and find newly-created tasks
+        # Get post-snapshot and find newly-created tasks (not in pre-snapshot)
         post_snapshot = await tm.get_tasks(project_root)
         post_flattened = self._flatten_tasks(post_snapshot)
         new_tasks = [
@@ -386,6 +402,9 @@ class TaskInterceptor:
         if not new_tasks:
             return {'removed': removed, 'kept': kept, 'errors': errors}
 
+        # Lazy-load the vector deduplicator once for all new tasks (step-6)
+        deduplicator = await self._get_deduplicator()
+
         for tid, title, _status in new_tasks:
             is_dup = False
 
@@ -394,18 +413,19 @@ class TaskInterceptor:
                 h = self._title_hash(title)
                 if h in pre_title_index:
                     is_dup = True
+                    matched_id, matched_title = pre_title_index[h]
                     try:
                         await tm.remove_task(tid, project_root)
                         removed.append({
                             'task_id': tid,
                             'title': title,
                             'reason': 'exact_title_match',
-                            'matched_task_id': pre_title_index[h],
+                            'matched_task_id': matched_id,
                         })
                         logger.warning(
                             'bulk_dedup: removed duplicate task %s '
                             '(title matches pre-existing task %s: %r)',
-                            tid, pre_title_index[h], title,
+                            tid, matched_id, title,
                         )
                     except Exception as exc:
                         logger.warning(
@@ -413,8 +433,47 @@ class TaskInterceptor:
                         )
                         errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
 
+            # Layer 2: vector similarity check (step-6) — only if Layer 1 missed
+            if not is_dup and title and deduplicator is not None:
+                try:
+                    match = await deduplicator.find_duplicate(title, project_id)
+                    if match is not None:
+                        is_dup = True
+                        try:
+                            await tm.remove_task(tid, project_root)
+                            removed.append({
+                                'task_id': tid,
+                                'title': title,
+                                'reason': 'vector_similarity',
+                                'matched_task_id': match['task_id'],
+                                'similarity_score': match['score'],
+                            })
+                            logger.warning(
+                                'bulk_dedup: removed duplicate task %s '
+                                '(vector similarity %.3f vs task %s: %r)',
+                                tid, match['score'], match['task_id'], title,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                'bulk_dedup: remove_task failed for %s: %s', tid, exc,
+                            )
+                            errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
+                except Exception as exc:
+                    logger.warning('bulk_dedup: find_duplicate failed for %s: %s', tid, exc)
+
+            # Record survivors in dedup stores (step-8)
             if not is_dup:
                 kept.append({'task_id': tid, 'title': title})
+                # Layer 1: populate cache so future add_task/bulk calls dedup against it
+                self._store_dedup_cache(title, {'id': tid, 'title': title})
+                # Layer 2: fire-and-forget embedding write (same pattern as add_task)
+                if deduplicator is not None:
+                    bg = asyncio.create_task(
+                        deduplicator.record_task(tid, title, project_id),
+                        name=f'bulk-dedup-record-{tid}',
+                    )
+                    self._background_tasks.add(bg)
+                    bg.add_done_callback(lambda t: self._background_tasks.discard(t))
 
         return {'removed': removed, 'kept': kept, 'errors': errors}
 
