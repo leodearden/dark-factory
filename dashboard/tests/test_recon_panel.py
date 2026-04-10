@@ -694,7 +694,7 @@ class TestReconDetailTrigger:
         assert 'x-data="{ open: false }"' not in html
         assert "x-data='{ open: false }'" not in html
 
-    def test_zero_journal_count_hides_badge_and_detail(self, client):
+    def test_zero_journal_count_hides_detail_row(self, client):
         runs_zero = MOCK_RUNS_NO_JOURNAL
         with _patch_recon_data(runs=runs_zero):
             html = client.get('/partials/recon').text
