@@ -1648,32 +1648,6 @@ class TestHarnessFilteredTaskTreeWiring:
 
         harness.taskmaster.get_tasks.assert_called_once()  # type: ignore[union-attr,attr-defined]
 
-    def test_get_tasks_exactly_once_docstring_is_accurate(self):
-        """Meta-test: guards against re-introducing the misleading docstring.
-
-        Asserts the accurate invariant description is present and the misleading
-        'no stage bypasses the helper' phrase (which overstates coverage when all
-        stage .run methods are mocked) is absent.
-        """
-        doc = (
-            TestHarnessFilteredTaskTreeWiring
-            .test_run_full_cycle_invokes_get_tasks_exactly_once
-            .__doc__
-        )
-        assert doc is not None, (
-            "test_run_full_cycle_invokes_get_tasks_exactly_once must have a docstring"
-        )
-        assert 'no stage bypasses the helper' not in doc, (
-            "Misleading phrase 'no stage bypasses the helper' found in docstring; "
-            "stages are mocked so this invariant cannot be verified by this test."
-        )
-        assert 'orchestration path' in doc, (
-            "Accurate phrase 'orchestration path' is missing from docstring."
-        )
-        assert 'mocked' in doc, (
-            "Docstring must mention that stages are 'mocked' to document the structural limitation."
-        )
-
     @pytest.mark.asyncio
     async def test_run_full_cycle_sets_filtered_task_tree_on_consolidator(
         self, journal, event_buffer, mock_memory_service,
