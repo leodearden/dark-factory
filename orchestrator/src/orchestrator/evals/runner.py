@@ -431,6 +431,7 @@ class _EvalScheduler:
 
     def __init__(self, config: OrchestratorConfig):
         self.config = config
+        self._status_cache: dict[str, str] = {}
 
     async def get_tasks(self):
         return []
