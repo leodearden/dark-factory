@@ -104,6 +104,7 @@ async def burndown_env(tmp_path):
     _create_burndown_db(db_path)
     config = DashboardConfig(project_root=tmp_path)
     async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
         yield db_path, config, conn
 
 
