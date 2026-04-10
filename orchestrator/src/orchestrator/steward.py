@@ -225,11 +225,7 @@ class TaskSteward:
             )
             return
 
-        # CWD: suggestions read from main (post-merge), others from worktree
-        if escalation.category == 'review_suggestions':
-            cwd = self.config.project_root
-        else:
-            cwd = self.worktree
+        cwd = self.worktree
 
         # Pre-triage large suggestion sets before invoking the steward session
         if escalation.category == 'review_suggestions' and escalation.detail:
