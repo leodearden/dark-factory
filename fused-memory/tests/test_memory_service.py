@@ -79,11 +79,9 @@ class TestAddMemory:
         )
         assert SourceStore.mem0 in result.stores_written
         assert result.category == MemoryCategory.preferences_and_norms
-        # Mem0 now routed through durable queue
-        service.durable_queue.enqueue.assert_called_once()
-        call_kwargs = service.durable_queue.enqueue.call_args[1]
-        assert call_kwargs['operation'] == 'mem0_add'
-        assert call_kwargs['group_id'].startswith('mem0_')
+        # Mem0 is now a direct synchronous call — NOT enqueued
+        service.mem0.add.assert_called_once()
+        service.durable_queue.enqueue.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_dual_write(self, service):
@@ -95,11 +93,11 @@ class TestAddMemory:
         )
         assert SourceStore.graphiti in result.stores_written
         assert SourceStore.mem0 in result.stores_written
-        # Both stores go through the queue now
-        assert service.durable_queue.enqueue.call_count == 2
+        # Graphiti still goes through the durable queue; Mem0 is now a direct call
+        assert service.durable_queue.enqueue.call_count == 1
         ops = [c[1]['operation'] for c in service.durable_queue.enqueue.call_args_list]
-        assert 'add_memory_graphiti' in ops
-        assert 'mem0_add' in ops
+        assert ops == ['add_memory_graphiti']
+        service.mem0.add.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_auto_classification(self, service):
@@ -129,10 +127,10 @@ class TestAddMemory:
         )
 
     @pytest.mark.asyncio
-    async def test_mem0_enqueue_error_surfaced_in_response(self, service):
-        """Mem0 enqueue errors must appear in the response message."""
-        service.durable_queue.enqueue = AsyncMock(
-            side_effect=ValueError('sqlite disk full')
+    async def test_mem0_direct_error_surfaced_in_response(self, service):
+        """Mem0 direct-call errors must appear in the response message."""
+        service.mem0.add = AsyncMock(
+            side_effect=RuntimeError('qdrant write failed')
         )
 
         result = await service.add_memory(
@@ -147,13 +145,13 @@ class TestAddMemory:
 
     @pytest.mark.asyncio
     async def test_success_false_when_only_targeted_store_fails(self, service):
-        """success must be False when the only targeted store's enqueue fails.
+        """success must be False when the only targeted store's direct call fails.
 
-        For a Mem0-only write (preferences_and_norms), if enqueue raises,
+        For a Mem0-only write (preferences_and_norms), if mem0.add raises,
         _graphiti_error is None and _mem0_error is set.
         """
-        service.durable_queue.enqueue = AsyncMock(
-            side_effect=ValueError('sqlite disk full')
+        service.mem0.add = AsyncMock(
+            side_effect=ValueError('qdrant unreachable')
         )
         mock_journal = MagicMock()
         mock_journal.log_write_op = AsyncMock()
