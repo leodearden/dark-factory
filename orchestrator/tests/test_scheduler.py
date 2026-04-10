@@ -1274,3 +1274,25 @@ class TestRequeueCooldown:
 
         a2 = await scheduler.acquire_next()
         assert a2 is not None and a2.task_id == '99'
+
+
+class TestGetCachedStatus:
+    """get_cached_status() exposes the internal status cache via a public method."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def test_get_cached_status_returns_none_for_unknown_task(self, scheduler: Scheduler):
+        """get_cached_status returns None when the task has never been seen."""
+        assert scheduler.get_cached_status('unknown') is None
+
+    @pytest.mark.asyncio
+    async def test_get_cached_status_returns_status_after_set_task_status(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """get_cached_status returns the last status written via set_task_status."""
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value={}))
+        await scheduler.set_task_status('42', 'in-progress')
+        assert scheduler.get_cached_status('42') == 'in-progress'
