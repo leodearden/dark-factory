@@ -698,7 +698,7 @@ class TestReconDetailTrigger:
         runs_zero = MOCK_RUNS_NO_JOURNAL
         with _patch_recon_data(runs=runs_zero):
             html = client.get('/partials/recon').text
-        assert 'x-show="open"' not in html
+        assert 'data-testid="run-detail-row"' not in html
 
     def test_positive_journal_count_shows_detail_row(self, client):
         """Default MOCK_RUNS (journal_entry_count=3): detail row is emitted with x-show and data-testid."""
