@@ -20,8 +20,6 @@ class TestWriteTasksJsonHelper:
 
     def test_creates_directory_and_file(self, tmp_path):
         """Creates .taskmaster/tasks/tasks.json with correct JSON content."""
-        import json
-
         tasks = [
             {'id': '1', 'title': 'A', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
         ]
@@ -34,8 +32,6 @@ class TestWriteTasksJsonHelper:
 
     def test_idempotent_when_dir_exists(self, tmp_path):
         """Pre-created .taskmaster/tasks/ dir causes no error; file is written correctly."""
-        import json
-
         (tmp_path / '.taskmaster' / 'tasks').mkdir(parents=True)
         tasks = [
             {'id': '2', 'title': 'B', 'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}},
