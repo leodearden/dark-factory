@@ -551,9 +551,9 @@ class ReconciliationHarness:
                         filtered_task_tree=filtered_task_tree,
                     )
 
-                # Wire harness-fetched task tree into Stage 2 (ref: task 455)
+                # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)
                 if isinstance(stage, TaskKnowledgeSync):
-                    stage.filtered_task_tree = filtered_task_tree
+                    self._configure_task_sync(stage, filtered_task_tree=filtered_task_tree)
 
                 report = await stage.run(
                     events, watermark, reports, run_id, model=tier.model,

@@ -1765,6 +1765,48 @@ class TestHarnessFilteredTaskTreeWiring:
         )
 
 
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_uses_configure_task_sync_for_stage2(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """run_full_cycle calls _configure_task_sync (not naked assignment) for Stage-2 wiring."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        expected_tree = self._make_tree()
+        harness._fetch_filtered_task_tree = AsyncMock(return_value=expected_tree)
+
+        spy_calls: list = []
+        # Accessing a staticmethod via the class already unwraps it to a plain function
+        real_helper = ReconciliationHarness._configure_task_sync
+
+        def spy(stage, *, filtered_task_tree=None, remediation_mode=False):
+            spy_calls.append({'stage': stage, 'filtered_task_tree': filtered_task_tree, 'remediation_mode': remediation_mode})
+            real_helper(stage, filtered_task_tree=filtered_task_tree, remediation_mode=remediation_mode)
+
+        ReconciliationHarness._configure_task_sync = staticmethod(spy)  # type: ignore[method-assign]
+        try:
+            for stage in harness.stages:
+                _mock_stage_run(stage)
+
+            event = _make_event()
+            event.payload['_project_root'] = '/my/project'
+            await harness.run_full_cycle('test-project', 'test-trigger', events=[event])
+        finally:
+            ReconciliationHarness._configure_task_sync = staticmethod(real_helper)  # type: ignore[method-assign]
+
+        assert len(spy_calls) == 1, f"Expected _configure_task_sync called once, got {len(spy_calls)}"
+        call = spy_calls[0]
+        stage2 = harness.stages[1]
+        assert isinstance(stage2, TaskKnowledgeSync)
+        assert call['stage'] is stage2
+        assert call['filtered_task_tree'] is expected_tree
+        assert call['remediation_mode'] is False
+
+
 class TestConfigureTaskSync:
     """Unit tests for the _configure_task_sync staticmethod on ReconciliationHarness."""
 
