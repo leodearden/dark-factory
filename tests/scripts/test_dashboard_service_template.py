@@ -16,7 +16,14 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 TEMPLATE = REPO_ROOT / "scripts" / "dashboard.service.template"
 HARDCODED = REPO_ROOT / "dashboard" / "dark-factory-dashboard.service"
 
-EXPECTED_ENV_LINE = (
+TEMPLATE_EXPECTED_ENV_LINE = (
+    "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS="
+    "__REPO_ROOT__,"
+    "/home/leo/src/reify,"
+    "/home/leo/src/autopilot-video"
+)
+
+HARDCODED_EXPECTED_ENV_LINE = (
     "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS="
     "/home/leo/src/dark-factory,"
     "/home/leo/src/reify,"
@@ -25,19 +32,20 @@ EXPECTED_ENV_LINE = (
 
 
 def test_template_sets_known_project_roots() -> None:
-    """scripts/dashboard.service.template must declare DASHBOARD_KNOWN_PROJECT_ROOTS."""
+    """scripts/dashboard.service.template must declare DASHBOARD_KNOWN_PROJECT_ROOTS with __REPO_ROOT__ sentinel."""
     content = TEMPLATE.read_text(encoding="utf-8")
-    assert EXPECTED_ENV_LINE in content, (
-        f"Expected line not found in {TEMPLATE}:\n  {EXPECTED_ENV_LINE!r}\n"
+    assert TEMPLATE_EXPECTED_ENV_LINE in content, (
+        f"Expected line not found in {TEMPLATE}:\n  {TEMPLATE_EXPECTED_ENV_LINE!r}\n"
+        "The template must use __REPO_ROOT__ as the self entry, not a hardcoded path. "
         "Add it to the [Service] section after the ExecStart block."
     )
 
 
 def test_hardcoded_service_file_sets_known_project_roots() -> None:
-    """dashboard/dark-factory-dashboard.service must declare DASHBOARD_KNOWN_PROJECT_ROOTS."""
+    """dashboard/dark-factory-dashboard.service must declare DASHBOARD_KNOWN_PROJECT_ROOTS with literal path."""
     content = HARDCODED.read_text(encoding="utf-8")
-    assert EXPECTED_ENV_LINE in content, (
-        f"Expected line not found in {HARDCODED}:\n  {EXPECTED_ENV_LINE!r}\n"
+    assert HARDCODED_EXPECTED_ENV_LINE in content, (
+        f"Expected line not found in {HARDCODED}:\n  {HARDCODED_EXPECTED_ENV_LINE!r}\n"
         "Add it to the [Service] section after the ExecStart block."
     )
 
