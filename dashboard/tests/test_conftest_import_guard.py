@@ -49,9 +49,51 @@ def _first_non_stdlib_import_line(tree: ast.Module) -> int | None:
                 top_level = alias.name.split(".")[0]
                 if top_level not in stdlib:
                     return node.lineno
-        elif isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[0] not in stdlib:
-            return node.lineno
+        elif isinstance(node, ast.ImportFrom):
+            if node.level > 0:
+                # Relative imports are definitionally non-stdlib.
+                return node.lineno
+            if node.module is None:
+                continue
+            top_level = node.module.split(".")[0]
+            if top_level not in stdlib:
+                return node.lineno
     return None
+
+
+def test_relative_import_detected_as_non_stdlib() -> None:
+    """from . import helpers — level>0, module=None — must be returned as non-stdlib."""
+    source = "import os\nfrom . import helpers\n"
+    tree = ast.parse(source)
+    assert _first_non_stdlib_import_line(tree) == 2
+
+
+def test_dotted_relative_import_detected_as_non_stdlib() -> None:
+    """from .utils import helper — level=1, module='utils' — must be returned as non-stdlib."""
+    source = "import sys\nfrom .utils import helper\n"
+    tree = ast.parse(source)
+    assert _first_non_stdlib_import_line(tree) == 2
+
+
+def test_double_dot_relative_import_detected() -> None:
+    """from .. import config — level=2, module=None — must be returned as non-stdlib."""
+    source = "from .. import config\n"
+    tree = ast.parse(source)
+    assert _first_non_stdlib_import_line(tree) == 1
+
+
+def test_stdlib_only_returns_none() -> None:
+    """A file with only stdlib imports must return None."""
+    source = "import os\nimport sys\nfrom pathlib import Path\n"
+    tree = ast.parse(source)
+    assert _first_non_stdlib_import_line(tree) is None
+
+
+def test_absolute_thirdparty_still_detected() -> None:
+    """Absolute non-stdlib import must still be detected after the refactor."""
+    source = "import os\nimport pytest\n"
+    tree = ast.parse(source)
+    assert _first_non_stdlib_import_line(tree) == 2
 
 
 def test_syspath_insert_precedes_non_stdlib_imports() -> None:
