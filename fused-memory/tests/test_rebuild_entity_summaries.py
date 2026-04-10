@@ -403,7 +403,7 @@ class TestRebuildEntitySummaries:
     """GraphitiBackend.rebuild_entity_summaries() batch-rebuilds stale entities."""
 
     @pytest.mark.asyncio
-    async def test_rebuilds_only_stale_entities(self, mock_config, make_backend):
+    async def test_rebuilds_only_stale_entities(self, mock_config, make_backend, make_edge_backend):
         """Only stale entities are rebuilt; clean entities are skipped.
 
         Alice has summary='stale fact' but her only valid edge has fact='current fact',
@@ -411,12 +411,10 @@ class TestRebuildEntitySummaries:
         Bob has summary='current fact' matching his edge canonical → clean.
         Total entities=2, stale=1, rebuilt=1.
         """
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale fact'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'current fact'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'current fact', 'name': 'edge2'}],
         })
@@ -431,14 +429,12 @@ class TestRebuildEntitySummaries:
         assert result['details'][0]['old_summary'] == 'stale fact'
 
     @pytest.mark.asyncio
-    async def test_force_rebuilds_all(self, mock_config, make_backend):
+    async def test_force_rebuilds_all(self, mock_config, make_backend, make_edge_backend):
         """With force=True, rebuilds all entities using get_all_valid_edges (no refresh_entity_summary)."""
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'ok'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'also ok'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
         })
@@ -460,17 +456,15 @@ class TestRebuildEntitySummaries:
         assert set(result.keys()) == {'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors', 'details'}
 
     @pytest.mark.asyncio
-    async def test_partial_failure_continues(self, mock_config, make_backend):
+    async def test_partial_failure_continues(self, mock_config, make_backend, make_edge_backend):
         """Both entities are detected stale because their summaries differ from the canonical facts derived from their valid edges.
 
         Alice's update_node_summary raises RuntimeError; Bob's succeeds.
         """
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
         })
@@ -490,11 +484,9 @@ class TestRebuildEntitySummaries:
         backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
 
     @pytest.mark.asyncio
-    async def test_empty_graph_returns_zero_counts(self, mock_config, make_backend):
+    async def test_empty_graph_returns_zero_counts(self, mock_config, make_backend, make_edge_backend):
         """No entities means all counts are 0."""
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[])
-        backend.get_all_valid_edges = AsyncMock(return_value={})
+        backend = make_edge_backend(make_backend(mock_config), nodes=[], edges={})
         result = await backend.rebuild_entity_summaries(group_id='test')
         assert result['total_entities'] == 0
         assert result['stale_entities'] == 0
