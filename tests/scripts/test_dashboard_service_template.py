@@ -104,14 +104,5 @@ def test_known_project_roots_uses_comma_separator_not_colon() -> None:
     The consumer code is ``roots.split(',')`` — a colon-separated value would
     be parsed as a single path literal and silently aggregate nothing.
     """
-    colon_pattern = (
-        "DASHBOARD_KNOWN_PROJECT_ROOTS="
-        "/home/leo/src/dark-factory:"
-    )
     for path in (TEMPLATE, HARDCODED):
-        content = path.read_text(encoding="utf-8")
-        assert colon_pattern not in content, (
-            f"Colon-separated DASHBOARD_KNOWN_PROJECT_ROOTS found in {path}. "
-            "Use commas — the parser at dashboard/src/dashboard/config.py:84 "
-            "calls roots.split(',')."
-        )
+        _assert_known_project_roots_comma_separated(path)
