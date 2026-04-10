@@ -322,34 +322,87 @@ You MUST output ONLY valid JSON matching this schema:
     )
 
 
-REVIEWER_TEST_ANALYST = _reviewer_role(
-    'test_analyst',
-    'Test coverage and quality. Are the right behaviors tested? Meaningful assertions? '
-    'Untested failure modes? Edge cases? Do tests test what they claim?',
+REVIEWER_COMPREHENSIVE = _reviewer_role(
+    'comprehensive',
+    'Comprehensive code review covering ALL of the following areas:\n\n'
+    '1. **Test coverage and quality**: Are the right behaviors tested? '
+    'Meaningful assertions? Untested failure modes? Edge cases? '
+    'Do tests test what they claim?\n\n'
+    '2. **Code reuse and duplication**: Is there code duplication? '
+    'Missed existing utilities? Unnecessary new abstractions? Over-engineering?\n\n'
+    '3. **Architecture and design coherence**: Consistent with system design? '
+    'Good naming? Correct module boundaries? SOLID principles? Pattern consistency?\n\n'
+    '4. **Performance and efficiency**: Algorithmic complexity? N+1 queries? '
+    'Unnecessary allocations? Hot path considerations? Resource cleanup?\n\n'
+    '5. **Robustness and error handling**: Error handling at boundaries? '
+    'Failure modes? Race conditions? Resource leaks? Graceful degradation?\n\n'
+    'You are responsible for ALL five areas above. Produce findings under each.\n\n'
+    '**Scope adjustment for shell test scaffolding:** For bash test files '
+    '(tests/infra/*.sh, scripts/test_*.sh, *_test.sh, test_helpers.sh, e2e/*.sh) '
+    'only flag correctness bugs — e.g. broken assertions, wrong exit codes, tests '
+    'that silently pass on failure. Skip style, architecture, robustness, and '
+    'performance analysis on these files; the ROI is too low.',
 )
 
-REVIEWER_REUSE_AUDITOR = _reviewer_role(
-    'reuse_auditor',
-    'Code reuse and duplication. Is there code duplication? Missed existing utilities? '
-    'Unnecessary new abstractions? Over-engineering?',
-)
 
-REVIEWER_ARCHITECT = _reviewer_role(
-    'architect_reviewer',
-    'Architecture and design coherence. Consistent with system design? Good naming? '
-    'Correct module boundaries? SOLID principles? Pattern consistency?',
-)
+JUDGE = AgentRole(
+    name='judge',
+    system_prompt="""\
+You are a completion judge. You decide whether an implementer agent has
+*substantively* completed a task's work, regardless of whether the plan.json
+bookkeeping reflects that.
 
-REVIEWER_PERFORMANCE = _reviewer_role(
-    'performance',
-    'Performance and efficiency. Algorithmic complexity? N+1 queries? Unnecessary allocations? '
-    'Hot path considerations? Resource cleanup?',
-)
+## Context
 
-REVIEWER_ROBUSTNESS = _reviewer_role(
-    'robustness',
-    'Robustness and error handling. Error handling at boundaries? Failure modes? '
-    'Race conditions? Resource leaks? Graceful degradation?',
+You run AFTER each implementer iteration inside the orchestrator's execute
+loop. You are read-only — you cannot edit code. Your job is to compare the
+plan's intended behavior against the code that currently exists in the
+worktree, and return a structured JSON verdict.
+
+## Inputs you receive
+
+1. The original plan (plan.json contents)
+2. The iteration log so far (recent implementer activity)
+3. The full diff of the worktree against the task's pre-task base commit
+
+## What you must decide
+
+- **complete**: Has the substantive work described by the plan's steps
+  actually been implemented in the code diff? Ignore plan.json step
+  statuses — they may be stale because some implementers don't update them.
+  Judge by the code.
+- **substantive_work**: Is the diff non-trivial and actually implements
+  the plan? Return `false` if the diff is empty, only touches .task/,
+  only contains whitespace/comment edits, deletes tests that were
+  previously failing, or consists of trivially-passing tests with no
+  corresponding production code.
+- **uncovered_plan_steps**: Which plan step IDs appear unimplemented in
+  the diff? Empty list means all steps are covered. This is advisory;
+  your overall `complete` verdict is authoritative.
+- **reasoning**: 2-5 sentences. Cite specific files and behaviors you
+  checked to reach the verdict. Be concrete.
+
+## Safety rules
+
+- If `substantive_work` is `false`, you MUST return `complete=false`.
+  An empty or trivial diff cannot be a completed task.
+- When uncertain, prefer `complete=false`. The cost of a false negative
+  is one extra implementer iteration; the cost of a false positive is a
+  shipped incomplete task.
+- Do not be swayed by plan.json status fields. The whole reason you exist
+  is that those fields can be wrong.
+- Do not run tests or modify anything. Use Read/Glob/Grep only.
+
+## Output
+
+You MUST output ONLY valid JSON matching the schema provided by the
+--json-schema flag. No markdown fences, no prose outside the JSON.
+""",
+    allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS],
+    disallowed_tools=['Edit', 'Write'],
+    default_model='sonnet',
+    default_budget=0.50,
+    default_max_turns=15,
 )
 
 
@@ -439,6 +492,11 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
   with category `preferences_and_norms`.
 - **dismiss** — Not actionable, already covered, or noise.
 
+**Deduplication:** Before creating any task, call `get_tasks` to check for existing
+pending or in-progress tasks with the same intent.  If a match exists, skip creation
+and cite the existing task ID.  Same module + same fix intent = duplicate even if
+wording differs.
+
 ## Rules
 
 1. **Stay in scope.** Only fix what the escalation describes. Do not refactor surrounding
@@ -449,6 +507,12 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
 4. **Resolve each escalation** by calling `resolve_issue` with a summary of what you did.
 5. **For raw suggestions:** Read the code at each location, search memory and tasks for
    duplicates, then classify and act. Maximum 50 tasks per triage batch.
+6. **Working-tree conflict escalations (`wip_conflict` category).** NEVER attempt to
+   auto-resolve these. They indicate the orchestrator's merge queue corrupted the user's
+   uncommitted work in project_root. Do NOT run destructive git commands (`git reset`,
+   `git checkout -- .`, `git stash drop/clear`, `git restore`, `git clean`) against the
+   main project root. Instead, immediately re-escalate to level-1 via `escalate_blocker`
+   with `category='wip_conflict'` and `suggested_action='manual_intervention'`.
 
 ## CRITICAL: Git Staging Rules
 
@@ -585,13 +649,7 @@ Use the `escalate_info` MCP tool for findings that need human judgment:
 )
 
 
-ALL_REVIEWERS = [
-    REVIEWER_TEST_ANALYST,
-    REVIEWER_REUSE_AUDITOR,
-    REVIEWER_ARCHITECT,
-    REVIEWER_PERFORMANCE,
-    REVIEWER_ROBUSTNESS,
-]
+ALL_REVIEWERS = [REVIEWER_COMPREHENSIVE]
 
 ROLES = {
     'architect': ARCHITECT,
@@ -600,9 +658,6 @@ ROLES = {
     'merger': MERGER,
     'steward': STEWARD,
     'deep_reviewer': DEEP_REVIEWER,
-    'reviewer_test_analyst': REVIEWER_TEST_ANALYST,
-    'reviewer_reuse_auditor': REVIEWER_REUSE_AUDITOR,
-    'reviewer_architect_reviewer': REVIEWER_ARCHITECT,
-    'reviewer_performance': REVIEWER_PERFORMANCE,
-    'reviewer_robustness': REVIEWER_ROBUSTNESS,
+    'reviewer_comprehensive': REVIEWER_COMPREHENSIVE,
+    'judge': JUDGE,
 }

@@ -1,0 +1,98 @@
+{
+  "variant_name": "baseline",
+  "diff_id": "ts_real_01",
+  "reviews": {
+    "test_analyst": {
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "gui/src/__tests__/gotoDefinition.test.ts",
+          "category": "missing_negative_path_test",
+          "description": "The entire new feature in this diff is the `view.dom.isConnected` guard in gotoDefinition.ts. All three test cases set `dom: { isConnected: true }`, so only the pass-through path is exercised. The guard's short-circuit path (`isConnected === false` \u2192 early return, no dispatch, no onNavigate) is completely untested. If the guard were accidentally removed or its condition inverted, every existing test would still pass.",
+          "suggested_fix": "Add a test case (for both same-file and cross-file branches) where `mockView.dom.isConnected = false`, then verify that `mockView.dispatch` is NOT called and `onNavigate` is NOT called after `flushMacrotasks()`. For example:\n\n```ts\nit('does nothing when view is detached (isConnected: false)', async () => {\n  mockInvoke.mockResolvedValue(JSON.stringify(sameFileLocation));\n  const onNavigate = vi.fn();\n  const ext = reifyGotoDefinition(currentUri, onNavigate) as any;\n  const mockView = {\n    posAtCoords: () => 5,\n    state: { doc: { lineAt: () => ({ number: 1, from: 0, to: 10 }), line: () => ({ from: 0 }) } },\n    dispatch: vi.fn(),\n    dom: { isConnected: false },\n  };\n  ext.handlers.mousedown({ ctrlKey: true, metaKey: false, clientX: 100, clientY: 50 } as MouseEvent, mockView);\n  await flushMacrotasks();\n  expect(mockView.dispatch).not.toHaveBeenCalled();\n  expect(onNavigate).not.toHaveBeenCalled();\n});\n```"
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/gotoDefinition.test.ts",
+          "category": "untested_null_result_path",
+          "description": "The `requestDefinition` callback has an early `if (!location) return;` branch (before the `isConnected` guard). There is no test that mocks `invoke` returning `null` or an invalid response and confirms neither `dispatch` nor `onNavigate` is triggered. While pre-existing, the new guard sits immediately after this branch and a null-result test would also incidentally confirm the guard ordering is correct.",
+          "suggested_fix": "Add a test where `mockInvoke.mockResolvedValue(null)` (or `mockResolvedValue('null')`) and assert that `dispatch` and `onNavigate` are not called after `flushMacrotasks()`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/gotoDefinition.test.ts",
+          "category": "missing_assertion_on_consumed_event",
+          "description": "The mousedown handler returns `true` to consume the event on Ctrl+Click, but no test asserts the return value. If the handler accidentally returned `false` or `undefined`, CodeMirror would not suppress default browser behavior (text selection on Ctrl+Click), which is a visible regression with no test guard.",
+          "suggested_fix": "Capture and assert the return value of `mousedownHandler(mockEvent, mockView)` is `true` in at least one test that passes `ctrlKey: true`."
+        }
+      ],
+      "reviewer": "test_analyst",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The diff adds a `view.dom.isConnected` guard to prevent dispatching on a detached editor view, and correctly threads `dom: { isConnected: true }` into all three existing mock views. However, the core behavioral change \u2014 the guard itself \u2014 has zero test coverage: no test exercises the `isConnected: false` path to confirm that `dispatch` and `onNavigate` are suppressed when the view is detached. Because that guard is the entire new logic introduced in this PR, the omission is blocking; all existing tests would pass even if the guard were deleted. Two lower-priority gaps also exist: the null/invalid-location return path and the event-consumption return value are not asserted anywhere."
+    },
+    "reuse_auditor": {
+      "reviewer": "reuse_auditor",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/gotoDefinition.test.ts:50-55, 107-112, 148-153, 191-196, 229-234",
+          "category": "duplication",
+          "description": "The identical `mockEvent` object literal (`{ ctrlKey: true, metaKey: false, clientX: 100, clientY: 50 }`) is copy-pasted verbatim across all 5 tests in the file. It is never varied.",
+          "suggested_fix": "Extract to a module-level constant before the first `describe` block: `const CTRL_CLICK_EVENT = { ctrlKey: true, metaKey: false, clientX: 100, clientY: 50 } as MouseEvent;` and reference it in every test."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/gotoDefinition.test.ts:57-67, 114-124, 154-164, 198-208, 236-246",
+          "category": "duplication",
+          "description": "The `mockView` object is duplicated across all 5 tests with only two structural variants (differing in the `line` implementation and `dom.isConnected` value). Because this structure is not factored into a helper, the `dom: { isConnected: true }` property had to be added to 3 separate locations in this diff instead of one. If the guard were extended or renamed, all 5 copies would need updating.",
+          "suggested_fix": "Extract a factory function, e.g. `function createMockView(isConnected = true, lineImpl = (n: number) => ({ from: (n - 1) * 20 })) { return { posAtCoords: () => 5, state: { doc: { lineAt: () => ({ number: 1, from: 0, to: 10 }), line: lineImpl } }, dispatch: vi.fn(), dom: { isConnected } }; }`. Tests that need a fixed `dispatch` spy can capture the return value. This reduces future guard changes to a single edit point."
+        }
+      ],
+      "summary": "The production change in gotoDefinition.ts is a clean, minimal single-line guard (`if (!view.dom.isConnected) return;`) with no duplication concerns. The test file, however, has two pre-existing but now-more-visible duplication problems that this diff surfaces: (1) an identical `mockEvent` literal is repeated 5 times and should be a module-level constant, and (2) the `mockView` structure is repeated 5 times with only minor variations, which is why `dom: { isConnected: true }` had to be added to 3 separate mock objects in this diff rather than a single definition. Both are suggestions; neither causes a runtime error."
+    },
+    "architect_reviewer": {
+      "reviewer": "architect_reviewer",
+      "verdict": "ERROR",
+      "issues": [],
+      "summary": "Unparseable output: You've hit your limit \u00b7 resets 8pm (Europe/London)"
+    },
+    "performance": {
+      "reviewer": "performance",
+      "verdict": "PASS",
+      "issues": [],
+      "summary": "The diff adds a single `view.dom.isConnected` guard inside an async `.then()` callback, which is a correct and cheap resource-cleanup check that prevents dispatching to a detached editor view. `resolveUri(uri)` is called twice per click, but both calls are O(1) (string return or getter invocation) and the second call is semantically necessary to detect URI drift between click-time and response-time for the getter overload. No N+1 queries, no hot-path regressions, no unnecessary allocations. Test mock changes are minimal and appropriate."
+    },
+    "robustness": {
+      "reviewer": "robustness",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "gui/src/editor/gotoDefinition.ts:104",
+          "category": "unhandled_rejection",
+          "description": "The detached promise `requestDefinition(...).then(...)` has no `.catch()` handler. Although `requestDefinition` itself swallows all `invoke` and `JSON.parse` errors, the `.then()` callback can still throw: `view.state.doc.line(location.range.start.line + 1)` raises a CodeMirror `RangeError` if the LSP-returned line number exceeds the current document's line count (a real scenario when the document is edited between the Ctrl+Click and the async response). `onNavigate(...)` can also throw if the caller's callback is buggy. Any such throw becomes an unhandled promise rejection \u2014 silent in most browsers today but a hard crash in Node-based test runners with `--exit-on-unhandled-rejection` and a potential abort in future browser standards.",
+          "suggested_fix": "Add a `.catch()` at the end of the chain: `requestDefinition(...).then(...).catch((err) => { console.error('[gotoDefinition] unexpected error:', err); });`. Alternatively wrap the entire `.then()` body in a try/catch and return early on error."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/editor/gotoDefinition.ts:106-118",
+          "category": "stale_document_state",
+          "description": "`view.dom.isConnected` confirms the editor DOM node is still attached, but does not guard against a stale document state. If the user edits the document between the Ctrl+Click and the LSP response, `view.state.doc.line(location.range.start.line + 1)` may silently navigate to the wrong position, or throw (and become an unhandled rejection per the issue above) if lines were deleted. The `isConnected` check prevents dispatch to a destroyed view but does not prevent semantically-wrong navigation inside a live, mutated view.",
+          "suggested_fix": "Document this known limitation with a comment near the `isConnected` check. If stricter guarantees are needed, record `view.state.doc.length` at click-time and compare it at response-time before dispatching, bailing out if the document has changed significantly."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/editor/gotoDefinition.ts:106",
+          "category": "overly_broad_guard",
+          "description": "The `isConnected` guard gates both same-file `view.dispatch` (where the guard is clearly necessary) and cross-file `onNavigate` (where it may be overly conservative). `onNavigate` is a callback owned by the parent component, which may still be alive and willing to perform the navigation even after the source editor instance is destroyed (e.g. the editor was replaced but the outer panel component is still mounted). Silently discarding the cross-file navigation response in that scenario may surprise callers; there is currently no warning or observable signal that the response was dropped.",
+          "suggested_fix": "Either document the current behavior with an explicit comment explaining why cross-file navigation is also suppressed, or split the guard: keep `if (!view.dom.isConnected) return;` only around `view.dispatch`, and always call `onNavigate` when the response is a cross-file location."
+        }
+      ],
+      "summary": "The diff introduces a correct `view.dom.isConnected` guard to prevent dispatching to a destroyed CodeMirror view after an async LSP round-trip, and the tests are updated appropriately. One blocking robustness gap remains: the detached promise has no `.catch()` handler, so any exception thrown inside the `.then()` callback \u2014 most likely a `RangeError` from `view.state.doc.line()` when the LSP returns a line number that exceeds the (now-modified) document \u2014 becomes an unhandled promise rejection, which is a hard crash in strict test/Node environments. Two additional suggestions cover the stale-document-state window that `isConnected` alone cannot close, and the potentially surprising suppression of the cross-file `onNavigate` callback when the editor is disconnected."
+    }
+  },
+  "total_cost_usd": 0.61206645,
+  "wall_clock_ms": 114321,
+  "errors": []
+}

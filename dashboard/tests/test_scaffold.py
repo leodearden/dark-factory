@@ -1,5 +1,6 @@
 """Tests for dashboard scaffold: config, app, and fixtures."""
 
+import dataclasses
 import re
 from pathlib import Path
 
@@ -110,6 +111,17 @@ class TestConfigEnvOverrides:
         cfg = DashboardConfig.from_env()
         # known_project_roots must contain the resolved real path, not the symlink
         assert cfg.known_project_roots == [real_dir.resolve()]
+
+    def test_from_env_resolves_project_root_symlink(self, monkeypatch, tmp_path):
+        """from_env() must resolve a symlinked path in DASHBOARD_PROJECT_ROOT."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', str(link))
+        cfg = DashboardConfig.from_env()
+        assert cfg.project_root == real_dir.resolve()
 
     def test_known_project_roots_unset_preserves_default(self, monkeypatch):
         monkeypatch.setenv('DASHBOARD_HOST', '0.0.0.0')
@@ -258,3 +270,81 @@ class TestStaticFiles:
         resp = client.get('/static/tailwind.css')
         assert resp.status_code == 200
         assert 'text/css' in resp.headers['content-type']
+
+
+class TestPostInit:
+    """Unit tests for DashboardConfig.__post_init__ path normalization invariant.
+
+    These tests exercise the invariant directly on DashboardConfig construction
+    (not through burndown consumer logic), so they remain valid even if consumer
+    code is later refactored.
+    """
+
+    def test_resolves_project_root_symlink(self, tmp_path):
+        """DashboardConfig must resolve a symlinked project_root in __post_init__."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        cfg = DashboardConfig(project_root=link)
+        assert cfg.project_root == real_dir.resolve()
+
+    def test_resolves_known_project_roots_symlinks(self, tmp_path):
+        """DashboardConfig must resolve symlinks in known_project_roots in __post_init__."""
+        real1 = tmp_path / 'real1'
+        real1.mkdir()
+        link1 = tmp_path / 'link1'
+        link1.symlink_to(real1)
+
+        real2 = tmp_path / 'real2'
+        real2.mkdir()
+        link2 = tmp_path / 'link2'
+        link2.symlink_to(real2)
+
+        cfg = DashboardConfig(project_root=tmp_path, known_project_roots=[link1, link2])
+        assert cfg.known_project_roots == [real1.resolve(), real2.resolve()]
+
+    def test_tasks_json_derived_from_resolved_root(self, tmp_path):
+        """tasks_json must be derived from the resolved project_root, not the symlink path."""
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        cfg = DashboardConfig(project_root=link)
+        assert cfg.tasks_json == real_dir.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+
+    def test_replace_resolves_known_project_roots_symlinks(self, tmp_path):
+        """dataclasses.replace() must resolve symlinks in known_project_roots via __post_init__.
+
+        Validates the __post_init__ docstring contract that dataclasses.replace() is a
+        covered construction path: 'every construction path — direct kwargs, from_env(),
+        dataclass.replace(), test fixtures'.  dataclasses.replace() internally calls
+        __init__ which triggers __post_init__, so the invariant must hold.
+        """
+        base_cfg = DashboardConfig(project_root=tmp_path)
+
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        new_cfg = dataclasses.replace(base_cfg, known_project_roots=[link])
+        assert new_cfg.known_project_roots == [real_dir.resolve()]
+
+    def test_post_init_docstring_documents_nonexistent_path_limitation(self):
+        """__post_init__ docstring must document the non-existent path caveat."""
+        doc = DashboardConfig.__post_init__.__doc__ or ''
+        assert 'canonical (symlink-resolved) forms' in doc, (
+            f"Expected original invariant language 'canonical (symlink-resolved) forms' "
+            f"in docstring, got: {doc!r}"
+        )
+        assert 'Note: resolution is canonical only for paths that exist at construction time' in doc, (
+            f"Expected caveat 'Note: resolution is canonical only for paths that exist at "
+            f"construction time' in docstring, got: {doc!r}"
+        )
+        assert 'cannot follow symlink segments that do not yet exist on disk' in doc, (
+            f"Expected warning 'cannot follow symlink segments that do not yet exist on disk' "
+            f"in docstring, got: {doc!r}"
+        )

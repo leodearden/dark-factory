@@ -136,14 +136,25 @@ class AgentStub:
     Tracks which roles have been invoked and their order.
     """
 
-    def __init__(self, verify_results: list[VerifyResult] | None = None):
+    def __init__(
+        self,
+        verify_results: list[VerifyResult] | None = None,
+        judge_verdicts: list | None = None,
+    ):
         self.calls: list[str] = []
+        # Last env_overrides seen per role — set by invoke_agent before dispatch.
+        self.env_overrides_by_role: dict[str, dict[str, str] | None] = {}
         self._impl_iteration = 0
         # Sequence of verify results to return (pops from front)
         self._verify_results = list(verify_results or [VerifyResult(
             passed=True, test_output='', lint_output='', type_output='',
             summary='All checks passed',
         )])
+        # Sequence of judge verdicts to return (pops from front; last persists).
+        # Each entry may be a dict (structured verdict), an Exception to raise,
+        # None (to simulate structured_output=None), or the string 'SUCCESS_FALSE'
+        # to simulate result.success=False.
+        self._judge_verdicts = list(judge_verdicts or [])
 
     async def invoke_agent(
         self,
@@ -165,10 +176,12 @@ class AgentStub:
         resume_session_id: str | None = None,
         timeout_seconds: float | None = None,
         config_dir: Path | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> AgentResult:
         """Determine role from system_prompt content, perform side effects."""
         role = self._detect_role(system_prompt)
         self.calls.append(role)
+        self.env_overrides_by_role[role] = env_overrides
 
         if role == 'architect':
             return await self._architect(cwd)
@@ -180,10 +193,16 @@ class AgentStub:
             return self._reviewer(role, output_schema)
         elif role == 'merger':
             return self._merger()
+        elif role == 'judge':
+            return self._judge()
         else:
             return AgentResult(success=True, output='OK')
 
     def _detect_role(self, system_prompt: str) -> str:
+        # Judge check goes first — its system prompt does not contain
+        # architect/implementer/reviewer substrings so ordering is safe.
+        if 'completion judge' in system_prompt.lower():
+            return 'judge'
         if 'TDD architect' in system_prompt:
             return 'architect'
         if 'TDD implementer' in system_prompt:
@@ -191,18 +210,7 @@ class AgentStub:
         if 'debugger' in system_prompt.lower() and 'You are a debugger' in system_prompt:
             return 'debugger'
         if 'code reviewer' in system_prompt.lower():
-            # Extract reviewer name from prompt
-            if 'test_analyst' in system_prompt:
-                return 'reviewer_test_analyst'
-            if 'reuse_auditor' in system_prompt:
-                return 'reviewer_reuse_auditor'
-            if 'architect_reviewer' in system_prompt:
-                return 'reviewer_architect_reviewer'
-            if 'performance' in system_prompt:
-                return 'reviewer_performance'
-            if 'robustness' in system_prompt:
-                return 'reviewer_robustness'
-            return 'reviewer_unknown'
+            return 'reviewer_comprehensive'
         if 'merge conflict resolver' in system_prompt.lower():
             return 'merger'
         # If re-planning (architect called with review feedback)
@@ -286,6 +294,40 @@ class AgentStub:
     def _merger(self) -> AgentResult:
         return AgentResult(success=True, output='Merged', cost_usd=0.20)
 
+    def _judge(self) -> AgentResult:
+        """Return the next queued judge verdict.
+
+        If the entry is an Exception, raise it (simulates invoke failure).
+        If the entry is 'SUCCESS_FALSE', return success=False.
+        If the entry is None, return success=True with structured_output=None.
+        Otherwise treat the entry as a verdict dict.
+        """
+        if not self._judge_verdicts:
+            # No verdicts queued — default: incomplete
+            verdict = {
+                'complete': False,
+                'reasoning': 'default stub verdict',
+                'uncovered_plan_steps': [],
+                'substantive_work': False,
+            }
+        elif len(self._judge_verdicts) > 1:
+            verdict = self._judge_verdicts.pop(0)
+        else:
+            verdict = self._judge_verdicts[0]
+
+        if isinstance(verdict, Exception):
+            raise verdict
+        if verdict == 'SUCCESS_FALSE':
+            return AgentResult(success=False, output='', cost_usd=0.05)
+        if verdict is None:
+            return AgentResult(success=True, output='', structured_output=None, cost_usd=0.05)
+        return AgentResult(
+            success=True,
+            output=json.dumps(verdict),
+            structured_output=verdict,
+            cost_usd=0.05,
+        )
+
     def next_verify_result(self) -> VerifyResult:
         """Pop the next verify result, or return the last one forever."""
         if len(self._verify_results) > 1:
@@ -309,6 +351,7 @@ class FakeScheduler:
 
     def __init__(self):
         self.statuses: dict[str, list[str]] = {}
+        self._status_cache: dict[str, str] = {}
 
     async def set_task_status(self, task_id: str, status: str) -> None:
         self.statuses.setdefault(task_id, []).append(status)
@@ -344,6 +387,16 @@ class FakeBriefing:
         self, reviewer_type: str, diff: str, context: str | None = None
     ) -> str:
         return f'Review ({reviewer_type}): {diff[:100]}'
+
+    async def build_completion_judge_prompt(
+        self,
+        plan: dict,
+        iteration_log: list,
+        diff: str,
+        task_id: str | None = None,
+        context: str | None = None,
+    ) -> str:
+        return f'Judge task {task_id}: plan has {len(plan.get("steps", []))} steps'
 
     async def build_merger_prompt(
         self, conflicts: str, task_intent: str, context: str | None = None
@@ -456,17 +509,10 @@ class TestHappyPath:
 
         await workflow.run()
 
-        # Expected: architect, implementer, 5 reviewers (parallel, order varies)
+        # Expected: architect, implementer, 1 comprehensive reviewer
         assert stub.calls[0] == 'architect'
         assert stub.calls[1] == 'implementer'
-        reviewer_calls = sorted(stub.calls[2:7])
-        assert reviewer_calls == sorted([
-            'reviewer_architect_reviewer',
-            'reviewer_performance',
-            'reviewer_reuse_auditor',
-            'reviewer_robustness',
-            'reviewer_test_analyst',
-        ])
+        assert stub.calls[2] == 'reviewer_comprehensive'
 
     async def test_code_appears_on_main_after_merge(
         self, config, git_ops, task_assignment, monkeypatch
@@ -532,10 +578,214 @@ class TestHappyPath:
 
         await workflow.run()
 
-        # 1 architect + 1 implementer + 5 reviewers = 7
-        assert workflow.metrics.agent_invocations == 7
+        # 1 architect + 1 implementer + 1 reviewer = 3
+        assert workflow.metrics.agent_invocations == 3
         assert workflow.metrics.total_cost_usd > 0
         assert workflow.metrics.execute_iterations == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: Completion Judge (ζ)
+# ---------------------------------------------------------------------------
+
+
+def _config_with_judge(config: OrchestratorConfig, enabled: bool) -> OrchestratorConfig:
+    """Return a new config identical to *config* with judge_after_each_iteration toggled."""
+    return OrchestratorConfig(
+        project_root=config.project_root,
+        max_concurrent_tasks=config.max_concurrent_tasks,
+        max_execute_iterations=config.max_execute_iterations,
+        max_verify_attempts=config.max_verify_attempts,
+        max_review_cycles=config.max_review_cycles,
+        judge_after_each_iteration=enabled,
+        git=config.git,
+    )
+
+
+@pytest.mark.asyncio
+class TestCompletionJudge:
+    """Judge-LLM early-exit hook (ζ). Exercises _execute_iterations + _run_completion_judge."""
+
+    async def test_execute_iterations_exits_early_when_judge_says_complete(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        judge_cfg = _config_with_judge(config, enabled=True)
+        stub = AgentStub(judge_verdicts=[{
+            'complete': True,
+            'reasoning': 'diff implements both plan steps end-to-end.',
+            'uncovered_plan_steps': [],
+            'substantive_work': True,
+        }])
+        workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert workflow.metrics.execute_iterations == 1
+        assert workflow.metrics.judge_invocations == 1
+        assert workflow.metrics.judge_early_exits == 1
+        assert 'judge' in stub.calls
+
+    async def test_execute_iterations_rejects_judge_complete_when_substantive_work_false(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """complete=True + substantive_work=False must NOT trigger an early exit."""
+        judge_cfg = _config_with_judge(config, enabled=True)
+        # Queue: first verdict is the dangerous one; fallback to incomplete so loop continues.
+        stub = AgentStub(judge_verdicts=[
+            {
+                'complete': True,
+                'reasoning': 'bogus — diff is empty',
+                'uncovered_plan_steps': ['step-1', 'step-2'],
+                'substantive_work': False,
+            },
+            {
+                'complete': False,
+                'reasoning': 'still nothing',
+                'uncovered_plan_steps': ['step-1', 'step-2'],
+                'substantive_work': False,
+            },
+        ])
+        workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        # The implementer still completes all plan steps in iteration 1, so the
+        # loop exits via the normal `while pending_steps` gate — NOT via judge
+        # early-exit. judge_early_exits must remain 0.
+        assert outcome == WorkflowOutcome.DONE
+        assert workflow.metrics.judge_early_exits == 0
+        assert workflow.metrics.judge_invocations >= 1
+
+    async def test_execute_iterations_continues_on_judge_exception(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """A judge invocation exception must not blow up the workflow."""
+        judge_cfg = _config_with_judge(config, enabled=True)
+        stub = AgentStub(judge_verdicts=[ConnectionError('judge backend down')])
+        workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        # Workflow still completes via normal plan-step completion path
+        assert outcome == WorkflowOutcome.DONE
+        assert workflow.metrics.judge_early_exits == 0
+
+    async def test_execute_iterations_continues_on_judge_malformed_output(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Malformed judge output (missing required keys) must fall through."""
+        judge_cfg = _config_with_judge(config, enabled=True)
+        stub = AgentStub(judge_verdicts=[
+            # Missing 'substantive_work' and 'uncovered_plan_steps'
+            {'complete': True, 'reasoning': 'incomplete verdict'},
+        ])
+        workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert workflow.metrics.judge_early_exits == 0
+        assert workflow.metrics.judge_invocations >= 1
+
+    async def test_execute_iterations_disabled_by_default(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """With judge_after_each_iteration=False (the default), judge is never called."""
+        judge_cfg = _config_with_judge(config, enabled=False)
+        stub = AgentStub()  # No verdicts queued; judge should never run
+        workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert workflow.metrics.judge_invocations == 0
+        assert workflow.metrics.judge_early_exits == 0
+        assert 'judge' not in stub.calls
+
+    async def test_judge_does_not_inherit_env_overrides(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Judge must NOT receive env_overrides (always hits Claude API).
+
+        Propagating ANTHROPIC_BASE_URL routes the judge through the vLLM
+        bridge where max_model_len causes ServerDisconnectedError after
+        2 tool-use rounds (~48 KB each exceed 80k context).  See 3cd380a079.
+        """
+        judge_cfg = _config_with_judge(config, enabled=True)
+        judge_cfg.env_overrides = {'ANTHROPIC_BASE_URL': 'http://127.0.0.1:9999'}
+
+        stub = AgentStub(judge_verdicts=[{
+            'complete': True,
+            'reasoning': 'diff implements plan.',
+            'uncovered_plan_steps': [],
+            'substantive_work': True,
+        }])
+        workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        # Implementer and debugger receive env_overrides.
+        assert stub.env_overrides_by_role.get('implementer') == {
+            'ANTHROPIC_BASE_URL': 'http://127.0.0.1:9999',
+        }
+        # Judge must NOT receive env_overrides — it always uses Claude API.
+        assert stub.env_overrides_by_role.get('judge') is None
 
 
 # ---------------------------------------------------------------------------
@@ -629,8 +879,8 @@ class TestReviewLoop:
         class ReviewAgentStub(AgentStub):
             def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
                 nonlocal review_round
-                # First round: one reviewer finds blocking issue
-                if review_round == 0 and role == 'reviewer_test_analyst':
+                # First round: reviewer finds blocking issue
+                if review_round == 0 and role == 'reviewer_comprehensive':
                     review = _make_review(role, 'ISSUES_FOUND', [{
                         'severity': 'blocking',
                         'location': 'lib.py:5',
@@ -756,6 +1006,7 @@ class TestPostMergeFailure:
             )
 
         monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify_fn)
+        monkeypatch.setattr('orchestrator.merge_queue.run_scoped_verification', verify_fn)
 
         # Capture pre-merge main ref
         _, pre_merge_sha, _ = await _run(
@@ -765,7 +1016,9 @@ class TestPostMergeFailure:
         outcome = await workflow.run()
 
         assert outcome == WorkflowOutcome.BLOCKED
-        assert scheduler.statuses['42'][-1] == 'blocked'
+        # merge_phase=True suppresses scheduler status transition —
+        # the orchestrator's outer loop handles the final status update.
+        assert scheduler.statuses['42'][-1] == 'in-progress'
 
         # Main should NOT have advanced — update-ref was never called
         _, post_sha, _ = await _run(
@@ -1062,13 +1315,13 @@ class TestPlanLockAndProvenance:
         )
 
         # Pre-create the worktree, plan.json, and plan.lock
-        worktree, base_commit = await git_ops.create_worktree(task_assignment.task_id)
-        workflow.worktree = worktree
+        worktree_info = await git_ops.create_worktree(task_assignment.task_id)
+        workflow.worktree = worktree_info.path
 
         # Write .task/ artifacts directly
         from orchestrator.artifacts import TaskArtifacts
-        arts = TaskArtifacts(worktree)
-        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=base_commit)
+        arts = TaskArtifacts(worktree_info.path)
+        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=worktree_info.base_commit)
         arts.write_plan(PLAN)
         arts.stamp_plan_provenance('pre-existing-session')
         arts.lock_plan('pre-existing-session')
@@ -1101,12 +1354,12 @@ class TestPlanLockAndProvenance:
         )
 
         # Pre-create the worktree with plan.json (valid steps) stamped with a DIFFERENT session
-        worktree, base_commit = await git_ops.create_worktree(task_assignment.task_id)
-        workflow.worktree = worktree
+        worktree_info = await git_ops.create_worktree(task_assignment.task_id)
+        workflow.worktree = worktree_info.path
 
         from orchestrator.artifacts import TaskArtifacts
-        arts = TaskArtifacts(worktree)
-        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=base_commit)
+        arts = TaskArtifacts(worktree_info.path)
+        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=worktree_info.base_commit)
         arts.write_plan(PLAN)
         original_session = 'original-owner-session'
         arts.stamp_plan_provenance(original_session)
@@ -1144,12 +1397,12 @@ class TestPlanLockAndProvenance:
         )
 
         # Pre-create the worktree with plan.json owned by a different session
-        worktree, base_commit = await git_ops.create_worktree(task_assignment.task_id)
-        workflow.worktree = worktree
+        worktree_info = await git_ops.create_worktree(task_assignment.task_id)
+        workflow.worktree = worktree_info.path
 
         from orchestrator.artifacts import TaskArtifacts
-        arts = TaskArtifacts(worktree)
-        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=base_commit)
+        arts = TaskArtifacts(worktree_info.path)
+        arts.init(task_assignment.task_id, 'Add farewell function', 'desc', base_commit=worktree_info.base_commit)
         arts.write_plan(PLAN)
         original_session = 'original-owner-session'
         arts.stamp_plan_provenance(original_session)
@@ -1480,7 +1733,7 @@ class TestReviewerErrors:
 
         class ErrorReviewerStub(AgentStub):
             def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
-                if role == 'reviewer_test_analyst':
+                if role == 'reviewer_comprehensive':
                     # Simulate 401 — unparseable output, no structured_output
                     return AgentResult(
                         success=False,
@@ -1564,7 +1817,7 @@ class TestReviewerErrors:
         class RetryHealStub(AgentStub):
             def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
                 call_counts[role] = call_counts.get(role, 0) + 1
-                if role == 'reviewer_robustness' and call_counts[role] <= 1:
+                if role == 'reviewer_comprehensive' and call_counts[role] <= 1:
                     # First call fails
                     return AgentResult(
                         success=False,
@@ -1594,8 +1847,8 @@ class TestReviewerErrors:
         outcome = await workflow.run()
 
         assert outcome == WorkflowOutcome.DONE
-        # robustness was called twice (initial fail + retry success)
-        assert call_counts['reviewer_robustness'] == 2
+        # comprehensive reviewer was called twice (initial fail + retry success)
+        assert call_counts['reviewer_comprehensive'] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1612,7 +1865,8 @@ class TestGhostLoopGuard:
     ):
         """Reused worktree with no implementation entries → normal execution."""
         # 1. Pre-create the worktree (simulates a prior run that planned but requeued)
-        wt, _ = await git_ops.create_worktree(task_assignment.task_id)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
         task_dir = wt / '.task'
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
@@ -1646,7 +1900,8 @@ class TestGhostLoopGuard:
     ):
         """Worktree with implementer iteration entry + HEAD on main → skip."""
         # 1. Create worktree and simulate prior implementation
-        wt, _ = await git_ops.create_worktree(task_assignment.task_id)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
         task_dir = wt / '.task'
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
@@ -1685,3 +1940,36 @@ class TestGhostLoopGuard:
         assert outcome == WorkflowOutcome.DONE
         # The implementer must NOT have been called (ghost-loop skipped)
         assert 'implementer' not in stub.calls
+
+
+# ---------------------------------------------------------------------------
+# Tests: Protocol Conformance — _SchedulerLike test doubles
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerProtocolConformance:
+    """Verify that test doubles satisfy the _SchedulerLike Protocol."""
+
+    def test_fake_scheduler_has_status_cache(self):
+        """FakeScheduler must have _status_cache to satisfy _SchedulerLike."""
+        fake = FakeScheduler()
+        assert hasattr(fake, '_status_cache'), (
+            'FakeScheduler is missing _status_cache required by the _SchedulerLike Protocol'
+        )
+        assert isinstance(fake._status_cache, dict), (
+            '_status_cache must be a dict[str, str]'
+        )
+
+    def test_eval_scheduler_has_status_cache(self):
+        """_EvalScheduler must have _status_cache to satisfy _SchedulerLike."""
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.runner import _EvalScheduler
+
+        cfg = OrchestratorConfig()
+        sched = _EvalScheduler(cfg)
+        assert hasattr(sched, '_status_cache'), (
+            '_EvalScheduler is missing _status_cache required by the _SchedulerLike Protocol'
+        )
+        assert isinstance(sched._status_cache, dict), (
+            '_status_cache must be a dict[str, str]'
+        )

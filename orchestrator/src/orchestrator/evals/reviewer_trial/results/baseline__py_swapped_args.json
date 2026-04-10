@@ -1,0 +1,170 @@
+{
+  "variant_name": "baseline",
+  "diff_id": "py_swapped_args",
+  "reviews": {
+    "test_analyst": {
+      "reviewer": "test_analyst",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/git_ops.py (get_changed_files, new implementation)",
+          "category": "behavioral_regression_untested",
+          "description": "The diff silently reverses the argument order passed to `git diff`: the original was `['git', 'diff', '--name-only', from_sha, to_sha]` but the new code is `['git', 'diff', '--name-only', diff_filter, to_sha, from_sha]`. The parameter names in the function signature are still `(from_sha, to_sha)`, but the git invocation now passes them as `to_sha, from_sha`. The only existing caller \u2014 `workflow.py:860` \u2014 calls `get_changed_files(old_base, current_main)`, which now runs `git diff current_main old_base` (reversed). This flips the diff direction: instead of listing files that *changed on main* since the branch point, it lists files that were *reverted* (which for a fast-forward main will mostly be empty or wrong). There are zero tests for `get_changed_files`, so this regression is completely invisible.",
+          "suggested_fix": "Either restore the correct argument order to `['git', 'diff', '--name-only', diff_filter, from_sha, to_sha]`, or \u2014 if the reversal is intentional for rollback use-cases \u2014 rename the parameters to make the direction explicit and add a test that asserts which SHA is treated as the base. Either way, add a test using a real or mocked git repo that verifies `get_changed_files('A', 'B')` returns files modified *going from A to B*, not B to A."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/git_ops.py (get_changed_files, include_deleted branch)",
+          "category": "missing_test_coverage_for_new_branch",
+          "description": "The new `include_deleted` parameter introduces a conditional that selects between `--diff-filter=ACMR` and `--diff-filter=ACMRD`. Neither branch has any test coverage. The test file `orchestrator/tests/test_git_ops.py` has 34 test methods across 5 classes but zero tests for `get_changed_files`. There is no test that: (a) verifies `include_deleted=False` omits the 'D' filter, (b) verifies `include_deleted=True` includes it, or (c) verifies the end-to-end behavior that a deleted file is or is not returned in the list.",
+          "suggested_fix": "Add at least two tests in `test_git_ops.py` for `get_changed_files`: one that mocks `_run` and asserts the command contains `--diff-filter=ACMR` when `include_deleted=False`, and one that asserts `--diff-filter=ACMRD` when `include_deleted=True`. Add a third integration-style test (using the existing repo fixture pattern) that creates, then deletes a file across two commits and verifies it appears only when `include_deleted=True`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py (get_diff_stats, entire method)",
+          "category": "missing_test_coverage_new_method",
+          "description": "`get_diff_stats` is a new method with no tests at all. The parsing logic splits on commas and checks for substring `'insertion'` / `'deletion'` in each token. There are multiple untested paths: (1) normal output with both insertions and deletions, (2) output with only insertions (no deletions line emitted by git), (3) output with only deletions (no insertions line), (4) completely empty output (no changes between the two SHAs), (5) non-zero return code from `_run` (invalid SHAs, detached state, etc.) \u2014 the `rc` is ignored and the method silently returns zeros in all error cases.",
+          "suggested_fix": "Add unit tests parametrized over git --shortstat output variants: normal, insertions-only, deletions-only, empty string. For the error case, either check `rc` and raise or return a sentinel so callers can distinguish 'no changes' from 'git failed'. A test like `assert await git_ops.get_diff_stats('HEAD', 'HEAD') == {'insertions': 0, 'deletions': 0}` would catch the empty-output path and double as a regression guard."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py (get_diff_stats:rc ignored)",
+          "category": "silent_error_masking",
+          "description": "`get_diff_stats` discards the `rc` (return code) from `_run`. If git exits non-zero (e.g., one of the SHAs is invalid, or the repo is in a bad state), the method returns `{'insertions': 0, 'deletions': 0}` with no indication of failure. Every other method in `GitOps` that cares about success checks `rc`. The asymmetry means callers cannot distinguish 'no diff' from 'git error'.",
+          "suggested_fix": "Capture `rc` and either raise an exception or log a warning when `rc != 0` before returning the default zeros, consistent with how other methods in the class handle git failures."
+        }
+      ],
+      "summary": "The diff introduces two changes to `git_ops.py`: a new `include_deleted` parameter on `get_changed_files`, and a new `get_diff_stats` method. There are two blocking test-coverage issues. First and most critically, the refactored `get_changed_files` silently reverses the argument order in the underlying `git diff` invocation (`to_sha, from_sha` instead of `from_sha, to_sha`), which flips the diff direction for the only existing caller in `workflow.py` \u2014 and there are zero tests for this method, so the regression is completely invisible. Second, the new `include_deleted` branch has no test coverage at all. Additionally, `get_diff_stats` (new method) has no tests for any code path, and its return-code-ignoring design silently swallows git errors, making it impossible for callers to distinguish a clean zero-change result from a git failure."
+    },
+    "reuse_auditor": {
+      "reviewer": "reuse_auditor",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/git_ops.py:419",
+          "category": "behavioral_regression",
+          "description": "The SHA argument order is silently reversed in the new code. Original: `['git', 'diff', '--name-only', from_sha, to_sha]`. New: `['git', 'diff', '--name-only', diff_filter, to_sha, from_sha]`. The existing caller in workflow.py (line 860) passes `(old_base, current_main)` expecting to see what changed going forward from old_base to current_main. With the swap it now gets the reverse diff. This will cause the rebase-window conflict detector to read the wrong set of files and silently under-report conflicts.",
+          "suggested_fix": "Restore argument order to `from_sha, to_sha`: `['git', 'diff', '--name-only', diff_filter, from_sha, to_sha]`. If rollback callers genuinely need the reverse direction, add a separate `reversed: bool = False` flag that swaps the order explicitly, or add a dedicated `get_rollback_files()` method so the inversion is named and intentional."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/git_ops.py:418-421",
+          "category": "behavioral_regression",
+          "description": "Adding `--diff-filter=ACMR` as the new default changes behavior for every existing caller. The original had no filter, so it returned all changed paths including deletions. Now the default silently drops deleted files (filter letter D is absent from the default). The workflow.py caller uses this to track files touched on main during a rebase window; missing deleted files means rebase conflicts involving deleted paths go undetected.",
+          "suggested_fix": "Keep `--diff-filter=ACMRD` as the default (i.e., when `include_deleted=False` still include D), or drop the filter entirely for the default path. Only exclude D-type entries when the caller explicitly requests a narrowed set. Alternatively, flip the semantics: default includes deleted files, and `include_deleted` is replaced with `exclude_deleted`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:138-165",
+          "category": "duplication",
+          "description": "`_git_diff_stats()` in metrics.py is a private async function that spawns its own subprocess to run `git diff --stat` and hand-parses the output. Now that `GitOps.get_diff_stats()` exists in git_ops.py, this is duplicate git-stat parsing logic spread across two modules. The metrics function also bypasses the shared `_run()` helper and the `GitOps` class entirely, creating a second code path that can drift.",
+          "suggested_fix": "Refactor `_git_diff_stats()` to accept a `GitOps` instance and delegate: call `self.git_ops.get_diff_stats(base_commit, 'HEAD')` and derive `lines_changed = stats['insertions'] + stats['deletions']`. For `files_changed`, either extend `get_diff_stats` to return it (add `--shortstat` already provides the files count in the same output line) or keep a thin wrapper. This eliminates the subprocess duplication and the separate regex parsing."
+        }
+      ],
+      "summary": "The diff introduces two silent behavioral regressions in `get_changed_files` that will affect the existing workflow.py caller: (1) the SHA arguments are transposed in the git command, reversing the diff direction for all callers, and (2) a new default `--diff-filter=ACMR` silently drops deleted files from the results, where none existed before. Both are blocking because they corrupt the rebase-window conflict detection in `_inter_iteration_rebase()` without any compile-time or test-time signal. Separately, the new `get_diff_stats` method adds git-stat parsing that already exists as `_git_diff_stats()` in `evals/metrics.py`; that private function spawns its own subprocess and does equivalent regex parsing \u2014 it should now delegate to the new GitOps method to avoid ongoing drift."
+    },
+    "architect_reviewer": {
+      "reviewer": "architect_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/git_ops.py (new line ~419, diff_filter default)",
+          "category": "silent_behavioral_regression",
+          "description": "Adding `--diff-filter=ACMR` as the default silently drops deleted files (`D`) and type-changed files (`T`) from results. The original method had no diff-filter, so it returned all changed file statuses. The sole production call site at `workflow.py:860` \u2014 `get_changed_files(old_base, current_main)` \u2014 now silently omits files deleted on main from `changed_files` and the downstream `files_changed_on_main` iteration log. Any agent relying on that list to detect deletions on main will get incomplete data with no error.",
+          "suggested_fix": "Change the default filter to include `D`: `--diff-filter=ACMRD` when `include_deleted` is False should still be `--diff-filter=ACMR`, but the original no-filter behavior should be preserved as the default. Either remove the default filter entirely (restoring original semantics) and only apply a filter when `include_deleted=True`, or explicitly pass `--diff-filter=ACMRD` for both cases. The cleanest fix: only add `--diff-filter` to the argument list when needed, e.g., `cmd = ['git', 'diff', '--name-only']; if not include_deleted: cmd.append('--diff-filter=ACMR'); cmd += [from_sha, to_sha]` \u2014 but see the second issue about arg order."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/git_ops.py (new line ~421, `to_sha, from_sha` ordering)",
+          "category": "api_contract_violation",
+          "description": "The git invocation unconditionally reverses the SHA arguments to `to_sha, from_sha` instead of the documented `from_sha, to_sha`. For `--diff-filter=ACMR` (no `D`), git diff is symmetric so the existing caller is unaffected. However, `--diff-filter=ACMRD` (when `include_deleted=True`) includes `D`, which is direction-sensitive: `git diff to_sha from_sha --diff-filter=D` returns files present in `to_sha` but absent in `from_sha` \u2014 i.e., files *added* going `from_sha\u2192to_sha`, not deleted. This directly inverts the semantics of `include_deleted`, contradicting both the parameter name and the docstring ('useful for rollback validation where we need to know what was removed'). Any caller using `include_deleted=True` to find deleted files will silently receive the wrong set.",
+          "suggested_fix": "Remove the unconditional arg reversal. Keep canonical order `from_sha, to_sha` in the git invocation. If the `D` component is intended to capture files removed in a rollback scenario (present in `to_sha`, absent in `from_sha`), model this explicitly with a dedicated parameter like `rollback_perspective: bool = False` that documents the inversion and applies it only when needed, rather than baking it into all calls."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py:430 (get_diff_stats)",
+          "category": "dead_code",
+          "description": "`get_diff_stats` has no production caller anywhere in the codebase (confirmed by full-repo search; it appears only in the synthetic eval corpus under `.claude/worktrees/reviewer-trial/`). Adding a public async method with no current consumer increases maintenance surface \u2014 future refactors of `_run` or the `GitOps` interface must account for it without any test coverage or usage to validate against.",
+          "suggested_fix": "Defer adding `get_diff_stats` until there is a concrete caller. If it must be added now, add at minimum one unit test and document the intended call site in the docstring or a TODO comment."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py (get_changed_files docstring/signature)",
+          "category": "principle_of_least_surprise",
+          "description": "The internal arg reversal (`to_sha, from_sha` in the git call) is not reflected anywhere in the method's public contract \u2014 neither the parameter names nor the docstring hint at it. Even if this were intentional, a reader of `get_changed_files(from_sha='abc', to_sha='def')` will assume the diff runs `git diff abc def`. Undocumented inversions between the public API and the implementation are a maintenance trap and will cause confusion when the method gains more callers.",
+          "suggested_fix": "If the reversal is intentional, document it clearly in the docstring: 'Note: internally computes `git diff to_sha from_sha` to \u2026'. Better yet, eliminate the inversion so the implementation matches the API contract."
+        }
+      ],
+      "summary": "The diff introduces two blocking defects in `get_changed_files`. First, applying `--diff-filter=ACMR` as a new default silently strips deleted files from results compared to the original no-filter behavior, causing the existing caller in `workflow.py` to produce an incomplete `files_changed_on_main` list whenever a file is deleted on main. Second, the positional SHA arguments are unconditionally reversed (`to_sha, from_sha`) in the git invocation; for the symmetric `ACMR` filter this is harmless, but when `include_deleted=True` adds the direction-sensitive `D` component, the method returns files added in the `from\u2192to` direction rather than deleted \u2014 the opposite of what the parameter name and docstring promise. The new `get_diff_stats` method is clean in isolation but has no production caller (confirmed by full-repo search), making it dead code. The fix is to preserve the original no-filter default for non-deleted mode, correct the SHA order, and add `D` only when `include_deleted=True` with canonical argument ordering."
+    },
+    "performance": {
+      "reviewer": "performance",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/git_ops.py:get_changed_files",
+          "category": "correctness_regression_in_hot_path",
+          "description": "The `from_sha`/`to_sha` argument order to `git diff` was silently reversed: the new call is `['git', 'diff', '--name-only', diff_filter, to_sha, from_sha]` instead of `from_sha, to_sha`. In the reversed direction, files that were **Added** going forward appear as **Deleted** going backward and are excluded by `--diff-filter=ACMR`. The existing hot-path caller in `workflow.py:860` passes `(old_base, current_main)`, meaning newly-added files between the two commits are now silently dropped from the result. This breaks the inter-iteration rebase overlap check, causing the orchestrator to miss conflicts for added files every time a task rebases onto a newer main.",
+          "suggested_fix": "Keep the original argument order: `['git', 'diff', '--name-only', diff_filter, from_sha, to_sha]`. The `include_deleted` feature just needs the filter string changed, not a direction reversal. If the intent was to show 'what would be removed by a rollback', document that explicitly and add a separate helper rather than changing the default direction."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py:get_diff_stats",
+          "category": "redundant_subprocess_call",
+          "description": "`get_diff_stats` spawns a second `git diff` subprocess in addition to `get_changed_files`. Any caller that needs both the file list and the insertion/deletion counts pays two full subprocess round-trips. `git diff --numstat` produces per-file `insertions<TAB>deletions<TAB>filename` lines in one pass, making it possible to derive both the file list and aggregate stats from a single call.",
+          "suggested_fix": "Replace `--shortstat` with `--numstat` in a single combined helper (or add an optional `with_stats: bool` flag to `get_changed_files`). Parse the tab-separated output to build both the file list and the aggregated stats dict, eliminating the second subprocess entirely."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py:get_diff_stats",
+          "category": "unnecessary_allocation",
+          "description": "`part.split()[0]` in the `--shortstat` parser splits the entire token string into a list just to take the first element. For each comma-delimited part this allocates an intermediate list that is immediately discarded.",
+          "suggested_fix": "Use `part.split(None, 1)[0]` (limit split to 1) to avoid building the full list, or use `int(part.strip().partition(' ')[0])` which does a single O(n) scan with no list allocation."
+        }
+      ],
+      "summary": "The diff introduces a silent argument-order reversal in `get_changed_files` \u2014 `to_sha` and `from_sha` are swapped in the `git diff` invocation, so the diff now runs in the opposite direction. The existing caller in `workflow.py` that checks which files changed between `old_base` and `current_main` will now silently exclude all newly-added files (they appear as Deleted in the reversed direction and are filtered by `ACMR`), breaking conflict detection on the inter-iteration rebase hot path. This is blocking. Two lower-priority suggestions: `get_diff_stats` is a redundant second subprocess that could be folded into `get_changed_files` via `--numstat`, and the `--shortstat` parser over-allocates with an unsized `str.split()` call."
+    },
+    "robustness": {
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/git_ops.py:get_changed_files (diff line ~422)",
+          "category": "silent_semantic_regression",
+          "description": "The SHA arguments passed to `git diff` are silently reversed from the original. The original command was `git diff --name-only from_sha to_sha`; the new command is `git diff --name-only diff_filter to_sha from_sha`. The sole call site in `workflow.py:860` passes `(old_base, current_main)`, so the command now runs `git diff current_main old_base`, which shows the *inverse* diff \u2014 files that would change going backwards in history. For the `_inter_iteration_rebase` caller this means `changed_files` will reflect what existed in `old_base` but not in `current_main`, exactly backwards from what is intended. Because `_run` never raises on non-zero exit and silently returns output, the caller receives plausible-looking but wrong data with no indication of the error.",
+          "suggested_fix": "Restore the original argument order: `['git', 'diff', '--name-only', diff_filter, from_sha, to_sha]`. If the intent for rollback callers is to see what files were *removed* going forward (from_sha \u2192 to_sha), keep the forward order but add `D` to the diff filter when `include_deleted=True`, rather than reversing direction. Document clearly in the docstring that the diff direction is always from_sha \u2192 to_sha."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/git_ops.py:get_changed_files (diff line ~422)",
+          "category": "silent_behavior_change_for_existing_callers",
+          "description": "The original `get_changed_files` had no `--diff-filter`, so it returned all changed file paths including deleted files (`D`). The new default (`--diff-filter=ACMR`) silently drops deleted files from the result for all existing callers. The `workflow.py:860` call site passes no `include_deleted` argument and will now silently miss files that were deleted on main between `old_base` and `current_main`. If rebase/conflict logic downstream depends on knowing about deleted files, it will produce incorrect decisions without any error signal.",
+          "suggested_fix": "Either preserve the original no-filter behavior as the default (change default `include_deleted=True`), or audit all call sites to confirm they are safe with deleted files excluded. If exclusion is intentional, document the behavior change explicitly and add a release note or migration comment."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py:get_diff_stats",
+          "category": "ignored_error_return_code",
+          "description": "`_run` returns `(returncode, stdout, stderr)` and never raises on failure. `get_diff_stats` discards the return code with `_`. If the git command fails (e.g., one or both SHAs are invalid, the repo is in a bad state, or git is not available), `output` will be empty or contain an error message rather than stat output. The parser silently returns `{'insertions': 0, 'deletions': 0}`, making callers indistinguishable from a genuine no-change diff versus a total command failure.",
+          "suggested_fix": "Capture and check the return code: `rc, output, stderr = await _run(...)`. If `rc != 0`, raise a descriptive `RuntimeError(f'git diff --shortstat failed (rc={rc}): {stderr}')` or return `None` to allow callers to distinguish failure from a zero-change diff."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py:get_diff_stats",
+          "category": "uncaught_parse_exception",
+          "description": "The line `stats['insertions'] = int(part.split()[0])` (and the equivalent for deletions) will raise `IndexError` if `part` is empty/whitespace after splitting, or `ValueError` if the first token is not a valid integer. This can occur if git produces non-English locale output (e.g., `10 insertionen(+)`) or an unexpected `--shortstat` format variant. The exception would propagate unhandled to callers, which may not expect a parse error from what looks like a simple stats query.",
+          "suggested_fix": "Wrap the integer conversion in a try/except: `try: stats['insertions'] = int(part.split()[0]) except (IndexError, ValueError): pass`. Alternatively, use a compiled regex like `re.search(r'(\\d+) insertion', output)` for more robust parsing that is immune to token-count and locale variations."
+        }
+      ],
+      "reviewer": "robustness",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The diff introduces two blocking regressions in `get_changed_files`. First, the SHA positional arguments to `git diff` are silently reversed (`to_sha, from_sha` instead of the original `from_sha, to_sha`), so the sole production call site in `workflow.py` will receive an inverted file list \u2014 changes that exist in the older commit but not the newer one \u2014 with no error signal because `_run` never raises on failure. Second, the new default `--diff-filter=ACMR` silently drops deleted files from results for all existing callers, changing established semantics without any opt-in. The new `get_diff_stats` method has two additional robustness concerns: it ignores `_run`'s return code (masking git failures as a phantom zero-change result) and its integer parsing can raise uncaught `ValueError`/`IndexError` on unexpected output formats or non-English git locales."
+    }
+  },
+  "total_cost_usd": 1.83311915,
+  "wall_clock_ms": 206250,
+  "errors": []
+}

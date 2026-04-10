@@ -691,8 +691,10 @@ async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_ser
         run_full_cycle_called.append(args)
         return await original_rfc(*args, **kwargs)
 
-    # Also make _recover_stale_runs a no-op
+    # Also make _recover_stale_runs and escalation server no-ops
     harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
 
     with patch.object(harness, 'run_full_cycle', side_effect=spy_rfc), contextlib.suppress(TimeoutError):
         # Run loop for one sleep cycle (loop sleeps 5s; we wait 0.2s — enough for 1 iteration)
@@ -1460,4 +1462,304 @@ async def test_remediation_forwards_tier_model_to_stage_run(
     for name, call_args in models_seen.items():
         assert call_args.get('model') == 'opus', (
             f"{name}: expected model='opus', got {call_args.get('model')!r}"
+        )
+
+
+# ── Tests for task 455: harness._fetch_filtered_task_tree ──────────────────────
+
+
+class TestHarnessFetchFilteredTaskTree:
+    """ReconciliationHarness._fetch_filtered_task_tree returns filtered task trees."""
+
+    @pytest.mark.asyncio
+    async def test_fetches_and_filters_task_tree(self, journal, event_buffer, mock_memory_service):
+        """_fetch_filtered_task_tree fetches tasks and returns a FilteredTaskTree."""
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # Mock taskmaster to return a mix of active + done + cancelled tasks
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+            'tasks': [
+                {'id': 1, 'title': 'T1', 'status': 'in-progress', 'dependencies': []},
+                {'id': 2, 'title': 'T2', 'status': 'pending', 'dependencies': []},
+                {'id': 3, 'title': 'T3', 'status': 'blocked', 'dependencies': []},
+                {'id': 4, 'title': 'T4', 'status': 'deferred', 'dependencies': []},
+                {'id': 5, 'title': 'T5', 'status': 'done', 'dependencies': []},
+                {'id': 6, 'title': 'T6', 'status': 'done', 'dependencies': []},
+                {'id': 7, 'title': 'T7', 'status': 'cancelled', 'dependencies': []},
+            ]
+        }
+
+        result = await harness._fetch_filtered_task_tree('/abs/path')
+
+        assert isinstance(result, FilteredTaskTree)
+        assert len(result.active_tasks) == 4
+        assert result.done_count == 2
+        assert len(result.done_tasks) == 2  # main's FilteredTaskTree retains done task dicts
+        assert result.cancelled_count == 1
+        harness.taskmaster.get_tasks.assert_called_once_with(project_root='/abs/path')  # type: ignore[union-attr,attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_handles_fetch_exception(
+        self, journal, event_buffer, mock_memory_service, caplog,
+    ):
+        """_fetch_filtered_task_tree returns empty FilteredTaskTree and logs warning on error."""
+        import logging
+
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.taskmaster.get_tasks.side_effect = RuntimeError('connection refused')  # type: ignore[union-attr,attr-defined]
+
+        with caplog.at_level(logging.WARNING):
+            result = await harness._fetch_filtered_task_tree('/abs/path')
+
+        # Must NOT re-raise; must return empty tree
+        assert isinstance(result, FilteredTaskTree)
+        assert result.active_tasks == []
+        assert result.total_count == 0
+
+        # Must have logged a warning
+        assert any(
+            'connection refused' in r.message or '/abs/path' in r.message
+            for r in caplog.records if r.levelno >= logging.WARNING
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_no_taskmaster(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """_fetch_filtered_task_tree returns empty tree when taskmaster is None."""
+        from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        config = FusedMemoryConfig(
+            reconciliation=ReconciliationConfig(
+                enabled=True,
+                explore_codebase_root='/tmp/test',
+                agent_llm_provider='anthropic',
+                agent_llm_model='claude-sonnet-4-20250514',
+            )
+        )
+        harness = ReconciliationHarness(
+            memory_service=mock_memory_service,
+            taskmaster=None,
+            journal=journal,
+            event_buffer=event_buffer,
+            config=config,
+        )
+
+        result = await harness._fetch_filtered_task_tree('/abs/path')
+
+        assert isinstance(result, FilteredTaskTree)
+        assert result.active_tasks == []
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_empty_project_root(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """_fetch_filtered_task_tree returns empty tree when project_root is empty."""
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        result = await harness._fetch_filtered_task_tree('')
+
+        assert isinstance(result, FilteredTaskTree)
+        assert result.active_tasks == []
+        harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
+
+
+# ── Tests for task 455: harness wires filtered_task_tree into stages ──────────
+
+
+class TestHarnessFilteredTaskTreeWiring:
+    """run_full_cycle and _run_remediation_pass wire _fetch_filtered_task_tree into stages."""
+
+    def _make_tree(self):
+        """Return a small FilteredTaskTree for wiring assertions."""
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+        return FilteredTaskTree(
+            active_tasks=[
+                {'id': 1, 'title': 'T1', 'status': 'in-progress', 'dependencies': []},
+            ],
+            done_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            total_count=1,
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_calls_fetch_once_with_project_root(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """run_full_cycle calls _fetch_filtered_task_tree exactly once with the project_root."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness._fetch_filtered_task_tree = AsyncMock(return_value=FilteredTaskTree())
+
+        for stage in harness.stages:
+            _mock_stage_run(stage)
+
+        # Embed _project_root in the event payload so run_full_cycle can extract it
+        event = _make_event()
+        event.payload['_project_root'] = '/my/project'
+
+        await harness.run_full_cycle('test-project', 'test-trigger', events=[event])
+
+        harness._fetch_filtered_task_tree.assert_called_once_with('/my/project')  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_sets_filtered_task_tree_on_consolidator(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """run_full_cycle passes fetched filtered_task_tree to MemoryConsolidator via _configure_consolidator."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        expected_tree = self._make_tree()
+        harness._fetch_filtered_task_tree = AsyncMock(return_value=expected_tree)
+
+        captured: dict = {}
+
+        stage1 = harness.stages[0]
+        assert isinstance(stage1, MemoryConsolidator)
+
+        async def capture_tree(stage):
+            captured['filtered_task_tree'] = stage.filtered_task_tree
+
+        _mock_stage_run(stage1, before_return=capture_tree)
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        await harness.run_full_cycle('test-project', 'test-trigger', events=[_make_event()])
+
+        assert captured.get('filtered_task_tree') is expected_tree, (
+            f"Expected MemoryConsolidator.filtered_task_tree to be the fetched tree, "
+            f"got {captured.get('filtered_task_tree')!r}. "
+            "run_full_cycle must call _configure_consolidator with filtered_task_tree kwarg."
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_sets_filtered_task_tree_on_task_knowledge_sync(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """run_full_cycle sets filtered_task_tree on TaskKnowledgeSync."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        expected_tree = self._make_tree()
+        harness._fetch_filtered_task_tree = AsyncMock(return_value=expected_tree)
+
+        captured: dict = {}
+
+        stage2 = harness.stages[1]
+        assert isinstance(stage2, TaskKnowledgeSync)
+
+        async def capture_tree(stage):
+            captured['filtered_task_tree'] = stage.filtered_task_tree
+
+        _mock_stage_run(harness.stages[0])
+        _mock_stage_run(stage2, before_return=capture_tree)
+        _mock_stage_run(harness.stages[2])
+
+        await harness.run_full_cycle('test-project', 'test-trigger', events=[_make_event()])
+
+        assert captured.get('filtered_task_tree') is expected_tree, (
+            f"Expected TaskKnowledgeSync.filtered_task_tree to be the fetched tree, "
+            f"got {captured.get('filtered_task_tree')!r}. "
+            "run_full_cycle must set stage.filtered_task_tree on TaskKnowledgeSync instances."
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_sets_filtered_task_tree_on_consolidator(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """_run_remediation_pass wires filtered_task_tree to MemoryConsolidator."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.reconciliation.harness import TierConfig
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        stages = harness._make_stages()
+        harness._make_stages = lambda: stages
+
+        expected_tree = self._make_tree()
+        harness._fetch_filtered_task_tree = AsyncMock(return_value=expected_tree)
+
+        captured: dict = {}
+
+        stage1 = stages[0]
+        assert isinstance(stage1, MemoryConsolidator)
+
+        async def capture_tree(stage):
+            captured['filtered_task_tree'] = stage.filtered_task_tree
+
+        _mock_stage_run(stage1, before_return=capture_tree)
+        _mock_stage_run(stages[1])
+        _mock_stage_run(stages[2])
+
+        findings = [_make_s3_findings()[0]]
+        tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+
+        await harness._run_remediation_pass(
+            'test-project', '/my/project', 'parent-run-id', findings, tier,
+        )
+
+        assert captured.get('filtered_task_tree') is expected_tree, (
+            f"Expected MemoryConsolidator.filtered_task_tree to be the fetched tree in remediation, "
+            f"got {captured.get('filtered_task_tree')!r}. "
+            "_run_remediation_pass must also call _fetch_filtered_task_tree and wire the result."
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_sets_filtered_task_tree_on_task_knowledge_sync(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """_run_remediation_pass wires filtered_task_tree to TaskKnowledgeSync."""
+        from unittest.mock import AsyncMock
+
+        from fused_memory.reconciliation.harness import TierConfig
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        stages = harness._make_stages()
+        harness._make_stages = lambda: stages
+
+        expected_tree = self._make_tree()
+        harness._fetch_filtered_task_tree = AsyncMock(return_value=expected_tree)
+
+        captured: dict = {}
+
+        stage2 = stages[1]
+        assert isinstance(stage2, TaskKnowledgeSync)
+
+        async def capture_tree(stage):
+            captured['filtered_task_tree'] = stage.filtered_task_tree
+
+        _mock_stage_run(stages[0])
+        _mock_stage_run(stage2, before_return=capture_tree)
+        _mock_stage_run(stages[2])
+
+        findings = [_make_s3_findings()[0]]
+        tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+
+        await harness._run_remediation_pass(
+            'test-project', '/my/project', 'parent-run-id', findings, tier,
+        )
+
+        assert captured.get('filtered_task_tree') is expected_tree, (
+            f"Expected TaskKnowledgeSync.filtered_task_tree to be the fetched tree in remediation, "
+            f"got {captured.get('filtered_task_tree')!r}. "
+            "_run_remediation_pass must set stage.filtered_task_tree on TaskKnowledgeSync instances."
         )

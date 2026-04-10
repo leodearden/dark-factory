@@ -1,0 +1,29 @@
+{
+  "diff_id": "py_real_01",
+  "ground_truth": [
+    {
+      "id": "py_real_cap_1",
+      "location": "shared/src/shared/cli_invoke.py:476",
+      "category": "incorrect_success_detection",
+      "severity": "blocking",
+      "description": "The original code treated is_error=true responses as successes when the CLI returned exit code 0 or subtype='success'. The fix correctly uses the is_error field from the JSON output as an authoritative override. Without this, usage cap hits with is_error=true would be returned as successful results with empty/useless output.",
+      "mutation_type": "real_world"
+    },
+    {
+      "id": "py_real_cap_2",
+      "location": "shared/src/shared/usage_gate.py:46",
+      "category": "incomplete_pattern_matching",
+      "severity": "blocking",
+      "description": "The CAP_HIT_PREFIXES list was missing the 'You're out of extra usage' variant of the cap message. Without this prefix, extra-usage cap hits would not be detected by the pattern matcher, causing the retry loop to accept them as legitimate (failed) responses instead of cap-hitting and rotating to another account.",
+      "mutation_type": "real_world"
+    },
+    {
+      "id": "py_real_cap_3",
+      "location": "shared/src/shared/cli_invoke.py:253",
+      "category": "defensive_heuristic",
+      "severity": "suggestion",
+      "description": "The heuristic safety net (zero-cost, instant, <=1-turn failed result = probable cap hit) is a reasonable belt-and-suspenders approach, but it could false-positive on legitimately fast failures like syntax errors in the prompt. The conditions are conservative (success=False AND cost==0 AND turns<=1 AND duration<5s), making false positives unlikely in practice.",
+      "mutation_type": "real_world"
+    }
+  ]
+}

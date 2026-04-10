@@ -13,7 +13,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from shared.vllm_bridge import VllmBridge
+# VllmBridge depends on aiohttp, which is not installed in every consumer
+# environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
+# that never set ANTHROPIC_BASE_URL can still import shared.cli_invoke.
+try:
+    from shared.vllm_bridge import VllmBridge
+except ImportError:  # pragma: no cover - exercised only when aiohttp absent
+    VllmBridge = None  # type: ignore[assignment,misc]
 
 if TYPE_CHECKING:
     from shared.config_dir import TaskConfigDir
@@ -24,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
+_DEFAULT_MAX_CAP_RETRIES = 20
+_DEFAULT_CAP_RETRY_DEADLINE_SECS = 3600.0
 CAP_HIT_RESUME_PROMPT = (
     'Your previous run was interrupted by a usage limit. '
     'Continue where you left off and complete your task.'
@@ -32,9 +40,29 @@ CAP_HIT_RESUME_PROMPT = (
 __all__ = [
     'CAP_HIT_RESUME_PROMPT',
     'AgentResult',
+    'AllAccountsCappedException',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
 ]
+
+
+class AllAccountsCappedException(Exception):
+    """Raised when the cap-hit retry loop exceeds max retries or wall-clock deadline.
+
+    Attributes:
+    - ``retries``: number of consecutive cap hits before giving up
+    - ``elapsed_secs``: wall-clock seconds elapsed since first cap hit
+    - ``label``: caller label from invoke_with_cap_retry (e.g. "Task 7 [impl]")
+    """
+
+    def __init__(self, retries: int, elapsed_secs: float, label: str) -> None:
+        self.retries = retries
+        self.elapsed_secs = elapsed_secs
+        self.label = label
+        super().__init__(
+            f'{label}: all accounts capped after {retries} retries '
+            f'({elapsed_secs:.1f}s elapsed)'
+        )
 
 
 @dataclass
@@ -150,6 +178,8 @@ async def invoke_with_cap_retry(
     task_id: str = '',
     project_id: str = '',
     role: str = '',
+    max_cap_retries: int | None = _DEFAULT_MAX_CAP_RETRIES,
+    cap_retry_deadline_secs: float | None = _DEFAULT_CAP_RETRY_DEADLINE_SECS,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -176,6 +206,7 @@ async def invoke_with_cap_retry(
     original_prompt = invoke_kwargs.get('prompt', '')
     consecutive_cap_hits = 0
     num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
+    retry_start = time.monotonic()
     while True:
         oauth_token = None
         account_name = ''
@@ -238,6 +269,92 @@ async def invoke_with_cap_retry(
                     f'{label}: cap hit on all accounts ({consecutive_cap_hits} consecutive), '
                     f'sleeping {cooldown:.0f}s then waiting for reset ({resume_or_fresh})',
                 )
+
+            # Guard: raise before sleeping if retry limit or deadline exceeded
+            elapsed = time.monotonic() - retry_start
+            if max_cap_retries is not None and consecutive_cap_hits >= max_cap_retries:
+                logger.error(
+                    f'{label}: giving up after {consecutive_cap_hits} consecutive cap hits '
+                    f'({elapsed:.1f}s elapsed, {num_accounts} account(s))',
+                )
+                raise AllAccountsCappedException(
+                    retries=consecutive_cap_hits,
+                    elapsed_secs=elapsed,
+                    label=label,
+                )
+            if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
+                logger.error(
+                    f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
+                    f'({consecutive_cap_hits} retries, {num_accounts} account(s))',
+                )
+                raise AllAccountsCappedException(
+                    retries=consecutive_cap_hits,
+                    elapsed_secs=elapsed,
+                    label=label,
+                )
+
+            await asyncio.sleep(cooldown)
+            continue
+
+        # Heuristic safety net: a zero-cost, near-instant, ≤1-turn result
+        # that wasn't caught by pattern matching is almost certainly a cap
+        # hit with an unrecognised message format.  Treat it as a cap hit so
+        # the retry loop can wait / fail over instead of silently returning a
+        # useless "success" to the caller.
+        if (
+            usage_gate
+            and not result.success  # is_error=true → success=False after fix 2
+            and result.cost_usd == 0
+            and result.turns <= 1
+            and result.duration_ms < 5000
+        ):
+            logger.warning(
+                f'{label}: suspicious zero-cost instant exit (turns={result.turns}, '
+                f'duration={result.duration_ms}ms) — treating as cap hit. '
+                f'Output: {result.output[:200]!r}',
+            )
+            usage_gate._handle_cap_detected(
+                f'Heuristic cap: zero-cost instant exit — {result.output[:120]}',
+                None,
+                oauth_token,
+            )
+            consecutive_cap_hits += 1
+            full_cycles = (consecutive_cap_hits - 1) // num_accounts
+            cooldown = min(
+                _CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles),
+                _MAX_CAP_COOLDOWN_SECS,
+            )
+            # Cannot resume a session that never ran
+            invoke_kwargs.pop('resume_session_id', None)
+            invoke_kwargs['prompt'] = original_prompt
+            acct_name = usage_gate.active_account_name
+            logger.warning(
+                f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
+            )
+
+            # Guard: raise before sleeping if retry limit or deadline exceeded
+            elapsed = time.monotonic() - retry_start
+            if max_cap_retries is not None and consecutive_cap_hits >= max_cap_retries:
+                logger.error(
+                    f'{label}: giving up after {consecutive_cap_hits} consecutive heuristic cap hits '
+                    f'({elapsed:.1f}s elapsed, {num_accounts} account(s))',
+                )
+                raise AllAccountsCappedException(
+                    retries=consecutive_cap_hits,
+                    elapsed_secs=elapsed,
+                    label=label,
+                )
+            if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
+                logger.error(
+                    f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
+                    f'(heuristic branch, {consecutive_cap_hits} retries, {num_accounts} account(s))',
+                )
+                raise AllAccountsCappedException(
+                    retries=consecutive_cap_hits,
+                    elapsed_secs=elapsed,
+                    label=label,
+                )
+
             await asyncio.sleep(cooldown)
             continue
 
@@ -366,6 +483,11 @@ async def _invoke_claude(
     bridge: VllmBridge | None = None
     try:
         if env_overrides and env_overrides.get('ANTHROPIC_BASE_URL'):
+            if VllmBridge is None:
+                raise RuntimeError(
+                    'ANTHROPIC_BASE_URL is set but aiohttp is not installed; '
+                    'install dark-factory-shared with the vllm extras to use VllmBridge.'
+                )
             bridge = VllmBridge(upstream_url=env_overrides['ANTHROPIC_BASE_URL'])
             await bridge.start()
             env['ANTHROPIC_BASE_URL'] = bridge.url
@@ -424,7 +546,10 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
                         parts.append(block)
         output_text = '\n'.join(parts)
 
-    is_success = subtype == 'success' or result.returncode == 0
+    # The CLI may report subtype='success' even when is_error is true (e.g.
+    # usage cap hit).  Trust is_error as an authoritative override.
+    is_error = data.get('is_error', False)
+    is_success = (subtype == 'success' or result.returncode == 0) and not is_error
 
     return AgentResult(
         success=is_success,
@@ -518,7 +643,16 @@ async def _run_subprocess(
     if stderr_text:
         logger.info(f'Agent stderr (last 1000): {stderr_text[-1000:]}')
     logger.info(f'Agent exit code: {proc.returncode}')
-    logger.info(f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout.decode()[:500]}')
+    stdout_text_for_log = stdout.decode()
+    if proc.returncode != 0:
+        # On failure, dump the full stdout so downstream debugging can see
+        # the actual messages array (tool_use blocks, error details) instead
+        # of only the truncated result envelope.
+        logger.info(
+            f'Agent stdout length: {len(stdout)} bytes (full, returncode={proc.returncode}):\n{stdout_text_for_log}'
+        )
+    else:
+        logger.info(f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout_text_for_log[:500]}')
 
     return _SubprocessResult(
         stdout=stdout.decode(),

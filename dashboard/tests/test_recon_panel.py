@@ -240,6 +240,8 @@ MOCK_RUNS = [
     }
 ]
 
+MOCK_RUNS_NO_JOURNAL = [{**MOCK_RUNS[0], 'journal_entry_count': 0}]
+
 MOCK_LAST_ATTEMPTED = {
     'dark_factory': {
         'id': 'run-002',
@@ -381,16 +383,10 @@ class TestReconRoute:
     def test_trigger_formatted_in_html(self, client):
         runs_with_colon = [
             {
+                **MOCK_RUNS_NO_JOURNAL[0],
                 'id': 'run-002',
-                'project_id': 'dark_factory',
-                'run_type': 'full',
                 'trigger_reason': 'max_staleness:2026-03-19T08:00:00+00:00',
-                'started_at': '2026-03-19T08:00:00+00:00',
-                'completed_at': '2026-03-19T08:05:00+00:00',
                 'events_processed': 3,
-                'status': 'completed',
-                'duration_seconds': 300.0,
-                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_with_colon):
@@ -562,16 +558,13 @@ class TestReconBadgeAriaLabels:
     def test_run_status_running_aria_label(self, client):
         runs_running = [
             {
+                **MOCK_RUNS_NO_JOURNAL[0],
                 'id': 'run-002',
-                'project_id': 'dark_factory',
-                'run_type': 'full',
                 'trigger_reason': 'manual',
-                'started_at': '2026-03-19T08:00:00+00:00',
                 'completed_at': None,
                 'events_processed': 0,
                 'status': 'running',
                 'duration_seconds': None,
-                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_running):
@@ -581,16 +574,13 @@ class TestReconBadgeAriaLabels:
     def test_run_status_failed_aria_label(self, client):
         runs_failed = [
             {
+                **MOCK_RUNS_NO_JOURNAL[0],
                 'id': 'run-003',
-                'project_id': 'dark_factory',
-                'run_type': 'full',
                 'trigger_reason': 'manual',
-                'started_at': '2026-03-19T08:00:00+00:00',
                 'completed_at': '2026-03-19T08:01:00+00:00',
                 'events_processed': 0,
                 'status': 'failed',
                 'duration_seconds': 60.0,
-                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_failed):
@@ -600,16 +590,13 @@ class TestReconBadgeAriaLabels:
     def test_run_status_rolled_back_aria_label(self, client):
         runs_rb = [
             {
+                **MOCK_RUNS_NO_JOURNAL[0],
                 'id': 'run-004',
-                'project_id': 'dark_factory',
-                'run_type': 'full',
                 'trigger_reason': 'manual',
-                'started_at': '2026-03-19T08:00:00+00:00',
                 'completed_at': '2026-03-19T08:01:00+00:00',
                 'events_processed': 0,
                 'status': 'rolled_back',
                 'duration_seconds': 60.0,
-                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_rb):
@@ -619,16 +606,13 @@ class TestReconBadgeAriaLabels:
     def test_run_status_circuit_breaker_aria_label(self, client):
         runs_cb = [
             {
+                **MOCK_RUNS_NO_JOURNAL[0],
                 'id': 'run-005',
-                'project_id': 'dark_factory',
-                'run_type': 'full',
                 'trigger_reason': 'manual',
-                'started_at': '2026-03-19T08:00:00+00:00',
                 'completed_at': '2026-03-19T08:01:00+00:00',
                 'events_processed': 0,
                 'status': 'circuit_breaker',
                 'duration_seconds': 60.0,
-                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_cb):
@@ -647,13 +631,7 @@ class TestReconJournalBadge:
         assert '>3<' in html or '>\n                    3\n' in html or '3</button>' in html
 
     def test_badge_hidden_when_count_zero(self, client):
-        runs_no_journal = [
-            {
-                **MOCK_RUNS[0],
-                'journal_entry_count': 0,
-            }
-        ]
-        with _patch_recon_data(runs=runs_no_journal):
+        with _patch_recon_data(runs=MOCK_RUNS_NO_JOURNAL):
             html = client.get('/partials/recon').text
         assert 'data-testid="journal-badge"' not in html
 
@@ -704,6 +682,30 @@ class TestReconJournalBadge:
         with _patch_recon_data(runs=runs_5):
             html = client.get('/partials/recon').text
         assert 'aria-label="Show 5 journal entries"' in html
+
+
+class TestReconDetailTrigger:
+    """Tests for the Alpine.js detail row trigger (x-data, @click, x-show)."""
+
+    def test_no_local_open_state_in_x_data(self, client):
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-data="runPanel"' in html
+        assert 'x-data="{ open: false }"' not in html
+        assert "x-data='{ open: false }'" not in html
+
+    def test_zero_journal_count_hides_badge_and_detail(self, client):
+        runs_zero = MOCK_RUNS_NO_JOURNAL
+        with _patch_recon_data(runs=runs_zero):
+            html = client.get('/partials/recon').text
+        assert 'data-testid="run-detail-row"' not in html
+
+    def test_positive_journal_count_shows_detail_row(self, client):
+        """Default MOCK_RUNS (journal_entry_count=3): detail row is emitted with x-show and data-testid."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-show="open"' in html
+        assert 'data-testid="run-detail-row"' in html
 
 
 @pytest.fixture(scope='class')
@@ -905,7 +907,7 @@ class TestRunPanelJournalBadgeRegression:
 
     def test_badge_hidden_with_zero_entries(self, client):
         """Badge not rendered when journal_entry_count == 0."""
-        runs_zero = [{**MOCK_RUNS[0], 'journal_entry_count': 0}]
+        runs_zero = MOCK_RUNS_NO_JOURNAL
         with _patch_recon_data(runs=runs_zero):
             html = client.get('/partials/recon').text
         assert 'data-testid="journal-badge"' not in html
@@ -1118,3 +1120,86 @@ class TestRunPanelAlpineComponent:
         # Ensure delete this.dataset.loading appears near the after-request handler
         segment = html[after_req_idx:after_req_idx + 200]
         assert 'delete this.dataset.loading' in segment
+
+
+class TestDetailRowJournalGuard:
+    """Tests that the detail <tr> row is guarded by journal_entry_count > 0."""
+
+    def test_detail_row_not_emitted_when_journal_count_zero(self, client):
+        """When journal_entry_count=0 the detail <tr x-show="open"> must not be emitted."""
+        runs_zero = MOCK_RUNS_NO_JOURNAL
+        with _patch_recon_data(runs=runs_zero):
+            html = client.get('/partials/recon').text
+        assert 'x-show="open"' not in html
+        assert 'hx-get="/partials/recon/run/' not in html
+
+    def test_no_orphaned_x_cloak_when_journal_count_zero(self, client):
+        """When journal_entry_count=0 there must be no x-cloak on orphaned detail row."""
+        runs_zero = MOCK_RUNS_NO_JOURNAL
+        with _patch_recon_data(runs=runs_zero):
+            html = client.get('/partials/recon').text
+        assert 'x-cloak' not in html
+
+    def test_no_error_when_journal_count_missing(self, client):
+        """When journal_entry_count key is absent the template must render 200, no badge, no detail row."""
+        run_no_key = {k: v for k, v in MOCK_RUNS[0].items() if k != 'journal_entry_count'}
+        with _patch_recon_data(runs=[run_no_key]):
+            resp = client.get('/partials/recon')
+        assert resp.status_code == 200
+        html = resp.text
+        assert 'data-testid="journal-badge"' not in html
+        assert 'x-show="open"' not in html
+
+    def test_detail_row_emitted_when_journal_count_positive(self, client):
+        """Default MOCK_RUNS (journal_entry_count=3): detail row and hx-get endpoint are present."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-show="open"' in html
+        assert 'hx-get="/partials/recon/run/run-001"' in html
+
+    def test_detail_row_has_x_cloak_when_journal_count_positive(self, client):
+        """Default MOCK_RUNS (journal_entry_count=3): detail row carries x-cloak."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-cloak' in html
+
+    def test_mixed_journal_counts_emit_detail_only_for_positive_counts(self, client):
+        """Mixed journal counts [3, 0, 1]: detail rows emitted only for runs with count > 0."""
+        mixed_runs = [
+            {**MOCK_RUNS[0], 'id': 'run-mix-a', 'journal_entry_count': 3},
+            {**MOCK_RUNS[0], 'id': 'run-mix-b', 'journal_entry_count': 0},
+            {**MOCK_RUNS[0], 'id': 'run-mix-c', 'journal_entry_count': 1},
+        ]
+        with _patch_recon_data(runs=mixed_runs):
+            html = client.get('/partials/recon').text
+        assert 'hx-get="/partials/recon/run/run-mix-a"' in html
+        assert 'hx-get="/partials/recon/run/run-mix-c"' in html
+        assert 'hx-get="/partials/recon/run/run-mix-b"' not in html
+        assert html.count('x-show="open"') == 2
+
+    def test_mixed_journal_counts_per_row_badge_and_detail_scoped(self, client):
+        """Per-row scoping: badge and detail row are absent in zero-count tbody, present in positive-count tbody."""
+        # Use ids without 'run-' prefix to avoid double prefix in rendered id="run-{run.id}"
+        runs = [
+            {**MOCK_RUNS[0], 'id': 'scoped-zero', 'journal_entry_count': 0},
+            {**MOCK_RUNS[0], 'id': 'scoped-pos', 'journal_entry_count': 5},
+        ]
+        with _patch_recon_data(runs=runs):
+            html = client.get('/partials/recon').text
+
+        # Template renders id="run-{{ run.id }}" on each tbody
+        zero_start = html.index('id="run-scoped-zero"')
+        zero_end = html.index('</tbody>', zero_start)
+        zero_tbody = html[zero_start:zero_end]
+
+        pos_start = html.index('id="run-scoped-pos"')
+        pos_end = html.index('</tbody>', pos_start)
+        pos_tbody = html[pos_start:pos_end]
+
+        # Zero-count row: neither badge nor detail row should be emitted
+        assert 'data-testid="journal-badge"' not in zero_tbody
+        assert 'data-testid="run-detail-row"' not in zero_tbody
+
+        # Positive-count row: both badge and detail row must be emitted
+        assert 'data-testid="journal-badge"' in pos_tbody
+        assert 'data-testid="run-detail-row"' in pos_tbody

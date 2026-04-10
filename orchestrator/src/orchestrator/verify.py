@@ -2,9 +2,12 @@
 
 import asyncio
 import logging
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 logger = logging.getLogger(__name__)
@@ -71,6 +74,113 @@ def _strip_directory_flag(cmd: str | None, module_prefix: str) -> str | None:
     cmd = cmd.replace(f'--directory {module_prefix}', '')
     cmd = cmd.replace(f'--directory={module_prefix}', '')
     return ' '.join(cmd.split())
+
+
+# Cargo subcommands whose ``--workspace`` flag we know how to rewrite.  Other
+# cargo subcommands (doc, bench, ...) are left alone to avoid semantic drift.
+_CARGO_SUBCMDS = ('test', 'clippy', 'check', 'build', 'run')
+
+# Pre-compiled regex that matches ``cargo <subcmd> ...--workspace`` where
+# ``...`` does not cross a shell delimiter (``&&``, ``||``, ``;``, ``|``),
+# so chained non-cargo commands (like ``cd gui && npm test``) are left alone.
+_CARGO_WORKSPACE_RE = re.compile(
+    r'(cargo\s+(?:' + '|'.join(_CARGO_SUBCMDS) + r')\b[^&|;]*?)'
+    r'\s--workspace\b',
+)
+
+
+def _scope_cargo_workspace(cmd: str | None, crates: list[str]) -> str | None:
+    """Rewrite ``cargo ... --workspace`` → ``cargo ... -p c1 -p c2 ...``.
+
+    Returns *cmd* unchanged when:
+    - *cmd* is ``None``
+    - *crates* is empty
+    - ``--workspace`` is not present
+    - no cargo subcommand we recognise precedes ``--workspace``
+
+    Supported cargo subcommands: test, clippy, check, build, run.
+
+    Flags present between ``cargo <subcmd>`` and ``--workspace`` (e.g.,
+    ``--all-targets``, ``--tests``, ``--lib``, ``-F <feature>``) and trailing
+    args (``-- --test-threads=1``) are preserved verbatim — the helper only
+    substitutes the ``--workspace`` token.  Chained shell commands after
+    ``&&``/``||``/``;``/``|`` are untouched.
+    """
+    if cmd is None or not crates:
+        return cmd
+    if '--workspace' not in cmd:
+        return cmd
+
+    p_flags = ' '.join(f'-p {c}' for c in crates)
+    new_cmd = _CARGO_WORKSPACE_RE.sub(
+        lambda m: f'{m.group(1)} {p_flags}', cmd,
+    )
+    return new_cmd
+
+
+def _apply_cargo_scope(
+    mc: ModuleConfig,
+    task_files: list[str],
+    project_root: Path,
+    scope_cargo_enabled: bool,
+) -> ModuleConfig:
+    """Return *mc* with cargo ``--workspace`` rewritten to touched crates.
+
+    Guard conditions — returns *mc* unchanged when any fail:
+    - ``scope_cargo_enabled`` is False, or ``mc.scope_cargo`` is explicitly False
+    - *task_files* is empty
+    - any file in *task_files* is not a ``.rs`` file (mixed-language guard;
+      prevents under-protecting the JS/TS portion of a polyglot task)
+    - the workspace has no discoverable crates
+    - ``files_to_crates`` returns ``None`` (a file lives outside all crates)
+    - the rewritten commands are byte-identical to the originals
+    """
+    if not scope_cargo_enabled:
+        return mc
+    if mc.scope_cargo is False:
+        return mc
+    if not task_files:
+        return mc
+    if not all(f.endswith('.rs') for f in task_files):
+        return mc
+
+    crates_map = discover_workspace_crates(project_root)
+    if not crates_map:
+        return mc
+    matched = files_to_crates(task_files, crates_map)
+    if not matched:
+        return mc
+
+    new_test = _scope_cargo_workspace(mc.test_command, matched)
+    new_lint = _scope_cargo_workspace(mc.lint_command, matched)
+    new_type = _scope_cargo_workspace(mc.type_check_command, matched)
+
+    if (new_test, new_lint, new_type) == (
+        mc.test_command, mc.lint_command, mc.type_check_command,
+    ):
+        return mc  # nothing to rewrite — original didn't contain --workspace
+
+    for label, old, new in (
+        ('test', mc.test_command, new_test),
+        ('lint', mc.lint_command, new_lint),
+        ('type', mc.type_check_command, new_type),
+    ):
+        if old != new:
+            logger.info('cargo scope (%s): %r -> %r', label, old, new)
+
+    return ModuleConfig(
+        prefix=mc.prefix,
+        test_command=new_test,
+        lint_command=new_lint,
+        type_check_command=new_type,
+        lock_depth=mc.lock_depth,
+        max_per_module=mc.max_per_module,
+        module_overrides=mc.module_overrides,
+        verify_command_timeout_secs=mc.verify_command_timeout_secs,
+        concurrent_verify=mc.concurrent_verify,
+        verify_env=mc.verify_env,
+        scope_cargo=mc.scope_cargo,
+    )
 
 
 def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig:
@@ -151,10 +261,28 @@ class VerifyResult:
     lint_output: str
     type_output: str
     summary: str
+    timed_out: bool = False
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
         sections = []
+        if self.timed_out:
+            # Lead with timeout info so the debugger knows the failure may not
+            # be real code — list which commands actually hit the wall clock.
+            timed_out_cmds = []
+            if self.test_output and 'timed out' in self.test_output.lower():
+                timed_out_cmds.append('test')
+            if self.lint_output and 'timed out' in self.lint_output.lower():
+                timed_out_cmds.append('lint')
+            if self.type_output and 'timed out' in self.type_output.lower():
+                timed_out_cmds.append('type')
+            joined = ', '.join(timed_out_cmds) if timed_out_cmds else 'unknown'
+            sections.append(
+                f'## Verify Timed Out\n\nCommands that hit the timeout: {joined}.\n'
+                f'This may indicate a cold build, resource contention, or a '
+                f'genuinely hanging command — inspect the output below before '
+                f'treating it as a real failure.'
+            )
         if self.test_output and 'FAILED' in self.test_output:
             sections.append(f'## Test Failures\n\n```\n{self.test_output[-3000:]}\n```')
         if self.lint_output and self.lint_output.strip():
@@ -164,9 +292,22 @@ class VerifyResult:
         return '\n\n'.join(sections) if sections else self.summary
 
 
-async def _run_cmd(cmd: str, cwd: Path, timeout: float = 300) -> tuple[int, str]:
-    """Run a shell command, return (returncode, combined output)."""
+async def _run_cmd(
+    cmd: str,
+    cwd: Path,
+    timeout: float,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str, bool]:
+    """Run a shell command, return (returncode, combined output, timed_out).
+
+    When *env* is non-None, it is merged on top of ``os.environ`` and passed
+    to the subprocess so callers can inject build accelerators like
+    ``RUSTC_WRAPPER=sccache`` without mutating the parent process's env.
+    """
     proc = None
+    subprocess_env: dict[str, str] | None = None
+    if env:
+        subprocess_env = {**os.environ, **env}
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -174,15 +315,60 @@ async def _run_cmd(cmd: str, cwd: Path, timeout: float = 300) -> tuple[int, str]
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             executable='/bin/bash',
+            env=subprocess_env,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        return proc.returncode if proc.returncode is not None else 1, stdout.decode()
+        rc = proc.returncode if proc.returncode is not None else 1
+        return rc, stdout.decode(), False
     except TimeoutError:
         if proc is not None:
             proc.kill()
-        return 1, f'Command timed out after {timeout}s: {cmd}'
+        return 1, f'Command timed out after {timeout}s: {cmd}', True
     except Exception as e:
-        return 1, f'Command failed: {e}'
+        return 1, f'Command failed: {e}', False
+
+
+def _resolve_verify_timeout(
+    config: OrchestratorConfig,
+    module_config: ModuleConfig | None,
+) -> float:
+    """Return the effective per-command verify timeout.
+
+    Module override wins over top-level config; falls back to the
+    top-level ``verify_command_timeout_secs`` default.
+    """
+    if module_config is not None and module_config.verify_command_timeout_secs is not None:
+        return module_config.verify_command_timeout_secs
+    return config.verify_command_timeout_secs
+
+
+def _resolve_concurrent_verify(
+    config: OrchestratorConfig,
+    module_config: ModuleConfig | None,
+) -> bool:
+    """Return whether test/lint/type should run concurrently.
+
+    Module override wins over top-level config.
+    """
+    if module_config is not None and module_config.concurrent_verify is not None:
+        return module_config.concurrent_verify
+    return config.concurrent_verify
+
+
+def _resolve_verify_env(
+    config: OrchestratorConfig,
+    module_config: ModuleConfig | None,
+) -> dict[str, str]:
+    """Return the effective env injected into verify commands.
+
+    Merges ``config.verify_env`` with ``module_config.verify_env``; module
+    keys override top-level keys.
+    """
+    merged: dict[str, str] = {}
+    merged.update(config.verify_env or {})
+    if module_config is not None and module_config.verify_env:
+        merged.update(module_config.verify_env)
+    return merged
 
 
 async def run_verification(
@@ -195,6 +381,11 @@ async def run_verification(
     When *module_config* is provided, a ``None`` command means "skip that check"
     (the subproject doesn't define it).  When *module_config* is ``None``,
     global config commands are used for every check.
+
+    If any enabled command times out while the others pass, the whole verify
+    is retried up to ``config.verify_timeout_retries`` times.  A retry that
+    surfaces a genuine failure (e.g., a real lint error) is returned
+    immediately instead of being retried further.
     """
     if module_config is not None:
         # Scoped: use module command; None → skip
@@ -207,28 +398,90 @@ async def run_verification(
         lint_cmd = config.lint_command
         type_cmd = config.type_check_command
 
-    # Run non-None checks in parallel
-    async def _run_or_skip(cmd: str | None) -> tuple[int, str]:
+    timeout = _resolve_verify_timeout(config, module_config)
+    max_retries = config.verify_timeout_retries
+    concurrent = _resolve_concurrent_verify(config, module_config)
+    verify_env = _resolve_verify_env(config, module_config)
+
+    if verify_env:
+        logger.info(
+            'Verification env (mode=%s): %s',
+            'concurrent' if concurrent else 'sequential',
+            sorted(verify_env.keys()),
+        )
+    else:
+        logger.debug(
+            'Verification mode: %s',
+            'concurrent' if concurrent else 'sequential',
+        )
+
+    async def _run_or_skip(cmd: str | None) -> tuple[int, str, bool]:
         if cmd is None:
-            return 0, ''
-        return await _run_cmd(cmd, worktree)
+            return 0, '', False
+        return await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
 
-    (test_rc, test_out), (lint_rc, lint_out), (type_rc, type_out) = await asyncio.gather(
-        _run_or_skip(test_cmd), _run_or_skip(lint_cmd), _run_or_skip(type_cmd)
-    )
+    attempt = 0
+    while True:
+        if concurrent:
+            (
+                (test_rc, test_out, test_timed_out),
+                (lint_rc, lint_out, lint_timed_out),
+                (type_rc, type_out, type_timed_out),
+            ) = await asyncio.gather(
+                _run_or_skip(test_cmd),
+                _run_or_skip(lint_cmd),
+                _run_or_skip(type_cmd),
+            )
+        else:
+            test_rc, test_out, test_timed_out = await _run_or_skip(test_cmd)
+            lint_rc, lint_out, lint_timed_out = await _run_or_skip(lint_cmd)
+            type_rc, type_out, type_timed_out = await _run_or_skip(type_cmd)
 
-    passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
+        passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
+        any_timed_out = test_timed_out or lint_timed_out or type_timed_out
+
+        # Check whether every failure is a timeout (no real rc!=0 without
+        # timeout).  If so, the failure is a pure timeout and is retryable.
+        pure_timeout_failure = (
+            not passed
+            and any_timed_out
+            and (test_rc == 0 or test_timed_out)
+            and (lint_rc == 0 or lint_timed_out)
+            and (type_rc == 0 or type_timed_out)
+        )
+
+        if passed or not pure_timeout_failure or attempt >= max_retries:
+            break
+
+        attempt += 1
+        timed_out_names = []
+        if test_timed_out:
+            timed_out_names.append('test')
+        if lint_timed_out:
+            timed_out_names.append('lint')
+        if type_timed_out:
+            timed_out_names.append('type')
+        logger.warning(
+            'Verification hit timeout on %s; retry %d/%d',
+            ','.join(timed_out_names), attempt, max_retries,
+        )
+
+    # Classify timed_out: true only when the final failure was a pure timeout
+    # (no real non-timeout failure mixed in).
+    timed_out = (not passed) and pure_timeout_failure
 
     # Build summary
-    parts = []
-    if test_rc != 0:
-        parts.append('tests failed')
-    if lint_rc != 0:
-        parts.append('lint issues')
-    if type_rc != 0:
-        parts.append('type errors')
-
-    summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
+    if timed_out:
+        summary = f'Verification timed out after {max_retries} retries' if max_retries > 0 else 'Verification timed out'
+    else:
+        parts = []
+        if test_rc != 0:
+            parts.append('tests failed')
+        if lint_rc != 0:
+            parts.append('lint issues')
+        if type_rc != 0:
+            parts.append('type errors')
+        summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
 
     result = VerifyResult(
         passed=passed,
@@ -236,9 +489,15 @@ async def run_verification(
         lint_output=lint_out if lint_rc != 0 else '',
         type_output=type_out if type_rc != 0 else '',
         summary=summary,
+        timed_out=timed_out,
     )
 
-    logger.info(f'Verification {"passed" if passed else "failed"}: {summary}')
+    if passed:
+        logger.info('Verification passed: %s', summary)
+    elif timed_out:
+        logger.warning('Verification failed: %s', summary)
+    else:
+        logger.info('Verification failed: %s', summary)
     return result
 
 
@@ -252,15 +511,22 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
     lint_output = '\n'.join(r.lint_output for r in results if r.lint_output)
     type_output = '\n'.join(r.type_output for r in results if r.type_output)
 
-    parts = []
-    if any('tests failed' in r.summary for r in results):
-        parts.append('tests failed')
-    if any('lint issues' in r.summary for r in results):
-        parts.append('lint issues')
-    if any('type errors' in r.summary for r in results):
-        parts.append('type errors')
+    # Aggregate timed_out: true only when every failing subproject failed
+    # purely due to timeout.  A single real failure poisons the signal.
+    failing = [r for r in results if not r.passed]
+    timed_out = (not passed) and bool(failing) and all(r.timed_out for r in failing)
 
-    summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
+    if timed_out:
+        summary = 'Verification timed out'
+    else:
+        parts = []
+        if any('tests failed' in r.summary for r in results):
+            parts.append('tests failed')
+        if any('lint issues' in r.summary for r in results):
+            parts.append('lint issues')
+        if any('type errors' in r.summary for r in results):
+            parts.append('type errors')
+        summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
 
     return VerifyResult(
         passed=passed,
@@ -268,6 +534,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         lint_output=lint_output,
         type_output=type_output,
         summary=summary,
+        timed_out=timed_out,
     )
 
 
@@ -317,12 +584,20 @@ async def run_scoped_verification(
     3. **Global** — when *task_files* is ``None`` (or falsy) with no
        module_configs, or when fallback returns ``None`` (no .py files).
     """
+    scope_cargo_enabled = config.scope_cargo
+
     if module_configs:
         # Apply file-level scoping within each subproject when task_files given
         if task_files:
             # Filter to files that still exist — tasks may delete files as part of their work
             existing_files = [f for f in task_files if (worktree / f).exists()]
             scoped = [scope_module_config(mc, existing_files) for mc in module_configs]
+            # Rewrite cargo --workspace → cargo -p <crate> when all task files
+            # are .rs and map to known workspace crates.
+            scoped = [
+                _apply_cargo_scope(mc, existing_files, worktree, scope_cargo_enabled)
+                for mc in scoped
+            ]
             n_files = len(existing_files)
             n_mods = len(scoped)
             logger.info('Verification mode: file-scoped (%d files across %d subprojects)', n_files, n_mods)
@@ -340,8 +615,30 @@ async def run_scoped_verification(
         existing_files = [f for f in task_files if (worktree / f).exists()]
         fallback = _build_fallback_config(existing_files)
         if fallback is not None:
+            fallback = _apply_cargo_scope(
+                fallback, existing_files, worktree, scope_cargo_enabled,
+            )
             logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
             return await run_verification(worktree, config, fallback)
+
+        # For Rust projects with no module_configs and no Python fallback
+        # (Reify's layout), try to scope the global commands.
+        if existing_files and scope_cargo_enabled:
+            synthetic = ModuleConfig(
+                prefix='__cargo_scoped__',
+                test_command=config.test_command,
+                lint_command=config.lint_command,
+                type_check_command=config.type_check_command,
+            )
+            rewritten = _apply_cargo_scope(
+                synthetic, existing_files, worktree, scope_cargo_enabled,
+            )
+            if rewritten is not synthetic:
+                logger.info(
+                    'Verification mode: cargo-scoped (%d .rs files)',
+                    len(existing_files),
+                )
+                return await run_verification(worktree, config, rewritten)
 
     logger.info('Verification mode: global (no scope info)')
     return await run_verification(worktree, config)

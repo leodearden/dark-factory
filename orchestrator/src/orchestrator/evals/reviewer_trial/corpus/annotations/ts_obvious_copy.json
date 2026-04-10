@@ -1,0 +1,29 @@
+{
+  "diff_id": "ts_obvious_copy",
+  "ground_truth": [
+    {
+      "id": "ts_copy_1",
+      "location": "gui/src/viewport/selection.ts:249",
+      "category": "code_duplication",
+      "severity": "blocking",
+      "description": "focusOnBounds() duplicates the camera positioning logic from fitToView() (line 189) and flyToEntity() (line 220). The center/size calculation, FOV distance computation, and camera+controls update are identical across all three functions. The existing functions should be refactored to call focusOnBounds() instead of duplicating the same 12 lines of camera math.",
+      "mutation_type": "obvious_copy"
+    },
+    {
+      "id": "ts_copy_2",
+      "location": "gui/src/viewport/selection.ts:279",
+      "category": "redundant_function",
+      "severity": "suggestion",
+      "description": "focusOnEntities() is nearly identical to fitToView() — both compute a bounding box from meshes and position the camera. The only difference is fitToView uses all meshes while focusOnEntities uses a subset. fitToView could be implemented as focusOnEntities([...getMeshes().keys()]).",
+      "mutation_type": "obvious_copy"
+    },
+    {
+      "id": "ts_copy_3",
+      "location": "gui/src/viewport/selection.ts:259",
+      "category": "inconsistent_behavior",
+      "severity": "suggestion",
+      "description": "focusOnBounds() applies a padding multiplier (default 1.2) to maxDim before computing camera distance, while the existing fitToView() and flyToEntity() do not. This means focusOnBounds-based views will have 20% more whitespace around the target than direct calls, creating inconsistent zoom behavior.",
+      "mutation_type": "obvious_copy"
+    }
+  ]
+}

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -76,7 +76,7 @@ def load_state(path: Path = STATE_FILE) -> JudgeState:
 
 def save_state(state: JudgeState, path: Path = STATE_FILE) -> None:
     """Persist judge state to disk."""
-    state.updated_at = datetime.now(timezone.utc).isoformat()
+    state.updated_at = datetime.now(UTC).isoformat()
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, 'w') as f:
         json.dump(state.to_dict(), f, indent=2)

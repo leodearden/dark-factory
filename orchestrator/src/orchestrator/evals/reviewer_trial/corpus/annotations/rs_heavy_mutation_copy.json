@@ -1,0 +1,21 @@
+{
+  "diff_id": "rs_heavy_mutation_copy",
+  "ground_truth": [
+    {
+      "id": "rs_copy_1",
+      "location": "crates/reify-constraints/src/solver.rs:72",
+      "category": "code_duplication",
+      "severity": "blocking",
+      "description": "create_solution_map() is a verbatim copy of build_solved_values() (defined at line 55) with only variable names renamed (params→specifications, x→solution_values, param→spec, val→computed_val). The function body, return type, assert, iterator chain, and Value construction are identical. This is pure code duplication that will cause maintenance divergence.",
+      "mutation_type": "heavy_mutation_copy"
+    },
+    {
+      "id": "rs_copy_2",
+      "location": "crates/reify-constraints/src/solver.rs:72",
+      "category": "unused_function",
+      "severity": "suggestion",
+      "description": "create_solution_map() is defined but never called in this diff. If it's meant to replace build_solved_values(), the old function should be removed. If both are needed, they should be consolidated into one.",
+      "mutation_type": "heavy_mutation_copy"
+    }
+  ]
+}

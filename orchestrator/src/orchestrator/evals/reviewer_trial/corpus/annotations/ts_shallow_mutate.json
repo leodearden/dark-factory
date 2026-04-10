@@ -1,0 +1,29 @@
+{
+  "diff_id": "ts_shallow_mutate",
+  "ground_truth": [
+    {
+      "id": "ts_shallow_1",
+      "location": "gui/src/stores/claudeStore.ts:158",
+      "category": "store_reference_leak",
+      "severity": "blocking",
+      "description": "toolCall object is created outside the produce() callback and holds a direct reference to msg.tool_input (not a deep copy). When this object is pushed into the Solid.js store via produce(), the store wraps it in a reactive proxy, but msg.tool_input remains the original mutable reference. If the WebSocket message handler or any upstream code later modifies msg.tool_input, it will silently mutate the store state without triggering reactivity, causing stale UI.",
+      "mutation_type": "shallow_mutate"
+    },
+    {
+      "id": "ts_shallow_2",
+      "location": "gui/src/stores/claudeStore.ts:156",
+      "category": "store_read_outside_tracking",
+      "severity": "blocking",
+      "description": "Accessing state.messages[idx] outside of a tracked context (batch doesn't create a tracking scope) to read toolCalls.length for the ID. In Solid.js, reading store properties outside of createEffect/createMemo/JSX doesn't subscribe to updates. More critically, if another tool_call arrives between this read and the produce() execution, the length-based ID will be wrong (duplicate IDs).",
+      "mutation_type": "shallow_mutate"
+    },
+    {
+      "id": "ts_shallow_3",
+      "location": "gui/src/stores/claudeStore.ts:189",
+      "category": "shallow_copy_nested_mutation",
+      "severity": "blocking",
+      "description": "The resultCache is constructed via spread ({ ...(state.messages[idx] as any).resultCache || {} }) which is a shallow copy. The inner objects ({output, is_error}) are new, so this particular spread is safe. However, assigning resultCache inside produce() replaces the entire cache object, breaking any existing reactive subscriptions to individual cache entries in the Solid.js store.",
+      "mutation_type": "shallow_mutate"
+    }
+  ]
+}

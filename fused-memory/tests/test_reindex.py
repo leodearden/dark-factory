@@ -4,6 +4,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from conftest import assert_ro_query_only
 
 from fused_memory.backends.graphiti_client import (
     EdgeNotFoundError,
@@ -148,11 +149,7 @@ class TestGetNodeText:
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
         """get_node_text uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock([['Node', 'Summary']])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.get_node_text('uuid-1', group_id='test')
-        graph.ro_query.assert_awaited_once()
-        graph.query.assert_not_awaited()
+        await assert_ro_query_only(backend, make_graph_mock, [['Node', 'Summary']], 'get_node_text', 'uuid-1', group_id='test')
 
 
 class TestGetEdgeText:
@@ -196,11 +193,7 @@ class TestGetEdgeText:
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
         """get_edge_text uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock([['edge-name', 'Some fact']])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.get_edge_text('edge-uuid-1', group_id='test')
-        graph.ro_query.assert_awaited_once()
-        graph.query.assert_not_awaited()
+        await assert_ro_query_only(backend, make_graph_mock, [['edge-name', 'Some fact']], 'get_edge_text', 'edge-uuid-1', group_id='test')
 
 
 # ---------------------------------------------------------------------------
@@ -313,11 +306,11 @@ class TestListIndices:
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
         """list_indices uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock([])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.list_indices(group_id='test')
-        graph.ro_query.assert_awaited_once()
-        graph.query.assert_not_awaited()
+        graph = await assert_ro_query_only(backend, make_graph_mock, [], 'list_indices', group_id='test')
+        args, kwargs = graph.ro_query.call_args
+        cypher = args[0] if args else next(iter(kwargs.values()), '')
+        assert 'db.indexes' in cypher
+
 
 
 class TestDropIndex:
@@ -939,3 +932,46 @@ class TestRunReindexDelegation:
             expected_dim=1536,
         )
         assert result is mock_result
+
+
+# ---------------------------------------------------------------------------
+# step-{task-527}: GraphitiBackend.node_count
+# ---------------------------------------------------------------------------
+
+class TestNodeCount:
+    """GraphitiBackend.node_count(graph_name) returns node count for the named graph."""
+
+    @pytest.mark.asyncio
+    async def test_returns_count(self, mock_config, make_backend, make_graph_mock):
+        """Returns the integer count from result_set[0][0]."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([[42]])
+        backend.client.driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.node_count('my_graph')
+        assert result == 42
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_when_empty(self, mock_config, make_backend, make_graph_mock):
+        """Returns 0 when result_set is empty."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend.client.driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.node_count('empty_graph')
+        assert result == 0
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        """Raises RuntimeError when client is None."""
+        backend = GraphitiBackend(mock_config)  # client is None
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.node_count('some_graph')
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """node_count uses ro_query (read-only path) and never calls graph.query."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([[7]])
+        backend.client.driver._get_graph = MagicMock(return_value=graph)
+        await backend.node_count('test_graph')
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()

@@ -1,0 +1,21 @@
+{
+  "diff_id": "ts_real_01",
+  "ground_truth": [
+    {
+      "id": "ts_real_goto_1",
+      "location": "gui/src/editor/gotoDefinition.ts:105",
+      "category": "use_after_destroy",
+      "severity": "blocking",
+      "description": "The gotoDefinition handler fires an async requestDefinition() and then calls view.dispatch() in the .then() callback. If the EditorView has been destroyed (e.g., user navigated away) before the promise resolves, view.dispatch() will throw on a disconnected DOM. The fix adds a guard checking view.dom.isConnected before dispatching.",
+      "mutation_type": "real_world"
+    },
+    {
+      "id": "ts_real_goto_2",
+      "location": "gui/src/__tests__/gotoDefinition.test.ts:66",
+      "category": "missing_test_coverage",
+      "severity": "suggestion",
+      "description": "The test mocks add dom: { isConnected: true } to satisfy the new guard, but there is no test case verifying the guard actually prevents dispatch when isConnected is false. A negative test case would validate the fix works.",
+      "mutation_type": "real_world"
+    }
+  ]
+}

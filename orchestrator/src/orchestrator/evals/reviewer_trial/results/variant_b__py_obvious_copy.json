@@ -1,0 +1,72 @@
+{
+  "variant_name": "variant_b",
+  "diff_id": "py_obvious_copy",
+  "reviews": {
+    "opus_bug_hunter": {
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:66-83",
+          "category": "missing_error_handling",
+          "description": "`_count_diff_changes` has no try/except, unlike the sibling `_git_diff_stats` (lines 138-165) which wraps everything in `try/except Exception: return 0, 0`. If `git` is not found, the subprocess fails, or the output format is unexpected, this function will propagate an unhandled exception to any caller. The `int(part.split()[0])` parse on the summary line will raise `ValueError` or `IndexError` on unexpected git output formats (e.g. a summary part containing 'insertion' or 'deletion' as a substring without a leading integer).",
+          "suggested_fix": "Wrap the function body in `try/except Exception: return 0, 0` to match the defensive pattern of `_git_diff_stats`, or at minimum guard the `int()` parse with a try/except."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:66-83",
+          "category": "dead_code",
+          "description": "`_count_diff_changes` is defined but never called. `collect_metrics` (line 102) still calls `_git_diff_stats`. The two functions are near-duplicates \u2014 both run `git diff --stat` against a base ref and parse the summary line. The only differences are parameter naming, git range syntax (`base_ref HEAD` vs `{base_commit}..HEAD`), and the parsing approach (string splitting vs regex).",
+          "suggested_fix": "Either wire `_count_diff_changes` into a caller or delete it. If the intent is to replace `_git_diff_stats`, refactor that function instead of duplicating it. The regex-based parsing in the existing function is more robust than the string-split approach."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:75",
+          "category": "fragile_parsing",
+          "description": "`files_changed = max(0, len(lines) - 1)` assumes every line except the last is a file entry. This breaks if git outputs additional decorative lines, warnings, or if the diff is binary (where git may add extra annotation lines). The existing `_git_diff_stats` uses `re.search(r'(\\d+) files? changed', summary)` which is strictly more robust \u2014 it extracts the actual count from the summary line rather than inferring it from line count.",
+          "suggested_fix": "Parse the file count from the summary line using a regex like the existing function does: `re.search(r'(\\d+) files? changed', summary)`."
+        }
+      ],
+      "reviewer": "opus_bug_hunter",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The new `_count_diff_changes` function is a near-duplicate of the existing `_git_diff_stats` but with weaker error handling and more fragile parsing. It lacks the try/except guard present in its sibling, meaning any subprocess failure or unexpected git output format will propagate as an unhandled exception. The function is also dead code \u2014 nothing calls it, as `collect_metrics` still uses `_git_diff_stats`. None of these are blocking since the code is unreachable today, but they represent latent bugs that would surface immediately if the function were wired in."
+    },
+    "opus_design_critic": {
+      "reviewer": "opus_design_critic",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:66-83",
+          "category": "code_duplication",
+          "description": "`_count_diff_changes` is a near-exact duplicate of the existing `_git_diff_stats` function (lines 138-165 in the same file). Both run `git diff --stat` against a base ref, parse the summary line, and return `tuple[int, int]` of (lines_changed, files_changed). The only differences are cosmetic: parameter naming (`repo_path`/`base_ref` vs `worktree`/`base_commit`), git range syntax (positional args vs `..` range), and parsing strategy (string splitting vs regex). The new function is never called anywhere\u2014`collect_metrics` still uses `_git_diff_stats` at line 102\u2014making it unreachable dead code on top of a duplicate.",
+          "suggested_fix": "Remove `_count_diff_changes` entirely. If a different calling convention or range syntax is needed, refactor `_git_diff_stats` in place and update its single call site in `collect_metrics`."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:66-83",
+          "category": "missing_error_handling",
+          "description": "`_git_diff_stats` wraps its entire body in `try/except Exception: return 0, 0`, establishing a defensive pattern for git subprocess calls in this module. `_count_diff_changes` has no error handling at all. If git is unavailable, the cwd is invalid, or the subprocess fails, the exception propagates uncaught. Additionally, `lines[-1]` will raise `IndexError` when `lines` is empty (e.g., no diff output).",
+          "suggested_fix": "If the function is kept (it should not be\u2014see duplication issue), wrap the body in `try/except Exception: return 0, 0` matching the established pattern."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:78-82",
+          "category": "fragile_parsing",
+          "description": "The summary-line parsing in `_count_diff_changes` uses `str.split(',')` and substring matching (`'insertion' in part`), which is less robust than the regex approach in `_git_diff_stats`. It does not handle the singular form ('file changed' vs 'files changed'), and would silently produce wrong results if git's locale or format changes. The existing `_git_diff_stats` uses `re.search`/`re.finditer` which handles these variations correctly.",
+          "suggested_fix": "Reuse the regex-based parsing from `_git_diff_stats` if this function is retained."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:73",
+          "category": "inconsistent_convention",
+          "description": "`_git_diff_stats` uses the two-dot range format `{base_commit}..HEAD` while `_count_diff_changes` passes `base_ref` and `HEAD` as separate positional arguments. While often equivalent, this inconsistency within the same module is confusing and the two forms can diverge when branches have diverged.",
+          "suggested_fix": "Stick with the `base..HEAD` convention already established by `_git_diff_stats`."
+        }
+      ],
+      "summary": "`_count_diff_changes` is a near-exact duplicate of the existing `_git_diff_stats` in the same file, with no call site anywhere in the codebase\u2014it is dead code. It also breaks the module's established error-handling pattern (no try/except) and uses a less robust parsing strategy. The function should be removed entirely; if a different calling convention is needed, `_git_diff_stats` should be refactored in place."
+    }
+  },
+  "total_cost_usd": 0.4044215,
+  "wall_clock_ms": 62534,
+  "errors": []
+}

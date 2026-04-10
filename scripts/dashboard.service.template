@@ -1,0 +1,28 @@
+[Unit]
+Description=Dark Factory Dashboard (monitoring UI)
+Documentation=file://__REPO_ROOT__/dashboard/prd.md
+After=network.target fused-memory.service
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO_ROOT__
+ExecStart=__UV_PATH__ run --project dashboard \
+  python -m uvicorn dashboard.app:app \
+  --host 127.0.0.1 --port 8080
+
+# Multi-project cost aggregation (comma-separated, no spaces)
+Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory,/home/leo/src/reify,/home/leo/src/autopilot-video
+
+# Restart policy: always restart on failure, back off up to 60s
+Restart=on-failure
+RestartSec=5
+RestartMaxDelaySec=60
+
+TimeoutStopSec=15
+
+# Logging goes to journalctl --user -u dark-factory-dashboard
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

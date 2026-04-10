@@ -5,9 +5,12 @@ from __future__ import annotations
 import re
 
 from fused_memory.reconciliation.task_filter import (
+    _STATUS_PRIORITY,
     FilteredTaskTree,
+    _render_task_line,
     filter_task_tree,
     format_filtered_task_tree,
+    format_task_list,
 )
 
 
@@ -511,3 +514,120 @@ class TestFormatFilteredTaskTree:
             f'Output length {len(output)} exceeds max_chars=5000; '
             f'deps display is not being truncated'
         )
+
+
+class TestFilterTaskTreeDoneAndCancelledLists:
+    """Tests for done_tasks and cancelled_tasks list fields on FilteredTaskTree."""
+
+    def test_filter_task_tree_exposes_done_tasks_list(self):
+        """filter_task_tree populates done_tasks as a list sorted by id descending."""
+        tasks_data = {
+            'tasks': [
+                {'id': 5, 'title': 'Done 5', 'status': 'done', 'dependencies': []},
+                {'id': 10, 'title': 'Done 10', 'status': 'done', 'dependencies': []},
+                {'id': 3, 'title': 'Done 3', 'status': 'done', 'dependencies': []},
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert isinstance(result.done_tasks, list)
+        assert len(result.done_tasks) == 3
+        ids = [t['id'] for t in result.done_tasks]
+        assert ids == [10, 5, 3], f'Expected [10, 5, 3] (descending), got {ids}'
+        assert result.done_count == 3
+
+    def test_filter_task_tree_exposes_cancelled_tasks_list(self):
+        """filter_task_tree populates cancelled_tasks as a list sorted by id descending."""
+        tasks_data = {
+            'tasks': [
+                {'id': 7, 'title': 'Cancelled 7', 'status': 'cancelled', 'dependencies': []},
+                {'id': 2, 'title': 'Cancelled 2', 'status': 'cancelled', 'dependencies': []},
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert isinstance(result.cancelled_tasks, list)
+        assert len(result.cancelled_tasks) == 2
+        ids = [t['id'] for t in result.cancelled_tasks]
+        assert ids == [7, 2], f'Expected [7, 2] (descending), got {ids}'
+        assert result.cancelled_count == 2
+
+    def test_filter_task_tree_done_and_cancelled_empty_by_default(self):
+        """Empty input yields empty done_tasks and cancelled_tasks lists."""
+        result = filter_task_tree({})
+
+        assert result.done_tasks == []
+        assert result.cancelled_tasks == []
+        assert result.done_count == 0
+        assert result.cancelled_count == 0
+
+
+class TestStatusPriorityIncludesDone:
+    """Tests that _STATUS_PRIORITY includes 'done' and all expected keys."""
+
+    def test_status_priority_includes_done(self):
+        """_STATUS_PRIORITY must contain 'done': 4."""
+        assert 'done' in _STATUS_PRIORITY, (
+            "_STATUS_PRIORITY is missing 'done' key; task_filter is the source of truth"
+        )
+        assert _STATUS_PRIORITY['done'] == 4, (
+            f"Expected _STATUS_PRIORITY['done'] == 4, got {_STATUS_PRIORITY['done']}"
+        )
+
+    def test_status_priority_has_all_expected_keys(self):
+        """_STATUS_PRIORITY must contain all six status keys with correct priority values."""
+        expected = {
+            'in-progress': 0,
+            'blocked': 1,
+            'review': 2,
+            'pending': 3,
+            'done': 4,
+            'deferred': 5,
+        }
+        for status, priority in expected.items():
+            assert status in _STATUS_PRIORITY, (
+                f"_STATUS_PRIORITY missing key '{status}'"
+            )
+            assert _STATUS_PRIORITY[status] == priority, (
+                f"_STATUS_PRIORITY['{status}'] = {_STATUS_PRIORITY[status]}, expected {priority}"
+            )
+
+
+class TestRenderTaskLineAndFormatTaskList:
+    """Tests for _render_task_line and format_task_list helpers."""
+
+    def test_render_task_line_basic(self):
+        """_render_task_line produces '- [id] (status) title deps=[]' format."""
+        task = {'id': 1, 'status': 'pending', 'title': 'X', 'dependencies': []}
+        result = _render_task_line(task)
+        assert result == '- [1] (pending) X deps=[]'
+
+    def test_render_task_line_truncates_deps_over_5(self):
+        """_render_task_line truncates deps to first 5 items with '...' suffix."""
+        task = {'id': 2, 'status': 'in-progress', 'title': 'Y', 'dependencies': list(range(1, 9))}
+        result = _render_task_line(task)
+        assert 'deps=[1, 2, 3, 4, 5]...' in result
+
+    def test_render_task_line_deps_none_normalized(self):
+        """_render_task_line treats deps=None as empty list."""
+        task = {'id': 3, 'status': 'review', 'title': 'Z', 'dependencies': None}
+        result = _render_task_line(task)
+        assert 'deps=[]' in result
+        assert 'deps=None' not in result
+
+    def test_render_task_line_missing_fields(self):
+        """_render_task_line uses '?' defaults for missing id/status/title."""
+        result = _render_task_line({})
+        assert result == '- [?] (?) ? deps=[]'
+
+    def test_format_task_list_empty_returns_no_tasks(self):
+        """format_task_list([]) returns 'No tasks.'."""
+        assert format_task_list([]) == 'No tasks.'
+
+    def test_format_task_list_joins_rendered_lines(self):
+        """format_task_list of 2 tasks returns their rendered lines joined by newline."""
+        t1 = {'id': 1, 'status': 'pending', 'title': 'Alpha', 'dependencies': []}
+        t2 = {'id': 2, 'status': 'done', 'title': 'Beta', 'dependencies': []}
+        result = format_task_list([t1, t2])
+        expected = _render_task_line(t1) + '\n' + _render_task_line(t2)
+        assert result == expected

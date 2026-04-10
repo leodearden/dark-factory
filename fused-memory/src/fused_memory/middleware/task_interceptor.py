@@ -1,7 +1,9 @@
 """Intercepts task state transitions for targeted reconciliation."""
 
 import asyncio
+import hashlib
 import logging
+import time
 import uuid as uuid_mod
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -16,10 +18,15 @@ from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 if TYPE_CHECKING:
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.middleware.task_dedup import TaskDeduplicator
     from fused_memory.middleware.task_file_committer import TaskFileCommitter
     from fused_memory.reconciliation.targeted import TargetedReconciler
 
 logger = logging.getLogger(__name__)
+
+# Dedup cache: suppress identical add_task calls within this window (seconds).
+_DEDUP_CACHE_TTL = 300
 
 
 class TaskInterceptor:
@@ -34,12 +41,19 @@ class TaskInterceptor:
         targeted_reconciler: 'TargetedReconciler | None',
         event_buffer: EventBuffer,
         task_committer: 'TaskFileCommitter | None' = None,
+        config: 'FusedMemoryConfig | None' = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
         self.buffer = event_buffer
         self.task_committer = task_committer
         self._background_tasks: set[asyncio.Task] = set()
+
+        # Layer 1: in-memory title-hash cache  {hash -> (task_result, timestamp)}
+        self._dedup_cache: dict[str, tuple[dict, float]] = {}
+        # Layer 2: Qdrant vector similarity (created lazily)
+        self._config = config
+        self._deduplicator: TaskDeduplicator | None = None
 
     async def _ensure_taskmaster(self) -> TaskmasterBackend:
         """Return a connected TaskmasterBackend, or raise with a structured error."""
@@ -236,12 +250,92 @@ class TaskInterceptor:
 
         return result
 
+    # ── Dedup helpers ─────────��─────────────────────────────────────────
+
+    @staticmethod
+    def _title_hash(title: str) -> str:
+        """Deterministic hash of a normalized title for the dedup cache."""
+        normalized = ' '.join(title.lower().split())
+        return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+    def _check_dedup_cache(self, title: str) -> dict | None:
+        """Layer 1: check the in-memory title-hash cache.
+
+        Returns the cached task result if a matching title was created
+        within the TTL window, otherwise None.  Also evicts stale entries.
+        """
+        now = time.monotonic()
+        # Lazy eviction
+        stale = [k for k, (_, ts) in self._dedup_cache.items() if now - ts > _DEDUP_CACHE_TTL]
+        for k in stale:
+            del self._dedup_cache[k]
+
+        h = self._title_hash(title)
+        entry = self._dedup_cache.get(h)
+        if entry is not None:
+            cached_result, ts = entry
+            if now - ts <= _DEDUP_CACHE_TTL:
+                return cached_result
+            del self._dedup_cache[h]
+        return None
+
+    def _store_dedup_cache(self, title: str, result: dict) -> None:
+        self._dedup_cache[self._title_hash(title)] = (result, time.monotonic())
+
+    async def _get_deduplicator(self) -> 'TaskDeduplicator | None':
+        """Lazily create the Qdrant-backed deduplicator."""
+        if self._deduplicator is not None:
+            return self._deduplicator
+        if self._config is None:
+            return None
+        try:
+            from fused_memory.middleware.task_dedup import TaskDeduplicator
+
+            self._deduplicator = TaskDeduplicator(self._config)
+            return self._deduplicator
+        except Exception:
+            logger.warning('Failed to create TaskDeduplicator', exc_info=True)
+            return None
+
     # ── Write pass-throughs (emit event, no targeted reconciliation) ───
 
     async def add_task(self, project_root: str, **kwargs: Any) -> dict:
         # Extract metadata before forwarding — taskmaster's add_task doesn't accept it
         metadata = kwargs.pop('metadata', None)
+        title = kwargs.get('title') or kwargs.get('prompt') or ''
 
+        # ── Dedup Layer 1: in-memory title-hash cache ────────────────
+        if title:
+            cached = self._check_dedup_cache(title)
+            if cached is not None:
+                task_id = cached.get('id', '?')
+                logger.warning(
+                    'task_dedup: exact title match in cache — returning existing task %s '
+                    'instead of creating duplicate: %s',
+                    task_id, title[:80],
+                )
+                return cached
+
+        # ── Dedup Layer 2: Qdrant vector similarity ──────────────────
+        if title:
+            deduplicator = await self._get_deduplicator()
+            if deduplicator is not None:
+                project_id = resolve_project_id(project_root)
+                match = await deduplicator.find_duplicate(title, project_id)
+                if match is not None:
+                    logger.warning(
+                        'task_dedup: similar task found (score=%.3f) — returning '
+                        'existing task %s instead of creating duplicate: %s',
+                        match['score'], match['task_id'], title[:80],
+                    )
+                    return {
+                        'id': match['task_id'],
+                        'title': match['task_title'],
+                        'deduplicated': True,
+                        'similarity_score': match['score'],
+                    }
+
+        # ── Create task ──────────────────────────────────────────────
         tm = await self._ensure_taskmaster()
         result = await tm.add_task(project_root=project_root, **kwargs)
 
@@ -256,6 +350,20 @@ class TaskInterceptor:
                 )
             except Exception as e:
                 logger.warning(f'add_task: metadata update for task {task_id} failed: {e}')
+
+        # ── Record in dedup stores ────────────���──────────────────────
+        if title and isinstance(result, dict):
+            self._store_dedup_cache(title, result)
+            deduplicator = await self._get_deduplicator()
+            if deduplicator is not None and task_id:
+                project_id = resolve_project_id(project_root)
+                # Fire-and-forget — don't block on embedding write
+                bg = asyncio.create_task(
+                    deduplicator.record_task(task_id, title, project_id),
+                    name=f'dedup-record-{task_id}',
+                )
+                self._background_tasks.add(bg)
+                bg.add_done_callback(lambda t: self._background_tasks.discard(t))
 
         event = self._make_event(
             EventType.task_created,
