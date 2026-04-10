@@ -240,6 +240,8 @@ MOCK_RUNS = [
     }
 ]
 
+MOCK_RUNS_NO_JOURNAL = [{**MOCK_RUNS[0], 'journal_entry_count': 0}]
+
 MOCK_LAST_ATTEMPTED = {
     'dark_factory': {
         'id': 'run-002',
@@ -647,13 +649,7 @@ class TestReconJournalBadge:
         assert '>3<' in html or '>\n                    3\n' in html or '3</button>' in html
 
     def test_badge_hidden_when_count_zero(self, client):
-        runs_no_journal = [
-            {
-                **MOCK_RUNS[0],
-                'journal_entry_count': 0,
-            }
-        ]
-        with _patch_recon_data(runs=runs_no_journal):
+        with _patch_recon_data(runs=MOCK_RUNS_NO_JOURNAL):
             html = client.get('/partials/recon').text
         assert 'data-testid="journal-badge"' not in html
 
@@ -717,7 +713,7 @@ class TestReconDetailTrigger:
         assert "x-data='{ open: false }'" not in html
 
     def test_zero_journal_count_hides_badge_and_detail(self, client):
-        runs_zero = [{**MOCK_RUNS[0], 'journal_entry_count': 0}]
+        runs_zero = MOCK_RUNS_NO_JOURNAL
         with _patch_recon_data(runs=runs_zero):
             html = client.get('/partials/recon').text
         assert 'data-testid="journal-badge"' not in html
@@ -930,7 +926,7 @@ class TestRunPanelJournalBadgeRegression:
 
     def test_badge_hidden_with_zero_entries(self, client):
         """Badge not rendered when journal_entry_count == 0."""
-        runs_zero = [{**MOCK_RUNS[0], 'journal_entry_count': 0}]
+        runs_zero = MOCK_RUNS_NO_JOURNAL
         with _patch_recon_data(runs=runs_zero):
             html = client.get('/partials/recon').text
         assert 'data-testid="journal-badge"' not in html
@@ -1150,7 +1146,7 @@ class TestDetailRowJournalGuard:
 
     def test_detail_row_not_emitted_when_journal_count_zero(self, client):
         """When journal_entry_count=0 the detail <tr x-show="open"> must not be emitted."""
-        runs_zero = [{**MOCK_RUNS[0], 'journal_entry_count': 0}]
+        runs_zero = MOCK_RUNS_NO_JOURNAL
         with _patch_recon_data(runs=runs_zero):
             html = client.get('/partials/recon').text
         assert 'x-show="open"' not in html
@@ -1158,7 +1154,7 @@ class TestDetailRowJournalGuard:
 
     def test_no_orphaned_x_cloak_when_journal_count_zero(self, client):
         """When journal_entry_count=0 there must be no x-cloak on orphaned detail row."""
-        runs_zero = [{**MOCK_RUNS[0], 'journal_entry_count': 0}]
+        runs_zero = MOCK_RUNS_NO_JOURNAL
         with _patch_recon_data(runs=runs_zero):
             html = client.get('/partials/recon').text
         assert 'x-cloak' not in html
