@@ -1415,12 +1415,7 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
         )
 
         # (b) done tasks appear in descending id order: 10, 8, 5, 3
-        recently_idx = payload.index('### Recently Completed Tasks')
-        # Find the next section after Recently Completed
-        next_section_idx = payload.find('\n#', recently_idx + 1)
-        if next_section_idx == -1:
-            next_section_idx = len(payload)
-        section_text = payload[recently_idx:next_section_idx]
+        section_text = _extract_section(payload, '### Recently Completed Tasks')
 
         pos_10 = section_text.find('[10]')
         pos_8 = section_text.find('[8]')
@@ -1588,13 +1583,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         assert 'Task 20' in payload
         # Recently Completed: done_count > 0 but done_tasks=[] (harness path)
         # Either the section is absent (future-proof) OR it mentions the count '5'
-        recently_section = ''
-        if '### Recently Completed Tasks' in payload:
-            recently_idx = payload.index('### Recently Completed Tasks')
-            next_section_idx = payload.find('\n#', recently_idx + 1)
-            if next_section_idx == -1:
-                next_section_idx = len(payload)
-            recently_section = payload[recently_idx:next_section_idx]
+        recently_section = _extract_section(payload, '### Recently Completed Tasks')
         assert '### Recently Completed Tasks' not in payload or '5' in recently_section, (
             "Expected '### Recently Completed Tasks' absent or done_count '5' in section body"
         )
@@ -1746,13 +1735,8 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
             "Payload missing '### Recently Completed Tasks' header in fallback path"
         )
 
-        # (b) Extract the Recently Completed section body (same pattern as
-        #     test_payload_recently_completed_tasks_sorted_desc lines 1403-1408)
-        recently_idx = payload.index('### Recently Completed Tasks')
-        next_section_idx = payload.find('\n#', recently_idx + 1)
-        if next_section_idx == -1:
-            next_section_idx = len(payload)
-        recently_section = payload[recently_idx:next_section_idx]
+        # (b) Extract the Recently Completed section body
+        recently_section = _extract_section(payload, '### Recently Completed Tasks')
 
         # (c) Done-task ids must appear INSIDE the Recently Completed section (scoped)
         assert '[10]' in recently_section, "Done task id=10 not found in Recently Completed section"
