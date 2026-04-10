@@ -1203,3 +1203,18 @@ class TestDetailRowJournalGuard:
         # Positive-count row: both badge and detail row must be emitted
         assert 'data-testid="journal-badge"' in pos_tbody
         assert 'data-testid="run-detail-row"' in pos_tbody
+
+
+class TestMockRunsFactory:
+    """Verify that mock_runs() is a proper factory: each call returns a fresh list with fresh dicts."""
+
+    def test_mock_runs_returns_fresh_copy_each_call(self):
+        """mock_runs() must allocate new list and new inner dict objects on every call."""
+        # Distinct list identity
+        assert mock_runs() is not mock_runs()
+        # Distinct inner-dict identity
+        assert mock_runs()[0] is not mock_runs()[0]
+        # Mutation of one call's result must not affect the next call
+        first = mock_runs()
+        first[0]['events_processed'] = 999
+        assert mock_runs()[0]['events_processed'] == 7
