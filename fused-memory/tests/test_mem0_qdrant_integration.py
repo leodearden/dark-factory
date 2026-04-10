@@ -18,7 +18,7 @@ from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedR
 from qdrant_client.models import Distance, VectorParams
 
 QDRANT_URL = 'http://localhost:6333'
-TEST_COLLECTION = '_test_mem0_qdrant_integration'
+_COLLECTION_PREFIX = '_test_mem0_qdrant_integration'
 VECTOR_DIM = 8  # tiny vectors for speed
 
 
@@ -39,26 +39,32 @@ pytestmark = [
 
 
 @pytest.fixture
-def qdrant():
+def test_collection(worker_id):
+    """Per-worker collection name to avoid races under pytest-xdist."""
+    return f'{_COLLECTION_PREFIX}_{worker_id}'
+
+
+@pytest.fixture
+def qdrant(test_collection):
     """Provide a QdrantClient and clean up the test collection after each test."""
     client = QdrantClient(url=QDRANT_URL, timeout=10)
     # Ensure clean state
     with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
-        client.delete_collection(TEST_COLLECTION)
+        client.delete_collection(test_collection)
     client.create_collection(
-        collection_name=TEST_COLLECTION,
+        collection_name=test_collection,
         vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE),
     )
     yield client
     with contextlib.suppress(Exception):
-        client.delete_collection(TEST_COLLECTION)
+        client.delete_collection(test_collection)
     client.close()
 
 
 class TestPointStructCompat:
     """Verify qdrant-client PointStruct accepts the patterns mem0 uses."""
 
-    def test_upsert_with_vector(self, qdrant: QdrantClient):
+    def test_upsert_with_vector(self, qdrant: QdrantClient, test_collection: str):
         """Standard upsert with id + vector + payload (mem0 insert path)."""
         from qdrant_client.models import PointStruct
 
@@ -67,14 +73,14 @@ class TestPointStructCompat:
             vector=[0.1] * VECTOR_DIM,
             payload={'text': 'hello', 'user_id': 'u1'},
         )
-        qdrant.upsert(collection_name=TEST_COLLECTION, points=[point])
+        qdrant.upsert(collection_name=test_collection, points=[point])
 
-        result = qdrant.retrieve(TEST_COLLECTION, ids=[1], with_payload=True)
+        result = qdrant.retrieve(test_collection, ids=[1], with_payload=True)
         assert len(result) == 1
         assert result[0].payload is not None
         assert result[0].payload['text'] == 'hello'
 
-    def test_set_payload_without_vector(self, qdrant: QdrantClient):
+    def test_set_payload_without_vector(self, qdrant: QdrantClient, test_collection: str):
         """Payload-only update via set_payload (mem0 >=1.0.10 update path).
 
         This is the fix for the PointStruct(vector=None) crash.
@@ -83,18 +89,18 @@ class TestPointStructCompat:
 
         # Insert initial point
         qdrant.upsert(
-            collection_name=TEST_COLLECTION,
+            collection_name=test_collection,
             points=[PointStruct(id=1, vector=[0.1] * VECTOR_DIM, payload={'v': '1'})],
         )
 
         # Update payload only — no vector
         qdrant.set_payload(
-            collection_name=TEST_COLLECTION,
+            collection_name=test_collection,
             payload={'v': '2', 'agent_id': 'new-agent'},
             points=[1],
         )
 
-        result = qdrant.retrieve(TEST_COLLECTION, ids=[1], with_payload=True, with_vectors=True)
+        result = qdrant.retrieve(test_collection, ids=[1], with_payload=True, with_vectors=True)
         assert result[0].payload is not None
         assert result[0].payload['v'] == '2'
         assert result[0].payload['agent_id'] == 'new-agent'
@@ -110,19 +116,19 @@ class TestMem0VectorStoreUpdate:
     was passing vector=None to PointStruct, which qdrant-client 1.17+ rejects.
     """
 
-    def test_update_payload_only(self, qdrant: QdrantClient):
+    def test_update_payload_only(self, qdrant: QdrantClient, test_collection: str):
         """mem0 update(vector_id, vector=None, payload={...}) must not raise."""
         from mem0.vector_stores.qdrant import Qdrant as Mem0Qdrant
 
         store = Mem0Qdrant.__new__(Mem0Qdrant)
         store.client = qdrant
-        store.collection_name = TEST_COLLECTION
+        store.collection_name = test_collection
 
         # Insert a point first
         from qdrant_client.models import PointStruct
 
         qdrant.upsert(
-            collection_name=TEST_COLLECTION,
+            collection_name=test_collection,
             points=[PointStruct(
                 id=42,
                 vector=[0.5] * VECTOR_DIM,
@@ -134,7 +140,7 @@ class TestMem0VectorStoreUpdate:
         # cast: mem0's update() signature declares vector: list but accepts None at runtime
         store.update(vector_id=42, vector=cast(list, None), payload={'text': 'original', 'agent_id': 'new'})
 
-        result = qdrant.retrieve(TEST_COLLECTION, ids=[42], with_payload=True, with_vectors=True)
+        result = qdrant.retrieve(test_collection, ids=[42], with_payload=True, with_vectors=True)
         assert result[0].payload is not None
         assert result[0].payload['agent_id'] == 'new'
         assert result[0].payload['text'] == 'original'
@@ -142,18 +148,18 @@ class TestMem0VectorStoreUpdate:
         assert result[0].vector is not None
         assert len(result[0].vector) == VECTOR_DIM
 
-    def test_update_vector_only(self, qdrant: QdrantClient):
+    def test_update_vector_only(self, qdrant: QdrantClient, test_collection: str):
         """mem0 update(vector_id, vector=[...], payload=None) must not raise."""
         from mem0.vector_stores.qdrant import Qdrant as Mem0Qdrant
 
         store = Mem0Qdrant.__new__(Mem0Qdrant)
         store.client = qdrant
-        store.collection_name = TEST_COLLECTION
+        store.collection_name = test_collection
 
         from qdrant_client.models import PointStruct
 
         qdrant.upsert(
-            collection_name=TEST_COLLECTION,
+            collection_name=test_collection,
             points=[PointStruct(
                 id=43,
                 vector=[0.1] * VECTOR_DIM,
@@ -165,30 +171,30 @@ class TestMem0VectorStoreUpdate:
         # cast: mem0's update() signature declares payload: dict but accepts None at runtime
         store.update(vector_id=43, vector=new_vec, payload=cast(dict, None))
 
-        result = qdrant.retrieve(TEST_COLLECTION, ids=[43], with_payload=True, with_vectors=True)
+        result = qdrant.retrieve(test_collection, ids=[43], with_payload=True, with_vectors=True)
         assert result[0].vector is not None
         assert len(result[0].vector) == VECTOR_DIM
         assert result[0].payload is not None
         assert result[0].payload['text'] == 'keep me'
 
-    def test_update_both(self, qdrant: QdrantClient):
+    def test_update_both(self, qdrant: QdrantClient, test_collection: str):
         """mem0 update(vector_id, vector=[...], payload={...}) uses upsert."""
         from mem0.vector_stores.qdrant import Qdrant as Mem0Qdrant
 
         store = Mem0Qdrant.__new__(Mem0Qdrant)
         store.client = qdrant
-        store.collection_name = TEST_COLLECTION
+        store.collection_name = test_collection
 
         from qdrant_client.models import PointStruct
 
         qdrant.upsert(
-            collection_name=TEST_COLLECTION,
+            collection_name=test_collection,
             points=[PointStruct(id=44, vector=[0.1] * VECTOR_DIM, payload={'v': '1'})],
         )
 
         store.update(vector_id=44, vector=[0.8] * VECTOR_DIM, payload={'v': '2'})
 
-        result = qdrant.retrieve(TEST_COLLECTION, ids=[44], with_payload=True, with_vectors=True)
+        result = qdrant.retrieve(test_collection, ids=[44], with_payload=True, with_vectors=True)
         assert result[0].vector is not None
         assert len(result[0].vector) == VECTOR_DIM
         assert result[0].payload is not None
