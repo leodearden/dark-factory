@@ -100,6 +100,21 @@ class TestAddMemory:
         service.mem0.add.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_dual_write_returns_mem0_memory_ids(self, service):
+        """dual_write=True must still return Mem0 memory_ids synchronously."""
+        result = await service.add_memory(
+            content='We decided to use PostgreSQL for its JSON support',
+            category='decisions_and_rationale',
+            project_id='test',
+            dual_write=True,
+        )
+        assert result.memory_ids == ['mem0-1'], (
+            f'Expected memory_ids=[\'mem0-1\'] for dual_write, got {result.memory_ids!r}'
+        )
+        assert SourceStore.graphiti in result.stores_written
+        assert SourceStore.mem0 in result.stores_written
+
+    @pytest.mark.asyncio
     async def test_auto_classification(self, service):
         result = await service.add_memory(
             content='The payment gateway depends on the billing API',
