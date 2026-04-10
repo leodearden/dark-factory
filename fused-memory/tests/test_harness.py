@@ -1520,9 +1520,9 @@ class TestHarnessFetchFilteredTaskTree:
         assert result.active_tasks == []
         assert result.total_count == 0
 
-        # Must have logged a warning
+        # Must have logged a warning containing BOTH the project_root and exception message
         assert any(
-            'connection refused' in r.message or '/abs/path' in r.message
+            'connection refused' in r.message and '/abs/path' in r.message
             for r in caplog.records if r.levelno >= logging.WARNING
         )
 
