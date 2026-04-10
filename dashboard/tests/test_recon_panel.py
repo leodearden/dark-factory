@@ -723,6 +723,13 @@ class TestReconDetailTrigger:
         assert 'data-testid="journal-badge"' not in html
         assert 'x-show="open"' not in html
 
+    def test_positive_journal_count_shows_detail_row(self, client):
+        """Default MOCK_RUNS (journal_entry_count=3): detail row is emitted with x-show and data-testid."""
+        with _patch_recon_data():
+            html = client.get('/partials/recon').text
+        assert 'x-show="open"' in html
+        assert 'data-testid="run-detail-row"' in html
+
 
 @pytest.fixture(scope='class')
 def recon_layout_html():
