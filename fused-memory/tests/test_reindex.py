@@ -311,20 +311,6 @@ class TestListIndices:
         cypher = args[0] if args else kwargs.get('query', '')
         assert 'db.indexes' in cypher
 
-    @pytest.mark.asyncio
-    async def test_uses_ro_query_cypher_via_kwargs(self, mock_config, make_backend, make_graph_mock):
-        """Regression: Cypher extraction survives kwargs-style call_args (IndexError guard)."""
-        backend = make_backend(mock_config)
-        graph = make_graph_mock([])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.list_indices(group_id='test')
-        # Simulate a kwargs-only call_args: args=(), kwargs={'query': '...'}.
-        # This is the 2-tuple form that Mock stores internally when ro_query
-        # would be called as ro_query(query='CALL db.indexes() YIELD *').
-        graph.ro_query.call_args = ((), {'query': 'CALL db.indexes() YIELD *'})
-        args, kwargs = graph.ro_query.call_args
-        cypher = args[0] if args else kwargs.get('query', '')
-        assert 'db.indexes' in cypher
 
 
 class TestDropIndex:
