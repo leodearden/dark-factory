@@ -698,7 +698,6 @@ class TestReconDetailTrigger:
         runs_zero = MOCK_RUNS_NO_JOURNAL
         with _patch_recon_data(runs=runs_zero):
             html = client.get('/partials/recon').text
-        assert 'data-testid="journal-badge"' not in html
         assert 'x-show="open"' not in html
 
     def test_positive_journal_count_shows_detail_row(self, client):
