@@ -52,6 +52,10 @@ def _insert_snapshot(
     )
 
 
+def _fake_load(tasks_map):
+    return lambda path: tasks_map[path]
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -226,11 +230,8 @@ class TestCollectSnapshot:
             autopilot_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': autopilot_tasks,
         }
 
-        def fake_load(path):
-            return _tasks_map[path]
-
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
         ):
             await collect_snapshot(conn, config)
@@ -352,16 +353,17 @@ class TestCollectSnapshot:
         # load_task_tree call for the known_project_roots entry that resolves to the same root.
         # Path-keyed dispatch because asyncio.gather fires calls concurrently —
         # an ordered side_effect list can race on thread scheduling.
+        # NOTE: the orchestrator entry's key intentionally omits .resolve() because
+        # _read_project_root_from_config is mocked to return the raw (unresolved)
+        # reify_root, and production burndown.py passes that raw value through to the
+        # tasks.json path construction (see roots_to_snapshot.append around line 100).
         _tasks_map = {
             config.tasks_json: [],
             reify_root / '.taskmaster' / 'tasks' / 'tasks.json': [{'status': 'done'}],
         }
 
-        def fake_load(path):
-            return _tasks_map[path]
-
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
         ):
@@ -420,11 +422,8 @@ class TestCollectSnapshot:
             reify_root / '.taskmaster' / 'tasks' / 'tasks.json': reify_tasks,
         }
 
-        def fake_load(path):
-            return _tasks_map[path]
-
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
         ):
@@ -634,8 +633,8 @@ class TestCollectSnapshot:
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
-        reify_root = Path('/home/leo/src/reify')
-        autopilot_root = Path('/home/leo/src/autopilot-video')
+        reify_root = tmp_path / 'reify'
+        autopilot_root = tmp_path / 'autopilot'
 
         config = DashboardConfig(
             project_root=tmp_path,
