@@ -328,6 +328,7 @@ class TestRebuildEntitySummariesForceDryRun:
 
         backend.get_all_valid_edges.assert_not_awaited()
         backend._rebuild_entity_from_edges.assert_not_awaited()
+        backend.list_entity_nodes.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_force_dry_run_returns_correct_aggregate(self, mock_config, make_backend):
