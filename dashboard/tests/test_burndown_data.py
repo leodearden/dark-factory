@@ -52,6 +52,42 @@ def _insert_snapshot(
     )
 
 
+def _assert_snapshot_counts(
+    row,
+    *,
+    pending: int = 0,
+    in_progress: int = 0,
+    blocked: int = 0,
+    deferred: int = 0,
+    cancelled: int = 0,
+    done: int = 0,
+) -> None:
+    """Assert that a snapshot row matches the expected count values by column name.
+
+    Requires the row to be an aiosqlite.Row (name-based access).  Each count
+    column is checked individually so that mismatch messages identify which
+    column failed and what values were expected vs. actual.
+    """
+    assert row['pending'] == pending, (
+        f'pending: expected {pending}, got {row["pending"]}'
+    )
+    assert row['in_progress'] == in_progress, (
+        f'in_progress: expected {in_progress}, got {row["in_progress"]}'
+    )
+    assert row['blocked'] == blocked, (
+        f'blocked: expected {blocked}, got {row["blocked"]}'
+    )
+    assert row['deferred'] == deferred, (
+        f'deferred: expected {deferred}, got {row["deferred"]}'
+    )
+    assert row['cancelled'] == cancelled, (
+        f'cancelled: expected {cancelled}, got {row["cancelled"]}'
+    )
+    assert row['done'] == done, (
+        f'done: expected {done}, got {row["done"]}'
+    )
+
+
 def _fake_load(tasks_map):
     return lambda path: tasks_map[path]
 
