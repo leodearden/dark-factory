@@ -225,6 +225,24 @@ MOCK_VERDICT = {
     'reviewed_at': '2026-03-19T10:00:00+00:00',
 }
 
+def mock_runs() -> list[dict]:
+    """Return a fresh list with a fresh dict on each call (mutation-safe factory)."""
+    return [
+        {
+            'id': 'run-001',
+            'project_id': 'dark_factory',
+            'run_type': 'full',
+            'trigger_reason': 'staleness_timer',
+            'started_at': '2026-03-19T08:00:00+00:00',
+            'completed_at': '2026-03-19T08:05:00+00:00',
+            'events_processed': 7,
+            'status': 'completed',
+            'duration_seconds': 300.0,
+            'journal_entry_count': 3,
+        }
+    ]
+
+
 MOCK_RUNS = [
     {
         'id': 'run-001',
