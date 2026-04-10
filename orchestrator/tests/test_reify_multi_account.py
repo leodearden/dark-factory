@@ -218,20 +218,21 @@ class TestGateFromReifyConfig:
             )
             assert state.token == f'token-{defn["name"]}'
 
-    def test_gate_skips_account_when_token_missing(self):
+    def test_gate_skips_account_when_token_missing(self, monkeypatch):
         """UsageGate skips accounts whose env var is not set."""
         acct_cfgs = [AccountConfig(**d) for d in REIFY_ACCOUNT_DEFS]
         config = UsageCapConfig(accounts=acct_cfgs)
 
-        # Set only 3 of the 5 tokens
-        partial_env = {
-            'CLAUDE_OAUTH_TOKEN_F': 'token-f',
-            'CLAUDE_OAUTH_TOKEN_E': 'token-e',
-            'CLAUDE_OAUTH_TOKEN_C': 'token-c',
-        }
+        # Set only the 3 present tokens; explicitly delete the 2 missing ones so
+        # ambient environment values (if any) don't accidentally satisfy the lookup.
+        # monkeypatch restores the original env on test teardown automatically.
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_F', 'token-f')
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_E', 'token-e')
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_C', 'token-c')
+        monkeypatch.delenv('CLAUDE_OAUTH_TOKEN_B', raising=False)
+        monkeypatch.delenv('CLAUDE_OAUTH_TOKEN_D', raising=False)
 
-        with patch.dict(os.environ, partial_env, clear=True):
-            gate = UsageGate(config)
+        gate = UsageGate(config)
 
         # Should have exactly 3 accounts (skipped B and D)
         assert len(gate._accounts) == 3
