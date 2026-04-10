@@ -291,7 +291,7 @@ class TestNearCapStateDistinction:
     def test_near_cap_does_not_set_capped_true(self):
         """NEAR_CAP message must NOT set acct.capped=True; must set acct.near_cap=True."""
         gate = make_gate(['a'])
-        msg = "You're now using extra compute credits. Your plan resets in 4h."
+        msg = "You're close to reaching your usage limit. Your plan resets in 4h."
         result = gate.detect_cap_hit('', msg)
         acct = gate._accounts[0]
         assert result is True               # detection must still return True
@@ -312,7 +312,7 @@ class TestNearCapStateDistinction:
         gate = make_gate(['a'])
         acct = gate._accounts[0]
 
-        gate.detect_cap_hit('', "You're now using extra compute credits. Your plan resets in 4h.")
+        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 4h.")
         assert acct.near_cap is True
         assert acct.capped is False
 
@@ -329,7 +329,7 @@ class TestNearCapStateDistinction:
     def test_near_cap_does_not_start_resume_probe(self):
         """NEAR_CAP must NOT launch a resume probe task."""
         gate = make_gate(['a'], wait_for_reset=True)
-        gate.detect_cap_hit('', "You're now using extra compute credits. Your plan resets in 4h.")
+        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 4h.")
         acct = gate._accounts[0]
         assert acct.resume_task is None
 
@@ -337,7 +337,7 @@ class TestNearCapStateDistinction:
         """_handle_near_cap_warning must fire a cost event when cost_store is set."""
         cost_store = make_mock_cost_store()
         gate = make_gate(['a'], cost_store=cost_store)
-        msg = "You're now using extra compute credits. Your plan resets in 4h."
+        msg = "You're close to reaching your usage limit. Your plan resets in 4h."
         with patch.object(gate, '_fire_cost_event') as mock_fire:
             gate.detect_cap_hit('', msg)
         mock_fire.assert_called_once()
@@ -345,7 +345,7 @@ class TestNearCapStateDistinction:
     def test_near_cap_no_cost_event_without_cost_store(self):
         """_handle_near_cap_warning must NOT fire a cost event when cost_store is None."""
         gate = make_gate(['a'], cost_store=None)
-        msg = "You're now using extra compute credits. Your plan resets in 4h."
+        msg = "You're close to reaching your usage limit. Your plan resets in 4h."
         with patch.object(gate, '_fire_cost_event') as mock_fire:
             gate.detect_cap_hit('', msg)
         mock_fire.assert_not_called()
