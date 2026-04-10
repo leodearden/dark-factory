@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from shared.config_models import AccountConfig, UsageCapConfig
@@ -15,6 +15,7 @@ from shared.usage_gate import (
     _extract_cap_message,
     _parse_resets_at,
 )
+from tests.conftest import build_usage_gate
 
 # --- Helpers ---
 
@@ -27,42 +28,20 @@ def _make_gate(
     max_probe_interval_secs: int = 1800,
 ) -> UsageGate:
     """Create a UsageGate with mock accounts (tokens pre-injected)."""
-    acct_cfgs = [
+    all_cfgs = [
         AccountConfig(name='max-a', oauth_token_env='CLAUDE_OAUTH_A'),
         AccountConfig(name='max-b', oauth_token_env='CLAUDE_OAUTH_B'),
         AccountConfig(name='max-c', oauth_token_env='CLAUDE_OAUTH_C'),
-    ][:num_accounts]
-    config = UsageCapConfig(
+    ]
+    all_tokens = ['token-a', 'token-b', 'token-c']
+    return build_usage_gate(
+        all_cfgs[:num_accounts],
+        all_tokens[:num_accounts],
         wait_for_reset=wait_for_reset,
         session_budget_usd=session_budget_usd,
         probe_interval_secs=probe_interval_secs,
         max_probe_interval_secs=max_probe_interval_secs,
-        accounts=acct_cfgs,
     )
-    gate = UsageGate.__new__(UsageGate)
-    gate._config = config
-    gate._open = asyncio.Event()
-    gate._open.set()
-    gate._lock = asyncio.Lock()
-    gate._cumulative_cost = 0.0
-    gate._paused_reason = ''
-    gate._pause_started_at = None
-    gate._total_pause_secs = 0.0
-    gate._cost_store = None
-    gate._project_id = None
-    gate._run_id = None
-    gate._last_account_name = None
-    gate._background_tasks = set()
-    gate._probe_config_dir = MagicMock()
-    # Mock _run_probe so tests don't spawn real `claude` processes.
-    # Tests that need specific probe behavior can override this.
-    gate._run_probe = AsyncMock(return_value=True)
-    tokens = ['token-a', 'token-b', 'token-c']
-    gate._accounts = [
-        AccountState(name=f'max-{chr(97+i)}', token=tokens[i])
-        for i in range(num_accounts)
-    ]
-    return gate
 
 
 # --- Cap hit detection ---
@@ -1305,9 +1284,6 @@ class TestNoCostStore:
 
 
 # --- build_usage_gate helper ---
-
-
-from tests.conftest import build_usage_gate  # noqa: E402  (import at use-site for clarity)
 
 
 class TestBuildUsageGateHelper:
