@@ -383,16 +383,10 @@ class TestReconRoute:
     def test_trigger_formatted_in_html(self, client):
         runs_with_colon = [
             {
+                **MOCK_RUNS_NO_JOURNAL[0],
                 'id': 'run-002',
-                'project_id': 'dark_factory',
-                'run_type': 'full',
                 'trigger_reason': 'max_staleness:2026-03-19T08:00:00+00:00',
-                'started_at': '2026-03-19T08:00:00+00:00',
-                'completed_at': '2026-03-19T08:05:00+00:00',
                 'events_processed': 3,
-                'status': 'completed',
-                'duration_seconds': 300.0,
-                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_with_colon):
@@ -564,16 +558,13 @@ class TestReconBadgeAriaLabels:
     def test_run_status_running_aria_label(self, client):
         runs_running = [
             {
+                **MOCK_RUNS_NO_JOURNAL[0],
                 'id': 'run-002',
-                'project_id': 'dark_factory',
-                'run_type': 'full',
                 'trigger_reason': 'manual',
-                'started_at': '2026-03-19T08:00:00+00:00',
                 'completed_at': None,
                 'events_processed': 0,
                 'status': 'running',
                 'duration_seconds': None,
-                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_running):
@@ -583,16 +574,13 @@ class TestReconBadgeAriaLabels:
     def test_run_status_failed_aria_label(self, client):
         runs_failed = [
             {
+                **MOCK_RUNS_NO_JOURNAL[0],
                 'id': 'run-003',
-                'project_id': 'dark_factory',
-                'run_type': 'full',
                 'trigger_reason': 'manual',
-                'started_at': '2026-03-19T08:00:00+00:00',
                 'completed_at': '2026-03-19T08:01:00+00:00',
                 'events_processed': 0,
                 'status': 'failed',
                 'duration_seconds': 60.0,
-                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_failed):
@@ -602,16 +590,13 @@ class TestReconBadgeAriaLabels:
     def test_run_status_rolled_back_aria_label(self, client):
         runs_rb = [
             {
+                **MOCK_RUNS_NO_JOURNAL[0],
                 'id': 'run-004',
-                'project_id': 'dark_factory',
-                'run_type': 'full',
                 'trigger_reason': 'manual',
-                'started_at': '2026-03-19T08:00:00+00:00',
                 'completed_at': '2026-03-19T08:01:00+00:00',
                 'events_processed': 0,
                 'status': 'rolled_back',
                 'duration_seconds': 60.0,
-                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_rb):
@@ -621,16 +606,13 @@ class TestReconBadgeAriaLabels:
     def test_run_status_circuit_breaker_aria_label(self, client):
         runs_cb = [
             {
+                **MOCK_RUNS_NO_JOURNAL[0],
                 'id': 'run-005',
-                'project_id': 'dark_factory',
-                'run_type': 'full',
                 'trigger_reason': 'manual',
-                'started_at': '2026-03-19T08:00:00+00:00',
                 'completed_at': '2026-03-19T08:01:00+00:00',
                 'events_processed': 0,
                 'status': 'circuit_breaker',
                 'duration_seconds': 60.0,
-                'journal_entry_count': 0,
             }
         ]
         with _patch_recon_data(runs=runs_cb):
