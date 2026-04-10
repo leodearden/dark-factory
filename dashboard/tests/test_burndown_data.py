@@ -457,13 +457,12 @@ class TestCollectSnapshot:
             rows = list(await cur.fetchall())
 
         assert len(rows) == 2
-        ids = {row[1] for row in rows}
+        ids = {row['project_id'] for row in rows}
         assert str(config.project_root) in ids  # main project
         assert str(reify_root) in ids            # config-discovered project
         # Check reify row counts
-        reify_row = next(r for r in rows if r[1] == str(reify_root))
-        assert reify_row[3] == 1  # pending
-        assert reify_row[8] == 1  # done
+        reify_row = next(r for r in rows if r['project_id'] == str(reify_root))
+        _assert_snapshot_counts(reify_row, pending=1, done=1)
 
     @pytest.mark.asyncio
     async def test_continues_when_known_root_unreadable(self, tmp_path):
