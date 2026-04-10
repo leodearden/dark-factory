@@ -7,9 +7,9 @@ Task 433: 8 code-quality improvements deferred from task-419 review.
 - rebuild_entity_summaries force+dry_run edge-fetch skip (steps 7-8)
 - rebuild_entity_summaries variable scoping / data-flow clarity (steps 9-10)
 """
+
 from __future__ import annotations
 
-import inspect
 from unittest.mock import AsyncMock
 
 import pytest
@@ -22,6 +22,7 @@ from fused_memory.backends.graphiti_client import (
 # ---------------------------------------------------------------------------
 # step-1: StaleSummaryResult named tuple with backward-compat tuple unpacking
 # ---------------------------------------------------------------------------
+
 
 class TestStaleSummaryResult:
     """StaleSummaryResult has named attrs and supports 3-tuple unpacking."""
@@ -78,12 +79,16 @@ class TestStaleSummaryResult:
     async def test_detect_stale_summaries_returns_named_result(self, mock_config, make_backend):
         """_detect_stale_summaries_with_edges returns StaleSummaryResult with named access."""
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'stale summary'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
-            'u1': [{'fact': 'fresh fact'}],
-        })
+        backend.list_entity_nodes = AsyncMock(
+            return_value=[
+                {'uuid': 'u1', 'name': 'Alice', 'summary': 'stale summary'},
+            ]
+        )
+        backend.get_all_valid_edges = AsyncMock(
+            return_value={
+                'u1': [{'fact': 'fresh fact'}],
+            }
+        )
         result = await backend._detect_stale_summaries_with_edges(group_id='test')
 
         # Named access
@@ -102,6 +107,7 @@ class TestStaleSummaryResult:
 # ---------------------------------------------------------------------------
 # step-3: _canonical_facts() @staticmethod
 # ---------------------------------------------------------------------------
+
 
 class TestCanonicalFacts:
     """GraphitiBackend._canonical_facts deduplicates facts preserving order."""
@@ -156,7 +162,7 @@ class TestCanonicalFacts:
         non-whitespace content pass through.
         """
         edges = [
-            {'fact': '   '},    # whitespace-only — filtered out
+            {'fact': '   '},  # whitespace-only — filtered out
             {'fact': 'A knows B'},
         ]
         result = GraphitiBackend._canonical_facts(edges)
@@ -171,12 +177,12 @@ class TestCanonicalFacts:
         be preserved with its original value.
         """
         edges = [
-            {'fact': '\t\t'},          # tabs only — filtered
-            {'fact': '\n'},            # newline only — filtered
-            {'fact': '  \t\n  '},     # mixed whitespace — filtered
-            {'fact': ' '},             # single space — filtered
-            {'fact': '  hello  '},    # real content with surrounding space — kept (raw value)
-            {'fact': 'A knows B'},    # plain fact — kept
+            {'fact': '\t\t'},  # tabs only — filtered
+            {'fact': '\n'},  # newline only — filtered
+            {'fact': '  \t\n  '},  # mixed whitespace — filtered
+            {'fact': ' '},  # single space — filtered
+            {'fact': '  hello  '},  # real content with surrounding space — kept (raw value)
+            {'fact': 'A knows B'},  # plain fact — kept
         ]
         result = GraphitiBackend._canonical_facts(edges)
         assert result == ['  hello  ', 'A knows B']
@@ -185,6 +191,7 @@ class TestCanonicalFacts:
 # ---------------------------------------------------------------------------
 # step-5: refresh_entity_summary optional name/old_summary params
 # ---------------------------------------------------------------------------
+
 
 class TestRefreshEntitySummaryOptionalParams:
     """refresh_entity_summary optional name+old_summary params."""
@@ -196,9 +203,7 @@ class TestRefreshEntitySummaryOptionalParams:
         backend.get_valid_edges_for_node = AsyncMock(return_value=[])
         backend.update_node_summary = AsyncMock()
         with pytest.raises(ValueError, match='both'):
-            await backend.refresh_entity_summary(
-                'u1', group_id='test', name='Alice'
-            )
+            await backend.refresh_entity_summary('u1', group_id='test', name='Alice')
 
     @pytest.mark.asyncio
     async def test_raises_if_old_summary_without_name(self, mock_config, make_backend):
@@ -216,9 +221,11 @@ class TestRefreshEntitySummaryOptionalParams:
         """When both name and old_summary provided, get_node_text is NOT called."""
         backend = make_backend(mock_config)
         backend.get_node_text = AsyncMock(return_value=('should-not-be-called', ''))
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'fact': 'Alice knows Bob'},
-        ])
+        backend.get_valid_edges_for_node = AsyncMock(
+            return_value=[
+                {'fact': 'Alice knows Bob'},
+            ]
+        )
         backend.update_node_summary = AsyncMock()
 
         result = await backend.refresh_entity_summary(
@@ -240,9 +247,11 @@ class TestRefreshEntitySummaryOptionalParams:
         """When neither name nor old_summary provided, get_node_text IS called (backward compat)."""
         backend = make_backend(mock_config)
         backend.get_node_text = AsyncMock(return_value=('Alice', 'old summary'))
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'fact': 'Alice knows Bob'},
-        ])
+        backend.get_valid_edges_for_node = AsyncMock(
+            return_value=[
+                {'fact': 'Alice knows Bob'},
+            ]
+        )
         backend.update_node_summary = AsyncMock()
 
         result = await backend.refresh_entity_summary('u1', group_id='test')
@@ -255,6 +264,7 @@ class TestRefreshEntitySummaryOptionalParams:
 # ---------------------------------------------------------------------------
 # step-7: rebuild_entity_summaries(force=True, dry_run=True) skips edge fetch
 # ---------------------------------------------------------------------------
+
 
 class TestRebuildEntitySummariesForceDryRun:
     """Pins the force=True, dry_run=True skip behaviour in rebuild_entity_summaries.
@@ -305,16 +315,16 @@ class TestRebuildEntitySummariesForceDryRun:
     async def test_force_dry_run_does_not_call_get_all_valid_edges(self, mock_config, make_backend):
         """When force=True and dry_run=True, get_all_valid_edges is NOT called."""
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
-            {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
-        ])
+        backend.list_entity_nodes = AsyncMock(
+            return_value=[
+                {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
+                {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
+            ]
+        )
         backend.get_all_valid_edges = AsyncMock(return_value={})
         backend._rebuild_entity_from_edges = AsyncMock()
 
-        await backend.rebuild_entity_summaries(
-            group_id='test', force=True, dry_run=True
-        )
+        await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=True)
 
         backend.get_all_valid_edges.assert_not_awaited()
         backend._rebuild_entity_from_edges.assert_not_awaited()
@@ -331,9 +341,7 @@ class TestRebuildEntitySummariesForceDryRun:
         backend.list_entity_nodes = AsyncMock(return_value=entities)
         backend.get_all_valid_edges = AsyncMock(return_value={})
 
-        result = await backend.rebuild_entity_summaries(
-            group_id='test', force=True, dry_run=True
-        )
+        result = await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=True)
 
         assert result['total_entities'] == 3
         assert result['stale_entities'] == 3  # force=True targets all
@@ -341,7 +349,9 @@ class TestRebuildEntitySummariesForceDryRun:
         assert result['rebuilt'] == 0
         assert result['errors'] == 0
         assert len(result['details']) == 3
-        expected_details = [{'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities]
+        expected_details = [
+            {'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities
+        ]
         assert result['details'] == expected_details
         assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
 
@@ -354,20 +364,25 @@ class TestRebuildEntitySummariesForceDryRun:
         get_all_valid_edges must be called before processing entities.
         """
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
-            {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
-        ])
+        backend.list_entity_nodes = AsyncMock(
+            return_value=[
+                {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
+                {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
+            ]
+        )
         backend.get_all_valid_edges = AsyncMock(return_value={})
         # Mock the inner rebuild to avoid touching real write path
-        backend._rebuild_entity_from_edges = AsyncMock(return_value={
-            'uuid': 'u1', 'name': 'Alice',
-            'old_summary': '', 'new_summary': '', 'edge_count': 0,
-        })
-
-        await backend.rebuild_entity_summaries(
-            group_id='test', force=True, dry_run=False
+        backend._rebuild_entity_from_edges = AsyncMock(
+            return_value={
+                'uuid': 'u1',
+                'name': 'Alice',
+                'old_summary': '',
+                'new_summary': '',
+                'edge_count': 0,
+            }
         )
+
+        await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=False)
 
         backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
         assert backend._rebuild_entity_from_edges.await_count == 2
@@ -376,6 +391,7 @@ class TestRebuildEntitySummariesForceDryRun:
 # ---------------------------------------------------------------------------
 # step-9: regression – rebuild_entity_summaries(force=False) data flow
 # ---------------------------------------------------------------------------
+
 
 class TestRebuildEntitySummariesDataFlow:
     """rebuild_entity_summaries(force=False) correctly flows total_entities from detect step."""
@@ -389,19 +405,22 @@ class TestRebuildEntitySummariesDataFlow:
         stale_list = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'old'}]
         all_edges = {'u1': [{'fact': 'Alice knows Bob'}]}
         # total_count=10 means 10 entities exist but only 1 is stale
-        detect_result = StaleSummaryResult(
-            stale=stale_list, all_edges=all_edges, total_count=10
-        )
+        detect_result = StaleSummaryResult(stale=stale_list, all_edges=all_edges, total_count=10)
         backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
-        backend._rebuild_entity_from_edges = AsyncMock(return_value={
-            'uuid': 'u1', 'name': 'Alice',
-            'old_summary': 'old', 'new_summary': 'Alice knows Bob', 'edge_count': 1,
-        })
+        backend._rebuild_entity_from_edges = AsyncMock(
+            return_value={
+                'uuid': 'u1',
+                'name': 'Alice',
+                'old_summary': 'old',
+                'new_summary': 'Alice knows Bob',
+                'edge_count': 1,
+            }
+        )
 
         result = await backend.rebuild_entity_summaries(group_id='test', force=False)
 
-        assert result['total_entities'] == 10   # flows from total_count=10
-        assert result['stale_entities'] == 1    # only 1 stale
+        assert result['total_entities'] == 10  # flows from total_count=10
+        assert result['stale_entities'] == 1  # only 1 stale
         assert result['rebuilt'] == 1
         assert result['skipped'] == 0
         assert result['errors'] == 0
@@ -423,9 +442,7 @@ class TestRebuildEntitySummariesDataFlow:
         # Mock the new cheap-probe directly: (stale_list, total_count)
         backend._detect_stale_summaries_dry_run = AsyncMock(return_value=(stale_list, 7))
 
-        result = await backend.rebuild_entity_summaries(
-            group_id='test', force=False, dry_run=True
-        )
+        result = await backend.rebuild_entity_summaries(group_id='test', force=False, dry_run=True)
 
         assert result['total_entities'] == 7
         assert result['stale_entities'] == 2
@@ -445,9 +462,11 @@ class TestRebuildEntitySummariesDataFlow:
         After the fix (adding _detect_stale_summaries_dry_run), this test passes.
         """
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'some summary'},
-        ])
+        backend.list_entity_nodes = AsyncMock(
+            return_value=[
+                {'uuid': 'u1', 'name': 'Alice', 'summary': 'some summary'},
+            ]
+        )
         backend.get_all_valid_edges = AsyncMock(return_value={})
         # Also mock get_valid_edges_for_node so the dry_run probe can run
         backend.get_valid_edges_for_node = AsyncMock(return_value=[])
@@ -470,14 +489,21 @@ class TestRebuildEntitySummariesDataFlow:
         call get_all_valid_edges to obtain the edges used for rebuilding.
         """
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'some summary'},
-        ])
+        backend.list_entity_nodes = AsyncMock(
+            return_value=[
+                {'uuid': 'u1', 'name': 'Alice', 'summary': 'some summary'},
+            ]
+        )
         backend.get_all_valid_edges = AsyncMock(return_value={})
-        backend._rebuild_entity_from_edges = AsyncMock(return_value={
-            'uuid': 'u1', 'name': 'Alice',
-            'old_summary': 'some summary', 'new_summary': '', 'edge_count': 0,
-        })
+        backend._rebuild_entity_from_edges = AsyncMock(
+            return_value={
+                'uuid': 'u1',
+                'name': 'Alice',
+                'old_summary': 'some summary',
+                'new_summary': '',
+                'edge_count': 0,
+            }
+        )
 
         await backend.rebuild_entity_summaries(group_id='test', force=False, dry_run=False)
 
@@ -503,18 +529,18 @@ class TestRebuildEntitySummariesDataFlow:
         behaviour and should pass on first run with no production changes.
         """
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'some summary 1'},
-            {'uuid': 'u2', 'name': 'Bob', 'summary': 'some summary 2'},
-        ])
+        backend.list_entity_nodes = AsyncMock(
+            return_value=[
+                {'uuid': 'u1', 'name': 'Alice', 'summary': 'some summary 1'},
+                {'uuid': 'u2', 'name': 'Bob', 'summary': 'some summary 2'},
+            ]
+        )
         backend.get_all_valid_edges = AsyncMock(return_value={})
         # Per-entity probe returns no edges → summaries are stale (non-empty summary,
         # canonical facts = '', summary != canonical).
         backend.get_valid_edges_for_node = AsyncMock(return_value=[])
 
-        result = await backend.rebuild_entity_summaries(
-            group_id='test', force=False, dry_run=True
-        )
+        result = await backend.rebuild_entity_summaries(group_id='test', force=False, dry_run=True)
 
         # Positive: per-entity fetch ran for each non-empty-summary entity
         assert backend.get_valid_edges_for_node.await_count == 2
@@ -531,6 +557,7 @@ class TestRebuildEntitySummariesDataFlow:
 # step-5 (task 443): error-accumulation path in rebuild_entity_summaries
 # ---------------------------------------------------------------------------
 
+
 class TestRebuildEntitySummariesErrorHandling:
     """rebuild_entity_summaries records per-entity errors without raising."""
 
@@ -543,18 +570,16 @@ class TestRebuildEntitySummariesErrorHandling:
         into result['errors'] and result['details'] with status='error'.
         """
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'stale summary'},
-        ])
+        backend.list_entity_nodes = AsyncMock(
+            return_value=[
+                {'uuid': 'u1', 'name': 'Alice', 'summary': 'stale summary'},
+            ]
+        )
         backend.get_all_valid_edges = AsyncMock(return_value={})
         # Simulate _rebuild_entity_from_edges failing for this entity
-        backend._rebuild_entity_from_edges = AsyncMock(
-            side_effect=RuntimeError('boom')
-        )
+        backend._rebuild_entity_from_edges = AsyncMock(side_effect=RuntimeError('boom'))
 
-        result = await backend.rebuild_entity_summaries(
-            group_id='test', force=True, dry_run=False
-        )
+        result = await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=False)
 
         assert result['errors'] == 1
         assert result['rebuilt'] == 0
@@ -578,21 +603,27 @@ class TestRebuildEntitySummariesErrorHandling:
         loop that is the core value of return_exceptions=True.
         """
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'stale summary'},
-            {'uuid': 'u2', 'name': 'Bob', 'summary': 'stale summary 2'},
-        ])
+        backend.list_entity_nodes = AsyncMock(
+            return_value=[
+                {'uuid': 'u1', 'name': 'Alice', 'summary': 'stale summary'},
+                {'uuid': 'u2', 'name': 'Bob', 'summary': 'stale summary 2'},
+            ]
+        )
         backend.get_all_valid_edges = AsyncMock(return_value={})
         backend._rebuild_entity_from_edges = AsyncMock(
             side_effect=[
                 RuntimeError('boom'),
-                {'uuid': 'u2', 'name': 'Bob', 'old_summary': 'stale summary 2', 'new_summary': 'Bob summary v2', 'edge_count': 3},
+                {
+                    'uuid': 'u2',
+                    'name': 'Bob',
+                    'old_summary': 'stale summary 2',
+                    'new_summary': 'Bob summary v2',
+                    'edge_count': 3,
+                },
             ]
         )
 
-        result = await backend.rebuild_entity_summaries(
-            group_id='test', force=True, dry_run=False
-        )
+        result = await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=False)
 
         assert result['errors'] == 1
         assert result['rebuilt'] == 1
@@ -651,14 +682,20 @@ class TestRebuildEntitySummariesErrorHandling:
         backend._rebuild_entity_from_edges = AsyncMock(
             side_effect=[
                 RuntimeError('boom'),
-                {'uuid': 'u2', 'name': 'Bob', 'old_summary': 'old B', 'new_summary': 'rebuilt B', 'edge_count': 0},
+                {
+                    'uuid': 'u2',
+                    'name': 'Bob',
+                    'old_summary': 'old B',
+                    'new_summary': 'rebuilt B',
+                    'edge_count': 0,
+                },
             ]
         )
 
         result = await backend.rebuild_entity_summaries(group_id='test', force=False)
 
-        assert result['total_entities'] == 5   # flows from total_count=5, not len(stale)
-        assert result['stale_entities'] == 2   # len(targets) = len(stale_list)
+        assert result['total_entities'] == 5  # flows from total_count=5, not len(stale)
+        assert result['stale_entities'] == 2  # len(targets) = len(stale_list)
         assert result['errors'] == 1
         assert result['rebuilt'] == 1
         assert result['skipped'] == 0
@@ -681,6 +718,7 @@ class TestRebuildEntitySummariesErrorHandling:
 # step-4: regression — whitespace-only fact must not cause false stale detection
 # ---------------------------------------------------------------------------
 
+
 class TestCanonicalFactsStalenessRegression:
     """Whitespace-only facts must not make a current entity appear stale."""
 
@@ -700,51 +738,20 @@ class TestCanonicalFactsStalenessRegression:
         so the entity is NOT stale.
         """
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'A knows B'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
-            'u1': [{'fact': '   '}, {'fact': 'A knows B'}],
-        })
+        backend.list_entity_nodes = AsyncMock(
+            return_value=[
+                {'uuid': 'u1', 'name': 'Alice', 'summary': 'A knows B'},
+            ]
+        )
+        backend.get_all_valid_edges = AsyncMock(
+            return_value={
+                'u1': [{'fact': '   '}, {'fact': 'A knows B'}],
+            }
+        )
 
         result = await backend._detect_stale_summaries_with_edges(group_id='test')
 
         assert result.stale == [], (
-            "Entity should NOT be flagged stale when its only non-whitespace "
-            "fact matches the stored summary."
-        )
-
-
-# ---------------------------------------------------------------------------
-# Meta-test: assert_not_awaited style for edge-fetch guard assertions
-# ---------------------------------------------------------------------------
-
-class TestEdgeFetchGuardAssertionStyle:
-    """Meta-test: verifies that test_force_dry_run_does_not_call_get_all_valid_edges
-    uses assert_not_awaited() (not assert_not_called()) for the AsyncMock edge-fetch
-    guard assertion, keeping the style consistent with the adjacent assertion on
-    backend._rebuild_entity_from_edges.
-    """
-
-    def test_force_dry_run_uses_assert_not_awaited_for_edge_fetch(self) -> None:
-        """Introspect test_force_dry_run_does_not_call_get_all_valid_edges source.
-
-        Assertions:
-          (a) source contains 'backend.get_all_valid_edges.assert_not_awaited()'
-          (b) source does NOT contain 'backend.get_all_valid_edges.assert_not_called()'
-        """
-        fn = TestRebuildEntitySummariesForceDryRun.test_force_dry_run_does_not_call_get_all_valid_edges
-        src = inspect.getsource(fn)
-
-        # (a) must use assert_not_awaited for the AsyncMock edge-fetch guard
-        assert 'backend.get_all_valid_edges.assert_not_awaited()' in src, (
-            "test_force_dry_run_does_not_call_get_all_valid_edges must use "
-            "assert_not_awaited() for the get_all_valid_edges AsyncMock"
-        )
-
-        # (b) must NOT use the generic assert_not_called for this AsyncMock
-        assert 'backend.get_all_valid_edges.assert_not_called()' not in src, (
-            "test_force_dry_run_does_not_call_get_all_valid_edges must NOT use "
-            "assert_not_called() for the get_all_valid_edges AsyncMock; "
-            "use assert_not_awaited() instead"
+            'Entity should NOT be flagged stale when its only non-whitespace '
+            'fact matches the stored summary.'
         )
