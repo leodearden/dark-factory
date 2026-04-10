@@ -52,6 +52,42 @@ def _insert_snapshot(
     )
 
 
+def _assert_snapshot_counts(
+    row,
+    *,
+    pending: int = 0,
+    in_progress: int = 0,
+    blocked: int = 0,
+    deferred: int = 0,
+    cancelled: int = 0,
+    done: int = 0,
+) -> None:
+    """Assert that a snapshot row matches the expected count values by column name.
+
+    Requires the row to be an aiosqlite.Row (name-based access).  Each count
+    column is checked individually so that mismatch messages identify which
+    column failed and what values were expected vs. actual.
+    """
+    assert row['pending'] == pending, (
+        f'pending: expected {pending}, got {row["pending"]}'
+    )
+    assert row['in_progress'] == in_progress, (
+        f'in_progress: expected {in_progress}, got {row["in_progress"]}'
+    )
+    assert row['blocked'] == blocked, (
+        f'blocked: expected {blocked}, got {row["blocked"]}'
+    )
+    assert row['deferred'] == deferred, (
+        f'deferred: expected {deferred}, got {row["deferred"]}'
+    )
+    assert row['cancelled'] == cancelled, (
+        f'cancelled: expected {cancelled}, got {row["cancelled"]}'
+    )
+    assert row['done'] == done, (
+        f'done: expected {done}, got {row["done"]}'
+    )
+
+
 def _fake_load(tasks_map):
     return lambda path: tasks_map[path]
 
@@ -68,6 +104,7 @@ async def burndown_env(tmp_path):
     _create_burndown_db(db_path)
     config = DashboardConfig(project_root=tmp_path)
     async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
         yield db_path, config, conn
 
 
@@ -143,14 +180,8 @@ class TestCollectSnapshot:
 
         assert len(rows) == 1
         row = rows[0]
-        # row: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
-        assert row[1] == str(config.project_root)  # project_id
-        assert row[3] == 1   # pending
-        assert row[4] == 1   # in_progress
-        assert row[5] == 0   # blocked
-        assert row[6] == 0   # deferred
-        assert row[7] == 0   # cancelled
-        assert row[8] == 2   # done
+        assert row['project_id'] == str(config.project_root)
+        _assert_snapshot_counts(row, pending=1, in_progress=1, done=2)
 
     @pytest.mark.asyncio
     async def test_symlinked_root_deduplicates_with_orchestrator(self, tmp_path):
@@ -239,39 +270,23 @@ class TestCollectSnapshot:
         async with conn.execute('SELECT * FROM snapshots') as cur:
             rows = list(await cur.fetchall())
 
-        # row: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
         assert len(rows) == 3
-        by_project = {row[1]: row for row in rows}
+        by_project = {row['project_id']: row for row in rows}
         assert str(base_config.project_root) in by_project
         assert str(reify_root.resolve()) in by_project
         assert str(autopilot_root.resolve()) in by_project
 
         # main project: 1 pending task
         main_row = by_project[str(base_config.project_root)]
-        assert main_row[3] == 1  # pending
-        assert main_row[4] == 0  # in_progress
-        assert main_row[5] == 0  # blocked
-        assert main_row[6] == 0  # deferred
-        assert main_row[7] == 0  # cancelled
-        assert main_row[8] == 0  # done
+        _assert_snapshot_counts(main_row, pending=1)
 
         # reify: 2 done tasks
         reify_row = by_project[str(reify_root.resolve())]
-        assert reify_row[3] == 0  # pending
-        assert reify_row[4] == 0  # in_progress
-        assert reify_row[5] == 0  # blocked
-        assert reify_row[6] == 0  # deferred
-        assert reify_row[7] == 0  # cancelled
-        assert reify_row[8] == 2  # done
+        _assert_snapshot_counts(reify_row, done=2)
 
         # autopilot: 1 in-progress task
         autopilot_row = by_project[str(autopilot_root.resolve())]
-        assert autopilot_row[3] == 0  # pending
-        assert autopilot_row[4] == 1  # in_progress
-        assert autopilot_row[5] == 0  # blocked
-        assert autopilot_row[6] == 0  # deferred
-        assert autopilot_row[7] == 0  # cancelled
-        assert autopilot_row[8] == 0  # done
+        _assert_snapshot_counts(autopilot_row, in_progress=1)
 
     @pytest.mark.asyncio
     async def test_dedupes_known_root_against_main_project(self, burndown_env):
@@ -442,13 +457,12 @@ class TestCollectSnapshot:
             rows = list(await cur.fetchall())
 
         assert len(rows) == 2
-        ids = {row[1] for row in rows}
+        ids = {row['project_id'] for row in rows}
         assert str(config.project_root) in ids  # main project
         assert str(reify_root) in ids            # config-discovered project
         # Check reify row counts
-        reify_row = next(r for r in rows if r[1] == str(reify_root))
-        assert reify_row[3] == 1  # pending
-        assert reify_row[8] == 1  # done
+        reify_row = next(r for r in rows if r['project_id'] == str(reify_root))
+        _assert_snapshot_counts(reify_row, pending=1, done=1)
 
     @pytest.mark.asyncio
     async def test_continues_when_known_root_unreadable(self, tmp_path):
@@ -785,6 +799,7 @@ class TestCollectSnapshot:
             return _tasks_map[path]
 
         async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
             with (
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
@@ -799,8 +814,7 @@ class TestCollectSnapshot:
         # (a) three rows: main + good_root_1 + good_root_2
         assert len(rows) == 3
 
-        # row layout: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
-        by_project = {row[1]: row for row in rows}
+        by_project = {row['project_id']: row for row in rows}
 
         # (b) bad_root must NOT appear
         assert str(bad_root.resolve()) not in by_project
@@ -812,10 +826,10 @@ class TestCollectSnapshot:
 
         # (d) per-root done counts must reflect the supplied task lists
         good_1_row = by_project[str(good_root_1.resolve())]
-        assert good_1_row[8] == 2  # done=2 for good_root_1
+        _assert_snapshot_counts(good_1_row, done=2)
 
         good_2_row = by_project[str(good_root_2.resolve())]
-        assert good_2_row[8] == 1  # done=1 for good_root_2
+        _assert_snapshot_counts(good_2_row, done=1)
 
         # (e) at least one WARNING record must name the bad root and carry exc_info
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -1040,3 +1054,65 @@ class TestBurndownEnvFixture:
             row = await cur.fetchone()
         assert row is not None
         assert row[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# _assert_snapshot_counts helper
+# ---------------------------------------------------------------------------
+
+
+class TestAssertSnapshotCounts:
+    @pytest.mark.asyncio
+    async def test_passes_on_matching_counts(self, burndown_env):
+        """Helper returns None when every count column matches."""
+        db_path, config, conn = burndown_env
+        await conn.execute(
+            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            ('test_proj', '2024-01-01T00:00:00', 1, 0, 0, 0, 0, 2),
+        )
+        await conn.commit()
+
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute('SELECT * FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
+
+        assert len(rows) == 1
+        result = _assert_snapshot_counts(rows[0], pending=1, done=2)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_raises_on_mismatched_count(self, burndown_env):
+        """Helper raises AssertionError when a count column doesn't match the expected value."""
+        db_path, config, conn = burndown_env
+        await conn.execute(
+            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            ('test_proj', '2024-01-01T00:00:00', 0, 0, 0, 0, 0, 2),
+        )
+        await conn.commit()
+
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute('SELECT * FROM snapshots') as cur:
+            row = await cur.fetchone()
+
+        with pytest.raises(AssertionError):
+            _assert_snapshot_counts(row, done=3)  # actual done=2, expected 3
+
+    @pytest.mark.asyncio
+    async def test_default_zeros_match_all_zero_row(self, burndown_env):
+        """Helper returns None when all counts are 0 and no kwargs are passed (defaults are 0)."""
+        db_path, config, conn = burndown_env
+        await conn.execute(
+            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            ('test_proj', '2024-01-01T00:00:00', 0, 0, 0, 0, 0, 0),
+        )
+        await conn.commit()
+
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute('SELECT * FROM snapshots') as cur:
+            row = await cur.fetchone()
+
+        result = _assert_snapshot_counts(row)  # all defaults are 0
+        assert result is None
