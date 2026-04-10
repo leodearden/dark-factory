@@ -685,3 +685,20 @@ class TestNextEscalation:
             assert '--level' in cmd
             level_idx = cmd.index('--level')
             assert cmd[level_idx + 1] == '0'
+
+
+# ---------------------------------------------------------------------------
+# Config Defaults
+# ---------------------------------------------------------------------------
+
+
+class TestStewardDefaultConfig:
+
+    def test_default_steward_max_retries_is_one(self, monkeypatch, tmp_path):
+        """steward_max_retries default must be 1 (one attempt, zero retries)."""
+        from orchestrator.config import OrchestratorConfig
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.steward_max_retries == 1
