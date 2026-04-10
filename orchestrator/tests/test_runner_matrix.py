@@ -515,3 +515,63 @@ class TestRunEvalMatrixNonCancelPath:
             'cancelled' in record.message.lower()
             for record in caplog.records
         ), f'Unexpected "cancelled" log record. Got: {[r.message for r in caplog.records]}'
+
+    async def test_failed_error_log_carries_exc_info(
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """Non-cancel RuntimeError log record must carry exc_info (traceback attached).
+
+        The message should be stable ('Eval failed') rather than including the
+        f-string repr of the exception, so that it is useful even when
+        str(exc) is empty.
+
+        This test would FAIL against the old code because
+        ``logger.error(f'Eval failed: {exc}')`` does not set exc_info and
+        embeds the exception message in the log string instead.
+        """
+        task_path = tmp_path / 'task_a.json'
+        task_path.touch()
+
+        async def fake_run_eval(*args, **kwargs):
+            raise RuntimeError('simulated failure')
+
+        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'):
+            await run_eval_matrix(
+                [task_path],
+                [_CFG],
+                force=True,
+            )
+
+        failed_records = [r for r in caplog.records if 'failed' in r.message.lower()]
+        assert failed_records, (
+            f'Expected at least one log record containing "failed". '
+            f'Got: {[r.message for r in caplog.records]}'
+        )
+        record = failed_records[0]
+
+        # (a) Message must be exactly 'Eval failed' — no f-string interpolation
+        assert record.message == 'Eval failed', (
+            f"Expected message 'Eval failed', got {record.message!r}"
+        )
+
+        # (b) exc_info must be a 3-tuple (type, value, traceback) — not None
+        assert isinstance(record.exc_info, tuple) and len(record.exc_info) == 3, (
+            f'Expected exc_info to be a 3-tuple, got {record.exc_info!r}'
+        )
+        exc_type, exc_val, exc_tb = record.exc_info
+
+        # (c) exc_type must be RuntimeError
+        assert exc_type is RuntimeError, (
+            f'Expected exc_type to be RuntimeError, got {exc_type!r}'
+        )
+
+        # (d) exc_val must be a RuntimeError instance
+        assert isinstance(exc_val, RuntimeError), (
+            f'Expected exc_val to be RuntimeError instance, got {exc_val!r}'
+        )
+
+        # (e) exc_tb must be present — the whole point of exc_info is to preserve
+        #     the traceback for post-mortem debugging
+        assert exc_tb is not None, 'Expected traceback to be attached to the RuntimeError'
