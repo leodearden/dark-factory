@@ -1224,7 +1224,7 @@ class TestRebuildEntitySummariesParallel:
         captured_calls: list[dict] = []
         original_rebuild = backend._rebuild_entity_from_edges
 
-        async def capture_rebuild(uuid, name, edges, *, group_id, old_summary=None):
+        async def capture_rebuild(uuid, name, edges, *, group_id, old_summary):
             captured_calls.append({'uuid': uuid, 'old_summary': old_summary})
             return await original_rebuild(uuid, name, edges, group_id=group_id, old_summary=old_summary)
 
@@ -1268,7 +1268,7 @@ class TestRebuildEntitySummariesParallel:
         captured_calls: list[dict] = []
         original_rebuild = backend._rebuild_entity_from_edges
 
-        async def capture_rebuild(uuid, name, edges, *, group_id, old_summary=None):
+        async def capture_rebuild(uuid, name, edges, *, group_id, old_summary):
             captured_calls.append({'uuid': uuid, 'old_summary': old_summary})
             return await original_rebuild(uuid, name, edges, group_id=group_id, old_summary=old_summary)
 
