@@ -1337,3 +1337,14 @@ class TestBuildUsageGateHelper:
         acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
         with pytest.raises(TypeError, match='str'):
             build_usage_gate(acct_cfgs, 'tok-a')  # bare string, not a list
+
+    def test_build_usage_gate_applies_probe_interval_secs(self):
+        """probe_interval_secs and max_probe_interval_secs are forwarded to gate._config."""
+        acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
+        gate = build_usage_gate(
+            acct_cfgs, ['tok-a'],
+            probe_interval_secs=7,
+            max_probe_interval_secs=42,
+        )
+        assert gate._config.probe_interval_secs == 7
+        assert gate._config.max_probe_interval_secs == 42
