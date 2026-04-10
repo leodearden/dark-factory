@@ -1618,11 +1618,12 @@ class TestHarnessFilteredTaskTreeWiring:
     async def test_run_full_cycle_invokes_get_tasks_exactly_once(
         self, journal, event_buffer, mock_memory_service,
     ):
-        """Single-fetch invariant: taskmaster.get_tasks is called exactly once per run_full_cycle.
+        """Regression guard: run_full_cycle issues exactly one taskmaster.get_tasks call via
+        _fetch_filtered_task_tree.
 
-        Unlike sibling tests in this class, _fetch_filtered_task_tree is NOT mocked here —
-        it runs the real implementation.  This verifies that no stage bypasses the helper
-        and calls taskmaster.get_tasks directly.  A regression would surface as call_count > 1.
+        Stages are mocked, so this covers the harness-level orchestration path (including that
+        remediation reuses the pre-fetched tree rather than re-fetching), not stage-internal
+        bypasses.
         """
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
@@ -1646,6 +1647,32 @@ class TestHarnessFilteredTaskTreeWiring:
         await harness.run_full_cycle('test-project', 'test-trigger', events=[event])
 
         harness.taskmaster.get_tasks.assert_called_once()  # type: ignore[union-attr,attr-defined]
+
+    def test_get_tasks_exactly_once_docstring_is_accurate(self):
+        """Meta-test: guards against re-introducing the misleading docstring.
+
+        Asserts the accurate invariant description is present and the misleading
+        'no stage bypasses the helper' phrase (which overstates coverage when all
+        stage .run methods are mocked) is absent.
+        """
+        doc = (
+            TestHarnessFilteredTaskTreeWiring
+            .test_run_full_cycle_invokes_get_tasks_exactly_once
+            .__doc__
+        )
+        assert doc is not None, (
+            "test_run_full_cycle_invokes_get_tasks_exactly_once must have a docstring"
+        )
+        assert 'no stage bypasses the helper' not in doc, (
+            "Misleading phrase 'no stage bypasses the helper' found in docstring; "
+            "stages are mocked so this invariant cannot be verified by this test."
+        )
+        assert 'orchestration path' in doc, (
+            "Accurate phrase 'orchestration path' is missing from docstring."
+        )
+        assert 'mocked' in doc, (
+            "Docstring must mention that stages are 'mocked' to document the structural limitation."
+        )
 
     @pytest.mark.asyncio
     async def test_run_full_cycle_sets_filtered_task_tree_on_consolidator(
