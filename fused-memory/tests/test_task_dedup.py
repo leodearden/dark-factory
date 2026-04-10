@@ -607,6 +607,137 @@ class TestBulkDedup:
         assert result['dedup']['removed'] == []
         assert len(result['dedup']['kept']) == 2
 
+    # ── step-9 test ───────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_parse_prd_removes_top_level_task_duplicating_existing(
+        self, bulk_taskmaster, event_buffer,
+    ):
+        """parse_prd removes new top-level tasks whose title matches a
+        pre-existing task (even a done one)."""
+        pre: dict = {
+            'tasks': [
+                {'id': '5', 'title': 'Implement parser', 'status': 'done', 'subtasks': []},
+            ]
+        }
+        post: dict = {
+            'tasks': [
+                {'id': '5', 'title': 'Implement parser', 'status': 'done', 'subtasks': []},
+                {'id': '42', 'title': 'Implement parser', 'status': 'pending', 'subtasks': []},
+            ]
+        }
+        bulk_taskmaster.get_tasks = AsyncMock(side_effect=[pre, post])
+        interceptor = TaskInterceptor(bulk_taskmaster, None, event_buffer)
+
+        result = await interceptor.parse_prd('/some/prd.md', project_root='/project')
+
+        assert bulk_taskmaster.remove_task.call_count == 1
+        removed_ids = [c.args[0] for c in bulk_taskmaster.remove_task.call_args_list]
+        assert '42' in removed_ids
+
+        assert 'dedup' in result
+        assert any(e.get('task_id') == '42' for e in result['dedup']['removed'])
+
+    # ── step-11 test (regression) ─────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_expand_task_rerun_idempotent(self, bulk_taskmaster, event_buffer):
+        """Regression: re-running expand_task on an already-expanded task must
+        not create duplicate subtasks.
+
+        First call: empty pre → two new subtasks 1.1, 1.2 created.
+        Second call: pre = post from first call; Taskmaster (re-)generates 1.3
+        and 1.4 with the same titles as 1.1/1.2 → both must be removed.
+        """
+        first_pre: dict = {'tasks': [{'id': '1', 'title': 'Parent', 'status': 'pending', 'subtasks': []}]}
+        first_post: dict = {
+            'tasks': [{
+                'id': '1', 'title': 'Parent', 'status': 'pending',
+                'subtasks': [
+                    {'id': '1.1', 'title': 'Task T1', 'status': 'pending'},
+                    {'id': '1.2', 'title': 'Task T2', 'status': 'pending'},
+                ],
+            }]
+        }
+        # Second call: pre = first_post; Taskmaster adds duplicates again
+        second_post: dict = {
+            'tasks': [{
+                'id': '1', 'title': 'Parent', 'status': 'pending',
+                'subtasks': [
+                    {'id': '1.1', 'title': 'Task T1', 'status': 'pending'},
+                    {'id': '1.2', 'title': 'Task T2', 'status': 'pending'},
+                    {'id': '1.3', 'title': 'Task T1', 'status': 'pending'},
+                    {'id': '1.4', 'title': 'Task T2', 'status': 'pending'},
+                ],
+            }]
+        }
+        # get_tasks call sequence: pre1, post1, pre2 (=first_post), post2
+        bulk_taskmaster.get_tasks = AsyncMock(
+            side_effect=[first_pre, first_post, first_post, second_post]
+        )
+        interceptor = TaskInterceptor(bulk_taskmaster, None, event_buffer)
+
+        # First expand — should keep 1.1/1.2, nothing to remove
+        r1 = await interceptor.expand_task('1', project_root='/project')
+        assert bulk_taskmaster.remove_task.call_count == 0
+        assert r1['dedup']['removed'] == []
+
+        bulk_taskmaster.remove_task.reset_mock()
+
+        # Second expand — must remove 1.3 and 1.4 (titles match 1.1/1.2)
+        await interceptor.expand_task('1', project_root='/project')
+        assert bulk_taskmaster.remove_task.call_count == 2
+        removed_ids = {c.args[0] for c in bulk_taskmaster.remove_task.call_args_list}
+        assert '1.3' in removed_ids
+        assert '1.4' in removed_ids
+
+    # ── step-13 test ─────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_bulk_dedup_tolerates_remove_task_failure(
+        self, bulk_taskmaster, event_buffer, pre_snapshot, post_snapshot,
+    ):
+        """When remove_task raises, expand_task still succeeds and the failure
+        is recorded in dedup['errors'] without propagating an exception."""
+        bulk_taskmaster.get_tasks = AsyncMock(side_effect=[pre_snapshot, post_snapshot])
+        bulk_taskmaster.remove_task = AsyncMock(
+            side_effect=RuntimeError('taskmaster busy')
+        )
+        interceptor = TaskInterceptor(bulk_taskmaster, None, event_buffer)
+
+        result = await interceptor.expand_task('1', project_root='/project')
+
+        # expand_task must not raise
+        assert 'dedup' in result
+        # The removal was attempted but failed — should be in errors, not removed
+        assert result['dedup']['removed'] == []
+        assert any(
+            e.get('task_id') == '1.2' for e in result['dedup']['errors']
+        )
+
+    # ── step-15 test ─────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_bulk_dedup_snapshot_failure_does_not_break_bulk_op(
+        self, bulk_taskmaster, event_buffer,
+    ):
+        """When the pre-snapshot get_tasks call raises, expand_task still
+        returns the Taskmaster result and marks dedup as skipped."""
+        # First call (pre-snapshot) raises; subsequent calls would work but aren't reached
+        bulk_taskmaster.get_tasks = AsyncMock(
+            side_effect=RuntimeError('taskmaster unavailable')
+        )
+        interceptor = TaskInterceptor(bulk_taskmaster, None, event_buffer)
+
+        result = await interceptor.expand_task('1', project_root='/project')
+
+        # Taskmaster expand_task result is preserved
+        assert result.get('success') is True
+        # Dedup was skipped due to snapshot failure
+        assert result['dedup'].get('skipped_reason') == 'pre_snapshot_failed'
+        # remove_task was never called
+        bulk_taskmaster.remove_task.assert_not_called()
+
 
 class TestHashPrefixStripping:
 
