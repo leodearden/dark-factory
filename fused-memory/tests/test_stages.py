@@ -1571,6 +1571,22 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         assert '### Active Task Tree' in payload
         assert 'Task 10' in payload
         assert 'Task 20' in payload
+        # Recently Completed: done_count > 0 but done_tasks=[] (harness path)
+        # Either the section is absent (future-proof) OR it mentions the count '5'
+        recently_section = ''
+        if '### Recently Completed Tasks' in payload:
+            recently_idx = payload.index('### Recently Completed Tasks')
+            next_section_idx = payload.find('\n#', recently_idx + 1)
+            if next_section_idx == -1:
+                next_section_idx = len(payload)
+            recently_section = payload[recently_idx:next_section_idx]
+        assert '### Recently Completed Tasks' not in payload or '5' in recently_section, (
+            "Expected '### Recently Completed Tasks' absent or done_count '5' in section body"
+        )
+        # No individual done-task lines anywhere (harness sample_pool = active_tasks only)
+        assert '(done)' not in payload, (
+            "Unexpected individual done-task line in harness-injected payload"
+        )
 
     @pytest.mark.asyncio
     async def test_fallback_self_fetch_uses_shared_filter(self, mock_deps, watermark):
@@ -1687,3 +1703,53 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         assert '### Recently Completed Tasks' in payload
         # At least one done task title must appear
         assert 'Task 1' in payload or 'Task 2' in payload or 'Task 3' in payload
+
+    @pytest.mark.asyncio
+    async def test_fallback_renders_done_tasks_in_recently_completed_section(
+        self, mock_deps, watermark,
+    ):
+        """Fallback path: done tasks appear inside Recently Completed section (scoped assertion)."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        stage.filtered_task_tree = None  # trigger fallback self-fetch
+
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'in-progress'),
+                self._make_task(2, 'pending'),
+                self._make_task(10, 'done'),
+                self._make_task(11, 'done'),
+                self._make_task(12, 'done'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # (a) Recently Completed Tasks header must be present in fallback path
+        assert '### Recently Completed Tasks' in payload, (
+            "Payload missing '### Recently Completed Tasks' header in fallback path"
+        )
+
+        # (b) Extract the Recently Completed section body (same pattern as
+        #     test_payload_recently_completed_tasks_sorted_desc lines 1403-1408)
+        recently_idx = payload.index('### Recently Completed Tasks')
+        next_section_idx = payload.find('\n#', recently_idx + 1)
+        if next_section_idx == -1:
+            next_section_idx = len(payload)
+        recently_section = payload[recently_idx:next_section_idx]
+
+        # (c) Done-task ids must appear INSIDE the Recently Completed section (scoped)
+        assert '[10]' in recently_section, "Done task id=10 not found in Recently Completed section"
+        assert '[11]' in recently_section, "Done task id=11 not found in Recently Completed section"
+        assert '[12]' in recently_section, "Done task id=12 not found in Recently Completed section"
+
+        # (d) Active-task ids must NOT appear inside the Recently Completed section —
+        #     cross-validates that section extraction is correctly bounded.
+        #     Use bracket-id form '[1]'/[2]' which avoids substring collision with '[10]'/'[11]'.
+        assert '[1]' not in recently_section, (
+            "Active task id=1 should NOT be in Recently Completed section"
+        )
+        assert '[2]' not in recently_section, (
+            "Active task id=2 should NOT be in Recently Completed section"
+        )
