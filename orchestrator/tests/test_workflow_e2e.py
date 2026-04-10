@@ -1999,3 +1999,30 @@ class TestFakeSchedulerCachedStatus:
         await fake.set_task_status('x', 'in-progress')
         await fake.set_task_status('x', 'done')
         assert fake.get_cached_status('x') == 'done'
+
+
+# ---------------------------------------------------------------------------
+# Tests: _EvalScheduler.get_cached_status
+# ---------------------------------------------------------------------------
+
+
+class TestEvalSchedulerCachedStatus:
+    """_EvalScheduler.get_cached_status tracks status set via set_task_status."""
+
+    def test_eval_scheduler_get_cached_status_returns_none_initially(self):
+        """Before any set_task_status call, get_cached_status returns None."""
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.runner import _EvalScheduler
+
+        sched = _EvalScheduler(OrchestratorConfig())
+        assert sched.get_cached_status('99') is None
+
+    @pytest.mark.asyncio
+    async def test_eval_scheduler_get_cached_status_tracks_set_task_status(self):
+        """get_cached_status returns the status written by set_task_status."""
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.runner import _EvalScheduler
+
+        sched = _EvalScheduler(OrchestratorConfig())
+        await sched.set_task_status('99', 'done')
+        assert sched.get_cached_status('99') == 'done'
