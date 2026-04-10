@@ -487,6 +487,11 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
   with category `preferences_and_norms`.
 - **dismiss** — Not actionable, already covered, or noise.
 
+**Deduplication:** Before creating any task, call `get_tasks` to check for existing
+pending or in-progress tasks with the same intent.  If a match exists, skip creation
+and cite the existing task ID.  Same module + same fix intent = duplicate even if
+wording differs.
+
 ## Rules
 
 1. **Stay in scope.** Only fix what the escalation describes. Do not refactor surrounding

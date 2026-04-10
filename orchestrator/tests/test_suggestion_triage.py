@@ -99,7 +99,11 @@ class TestEscalateSuggestions:
         assert esc.category == 'review_suggestions'
         assert esc.severity == 'info'
         assert esc.task_id == '42'
-        assert json.loads(esc.detail) == suggestions
+        # Detail is prefixed with content fingerprint: #hash:<hex16>#<json>
+        detail = esc.detail
+        assert detail.startswith('#hash:')
+        json_start = detail.index('#', 6) + 1
+        assert json.loads(detail[json_start:]) == suggestions
 
     def test_noop_without_queue(self):
         wf = _make_workflow(escalation_queue=None)

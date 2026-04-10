@@ -230,7 +230,7 @@ class TaskSteward:
         # Pre-triage large suggestion sets before invoking the steward session
         if escalation.category == 'review_suggestions' and escalation.detail:
             try:
-                suggestions = json.loads(escalation.detail)
+                suggestions = json.loads(_strip_hash_prefix(escalation.detail))
             except (json.JSONDecodeError, TypeError):
                 suggestions = []
             if len(suggestions) >= self.config.suggestion_triage_threshold:
@@ -437,7 +437,7 @@ class TaskSteward:
             parse_triage_result,
         )
 
-        suggestions = json.loads(escalation.detail)
+        suggestions = json.loads(_strip_hash_prefix(escalation.detail))
         prompt = build_triage_prompt(suggestions, self.task)
 
         oauth_token = None
@@ -451,7 +451,11 @@ class TaskSteward:
             model=self.config.models.triage,
             max_turns=self.config.max_turns.triage,
             max_budget_usd=self.config.budgets.triage,
-            allowed_tools=['Read', 'Glob', 'Grep'],
+            allowed_tools=[
+                'Read', 'Glob', 'Grep',
+                'mcp__fused-memory__get_tasks',
+                'mcp__fused-memory__search',
+            ],
             output_schema=TRIAGE_OUTPUT_SCHEMA,
             effort=self.config.effort.triage,
             backend=self.config.backends.triage,
@@ -552,3 +556,10 @@ class TaskSteward:
                 logger.warning(
                     f'Failed to patch steward metadata on {escalation_id}: {e}'
                 )
+
+
+def _strip_hash_prefix(detail: str) -> str:
+    """Strip the ``#hash:<hex>#`` content-fingerprint prefix if present."""
+    if detail.startswith('#hash:') and '#' in detail[6:]:
+        return detail[detail.index('#', 6) + 1:]
+    return detail

@@ -166,7 +166,9 @@ async def run_server():
         from fused_memory.middleware.task_file_committer import TaskFileCommitter
 
         task_committer = TaskFileCommitter()
-        task_interceptor = TaskInterceptor(taskmaster, targeted, event_buffer, task_committer)
+        task_interceptor = TaskInterceptor(
+            taskmaster, targeted, event_buffer, task_committer, config=config,
+        )
 
         # Full reconciliation harness (background loop)
         reconciliation_harness = ReconciliationHarness(
@@ -183,7 +185,9 @@ async def run_server():
         event_buffer = EventBuffer(db_path=None)
         await event_buffer.initialize()
         task_committer = TaskFileCommitter()
-        task_interceptor = TaskInterceptor(taskmaster, None, event_buffer, task_committer)
+        task_interceptor = TaskInterceptor(
+            taskmaster, None, event_buffer, task_committer, config=config,
+        )
 
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(

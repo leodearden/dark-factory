@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import hashlib
 import json
 import logging
 import uuid
@@ -2068,6 +2069,27 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if not suggestions or not self.escalation_queue:
             return
 
+        # Content fingerprint: skip if identical suggestions already escalated
+        content_hash = hashlib.sha256(
+            json.dumps(suggestions, sort_keys=True).encode(),
+        ).hexdigest()[:16]
+
+        existing = self.escalation_queue.get_by_task(self.task_id)
+        for prev in existing:
+            if (
+                prev.category == 'review_suggestions'
+                and prev.detail
+                and prev.detail.startswith(f'#hash:{content_hash}#')
+            ):
+                logger.info(
+                    'Task %s: skipping duplicate review_suggestions escalation '
+                    '(content hash %s matches %s)',
+                    self.task_id, content_hash, prev.id,
+                )
+                return
+
+        detail = f'#hash:{content_hash}#' + json.dumps(suggestions)
+
         esc = Escalation(
             id=self.escalation_queue.make_id(self.task_id),
             task_id=self.task_id,
@@ -2075,7 +2097,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             severity='info',
             category='review_suggestions',
             summary=f'{len(suggestions)} review suggestion(s) for triage',
-            detail=json.dumps(suggestions),
+            detail=detail,
             suggested_action='triage_suggestions',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
