@@ -235,14 +235,42 @@ class TestCollectSnapshot:
         ):
             await collect_snapshot(conn, config)
 
-        async with conn.execute('SELECT project_id FROM snapshots') as cur:
+        async with conn.execute('SELECT * FROM snapshots') as cur:
             rows = list(await cur.fetchall())
 
+        # row: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
         assert len(rows) == 3
-        project_ids = {row[0] for row in rows}
-        assert str(base_config.project_root) in project_ids
-        assert str(reify_root.resolve()) in project_ids
-        assert str(autopilot_root.resolve()) in project_ids
+        by_project = {row[1]: row for row in rows}
+        assert str(base_config.project_root) in by_project
+        assert str(reify_root.resolve()) in by_project
+        assert str(autopilot_root.resolve()) in by_project
+
+        # main project: 1 pending task
+        main_row = by_project[str(base_config.project_root)]
+        assert main_row[3] == 1  # pending
+        assert main_row[4] == 0  # in_progress
+        assert main_row[5] == 0  # blocked
+        assert main_row[6] == 0  # deferred
+        assert main_row[7] == 0  # cancelled
+        assert main_row[8] == 0  # done
+
+        # reify: 2 done tasks
+        reify_row = by_project[str(reify_root.resolve())]
+        assert reify_row[3] == 0  # pending
+        assert reify_row[4] == 0  # in_progress
+        assert reify_row[5] == 0  # blocked
+        assert reify_row[6] == 0  # deferred
+        assert reify_row[7] == 0  # cancelled
+        assert reify_row[8] == 2  # done
+
+        # autopilot: 1 in-progress task
+        autopilot_row = by_project[str(autopilot_root.resolve())]
+        assert autopilot_row[3] == 0  # pending
+        assert autopilot_row[4] == 1  # in_progress
+        assert autopilot_row[5] == 0  # blocked
+        assert autopilot_row[6] == 0  # deferred
+        assert autopilot_row[7] == 0  # cancelled
+        assert autopilot_row[8] == 0  # done
 
     @pytest.mark.asyncio
     async def test_dedupes_known_root_against_main_project(self, burndown_env):
@@ -260,8 +288,10 @@ class TestCollectSnapshot:
         ):
             await collect_snapshot(conn, config)
 
-        async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
-                                (str(base_config.project_root),)) as cur:
+        # Total row count (no WHERE) catches both same-id duplicates AND the
+        # symlink case where two rows with different project_id strings are
+        # inserted for the same physical directory.
+        async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
             row = await cur.fetchone()
             assert row is not None
             count = row[0]
