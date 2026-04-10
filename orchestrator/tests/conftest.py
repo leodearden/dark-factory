@@ -53,9 +53,16 @@ def build_usage_gate(
 
     Raises
     ------
+    TypeError
+        If ``tokens`` is a bare ``str`` instead of a list/tuple.
     ValueError
         If ``account_configs`` and ``tokens`` have different lengths.
     """
+    if isinstance(tokens, str):
+        raise TypeError(
+            f'tokens must be a list/tuple of str|None, not a bare str; '
+            f'got {tokens!r}. Did you forget to wrap it in a list?'
+        )
     if len(account_configs) != len(tokens):
         raise ValueError(
             f'account_configs and tokens must have the same length; '
