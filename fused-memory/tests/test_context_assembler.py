@@ -137,10 +137,7 @@ async def test_budget_stops_accumulation(mock_memory):
     config = _make_config(token_budget=1_450)  # overhead (1400) + room for ~1 event (~50 tokens)
     assembler = _make_assembler(memory_service=mock_memory, config=config)
 
-    events = [
-        _make_event(payload={'content_preview': f'content {i}'})
-        for i in range(10)
-    ]
+    events = [_make_event(payload={'content_preview': f'content {i}'}) for i in range(10)]
     watermark = _make_watermark()
 
     result = await assembler.assemble(events, watermark, 'test-project')
@@ -216,7 +213,10 @@ async def test_memory_added_searches_by_preview(mock_memory):
     events = [
         _make_event(
             event_type=EventType.memory_added,
-            payload={'content_preview': 'decision about auth', 'category': 'decisions_and_rationale'},
+            payload={
+                'content_preview': 'decision about auth',
+                'category': 'decisions_and_rationale',
+            },
         ),
     ]
     watermark = _make_watermark()
@@ -225,24 +225,29 @@ async def test_memory_added_searches_by_preview(mock_memory):
 
     mock_memory.search.assert_called_once()
     call_kwargs = mock_memory.search.call_args
-    assert call_kwargs.kwargs.get('query') == 'decision about auth' or call_kwargs[1].get('query') == 'decision about auth'
+    assert (
+        call_kwargs.kwargs.get('query') == 'decision about auth'
+        or call_kwargs[1].get('query') == 'decision about auth'
+    )
 
 
 @pytest.mark.asyncio
 async def test_task_status_changed_fetches_task(mock_memory, mock_taskmaster):
     """task_status_changed events fetch the task and search memory hints."""
-    mock_taskmaster.get_task = AsyncMock(return_value={
-        'id': '42',
-        'title': 'Implement auth',
-        'status': 'done',
-        'dependencies': [],
-        'metadata': {
-            'memory_hints': {
-                'queries': ['auth implementation decisions'],
-                'entities': ['AuthService'],
+    mock_taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '42',
+            'title': 'Implement auth',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {
+                'memory_hints': {
+                    'queries': ['auth implementation decisions'],
+                    'entities': ['AuthService'],
+                },
             },
-        },
-    })
+        }
+    )
     mock_memory.search = AsyncMock(return_value=[_make_memory_result()])
 
     assembler = _make_assembler(
@@ -380,10 +385,7 @@ async def test_batch_processing(mock_memory):
     config = _make_config(context_fetch_batch_size=3)
     assembler = _make_assembler(memory_service=mock_memory, config=config)
 
-    events = [
-        _make_event(payload={'content_preview': f'event {i}'})
-        for i in range(7)
-    ]
+    events = [_make_event(payload={'content_preview': f'event {i}'}) for i in range(7)]
     watermark = _make_watermark()
 
     result = await assembler.assemble(events, watermark, 'test-project')
@@ -521,14 +523,15 @@ class TestContextAssemblerCancellation:
         guard branches and accidentally promotes RuntimeError accounting before the
         cancellation check.
 
-        Directly patches assembler._fetch_context to emit a RuntimeError on the first
-        call and CancelledError on the second — bypassing _fetch_context's internal
-        ``except Exception`` wrapper and forcing the exact mix into batch_contexts that
-        the propagation pass must handle correctly.
+        Patches assembler._fetch_context via patch.object to emit a RuntimeError for
+        event_one and a CancelledError for event_two — bypassing _fetch_context's
+        internal ``except Exception`` wrapper and forcing the exact mix into
+        batch_contexts (in deterministic slot order, since gather preserves input-order
+        in its result list regardless of scheduling) that the propagation pass must
+        handle correctly.
 
         Sister test: TestRebuildEntitySummariesCancellation::
             test_cancelled_error_propagates_alongside_other_errors
-            (test_rebuild_entity_summaries.py:1162-1194)
         """
         call_count = 0
 
@@ -642,7 +645,10 @@ class TestContextAssemblerCancellation:
         ]
         watermark = _make_watermark()
 
-        with patch.object(assembler, '_fetch_context', new=patched_fetch_context), pytest.raises(asyncio.CancelledError):
+        with (
+            patch.object(assembler, '_fetch_context', new=patched_fetch_context),
+            pytest.raises(asyncio.CancelledError),
+        ):
             await assembler.assemble(events, watermark, 'test-project')
 
         assert call_count >= 11, (
