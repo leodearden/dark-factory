@@ -1331,3 +1331,9 @@ class TestBuildUsageGateHelper:
         acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
         with pytest.raises(ValueError, match='length'):
             build_usage_gate(acct_cfgs, ['tok-a', 'tok-b'])  # 1 cfg, 2 tokens
+
+    def test_build_usage_gate_raises_on_bare_string_tokens(self):
+        """TypeError is raised when tokens is a bare str instead of a list/tuple."""
+        acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
+        with pytest.raises(TypeError, match='str'):
+            build_usage_gate(acct_cfgs, 'tok-a')  # bare string, not a list
