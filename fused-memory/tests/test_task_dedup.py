@@ -496,6 +496,117 @@ class TestBulkDedup:
             for entry in result['dedup']['removed']
         )
 
+    # ── step-3 test ───────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_expand_task_skips_dedup_for_existing_subtasks(
+        self, bulk_taskmaster, event_buffer, pre_snapshot,
+    ):
+        """When all post-call subtasks already existed in the pre-snapshot,
+        no removal is attempted and dedup['removed'] is empty."""
+        # Both calls to get_tasks return the same snapshot — no new tasks created
+        bulk_taskmaster.get_tasks = AsyncMock(side_effect=[pre_snapshot, pre_snapshot])
+        interceptor = TaskInterceptor(bulk_taskmaster, None, event_buffer)
+
+        result = await interceptor.expand_task('1', project_root='/project')
+
+        bulk_taskmaster.remove_task.assert_not_called()
+        assert result['dedup']['removed'] == []
+
+    # ── step-5 test ───────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_expand_task_vector_dedup_removes_similar_subtask(
+        self, bulk_taskmaster, event_buffer, pre_snapshot,
+    ):
+        """Layer-2 (vector) dedup removes a new subtask that is semantically
+        similar to a pre-existing one even when the title is not an exact match."""
+        # post snapshot has one new subtask with a DIFFERENT title (Layer 1 misses)
+        post = {
+            'tasks': [
+                {
+                    'id': '1', 'title': 'Parent task', 'status': 'done',
+                    'subtasks': [
+                        {'id': '1.1', 'title': 'Fix auth bug', 'status': 'done'},
+                        # new task — similar but not identical title
+                        {'id': '1.2', 'title': 'Fix authentication vulnerability', 'status': 'pending'},
+                    ],
+                }
+            ]
+        }
+        bulk_taskmaster.get_tasks = AsyncMock(side_effect=[pre_snapshot, post])
+
+        mock_dedup = AsyncMock()
+        mock_dedup.find_duplicate = AsyncMock(return_value={
+            'task_id': '1.1',
+            'task_title': 'Fix auth bug',
+            'score': 0.94,
+        })
+        mock_dedup.record_task = AsyncMock()
+
+        interceptor = TaskInterceptor(bulk_taskmaster, None, event_buffer)
+        interceptor._deduplicator = mock_dedup
+
+        result = await interceptor.expand_task('1', project_root='/project')
+
+        # Layer-2 found a match → remove_task must be called for the new subtask
+        mock_dedup.find_duplicate.assert_called_once()
+        call_args = mock_dedup.find_duplicate.call_args
+        assert 'fix authentication vulnerability' in call_args.args[0].lower() or \
+               'Fix authentication vulnerability' in call_args.args[0]
+
+        assert bulk_taskmaster.remove_task.call_count == 1
+        removed_ids = [c.args[0] for c in bulk_taskmaster.remove_task.call_args_list]
+        assert '1.2' in removed_ids
+
+        assert 'dedup' in result
+        assert any(e.get('task_id') == '1.2' for e in result['dedup']['removed'])
+
+    # ── step-7 test ───────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_expand_task_records_surviving_subtasks_in_layer1_and_layer2(
+        self, bulk_taskmaster, event_buffer,
+    ):
+        """Surviving (non-duplicate) new subtasks are recorded in Layer-1 cache
+        and via a fire-and-forget Layer-2 record_task call."""
+        pre: dict = {'tasks': []}
+        post = {
+            'tasks': [
+                {'id': '10', 'title': 'Task Alpha', 'status': 'pending', 'subtasks': []},
+                {'id': '11', 'title': 'Task Beta',  'status': 'pending', 'subtasks': []},
+            ]
+        }
+        bulk_taskmaster.get_tasks = AsyncMock(side_effect=[pre, post])
+
+        mock_dedup = AsyncMock()
+        mock_dedup.find_duplicate = AsyncMock(return_value=None)
+        mock_dedup.record_task = AsyncMock()
+
+        interceptor = TaskInterceptor(bulk_taskmaster, None, event_buffer)
+        interceptor._deduplicator = mock_dedup
+
+        result = await interceptor.expand_task('1', project_root='/project')
+        await asyncio.sleep(0.05)
+        await interceptor.drain()
+
+        # Layer-1 cache must contain both survivors
+        h_alpha = interceptor._title_hash('Task Alpha')
+        h_beta  = interceptor._title_hash('Task Beta')
+        assert h_alpha in interceptor._dedup_cache
+        assert h_beta  in interceptor._dedup_cache
+
+        # Layer-2 record_task must have been called once per survivor.
+        # Titles are normalized (lowercased) by _flatten_tasks before being
+        # passed to record_task.
+        assert mock_dedup.record_task.call_count == 2
+        recorded_titles = {c.args[1] for c in mock_dedup.record_task.call_args_list}
+        assert 'task alpha' in recorded_titles
+        assert 'task beta'  in recorded_titles
+
+        assert result['dedup']['removed'] == []
+        assert len(result['dedup']['kept']) == 2
+
 
 class TestHashPrefixStripping:
 
