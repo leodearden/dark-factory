@@ -1009,7 +1009,7 @@ Output JSON matching the schema. Every task must appear in the output.
         self._escalation_queue.set_notify_callback(self._on_escalation)
         self._escalation_queue.set_resolve_callback(self._on_escalation_resolved)
 
-        mcp_server = create_server(self._escalation_queue, merge_queue=self._merge_queue)  # type: ignore[possibly-undefined]
+        mcp_server = create_server(self._escalation_queue, merge_queue=self._merge_queue, orch_config=self.config)  # type: ignore[possibly-undefined]
         host = self.config.escalation.host
         port = self.config.escalation.port
 
