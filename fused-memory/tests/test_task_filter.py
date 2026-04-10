@@ -233,7 +233,14 @@ class TestFormatFilteredTaskTree:
         assert '5 done, 2 cancelled \u2014 omitted' in output
 
     def test_caps_at_max_tasks_and_under_budget(self):
-        """format_filtered_task_tree caps at max_tasks and keeps output under max_chars."""
+        """Regression: format_filtered_task_tree must honour max_chars and emit the exact
+        max_tasks-cap header phrase when active tasks exceed max_tasks.
+
+        With 500 active tasks and the default max_tasks=50 cap, 450 tasks are omitted.
+        The header must contain the exact phrase '450 more active omitted by max_tasks cap'
+        (the format emitted at task_filter.py line 232 when omitted_active > 0) and the
+        total output must not exceed max_chars (default 50,000 chars).
+        """
         # 500 active tasks with plausible-length titles
         active = [
             _make_task(i, 'pending', f'This is a moderately long title for task number {i} in the queue')
@@ -249,13 +256,11 @@ class TestFormatFilteredTaskTree:
 
         output = format_filtered_task_tree(tree)
 
-        # Output must be under budget
+        # Output must not exceed max_chars budget (default 50,000)
         assert len(output) <= 50_000
 
-        # Must contain at least the first (highest-priority) tasks
-        # With max_tasks=50, we expect only 50 tasks rendered
-        # Check truncation notice
-        assert '450 more active' in output or 'truncated' in output.lower() or len(output) < 50_000
+        # Header must contain the exact max_tasks-cap omission phrase
+        assert '450 more active omitted by max_tasks cap' in output
 
     def test_empty_active_and_empty_tree(self):
         """format_filtered_task_tree handles empty FilteredTaskTree gracefully."""
