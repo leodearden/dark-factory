@@ -1255,6 +1255,12 @@ class TestRebuildEntitySummariesParallel:
         assert by_uuid['uuid-2']['old_summary'] == 'bob summary'
         # get_node_text must never be called
         backend.get_node_text.assert_not_awaited()
+        # end-to-end: details dict surfaces old_summary and new_summary per entity
+        by_detail = {d['uuid']: d for d in result['details']}
+        assert by_detail['uuid-1']['old_summary'] == 'alice summary'
+        assert by_detail['uuid-1']['new_summary'] == 'fact1'
+        assert by_detail['uuid-2']['old_summary'] == 'bob summary'
+        assert by_detail['uuid-2']['new_summary'] == 'fact2'
 
     @pytest.mark.asyncio
     async def test_force_path_passes_empty_string_old_summary(
@@ -1312,6 +1318,12 @@ class TestRebuildEntitySummariesParallel:
         assert by_uuid['uuid-1']['old_summary'] == 'alice stale'
         assert by_uuid['uuid-2']['old_summary'] == 'bob stale'
         backend.get_node_text.assert_not_awaited()
+        # end-to-end: details dict surfaces old_summary and new_summary per entity
+        by_detail = {d['uuid']: d for d in result['details']}
+        assert by_detail['uuid-1']['old_summary'] == 'alice stale'
+        assert by_detail['uuid-1']['new_summary'] == 'alice current'
+        assert by_detail['uuid-2']['old_summary'] == 'bob stale'
+        assert by_detail['uuid-2']['new_summary'] == 'bob current'
 
     @pytest.mark.asyncio
     async def test_partial_failure_in_update_does_not_cancel_others(
