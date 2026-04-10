@@ -4,7 +4,24 @@ import dataclasses
 import re
 from pathlib import Path
 
+import pytest
+
 from dashboard.config import DEFAULT_FUSED_MEMORY_URLS, DashboardConfig
+
+
+@pytest.fixture
+def symlinked_dir(tmp_path):
+    """Create a `link -> real` symlink in tmp_path.
+
+    Returns `(link, real.resolve())` so tests can pass `link` to production code
+    and assert against the pre-resolved real path, eliminating the 4-line
+    setup boilerplate that was previously duplicated across 5 tests.
+    """
+    real = tmp_path / 'real'
+    real.mkdir()
+    link = tmp_path / 'link'
+    link.symlink_to(real)
+    return link, real.resolve()
 
 
 class TestConfigDefaults:
@@ -98,19 +115,15 @@ class TestConfigEnvOverrides:
         cfg = DashboardConfig.from_env()
         assert cfg.known_project_roots == []
 
-    def test_from_env_resolves_known_project_roots(self, monkeypatch, tmp_path):
+    def test_from_env_resolves_known_project_roots(self, monkeypatch, symlinked_dir):
         """from_env() must resolve symlinked paths in DASHBOARD_KNOWN_PROJECT_ROOTS."""
         from dashboard.config import DashboardConfig
 
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
-
+        link, real_resolved = symlinked_dir
         monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', str(link))
         cfg = DashboardConfig.from_env()
         # known_project_roots must contain the resolved real path, not the symlink
-        assert cfg.known_project_roots == [real_dir.resolve()]
+        assert cfg.known_project_roots == [real_resolved]
 
     def test_from_env_resolves_project_root_symlink(self, monkeypatch, tmp_path):
         """from_env() must resolve a symlinked path in DASHBOARD_PROJECT_ROOT."""
