@@ -1296,6 +1296,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return await self._handle_wip_conflict(result, branch_name)
         if result.status == 'done_wip_recovery':
             return await self._handle_wip_recovery(result)
+        if result.status == 'wip_recovery_no_advance':
+            return await self._handle_wip_recovery_no_advance(result)
         if result.status == 'done':
             return WorkflowOutcome.DONE
         if result.status == 'already_merged':
@@ -1460,6 +1462,69 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             logger.info(f'Task {self.task_id}: WIP recovery escalation resolved')
 
         return WorkflowOutcome.DONE
+
+    async def _handle_wip_recovery_no_advance(self, result) -> WorkflowOutcome:
+        """Handle a wip_recovery_no_advance merge outcome.
+
+        The merge did NOT land on main (CAS failure path). A stash pop conflict
+        occurred, and WIP has been preserved on a recovery branch. Create a
+        level-1 escalation to inform a human, then return BLOCKED — the task
+        cannot proceed until the tree is manually inspected.
+
+        Unlike ``_handle_wip_recovery`` (which returns DONE because the merge
+        landed), this returns BLOCKED because main was NOT advanced.
+        """
+        recovery_branch = result.recovery_branch or '(unknown)'
+        detail = (
+            f'Merge for task {self.task_id} did NOT advance main. '
+            f'A stash pop conflict occurred after a CAS failure, leaving '
+            f'the working tree in an unresolvable state.\n\n'
+            f'Your WIP has been preserved on branch: {recovery_branch}\n\n'
+            f'The merge queue has been halted. To recover:\n'
+            f'  git checkout {recovery_branch}\n'
+            f'  # Review and reapply your changes to a clean branch\n\n'
+            f'Manual intervention required — do NOT let automated tooling '
+            f'resolve this escalation. Resolve this escalation to un-halt '
+            f'the merge queue.'
+        )
+        logger.warning(
+            f'Task {self.task_id}: stash pop conflicted on CAS-failure path — '
+            f'merge did not advance. WIP preserved on {recovery_branch}'
+        )
+
+        if self.escalation_queue:
+            from escalation.models import Escalation
+
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role='orchestrator',
+                severity='blocking',
+                category='wip_conflict',
+                summary=f'Stash pop conflict (merge did not advance) — WIP on {recovery_branch}',
+                detail=detail,
+                suggested_action='manual_intervention',
+                level=1,
+                worktree=str(self.worktree) if self.worktree else None,
+                workflow_state=self.state.value,
+            )
+            self.escalation_queue.submit(esc)
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.escalation_created,
+                    task_id=self.task_id, phase=self.state.value,
+                    data={'escalation_id': esc.id, 'category': 'wip_conflict',
+                          'severity': 'blocking', 'summary': esc.summary[:200]},
+                )
+
+            # Wait for human resolution — do NOT return DONE (merge did not land)
+            if self._escalation_event is None:
+                self._escalation_event = asyncio.Event()
+            self._escalation_event.clear()
+            await self._escalation_event.wait()
+            logger.info(f'Task {self.task_id}: wip_recovery_no_advance escalation resolved')
+
+        return WorkflowOutcome.BLOCKED
 
     def _write_merge_failure_review(self, category: str, detail: str) -> None:
         """Write a review-format JSON describing a merge failure to .task/reviews/.

@@ -880,6 +880,72 @@ class TestWorkingTreeSync:
         )
         assert stash_before.strip() == stash_after.strip()
 
+    async def test_cas_failure_pop_conflict_does_not_cascade_to_stash_failed(
+        self, git_ops: GitOps,
+    ):
+        """Full cascade regression guard: after pop_conflict_no_advance the tree is clean.
+
+        Simulates the exact cascade the bug report describes:
+        1. CAS failure → stash pop conflicts → pop_conflict_no_advance returned.
+        2. Second advance_main call (no mocks, no dirty WIP) must NOT return
+           'stash_failed' or 'unmerged_state' — it must succeed normally.
+        This proves _safe_stash_pop_with_recovery fully cleans the tree.
+        """
+        # Setup: create a merge commit
+        wt = await git_ops.create_worktree('cascade-regr')
+        (wt.path / 'cascade.py').write_text('x = 1\n')
+        await git_ops.commit(wt.path, 'Add cascade file')
+        merge_result = await git_ops.merge_to_main(wt.path, 'cascade-regr')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Dirty a tracked file so advance_main creates a stash
+        (git_ops.project_root / 'README.md').write_text('# WIP cascade regression\n')
+
+        # First call: force CAS failure AND mock stash pop to conflict
+        original_run = _run
+
+        async def mock_run_conflict(cmd, cwd=None):
+            if cmd[:3] == ['git', 'stash', 'pop']:
+                return (1, '', 'CONFLICT: merge conflict in README.md')
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run_conflict):
+            result1 = await git_ops.advance_main(
+                merge_result.merge_commit,
+                merge_result.merge_worktree,
+                branch='cascade-regr',
+                expected_main='0' * 40,  # force CAS failure
+            )
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result1 == 'pop_conflict_no_advance', f'Expected pop_conflict_no_advance, got {result1}'
+
+        # Tree must be fully clean now (recovery helper ran read-tree reset)
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert unmerged == [], f'Tree not clean after first advance: {unmerged}'
+
+        # Second call: create a fresh merge commit, no patching, no dirty WIP
+        wt2 = await git_ops.create_worktree('cascade-regr-2')
+        (wt2.path / 'cascade2.py').write_text('y = 2\n')
+        await git_ops.commit(wt2.path, 'Add cascade2')
+        merge_result2 = await git_ops.merge_to_main(wt2.path, 'cascade-regr-2')
+        assert merge_result2.success
+
+        result2 = await git_ops.advance_main(merge_result2.merge_commit)
+        if merge_result2.merge_worktree:
+            await git_ops.cleanup_merge_worktree(merge_result2.merge_worktree)
+
+        # Must NOT cascade to stash_failed or unmerged_state
+        assert result2 not in ('stash_failed', 'unmerged_state'), (
+            f'Cascade failure: second advance returned {result2!r} '
+            f'(tree was not cleaned by recovery helper)'
+        )
+        assert result2 in ('advanced', 'cas_failed'), (
+            f'Unexpected result: {result2!r}'
+        )
+
 
 @pytest.mark.asyncio
 class TestUnmergedDetection:

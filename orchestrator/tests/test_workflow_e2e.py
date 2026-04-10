@@ -1939,3 +1939,79 @@ class TestGhostLoopGuard:
         assert outcome == WorkflowOutcome.DONE
         # The implementer must NOT have been called (ghost-loop skipped)
         assert 'implementer' not in stub.calls
+
+
+# ---------------------------------------------------------------------------
+# Tests: WIP Recovery No Advance (pop_conflict on CAS-failure path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestWipRecoveryNoAdvance:
+    """wip_recovery_no_advance outcome creates L1 wip_conflict escalation and returns BLOCKED."""
+
+    async def test_workflow_handles_wip_recovery_no_advance_creates_level1_escalation(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        """When advance_main returns pop_conflict_no_advance, the workflow creates a
+        level-1 wip_conflict escalation and returns BLOCKED (not DONE — the merge
+        did NOT land on main).
+        """
+        recovery_branch = 'wip/recovery-no-advance-test'
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+        monkeypatch.setattr(
+            'orchestrator.merge_queue.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        async def _fake_advance(*args, **kwargs):
+            git_ops._last_recovery_branch = recovery_branch
+            return 'pop_conflict_no_advance'
+
+        monkeypatch.setattr(git_ops, 'advance_main', _fake_advance)
+
+        # Run the workflow as a separate task; it will block waiting on _escalation_event
+        workflow_task = asyncio.create_task(workflow.run())
+
+        # Poll until the wip_conflict escalation appears (meaning handler reached its wait)
+        for _ in range(200):
+            escs = queue.get_by_task('42')
+            if any(e.category == 'wip_conflict' for e in escs):
+                break
+            await asyncio.sleep(0.05)
+        else:
+            workflow_task.cancel()
+            pytest.fail('Timeout: wip_conflict escalation never created within 10s')
+
+        # Fire the event to unblock _handle_wip_recovery_no_advance
+        assert workflow._escalation_event is not None, 'Handler must have set _escalation_event'
+        workflow._escalation_event.set()
+
+        outcome = await workflow_task
+
+        # Merge did NOT land — must return BLOCKED, not DONE
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        wip_escs = [e for e in queue.get_by_task('42') if e.category == 'wip_conflict']
+        assert len(wip_escs) == 1
+        esc = wip_escs[0]
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert recovery_branch in (esc.summary + esc.detail)
+        # Detail must explain merge did not advance (not the same as done_wip_recovery)
+        assert 'did not advance' in esc.detail.lower() or 'merge did not' in esc.detail.lower()
