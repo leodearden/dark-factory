@@ -326,6 +326,8 @@ class UsageGate:
 
         acct.near_cap = True
         logger.warning(f'Account {acct.name} NEAR CAP: {reason}')
+        if self._cost_store:
+            self._fire_cost_event(acct.name, 'near_cap', json.dumps({'reason': reason}))
 
     def _find_account_by_token(self, token: str) -> AccountState | None:
         for acct in self._accounts:
