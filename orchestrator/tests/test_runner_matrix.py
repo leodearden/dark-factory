@@ -321,6 +321,78 @@ class TestRunEvalMatrixCancellation:
             f'Expected exc_val to be CancelledError instance, got {exc_val!r}'
         )
 
+    async def test_multiple_simultaneous_cancellederrors_all_logged(
+        self,
+        patch_load_task,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Both CancelledErrors must be logged when two tasks cancel in the same done batch.
+
+        With asyncio.wait(FIRST_COMPLETED), multiple tasks can complete in the
+        same event-loop iteration and land in the same ``done`` set.  The prior
+        implementation raised on the first cancelled task encountered, silently
+        discarding any subsequent cancellations in the batch.
+
+        The gate synchronisation forces both fake_run_eval coroutines to raise
+        CancelledError in the same event-loop iteration so they land in the same
+        ``done`` batch — exercising the multi-cancel code path deterministically.
+        Without the gate, the two coroutines might raise in separate iterations
+        and each hit the single-cancel path, passing against buggy code.
+
+        This test FAILS against the current implementation, which only logs the
+        first cancel before raising (Task 586).
+        """
+        path_a = tmp_path / 'task_a.json'
+        path_b = tmp_path / 'task_b.json'
+        path_a.touch()
+        path_b.touch()
+
+        gate = asyncio.Event()
+        arrival_count = 0
+
+        async def fake_run_eval(*args, **kwargs):
+            nonlocal arrival_count
+            arrival_count += 1
+            if arrival_count == 2:
+                # Second arrival sets the gate; this schedules the first
+                # coroutine's continuation via call_soon so both raise in the
+                # same event-loop iteration and land in the same done batch.
+                gate.set()
+            await gate.wait()
+            raise asyncio.CancelledError('simulated multi-cancel')
+
+        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'), pytest.raises(asyncio.CancelledError):
+            await run_eval_matrix(
+                [path_a, path_b],
+                [_CFG],
+                force=True,
+            )
+
+        cancel_records = [r for r in caplog.records if r.message == 'Eval cancelled']
+
+        # (a) Exactly two 'Eval cancelled' records — one per cancelled task
+        assert len(cancel_records) == 2, (
+            f'Expected 2 "Eval cancelled" log records, got {len(cancel_records)}. '
+            f'All records: {[r.message for r in caplog.records]}'
+        )
+
+        # (b) Each record must carry a 3-tuple exc_info with CancelledError
+        for i, record in enumerate(cancel_records):
+            assert isinstance(record.exc_info, tuple) and len(record.exc_info) == 3, (
+                f'Record {i}: expected exc_info to be a 3-tuple, got {record.exc_info!r}'
+            )
+            exc_type, exc_val, exc_tb = record.exc_info
+            assert exc_type is asyncio.CancelledError, (
+                f'Record {i}: expected exc_type to be CancelledError, got {exc_type!r}'
+            )
+            assert isinstance(exc_val, asyncio.CancelledError), (
+                f'Record {i}: expected exc_val to be CancelledError instance, got {exc_val!r}'
+            )
+
 
 @pytest.mark.asyncio
 class TestRunEvalMatrixNonCancelPath:

@@ -356,7 +356,14 @@ class TestAllCappedBlockResume:
         assert gate.is_paused, "Expected gate to be paused when all accounts are capped"
         assert not gate._open.is_set(), "Expected _open event to be cleared when all capped"
 
-        # Uncap max-e and signal the gate to open
+        # TEST SHORTCUT — bypasses the real production resume path.
+        # In production, accounts are uncapped in one of two ways:
+        #   (a) _refresh_capped_accounts() wakes periodically and checks whether
+        #       resets_at has elapsed, then clears `capped` and calls _open.set(); or
+        #   (b) _account_resume_probe_loop() fires a successful probe via _run_probe()
+        #       and calls _open.set() itself after clearing `capped`.
+        # Here we mutate `capped` and set the event directly so the test stays fast
+        # and synchronous without needing to run background tasks or mock the clock.
         gate._accounts[1].capped = False  # max-e is index 1
         gate._open.set()
 
@@ -420,3 +427,89 @@ class TestAllCappedBlockResume:
                 )
             else:
                 assert gate.is_paused, "Gate should be paused when all 5 accounts are capped"
+
+
+# ---------------------------------------------------------------------------
+# Unknown-token fallback: _handle_cap_detected with a token that matches no account
+# ---------------------------------------------------------------------------
+
+
+class TestCapDetectedUnknownToken:
+    """Characterizes the best-guess fallback in _handle_cap_detected.
+
+    When oauth_token does not match any configured account,
+    _handle_cap_detected walks _accounts and picks the first non-capped
+    account as the victim (usage_gate.py ~line 283).  If all accounts are
+    already capped it logs a warning and returns without mutating state.
+    """
+
+    def test_unknown_token_falls_back_to_first_uncapped_account(self):
+        """Unknown token causes _handle_cap_detected to cap the first uncapped account."""
+        gate = _make_reify_gate()  # all 5 accounts uncapped
+
+        gate._handle_cap_detected(
+            reason='unknown-token-cap',
+            resets_at=datetime.now(UTC) + timedelta(hours=1),
+            oauth_token='not-a-real-token',
+        )
+
+        # max-f (index 0) is the first uncapped account — it becomes the victim
+        assert gate._accounts[0].capped, "max-f should be capped (best-guess fallback victim)"
+        # The remaining 4 accounts should be untouched
+        for acct in gate._accounts[1:]:
+            assert not acct.capped, (
+                f"{acct.name} should still be uncapped after unknown-token fallback"
+            )
+        # Gate is not paused because 4 accounts remain available
+        assert not gate.is_paused, (
+            "Gate should not be paused: 4 of 5 accounts are still available"
+        )
+
+    def test_unknown_token_when_all_capped_is_noop(self):
+        """Unknown token with all accounts capped is a no-op (logs warning, no state change)."""
+        gate = _make_reify_gate()
+
+        # Cap all 5 accounts using the same loop pattern as test_gate_blocks_while_all_capped
+        future_reset = datetime.now(UTC) + timedelta(hours=1)
+        for defn in REIFY_ACCOUNT_DEFS:
+            gate._handle_cap_detected(
+                reason=f'cap-{defn["name"]}',
+                resets_at=future_reset,
+                oauth_token=f'token-{defn["name"]}',
+            )
+
+        assert gate.is_paused, "Gate should be paused after capping all 5 accounts"
+
+        # Snapshot the state of all 5 accounts before the unknown-token call
+        snapshot = [
+            (a.name, a.capped, a.resets_at)
+            for a in gate._accounts
+        ]
+
+        # Call with an unknown token — should be a no-op since no uncapped account exists
+        gate._handle_cap_detected(
+            reason='stray-token-cap',
+            resets_at=None,
+            oauth_token='not-a-real-token',
+        )
+
+        # All 5 accounts must still be capped
+        assert len(gate._accounts) == 5
+        for acct in gate._accounts:
+            assert acct.capped, (
+                f"{acct.name} should still be capped after noop unknown-token call"
+            )
+
+        # No account state was mutated: compare against snapshot
+        for i, (name, was_capped, was_resets_at) in enumerate(snapshot):
+            acct = gate._accounts[i]
+            assert acct.name == name
+            assert acct.capped == was_capped, (
+                f"{name}: capped changed unexpectedly"
+            )
+            assert acct.resets_at == was_resets_at, (
+                f"{name}: resets_at changed unexpectedly"
+            )
+
+        # Gate remains paused
+        assert gate.is_paused, "Gate must remain paused after noop unknown-token call"
