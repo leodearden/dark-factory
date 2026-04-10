@@ -710,3 +710,48 @@ class TestWorkingTreeSync:
             ['git', 'stash', 'list'], cwd=git_ops.project_root,
         )
         assert stash_list.strip() == ''
+
+
+@pytest.mark.asyncio
+class TestUnmergedDetection:
+    """Tests for the _detect_unmerged_paths helper."""
+
+    async def test_detect_unmerged_paths_empty_on_clean_tree(self, git_ops: GitOps):
+        """On a freshly-initialized repo with no conflicts, helper returns []."""
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert unmerged == []
+
+    async def test_detect_unmerged_paths_returns_uu_files(self, git_ops: GitOps):
+        """After a conflicting merge, helper returns paths containing the conflicted file."""
+        # Create a divergent branch with a conflicting change to README.md
+        await _run(
+            ['git', 'checkout', '-b', 'conflict-b'],
+            cwd=git_ops.project_root,
+        )
+        (git_ops.project_root / 'README.md').write_text('# From B\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'change README on B'],
+            cwd=git_ops.project_root,
+        )
+
+        # Go back to main and make a divergent change
+        await _run(['git', 'checkout', 'main'], cwd=git_ops.project_root)
+        (git_ops.project_root / 'README.md').write_text('# From Main\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'change README on main'],
+            cwd=git_ops.project_root,
+        )
+
+        # Trigger a conflicting merge — leaves UU markers in index/worktree
+        rc, _, _ = await _run(
+            ['git', 'merge', 'conflict-b'],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0  # Must have conflicted
+
+        # Now test the helper
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert 'README.md' in unmerged
+        assert len(unmerged) >= 1

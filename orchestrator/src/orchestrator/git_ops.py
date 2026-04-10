@@ -943,6 +943,29 @@ class GitOps:
         files = {f.strip() for f in (unstaged + '\n' + staged).splitlines() if f.strip()}
         return '\n'.join(sorted(files))
 
+    async def _detect_unmerged_paths(self, cwd: Path) -> list[str]:
+        """Return sorted list of file paths that are in an unmerged state.
+
+        Uses ``git status --porcelain`` XY parsing — a path is unmerged if
+        either the index (X) or working-tree (Y) column is ``U``, OR if both
+        columns are the same add/delete marker (``AA`` or ``DD``).
+
+        Returns an empty list when the tree is clean or fully merged.
+        """
+        _, porcelain, _ = await _run(
+            ['git', 'status', '--porcelain'],
+            cwd=cwd,
+        )
+        unmerged: list[str] = []
+        for line in porcelain.splitlines():
+            if len(line) < 4:
+                continue
+            xy = line[:2]
+            path = line[3:]
+            if 'U' in xy or xy in ('AA', 'DD'):
+                unmerged.append(path.strip())
+        return sorted(unmerged)
+
     async def get_conflict_details(self, cwd: Path) -> str:
         """Parse conflict markers and return structured description."""
         _, status, _ = await _run(['git', 'diff', '--name-only', '--diff-filter=U'], cwd=cwd)
