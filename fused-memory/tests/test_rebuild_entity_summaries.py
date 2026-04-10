@@ -1043,14 +1043,12 @@ class TestDetectStaleSummariesBulk:
     """detect_stale_summaries uses get_all_valid_edges (one query) not N per-entity queries."""
 
     @pytest.mark.asyncio
-    async def test_calls_get_all_valid_edges_once_not_per_entity(self, mock_config, make_backend):
+    async def test_calls_get_all_valid_edges_once_not_per_entity(self, mock_config, make_backend, make_edge_backend):
         """detect_stale_summaries calls get_all_valid_edges exactly once (not N times)."""
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'factB'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'}],
         })
@@ -1060,15 +1058,13 @@ class TestDetectStaleSummariesBulk:
         backend.get_valid_edges_for_node.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_correctly_identifies_stale_with_bulk_edges(self, mock_config, make_backend):
+    async def test_correctly_identifies_stale_with_bulk_edges(self, mock_config, make_backend, make_edge_backend):
         """Stale entity is returned; clean entity is not — using bulk-fetched edges."""
-        backend = make_backend(mock_config)
         # uuid-1 is stale (summary has old fact), uuid-2 is clean
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old fact'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'current fact'},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'current fact', 'name': 'edge2'}],
         })
@@ -1077,13 +1073,11 @@ class TestDetectStaleSummariesBulk:
         assert result[0]['uuid'] == 'uuid-1'
 
     @pytest.mark.asyncio
-    async def test_empty_summary_entities_skipped_with_bulk_path(self, mock_config, make_backend):
+    async def test_empty_summary_entities_skipped_with_bulk_path(self, mock_config, make_backend, make_edge_backend):
         """Empty-summary entity is skipped even with bulk edges data source."""
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': ''},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'some fact', 'name': 'edge1'}],
         })
         result = await backend.detect_stale_summaries(group_id='test')
@@ -1091,16 +1085,14 @@ class TestDetectStaleSummariesBulk:
 
     @pytest.mark.asyncio
     async def test_detect_stale_summaries_includes_summary_field(
-        self, mock_config, make_backend
+        self, mock_config, make_backend, make_edge_backend
     ):
         """Stale entity dicts returned by _detect_stale_summaries_with_edges include
         a 'summary' key whose value is the entity's original (pre-rebuild) summary."""
-        backend = make_backend(mock_config)
         original_summary = 'old stale fact'
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': original_summary},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
         })
         result = await backend._detect_stale_summaries_with_edges(group_id='test')
