@@ -6,14 +6,13 @@ Layer 2: Qdrant vector similarity via TaskDeduplicator (tested with mock embedde
 
 import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 
-from fused_memory.middleware.task_interceptor import TaskInterceptor, _DEDUP_CACHE_TTL
+from fused_memory.middleware.task_interceptor import _DEDUP_CACHE_TTL, TaskInterceptor
 from fused_memory.reconciliation.event_buffer import EventBuffer
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -407,6 +406,95 @@ def _strip_hash_prefix(detail: str) -> str:
     if detail.startswith('#hash:') and '#' in detail[6:]:
         return detail[detail.index('#', 6) + 1:]
     return detail
+
+
+# ---------------------------------------------------------------------------
+# Bulk-operation dedup (expand_task / parse_prd)
+# ---------------------------------------------------------------------------
+
+class TestBulkDedup:
+    """Tests for post-hoc dedup after expand_task / parse_prd.
+
+    The interceptor snapshots the task tree before each bulk call, diffs it
+    against the tree after, and removes any newly-created tasks whose title
+    matches a pre-existing one (exact hash in Layer 1, vector in Layer 2).
+    """
+
+    # ── shared fixtures ──────────────────────────────────────────────────
+
+    @pytest.fixture
+    def pre_snapshot(self):
+        """Task tree BEFORE expand_task runs."""
+        return {
+            'tasks': [
+                {
+                    'id': '1',
+                    'title': 'Parent task',
+                    'status': 'done',
+                    'subtasks': [
+                        {'id': '1.1', 'title': 'Fix auth bug', 'status': 'done'},
+                    ],
+                }
+            ]
+        }
+
+    @pytest.fixture
+    def post_snapshot(self):
+        """Task tree AFTER expand_task adds duplicates + a genuinely new subtask."""
+        return {
+            'tasks': [
+                {
+                    'id': '1',
+                    'title': 'Parent task',
+                    'status': 'done',
+                    'subtasks': [
+                        {'id': '1.1', 'title': 'Fix auth bug', 'status': 'done'},
+                        {'id': '1.2', 'title': 'Fix auth bug', 'status': 'pending'},
+                        {'id': '1.3', 'title': 'Add retries', 'status': 'pending'},
+                    ],
+                }
+            ]
+        }
+
+    @pytest.fixture
+    def bulk_taskmaster(self, pre_snapshot, post_snapshot):
+        """Taskmaster mock whose get_tasks returns pre then post snapshot."""
+        tm = AsyncMock()
+        tm.expand_task = AsyncMock(return_value={'success': True})
+        tm.parse_prd = AsyncMock(return_value={'success': True})
+        tm.remove_task = AsyncMock(return_value={'success': True})
+        # First call (pre-snapshot) → pre, second call (post-snapshot) → post
+        tm.get_tasks = AsyncMock(side_effect=[pre_snapshot, post_snapshot])
+        return tm
+
+    @pytest.fixture
+    def bulk_interceptor(self, bulk_taskmaster, event_buffer):
+        return TaskInterceptor(bulk_taskmaster, None, event_buffer)
+
+    # ── step-1 test ───────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_expand_task_removes_subtask_duplicating_existing_done_task(
+        self, bulk_interceptor, bulk_taskmaster,
+    ):
+        """expand_task removes newly-created subtasks whose title exactly matches
+        a pre-existing subtask — even done/cancelled ones — but keeps unique ones."""
+        result = await bulk_interceptor.expand_task('1', project_root='/project')
+
+        # 1.2 duplicates 'Fix auth bug' from done subtask 1.1 → exactly one removal
+        assert bulk_taskmaster.remove_task.call_count == 1
+        removed_ids = [c.args[0] for c in bulk_taskmaster.remove_task.call_args_list]
+        assert '1.2' in removed_ids
+
+        # 1.3 'Add retries' is unique — must NOT be removed
+        assert '1.3' not in removed_ids
+
+        # Result must carry dedup metadata
+        assert 'dedup' in result
+        assert any(
+            entry.get('task_id') == '1.2'
+            for entry in result['dedup']['removed']
+        )
 
 
 class TestHashPrefixStripping:
