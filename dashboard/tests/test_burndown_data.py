@@ -1040,3 +1040,65 @@ class TestBurndownEnvFixture:
             row = await cur.fetchone()
         assert row is not None
         assert row[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# _assert_snapshot_counts helper
+# ---------------------------------------------------------------------------
+
+
+class TestAssertSnapshotCounts:
+    @pytest.mark.asyncio
+    async def test_passes_on_matching_counts(self, burndown_env):
+        """Helper returns None when every count column matches."""
+        db_path, config, conn = burndown_env
+        await conn.execute(
+            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            ('test_proj', '2024-01-01T00:00:00', 1, 0, 0, 0, 0, 2),
+        )
+        await conn.commit()
+
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute('SELECT * FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
+
+        assert len(rows) == 1
+        result = _assert_snapshot_counts(rows[0], pending=1, done=2)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_raises_on_mismatched_count(self, burndown_env):
+        """Helper raises AssertionError when a count column doesn't match the expected value."""
+        db_path, config, conn = burndown_env
+        await conn.execute(
+            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            ('test_proj', '2024-01-01T00:00:00', 0, 0, 0, 0, 0, 2),
+        )
+        await conn.commit()
+
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute('SELECT * FROM snapshots') as cur:
+            row = await cur.fetchone()
+
+        with pytest.raises(AssertionError):
+            _assert_snapshot_counts(row, done=3)  # actual done=2, expected 3
+
+    @pytest.mark.asyncio
+    async def test_default_zeros_match_all_zero_row(self, burndown_env):
+        """Helper returns None when all counts are 0 and no kwargs are passed (defaults are 0)."""
+        db_path, config, conn = burndown_env
+        await conn.execute(
+            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            ('test_proj', '2024-01-01T00:00:00', 0, 0, 0, 0, 0, 0),
+        )
+        await conn.commit()
+
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute('SELECT * FROM snapshots') as cur:
+            row = await cur.fetchone()
+
+        result = _assert_snapshot_counts(row)  # all defaults are 0
+        assert result is None
