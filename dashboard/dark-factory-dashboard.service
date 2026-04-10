@@ -10,6 +10,9 @@ ExecStart=/home/leo/.local/bin/uv run --project dashboard \
   python -m uvicorn dashboard.app:app \
   --host 127.0.0.1 --port 8080
 
+# Multi-project cost aggregation (comma-separated, no spaces)
+Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory,/home/leo/src/reify,/home/leo/src/autopilot-video
+
 # Restart policy: always restart on failure, back off up to 60s
 Restart=on-failure
 RestartSec=5
