@@ -34,6 +34,14 @@ HARDCODED_EXPECTED_ENV_LINE = (
     "/home/leo/src/autopilot-video"
 )
 
+# Canonical substitution values for rendering the template.
+# Source of truth: setup-host.sh lines 325-329 which run:
+#   sed 's|__REPO_ROOT__|$REPO_ROOT|g'   (global, unanchored, literal substitution)
+#   sed 's|__UV_PATH__|$UV_PATH|g'       (global, unanchored, literal substitution)
+# These must match the values in the committed dashboard/dark-factory-dashboard.service.
+EXPECTED_REPO_ROOT = "/home/leo/src/dark-factory"
+EXPECTED_UV_PATH = "/home/leo/.local/bin/uv"
+
 
 def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
     """Assert that DASHBOARD_KNOWN_PROJECT_ROOTS in *path* uses commas, not colons.
@@ -179,3 +187,36 @@ def test_comment_warns_about_systemd_space_handling() -> None:
             "Remove it — the real hazard is systemd's space-as-separator behavior, "
             "not the Python parser's whitespace tolerance."
         )
+
+
+def test_template_renders_to_hardcoded_file() -> None:
+    """Rendered template must match the committed hardcoded service file verbatim.
+
+    This is the canonical drift-prevention invariant: applying the same substitutions
+    as setup-host.sh (lines 325-329) to the template must yield the hardcoded file
+    byte-for-byte.
+
+    Substitution semantics (mirroring setup-host.sh):
+        sed 's|__REPO_ROOT__|$REPO_ROOT|g'  →  str.replace('__REPO_ROOT__', EXPECTED_REPO_ROOT)
+        sed 's|__UV_PATH__|$UV_PATH|g'      →  str.replace('__UV_PATH__', EXPECTED_UV_PATH)
+
+    Both sentinels contain no regex metacharacters and no '|', so str.replace is
+    semantically identical to the sed command (global, unanchored, literal substitution).
+
+    If this test fails, the template and hardcoded file have drifted.  Re-render by
+    running the sed substitutions in setup-host.sh lines 325-329 and updating
+    dashboard/dark-factory-dashboard.service.
+    """
+    rendered = (
+        TEMPLATE.read_text(encoding="utf-8")
+        .replace("__REPO_ROOT__", EXPECTED_REPO_ROOT)
+        .replace("__UV_PATH__", EXPECTED_UV_PATH)
+    )
+    hardcoded = HARDCODED.read_text(encoding="utf-8")
+    assert rendered == hardcoded, (
+        f"Rendered template does not match {HARDCODED}.\n"
+        f"Template path: {TEMPLATE}\n"
+        "The files have drifted.  Re-render by running the sed substitutions "
+        "in setup-host.sh lines 325-329 and updating "
+        "dashboard/dark-factory-dashboard.service."
+    )
