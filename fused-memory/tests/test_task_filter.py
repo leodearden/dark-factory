@@ -350,13 +350,13 @@ class TestFormatFilteredTaskTree:
         assert 'deps=None' not in output, f'Found deps=None in output: {output!r}'
 
     def test_negative_budget_returns_header_plus_summary(self):
-        """When max_chars is too small to hold any task lines, return header+summary cleanly.
+        """Regression: when header+summary exceeds max_chars so that the remaining budget
+        for task lines is <= 0, format_filtered_task_tree must early-return
+        header + summary_line without appending a truncation notice.
 
-        With max_chars=50 and 5 active tasks, the header+summary alone exceed 50 chars.
-        The budget goes negative, the line-accumulation loop produces 0 kept_lines, and
-        the result must NOT include 'truncated for budget' — instead it should early-return
-        just header + summary_line. Bug: missing early-return guard causes a truncation
-        notice to be appended even when no task lines are kept.
+        With max_chars=50 and 5 active tasks, header+summary alone exceed 50 chars, the
+        budget goes non-positive, and the `budget <= 0` guard in format_filtered_task_tree
+        must short-circuit before any truncation notice is appended.
         """
         active = [_make_task(i, 'pending', f'Task {i}') for i in range(1, 6)]
         tree = FilteredTaskTree(
