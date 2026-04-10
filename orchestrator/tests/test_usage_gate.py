@@ -1331,3 +1331,26 @@ class TestBuildUsageGateHelper:
         acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
         with pytest.raises(ValueError, match='length'):
             build_usage_gate(acct_cfgs, ['tok-a', 'tok-b'])  # 1 cfg, 2 tokens
+
+    def test_build_usage_gate_raises_on_bare_string_tokens(self):
+        """TypeError is raised when tokens is a bare str instead of a list/tuple."""
+        acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
+        with pytest.raises(TypeError, match='str'):
+            build_usage_gate(acct_cfgs, 'tok-a')  # bare string, not a list
+
+    def test_build_usage_gate_applies_probe_interval_secs(self):
+        """probe_interval_secs and max_probe_interval_secs are forwarded to gate._config."""
+        acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
+        gate = build_usage_gate(
+            acct_cfgs, ['tok-a'],
+            probe_interval_secs=7,
+            max_probe_interval_secs=42,
+        )
+        assert gate._config.probe_interval_secs == 7
+        assert gate._config.max_probe_interval_secs == 42
+
+    def test_build_usage_gate_run_probe_is_asyncmock(self):
+        """gate._run_probe is an AsyncMock so tests don't spawn real claude processes."""
+        acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
+        gate = build_usage_gate(acct_cfgs, ['tok-a'])
+        assert isinstance(gate._run_probe, AsyncMock)
