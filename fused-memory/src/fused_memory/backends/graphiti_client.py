@@ -1264,8 +1264,25 @@ class GraphitiBackend:
         Uses ro_query since no writes are performed.
 
         Each record is a dict with keys: label, field, type, entity_type.
+
+        Note on the CALL db.indexes() procedure and the read-only path:
+        ``CALL db.indexes()`` is the *only* stored-procedure call sent on the
+        read-only path in this file — all other ``ro_query`` callers use plain
+        MATCH queries.  Stored procedures are sometimes classified as
+        write-capable by graph databases, so this usage was validated
+        empirically against FalkorDB module v41800 (4.18.0): the call is
+        accepted via ``GRAPH.RO_QUERY`` without error.
+
+        The live verification is pinned in
+        ``fused-memory/tests/test_list_indices_integration.py``
+        (Task 530 / esc-486-49).  If a future FalkorDB upgrade rejects
+        ``CALL`` on the RO path, revert this call to ``graph.query(...)``
+        (the write-capable command) and update the integration test to pin
+        the new behavior.
         """
         graph = self._graph_for(group_id)
+        # CALL db.indexes() is a read-only procedure; FalkorDB accepts it via
+        # GRAPH.RO_QUERY (verified via test_list_indices_integration.py).
         result = await graph.ro_query('CALL db.indexes()')
         indices = []
         for row in (result.result_set or []):
