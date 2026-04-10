@@ -180,14 +180,8 @@ class TestCollectSnapshot:
 
         assert len(rows) == 1
         row = rows[0]
-        # row: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
-        assert row[1] == str(config.project_root)  # project_id
-        assert row[3] == 1   # pending
-        assert row[4] == 1   # in_progress
-        assert row[5] == 0   # blocked
-        assert row[6] == 0   # deferred
-        assert row[7] == 0   # cancelled
-        assert row[8] == 2   # done
+        assert row['project_id'] == str(config.project_root)
+        _assert_snapshot_counts(row, pending=1, in_progress=1, done=2)
 
     @pytest.mark.asyncio
     async def test_symlinked_root_deduplicates_with_orchestrator(self, tmp_path):
