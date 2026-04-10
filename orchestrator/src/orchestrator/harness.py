@@ -20,6 +20,7 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle, mcp_call
 from orchestrator.review_checkpoint import ReviewCheckpoint
+from orchestrator.run_store import RunStore
 from orchestrator.scheduler import Scheduler, files_to_modules
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -144,6 +145,10 @@ class Harness:
         # Event store — created at run start with a generated run_id
         self.event_store: EventStore | None = None
 
+        # Run store — incremental task result persistence (shares runs.db)
+        self._run_store: RunStore | None = None
+        self._run_id: str | None = None
+
         # Cost store — per-invocation cost tracking (shares runs.db)
         self.cost_store: CostStore | None = None
 
@@ -163,16 +168,30 @@ class Harness:
         """
         self.report.started_at = datetime.now(UTC).isoformat()
 
-        # 0. Create event store for this run
+        # 0. Create event store and run store for this run
         import uuid
 
         run_id = f'run-{uuid.uuid4().hex[:12]}'
+        self._run_id = run_id
         db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
         try:
             self.event_store = EventStore(db_path, run_id)
             self.scheduler.event_store = self.event_store
         except Exception:
             logger.warning('Failed to create event store', exc_info=True)
+
+        # 0a. Create run store and register this run immediately so
+        # task_results can be written incrementally as tasks complete.
+        try:
+            self._run_store = RunStore(db_path)
+            self._run_store.start_run(
+                run_id,
+                self.config.fused_memory.project_id,
+                self.report.started_at,
+                str(prd_path) if prd_path else '',
+            )
+        except Exception:
+            logger.warning('Failed to create run store', exc_info=True)
 
         # 0b. Create cost store (shares runs.db with EventStore/RunStore)
         try:
@@ -381,19 +400,14 @@ class Harness:
             # 4. Shutdown
             self.report.completed_at = datetime.now(UTC).isoformat()
 
-            # Persist run metrics to SQLite
-            try:
-                from orchestrator.run_store import RunStore
-
-                db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
-                store = RunStore(db_path)
-                store.save_run(
-                    self.report,
-                    self.config.fused_memory.project_id,
-                    str(prd_path) if prd_path else '',
-                )
-            except Exception as e:
-                logger.warning(f'Failed to persist run metrics: {e}')
+            # Finalize run metrics in SQLite (task_results were written
+            # incrementally in _collect_done_reports; this updates the
+            # runs row with final aggregates).
+            if self._run_store and self._run_id:
+                try:
+                    self._run_store.finish_run(self._run_id, self.report)
+                except Exception as e:
+                    logger.warning(f'Failed to finalize run metrics: {e}')
 
             # Save HarnessReport alongside review checkpoint reports
             if self.report.review_checkpoints > 0:
@@ -842,6 +856,18 @@ Output JSON matching the schema. Every task must appear in the output.
                 report = t.result()
                 if report:
                     task_reports.append(report)
+                    # Persist task result immediately so it survives crashes
+                    if self._run_store and self._run_id:
+                        try:
+                            self._run_store.save_task_result(
+                                self._run_id, report,
+                                self.config.fused_memory.project_id,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f'Failed to persist task result '
+                                f'{report.task_id}: {e}'
+                            )
                     # Track module merges for review checkpoints
                     if (report.outcome == WorkflowOutcome.DONE
                             and self.review_checkpoint):
