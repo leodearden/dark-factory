@@ -188,6 +188,16 @@ class TaskInterceptor:
         tag: str | None = None,
     ) -> dict:
         tm = await self._ensure_taskmaster()
+
+        # Pre-snapshot: capture the task tree before Taskmaster generates subtasks
+        try:
+            pre_snapshot = await tm.get_tasks(project_root)
+        except Exception as pre_exc:
+            logger.warning(
+                'bulk_dedup: pre-snapshot failed for expand_task(%s): %s', task_id, pre_exc,
+            )
+            pre_snapshot = None
+
         result = await tm.expand_task(
             task_id, project_root, num=num, prompt=prompt, force=force, tag=tag
         )
@@ -198,6 +208,24 @@ class TaskInterceptor:
         )
         await self.buffer.push(event)
         await self._await_commit(project_root, f'expand_task({task_id})')
+
+        # Post-hoc dedup: remove newly-created tasks that duplicate pre-existing ones
+        try:
+            if pre_snapshot is not None:
+                dedup = await self._dedupe_bulk_created(
+                    project_root, pre_snapshot, parent_task_id=task_id,
+                )
+            else:
+                dedup = {
+                    'removed': [], 'kept': [], 'errors': [],
+                    'skipped_reason': 'pre_snapshot_failed',
+                }
+            result['dedup'] = dedup
+        except Exception as dedup_exc:
+            logger.warning(
+                'bulk_dedup: dedup block failed for expand_task(%s): %s', task_id, dedup_exc,
+            )
+            result['dedup'] = {'skipped_reason': f'exception: {dedup_exc}'}
 
         if self.reconciler:
             task = asyncio.create_task(
@@ -296,6 +324,99 @@ class TaskInterceptor:
         except Exception:
             logger.warning('Failed to create TaskDeduplicator', exc_info=True)
             return None
+
+    @staticmethod
+    def _flatten_tasks(tasks_data: dict) -> list[tuple[str, str, str]]:
+        """Flatten a get_tasks response into (id, normalized_title, status) tuples.
+
+        Walks all top-level tasks and their subtasks recursively so that every
+        task in the tree is represented exactly once.
+        """
+        result: list[tuple[str, str, str]] = []
+
+        def _walk(task_list: list) -> None:
+            for task in task_list:
+                tid = str(task.get('id', ''))
+                title = ' '.join(task.get('title', '').lower().split())
+                status = task.get('status', 'unknown')
+                result.append((tid, title, status))
+                subtasks = task.get('subtasks', [])
+                if subtasks:
+                    _walk(subtasks)
+
+        _walk(tasks_data.get('tasks', []))
+        return result
+
+    async def _dedupe_bulk_created(
+        self,
+        project_root: str,
+        pre_snapshot: dict,
+        parent_task_id: str | None = None,
+    ) -> dict:
+        """Post-hoc dedup after a bulk task-creation operation (Layer 1: title hash).
+
+        Reads the current task tree, diffs it against pre_snapshot, and removes
+        any new tasks whose normalized title matches a pre-existing one.
+
+        Returns {'removed': [...], 'kept': [...], 'errors': []}
+        """
+        removed: list[dict] = []
+        kept: list[dict] = []
+        errors: list[dict] = []
+
+        tm = await self._ensure_taskmaster()
+
+        # Build pre-snapshot index
+        pre_flattened = self._flatten_tasks(pre_snapshot)
+        pre_ids = {tid for tid, _, _ in pre_flattened}
+        pre_title_index: dict[str, str] = {}
+        for tid, title, _ in pre_flattened:
+            if title:
+                pre_title_index.setdefault(self._title_hash(title), tid)
+
+        # Get post-snapshot and find newly-created tasks
+        post_snapshot = await tm.get_tasks(project_root)
+        post_flattened = self._flatten_tasks(post_snapshot)
+        new_tasks = [
+            (tid, title, status)
+            for tid, title, status in post_flattened
+            if tid not in pre_ids
+        ]
+
+        if not new_tasks:
+            return {'removed': removed, 'kept': kept, 'errors': errors}
+
+        for tid, title, _status in new_tasks:
+            is_dup = False
+
+            # Layer 1: exact normalized-title hash match against pre-existing titles
+            if title:
+                h = self._title_hash(title)
+                if h in pre_title_index:
+                    is_dup = True
+                    try:
+                        await tm.remove_task(tid, project_root)
+                        removed.append({
+                            'task_id': tid,
+                            'title': title,
+                            'reason': 'exact_title_match',
+                            'matched_task_id': pre_title_index[h],
+                        })
+                        logger.warning(
+                            'bulk_dedup: removed duplicate task %s '
+                            '(title matches pre-existing task %s: %r)',
+                            tid, pre_title_index[h], title,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            'bulk_dedup: remove_task failed for %s: %s', tid, exc,
+                        )
+                        errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
+
+            if not is_dup:
+                kept.append({'task_id': tid, 'title': title})
+
+        return {'removed': removed, 'kept': kept, 'errors': errors}
 
     # ── Write pass-throughs (emit event, no targeted reconciliation) ───
 
