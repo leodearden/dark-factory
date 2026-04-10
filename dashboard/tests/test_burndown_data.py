@@ -353,6 +353,10 @@ class TestCollectSnapshot:
         # load_task_tree call for the known_project_roots entry that resolves to the same root.
         # Path-keyed dispatch because asyncio.gather fires calls concurrently —
         # an ordered side_effect list can race on thread scheduling.
+        # NOTE: the orchestrator entry's key intentionally omits .resolve() because
+        # _read_project_root_from_config is mocked to return the raw (unresolved)
+        # reify_root, and production burndown.py passes that raw value through to the
+        # tasks.json path construction (see roots_to_snapshot.append around line 100).
         _tasks_map = {
             config.tasks_json: [],
             reify_root / '.taskmaster' / 'tasks' / 'tasks.json': [{'status': 'done'}],
