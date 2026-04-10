@@ -1,10 +1,11 @@
 {
   "id": "df_task_18",
   "name": "Sleep mode reconciliation system",
+  "max_review_cycles": 2,
   "project": "dark-factory",
   "project_root": "/home/leo/src/dark-factory",
-  "pre_task_commit": "236b2dd602c2e06bda0e047ec4929c4693506573",
-  "post_task_commit": "386713c8d1be05ba1dbd7571817fd65b6d956bff",
+  "pre_task_commit": "f30baedab0ad9c573f8e3e94f8f536d384472a31",
+  "post_task_commit": "818c368f6c79d239c603881de895c5abd7f7cb62",
   "task_definition": {
     "title": "Sleep mode reconciliation system",
     "description": "Implement the sleep mode reconciliation system for fused-memory that synchronizes state across Graphiti, Mem0, and Taskmaster during idle periods. Three-way reconciliation with consolidation, cross-store integrity, and task-knowledge sync."
@@ -19,7 +20,7 @@
   ],
   "complexity": "medium",
   "setup_commands": [
-    "cd orchestrator && uv sync --quiet"
+    "cd fused-memory && uv sync --quiet"
   ],
   "expected_files_changed": [],
   "plan": {

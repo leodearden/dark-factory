@@ -1,0 +1,65 @@
+{
+  "variant_name": "variant_a_medium",
+  "diff_id": "py_deep_shallow",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/config.py:33-34",
+          "category": "robustness/correctness",
+          "description": "`_deep_merge` was changed from `merged = base.copy()` to `merged = base`, which makes `merged` an alias of the caller's `base` dict. Subsequent `merged[key] = value` assignments now mutate the caller's dict in place. This directly contradicts the newly-added docstring promise (\"The caller's *base* dict is never mutated \u2014 we work on a copy.\") and will silently corrupt any caller that reuses its `base` dict. In particular, `YamlSettingsSource.__call__` at config.py:96 does `base = _deep_merge(base, project_config)`, so the package-bundled defaults dict returned by `_load_defaults()` is fine (it's fresh), but the recursive call on line 37 (`_deep_merge(merged[key], value)`) mutates nested dicts of `base` as well \u2014 meaning even the single-shot use will mutate nested dicts of the defaults loaded from YAML. More broadly, any future caller passing a live config dict will see it corrupted. This is a regression of the behavior that `test_deep_merge_does_not_mutate_base` (test_config.py:214) explicitly guards.",
+          "suggested_fix": "Restore `merged = base.copy()` (shallow copy is sufficient because the recursive branch already builds a new nested dict via the recursive call). Alternatively use `merged = dict(base)` or `merged = {**base}` for clarity."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/tests/test_config.py:214-218",
+          "category": "test_failure",
+          "description": "The existing `test_deep_merge_does_not_mutate_base` test will fail with this change. After `_deep_merge(base, override)` runs with `merged = base`, the recursive call `_deep_merge(merged['a'], {'y': 2})` mutates `base['a']` to `{'x': 1, 'y': 2}`, breaking the `assert base == {'a': {'x': 1}}` invariant. CI will turn red immediately.",
+          "suggested_fix": "Fix the root cause in `_deep_merge` (see issue #1). Do not weaken the test \u2014 the non-mutation contract is correct and other call sites depend on it."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/config.py:_merge_env_overrides",
+          "category": "code_reuse/over_engineering",
+          "description": "`_merge_env_overrides` delegates to `_deep_merge` for a flat `dict[str, str]` where values are guaranteed to be strings, never nested dicts. The `isinstance(..., dict)` branch in `_deep_merge` can never fire here, so the recursive machinery is dead weight and also couples this helper to the mutation-sensitive deep-merge implementation (see issue #1). A flat spread is clearer and safer.",
+          "suggested_fix": "Replace the body with `result = {**base_env, **extra}` and then apply the empty-value filter. This is both faster and avoids the mutation footgun entirely."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/config.py:_merge_env_overrides",
+          "category": "correctness/silent_behavior_change",
+          "description": "The empty-value filter (`{k: v for k, v in result.items() if v}`) strips any key whose value is the empty string. This applies to BOTH the base and the extra dicts \u2014 not just to newly added values \u2014 and it silently removes callers' explicit intent. Setting `VAR=''` is a legitimate POSIX idiom (e.g. to clear an inherited env var, or to pass empty CLI flags). The inline comment (`some tools choke on FOO=\"\"`) handwaves a narrow justification that is applied blanket. If a caller relies on an explicit empty string to unset something, this will silently reintroduce the inherited value. Note that `'0'` and `'false'` are truthy strings and not affected, but `''` is load-bearing for some shells.",
+          "suggested_fix": "Either (a) drop the empty-value filter entirely and let callers that care filter themselves, or (b) apply the filter only to the `extra` dict before merging (so base empties are preserved), or (c) use an explicit sentinel to remove keys. If keeping the filter, document it prominently and add a test asserting the behavior."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/config.py:_merge_env_overrides",
+          "category": "test_coverage",
+          "description": "`_merge_env_overrides` has zero tests. Given the subtle empty-string stripping behavior and the mutation footgun via `_deep_merge`, this helper absolutely needs coverage before it's wired into any call site.",
+          "suggested_fix": "Add a `TestMergeEnvOverrides` class in test_config.py covering: (1) disjoint-key merge, (2) conflict resolution (extra wins), (3) empty-string stripping from extra, (4) empty-string handling for base, (5) non-mutation of both inputs, (6) falsy-but-valid values like '0' and 'false' are NOT stripped."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/config.py:_merge_env_overrides",
+          "category": "dead_code/premature_abstraction",
+          "description": "`_merge_env_overrides` has no callers anywhere in the repo \u2014 it is introduced as unreachable code. The existing env-override application sites (e.g. in `agents/invoke.py` and `shared/src/shared/cli_invoke.py`) use inline `env.update()`, and nothing in this diff wires them to the new helper. Introducing an untested helper with subtle behavior (empty-string stripping) without a caller is premature abstraction and creates an attractive nuisance for future code.",
+          "suggested_fix": "Either wire the helper into the actual call sites in the same diff (and update their tests), or drop the helper until there is a concrete need. If it must land standalone, at minimum add tests and a module docstring explaining why it lives in `config.py`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/config.py:_merge_env_overrides",
+          "category": "architecture/module_boundary",
+          "description": "`config.py` is responsible for loading and validating static configuration (YAML \u2192 pydantic models). Runtime environment-variable manipulation is a separate concern that lives in `agents/invoke.py` and `shared/src/shared/cli_invoke.py`. Placing `_merge_env_overrides` in `config.py` blurs the boundary between static config and dynamic invocation.",
+          "suggested_fix": "Move `_merge_env_overrides` next to the code that actually builds subprocess environments \u2014 most likely `shared/src/shared/cli_invoke.py` or a new `shared/env.py` \u2014 so the helper lives with its callers and tests."
+        }
+      ],
+      "summary": "The diff contains a blocking correctness regression: `_deep_merge` now does `merged = base` instead of `merged = base.copy()`, making it mutate the caller's dict in-place. This directly contradicts the newly-added docstring that promises non-mutation and will cause the existing `test_deep_merge_does_not_mutate_base` test to fail. The new `_merge_env_overrides` helper is functionally plausible but (a) inherits that mutation footgun by delegating to `_deep_merge` for what is always a flat `dict[str, str]`, (b) silently strips empty-string values across both base and extra \u2014 a load-bearing POSIX idiom \u2014 with no test coverage, (c) has no callers anywhere in the repo, and (d) arguably belongs next to the env-building code in `shared/cli_invoke.py` rather than in `config.py`. Fix `_deep_merge` first, then either drop `_merge_env_overrides` or wire it up with tests."
+    }
+  },
+  "total_cost_usd": 0.3390395,
+  "wall_clock_ms": 79939,
+  "errors": []
+}

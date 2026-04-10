@@ -6,6 +6,9 @@ until conftest.py is extended in step-2.
 from __future__ import annotations
 
 import os
+from unittest.mock import call
+
+from conftest import extract_cypher, extract_params
 
 # ---------------------------------------------------------------------------
 # preserve_config_path fixture tests
@@ -67,3 +70,57 @@ class TestStandardMockConfig:
         """MagicMock supports attribute assignment for alternate model names."""
         standard_mock_config.embedder.model = 'text-embedding-ada-002'
         assert standard_mock_config.embedder.model == 'text-embedding-ada-002'
+
+
+# ---------------------------------------------------------------------------
+# extract_cypher helper tests (task-435 step-1)
+# ---------------------------------------------------------------------------
+
+class TestExtractCypher:
+    """extract_cypher(call_args) extracts the Cypher query string from a mock call_args.
+
+    Handles both positional (args[0]) and keyword ('query' kwarg) calling conventions
+    so tests remain robust if the implementation switches between the two.
+    """
+
+    def test_positional_args_returns_first_arg(self):
+        """When query is passed positionally, returns args[0]."""
+        call_args = call('MATCH (n) RETURN n', {})
+        assert extract_cypher(call_args) == 'MATCH (n) RETURN n'
+
+    def test_keyword_query_returns_kwarg(self):
+        """When query is passed as keyword argument, returns kwargs['query']."""
+        call_args = call(query='MATCH (n) RETURN n')
+        assert extract_cypher(call_args) == 'MATCH (n) RETURN n'
+
+    def test_empty_call_returns_empty_string(self):
+        """When neither positional nor keyword query is present, returns empty string."""
+        call_args = call()
+        assert extract_cypher(call_args) == ''
+
+
+# ---------------------------------------------------------------------------
+# extract_params helper tests (task-435 step-2)
+# ---------------------------------------------------------------------------
+
+class TestExtractParams:
+    """extract_params(call_args) extracts the Cypher params dict from a mock call_args.
+
+    Handles both positional (args[1]) and keyword ('params' kwarg) calling conventions
+    so tests remain robust if the implementation switches between the two.
+    """
+
+    def test_positional_params_returns_second_arg(self):
+        """When params is passed positionally as second arg, returns args[1]."""
+        call_args = call('MATCH (n) RETURN n', {'uuid': 'x'})
+        assert extract_params(call_args) == {'uuid': 'x'}
+
+    def test_keyword_params_returns_kwarg(self):
+        """When params is passed as keyword argument, returns kwargs['params']."""
+        call_args = call('MATCH (n) RETURN n', params={'uuid': 'x'})
+        assert extract_params(call_args) == {'uuid': 'x'}
+
+    def test_no_params_returns_empty_dict(self):
+        """When no params argument is present, returns empty dict."""
+        call_args = call('MATCH (n) RETURN n')
+        assert extract_params(call_args) == {}

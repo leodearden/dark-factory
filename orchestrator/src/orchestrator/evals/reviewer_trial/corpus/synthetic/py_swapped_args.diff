@@ -1,0 +1,44 @@
+diff --git a/orchestrator/src/orchestrator/git_ops.py b/orchestrator/src/orchestrator/git_ops.py
+index abc1234..def5678 100644
+--- a/orchestrator/src/orchestrator/git_ops.py
++++ b/orchestrator/src/orchestrator/git_ops.py
+@@ -410,12 +410,31 @@ class GitOps:
+         )
+         return rc == 0 and bool(output.strip())
+
+-    async def get_changed_files(self, from_sha: str, to_sha: str) -> list[str]:
+-        """Return list of files changed between two commits."""
++    async def get_changed_files(
++        self, from_sha: str, to_sha: str, include_deleted: bool = False,
++    ) -> list[str]:
++        """Return list of files changed between two commits.
++
++        When *include_deleted* is True the diff filter includes deleted files
++        (useful for rollback validation where we need to know what was removed).
++        """
++        diff_filter = '--diff-filter=ACMR' if not include_deleted else '--diff-filter=ACMRD'
+         _, output, _ = await _run(
+-            ['git', 'diff', '--name-only', from_sha, to_sha],
++            ['git', 'diff', '--name-only', diff_filter, to_sha, from_sha],
+             cwd=self.project_root,
+         )
+         return [f for f in output.strip().splitlines() if f.strip()]
+
++    async def get_diff_stats(self, from_sha: str, to_sha: str) -> dict[str, int]:
++        """Return insertions/deletions stats between two commits."""
++        _, output, _ = await _run(
++            ['git', 'diff', '--shortstat', from_sha, to_sha],
++            cwd=self.project_root,
++        )
++        stats = {'insertions': 0, 'deletions': 0}
++        for part in output.split(','):
++            part = part.strip()
++            if 'insertion' in part:
++                stats['insertions'] = int(part.split()[0])
++            elif 'deletion' in part:
++                stats['deletions'] = int(part.split()[0])
++        return stats
++
+     async def merge_to_main(
+         self,
+         worktree: Path,

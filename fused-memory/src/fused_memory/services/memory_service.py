@@ -617,27 +617,30 @@ class MemoryService:
                 logger.error(f'Graphiti enqueue failed: {e}')
                 _graphiti_error = f'{type(e).__name__}: {e}'
 
-        # Mem0: enqueue via durable queue (retry + dead-letter on failure)
+        # Mem0: direct synchronous call so memory_ids are returned to the caller.
+        # The durable-queue path cannot return server-assigned IDs because Mem0
+        # assigns IDs server-side and the queue worker has no path back to the caller.
+        # Durability is retained via write_journal (log_backend_op captures every call).
+        # The _execute_durable_write 'mem0_add' dispatcher is kept intact for backward
+        # compat — any in-flight queue items from before this fix still drain correctly.
         if write_mem0:
             try:
-                assert self.durable_queue is not None
-                await self.durable_queue.enqueue(
-                    group_id=f'mem0_{scope.project_id}',
-                    operation='mem0_add',
-                    payload={
-                        'content': content,
-                        'metadata': meta,
-                        'project_id': project_id,
-                        'agent_id': agent_id,
-                        'session_id': session_id,
-                        '_causation_id': causation_id,
-                        '_write_op_id': write_op_id,
-                    },
+                mem0_result = await self._journaled_backend_call(
+                    write_op_id=write_op_id,
+                    causation_id=causation_id,
+                    backend='mem0',
+                    operation='add',
+                    payload={'content': content[:200]},
+                    coro=self.mem0.add(content=content, scope=scope, metadata=meta),
                 )
-                # Durably persisted to SQLite — report as queued
+                memory_ids.extend(
+                    r['id']
+                    for r in (mem0_result or {}).get('results', [])
+                    if isinstance(r, dict) and 'id' in r
+                )
                 stores_written.append(SourceStore.mem0)
             except Exception as e:
-                logger.error(f'Mem0 enqueue failed: {e}')
+                logger.error(f'Mem0 write failed: {e}')
                 _mem0_error = str(e)
 
         # Layer 1 journal entry
@@ -1302,7 +1305,12 @@ class MemoryService:
                         agent_id=agent_id,
                         session_id=session_id,
                         params={'force': force, 'dry_run': dry_run},
-                        result_summary=result if success else None,
+                        result_summary={
+                            'total_entities': result.get('total_entities', 0),
+                            'stale_entities': result.get('stale_entities', 0),
+                            'rebuilt': result.get('rebuilt', 0),
+                            'errors': result.get('errors', 0),
+                        } if success else None,
                         success=success,
                         error=error_msg,
                     )

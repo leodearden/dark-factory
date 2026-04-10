@@ -1,0 +1,86 @@
+{
+  "variant_name": "variant_c",
+  "diff_id": "ts_real_01",
+  "reviews": {
+    "opus_strategic": {
+      "reviewer": "opus_strategic",
+      "verdict": "PASS",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/gotoDefinition.test.ts:67,125,166",
+          "category": "test_duplication",
+          "description": "The mockView object is duplicated verbatim across all three test cases (and further in other tests not shown in the diff). Each copy includes the same posAtCoords, state.doc, dispatch, and now dom.isConnected properties. A shared helper like `createMockView(overrides?)` would reduce the maintenance burden of adding new required properties (as this diff demonstrates \u2014 the isConnected field had to be added in 3+ places).",
+          "suggested_fix": "Extract a `createMockView(overrides?: Partial<...>)` factory at the top of the describe block or in a test-utils module, and use it in all test cases. This way future view shape changes only need one edit."
+        }
+      ],
+      "summary": "The diff adds a `view.dom.isConnected` guard in gotoDefinition.ts to prevent dispatching to a destroyed editor view after an async LSP response arrives \u2014 a correct and necessary fix for a detached-promise lifecycle issue. The implementation is sound: the guard is placed immediately after the null-location check and before any view mutation, and the test suite already includes dedicated isConnected=false test cases (not shown in this diff). The only cross-cutting concern is that the mockView object is duplicated across multiple test cases, meaning this single-property addition required touching 3+ locations in the test file. A shared mock factory would improve maintainability. No blocking issues found."
+    },
+    "sonnet_test_analyst": {
+      "reviewer": "sonnet_test_analyst",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/gotoDefinition.test.ts",
+          "category": "missing_failure_mode_test",
+          "description": "No test covers the `posAtCoords() returning null` early-exit path. The production code has `if (pos === null) return false;`, which prevents the LSP request from being made entirely. This is a common real-world case (clicking in the line gutter or outside the editor content). Without a test, a regression that removes or miswires this guard would be invisible.",
+          "suggested_fix": "Add a test that sets `posAtCoords: () => null` and asserts that `mockInvoke` is never called."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/gotoDefinition.test.ts",
+          "category": "missing_failure_mode_test",
+          "description": "No test covers the `requestDefinition` returning `null` path (the `if (!location) return;` guard inside the `.then()`). This is the normal response when the LSP has no definition for the clicked position (e.g., whitespace, a keyword, an unresolved identifier). Without a test, a regression that skips the null check and tries to dereference `location.uri` would cause an unhandled error.",
+          "suggested_fix": "Add a test with `mockInvoke.mockResolvedValue('null')` (or an unrecognised shape) and assert that neither `view.dispatch` nor `onNavigate` is called."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/gotoDefinition.test.ts",
+          "category": "missing_behavior_test",
+          "description": "No test verifies that a plain (non-Ctrl, non-Meta) mousedown is ignored. The guard `if (!(event.ctrlKey || event.metaKey)) return false;` is the outermost branch of the handler; a regression there would cause every click to trigger a definition request. The event-handler contract (returning `false` to not consume the event) is also untested.",
+          "suggested_fix": "Add a test with `ctrlKey: false, metaKey: false` and assert that `mockInvoke` is never called."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/gotoDefinition.test.ts",
+          "category": "missing_behavior_test",
+          "description": "No test covers a cross-file definition result when `onNavigate` is not provided. The code silently drops the result via `else if (onNavigate)`, which is correct, but the silent-drop path is untested. If the condition were accidentally changed to an unconditional call, or if a fallback (e.g., logging) were accidentally introduced, no test would catch it.",
+          "suggested_fix": "Add a test calling `reifyGotoDefinition(currentUri)` (no `onNavigate`) with a cross-file location and assert that `view.dispatch` is not called and no error is thrown."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/__tests__/gotoDefinition.test.ts:181-269",
+          "category": "incomplete_mock",
+          "description": "The `bare-path currentUri` test (line 181) and `partial suffix overlap` test (line 227) omit `lines` from their `doc` mock. The production code evaluates `location.range.start.line + 1 > view.state.doc.lines` before calling `doc.line()`. With `lines: undefined`, the comparison `N > undefined` is always `false` in JS, so the line-bounds guard is silently bypassed in those two tests. They still pass, but they no longer truthfully exercise the full post-`isConnected` code path.",
+          "suggested_fix": "Add `lines: 100` (or an appropriate value) to the `doc` mock in both the bare-path and suffix-overlap tests to ensure the line-bounds guard is properly exercised alongside the URI normalization logic."
+        }
+      ],
+      "summary": "The diff correctly introduces the `view.dom.isConnected` guard in `gotoDefinition.ts` to prevent stale async callbacks from dispatching on a destroyed editor, and updates three existing mock views with `dom: { isConnected: true }` so they continue to exercise the happy path. The full test file (which includes a dedicated `isConnected guard` describe block, a `line-bounds guard` block, and a `.catch() error handler` block that appear to be part of this change or a closely related one) provides solid coverage of the new guard for both same-file and cross-file outcomes in the disconnected case. The core contract of the new guard is well-tested. Four suggestions remain: there are no tests for `posAtCoords` returning null, for `requestDefinition` returning null (no-definition response), for plain non-Ctrl clicks being ignored, or for a cross-file result when no `onNavigate` callback is provided. Additionally, two existing tests omit `doc.lines` from their mocks, which silently bypasses the line-bounds guard in those scenarios."
+    },
+    "sonnet_robustness": {
+      "reviewer": "sonnet_robustness",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "gui/src/editor/gotoDefinition.ts:requestDefinition().then() block",
+          "category": "unhandled_promise_rejection",
+          "description": "The `requestDefinition(...).then(...)` chain has no `.catch()` handler. If `requestDefinition` rejects (e.g. IPC timeout, backend crash), or if any synchronous code inside `.then()` throws (see next issue), the error becomes an unhandled promise rejection. The `isConnected` guard was added to prevent one class of post-async failure, but it does not add error recovery \u2014 errors still propagate silently.",
+          "suggested_fix": "Add `.catch((err) => console.error('gotoDefinition request failed', err))` (or a silent no-op) after `.then(...)` so all rejection paths are handled explicitly."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/editor/gotoDefinition.ts:view.state.doc.line(location.range.start.line + 1)",
+          "category": "unguarded_stale_lsp_position",
+          "description": "Inside the `.then()` callback, `view.state.doc.line(location.range.start.line + 1)` is called with a line number from an LSP response that may be arbitrarily old by the time it resolves. If the user has edited the document (deleted lines) in the interim, the line number can exceed the current document's line count, causing CodeMirror to throw a `RangeError`. Because there is no `.catch()`, this throw becomes an unhandled promise rejection. The `isConnected` guard does not protect against document mutations \u2014 it only checks DOM attachment.",
+          "suggested_fix": "Wrap the `view.state.doc.line()` call in a bounds check: `if (location.range.start.line + 1 > view.state.doc.lines) return;` before dereferencing the line. This is safe to add alongside the existing `isConnected` guard and eliminates the stale-position throw path."
+        }
+      ],
+      "summary": "The diff correctly adds a `view.dom.isConnected` guard to prevent dispatching into a destroyed EditorView after an async LSP round-trip. The guard placement (before all `view.state` access and `view.dispatch` calls) is sound, and the tests are updated to match. Two residual robustness gaps remain: (1) the `.then()` chain still has no `.catch()`, so any rejection from `requestDefinition` or any synchronous throw inside the callback becomes a silent unhandled promise rejection; (2) `view.state.doc.line(location.range.start.line + 1)` can throw a `RangeError` when the document is edited between request dispatch and response arrival, and because that throw happens inside the unguarded `.then()`, it hits the same unhandled-rejection path. Both are suggestions rather than blockers \u2014 they do not corrupt data and most environments absorb unhandled rejections without crashing \u2014 but fixing them would make the feature robust against realistic usage patterns (fast typists, slow LSP backends)."
+    }
+  },
+  "total_cost_usd": 0.64498425,
+  "wall_clock_ms": 215099,
+  "errors": []
+}

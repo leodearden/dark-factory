@@ -152,6 +152,8 @@ class Harness:
         prd_path: Path | None = None,
         dry_run: bool = False,
         delay_secs: int = 0,
+        force_dirty_start: bool = False,
+        retag_modules: bool = False,
     ) -> HarnessReport:
         """Execute the full orchestration pipeline.
 
@@ -199,6 +201,19 @@ class Harness:
 
         # 1b2. Start merge worker
         await self._start_merge_worker()
+
+        # 1b3. Refuse to start with dirty working tree (unless forced)
+        if not force_dirty_start:
+            dirty = await self.git_ops.has_dirty_working_tree()
+            if dirty:
+                await self._stop_merge_worker()
+                await self._stop_escalation_server()
+                await self.mcp.stop()
+                raise RuntimeError(
+                    'Refusing to start: project_root has uncommitted tracked changes. '
+                    'Commit or stash your work first, or pass --force-dirty-start to override.\n'
+                    f'Dirty files:\n{dirty}'
+                )
 
         try:
             # 1c. Dismiss stale escalations from prior runs (non-fatal)
@@ -258,7 +273,7 @@ class Harness:
 
             # 2b. Tag tasks with code modules for concurrency locking
             logger.info('Tagging tasks with code modules...')
-            await self._tag_task_modules()
+            await self._tag_task_modules(force=retag_modules)
 
             # 2c. Recover crashed tasks from surviving worktrees
             await self._recover_crashed_tasks()
@@ -448,28 +463,35 @@ class Harness:
         if tagged:
             logger.info(f'Tagged {tagged} tasks with PRD: {resolved_prd}')
 
-    async def _tag_task_modules(self) -> None:
+    async def _tag_task_modules(self, force: bool = False) -> None:
         """Invoke a Claude agent to tag each task with the code modules it touches.
 
         Uses structured output to get a JSON mapping of task_id → [modules],
         then persists via scheduler.update_task().
+
+        When *force* is ``True``, retag all non-done/cancelled tasks even if
+        they already have module metadata.
         """
         tasks = await self.scheduler.get_tasks()
 
-        # Filter to pending tasks that don't already have modules in metadata
-        # (done/cancelled tasks don't need module tags — they won't be executed)
+        skip_statuses = {'done', 'cancelled'}
         untagged = []
         for t in tasks:
-            if t.get('status') not in ('pending', 'in-progress'):
+            if t.get('status') in skip_statuses:
                 continue
-            metadata = t.get('metadata') or {}
-            modules = metadata.get('modules', [])
-            if not modules:
-                untagged.append(t)
+            if not force:
+                metadata = t.get('metadata') or {}
+                modules = metadata.get('modules', [])
+                if modules:
+                    continue
+            untagged.append(t)
 
         if not untagged:
-            logger.info('All tasks already have module tags — skipping')
+            logger.info('No tasks to tag — skipping')
             return
+
+        if force:
+            logger.info(f'Force-retagging {len(untagged)} tasks with module metadata')
 
         # Get top-level directory listing for context
         try:
@@ -1021,3 +1043,12 @@ Output JSON matching the schema. Every task must appear in the output.
         event = self._escalation_events.get(escalation.task_id)
         if event:
             event.set()
+
+        # Un-halt merge queue when a wip_conflict escalation is resolved
+        if (
+            getattr(escalation, 'category', None) == 'wip_conflict'
+            and self._merge_worker is not None
+            and self._merge_worker.is_wip_halted
+        ):
+            self._merge_worker.unhalt_wip()
+            logger.info('Merge queue un-halted: wip_conflict escalation resolved')

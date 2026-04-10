@@ -3,8 +3,8 @@
   "name": "Content-hash caching and early cutoff",
   "project": "reify",
   "project_root": "/home/leo/src/reify",
-  "pre_task_commit": "88d537a84e8e37e943b3f55e578c65943de4c2f7",
-  "post_task_commit": "6140657f5cce2e115755fa9081c5022a080e77e6",
+  "pre_task_commit": "4ad57c22a80de23f9fb077f5bfcfe7c56f496921",
+  "post_task_commit": "0a605a351aad740b3025bb4c160e84a1c7a8240e",
   "task_definition": {
     "title": "Content-hash caching and early cutoff",
     "description": "Implement a content-hash caching layer with early cutoff optimization for the reify evaluation pipeline. Includes CacheStore with version-based fast path, dependency tracing, invalidation propagation, and early cutoff that prevents downstream re-evaluation when content hashes match."

@@ -14,6 +14,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from conftest import assert_ro_query_only, extract_cypher, extract_params
 
 from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
@@ -81,19 +82,15 @@ class TestResolveEntityByName:
         await backend.resolve_entity_by_name(entity_name, group_id='test')
         call_args = graph.ro_query.call_args
         assert call_args is not None
-        args, kwargs = call_args
-        cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        cypher_params = extract_params(call_args)
         assert cypher_params.get('name') == entity_name
+        graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
         """resolve_entity_by_name uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock([['uuid-alice', 'Alice']])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.resolve_entity_by_name('Alice', group_id='test')
-        graph.ro_query.assert_awaited_once()
-        graph.query.assert_not_awaited()
+        await assert_ro_query_only(backend, make_graph_mock, [['uuid-alice', 'Alice']], 'resolve_entity_by_name', 'Alice', group_id='test')
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +167,7 @@ class TestGetValidEdgesForNode:
         await backend.get_valid_edges_for_node(node_uuid, group_id='test')
         call_args = graph.ro_query.call_args
         assert call_args is not None, "graph.ro_query was not called"
-        cypher_params = call_args.args[1]
+        cypher_params = extract_params(call_args)
         assert cypher_params.get('uuid') == node_uuid
 
     @pytest.mark.asyncio
@@ -182,22 +179,18 @@ class TestGetValidEdgesForNode:
         await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
         call_args = graph.ro_query.call_args
         assert call_args is not None, "graph.ro_query was not called"
-        cypher = call_args.args[0]
+        cypher = extract_cypher(call_args)
         assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
 
     @pytest.mark.asyncio
     async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
         """Uses ro_query (read-only) — graph.query must NOT be called."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock([])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
-        graph.ro_query.assert_awaited_once()
-        graph.query.assert_not_awaited()
+        await assert_ro_query_only(backend, make_graph_mock, [], 'get_valid_edges_for_node', 'node-uuid-1', group_id='test')
 
 
 # ---------------------------------------------------------------------------
-# step-3 (task-448): GraphitiBackend._edge_dict static helper
+# GraphitiBackend._edge_dict: edge dict normalisation helper
 # ---------------------------------------------------------------------------
 
 class TestEdgeDict:
@@ -211,19 +204,17 @@ class TestEdgeDict:
     def test_none_fact_coerced_to_empty_string(self):
         """None fact is coerced to '' in the returned dict."""
         result = GraphitiBackend._edge_dict('e-1', None, 'knows')
-        assert result['fact'] == ''
+        assert result == {'uuid': 'e-1', 'fact': '', 'name': 'knows'}
 
     def test_none_name_coerced_to_empty_string(self):
         """None name is coerced to '' in the returned dict."""
         result = GraphitiBackend._edge_dict('e-1', 'Alice knows Bob', None)
-        assert result['name'] == ''
+        assert result == {'uuid': 'e-1', 'fact': 'Alice knows Bob', 'name': ''}
 
-    def test_preserves_non_none_values(self):
-        """Non-None fact and name values are kept as-is."""
-        result = GraphitiBackend._edge_dict('e-42', 'some fact', 'some_name')
-        assert result['uuid'] == 'e-42'
-        assert result['fact'] == 'some fact'
-        assert result['name'] == 'some_name'
+    def test_both_none_coerced_to_empty_strings(self):
+        """Both fact and name None are coerced to empty strings."""
+        result = GraphitiBackend._edge_dict('e-null', None, None)
+        assert result == {'uuid': 'e-null', 'fact': '', 'name': ''}
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +244,7 @@ class TestUpdateNodeSummary:
         await backend.update_node_summary(node_uuid, summary, group_id='test')
         call_args = graph.query.call_args
         assert call_args is not None, "graph.query was not called"
-        cypher_params = call_args.args[1]
+        cypher_params = extract_params(call_args)
         assert cypher_params.get('uuid') == node_uuid
         assert cypher_params.get('summary') == summary
 
@@ -266,7 +257,7 @@ class TestUpdateNodeSummary:
         await backend.update_node_summary('node-uuid-1', 'some summary', group_id='test')
         call_args = graph.query.call_args
         assert call_args is not None, "graph.query was not called"
-        cypher = call_args.args[0]
+        cypher = extract_cypher(call_args)
         assert 'SET n.summary' in cypher, f"Cypher must SET n.summary: {cypher}"
 
     @pytest.mark.asyncio
@@ -670,7 +661,7 @@ class TestFusedMemoryInstructionsEntityName:
         server = create_mcp_server(svc)
 
         import asyncio
-        tools = asyncio.get_event_loop().run_until_complete(server.list_tools())
+        tools = asyncio.run(server.list_tools())
         tool = next(t for t in tools if t.name == 'refresh_entity_summary')
         desc = tool.description or ''
         assert 'entity_uuid' in desc

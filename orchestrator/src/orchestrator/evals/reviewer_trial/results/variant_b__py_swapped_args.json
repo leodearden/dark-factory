@@ -1,0 +1,65 @@
+{
+  "variant_name": "variant_b",
+  "diff_id": "py_swapped_args",
+  "reviews": {
+    "opus_bug_hunter": {
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/git_ops.py:420 (new line)",
+          "category": "argument_order_reversal",
+          "description": "The git diff argument order was swapped from `from_sha, to_sha` to `to_sha, from_sha`. This reverses the diff direction: files Added on main since old_base will be classified as Deleted (and filtered out by --diff-filter=ACMR), while files Deleted on main will be classified as Added (and incorrectly included). The existing caller in workflow.py:860 passes `(old_base, current_main)` expecting 'what changed on main since our base' \u2014 the reversed order returns the wrong file set, breaking inter-iteration rebase change detection.",
+          "suggested_fix": "Change the argument list back to `['git', 'diff', '--name-only', diff_filter, from_sha, to_sha]` to preserve the original (correct) semantics."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py:428-438 (new get_diff_stats method)",
+          "category": "error_handling",
+          "description": "get_diff_stats silently returns {insertions: 0, deletions: 0} if the git command fails (non-zero exit code) or produces unexpected output. The return code from _run is discarded. If git diff fails (e.g., invalid sha), the caller gets zeros instead of an error, which could mask problems.",
+          "suggested_fix": "Check the return code from _run and either raise or log a warning on failure, similar to how other methods in this class handle _run errors."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py:433",
+          "category": "parsing_robustness",
+          "description": "int(part.split()[0]) will raise IndexError if a comma-separated part is empty (e.g., trailing comma in git output), and ValueError if the first token is not an integer. While unlikely with standard git output, this is unguarded.",
+          "suggested_fix": "Wrap the parsing in a try/except (ValueError, IndexError) block, or validate that part.split() is non-empty and the first element is numeric before calling int()."
+        }
+      ],
+      "reviewer": "opus_bug_hunter",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The diff contains a blocking bug: the sha argument order in get_changed_files was swapped from `[from_sha, to_sha]` to `[to_sha, from_sha]`, reversing the git diff direction. Combined with the `--diff-filter=ACMR` flag, this means files added on main are now classified as deletions and filtered out, while deleted files are classified as additions and included \u2014 returning the wrong set of changed files. The existing caller in workflow.py (inter-iteration rebase detection) will get incorrect results. The new get_diff_stats method is functionally correct but lacks error handling for git command failures and has minor parsing fragility."
+    },
+    "opus_design_critic": {
+      "reviewer": "opus_design_critic",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/git_ops.py:420 (new line)",
+          "category": "argument_order_reversal",
+          "description": "The git diff argument order was swapped from `from_sha, to_sha` to `to_sha, from_sha`, reversing the diff direction. Combined with the new `--diff-filter=ACMR`, this inverts the filter semantics: files Added in from\u2192to appear as 'D' in the reversed direction and are excluded, while files Deleted in from\u2192to appear as 'A' and are included. The function's behavior is the opposite of its documented intent. The existing caller in workflow.py:860 (`get_changed_files(old_base, current_main)`) will now miss files added on main and incorrectly include deleted files.",
+          "suggested_fix": "Restore the original argument order: `['git', 'diff', '--name-only', diff_filter, from_sha, to_sha]`"
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py:416 (new lines)",
+          "category": "behavioral_change_without_opt_in",
+          "description": "Previously `get_changed_files` returned ALL changed files (no `--diff-filter`). Now it defaults to `--diff-filter=ACMR`, silently excluding deleted files for existing callers. The caller in workflow.py:860 checks what files changed between old_base and current_main for rebase awareness \u2014 it may need to know about deletions too. This is a backward-incompatible default change.",
+          "suggested_fix": "Consider defaulting `include_deleted=True` to preserve backward compatibility, or audit all existing callers to confirm they don't need deleted files."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py:427-440 (new `get_diff_stats`)",
+          "category": "code_duplication",
+          "description": "`get_diff_stats` duplicates the `--shortstat` parsing logic already present in `evals/metrics.py:138` (`_git_diff_stats`). Both extract insertions/deletions from git diff stat output using slightly different approaches (string splitting vs regex). The evals version additionally extracts files_changed. This is a missed reuse opportunity.",
+          "suggested_fix": "Extract a shared stat-parsing utility (e.g., in git_ops or a shared module) that both `get_diff_stats` and `evals/metrics._git_diff_stats` can call, or have `_git_diff_stats` delegate to `GitOps.get_diff_stats`."
+        }
+      ],
+      "summary": "The diff has one blocking bug and two design suggestions. The blocking issue is that the `git diff` argument order was swapped from `from_sha, to_sha` to `to_sha, from_sha`, which reverses the diff direction. When combined with the newly added `--diff-filter=ACMR`, this inverts the filter semantics \u2014 added files are excluded and deleted files are included, the exact opposite of the documented intent. The existing caller in `workflow.py:860` will silently receive wrong results. Additionally, adding `--diff-filter` as a non-optional behavior changes the contract for existing callers who previously received all changed files. Finally, the new `get_diff_stats` method duplicates stat-parsing logic already present in `evals/metrics.py`."
+    }
+  },
+  "total_cost_usd": 0.48012774999999996,
+  "wall_clock_ms": 91420,
+  "errors": []
+}

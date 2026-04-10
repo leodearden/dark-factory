@@ -17,7 +17,19 @@ max_reviewer_retries: 4
 # Merge conflict reduction
 max_advance_attempts: 3
 max_pre_merge_retries: 2
+max_merge_retries: 3
 inter_iteration_rebase: true
+
+# Verification timeouts
+verify_command_timeout_secs: 1800
+verify_timeout_retries: 2
+
+# Verification execution mode + environment injection
+concurrent_verify: true
+verify_env: {}
+# Task-phase verify rewrites cargo --workspace → cargo -p <crate> when
+# all task files live in one (or a few) workspace crates.
+scope_cargo: true
 
 # Steward lifecycle
 steward_lifetime_budget: 12.0
@@ -36,36 +48,39 @@ timeouts:
   architect: 2400
   implementer: 1200
   debugger: 1200
-  reviewer: 600
+  reviewer: 1200
   merger: 600
   steward: 900
   triage: 300
   module_tagger: 300
   deep_reviewer: 2400
+  judge: 300
 
 # Models per role
 models:
   architect: "opus"
   implementer: "sonnet"
   debugger: "sonnet"
-  reviewer: "sonnet"
+  reviewer: "opus"
   merger: "opus"
   steward: "opus"
   triage: "sonnet"
   module_tagger: "sonnet"
   deep_reviewer: "opus"
+  judge: "sonnet"
 
 # Budget per invocation (USD)
 budgets:
   architect: 8.0
   implementer: 10.0
   debugger: 5.0
-  reviewer: 2.0
+  reviewer: 5.0
   merger: 5.0
   steward: 5.0
   triage: 2.0
   module_tagger: 2.0
   deep_reviewer: 15.0
+  judge: 0.50
 
 # Turn limits per invocation
 max_turns:
@@ -78,18 +93,20 @@ max_turns:
   triage: 25
   module_tagger: 30
   deep_reviewer: 100
+  judge: 15
 
 # Reasoning effort per role
 effort:
   architect: "max"
   implementer: "max"
   debugger: "max"
-  reviewer: "medium"
+  reviewer: "high"
   merger: "max"
   steward: "high"
   triage: "medium"
   module_tagger: "medium"
   deep_reviewer: "max"
+  judge: "medium"
 
 # Backend CLI per role (claude, codex, gemini)
 backends:
@@ -102,6 +119,7 @@ backends:
   triage: "claude"
   module_tagger: "claude"
   deep_reviewer: "claude"
+  judge: "claude"
 
 # Review checkpoints
 review:

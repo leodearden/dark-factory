@@ -2,7 +2,50 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
+
+
+def _write_tasks_json(root: Path, tasks: list[dict]) -> None:
+    """Create .taskmaster/tasks/tasks.json under *root* with the given tasks list."""
+    tasks_dir = root / '.taskmaster' / 'tasks'
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
+
+
+class TestWriteTasksJsonHelper:
+    """Tests for _write_tasks_json module-level helper."""
+
+    def test_creates_directory_and_file(self, tmp_path):
+        """Creates .taskmaster/tasks/tasks.json with correct JSON content."""
+        import json
+
+        tasks = [
+            {'id': '1', 'title': 'A', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+        ]
+        _write_tasks_json(tmp_path, tasks)
+
+        tasks_json = tmp_path / '.taskmaster' / 'tasks' / 'tasks.json'
+        assert tasks_json.exists()
+        data = json.loads(tasks_json.read_text())
+        assert data == {'tasks': tasks}
+
+    def test_idempotent_when_dir_exists(self, tmp_path):
+        """Pre-created .taskmaster/tasks/ dir causes no error; file is written correctly."""
+        import json
+
+        (tmp_path / '.taskmaster' / 'tasks').mkdir(parents=True)
+        tasks = [
+            {'id': '2', 'title': 'B', 'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}},
+        ]
+        _write_tasks_json(tmp_path, tasks)
+
+        tasks_json = tmp_path / '.taskmaster' / 'tasks' / 'tasks.json'
+        assert tasks_json.exists()
+        data = json.loads(tasks_json.read_text())
+        assert data == {'tasks': tasks}
 
 
 class TestFindRunningOrchestrators:
@@ -588,8 +631,6 @@ class TestDiscoverOrchestrators:
         config = DashboardConfig(project_root=tmp_path)
 
         # Create tasks.json with 5 tasks of varying statuses + a worktree task
-        tasks_dir = tmp_path / '.taskmaster' / 'tasks'
-        tasks_dir.mkdir(parents=True)
         tasks = [
             {'id': '1', 'title': 'Setup', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
             {'id': '2', 'title': 'Build', 'status': 'done', 'priority': 'high', 'dependencies': ['1'], 'metadata': {}},
@@ -598,7 +639,7 @@ class TestDiscoverOrchestrators:
             {'id': '5', 'title': 'Deploy', 'status': 'pending', 'priority': 'low', 'dependencies': ['4'], 'metadata': {}},
             {'id': '7', 'title': 'Widget', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}},
         ]
-        (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
+        _write_tasks_json(tmp_path, tasks)
 
         # Create a worktree with .task/ artifacts
         wt_dir = tmp_path / '.worktrees' / '7'
@@ -669,10 +710,8 @@ class TestDiscoverOrchestrators:
         config = DashboardConfig(project_root=tmp_path)
 
         # Create tasks.json with a task whose id matches the worktree
-        tasks_dir = tmp_path / '.taskmaster' / 'tasks'
-        tasks_dir.mkdir(parents=True)
         tasks = [{'id': '7', 'title': 'Widget', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}}]
-        (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
+        _write_tasks_json(tmp_path, tasks)
 
         # Create worktree directory using 'task-7' naming convention
         wt_dir = tmp_path / '.worktrees' / 'task-7'
@@ -696,7 +735,6 @@ class TestDiscoverOrchestrators:
 
     def test_non_task_worktree_dirs_excluded(self, tmp_path):
         """Non-task directories (e.g. 'tmp-backup') are excluded; plain and 'task-' numeric dirs included."""
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -705,13 +743,11 @@ class TestDiscoverOrchestrators:
         config = DashboardConfig(project_root=tmp_path)
 
         # Create tasks.json with tasks matching the worktree IDs
-        tasks_dir = tmp_path / '.taskmaster' / 'tasks'
-        tasks_dir.mkdir(parents=True)
         tasks = [
             {'id': '3', 'title': 'T3', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
             {'id': '5', 'title': 'T5', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
         ]
-        (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
+        _write_tasks_json(tmp_path, tasks)
 
         worktrees_dir = tmp_path / '.worktrees'
         worktrees_dir.mkdir()
@@ -754,7 +790,6 @@ class TestDiscoverOrchestrators:
 
     def test_same_prd_grouped_into_single_entry(self, tmp_path):
         """Two processes with the same PRD path are merged into one entry with both PIDs."""
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -763,12 +798,10 @@ class TestDiscoverOrchestrators:
         config = DashboardConfig(project_root=tmp_path)
 
         # Create tasks.json so the shared task tree is populated
-        tasks_dir = tmp_path / '.taskmaster' / 'tasks'
-        tasks_dir.mkdir(parents=True)
         tasks = [
             {'id': '1', 'title': 'Setup', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
         ]
-        (tasks_dir / 'tasks.json').write_text(json.dumps({'tasks': tasks}))
+        _write_tasks_json(tmp_path, tasks)
 
         # Create a worktree so worktrees dict is populated
         wt_dir = tmp_path / '.worktrees' / '1'
@@ -859,6 +892,132 @@ class TestDiscoverOrchestrators:
         assert len(result) == 1
         assert result[0]['running'] is False
 
+    def test_bare_fallback_with_symlink_config_root(self, tmp_path):
+        """Bare process (no prd, no config_path) with symlinked config.project_root returns canonical path.
+
+        When a process has neither prd nor config_path, _resolve_root falls back to
+        config.project_root (line 308).  DashboardConfig.__post_init__ already resolves
+        the symlink, so project_root is canonical before it reaches line 348's
+        str(project_root.resolve()).  This test confirms the full bare-fallback pipeline
+        produces a canonical project_root in the result.
+        """
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real_dir)
+
+        # Create tasks.json under the real directory
+        _write_tasks_json(real_dir, [
+            {"id": "1", "title": "T", "status": "done", "priority": "high", "dependencies": [], "metadata": {}},
+        ])
+
+        # Config points at the symlink — __post_init__ resolves it to real_dir
+        config = DashboardConfig(project_root=link)
+
+        # Bare process: no prd, no config_path — hits line 308 return config.project_root
+        mock_procs = [{"pid": 1234, "prd": None, "config_path": None, "running": True, "started": "Apr09"}]
+        with patch("dashboard.data.orchestrator.find_running_orchestrators", return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        # project_root must be the resolved canonical path, not the symlink
+        assert result[0]["project_root"] == str(real_dir)
+        assert result[0]["pids"] == [1234]
+
+    def test_multi_bare_processes_grouped_under_project_root(self, tmp_path):
+        """Multiple bare processes (no prd, no config_path) sharing the same config root are merged.
+
+        When several processes have neither prd nor config_path, _resolve_root falls back to
+        config.project_root for all of them.  They should be grouped into a single entry
+        with all PIDs listed in insertion order, and the 'running' flag should be True
+        if any individual process is still running.
+        """
+        import json
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        # Set up tasks.json with two tasks of different statuses
+        (tmp_path / ".taskmaster" / "tasks").mkdir(parents=True)
+        (tmp_path / ".taskmaster" / "tasks" / "tasks.json").write_text(
+            json.dumps({"tasks": [
+                {"id": "1", "title": "Alpha", "status": "done", "priority": "high", "dependencies": [], "metadata": {}},
+                {"id": "2", "title": "Beta", "status": "in-progress", "priority": "medium", "dependencies": [], "metadata": {}},
+            ]})
+        )
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        # Three bare processes: two running, one stopped — all fall back to config.project_root
+        mock_procs = [
+            {"pid": 1001, "prd": None, "config_path": None, "running": True, "started": "Apr09"},
+            {"pid": 1002, "prd": None, "config_path": None, "running": True, "started": "Apr09"},
+            {"pid": 1003, "prd": None, "config_path": None, "running": False, "started": "Apr09"},
+        ]
+        with patch("dashboard.data.orchestrator.find_running_orchestrators", return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        # All three bare processes share the same fallback root → single grouped entry
+        assert len(result) == 1
+        assert result[0]["pids"] == [1001, 1002, 1003]
+        assert result[0]["project_root"] == str(tmp_path.resolve())
+        assert result[0]["prd"] is None
+        # Label falls back to project_root when no PRD is present
+        assert result[0]["label"] == str(tmp_path.resolve())
+        # At least one process is running → grouped entry is running
+        assert result[0]["running"] is True
+        # Summary reflects the two tasks written to tasks.json
+        assert result[0]["summary"] == {"total": 2, "done": 1, "in_progress": 1, "blocked": 0, "pending": 0}
+
+    def test_symlink_and_canonical_paths_grouped_into_single_entry(self, tmp_path):
+        """Two processes whose PRDs resolve to the same project root are merged into one entry.
+
+        Process A has its PRD under a symlinked directory component; process B has its
+        PRD under the real (canonical) path.  Both walk up to the same .taskmaster/
+        ancestor.  The grouping dict uses resolved Path objects as keys, so both
+        processes map to the same key and appear in a single entry with both PIDs.
+        """
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        real_dir = tmp_path / "real_proj"
+        real_dir.mkdir()
+        link_dir = tmp_path / "link_proj"
+        link_dir.symlink_to(real_dir)
+
+        # Create tasks.json under the real directory
+        _write_tasks_json(real_dir, [
+            {"id": "2", "title": "Work", "status": "in-progress", "priority": "high", "dependencies": [], "metadata": {}},
+        ])
+
+        (tmp_path / "unrelated").mkdir()
+        config = DashboardConfig(project_root=tmp_path / "unrelated")
+
+        # Process A: PRD under the symlink — _resolve_project_root resolves it to real_dir
+        prd_via_symlink = str(link_dir / "docs" / "prd.md")
+        # Process B: PRD under the canonical path — also resolves to real_dir
+        prd_canonical = str(real_dir / "docs" / "prd.md")
+
+        mock_procs = [
+            {"pid": 111, "prd": prd_via_symlink, "config_path": None, "running": True, "started": "Apr09"},
+            {"pid": 222, "prd": prd_canonical, "config_path": None, "running": True, "started": "Apr09"},
+        ]
+        with patch("dashboard.data.orchestrator.find_running_orchestrators", return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        # Both processes share the same canonical root → exactly one entry
+        assert len(result) == 1
+        assert set(result[0]["pids"]) == {111, 222}
+        assert result[0]["project_root"] == str(real_dir)
+
 
 class TestResolveProjectRoot:
     """Tests for _resolve_project_root — finds project root from PRD path."""
@@ -898,6 +1057,52 @@ class TestResolveProjectRoot:
         prd = str(tmp_path / 'docs' / '..' / 'docs' / 'prd.md')
         assert _resolve_project_root(prd, Path('/fallback')) == tmp_path
 
+    def test_fallback_returns_resolved_default_root(self, tmp_path):
+        """Fallback path returns the resolved (canonical) default_root, not a symlink."""
+        from dashboard.data.orchestrator import _resolve_project_root
+
+        real = tmp_path / 'real'
+        real.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real)
+
+        # No .taskmaster anywhere in the PRD's ancestor chain → falls back to default_root
+        result = _resolve_project_root('/nowhere/prd.md', link)
+
+        # Must return the resolved real path, not the symlink
+        assert result == real
+        assert result != link
+
+    def test_symlink_component_in_prd_path_returns_canonical_ancestor(self, tmp_path):
+        """PRD whose middle directory is a symlink resolves to the canonical ancestor.
+
+        When a component of the PRD path is a symlink, p.resolve() at line 35 rewrites
+        the full path to its canonical form before the ancestor walk begins.  Without
+        that resolve call, Path.parents would walk symlink parents rather than real
+        parents and could miss the .taskmaster/ directory.  This test guards against
+        regressions in that resolve call.
+        """
+        from pathlib import Path
+
+        from dashboard.data.orchestrator import _resolve_project_root
+
+        real_proj = tmp_path / "real_proj"
+        real_proj.mkdir()
+        (real_proj / ".taskmaster").mkdir()
+
+        # Create a symlink: link -> real_proj
+        link = tmp_path / "link"
+        link.symlink_to(real_proj)
+
+        # PRD is under the symlink component — middle dir is a symlink
+        prd = str(link / "docs" / "prd.md")
+
+        result = _resolve_project_root(prd, Path("/fallback"))
+
+        # Must return the canonical real_proj, not the symlink variant
+        assert result == real_proj
+        assert result != link
+
 
 class TestScanWorktrees:
     """Tests for _scan_worktrees — reads worktree artifacts from a directory."""
@@ -927,7 +1132,6 @@ class TestDiscoverOrchestratorsPerProject:
 
     def test_different_projects_get_own_tasks(self, tmp_path):
         """Two orchestrators in different projects each see their own task tree."""
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -937,18 +1141,16 @@ class TestDiscoverOrchestratorsPerProject:
 
         # Project A
         proj_a = tmp_path / 'proj_a'
-        (proj_a / '.taskmaster' / 'tasks').mkdir(parents=True)
-        (proj_a / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+        _write_tasks_json(proj_a, [
             {'id': '1', 'title': 'A1', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
             {'id': '2', 'title': 'A2', 'status': 'pending', 'priority': 'medium', 'dependencies': [], 'metadata': {}},
-        ]}))
+        ])
 
         # Project B
         proj_b = tmp_path / 'proj_b'
-        (proj_b / '.taskmaster' / 'tasks').mkdir(parents=True)
-        (proj_b / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+        _write_tasks_json(proj_b, [
             {'id': '10', 'title': 'B1', 'status': 'pending', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ]}))
+        ])
 
         mock_procs = [
             {'pid': 1000, 'prd': str(proj_a / 'docs' / 'prd.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
@@ -971,7 +1173,6 @@ class TestDiscoverOrchestratorsPerProject:
 
     def test_same_project_prds_merged_into_single_entry(self, tmp_path):
         """Two PRDs in the same project are merged into one entry (grouped by project root)."""
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -979,10 +1180,9 @@ class TestDiscoverOrchestratorsPerProject:
 
         config = DashboardConfig(project_root=tmp_path)
 
-        (tmp_path / '.taskmaster' / 'tasks').mkdir(parents=True)
-        (tmp_path / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+        _write_tasks_json(tmp_path, [
             {'id': '1', 'title': 'T1', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ]}))
+        ])
 
         mock_procs = [
             {'pid': 1000, 'prd': str(tmp_path / 'prd1.md'), 'config_path': None, 'running': True, 'started': 'Mar18'},
@@ -1008,20 +1208,18 @@ class TestDiscoverOrchestratorsPerProject:
 
         # Project A with worktree for task 3
         proj_a = tmp_path / 'proj_a'
-        (proj_a / '.taskmaster' / 'tasks').mkdir(parents=True)
-        (proj_a / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+        _write_tasks_json(proj_a, [
             {'id': '3', 'title': 'A-task', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ]}))
+        ])
         wt_a = proj_a / '.worktrees' / '3' / '.task'
         wt_a.mkdir(parents=True)
         (wt_a / 'plan.json').write_text(json.dumps({'steps': [{'id': 's1', 'status': 'done'}]}))
 
         # Project B with worktree for task 5
         proj_b = tmp_path / 'proj_b'
-        (proj_b / '.taskmaster' / 'tasks').mkdir(parents=True)
-        (proj_b / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+        _write_tasks_json(proj_b, [
             {'id': '5', 'title': 'B-task', 'status': 'in-progress', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ]}))
+        ])
         wt_b = proj_b / '.worktrees' / '5' / '.task'
         wt_b.mkdir(parents=True)
         (wt_b / 'plan.json').write_text(json.dumps({'steps': [{'id': 's1', 'status': 'pending'}]}))
@@ -1041,7 +1239,6 @@ class TestDiscoverOrchestratorsPerProject:
 
     def test_fallback_to_config_project_root(self, tmp_path):
         """When PRD path has no .taskmaster/ ancestor, falls back to config project_root."""
-        import json
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -1049,10 +1246,9 @@ class TestDiscoverOrchestratorsPerProject:
 
         config = DashboardConfig(project_root=tmp_path)
 
-        (tmp_path / '.taskmaster' / 'tasks').mkdir(parents=True)
-        (tmp_path / '.taskmaster' / 'tasks' / 'tasks.json').write_text(json.dumps({'tasks': [
+        _write_tasks_json(tmp_path, [
             {'id': '1', 'title': 'T', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
-        ]}))
+        ])
 
         mock_procs = [{'pid': 1000, 'prd': '/nonexistent/prd.md', 'config_path': None, 'running': True, 'started': 'Mar18'}]
         with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
@@ -1060,3 +1256,31 @@ class TestDiscoverOrchestratorsPerProject:
 
         assert len(result) == 1
         assert len(result[0]['tasks']) == 1
+
+    def test_project_root_in_result_is_resolved_when_config_root_is_symlink(self, tmp_path):
+        """project_root in result dict is canonicalised even when config.project_root is a symlink."""
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real_dir)
+
+        # Create tasks.json under the real directory so discover_orchestrators has data to read
+        _write_tasks_json(real_dir, [
+            {'id': '1', 'title': 'T', 'status': 'done', 'priority': 'high', 'dependencies': [], 'metadata': {}},
+        ])
+
+        config = DashboardConfig(project_root=link)
+
+        # PRD under /nonexistent — no .taskmaster ancestor found, falls back to config.project_root (=link)
+        mock_procs = [{'pid': 9999, 'prd': '/nonexistent/prd.md', 'config_path': None, 'running': True, 'started': 'Apr07'}]
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        assert len(result) == 1
+        # project_root must be the resolved canonical path, not the symlink
+        assert result[0]['project_root'] == str(real_dir)

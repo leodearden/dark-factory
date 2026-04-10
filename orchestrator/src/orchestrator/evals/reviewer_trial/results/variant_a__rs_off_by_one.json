@@ -1,0 +1,51 @@
+{
+  "variant_name": "variant_a",
+  "diff_id": "rs_off_by_one",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:469",
+          "category": "out_of_bounds_panic",
+          "description": "Loop range changed from `0..n` to `0..=n`, causing an index-out-of-bounds panic on the last iteration. When `i == n`, both `params[i]` and `vertex[i]` access index `n` of arrays/vectors with length `n`. This is a guaranteed runtime panic.",
+          "suggested_fix": "Revert the loop range back to `0..n`. The original range was correct: a simplex in N dimensions needs N+1 vertices (1 initial + N perturbations, one per dimension)."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:460",
+          "category": "api_contract_violation",
+          "description": "The function signature changed to require a `scale: f64` parameter, but the caller `solve_core()` at ~line 568 still calls `build_simplex(initial, &problem.auto_params)` with only two arguments. This will fail to compile.",
+          "suggested_fix": "Update the call site in `solve_core()` to pass a scale value, e.g. `build_simplex(initial, &problem.auto_params, 0.1)`, and update the test `simplex_has_n_plus_1_vertices` similarly."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:469",
+          "category": "incorrect_simplex_geometry",
+          "description": "Even if the out-of-bounds issue were somehow avoided, the inclusive range `0..=n` produces n+1 perturbation vertices, yielding n+2 total vertices (1 initial + n+1). A Nelder-Mead simplex in N dimensions must have exactly N+1 vertices. The extra vertex would cause incorrect solver behavior.",
+          "suggested_fix": "Use `0..n` to produce exactly N perturbation vertices, giving N+1 total vertices."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs:480-483",
+          "category": "dead_code",
+          "description": "`validate_simplex` is defined but never called anywhere in the codebase. It will trigger a dead-code compiler warning.",
+          "suggested_fix": "Either integrate `validate_simplex` as a debug_assert in `build_simplex` (e.g. `debug_assert!(validate_simplex(&simplex, n));` before returning), or remove it until it's actually needed."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs:2158-2217",
+          "category": "test_coverage",
+          "description": "The existing test `simplex_has_n_plus_1_vertices` needs to be updated for the new `scale` parameter. Additionally, no test covers edge-case scale values (0.0, 1.0, negative) or verifies that vertex values are properly clamped to bounds.",
+          "suggested_fix": "Update existing tests with the `scale` parameter and add tests for scale=0.0 (degenerate simplex), scale=1.0 (maximum spread), and boundary clamping behavior."
+        }
+      ],
+      "summary": "This diff contains three blocking bugs. First, the loop range change from `0..n` to `0..=n` causes a guaranteed index-out-of-bounds panic when `i == n`, since both `params` and `vertex` have length `n`. Second, even without the panic, the inclusive range produces n+2 simplex vertices instead of the mathematically required n+1 for Nelder-Mead optimization. Third, the new `scale` parameter was added to the function signature but not to the call site in `solve_core()` or the existing test, so the code will not compile. The new `validate_simplex` function is dead code and should either be wired in via `debug_assert!` or removed."
+    }
+  },
+  "total_cost_usd": 0.3688852,
+  "wall_clock_ms": 118166,
+  "errors": []
+}

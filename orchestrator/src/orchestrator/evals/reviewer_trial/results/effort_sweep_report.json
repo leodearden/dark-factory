@@ -1,0 +1,306 @@
+{
+  "summaries": [
+    {
+      "name": "variant_a",
+      "description": "1x opus generalist \u2014 depth replaces breadth",
+      "num_reviewers": 1,
+      "mean_recall": 0.6667,
+      "mean_precision": 0.3738,
+      "mean_f1": 0.472,
+      "mean_blocking_recall": 0.8778,
+      "total_cost_usd": 5.21,
+      "mean_wall_clock_ms": 119529.0,
+      "by_language": {
+        "python": {
+          "recall": 0.6389,
+          "precision": 0.3222,
+          "f1": 0.4232,
+          "blocking_recall": 0.9167
+        },
+        "rust": {
+          "recall": 0.7778,
+          "precision": 0.454,
+          "f1": 0.5712,
+          "blocking_recall": 0.8333
+        },
+        "typescript": {
+          "recall": 0.5,
+          "precision": 0.3167,
+          "f1": 0.3712,
+          "blocking_recall": 0.8889
+        }
+      },
+      "by_source": {
+        "synthetic": {
+          "recall": 0.7361,
+          "precision": 0.3978,
+          "f1": 0.5113,
+          "blocking_recall": 0.9722
+        },
+        "real_world": {
+          "recall": 0.3889,
+          "precision": 0.2778,
+          "f1": 0.3148,
+          "blocking_recall": 0.5
+        }
+      },
+      "f1_per_dollar": 0.0906,
+      "blocking_recall_per_dollar": 0.1685
+    },
+    {
+      "name": "variant_a_medium",
+      "description": "1x opus generalist @ medium effort",
+      "num_reviewers": 1,
+      "mean_recall": 0.7333,
+      "mean_precision": 0.3198,
+      "mean_f1": 0.4358,
+      "mean_blocking_recall": 0.7889,
+      "total_cost_usd": 6.76,
+      "mean_wall_clock_ms": 131066.0,
+      "by_language": {
+        "python": {
+          "recall": 0.7222,
+          "precision": 0.2691,
+          "f1": 0.3861,
+          "blocking_recall": 0.9167
+        },
+        "rust": {
+          "recall": 0.8611,
+          "precision": 0.3845,
+          "f1": 0.5291,
+          "blocking_recall": 0.8333
+        },
+        "typescript": {
+          "recall": 0.5,
+          "precision": 0.2917,
+          "f1": 0.3485,
+          "blocking_recall": 0.4444
+        }
+      },
+      "by_source": {
+        "synthetic": {
+          "recall": 0.7778,
+          "precision": 0.3134,
+          "f1": 0.4419,
+          "blocking_recall": 0.9444
+        },
+        "real_world": {
+          "recall": 0.5556,
+          "precision": 0.3452,
+          "f1": 0.4111,
+          "blocking_recall": 0.1667
+        }
+      },
+      "f1_per_dollar": 0.0644,
+      "blocking_recall_per_dollar": 0.1166
+    },
+    {
+      "name": "variant_a_max",
+      "description": "1x opus generalist @ max effort",
+      "num_reviewers": 1,
+      "mean_recall": 0.7444,
+      "mean_precision": 0.2919,
+      "mean_f1": 0.4158,
+      "mean_blocking_recall": 0.7889,
+      "total_cost_usd": 10.24,
+      "mean_wall_clock_ms": 175202.0,
+      "by_language": {
+        "python": {
+          "recall": 0.8611,
+          "precision": 0.3147,
+          "f1": 0.4563,
+          "blocking_recall": 1.0
+        },
+        "rust": {
+          "recall": 0.8056,
+          "precision": 0.3341,
+          "f1": 0.4695,
+          "blocking_recall": 0.75
+        },
+        "typescript": {
+          "recall": 0.3889,
+          "precision": 0.162,
+          "f1": 0.2273,
+          "blocking_recall": 0.4444
+        }
+      },
+      "by_source": {
+        "synthetic": {
+          "recall": 0.7639,
+          "precision": 0.2917,
+          "f1": 0.4182,
+          "blocking_recall": 0.9028
+        },
+        "real_world": {
+          "recall": 0.6667,
+          "precision": 0.2929,
+          "f1": 0.4063,
+          "blocking_recall": 0.3333
+        }
+      },
+      "f1_per_dollar": 0.0406,
+      "blocking_recall_per_dollar": 0.077
+    }
+  ],
+  "head_to_heads": [
+    {
+      "variant_a": "variant_a_medium",
+      "variant_b": "variant_a",
+      "a_wins": [
+        "py_swapped_args",
+        "rs_real_01",
+        "ts_obvious_copy"
+      ],
+      "b_wins": [
+        "py_always_passes",
+        "py_deep_shallow",
+        "py_missing_await",
+        "py_obvious_copy",
+        "py_real_01",
+        "rs_heavy_mutation_copy",
+        "rs_iter_vs_recurse",
+        "rs_leaked_resource",
+        "rs_missing_error_prop",
+        "rs_off_by_one",
+        "ts_shallow_mutate"
+      ],
+      "ties": [
+        "ts_real_01"
+      ]
+    },
+    {
+      "variant_a": "variant_a_medium",
+      "variant_b": "variant_a_max",
+      "a_wins": [
+        "py_always_passes",
+        "py_swapped_args",
+        "rs_iter_vs_recurse",
+        "rs_leaked_resource",
+        "rs_off_by_one",
+        "rs_real_01",
+        "ts_obvious_copy",
+        "ts_real_01",
+        "ts_shallow_mutate"
+      ],
+      "b_wins": [
+        "py_deep_shallow",
+        "py_missing_await",
+        "py_real_01"
+      ],
+      "ties": [
+        "py_obvious_copy",
+        "rs_heavy_mutation_copy",
+        "rs_missing_error_prop"
+      ]
+    },
+    {
+      "variant_a": "variant_a",
+      "variant_b": "variant_a_max",
+      "a_wins": [
+        "py_always_passes",
+        "py_obvious_copy",
+        "py_swapped_args",
+        "rs_heavy_mutation_copy",
+        "rs_iter_vs_recurse",
+        "rs_leaked_resource",
+        "rs_missing_error_prop",
+        "rs_off_by_one",
+        "ts_obvious_copy",
+        "ts_real_01",
+        "ts_shallow_mutate"
+      ],
+      "b_wins": [
+        "py_deep_shallow",
+        "py_missing_await",
+        "py_real_01",
+        "rs_real_01"
+      ],
+      "ties": []
+    }
+  ],
+  "missed_by_all": [
+    "py_pass_2",
+    "rs_leak_3",
+    "rs_real_dup_1",
+    "ts_copy_2",
+    "ts_shallow_1"
+  ],
+  "per_diff_scores": {
+    "py_missing_await": {
+      "variant_a_medium": 0.25,
+      "variant_a": 0.3333,
+      "variant_a_max": 0.5714
+    },
+    "py_swapped_args": {
+      "variant_a_medium": 0.4444,
+      "variant_a": 0.2857,
+      "variant_a_max": 0.2222
+    },
+    "py_always_passes": {
+      "variant_a_medium": 0.5,
+      "variant_a": 0.5714,
+      "variant_a_max": 0.4444
+    },
+    "py_obvious_copy": {
+      "variant_a_medium": 0.5,
+      "variant_a": 0.5714,
+      "variant_a_max": 0.5
+    },
+    "py_deep_shallow": {
+      "variant_a_medium": 0.2222,
+      "variant_a": 0.3333,
+      "variant_a_max": 0.4
+    },
+    "py_real_01": {
+      "variant_a_medium": 0.4,
+      "variant_a": 0.4444,
+      "variant_a_max": 0.6
+    },
+    "rs_off_by_one": {
+      "variant_a_medium": 0.6,
+      "variant_a": 0.75,
+      "variant_a_max": 0.3636
+    },
+    "rs_leaked_resource": {
+      "variant_a_medium": 0.3077,
+      "variant_a": 0.4,
+      "variant_a_max": 0.2857
+    },
+    "rs_heavy_mutation_copy": {
+      "variant_a_medium": 0.6667,
+      "variant_a": 0.8,
+      "variant_a_max": 0.6667
+    },
+    "rs_iter_vs_recurse": {
+      "variant_a_medium": 0.6667,
+      "variant_a": 0.7273,
+      "variant_a_max": 0.6154
+    },
+    "rs_missing_error_prop": {
+      "variant_a_medium": 0.6,
+      "variant_a": 0.75,
+      "variant_a_max": 0.6
+    },
+    "rs_real_01": {
+      "variant_a_medium": 0.3333,
+      "variant_a": 0.0,
+      "variant_a_max": 0.2857
+    },
+    "ts_shallow_mutate": {
+      "variant_a_medium": 0.1818,
+      "variant_a": 0.3636,
+      "variant_a_max": 0.1667
+    },
+    "ts_obvious_copy": {
+      "variant_a_medium": 0.3636,
+      "variant_a": 0.25,
+      "variant_a_max": 0.1818
+    },
+    "ts_real_01": {
+      "variant_a_medium": 0.5,
+      "variant_a": 0.5,
+      "variant_a_max": 0.3333
+    }
+  },
+  "total_cost_usd": 22.21
+}

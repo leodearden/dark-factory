@@ -1,0 +1,114 @@
+{
+  "variant_name": "variant_d",
+  "diff_id": "rs_off_by_one",
+  "reviews": {
+    "sonnet_test_analyst": {
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs (diff hunk, build_simplex loop)",
+          "category": "logic_bug_causing_panic_and_wrong_output",
+          "description": "The loop bound was changed from `0..n` to `0..=n`. This iterates n+1 times (i = 0, 1, \u2026, n), but `params` has only n elements. On the final iteration `params[n]` is an out-of-bounds index and will always panic at runtime for any n \u2265 1. Even if it did not panic, the simplex would contain n+2 vertices (n+1 from the loop plus the initial push) instead of the documented n+1, corrupting every subsequent Nelder-Mead step.",
+          "suggested_fix": "Revert the loop bound to `for i in 0..n`. The original invariant \u2014 push the initial point, then push one perturbed copy per dimension \u2014 already yields n+1 vertices. The existing test `simplex_has_n_plus_1_vertices` (lines 2158-2217) directly asserts this invariant and will fail (or panic) with the `0..=n` bound."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:2171,2190,2215 (simplex_has_n_plus_1_vertices test) and src/solver.rs:568 (production call site)",
+          "category": "api_contract_violation_compile_error",
+          "description": "The signature of `build_simplex` now requires a third argument `scale: f64`, but neither the existing unit test calls (lines 2171, 2190, 2215) nor the production call site (line 568: `build_simplex(initial, &problem.auto_params)`) were updated. The diff is incomplete: the callers still use the old two-argument form, so the crate will not compile.",
+          "suggested_fix": "Update every call site to pass a `scale` argument. For the production caller in `solve_core` decide on a default (e.g. `0.1`, preserving prior behaviour). For the unit test, pass the same default so the assertions remain meaningful."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs (new validate_simplex function)",
+          "category": "untested_dead_code",
+          "description": "`validate_simplex` is introduced but never called anywhere \u2014 not in production code, not in the test suite, and not in any assertion wrapping `build_simplex`. As dead code it provides no safety net, and the helper itself is untested.",
+          "suggested_fix": "Either (a) call it as a debug assertion inside `build_simplex` \u2014 `debug_assert!(validate_simplex(&simplex, n))` \u2014 so it guards every construction site at no release-build cost, or (b) add a dedicated unit test that exercises both the passing case and the two failure cases (wrong vertex count, wrong vertex dimension)."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs:2158-2217 (simplex_has_n_plus_1_vertices test)",
+          "category": "missing_coverage_for_new_behavior",
+          "description": "The `scale` parameter is the primary new behaviour introduced by this diff \u2014 it replaces the hardcoded `0.1` and allows callers to control simplex size. The existing test only checks vertex *count*; there are no assertions that the perturbation magnitude is actually proportional to `scale`. Edge cases that are now reachable but untested: `scale = 0.0` (degenerate simplex where all vertices are identical, likely to stall Nelder-Mead), `scale = 1.0` (perturbation is clipped to the bound because `initial[i] + (hi-lo)` exceeds `hi`), and a negative scale (inverts perturbation direction).",
+          "suggested_fix": "Add a test that constructs a simplex with a known scale (e.g. 0.05 and 0.2) and asserts that the perturbed vertex's `i`-th coordinate equals `(initial[i] + (hi-lo)*scale).clamp(lo, hi)`. Also add a test for `scale = 0.0` to document the degenerate behaviour and confirm it is handled (or explicitly rejected with a precondition check)."
+        }
+      ],
+      "reviewer": "sonnet_test_analyst",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The diff contains two blocking defects that will prevent compilation and cause a runtime panic. First, the loop bound change from `0..n` to `0..=n` is an off-by-one error: it accesses `params[n]` (out of bounds) and produces n+2 simplex vertices instead of the required n+1, breaking the Nelder-Mead invariant and crashing on any non-trivial input. Second, the new `scale` parameter is not threaded through to the two existing call sites (the production caller at line 568 and all three calls inside `simplex_has_n_plus_1_vertices`), so the crate will not compile. Ironically, the existing vertex-count test is well-targeted and would catch the `0..=n` regression immediately \u2014 it just cannot currently run because the API was changed without updating it. On the suggestion side, the new `validate_simplex` helper is dead code (never invoked or tested), and no test covers the semantics of the `scale` parameter itself, leaving edge cases like `scale=0.0` and boundary-clipped perturbations unexercised."
+    },
+    "sonnet_bug_hunter": {
+      "reviewer": "sonnet_bug_hunter",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs (build_simplex loop, diff hunk)",
+          "category": "index_out_of_bounds_panic",
+          "description": "The loop was changed from `for i in 0..n` to `for i in 0..=n`, making it iterate N+1 times instead of N. On the final iteration when `i == n`, the code executes `effective_bounds(&params[i])` which accesses `params[n]` \u2014 one past the end of the slice (params.len() == n). In Rust this is a runtime panic, not undefined behaviour, but it will fire unconditionally on every call to build_simplex with any non-zero number of dimensions.",
+          "suggested_fix": "Revert the loop bound back to `for i in 0..n`. The original intent documented in the function's doc-comment is 'N perturbations (one per dimension)', so the correct range is `0..n`. The `0..=n` change is the source of both the out-of-bounds access and the oversized simplex."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:568",
+          "category": "compilation_error_missing_argument",
+          "description": "The diff adds a new required `scale: f64` parameter to `build_simplex`, but the call site at line 568 (`let simplex = build_simplex(initial, &problem.auto_params);`) is not updated to pass the third argument. This diff as applied will not compile.",
+          "suggested_fix": "Either update the call site to pass an explicit scale value (e.g. `build_simplex(initial, &problem.auto_params, 0.1)` to preserve the prior behaviour), or make the scale an associated constant / give it a default by keeping the old call-path intact."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs (build_simplex, diff hunk)",
+          "category": "nelder_mead_invariant_violation",
+          "description": "Even if the `params[n]` panic were somehow avoided, the `0..=n` loop pushes N+1 perturbed vertices on top of the one initial vertex already pushed, yielding a simplex of size N+2. Nelder-Mead requires exactly N+1 vertices for an N-dimensional problem. Passing an N+2-vertex simplex to `NelderMead::new` will either error or produce nonsensical search behaviour. The existing test `simplex_has_n_plus_1_vertices` (line 2159) would immediately catch this.",
+          "suggested_fix": "Restore `for i in 0..n` so the loop produces exactly N perturbed vertices, making the total simplex size N+1 as documented and as the tests assert."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs (validate_simplex, diff hunk)",
+          "category": "dead_code",
+          "description": "`validate_simplex` is introduced in the diff but is never called from anywhere in the file. It will generate a dead-code compiler warning and provides no safety net at runtime.",
+          "suggested_fix": "Either invoke `debug_assert!(validate_simplex(&simplex, n))` immediately after the `build_simplex` call in the solver, or remove the function until it is actually needed."
+        }
+      ],
+      "summary": "The diff contains three blocking bugs. The most critical is an off-by-one error: changing `for i in 0..n` to `for i in 0..=n` causes an unconditional out-of-bounds panic on `params[n]` (the slice has length n, so valid indices are 0..n-1). Even ignoring the panic, the same change produces a simplex with N+2 vertices instead of the N+1 required by Nelder-Mead, violating the algorithm's invariant and breaking existing vertex-count tests. Separately, adding the `scale: f64` parameter without updating the only call site at line 568 means the diff will not compile at all. A new `validate_simplex` helper is also introduced but never invoked, making it dead code that won't catch the structural error at runtime. All three issues must be fixed before this change can be merged."
+    },
+    "sonnet_design_critic": {
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs (build_simplex, loop)",
+          "category": "logic_error_out_of_bounds",
+          "description": "The loop bound was changed from `0..n` to `0..=n`, which causes an out-of-bounds panic. `params` has length `n` (one entry per dimension), so `params[n]` in the final iteration is past the end of the slice. Additionally, the loop now pushes `n+1` perturbed vertices instead of `n`, producing an `n+2`-vertex simplex rather than the required `n+1` for Nelder-Mead. The existing tests `simplex_has_n_plus_1_vertices` (lines 2171, 2190, 2215) all assert `simplex.len() == n+1` and would fail immediately.",
+          "suggested_fix": "Revert the loop bound back to `0..n`. If the intent was to produce a larger initial simplex for broader exploration, the way to do it is via the `scale` parameter (already added), not by adding an extra vertex. The correct structure is: `simplex.push(initial.to_vec())` followed by `for i in 0..n { ... simplex.push(vertex); }` yielding exactly `n+1` vertices total."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs (build_simplex signature)",
+          "category": "api_contract_break_compilation_failure",
+          "description": "The new `scale: f64` parameter is added to `build_simplex` but none of the four call sites are updated in this diff (production call at line 568 and three test calls at lines 2171, 2190, 2215). This will cause a compilation failure \u2014 all four call sites pass only two arguments but the function now requires three.",
+          "suggested_fix": "Update all four call sites to pass an explicit scale value. For the production call in `solve_core`, use `0.1` (preserving the old behaviour) or the appropriate new constant. For tests, either pass `0.1` directly or define a named constant (e.g., `DEFAULT_SIMPLEX_SCALE = 0.1`) at module level and reference it in both the production call and the tests to make the coupling explicit."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs (validate_simplex)",
+          "category": "dead_code",
+          "description": "`validate_simplex` is defined but never called anywhere in the codebase. The correctness property it encodes (simplex has exactly `n+1` vertices, each of length `n`) is already asserted by the existing unit tests. A private helper that is never invoked from production code or tests adds noise and will generate a Rust dead-code warning (`#[allow(dead_code)]` would suppress it, but that only hides the smell).",
+          "suggested_fix": "Either call `validate_simplex` with a `debug_assert!` inside `build_simplex` itself \u2014 `debug_assert!(validate_simplex(&simplex, n), \"simplex invariant violated\")` \u2014 so it acts as a self-check with zero release overhead, or remove it and rely on the existing tests. If the intent is to use it externally (e.g., in the uniqueness-perturbation path), add that call site now."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs (build_simplex, capacity)",
+          "category": "minor_inefficiency",
+          "description": "`Vec::with_capacity(n + 1)` is correct for the original `n`-iteration loop but becomes under-allocated if `0..=n` were kept (which would push `n+2` entries). Even with the loop reverted to `0..n`, this is correct. This is a secondary note flagging that the capacity and loop bound must stay in sync; right now they are inconsistent in the diff.",
+          "suggested_fix": "Keep `Vec::with_capacity(n + 1)` and `for i in 0..n` together. If the loop bound is ever changed intentionally, update the capacity to match."
+        }
+      ],
+      "reviewer": "sonnet_design_critic",
+      "verdict": "ISSUES_FOUND",
+      "summary": "This diff has two blocking issues that prevent the code from working. First, the loop bound change from `0..n` to `0..=n` introduces an out-of-bounds panic on `params[n]` (params has exactly n entries) and simultaneously breaks the Nelder-Mead simplex invariant by producing an n+2-vertex simplex instead of the required n+1 \u2014 directly contradicting the three existing size-assertion tests. Second, adding the `scale: f64` parameter to `build_simplex` without updating any of the four call sites will cause a compilation failure. On the design side, the new `validate_simplex` helper is dead code: the same invariant is already enforced by unit tests, and the function is never called from production code, making it a maintenance liability rather than a structural improvement. If the goals of this change are (a) making the initial perturbation scale configurable and (b) adding a runtime guard, both are sound ideas \u2014 but they need the loop reverted, all call sites updated, and `validate_simplex` wired to a `debug_assert!` inside `build_simplex`."
+    }
+  },
+  "total_cost_usd": 0.6666306,
+  "wall_clock_ms": 156017,
+  "errors": []
+}

@@ -1,0 +1,79 @@
+{
+  "variant_name": "variant_c",
+  "diff_id": "py_deep_shallow",
+  "reviews": {
+    "opus_strategic": {
+      "reviewer": "opus_strategic",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/config.py:34",
+          "category": "mutation_bug",
+          "description": "The change from `merged = base.copy()` to `merged = base` causes `_deep_merge` to mutate the caller's `base` dict in-place. The updated docstring explicitly promises 'The caller's *base* dict is never mutated \u2014 we work on a copy', but the code does the opposite. This will break the existing `test_deep_merge_does_not_mutate_base` test (test_config.py:214-218) and silently corrupt callers such as `YamlSettingsSource.__call__` (line 96) and the new `_merge_env_overrides`, where the original `base_env` dict passed by the caller will be modified as a side-effect.",
+          "suggested_fix": "Restore `merged = base.copy()` to preserve the non-mutation contract."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/config.py:42-46",
+          "category": "code_reuse_misfit",
+          "description": "`_merge_env_overrides` delegates to `_deep_merge` for flat `dict[str, str]` dicts that can never contain nested dicts. The recursive deep-merge logic (with its `isinstance(..., dict)` checks on every key) is semantically misleading and unnecessarily couples this helper to the nested-config merge implementation. A simple `{**base_env, **extra}` achieves the same result for flat dicts and communicates intent more clearly.",
+          "suggested_fix": "Replace the body with `result = {**base_env, **extra}` followed by the empty-value filter."
+        }
+      ],
+      "summary": "The diff contains a critical mutation bug: removing `.copy()` from `_deep_merge` causes it to mutate callers' dicts in-place, directly contradicting its own updated docstring and breaking an existing test. The new `_merge_env_overrides` function is functionally sound but unnecessarily delegates to the nested deep-merge utility for flat string-to-string env dicts \u2014 a simple dict spread would be clearer and avoid coupling to the mutation-sensitive merge implementation."
+    },
+    "sonnet_test_analyst": {
+      "reviewer": "sonnet_test_analyst",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/config.py:22",
+          "category": "mutation_bug_breaks_existing_test",
+          "description": "The diff changes `merged = base.copy()` to `merged = base`, making `merged` an alias for the caller's dict rather than a copy. Every assignment `merged[key] = \u2026` now mutates `base` in place. This directly contradicts the new docstring ('The caller's *base* dict is never mutated \u2014 we work on a copy') and will cause `test_deep_merge_does_not_mutate_base` (test_config.py:214-218) to fail: after `_deep_merge({'a': {'x': 1}}, {'a': {'y': 2}})`, the assertion `assert base == {'a': {'x': 1}}` will fail because `base['a']` has been reassigned to `{'x': 1, 'y': 2}`. The recursive call path (`merged[key] = _deep_merge(merged[key], value)`) also propagates the mutation into every nested dict of `base`.",
+          "suggested_fix": "Revert to `merged = base.copy()`. The shallow copy at the top level is sufficient because nested dicts are replaced via recursive calls (not mutated in-place), which is the original correct design."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/config.py:43-47",
+          "category": "missing_test_coverage_new_function",
+          "description": "`_merge_env_overrides` is entirely untested. The function has four distinct behaviours that are not covered anywhere in test_config.py: (1) non-overlapping keys from both dicts are present in the result; (2) when the same key exists in both, `extra` wins; (3) empty-string values originating from `base` are stripped; (4) empty-string values originating from `extra` are stripped. Additionally, the function is not called anywhere in the codebase yet, so there is no indirect integration-test coverage either.",
+          "suggested_fix": "Add a `TestMergeEnvOverrides` class in test_config.py with at least four parameterised cases: disjoint keys, conflict resolution (extra wins), empty value in base stripped, empty value in extra stripped. Also add an edge-case test with both inputs empty to confirm an empty dict is returned."
+        }
+      ],
+      "summary": "The diff introduces a critical regression in `_deep_merge`: removing `.copy()` makes the function mutate its `base` argument, directly contradicting the new docstring and guaranteed to break the existing `test_deep_merge_does_not_mutate_base` test. The new `_merge_env_overrides` helper is added without any test coverage \u2014 none of its four observable behaviours (key union, conflict resolution, empty-value stripping from either input) are exercised. The mutation bug must be fixed before merge; test coverage for `_merge_env_overrides` should be added before the function is wired into production call sites."
+    },
+    "sonnet_robustness": {
+      "reviewer": "sonnet_robustness",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/config.py:35",
+          "category": "mutation_bug",
+          "description": "The diff changes `merged = base.copy()` to `merged = base`, removing the protective shallow copy. The new docstring simultaneously claims 'The caller's *base* dict is never mutated \u2014 we work on a copy.' This is a direct contradiction: without `.copy()`, `merged` is just an alias for `base`, so every assignment `merged[key] = value` mutates the caller's dict in place. The existing call at line 96 (`base = _deep_merge(base, project_config)`) reassigns the local `base` immediately so it escapes the bug, but any caller \u2014 including the new `_merge_env_overrides` \u2014 that retains a reference to the dict it passes as `base` will see unexpected in-place mutation. For `_merge_env_overrides(base_env, extra)` this means the caller's `base_env` dict (likely `config.env_overrides`) is silently corrupted with extra's keys on every call.",
+          "suggested_fix": "Restore `merged = base.copy()`. The docstring is correct in intent; the code must match it. A shallow copy is sufficient here because nested dicts are handled by the recursive call, which will copy each nested level on its own traversal."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/config.py:44",
+          "category": "silent_data_loss",
+          "description": "`_merge_env_overrides` strips keys whose value is the empty string (`if v`). This means a caller that explicitly sets `VAR: ''` in env_overrides to clear an inherited environment variable will silently lose that intent. Empty-string env vars are a legitimate POSIX mechanism (e.g., to unset a parent-process default). The comment 'some tools choke on FOO=\"\"' is true for a narrow set of tools but the blanket strip applies to all callers.",
+          "suggested_fix": "Either document the stripping more prominently so callers know they cannot use empty-string values to clear vars, or make it opt-in via a parameter (`strip_empty: bool = False`). If the goal is only to avoid forwarding keys that were never set, filter on `v is not None` instead of `if v`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/config.py:42",
+          "category": "semantic_mismatch",
+          "description": "`_merge_env_overrides` delegates to `_deep_merge` for what is guaranteed to be a flat `dict[str, str]`. Deep-merge semantics (recursive nested-dict traversal) are meaningless for string-to-string maps and carry the full mutation risk described in issue #1. A direct `{**base_env, **extra}` (or `base_env | extra`) would be clearer, safer (no mutation path at all), and communicates the flat-merge intent to readers.",
+          "suggested_fix": "Replace `result = _deep_merge(base_env, extra)` with `result = base_env | extra` (Python 3.9+). This creates a new dict without any mutation concern and makes the flat-merge intent explicit."
+        }
+      ],
+      "summary": "The diff introduces a critical mutation bug: it removes `base.copy()` from `_deep_merge` (changing `merged = base.copy()` to `merged = base`) while simultaneously adding a docstring that claims the caller's dict is never mutated. Without the copy, every top-level key assignment writes directly into the caller's original dict. The current sole call-site (line 96) happens to be immune because it immediately reassigns `base`, but the new `_merge_env_overrides` helper exposes the bug: any caller passing `config.env_overrides` as `base_env` will have that dict silently mutated with `extra`'s keys on every call. The fix is a one-character restore: `merged = base.copy()`. Two secondary suggestions: the empty-string stripping in `_merge_env_overrides` silently swallows intentional blank-value overrides, and using `_deep_merge` on flat string dicts is a semantic mismatch that could be replaced with the cleaner `base_env | extra` expression."
+    }
+  },
+  "total_cost_usd": 0.6235011,
+  "wall_clock_ms": 94751,
+  "errors": []
+}

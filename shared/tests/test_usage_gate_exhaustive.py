@@ -211,6 +211,145 @@ class TestCapDetectionPatterns:
         gate = make_gate(['a'])
         assert gate.detect_cap_hit('', 'RESOURCE_EXHAUSTED', backend='gemini') is True
 
+    # --- Realistic cap-hit smoke tests (verbatim Claude UI strings) ---
+
+    def test_realistic_cap_hit_out_of_extra_usage(self):
+        """Verbatim: 'You're out of extra usage for this billing period.'"""
+        gate = make_gate(['a'])
+        msg = "You're out of extra usage for this billing period. Your plan resets in 3 hours."
+        assert gate.detect_cap_hit('', msg) is True
+
+    def test_realistic_cap_hit_pro_plan_date_format(self):
+        """Verbatim: 'You've hit your usage limit for Claude Pro. Your plan resets on Apr 10, 9pm (UTC).'"""
+        gate = make_gate(['a'])
+        msg = "You've hit your usage limit for Claude Pro. Your plan resets on Apr 10, 9pm (UTC)."
+        assert gate.detect_cap_hit('', msg) is True
+
+    # --- Realistic near-cap smoke tests (verbatim Claude UI strings) ---
+
+    def test_realistic_near_cap_extra_compute_credits(self):
+        """Verbatim: 'You're now using extra compute credits. Your plan resets in 4h.'"""
+        gate = make_gate(['a'])
+        msg = "You're now using extra compute credits. Your plan resets in 4h."
+        assert gate.detect_cap_hit('', msg) is True
+
+    def test_realistic_near_cap_close_to_limit(self):
+        """Verbatim: 'You're close to reaching your usage limit. Your plan resets in 1h.'"""
+        gate = make_gate(['a'])
+        msg = "You're close to reaching your usage limit. Your plan resets in 1h."
+        assert gate.detect_cap_hit('', msg) is True
+
+    # --- Parametrized realistic cap messages (one per prefix) ---
+
+    @pytest.mark.parametrize('message,expected', [
+        # CAP_HIT_PREFIXES
+        (
+            "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours.",
+            True,
+        ),
+        (
+            "You've used all available credits. Upgrade for more capacity.",
+            True,
+        ),
+        (
+            "You're out of extra usage for this billing period. Your plan resets in 2h.",
+            True,
+        ),
+        # NEAR_CAP_PREFIXES
+        (
+            "You're close to reaching your plan limit. Your plan resets in 5h.",
+            True,
+        ),
+        (
+            "You're now using extra compute credits. Your plan resets in 1h.",
+            True,
+        ),
+    ], ids=[
+        'cap_hit_prefix_hit_your',
+        'cap_hit_prefix_used',
+        'cap_hit_prefix_out_of_extra',
+        'near_cap_prefix_close_to',
+        'near_cap_prefix_now_using_extra',
+    ])
+    def test_realistic_cap_messages(self, message, expected):
+        gate = make_gate(['a'])
+        assert gate.detect_cap_hit('', message) is expected
+
+
+# =========================================================================
+# TestNearCapStateDistinction
+# =========================================================================
+
+
+class TestNearCapStateDistinction:
+    """Behavioral tests that distinguish NEAR_CAP from CAP_HIT state transitions.
+
+    Step 4 (spec-first): test_near_cap_does_not_set_capped_true FAILS until
+    step-5 implementation adds _handle_near_cap_warning and near_cap field.
+    """
+
+    def test_near_cap_does_not_set_capped_true(self):
+        """NEAR_CAP message must NOT set acct.capped=True; must set acct.near_cap=True."""
+        gate = make_gate(['a'])
+        msg = "You're now using extra compute credits. Your plan resets in 4h."
+        result = gate.detect_cap_hit('', msg)
+        acct = gate._accounts[0]
+        assert result is True               # detection must still return True
+        assert acct.capped is False         # account is NOT blocked
+        assert acct.near_cap is True        # but the near-cap warning flag is set
+
+    def test_cap_hit_still_sets_capped_true(self):
+        """CAP_HIT message must still set acct.capped=True (existing behavior preserved)."""
+        gate = make_gate(['a'])
+        msg = "You've hit your usage limit. Your plan resets in 3h."
+        result = gate.detect_cap_hit('', msg)
+        acct = gate._accounts[0]
+        assert result is True
+        assert acct.capped is True
+
+    def test_near_cap_then_cap_hit_sets_capped(self):
+        """Near-cap followed by cap-hit on the same account sets capped=True, near_cap=False."""
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+
+        gate.detect_cap_hit('', "You're now using extra compute credits. Your plan resets in 4h.")
+        assert acct.near_cap is True
+        assert acct.capped is False
+
+        gate.detect_cap_hit('', "You've hit your usage limit. Your plan resets in 3h.")
+        assert acct.capped is True
+        assert acct.near_cap is False
+
+    def test_near_cap_does_not_close_gate(self):
+        """A single-account gate must remain open after a NEAR_CAP message."""
+        gate = make_gate(['a'])
+        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 1h.")
+        assert gate._open.is_set() is True
+
+    def test_near_cap_does_not_start_resume_probe(self):
+        """NEAR_CAP must NOT launch a resume probe task."""
+        gate = make_gate(['a'], wait_for_reset=True)
+        gate.detect_cap_hit('', "You're now using extra compute credits. Your plan resets in 4h.")
+        acct = gate._accounts[0]
+        assert acct.resume_task is None
+
+    def test_near_cap_fires_cost_event_with_cost_store(self):
+        """_handle_near_cap_warning must fire a cost event when cost_store is set."""
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['a'], cost_store=cost_store)
+        msg = "You're now using extra compute credits. Your plan resets in 4h."
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate.detect_cap_hit('', msg)
+        mock_fire.assert_called_once()
+
+    def test_near_cap_no_cost_event_without_cost_store(self):
+        """_handle_near_cap_warning must NOT fire a cost event when cost_store is None."""
+        gate = make_gate(['a'], cost_store=None)
+        msg = "You're now using extra compute credits. Your plan resets in 4h."
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate.detect_cap_hit('', msg)
+        mock_fire.assert_not_called()
+
 
 # =========================================================================
 # TestResetTimeParsing

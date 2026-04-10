@@ -1284,3 +1284,406 @@ class TestStagePayloadProjectIdGuideline:
 
         assert 'project_root="/home/leo/src/test_proj"' in payload
 
+
+class TestTaskKnowledgeSyncDeduplication:
+    """Module-introspection tests: task_knowledge_sync must not define symbols owned by task_filter."""
+
+    def test_no_local_status_priority(self):
+        """task_knowledge_sync must NOT define _STATUS_PRIORITY at module level.
+        task_filter._STATUS_PRIORITY is the single source of truth.
+        """
+        import fused_memory.reconciliation.stages.task_knowledge_sync as mod
+        assert not hasattr(mod, '_STATUS_PRIORITY'), (
+            'task_knowledge_sync._STATUS_PRIORITY must be removed after step-8; '
+            'import from task_filter instead'
+        )
+
+    def test_no_local_format_tasks(self):
+        """task_knowledge_sync must NOT define _format_tasks at module level.
+        Use task_filter._render_task_line / format_task_list instead.
+        """
+        import fused_memory.reconciliation.stages.task_knowledge_sync as mod
+        assert not hasattr(mod, '_format_tasks'), (
+            'task_knowledge_sync._format_tasks must be removed after step-8; '
+            'use task_filter.format_task_list instead'
+        )
+
+
+class TestTaskKnowledgeSyncUsesFilterTaskTree:
+    """Integration tests: assemble_payload delegates active-tree logic to filter_task_tree."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='test_project')
+
+    def _make_task(self, tid: int, status: str, title: str | None = None) -> dict:
+        return {
+            'id': tid,
+            'title': title or f'Task {tid} ({status})',
+            'status': status,
+            'dependencies': [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_payload_active_task_tree_uses_filter_task_tree(self, mock_deps, watermark):
+        """assemble_payload uses filter_task_tree: payload contains em-dash summary, 'shown'
+        parenthetical, blocked task, and deferred task in the Active Task Tree section."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'pending'),
+                self._make_task(2, 'in-progress'),
+                self._make_task(3, 'blocked', 'Blocked Task'),
+                self._make_task(4, 'deferred', 'Deferred Task'),
+                self._make_task(5, 'review'),
+                self._make_task(6, 'done'),
+                self._make_task(7, 'cancelled'),
+                self._make_task(8, 'done'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # (a) em-dash summary line produced by format_filtered_task_tree
+        assert '\u2014 omitted' in payload, (
+            'Payload missing em-dash summary line from format_filtered_task_tree'
+        )
+
+        # (b) 'shown' parenthetical from format_filtered_task_tree header
+        assert 'active shown' in payload, (
+            "Payload missing 'active shown' parenthetical from filter_task_tree header"
+        )
+
+        # (c) blocked task appears in the Active Task Tree section
+        assert 'Blocked Task' in payload, (
+            'Blocked task title not found in payload; active set may not have been widened'
+        )
+
+        # (d) deferred task appears in the Active Task Tree section
+        assert 'Deferred Task' in payload, (
+            'Deferred task title not found in payload; active set may not have been widened'
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_recently_completed_tasks_sorted_desc(self, mock_deps, watermark):
+        """assemble_payload sorts recently completed tasks by id descending."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'in-progress'),
+                self._make_task(5, 'done', 'Done Five'),
+                self._make_task(10, 'done', 'Done Ten'),
+                self._make_task(3, 'done', 'Done Three'),
+                self._make_task(8, 'done', 'Done Eight'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # (a) Recently Completed Tasks header present
+        assert '### Recently Completed Tasks' in payload, (
+            "Payload missing '### Recently Completed Tasks' header"
+        )
+
+        # (b) done tasks appear in descending id order: 10, 8, 5, 3
+        recently_idx = payload.index('### Recently Completed Tasks')
+        # Find the next section after Recently Completed
+        next_section_idx = payload.find('\n#', recently_idx + 1)
+        if next_section_idx == -1:
+            next_section_idx = len(payload)
+        section_text = payload[recently_idx:next_section_idx]
+
+        pos_10 = section_text.find('[10]')
+        pos_8 = section_text.find('[8]')
+        pos_5 = section_text.find('[5]')
+        pos_3 = section_text.find('[3]')
+
+        assert pos_10 != -1, "Done task id=10 not found in Recently Completed section"
+        assert pos_8 != -1, "Done task id=8 not found in Recently Completed section"
+        assert pos_5 != -1, "Done task id=5 not found in Recently Completed section"
+        assert pos_3 != -1, "Done task id=3 not found in Recently Completed section"
+
+        assert pos_10 < pos_8 < pos_5 < pos_3, (
+            f'Recently Completed Tasks not sorted by id desc. '
+            f'positions: [10]={pos_10}, [8]={pos_8}, [5]={pos_5}, [3]={pos_3}'
+        )
+
+
+# ── Tests for task 455: MemoryConsolidator filtered task tree injection ─────────
+
+
+class TestMemoryConsolidatorFilteredTaskTree:
+    """MemoryConsolidator includes/omits '### Active Task Tree' based on filtered_task_tree."""
+
+    @pytest.fixture
+    def mock_memory(self):
+        svc = AsyncMock()
+        svc.get_episodes = AsyncMock(return_value=[])
+        svc.get_status = AsyncMock(return_value={})
+        svc.mem0 = AsyncMock()
+        svc.mem0.get_all = AsyncMock(return_value={'results': []})
+        return svc
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='test_project')
+
+    def _make_active_tree(self, count: int = 3):
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+        active = [
+            {'id': i, 'title': f'Active task {i}', 'status': 'pending', 'dependencies': []}
+            for i in range(1, count + 1)
+        ]
+        return FilteredTaskTree(
+            active_tasks=active,
+            done_count=5,
+            cancelled_count=2,
+            other_count=0,
+            total_count=count + 7,
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_includes_active_task_tree_section_when_set(
+        self, mock_memory, watermark,
+    ):
+        """assemble_payload includes '### Active Task Tree' when filtered_task_tree is set."""
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator, mock_memory, None, AsyncMock(), AsyncMock(),
+        )
+        stage.project_id = 'test_project'
+        stage.episode_limit = 100
+        stage.memory_limit = 200
+        stage.filtered_task_tree = self._make_active_tree(3)
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Active Task Tree' in payload
+        assert 'Active task 1' in payload
+
+    @pytest.mark.asyncio
+    async def test_payload_omits_section_when_tree_none(self, mock_memory, watermark):
+        """assemble_payload does NOT include '### Active Task Tree' when filtered_task_tree is None."""
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator, mock_memory, None, AsyncMock(), AsyncMock(),
+        )
+        stage.project_id = 'test_project'
+        stage.episode_limit = 100
+        stage.memory_limit = 200
+        stage.filtered_task_tree = None
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Active Task Tree' not in payload
+
+    @pytest.mark.asyncio
+    async def test_format_assembled_payload_includes_tree_when_set(
+        self, mock_memory, watermark,
+    ):
+        """_format_assembled_payload includes '### Active Task Tree' when filtered_task_tree is set."""
+        from fused_memory.models.reconciliation import AssembledPayload
+
+        ap = AssembledPayload(
+            events=[],
+            context_items={},
+            total_tokens=0,
+            events_remaining=0,
+        )
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator, mock_memory, None, AsyncMock(), AsyncMock(),
+        )
+        stage.project_id = 'test_project'
+        stage.episode_limit = 100
+        stage.memory_limit = 200
+        stage.assembled_payload = ap
+        stage.filtered_task_tree = self._make_active_tree(2)
+
+        payload = await stage._format_assembled_payload(watermark)
+
+        assert '### Active Task Tree' in payload
+        assert 'Active task 1' in payload
+
+
+# ── Tests for task 455: TaskKnowledgeSync filtered task tree injection ─────────
+
+
+class TestTaskKnowledgeSyncFilteredTaskTree:
+    """TaskKnowledgeSync prefers harness-provided filtered_task_tree over self-fetch."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='test_project')
+
+    def _make_task(self, tid: int, status: str) -> dict:
+        return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': []}
+
+    def _make_tree(self, tasks: list[dict], done_count: int = 0, cancelled_count: int = 0,
+                   done_tasks: list[dict] | None = None):
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+        return FilteredTaskTree(
+            active_tasks=tasks,
+            done_tasks=done_tasks or [],
+            done_count=done_count,
+            cancelled_count=cancelled_count,
+            other_count=0,
+            total_count=len(tasks) + done_count + cancelled_count,
+        )
+
+    @pytest.mark.asyncio
+    async def test_uses_harness_filtered_tree_when_set(self, mock_deps, watermark):
+        """When filtered_task_tree is set, assemble_payload uses it and skips get_tasks."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        stage.filtered_task_tree = self._make_tree(
+            [self._make_task(10, 'in-progress'), self._make_task(20, 'pending')],
+            done_count=5,
+        )
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # get_tasks must NOT be called
+        mock_deps['taskmaster'].get_tasks.assert_not_called()
+        # Payload must contain the Active Task Tree section
+        assert '### Active Task Tree' in payload
+        assert 'Task 10' in payload
+        assert 'Task 20' in payload
+
+    @pytest.mark.asyncio
+    async def test_fallback_self_fetch_uses_shared_filter(self, mock_deps, watermark):
+        """When filtered_task_tree is None, fallback fetch includes blocked/deferred tasks."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        stage.filtered_task_tree = None  # no harness-provided tree
+
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'blocked'),
+                self._make_task(2, 'deferred'),
+                self._make_task(3, 'pending'),
+                self._make_task(4, 'done'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # Active section must include blocked and deferred tasks
+        assert '### Active Task Tree' in payload
+        assert 'Task 1' in payload
+        assert 'Task 2' in payload
+
+    @pytest.mark.asyncio
+    async def test_proactive_sample_derived_from_filtered_tree(self, mock_deps, watermark):
+        """With filtered_task_tree set, proactive sample is drawn from active_tasks, not a self-fetch."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        stage.filtered_task_tree = self._make_tree(
+            [
+                self._make_task(1, 'in-progress'),
+                self._make_task(2, 'blocked'),
+                self._make_task(3, 'pending'),
+                self._make_task(4, 'pending'),
+                self._make_task(5, 'pending'),
+                self._make_task(6, 'pending'),
+            ],
+            done_count=3,
+        )
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # get_tasks must NOT be called
+        mock_deps['taskmaster'].get_tasks.assert_not_called()
+        # Proactive Task Sample section must be present
+        assert '### Proactive Task Sample' in payload
+
+    @pytest.mark.asyncio
+    async def test_recently_completed_shows_done_tasks_from_harness_tree(
+        self, mock_deps, watermark,
+    ):
+        """When filtered_task_tree has done_tasks populated, Recently Completed renders them."""
+        done_task = self._make_task(99, 'done')
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        stage.filtered_task_tree = self._make_tree(
+            [self._make_task(10, 'in-progress')],
+            done_count=1,
+            done_tasks=[done_task],
+        )
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        mock_deps['taskmaster'].get_tasks.assert_not_called()
+        assert '### Recently Completed Tasks' in payload
+        # Done task title must appear in the recently completed section
+        assert 'Task 99' in payload
+
+    @pytest.mark.asyncio
+    async def test_recently_completed_shows_count_when_no_done_tasks_objects(
+        self, mock_deps, watermark,
+    ):
+        """When filtered_task_tree has done_count > 0 but done_tasks=[], show count summary."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        stage.filtered_task_tree = self._make_tree(
+            [self._make_task(10, 'in-progress')],
+            done_count=15,
+            # done_tasks deliberately omitted → empty list
+        )
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        mock_deps['taskmaster'].get_tasks.assert_not_called()
+        assert '### Recently Completed Tasks' in payload
+        # Must mention the done count (15) somewhere in the recently completed section
+        assert '15' in payload
+
+    @pytest.mark.asyncio
+    async def test_recently_completed_populated_on_fallback(self, mock_deps, watermark):
+        """When filtered_task_tree is None, fallback path populates recently completed tasks."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        stage.filtered_task_tree = None  # no harness-provided tree
+
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'done'),
+                self._make_task(2, 'done'),
+                self._make_task(3, 'done'),
+                self._make_task(4, 'pending'),
+                self._make_task(5, 'in-progress'),
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Recently Completed Tasks' in payload
+        # At least one done task title must appear
+        assert 'Task 1' in payload or 'Task 2' in payload or 'Task 3' in payload

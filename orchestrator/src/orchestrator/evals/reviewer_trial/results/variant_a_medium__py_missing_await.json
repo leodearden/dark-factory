@@ -1,0 +1,58 @@
+{
+  "variant_name": "variant_a_medium",
+  "diff_id": "py_missing_await",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:94",
+          "category": "robustness/async-correctness",
+          "description": "The diff removes `await` from `run_verification(worktree, workflow.config)`, but `run_verification` in orchestrator/src/orchestrator/verify.py:188 is still defined as `async def run_verification(...)` and every other call site in verify.py (lines 289, 296, 333, 344, 347) still awaits it. As a result, `verify` is now a coroutine object, not a `VerifyResult`. The very next access, `verify.passed` (line 112), will raise `AttributeError: 'coroutine' object has no attribute 'passed'` at runtime, and Python will emit a `RuntimeWarning: coroutine 'run_verification' was never awaited`. The added log statement (line ~114) also dereferences `.passed`, `.lint_output`, `.type_output` on the coroutine and will fail first. Because `collect_metrics` is wrapped in a try/except in runner.py:244\u2013246, eval runs will silently lose all tests/lint/types/verification signal in metrics \u2014 exactly the opposite of the stated intent of the logging addition.",
+          "suggested_fix": "Restore the `await`: `verify = await run_verification(worktree, workflow.config)`. If the goal was to drop the async, first convert `run_verification` (and all its internal `await _run_cmd(...)` / `asyncio.gather` usages) to sync, and update all five other call sites \u2014 but that is a much larger refactor and almost certainly not desired for a 'collect metrics' path that already runs in an async workflow."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:111-117 (new log block)",
+          "category": "code_reuse/duplication",
+          "description": "The log line re-derives `not verify.lint_output` and `not verify.type_output`, duplicating the exact expressions used two lines later to populate `m.lint_clean` / `m.typecheck_clean`. This invites drift if those semantics change.",
+          "suggested_fix": "Move the log statement to after `m = EvalMetrics(...)` and log the already-computed fields: `logger.info('Metrics for task %s: tests=%s lint=%s types=%s plan=%.1f%%', task.get('id', '?'), m.tests_pass, m.lint_clean, m.typecheck_clean, m.plan_completion_pct * 100)`. That also naturally sidesteps the dead `if verify else 'N/A'` branch (see next issue)."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:111-117 (new log block)",
+          "category": "dead_code",
+          "description": "The `verify.passed if verify else 'N/A'` ternary has an unreachable else branch: `run_verification` in verify.py always returns a `VerifyResult` (it never returns `None`), so `verify` is always truthy. This mirrors an existing pattern on lines 112\u2013114 that is also effectively dead, but the new logging adds a third copy. It's misleading to readers because it implies verification can legitimately be missing.",
+          "suggested_fix": "Drop the `if verify else ...` guard entirely once the `await` is restored, since the postcondition of `run_verification` guarantees a `VerifyResult`. Apply this to the existing lines 112\u2013114 at the same time (optional cleanup)."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:80 (`# noqa: C901`)",
+          "category": "architecture/maintainability",
+          "description": "Adding `# noqa: C901` silences the cyclomatic-complexity lint without addressing it. The function is already mixing: plan parsing, verification re-run, review aggregation, git stats, throughput computation, and construction. Suppressing the warning in the same commit that adds more inline logging nudges the function further over the threshold.",
+          "suggested_fix": "Extract cohesive helpers (e.g. `_compute_plan_completion(workflow)`, `_compute_throughput(wf_metrics, config)`) so the noqa is unnecessary. At minimum, include a short comment explaining why the suppression is tolerated for now and link to a follow-up task."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/tests (missing test for orchestrator/src/orchestrator/evals/metrics.py::collect_metrics)",
+          "category": "test_coverage",
+          "description": "There are zero tests that exercise `collect_metrics` (grep of the orchestrator tree finds it only in metrics.py and runner.py). That is precisely why the await-removal bug above is not caught by the test suite: a single test that monkeypatches `run_verification` to return a fake `VerifyResult` and asserts the resulting `EvalMetrics.tests_pass` / `lint_clean` / `typecheck_clean` would have failed immediately when the `await` was dropped. df_task_12 already tracks adding tests for `verify.py`; a companion test for `collect_metrics` is appropriate.",
+          "suggested_fix": "Add `orchestrator/tests/test_metrics.py` with at least: (1) happy path with stubbed workflow, artifacts, and `run_verification` returning a passing `VerifyResult`; (2) failing verification produces `tests_pass=False` and correct `lint_clean` / `typecheck_clean`; (3) empty plan yields `plan_completion=0.0` without divide-by-zero. Patch `orchestrator.verify.run_verification` via `monkeypatch` to avoid running real subprocesses."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:93-94",
+          "category": "performance",
+          "description": "`collect_metrics` re-invokes `run_verification` on the worktree after the workflow has already completed its own verification passes. This is an extra full run of tests + lint + typecheck per evaluated task (already true before this diff, but the newly added log makes it more visible). On slow suites this doubles wall-clock eval time and can mask flakes as real regressions. Not introduced by this diff, so non-blocking \u2014 but worth a TODO.",
+          "suggested_fix": "If the workflow already stores its last `VerifyResult` on `workflow.artifacts` or `workflow.metrics`, read it from there instead of re-running. Otherwise, add a cached `_last_verify` attribute on `TaskWorkflow` that `collect_metrics` can prefer."
+        }
+      ],
+      "summary": "This diff contains a blocking async-correctness bug: it removes `await` from the call to `run_verification` on metrics.py:94, but that function is still `async def` in verify.py (line 188), and every other call site in verify.py still awaits it. `verify` becomes a coroutine object, so the immediately following `verify.passed`, `verify.lint_output`, `verify.type_output` accesses \u2014 including those in the newly added log statement \u2014 will raise `AttributeError` at runtime. Because `collect_metrics` is wrapped in a broad try/except in runner.py:244\u2013246, this will fail silently and every eval run will lose its tests/lint/types signal \u2014 exactly the opposite of the diff's stated goal of improving eval-failure debuggability. Restore the `await` (or, if a sync conversion was intended, convert `run_verification` and update all five other call sites). Separately, the new log re-derives `not verify.lint_output` / `not verify.type_output` which duplicates logic used two lines later when constructing `EvalMetrics` \u2014 logging the already-built `m` instead would be cleaner. The `# noqa: C901` just silences the complexity lint; the underlying function mixes plan/verify/review/git/throughput concerns and would benefit from extraction. Finally, `collect_metrics` has no unit tests anywhere in the orchestrator tree \u2014 a single test with a stubbed `run_verification` would have caught the blocker immediately."
+    }
+  },
+  "total_cost_usd": 0.53555475,
+  "wall_clock_ms": 136127,
+  "errors": []
+}

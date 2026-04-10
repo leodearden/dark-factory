@@ -1,0 +1,72 @@
+{
+  "variant_name": "variant_a_max",
+  "diff_id": "rs_off_by_one",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:472",
+          "category": "robustness/off_by_one_panic",
+          "description": "The loop bound changed from `0..n` to `0..=n`, so when `i == n` the body accesses `params[i]` (length n) and `vertex[i]` (length n), producing an out-of-bounds panic at runtime whenever `build_simplex` is called. This is a guaranteed runtime crash for every solver invocation, not just an edge case.",
+          "suggested_fix": "Revert the loop to `for i in 0..n`. A simplex in N-dimensional Nelder-Mead must have exactly N+1 vertices (1 initial + N perturbations), which is what the original loop produced."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:467",
+          "category": "api_contract/compile_error",
+          "description": "`build_simplex` gained a new required `scale: f64` parameter, but none of the existing call sites were updated. This is a compile error: `src/solver.rs:568` (the production caller inside the Nelder-Mead setup) and the unit tests at `src/solver.rs:2171`, `:2190`, `:2215` all still call `build_simplex(initial, &params)` with two arguments.",
+          "suggested_fix": "Either (a) give `scale` a default by making the public function call an inner helper with a constant 0.1 to preserve behavior, or (b) update every call site to pass `scale` explicitly (e.g., `build_simplex(initial, &problem.auto_params, 0.1)` and the three test calls)."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:2158-2217",
+          "category": "test_failure/broken_invariant",
+          "description": "The existing test `simplex_has_n_plus_1_vertices` asserts that `build_simplex` returns exactly N+1 vertices for N=1,2,3. With the `0..=n` loop the function would (if it didn't panic first) return N+2 vertices, so this test must fail. The integration test `multi_param_warm_start_with_objective` (tests/solver_integration.rs:1078) also documents the 3+1 vertex contract. No test in the diff was updated or added to cover the new behavior.",
+          "suggested_fix": "Fix the loop bound. The existing test suite is correct about the Nelder-Mead contract \u2014 do not weaken it."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:568",
+          "category": "architecture/broken_wiring",
+          "description": "The sole production caller of `build_simplex` passes the result directly into `NelderMead::new(simplex)`. argmin's Nelder-Mead implementation requires exactly `n+1` vertices for an `n`-parameter problem; feeding it a simplex of the wrong cardinality will either error out or produce undefined behavior. Combined with the off-by-one bug above, every solver call would panic or return `SolveResult::NoProgress`, regressing M3 auto-resolution entirely.",
+          "suggested_fix": "Once the off-by-one is fixed, re-run `cargo test -p reify-constraints` to confirm the Nelder-Mead solver still converges on the integration suite."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:478-482",
+          "category": "dead_code",
+          "description": "`validate_simplex` is introduced but never called anywhere in the workspace (verified via grep \u2014 zero references outside the definition itself). In a workspace that treats `#![deny(dead_code)]` / `-D warnings` as CI-blocking, this will fail the build. Even setting lint policy aside, adding an unused helper is the over-engineering pattern called out in `feedback_no_throwaway.md`.",
+          "suggested_fix": "Either delete `validate_simplex`, or actually wire it in at the call site (e.g., `debug_assert!(validate_simplex(&simplex, problem.auto_params.len()))` in `run_solver` after building the simplex). If you wire it in, note that its current predicate (`len() == n + 1`) would contradict the new `0..=n` loop \u2014 another reason the loop change is wrong."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs:463-466",
+          "category": "documentation/stale_comment",
+          "description": "The doc comment still says \"Creates N+1 vertices: the initial point plus N perturbations,\" but the new loop (if it didn't panic) would create N+2 vertices. After fixing the loop bound this becomes a non-issue; if the intent really were to create N+2, the doc would need updating and so would every caller's expectations.",
+          "suggested_fix": "Keep the N+1 doc and revert the loop; alternatively, if a different cardinality is genuinely desired, update the doc, the capacity hint (`Vec::with_capacity(n + 1)`), the existing `simplex_has_n_plus_1_vertices` test, and the Nelder-Mead caller."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs:467",
+          "category": "robustness/input_validation",
+          "description": "The new `scale` parameter is unvalidated. A caller passing `0.0` produces a degenerate simplex (all perturbed vertices coincide with `initial` after clamping), which silently breaks Nelder-Mead convergence without an error. Negative or NaN values are similarly unguarded.",
+          "suggested_fix": "Either constrain the type (e.g., accept only positive finite scales and `debug_assert!(scale.is_finite() && scale > 0.0)`) or document the precondition and keep a single internal constant (0.1) rather than exposing the knob until a caller actually needs it. If no caller needs it yet, don't add the parameter \u2014 YAGNI."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs:467",
+          "category": "test_coverage/missing",
+          "description": "No tests cover the new `scale` parameter or `validate_simplex`. The only existing tests check vertex count, not perturbation magnitude, so the behavioral change of swapping `0.1` for a parameter is completely unverified.",
+          "suggested_fix": "Add a unit test that asserts each perturbed vertex differs from `initial` by `(hi - lo) * scale` in exactly one dimension, and a test for `validate_simplex` covering (a) correct N+1 shape, (b) wrong outer length, (c) wrong inner length."
+        }
+      ],
+      "summary": "This diff is not shippable. The change to `for i in 0..=n` causes a guaranteed out-of-bounds panic on `params[i]`/`vertex[i]` when `i == n`, and the new required `scale` parameter breaks four existing call sites (one production, three tests) without updating any of them \u2014 the crate will not even compile. Even if those were fixed, the new loop would produce N+2 vertices, violating the Nelder-Mead contract and the existing `simplex_has_n_plus_1_vertices` test. On top of the correctness bugs, `validate_simplex` is dead code (and its own predicate contradicts the new build logic), the doc comment is now stale, the `scale` parameter is unvalidated, and there are no tests for either addition. Revert the loop change, either drop `scale` or thread it through every caller with validation, and either remove or actually wire in `validate_simplex`."
+    }
+  },
+  "total_cost_usd": 0.4739175000000001,
+  "wall_clock_ms": 131190,
+  "errors": []
+}

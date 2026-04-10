@@ -31,13 +31,13 @@ from dashboard.data.burndown import (
 )
 from dashboard.data.chart_utils import ChartData, group_top_n
 from dashboard.data.costs import (
-    get_account_events,
-    get_cost_by_account,
-    get_cost_by_project,
-    get_cost_by_role,
-    get_cost_summary,
-    get_cost_trend,
-    get_run_cost_breakdown,
+    aggregate_account_events,
+    aggregate_cost_by_account,
+    aggregate_cost_by_project,
+    aggregate_cost_by_role,
+    aggregate_cost_summary,
+    aggregate_cost_trend,
+    aggregate_run_cost_breakdown,
 )
 from dashboard.data.db import DbPool
 from dashboard.data.orchestrator import discover_orchestrators
@@ -537,15 +537,26 @@ async def partials_performance(request: Request):
 # Costs partials
 # ---------------------------------------------------------------------------
 
+
+async def _cost_dbs(config: DashboardConfig, pool: DbPool) -> list[aiosqlite.Connection | None]:
+    """Collect DB connections for all known project runs.db files."""
+    paths = [config.runs_db]
+    for root in config.known_project_roots:
+        p = root / 'data' / 'orchestrator' / 'runs.db'
+        if p.resolve() != config.runs_db.resolve():
+            paths.append(p)
+    return [await pool.get(p) for p in paths]
+
+
 @app.get('/costs/partials/summary')
 async def costs_partials_summary(request: Request):
     """Cost summary: 4 metric cards aggregated across all projects."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
+    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     try:
-        summary = await get_cost_summary(db, days=days)
+        summary = await aggregate_cost_summary(dbs, days=days)
     except Exception as exc:
         logger.warning('Error fetching cost summary: %s', exc)
         summary = {}
@@ -560,10 +571,10 @@ async def costs_partials_by_project(request: Request):
     """Cost by project: horizontal stacked bar chart."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
+    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     try:
-        by_project = await get_cost_by_project(db, days=days)
+        by_project = await aggregate_cost_by_project(dbs, days=days)
     except Exception as exc:
         logger.warning('Error fetching cost by project: %s', exc)
         by_project = {}
@@ -578,10 +589,10 @@ async def costs_partials_by_account(request: Request):
     """Cost by account: doughnut chart + table."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
+    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     try:
-        by_account = await get_cost_by_account(db, days=days)
+        by_account = await aggregate_cost_by_account(dbs, days=days)
     except Exception as exc:
         logger.warning('Error fetching cost by account: %s', exc)
         by_account = {}
@@ -596,10 +607,10 @@ async def costs_partials_by_role(request: Request):
     """Cost by role: horizontal stacked bar chart."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
+    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     try:
-        by_role = await get_cost_by_role(db, days=days)
+        by_role = await aggregate_cost_by_role(dbs, days=days)
     except Exception as exc:
         logger.warning('Error fetching cost by role: %s', exc)
         by_role = {}
@@ -614,10 +625,10 @@ async def costs_partials_trend(request: Request):
     """Cost trend: daily line chart."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
+    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     try:
-        trend = await get_cost_trend(db, days=days)
+        trend = await aggregate_cost_trend(dbs, days=days)
     except Exception as exc:
         logger.warning('Error fetching cost trend: %s', exc)
         trend = {}
@@ -632,10 +643,10 @@ async def costs_partials_events(request: Request):
     """Account events feed."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
+    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     try:
-        events = await get_account_events(db, days=days)
+        events = await aggregate_account_events(dbs, days=days)
     except Exception as exc:
         logger.warning('Error fetching account events: %s', exc)
         events = []
@@ -650,10 +661,10 @@ async def costs_partials_runs(request: Request):
     """Run cost breakdown: expandable drilldown table."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
+    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     try:
-        runs = await get_run_cost_breakdown(db, days=days)
+        runs = await aggregate_run_cost_breakdown(dbs, days=days)
     except Exception as exc:
         logger.warning('Error fetching run cost breakdown: %s', exc)
         runs = []

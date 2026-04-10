@@ -140,7 +140,7 @@ class TestCollectSnapshot:
         assert len(rows) == 1
         row = rows[0]
         # row: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
-        assert row[1] == str(config.project_root.resolve())  # project_id
+        assert row[1] == str(config.project_root)  # project_id
         assert row[3] == 1   # pending
         assert row[4] == 1   # in_progress
         assert row[5] == 0   # blocked
@@ -241,12 +241,12 @@ class TestCollectSnapshot:
         # row: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
         assert len(rows) == 3
         by_project = {row[1]: row for row in rows}
-        assert str(base_config.project_root.resolve()) in by_project
+        assert str(base_config.project_root) in by_project
         assert str(reify_root.resolve()) in by_project
         assert str(autopilot_root.resolve()) in by_project
 
         # main project: 1 pending task
-        main_row = by_project[str(base_config.project_root.resolve())]
+        main_row = by_project[str(base_config.project_root)]
         assert main_row[3] == 1  # pending
         assert main_row[4] == 0  # in_progress
         assert main_row[5] == 0  # blocked
@@ -435,7 +435,7 @@ class TestCollectSnapshot:
 
         assert len(rows) == 2
         ids = {row[1] for row in rows}
-        assert str(config.project_root.resolve()) in ids  # main project
+        assert str(config.project_root) in ids  # main project
         assert str(reify_root) in ids            # config-discovered project
         # Check reify row counts
         reify_row = next(r for r in rows if r[1] == str(reify_root))

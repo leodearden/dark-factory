@@ -1,11 +1,13 @@
 """Tests for the LLM-as-judge module (judge.py)."""
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.reconciliation import JudgeVerdict, VerdictSeverity
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
@@ -216,7 +218,6 @@ async def test_build_review_prompt_handles_error_dict_entries(mock_journal):
     and during stale-run recovery.  Without the isinstance guard those dicts
     raise AttributeError because they lack .items_flagged / .stats etc.
     """
-    from datetime import UTC, datetime
 
     from fused_memory.models.reconciliation import (
         ReconciliationRun,
@@ -417,12 +418,10 @@ async def test_judge_call_llm_openai_none_content(mock_journal):
 
 def _make_verdicts(severities: list[str]):
     """Build a list of JudgeVerdict objects from severity strings."""
-    from datetime import datetime, timezone
-    from fused_memory.models.reconciliation import JudgeVerdict, VerdictSeverity
     return [
         JudgeVerdict(
             run_id=f'run-{i}',
-            reviewed_at=datetime.now(tz=timezone.utc),
+            reviewed_at=datetime.now(tz=UTC),
             severity=VerdictSeverity(s),
         )
         for i, s in enumerate(severities)

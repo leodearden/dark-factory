@@ -1,0 +1,55 @@
+diff --git a/crates/reify-runtime/src/mesh_export.rs b/crates/reify-runtime/src/mesh_export.rs
+index abc1234..def5678 100644
+--- a/crates/reify-runtime/src/mesh_export.rs
++++ b/crates/reify-runtime/src/mesh_export.rs
+@@ -1,6 +1,7 @@
+ use std::fs::File;
+-use std::io::BufWriter;
++use std::io::{BufWriter, Write};
+ use std::path::Path;
++use std::os::unix::io::FromRawFd;
+
+ use anyhow::{Context, Result};
+ use reify_kernel_occt::Mesh;
+@@ -42,6 +43,38 @@ pub fn export_stl(mesh: &Mesh, path: &Path) -> Result<()> {
+     Ok(())
+ }
+
++/// Export mesh to a temporary file descriptor for streaming to a client.
++///
++/// Returns the raw fd that the caller can pass to a socket send operation.
++/// The caller is responsible for closing the fd when done.
++pub fn export_stl_to_fd(mesh: &Mesh, fd: i32) -> Result<usize> {
++    // SAFETY: caller guarantees fd is valid and open
++    let file = unsafe { File::from_raw_fd(fd) };
++    let mut writer = BufWriter::new(file);
++
++    let vertices = mesh.vertices();
++    let triangles = mesh.triangles();
++
++    // STL binary header (80 bytes + triangle count)
++    let header = [0u8; 80];
++    writer.write_all(&header)?;
++    let tri_count = (triangles.len() / 3) as u32;
++    writer.write_all(&tri_count.to_le_bytes())?;
++
++    let mut bytes_written: usize = 84;
++    for tri in triangles.chunks(3) {
++        // Normal placeholder (0,0,0) — viewer will recompute
++        writer.write_all(&[0u8; 12])?;
++        for &idx in tri {
++            let v = &vertices[idx as usize];
++            writer.write_all(&(v.x as f32).to_le_bytes())?;
++            writer.write_all(&(v.y as f32).to_le_bytes())?;
++            writer.write_all(&(v.z as f32).to_le_bytes())?;
++        }
++        // Attribute byte count
++        writer.write_all(&0u16.to_le_bytes())?;
++        bytes_written += 50;
++    }
++
++    writer.flush()?;
++    // BufWriter drops here, which drops the inner File, which closes the fd.
++    // But the caller expects the fd to remain open for further operations.
++    Ok(bytes_written)
++}

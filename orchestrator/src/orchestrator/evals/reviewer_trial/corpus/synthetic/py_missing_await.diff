@@ -1,0 +1,38 @@
+diff --git a/orchestrator/src/orchestrator/evals/metrics.py b/orchestrator/src/orchestrator/evals/metrics.py
+index abc1234..def5678 100644
+--- a/orchestrator/src/orchestrator/evals/metrics.py
++++ b/orchestrator/src/orchestrator/evals/metrics.py
+@@ -77,7 +77,7 @@ async def collect_metrics(
+     workflow: TaskWorkflow,
+     worktree: Path,
+     task: dict,
+-) -> EvalMetrics:
++) -> EvalMetrics:  # noqa: C901
+     """Collect metrics from a completed workflow run."""
+     wf_metrics = workflow.metrics
+
+@@ -91,7 +91,7 @@ async def collect_metrics(
+
+     # Verification results (re-read from last run)
+     from orchestrator.verify import run_verification
+-    verify = await run_verification(worktree, workflow.config)
++    verify = run_verification(worktree, workflow.config)
+
+     # Review stats from artifacts
+     reviews = workflow.artifacts.aggregate_reviews() if workflow.artifacts else None
+@@ -108,6 +108,14 @@ async def collect_metrics(
+     tps = wf_metrics.total_output_tokens / duration_secs if duration_secs > 0 else 0.0
+     is_local = bool(workflow.config.env_overrides.get('ANTHROPIC_BASE_URL'))
+
++    # Log key verification results for debugging eval failures
++    logger.info(
++        'Metrics for task %s: tests=%s lint=%s types=%s plan=%.1f%%',
++        task.get('id', '?'),
++        verify.passed if verify else 'N/A',
++        not verify.lint_output if verify else 'N/A',
++        not verify.type_output if verify else 'N/A',
++        plan_completion * 100,
++    )
+     m = EvalMetrics(
+         tests_pass=verify.passed if verify else False,
+         lint_clean=(not verify.lint_output) if verify else False,

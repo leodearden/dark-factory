@@ -1,0 +1,65 @@
+{
+  "variant_name": "variant_a_medium",
+  "diff_id": "py_swapped_args",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/git_ops.py:431",
+          "category": "correctness/argument_order_bug",
+          "description": "The git diff arguments were swapped from [from_sha, to_sha] to [to_sha, from_sha]. `git diff A B` and `git diff B A` are NOT symmetric once a diff-filter is applied: 'Added' (A) and 'Deleted' (D) statuses swap meaning. Combined with the new --diff-filter=ACMR default, this means files that were *added* to main between from_sha and to_sha are now classified as 'D' in the reversed diff and get filtered out of the result. The only in-tree caller, workflow.py:_inter_iteration_rebase (workflow.py:862-864), calls `get_changed_files(old_base, current_main)` expecting 'files changed on main' for the rebase log and `files_changed_on_main` artifact. After this change, newly added files on main silently disappear from that list, which corrupts rebase conflict reasoning and the iteration log. The previous behavior (no filter, forward direction) returned all changed files.",
+          "suggested_fix": "Either (a) keep the original argument order [from_sha, to_sha] and apply the filter in the forward direction, or (b) if reverse-direction semantics are intentionally desired for rollback, introduce a separate method (e.g., get_files_removed_by_rollback) rather than silently flipping the default behavior of get_changed_files. For the default path used by _inter_iteration_rebase, emit: ['git', 'diff', '--name-only', from_sha, to_sha] (no filter), matching the pre-change behavior."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/git_ops.py:428-434",
+          "category": "api_contract/silent_behavior_change",
+          "description": "The default behavior of a public method changed without any caller updates. The previous implementation returned *all* files touched between the two SHAs (including deletions). The new default (include_deleted=False) filters deletions. workflow.py:862 does not opt in to include_deleted=True, so its artifact `files_changed_on_main` and the iteration log summary now under-report changes on main whenever files were deleted there. This is a silent semantic regression to an existing caller.",
+          "suggested_fix": "Either preserve the original default (no filter) and have rollback callers opt into filtering, or update workflow.py:_inter_iteration_rebase to pass include_deleted=True so that its 'files changed on main' count remains accurate. Add a docstring note explicitly describing what include_deleted=False excludes."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py:436-449",
+          "category": "code_reuse/dead_code",
+          "description": "`get_diff_stats` has zero callers in the repository (confirmed via grep across orchestrator/). Adding a public method with no consumer is speculative generality / over-engineering, and it has no test coverage to lock in behavior. If a follow-up task needs this, add it there with the caller in the same PR.",
+          "suggested_fix": "Remove get_diff_stats until a caller exists, or add the caller in this diff along with a unit test that exercises it."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py:440-449",
+          "category": "error_handling/silent_failure",
+          "description": "get_diff_stats ignores the return code from `_run` and discards stderr. If `git diff --shortstat` fails (bad SHA, repo corruption, lock contention), the function silently returns {'insertions': 0, 'deletions': 0}, which is indistinguishable from 'no changes'. Every other method in this file that consults `_run` either checks rc or tolerates failure explicitly with a comment.",
+          "suggested_fix": "Capture rc and on rc != 0 either raise (matches get_main_sha's implicit assumption) or log a warning and return a sentinel. At minimum: `rc, output, err = await _run(...)` and `if rc != 0: logger.warning(f'get_diff_stats failed: {err}'); return stats`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py:445-448",
+          "category": "robustness/parsing",
+          "description": "`int(part.split()[0])` will raise ValueError if git output ever contains a non-numeric leading token in a part matching 'insertion'/'deletion' (unlikely but not impossible across git versions/locales). It also assumes the C locale; with LANG=fr_FR git may emit localized words that don't contain 'insertion'/'deletion'. The orchestrator already sets LANG elsewhere in some paths but not consistently.",
+          "suggested_fix": "Wrap the parse in try/except ValueError and log-and-skip on failure, or force the environment to `LC_ALL=C` when running the command. A regex like `re.search(r'(\\d+)\\s+insertion', output)` is more robust than split-and-index."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/tests (absent)",
+          "category": "test_coverage",
+          "description": "Neither the modified get_changed_files nor the new get_diff_stats has a unit or integration test. Given the subtle direction+filter interaction in get_changed_files, this is exactly the kind of change that should ship with a test \u2014 ideally a real-git temp-repo test that creates an add, a modify, and a delete between two commits and asserts the result for both include_deleted values. A mock-based test that asserts the exact argv passed to `_run` would also have caught the swapped arg order before merge.",
+          "suggested_fix": "Add a pytest that (1) creates a temp git repo, (2) commits an initial file set, (3) adds one file, modifies one, deletes one, (4) calls get_changed_files with include_deleted=False and True, and asserts the returned lists. Add a second test that monkeypatches `_run` and asserts the exact git argv."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/git_ops.py:428-434",
+          "category": "design/api_shape",
+          "description": "A boolean flag that materially changes diff direction semantics (not just filter scope) is a design smell. Callers reading `get_changed_files(old, new, include_deleted=True)` will reasonably assume they get the forward diff A|C|M|R|D between old and new \u2014 not a reverse-direction diff. Either keep direction forward and only toggle the filter, or split into two clearly-named methods.",
+          "suggested_fix": "Keep the forward direction unconditionally: `['git', 'diff', '--name-only', diff_filter, from_sha, to_sha]`. The filter alone is sufficient to express 'include deletions or not' in the forward direction."
+        }
+      ],
+      "summary": "The diff introduces a blocking correctness regression in get_changed_files: the git diff arguments were swapped (to_sha, from_sha) and a --diff-filter=ACMR default was added. Together these silently exclude files *added* on main between the two SHAs from the result, breaking the only in-tree caller (workflow.py:_inter_iteration_rebase) which uses the list to populate `files_changed_on_main` in rebase artifacts and logs. The default behavior changed without updating the caller, so this is a silent semantic regression of an existing API contract. The new get_diff_stats helper is unused (no callers), swallows git failures by ignoring the return code, and uses fragile locale-sensitive parsing. No tests accompany either change \u2014 an argv-level mock test would have caught the argument swap immediately. Recommended fixes: restore forward-direction args in get_changed_files, either drop the default-filter change or update the workflow caller to opt in, harden or remove get_diff_stats, and add unit tests."
+    }
+  },
+  "total_cost_usd": 0.5373565,
+  "wall_clock_ms": 139429,
+  "errors": []
+}

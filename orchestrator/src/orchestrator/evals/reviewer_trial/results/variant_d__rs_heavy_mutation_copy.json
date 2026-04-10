@@ -1,0 +1,72 @@
+{
+  "variant_name": "variant_d",
+  "diff_id": "rs_heavy_mutation_copy",
+  "reviews": {
+    "sonnet_test_analyst": {
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs (create_solution_map, new function)",
+          "category": "missing_tests",
+          "description": "create_solution_map has zero tests, while the functionally identical build_solved_values has four dedicated unit tests covering: normal multi-param construction, empty params returning an empty map, dimensionless param types, and a #[should_panic] test for the length-mismatch assert. The new function introduces an assert_eq! that will panic at runtime on mismatched slice lengths \u2014 the exact failure mode covered by build_solved_values's 'panics_on_length_mismatch' test \u2014 but that branch is completely untested here.",
+          "suggested_fix": "Add a parallel test module for create_solution_map mirroring the four existing build_solved_values tests: (1) correct HashMap construction with mixed dimension types, (2) empty slices return empty map, (3) dimensionless param type, (4) #[should_panic] for differing slice lengths. If create_solution_map is intended to replace build_solved_values, migrate and rename the existing tests instead of duplicating them."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs (create_solution_map vs build_solved_values)",
+          "category": "untested_duplicate_logic",
+          "description": "create_solution_map is a line-for-line duplicate of build_solved_values (same assert, same zip/map/collect, same Value::Scalar construction). The diff does not include any call site for create_solution_map, so it is currently dead code. Untested dead code carries no coverage value and risks diverging silently from build_solved_values if either is changed later.",
+          "suggested_fix": "Either (a) delete create_solution_map and consolidate on build_solved_values with its existing tests, or (b) include the call sites in this diff and add tests that exercise create_solution_map through those paths so coverage is meaningful."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs (create_solution_map)",
+          "category": "edge_case_not_tested",
+          "description": "Neither the new function nor its tests (absent here) cover a param whose param_type is not Type::Scalar \u2014 dimension_of returns DimensionVector::DIMENSIONLESS for non-Scalar types. build_solved_values has a 'dimensionless_type' test covering this branch. create_solution_map omits it entirely.",
+          "suggested_fix": "Add a test that passes an AutoParam whose param_type is not Type::Scalar and asserts the resulting Value::Scalar carries DimensionVector::DIMENSIONLESS, matching the coverage already present for build_solved_values."
+        }
+      ],
+      "reviewer": "sonnet_test_analyst",
+      "verdict": "ISSUES_FOUND",
+      "summary": "The diff introduces create_solution_map, which is a functionally identical duplicate of the existing build_solved_values. The critical problem from a test-coverage standpoint is that build_solved_values ships with four unit tests (normal construction, empty input, dimensionless type, and a #[should_panic] for the length-mismatch assert_eq!), while create_solution_map ships with none. The assert_eq! panic path is the most dangerous gap: it is an explicit runtime failure mode that is tested on the original function but completely untested on the new one. Additionally, no call site for create_solution_map appears in the diff, making it dead code \u2014 untested dead code provides no coverage value and is liable to drift silently. The blocking issue is the absent tests for new code that duplicates already-tested logic; the suggestions address the broader duplication concern and the missing dimensionless-type edge-case test."
+    },
+    "sonnet_bug_hunter": {
+      "reviewer": "sonnet_bug_hunter",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:72-100",
+          "category": "dead_code",
+          "description": "`create_solution_map` is defined but never called anywhere in the codebase. As a private `fn` with no callers, the Rust compiler will emit a `dead_code` warning. If the crate (or workspace) has `#![deny(warnings)]` or an equivalent lint configuration\u2014common in production Rust projects\u2014this will be a compile error. Even without that, the diff is incomplete: a function added with no callsite means the intended refactor or new code path was not wired up.",
+          "suggested_fix": "Either (a) add the callsite(s) that replace the existing invocations of `build_solved_values` with `create_solution_map`, or (b) remove the new function entirely. If this function is truly meant to replace `build_solved_values`, migrate all four call-sites in solver.rs (lines ~537, ~662, ~697, and the test helpers) and delete the original."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-constraints/src/solver.rs:72-100",
+          "category": "duplicate_logic",
+          "description": "`create_solution_map` is functionally identical to the existing `build_solved_values` (same `assert_eq!` guard, same `zip`/`map`/`collect` pipeline, same `Value::Scalar` construction via `dimension_of`). The only differences are the parameter names. Maintaining two copies of this logic is a maintenance liability: future changes to the mapping (e.g. handling non-Scalar types, changing the dimension fallback) must be applied twice.",
+          "suggested_fix": "Consolidate to a single function. If the new naming (`specifications`/`solution_values`) is preferred for clarity, rename the existing `build_solved_values` and its call-sites instead of introducing a duplicate."
+        }
+      ],
+      "summary": "The diff introduces `create_solution_map`, a private helper that is semantically identical to the pre-existing `build_solved_values` but is never called anywhere in the codebase. This is dead code that will produce at minimum a compiler warning and, if the workspace enforces `deny(warnings)`, a compile failure. The diff appears to be an incomplete refactor: the new function was defined but its call-sites were not wired up (or `build_solved_values` was not removed). No new logic errors are introduced\u2014the assert/zip/map pattern is correct and consistent with the existing function\u2014but the incomplete state of the change is a blocking concern."
+    },
+    "sonnet_design_critic": {
+      "reviewer": "sonnet_design_critic",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-constraints/src/solver.rs:72-101 (new create_solution_map)",
+          "category": "code_duplication",
+          "description": "create_solution_map is a near-exact duplicate of the pre-existing build_solved_values function (lines 55\u201374). Both accept (&[AutoParam], &[f64]), assert equal length, zip-and-map into HashMap<ValueCellId, Value::Scalar { si_value, dimension }>, and return the same type. The only differences are parameter names and assert message wording. The existing function's own doc comment already explicitly states it is 'Used by early-exit, fallback, and solution construction paths', indicating it was designed for general reuse. Introducing a second function with identical semantics violates DRY, creates confusion about which to call, and risks silent divergence if one is updated without the other.",
+          "suggested_fix": "Delete create_solution_map entirely. Call build_solved_values at every site where create_solution_map was intended to be used. If the longer parameter names were meant to serve as documentation, they can instead be noted in a comment at the call site or by renaming build_solved_values itself (e.g. to build_solution_map) in a single controlled rename rather than duplicating it."
+        }
+      ],
+      "summary": "The diff introduces create_solution_map, a function that is functionally identical to the already-existing build_solved_values: same input types (&[AutoParam], &[f64]), same assert-equal-length guard, same zip-map-collect body producing HashMap<ValueCellId, Value::Scalar>. The only variation is cosmetic (parameter names, assert message text). build_solved_values already carries a doc comment noting it is intended for 'solution construction paths', so no new abstraction is needed. This duplication should be rejected and the caller should use build_solved_values directly."
+    }
+  },
+  "total_cost_usd": 0.5440384,
+  "wall_clock_ms": 99172,
+  "errors": []
+}
