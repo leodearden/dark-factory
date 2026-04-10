@@ -14,11 +14,34 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
 from fused_memory.backends.graphiti_client import GraphitiBackend, StaleSummaryResult
+
+
+def _make_rebuild_spy(backend) -> tuple[list[dict], Callable]:
+    """Install a strict spy on backend._rebuild_entity_from_edges.
+
+    Captures each call's uuid and old_summary, then delegates to the original.
+    Returns (captured_calls, original_rebuild).
+
+    The spy uses a required (no-default) old_summary kwarg to mirror the
+    production signature — any caller that drops old_summary will raise TypeError
+    instead of silently capturing None.
+    """
+    captured_calls: list[dict] = []
+    original_rebuild = backend._rebuild_entity_from_edges
+
+    async def capture_rebuild(uuid, name, edges, *, group_id, old_summary):
+        captured_calls.append({'uuid': uuid, 'old_summary': old_summary})
+        return await original_rebuild(uuid, name, edges, group_id=group_id, old_summary=old_summary)
+
+    backend._rebuild_entity_from_edges = capture_rebuild
+    return captured_calls, original_rebuild
+
 
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.list_entity_nodes
@@ -1221,14 +1244,7 @@ class TestRebuildEntitySummariesParallel:
         backend.get_node_text = AsyncMock()
         backend.update_node_summary = AsyncMock()
 
-        captured_calls: list[dict] = []
-        original_rebuild = backend._rebuild_entity_from_edges
-
-        async def capture_rebuild(uuid, name, edges, *, group_id, old_summary):
-            captured_calls.append({'uuid': uuid, 'old_summary': old_summary})
-            return await original_rebuild(uuid, name, edges, group_id=group_id, old_summary=old_summary)
-
-        backend._rebuild_entity_from_edges = capture_rebuild
+        captured_calls, _ = _make_rebuild_spy(backend)
 
         result = await backend.rebuild_entity_summaries(group_id='test', force=True)
 
@@ -1265,14 +1281,7 @@ class TestRebuildEntitySummariesParallel:
         backend.get_node_text = AsyncMock()
         backend.update_node_summary = AsyncMock()
 
-        captured_calls: list[dict] = []
-        original_rebuild = backend._rebuild_entity_from_edges
-
-        async def capture_rebuild(uuid, name, edges, *, group_id, old_summary):
-            captured_calls.append({'uuid': uuid, 'old_summary': old_summary})
-            return await original_rebuild(uuid, name, edges, group_id=group_id, old_summary=old_summary)
-
-        backend._rebuild_entity_from_edges = capture_rebuild
+        captured_calls, _ = _make_rebuild_spy(backend)
 
         result = await backend.rebuild_entity_summaries(group_id='test', force=False)
 
