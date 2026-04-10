@@ -290,12 +290,14 @@ class TestFormatFilteredTaskTree:
         assert 'No active tasks.' in output2
 
     def test_trimmed_count_relative_to_max_tasks_cap(self):
-        """trimmed_count in truncation notice must reflect tasks after max_tasks cap, not total_active.
+        """Regression: trimmed_count in the truncation notice must be bounded by max_tasks,
+        not by total_active.
 
-        With 200 total active tasks, max_tasks=50, and max_chars=300 (tiny budget), the
-        truncation notice must show a count <= 50 (tasks dropped from the 50-task cap),
-        NOT close to 200 (total_active). Bug: `trimmed_count = total_active - len(kept_lines)`
-        yields ~197 instead of the correct ~47.
+        With 200 active tasks, max_tasks=50, and max_chars=300 (tiny budget), the notice
+        must report a count <= 50 (tasks dropped from the 50-task render cap), never a
+        count anywhere near 200 (total_active). The implementation uses
+        `trimmed_count = len(active) - len(kept_lines)` where
+        `active = tree.active_tasks[:max_tasks]`, so trimmed_count is always <= max_tasks.
         """
         active = [_make_task(i, 'pending', f'Task {i}') for i in range(1, 201)]
         tree = FilteredTaskTree(
