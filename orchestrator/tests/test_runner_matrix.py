@@ -275,8 +275,8 @@ class TestRunEvalMatrixCancellation:
         the f-string repr of the exception, so that it is useful even when
         str(CancelledError) is empty.
 
-        This test FAILS against the current code because
-        ``logger.error(f'Eval cancelled: {r}')`` does not set exc_info.
+        This test would FAIL without the exc_info fix because the old
+        ``logger.error(f'Eval cancelled: {r}')`` call did not set exc_info.
         """
         task_path = tmp_path / 'task_a.json'
         task_path.touch()
