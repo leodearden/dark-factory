@@ -318,7 +318,7 @@ class TestPostInit:
         cfg = DashboardConfig(project_root=link)
         assert cfg.tasks_json == real_resolved / '.taskmaster' / 'tasks' / 'tasks.json'
 
-    def test_replace_resolves_known_project_roots_symlinks(self, tmp_path):
+    def test_replace_resolves_known_project_roots_symlinks(self, tmp_path, symlinked_dir):
         """dataclasses.replace() must resolve symlinks in known_project_roots via __post_init__.
 
         Validates the __post_init__ docstring contract that dataclasses.replace() is a
@@ -328,10 +328,7 @@ class TestPostInit:
         """
         base_cfg = DashboardConfig(project_root=tmp_path)
 
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
+        link, real_resolved = symlinked_dir
 
         new_cfg = dataclasses.replace(base_cfg, known_project_roots=[link])
-        assert new_cfg.known_project_roots == [real_dir.resolve()]
+        assert new_cfg.known_project_roots == [real_resolved]
