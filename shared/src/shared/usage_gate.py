@@ -480,6 +480,7 @@ class UsageGate:
 
             if ok:
                 acct.capped = False
+                acct.near_cap = False
                 acct.probing = True  # gate: let one real task confirm first
                 acct.probe_count = 0
                 if acct.pause_started_at:
