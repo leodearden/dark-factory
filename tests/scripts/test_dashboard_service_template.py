@@ -27,6 +27,32 @@ EXPECTED_ENV_LINE = (
 )
 
 
+def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
+    """Assert that DASHBOARD_KNOWN_PROJECT_ROOTS in *path* uses commas, not colons.
+
+    Parses the Environment= line with a regex so the check is position-independent:
+    a colon anywhere in the value fails the assertion regardless of which root it
+    follows.
+    """
+    content = path.read_text(encoding="utf-8")
+    match = re.search(
+        r"^Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=(.*)$",
+        content,
+        re.MULTILINE,
+    )
+    assert match is not None, (
+        f"Environment=DASHBOARD_KNOWN_PROJECT_ROOTS= line not found in {path}"
+    )
+    value = match.group(1)
+    assert ":" not in value, (
+        f"Colon-separated DASHBOARD_KNOWN_PROJECT_ROOTS found in {path}. "
+        "Use commas — the parser at "
+        "dashboard/src/dashboard/config.py \u2014 "
+        "DashboardConfig.from_env handling of DASHBOARD_KNOWN_PROJECT_ROOTS "
+        "calls roots.split(',')."
+    )
+
+
 def test_template_sets_known_project_roots() -> None:
     """scripts/dashboard.service.template must declare DASHBOARD_KNOWN_PROJECT_ROOTS."""
     content = TEMPLATE.read_text(encoding="utf-8")
