@@ -52,6 +52,10 @@ def _insert_snapshot(
     )
 
 
+def _fake_load(tasks_map):
+    return lambda path: tasks_map[path]
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -226,11 +230,8 @@ class TestCollectSnapshot:
             autopilot_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': autopilot_tasks,
         }
 
-        def fake_load(path):
-            return _tasks_map[path]
-
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
         ):
             await collect_snapshot(conn, config)
@@ -357,11 +358,8 @@ class TestCollectSnapshot:
             reify_root / '.taskmaster' / 'tasks' / 'tasks.json': [{'status': 'done'}],
         }
 
-        def fake_load(path):
-            return _tasks_map[path]
-
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
         ):
@@ -420,11 +418,8 @@ class TestCollectSnapshot:
             reify_root / '.taskmaster' / 'tasks' / 'tasks.json': reify_tasks,
         }
 
-        def fake_load(path):
-            return _tasks_map[path]
-
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
         ):
