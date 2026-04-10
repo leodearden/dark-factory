@@ -416,6 +416,30 @@ class TestRebuildEntitySummariesDataFlow:
         assert result['skipped'] == 2
         assert result['rebuilt'] == 0
 
+    @pytest.mark.asyncio
+    async def test_force_false_dry_run_does_not_fetch_edge_map(self, mock_config, make_backend):
+        """force=False, dry_run=True: get_all_valid_edges is NOT awaited (task-526).
+
+        The force=False dry_run=True path should NOT pre-fetch the bulk O(E) edge
+        map via get_all_valid_edges because the edges are never used — the dry_run
+        block short-circuits before the rebuild loop that would consume them.
+
+        Under current code this test FAILS: _detect_stale_summaries_with_edges
+        unconditionally awaits get_all_valid_edges regardless of dry_run.
+        After the fix (adding _detect_stale_summaries_dry_run), this test passes.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'some summary'},
+        ])
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        # Also mock get_valid_edges_for_node so the dry_run probe can run
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[])
+
+        await backend.rebuild_entity_summaries(group_id='test', force=False, dry_run=True)
+
+        backend.get_all_valid_edges.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # step-5 (task 443): error-accumulation path in rebuild_entity_summaries
