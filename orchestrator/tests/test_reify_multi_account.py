@@ -18,7 +18,8 @@ from unittest.mock import patch
 import pytest
 import yaml
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import AccountState, UsageGate
+from shared.usage_gate import UsageGate
+
 from tests.conftest import build_usage_gate
 
 # ---------------------------------------------------------------------------

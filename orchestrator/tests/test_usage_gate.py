@@ -9,12 +9,12 @@ from unittest.mock import AsyncMock
 import pytest
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import (
-    AccountState,
     SessionBudgetExhausted,
     UsageGate,
     _extract_cap_message,
     _parse_resets_at,
 )
+
 from tests.conftest import build_usage_gate
 
 # --- Helpers ---
