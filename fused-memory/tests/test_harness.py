@@ -1892,6 +1892,32 @@ class TestHarnessFilteredTaskTreeWiring:
         assert captured.get('s1_tree') is prefetched_tree
         assert captured.get('s2_tree') is prefetched_tree
 
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_and_remediation_fetches_task_tree_once_total(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """run_full_cycle + remediation makes exactly one _fetch_filtered_task_tree call total."""
+        from unittest.mock import AsyncMock
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        expected_tree = self._make_tree()
+        harness._fetch_filtered_task_tree = AsyncMock(return_value=expected_tree)
+
+        # Stage 1 and 2 run normally; Stage 3 returns an actionable finding to trigger remediation
+        _mock_stage_run(harness.stages[0])
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2], items_flagged=[_make_s3_findings()[0]])
+
+        event = _make_event()
+        event.payload['_project_root'] = '/my/project'
+        await harness.run_full_cycle('test-project', 'test-trigger', events=[event])
+
+        assert harness._fetch_filtered_task_tree.call_count == 1, (  # type: ignore[attr-defined]
+            f"Expected exactly one _fetch_filtered_task_tree call across the full cycle + "
+            f"remediation pass, got {harness._fetch_filtered_task_tree.call_count}. "  # type: ignore[attr-defined]
+            "run_full_cycle must thread its pre-fetched tree into _maybe_remediate."
+        )
+
 
 class TestConfigureTaskSync:
     """Unit tests for the _configure_task_sync staticmethod on ReconciliationHarness."""

@@ -581,8 +581,9 @@ class ReconciliationHarness:
             if self.judge:
                 asyncio.create_task(self._run_judge(run_id))
 
-            # Remediation pass: extract S3 findings and trigger second pass
-            await self._maybe_remediate(project_id, project_root, run_id, run, tier)
+            # Remediation pass: pass pre-fetched tree to avoid a redundant fetch (ref: task 478)
+            await self._maybe_remediate(project_id, project_root, run_id, run, tier,
+                                        filtered_task_tree=filtered_task_tree)
 
             logger.info(
                 'reconciliation.run_completed',
@@ -674,6 +675,8 @@ class ReconciliationHarness:
         parent_run_id: str,
         parent_run: ReconciliationRun,
         tier: TierConfig,
+        *,
+        filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
         """Extract Stage 3 findings from the parent run and trigger remediation if needed."""
         try:
@@ -711,6 +714,7 @@ class ReconciliationHarness:
             )
             await self._run_remediation_pass(
                 project_id, project_root, parent_run_id, actionable, tier,
+                filtered_task_tree=filtered_task_tree,
             )
         except Exception as e:
             logger.error(f'Remediation check failed for run {parent_run_id}: {e}')
