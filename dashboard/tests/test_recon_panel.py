@@ -1199,3 +1199,30 @@ class TestDetailRowJournalGuard:
         assert 'hx-get="/partials/recon/run/run-mix-c"' in html
         assert 'hx-get="/partials/recon/run/run-mix-b"' not in html
         assert html.count('x-show="open"') == 2
+
+    def test_mixed_journal_counts_per_row_badge_and_detail_scoped(self, client):
+        """Per-row scoping: badge and detail row are absent in zero-count tbody, present in positive-count tbody."""
+        # Use ids without 'run-' prefix to avoid double prefix in rendered id="run-{run.id}"
+        runs = [
+            {**MOCK_RUNS[0], 'id': 'scoped-zero', 'journal_entry_count': 0},
+            {**MOCK_RUNS[0], 'id': 'scoped-pos', 'journal_entry_count': 5},
+        ]
+        with _patch_recon_data(runs=runs):
+            html = client.get('/partials/recon').text
+
+        # Template renders id="run-{{ run.id }}" on each tbody
+        zero_start = html.index('id="run-scoped-zero"')
+        zero_end = html.index('</tbody>', zero_start)
+        zero_tbody = html[zero_start:zero_end]
+
+        pos_start = html.index('id="run-scoped-pos"')
+        pos_end = html.index('</tbody>', pos_start)
+        pos_tbody = html[pos_start:pos_end]
+
+        # Zero-count row: neither badge nor detail row should be emitted
+        assert 'data-testid="journal-badge"' not in zero_tbody
+        assert 'data-testid="run-detail-row"' not in zero_tbody
+
+        # Positive-count row: both badge and detail row must be emitted
+        assert 'data-testid="journal-badge"' in pos_tbody
+        assert 'data-testid="run-detail-row"' in pos_tbody
