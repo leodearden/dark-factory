@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 AdvanceResult = Literal[
     'advanced', 'cas_failed', 'not_descendant', 'contaminated',
     'stash_failed', 'wip_overlap', 'pop_conflict',
-    'unmerged_state',
+    'unmerged_state', 'pop_conflict_no_advance',
 ]
 
 
@@ -651,6 +651,10 @@ class GitOps:
           (permanent; stop retrying).
         * ``'stash_failed'`` — ``git stash push`` failed before the advance
           (permanent; halt merge to prevent code loss).
+        * ``'pop_conflict_no_advance'`` — CAS ``update-ref`` failed AND the
+          subsequent stash pop conflicted.  The merge did NOT land.  WIP is
+          preserved on a ``wip/recovery-*`` branch; routes to a human-level
+          escalation.
         * ``'unmerged_state'`` — ``project_root`` already has unresolved merge
           conflicts in its index (UU/AA/DD paths detected via
           ``git status --porcelain``).  Halts immediately; manual cleanup of
@@ -872,9 +876,24 @@ class GitOps:
             update_cmd.append(expected_main)
         rc, _, err = await _run(update_cmd, cwd=self.project_root)
         if rc != 0:
-            # Restore stash before returning — ref didn't move
+            # Restore stash before returning — ref didn't move.
+            # Use _safe_stash_pop_with_recovery so that a pop conflict here
+            # does NOT leave UU markers in project_root and is escalated to
+            # humans rather than silently cascading to 'stash_failed' on the
+            # next cycle.
             if did_stash:
-                await _run(['git', 'stash', 'pop'], cwd=self.project_root)
+                pop_ok, recovery = await self._safe_stash_pop_with_recovery(
+                    branch or merge_sha[:8],
+                )
+                if not pop_ok:
+                    self._last_recovery_branch = recovery
+                    logger.critical(
+                        'CRITICAL: stash pop conflicted during CAS-failure recovery '
+                        '(task %s). WIP preserved on recovery branch: %s. '
+                        'Halting — manual intervention required.',
+                        branch or merge_sha[:8], recovery,
+                    )
+                    return 'pop_conflict_no_advance'
             if expected_main is not None:
                 logger.warning(
                     f'CAS update-ref failed (expected {expected_main[:8]}): {err}'
@@ -901,16 +920,10 @@ class GitOps:
                 )
 
             if did_stash:
-                pop_rc, _, pop_err = await _run(
-                    ['git', 'stash', 'pop'],
-                    cwd=self.project_root,
+                pop_ok, recovery = await self._safe_stash_pop_with_recovery(
+                    branch or merge_sha[:8],
                 )
-                if pop_rc != 0:
-                    # Pop conflict: merge landed but WIP conflicts with it.
-                    # Preserve WIP on a recovery branch, clean up working tree.
-                    recovery = await self._create_recovery_branch_from_stash(
-                        branch or merge_sha[:8],
-                    )
+                if not pop_ok:
                     self._last_recovery_branch = recovery
                     logger.warning(
                         'Stash pop conflicted after merge advance (task %s). '
@@ -950,6 +963,34 @@ class GitOps:
             cwd=self.project_root,
         )
         return name
+
+    async def _safe_stash_pop_with_recovery(
+        self, label: str,
+    ) -> tuple[bool, str | None]:
+        """Pop ``stash@{0}`` and preserve WIP on a recovery branch if it conflicts.
+
+        1. Run ``git stash pop``.
+        2. Check return code AND ``_detect_unmerged_paths`` — either signal
+           is sufficient to declare failure (belt-and-braces).
+        3. On failure: call ``_create_recovery_branch_from_stash(label)``
+           which saves the stash to a branch, drops the stash entry, and
+           resets the working tree to HEAD.
+        4. Return ``(True, None)`` on clean pop, or
+           ``(False, recovery_branch_name)`` on conflict.
+        """
+        pop_rc, _, pop_err = await _run(['git', 'stash', 'pop'], cwd=self.project_root)
+        unmerged = await self._detect_unmerged_paths(self.project_root)
+
+        if pop_rc != 0 or unmerged:
+            logger.warning(
+                'Stash pop failed (rc=%d, unmerged=%s, err=%s) for label %r — '
+                'creating recovery branch to preserve WIP.',
+                pop_rc, unmerged or [], pop_err, label,
+            )
+            recovery = await self._create_recovery_branch_from_stash(label)
+            return (False, recovery)
+
+        return (True, None)
 
     async def has_dirty_working_tree(self) -> str:
         """Return names of tracked dirty files, or empty string if clean.

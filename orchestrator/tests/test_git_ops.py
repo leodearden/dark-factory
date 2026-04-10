@@ -711,6 +711,104 @@ class TestWorkingTreeSync:
         )
         assert stash_list.strip() == ''
 
+    async def test_sync_path_pop_conflict_still_uses_safe_helper(
+        self, git_ops: GitOps,
+    ):
+        """After refactor, sync-path pop still returns 'pop_conflict' and leaves tree clean.
+
+        This is a regression guard: the result code must remain 'pop_conflict'
+        (merge DID advance), and _detect_unmerged_paths must return [] after
+        recovery (proving the helper cleaned the tree).
+        """
+        # Create a merge commit
+        wt = await git_ops.create_worktree('sync-safe-helper')
+        (wt.path / 'sync_file.py').write_text('x = 1\n')
+        await git_ops.commit(wt.path, 'Add sync_file')
+        merge_result = await git_ops.merge_to_main(wt.path, 'sync-safe-helper')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Dirty tracked file so stash is created
+        (git_ops.project_root / 'README.md').write_text('# WIP sync guard\n')
+
+        # Mock: stash pop returns failure (simulates sync-path pop conflict)
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None):
+            if cmd[:3] == ['git', 'stash', 'pop']:
+                return (1, '', 'CONFLICT: merge conflict in README.md')
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        # Sync path: merge DID advance, WIP conflicted — must still be 'pop_conflict'
+        assert result == 'pop_conflict'
+
+        # Tree must be fully clean (recovery helper ran read-tree reset)
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert unmerged == [], f'Expected clean tree after recovery, got: {unmerged}'
+
+    async def test_cas_failure_pop_conflict_returns_pop_conflict_no_advance(
+        self, git_ops: GitOps,
+    ):
+        """When CAS fails AND stash pop conflicts, advance_main returns 'pop_conflict_no_advance'.
+
+        Main ref must not move, _last_recovery_branch must be set, and no
+        unmerged paths may remain in project_root after the call.
+        """
+        # Create a merge commit (adds cas_pop.py — no overlap with README.md)
+        wt = await git_ops.create_worktree('cas-pop-conflict')
+        (wt.path / 'cas_pop.py').write_text('x = 1\n')
+        await git_ops.commit(wt.path, 'Add cas_pop')
+        merge_result = await git_ops.merge_to_main(wt.path, 'cas-pop-conflict')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Dirty tracked file (no overlap with merge diff) so stash is created
+        (git_ops.project_root / 'README.md').write_text('# WIP for CAS pop conflict\n')
+
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
+        # Mock: stash pop returns failure (simulates pop conflict after CAS failure)
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None):
+            if cmd[:3] == ['git', 'stash', 'pop']:
+                return (1, '', 'CONFLICT: merge conflict in README.md')
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await git_ops.advance_main(
+                merge_result.merge_commit,
+                merge_result.merge_worktree,
+                branch='cas-pop-conflict',
+                expected_main='0' * 40,  # force CAS failure
+            )
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result == 'pop_conflict_no_advance'
+
+        # Recovery branch must have been created and recorded
+        assert hasattr(git_ops, '_last_recovery_branch')
+        recovery = git_ops._last_recovery_branch
+        assert recovery is not None and recovery.startswith('wip/recovery-')
+
+        # Main ref must NOT have moved
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip()
+
+        # No leftover unmerged paths
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert unmerged == []
+
     async def test_advance_main_halts_on_preexisting_unmerged_state(
         self, git_ops: GitOps,
     ):
@@ -826,3 +924,104 @@ class TestUnmergedDetection:
         unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
         assert 'README.md' in unmerged
         assert len(unmerged) >= 1
+
+
+@pytest.mark.asyncio
+class TestSafeStashPopWithRecovery:
+    """Tests for the _safe_stash_pop_with_recovery helper."""
+
+    async def test_safe_stash_pop_success_returns_ok(self, git_ops: GitOps):
+        """_safe_stash_pop_with_recovery returns (True, None) on a clean pop.
+
+        Dirty file content is restored, stash list is empty, no recovery
+        branch is created.
+        """
+        # Stash a dirty tracked file
+        (git_ops.project_root / 'README.md').write_text('# WIP content\n')
+        await _run(
+            ['git', 'stash', 'push', '-m', 'test stash'], cwd=git_ops.project_root,
+        )
+
+        # Verify stash was created
+        _, stash_list, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_list.strip(), 'Stash should have an entry before pop'
+
+        # Call the helper — no conflict exists, should succeed
+        ok, recovery = await git_ops._safe_stash_pop_with_recovery('label-1')
+
+        assert ok is True
+        assert recovery is None
+
+        # Dirty file content must be restored
+        assert '# WIP content' in (git_ops.project_root / 'README.md').read_text()
+
+        # No recovery branch was created
+        _, branches, _ = await _run(['git', 'branch'], cwd=git_ops.project_root)
+        assert 'wip/recovery' not in branches
+
+        # Stash list is now empty
+        _, stash_after, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_after.strip() == ''
+
+    async def test_safe_stash_pop_conflict_creates_recovery_branch(
+        self, git_ops: GitOps,
+    ):
+        """_safe_stash_pop_with_recovery returns (False, branch) and cleans up on conflict.
+
+        The recovery branch points at the original stash tree, stash list is
+        empty, and project_root has no leftover unmerged paths afterward.
+        """
+        # Write WIP content to README.md and stash it
+        (git_ops.project_root / 'README.md').write_text('# WIP content for conflict\n')
+        await _run(
+            ['git', 'stash', 'push', '-m', 'wip-for-conflict'],
+            cwd=git_ops.project_root,
+        )
+
+        # Capture stash tree before pop attempt (to verify recovery branch later)
+        _, stash_tree, _ = await _run(
+            ['git', 'rev-parse', 'stash@{0}^{tree}'], cwd=git_ops.project_root,
+        )
+
+        # Commit a DIFFERENT version of README.md on main so stash pop will conflict.
+        # Three-way merge scenario:
+        #   base (stash parent) : '# Test\n'
+        #   ours (HEAD)         : '# Main version…\n'
+        #   theirs (stash)      : '# WIP content for conflict\n'
+        (git_ops.project_root / 'README.md').write_text('# Main version — conflicts with WIP\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Commit conflicting README'],
+            cwd=git_ops.project_root,
+        )
+
+        # Call the helper — git stash pop will conflict (real git conflict)
+        ok, recovery = await git_ops._safe_stash_pop_with_recovery('label-2')
+
+        assert ok is False
+        assert recovery is not None
+        assert recovery.startswith('wip/recovery-label-2-'), (
+            f'Recovery branch name should start with wip/recovery-label-2-, got {recovery!r}'
+        )
+
+        # Recovery branch tree must match the original stash tree
+        _, branch_tree, _ = await _run(
+            ['git', 'rev-parse', f'{recovery}^{{tree}}'], cwd=git_ops.project_root,
+        )
+        assert stash_tree.strip() == branch_tree.strip(), (
+            'Recovery branch tree must equal original stash tree'
+        )
+
+        # Stash list must be empty (stash was dropped after branch creation)
+        _, stash_after, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_after.strip() == ''
+
+        # No unmerged paths remain in project_root
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert unmerged == [], f'Expected no unmerged paths after recovery, got: {unmerged}'
