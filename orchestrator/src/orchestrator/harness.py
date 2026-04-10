@@ -726,10 +726,11 @@ Output JSON matching the schema. Every task must appear in the output.
                 continue
 
             # Check if plan has any completed steps
+            # Note: some plans have prerequisites as plain strings (not dicts)
             completed = [
                 s for col in ('prerequisites', 'steps')
                 for s in plan.get(col, [])
-                if s.get('status') == 'done'
+                if isinstance(s, dict) and s.get('status') == 'done'
             ]
 
             if not completed:
