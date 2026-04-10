@@ -279,12 +279,26 @@ class TestRebuildEntitySummariesForceDryRun:
        ``asyncio.Semaphore``-based rebuild loop executes. This is why
        ``_rebuild_entity_from_edges`` is also never awaited.
 
-    force=False contrast
-    --------------------
-    The force=False path delegates to ``_detect_stale_summaries_with_edges``,
-    which unconditionally calls ``get_all_valid_edges`` for staleness detection
-    regardless of ``dry_run``. Therefore the edge-fetch skip behaviour pinned by
-    this class only applies to the force=True path.
+    force=False contrast (updated by task 526)
+    ------------------------------------------
+    The force=False path branches on ``dry_run`` at the call site in
+    ``rebuild_entity_summaries``:
+
+    - ``force=False, dry_run=True`` → calls ``_detect_stale_summaries_dry_run``,
+      which fetches edges per-entity via ``get_valid_edges_for_node`` and does
+      **NOT** call ``get_all_valid_edges``. This is the cheap-probe path added
+      by task 526 to avoid materialising the O(E) edge dict when the result is
+      never passed to ``_rebuild_entity_from_edges``.
+
+    - ``force=False, dry_run=False`` → calls ``_detect_stale_summaries_with_edges``,
+      which still issues a single bulk ``get_all_valid_edges`` query. That full
+      edge map is needed because the actual rebuild loop (``_rebuild_entity_from_edges``)
+      will consume it.
+
+    Therefore the edge-fetch skip behaviour pinned by this class applies to both
+    the force=True path and the force=False dry_run=True path (see also
+    ``TestRebuildEntitySummariesDataFlow`` for tests specific to the force=False
+    branching).
     """
 
     @pytest.mark.asyncio
