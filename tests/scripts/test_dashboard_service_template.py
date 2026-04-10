@@ -8,9 +8,13 @@ by setup-host.sh) and the checked-in hardcoded copy
 
 See also:
   - tests/scripts/test_run_vllm_eval_lint.py  — pattern reference
-  - dashboard/src/dashboard/config.py line 84  — COMMA-separated split
+  - dashboard/src/dashboard/config.py — DashboardConfig.from_env handling of DASHBOARD_KNOWN_PROJECT_ROOTS (COMMA-separated split)
 """
+
 import pathlib
+import re
+
+import pytest
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 TEMPLATE = REPO_ROOT / "scripts" / "dashboard.service.template"
@@ -29,6 +33,32 @@ HARDCODED_EXPECTED_ENV_LINE = (
     "/home/leo/src/reify,"
     "/home/leo/src/autopilot-video"
 )
+
+
+def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
+    """Assert that DASHBOARD_KNOWN_PROJECT_ROOTS in *path* uses commas, not colons.
+
+    Parses the Environment= line with a regex so the check is position-independent:
+    a colon anywhere in the value fails the assertion regardless of which root it
+    follows.
+    """
+    content = path.read_text(encoding="utf-8")
+    match = re.search(
+        r"^Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=(.*)$",
+        content,
+        re.MULTILINE,
+    )
+    assert match is not None, (
+        f"Environment=DASHBOARD_KNOWN_PROJECT_ROOTS= line not found in {path}"
+    )
+    value = match.group(1)
+    assert ":" not in value, (
+        f"Colon-separated DASHBOARD_KNOWN_PROJECT_ROOTS found in {path}. "
+        "Use commas — the parser at "
+        "dashboard/src/dashboard/config.py \u2014 "
+        "DashboardConfig.from_env handling of DASHBOARD_KNOWN_PROJECT_ROOTS "
+        "calls roots.split(',')."
+    )
 
 
 def test_template_sets_known_project_roots() -> None:
@@ -50,37 +80,46 @@ def test_hardcoded_service_file_sets_known_project_roots() -> None:
     )
 
 
+def test_comma_separator_helper_detects_colon_in_any_position(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_assert_known_project_roots_comma_separated must catch colons in any position.
+
+    The narrow old guard (looking for '/home/leo/src/dark-factory:') fails when the
+    first root is not dark-factory or the colon appears between the second and third
+    roots.  This test exercises the case that the old guard cannot see.
+    """
+    # Bad: colon between second and third roots (old guard misses this)
+    bad_file = tmp_path / "bad.service"
+    bad_file.write_text(
+        "[Service]\nEnvironment=DASHBOARD_KNOWN_PROJECT_ROOTS=/a,/b:/c\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _assert_known_project_roots_comma_separated(bad_file)
+
+    # Good: all commas, helper must not raise
+    good_file = tmp_path / "good.service"
+    good_file.write_text(
+        "[Service]\nEnvironment=DASHBOARD_KNOWN_PROJECT_ROOTS=/a,/b,/c\n",
+        encoding="utf-8",
+    )
+    _assert_known_project_roots_comma_separated(good_file)
+
+
 def test_known_project_roots_uses_comma_separator_not_colon() -> None:
     """Both service files must use commas (not colons) to separate project roots.
 
     The consumer code is ``roots.split(',')`` — a colon-separated value would
     be parsed as a single path literal and silently aggregate nothing.
 
-    Two colon patterns are checked:
-    - The literal-path form (guards both files)
-    - The sentinel form (guards the template against accidental colon use after
-      __REPO_ROOT__ is substituted back in)
+    The helper parses the Environment= value and checks for any colon, so it
+    guards both the literal-path form (``/home/leo/src/dark-factory:``) and the
+    template's ``__REPO_ROOT__:`` sentinel form in a single, position-independent
+    pass.
     """
-    literal_colon_pattern = (
-        "DASHBOARD_KNOWN_PROJECT_ROOTS="
-        "/home/leo/src/dark-factory:"
-    )
-    sentinel_colon_pattern = (
-        "DASHBOARD_KNOWN_PROJECT_ROOTS="
-        "__REPO_ROOT__:"
-    )
     for path in (TEMPLATE, HARDCODED):
-        content = path.read_text(encoding="utf-8")
-        assert literal_colon_pattern not in content, (
-            f"Colon-separated DASHBOARD_KNOWN_PROJECT_ROOTS (literal path) found in {path}. "
-            "Use commas — the parser at dashboard/src/dashboard/config.py:84 "
-            "calls roots.split(',')."
-        )
-        assert sentinel_colon_pattern not in content, (
-            f"Colon-separated DASHBOARD_KNOWN_PROJECT_ROOTS (__REPO_ROOT__ sentinel) found in {path}. "
-            "Use commas — the parser at dashboard/src/dashboard/config.py:84 "
-            "calls roots.split(',')."
-        )
+        _assert_known_project_roots_comma_separated(path)
 
 
 def test_comment_warns_about_systemd_space_handling() -> None:
