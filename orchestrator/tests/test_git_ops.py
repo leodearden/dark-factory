@@ -504,6 +504,7 @@ class TestWorkingTreeSync:
         # Recovery branch should be recorded
         assert hasattr(git_ops, '_last_recovery_branch')
         recovery = git_ops._last_recovery_branch
+        assert recovery is not None
         assert recovery.startswith('wip/recovery-')
 
     async def test_consecutive_advance_after_pop_conflict(self, git_ops: GitOps):
@@ -933,6 +934,7 @@ class TestWorkingTreeSync:
         merge_result2 = await git_ops.merge_to_main(wt2.path, 'cascade-regr-2')
         assert merge_result2.success
 
+        assert merge_result2.merge_commit is not None
         result2 = await git_ops.advance_main(merge_result2.merge_commit)
         if merge_result2.merge_worktree:
             await git_ops.cleanup_merge_worktree(merge_result2.merge_worktree)

@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 
 
 class _SchedulerLike(Protocol):
+    _status_cache: dict[str, str]
     async def set_task_status(self, task_id: str, status: str, /) -> None: ...
     async def handle_blast_radius_expansion(
         self, task_id: str, current: list[str], needed: list[str], /
@@ -89,6 +90,10 @@ class _BriefingLike(Protocol):
     ) -> str: ...
     async def build_merger_prompt(
         self, conflicts: str, task_intent: str, context: str | None = ...
+    ) -> str: ...
+    async def build_completion_judge_prompt(
+        self, plan: dict, iteration_log: list, diff: str,
+        task_id: str | None = ..., context: str | None = ...,
     ) -> str: ...
 
 logger = logging.getLogger(__name__)
@@ -642,6 +647,7 @@ class TaskWorkflow:
 
         prompt = await self.briefing.build_architect_prompt(self.task, worktree=self.worktree)
 
+        result: AgentResult | None = None
         for attempt in range(2):
             result = await self._invoke(ARCHITECT, prompt, self.worktree)
 
@@ -671,6 +677,7 @@ class TaskWorkflow:
 
             break
 
+        assert result is not None  # range(2) always executes at least once
         if not self.plan:
             logger.error(f'Task {self.task_id}: architect produced no plan.json')
             return await self._mark_blocked(
