@@ -5,6 +5,7 @@ until conftest.py is extended in step-2.
 """
 from __future__ import annotations
 
+import inspect
 import os
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -183,11 +184,9 @@ class TestMakeEdgeBackend:
             make_edge_backend(backend, [], {})  # type: ignore[call-arg]
 
     def test_edges_is_keyword_only(self, make_edge_backend):
-        """Calling with edges as the second positional argument raises TypeError."""
-        backend = MagicMock()
-        nodes = []
-        with pytest.raises(TypeError):
-            make_edge_backend(backend, nodes, {})  # type: ignore[call-arg]
+        """edges parameter has kind KEYWORD_ONLY in the factory signature."""
+        sig = inspect.signature(make_edge_backend)
+        assert sig.parameters['edges'].kind == inspect.Parameter.KEYWORD_ONLY
 
     @pytest.mark.asyncio
     async def test_awaiting_list_entity_nodes_yields_nodes(self, make_edge_backend):
