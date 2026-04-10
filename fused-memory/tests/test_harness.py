@@ -1615,6 +1615,39 @@ class TestHarnessFilteredTaskTreeWiring:
         harness._fetch_filtered_task_tree.assert_called_once_with('/my/project')  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
+    async def test_run_full_cycle_invokes_get_tasks_exactly_once(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """Single-fetch invariant: taskmaster.get_tasks is called exactly once per run_full_cycle.
+
+        Unlike sibling tests in this class, _fetch_filtered_task_tree is NOT mocked here —
+        it runs the real implementation.  This verifies that no stage bypasses the helper
+        and calls taskmaster.get_tasks directly.  A regression would surface as call_count > 1.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # Set up taskmaster.get_tasks to return a valid task list so the real
+        # _fetch_filtered_task_tree can produce a non-empty FilteredTaskTree.
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr]
+            'tasks': (
+                [{'id': i, 'title': f'T{i}', 'status': 'pending', 'dependencies': []}
+                 for i in range(1, 4)]
+                + [{'id': i, 'title': f'T{i}', 'status': 'done', 'dependencies': []}
+                   for i in range(4, 9)]
+            )
+        }
+
+        for stage in harness.stages:
+            _mock_stage_run(stage)
+
+        event = _make_event()
+        event.payload['_project_root'] = '/my/project'
+
+        await harness.run_full_cycle('test-project', 'test-trigger', events=[event])
+
+        harness.taskmaster.get_tasks.assert_called_once()  # type: ignore[union-attr,attr-defined]
+
+    @pytest.mark.asyncio
     async def test_run_full_cycle_sets_filtered_task_tree_on_consolidator(
         self, journal, event_buffer, mock_memory_service,
     ):
