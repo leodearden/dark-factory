@@ -27,7 +27,11 @@ def _resolve_project_root(prd: str, default_root: Path) -> Path:
     Falls back to *default_root* (the dashboard's own project root) if no
     ``.taskmaster/`` is found or the PRD path is relative.
 
-    The returned Path is always canonical (symlinks resolved).
+    The returned Path is always canonical (symlinks resolved).  This guarantee
+    is now mirrored by ``_resolve_root`` inside :func:`discover_orchestrators`:
+    every branch of that helper also returns a canonical Path, so consumers of
+    either function can rely on canonical-path equality without defensive
+    ``.resolve()`` calls.
     """
     p = Path(prd)
     if not p.is_absolute():
@@ -298,7 +302,12 @@ def discover_orchestrators(config: DashboardConfig) -> list[dict]:
         return []
 
     def _resolve_root(proc: dict) -> Path:
-        """Resolve project root from process info: prd > config > default."""
+        """Resolve project root from process info: prd > config > default.
+
+        All three branches return a canonical (symlink-resolved) Path so that
+        the ``groups`` dict always uses canonical keys and the ``project_root``
+        emitted in each result entry is canonical without further ``.resolve()``.
+        """
         if proc.get('prd'):
             return _resolve_project_root(proc['prd'], config.project_root)
         if proc.get('config_path'):
