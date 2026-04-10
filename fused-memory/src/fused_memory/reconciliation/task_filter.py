@@ -73,12 +73,14 @@ class FilteredTaskTree:
 # Core filter
 # --------------------------------------------------------------------------- #
 
-def filter_task_tree(tasks_data: dict) -> FilteredTaskTree:
+def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
     """Partition a raw get_tasks response into active vs. inactive tasks.
 
     Args:
-        tasks_data: Dict returned by taskmaster.get_tasks(), expected to contain
-            a 'tasks' key with a list of task dicts.
+        tasks_data: Value returned by taskmaster.get_tasks(), expected to be a
+            dict containing a 'tasks' key with a list of task dicts.  Any
+            non-dict value (None, list, str, …) is treated as missing input and
+            returns an empty FilteredTaskTree.
 
     Returns:
         FilteredTaskTree with active_tasks sorted by (_STATUS_PRIORITY, -id),

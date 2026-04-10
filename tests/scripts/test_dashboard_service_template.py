@@ -10,6 +10,7 @@ See also:
   - tests/scripts/test_run_vllm_eval_lint.py  — pattern reference
   - dashboard/src/dashboard/config.py — DashboardConfig.from_env handling of DASHBOARD_KNOWN_PROJECT_ROOTS (COMMA-separated split)
 """
+
 import pathlib
 import re
 
@@ -19,7 +20,14 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 TEMPLATE = REPO_ROOT / "scripts" / "dashboard.service.template"
 HARDCODED = REPO_ROOT / "dashboard" / "dark-factory-dashboard.service"
 
-EXPECTED_ENV_LINE = (
+TEMPLATE_EXPECTED_ENV_LINE = (
+    "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS="
+    "__REPO_ROOT__,"
+    "/home/leo/src/reify,"
+    "/home/leo/src/autopilot-video"
+)
+
+HARDCODED_EXPECTED_ENV_LINE = (
     "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS="
     "/home/leo/src/dark-factory,"
     "/home/leo/src/reify,"
@@ -54,19 +62,20 @@ def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
 
 
 def test_template_sets_known_project_roots() -> None:
-    """scripts/dashboard.service.template must declare DASHBOARD_KNOWN_PROJECT_ROOTS."""
+    """scripts/dashboard.service.template must declare DASHBOARD_KNOWN_PROJECT_ROOTS with __REPO_ROOT__ sentinel."""
     content = TEMPLATE.read_text(encoding="utf-8")
-    assert EXPECTED_ENV_LINE in content, (
-        f"Expected line not found in {TEMPLATE}:\n  {EXPECTED_ENV_LINE!r}\n"
+    assert TEMPLATE_EXPECTED_ENV_LINE in content, (
+        f"Expected line not found in {TEMPLATE}:\n  {TEMPLATE_EXPECTED_ENV_LINE!r}\n"
+        "The template must use __REPO_ROOT__ as the self entry, not a hardcoded path. "
         "Add it to the [Service] section after the ExecStart block."
     )
 
 
 def test_hardcoded_service_file_sets_known_project_roots() -> None:
-    """dashboard/dark-factory-dashboard.service must declare DASHBOARD_KNOWN_PROJECT_ROOTS."""
+    """dashboard/dark-factory-dashboard.service must declare DASHBOARD_KNOWN_PROJECT_ROOTS with literal path."""
     content = HARDCODED.read_text(encoding="utf-8")
-    assert EXPECTED_ENV_LINE in content, (
-        f"Expected line not found in {HARDCODED}:\n  {EXPECTED_ENV_LINE!r}\n"
+    assert HARDCODED_EXPECTED_ENV_LINE in content, (
+        f"Expected line not found in {HARDCODED}:\n  {HARDCODED_EXPECTED_ENV_LINE!r}\n"
         "Add it to the [Service] section after the ExecStart block."
     )
 
@@ -103,6 +112,33 @@ def test_known_project_roots_uses_comma_separator_not_colon() -> None:
 
     The consumer code is ``roots.split(',')`` — a colon-separated value would
     be parsed as a single path literal and silently aggregate nothing.
+
+    The helper parses the Environment= value and checks for any colon, so it
+    guards both the literal-path form (``/home/leo/src/dark-factory:``) and the
+    template's ``__REPO_ROOT__:`` sentinel form in a single, position-independent
+    pass.
     """
     for path in (TEMPLATE, HARDCODED):
         _assert_known_project_roots_comma_separated(path)
+
+
+def test_comment_warns_about_systemd_space_handling() -> None:
+    """Both service files must carry the systemd-aware comment for DASHBOARD_KNOWN_PROJECT_ROOTS.
+
+    The old wording 'comma-separated, no spaces' was misleading — the Python parser
+    tolerates whitespace around commas.  The real hazard is systemd: spaces inside
+    an Environment= value are treated as separators between variable assignments.
+    The updated comment makes this explicit so future editors understand why spaces
+    are forbidden.
+    """
+    expected_comment = (
+        "# Multi-project cost aggregation "
+        "(comma-separated; avoid spaces inside the value \u2014 "
+        "systemd would treat them as assignment separators)"
+    )
+    for path in (TEMPLATE, HARDCODED):
+        content = path.read_text(encoding="utf-8")
+        assert expected_comment in content, (
+            f"Systemd-aware comment not found in {path}:\n  {expected_comment!r}\n"
+            "Update the comment above the Environment=DASHBOARD_KNOWN_PROJECT_ROOTS line."
+        )

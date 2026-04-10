@@ -930,6 +930,66 @@ class GraphitiBackend:
             })
         return StaleSummaryResult(stale=stale, all_edges=all_edges, total_count=len(entities))
 
+    async def _detect_stale_summaries_dry_run(
+        self, *, group_id: str
+    ) -> tuple[list[dict], int]:
+        """Internal: detect stale summaries using per-entity edge fetching (dry_run variant).
+
+        Memory-cheaper alternative to ``_detect_stale_summaries_with_edges`` for use
+        in the ``force=False, dry_run=True`` code path.  Unlike the bulk variant, this
+        method never materialises the O(E) all-edges dict because:
+
+        - The dry_run path short-circuits before ``_rebuild_entity_from_edges``, so
+          the edges dict is only needed for staleness comparison, not for writing.
+        - Fetching edges per-entity (only for non-empty-summary entities) avoids
+          holding the full graph's edge data in Python memory when none of it will
+          be used to write.
+
+        Trade-off vs ``_detect_stale_summaries_with_edges``:
+        - Issues up-to-N targeted ``get_valid_edges_for_node`` queries rather than a
+          single bulk ``get_all_valid_edges`` query.
+        - Entities with empty summaries are skipped without any edge query (matching
+          the existing empty-summary semantics, adding a Pareto improvement for graphs
+          with many empty-summary entities).
+
+        Args:
+            group_id: Project graph to query.
+
+        Returns:
+            Tuple of (stale_list, total_count) where stale_list contains the same
+            per-entity dict schema as ``_detect_stale_summaries_with_edges``
+            (uuid, name, summary, duplicate_count, stale_line_count, valid_fact_count,
+            summary_line_count) and total_count is len(all entities).
+        """
+        entities = await self.list_entity_nodes(group_id=group_id)
+        stale: list[dict] = []
+        for entity in entities:
+            summary = entity['summary']
+            if not summary:
+                # Empty summary — not stale by definition; skip without an edge query.
+                continue
+            edges = await self.get_valid_edges_for_node(entity['uuid'], group_id=group_id)
+            valid_facts = self._canonical_facts(edges)
+            canonical = '\n'.join(valid_facts)
+            if summary == canonical:
+                continue  # Already up-to-date
+            # Compute diagnostic counts (same schema as _detect_stale_summaries_with_edges)
+            summary_lines = summary.split('\n')
+            valid_fact_set = set(valid_facts)
+            line_counts = Counter(summary_lines)
+            duplicate_count = sum(c - 1 for c in line_counts.values() if c > 1)
+            stale_line_count = sum(1 for line in summary_lines if line not in valid_fact_set)
+            stale.append({
+                'uuid': entity['uuid'],
+                'name': entity['name'],
+                'summary': summary,
+                'duplicate_count': duplicate_count,
+                'stale_line_count': stale_line_count,
+                'valid_fact_count': len(valid_facts),
+                'summary_line_count': len(summary_lines),
+            })
+        return (stale, len(entities))
+
     async def detect_stale_summaries(self, *, group_id: str) -> list[dict]:
         """Identify Entity nodes whose summary is out of sync with valid edge facts.
 
@@ -1048,10 +1108,17 @@ class GraphitiBackend:
             if not dry_run:
                 all_edges = await self.get_all_valid_edges(group_id=group_id)
         else:
-            result = await self._detect_stale_summaries_with_edges(group_id=group_id)
-            stale = result.stale
-            all_edges = result.all_edges
-            total_entities = result.total_count
+            if dry_run:
+                # dry_run=True: use the memory-cheaper per-entity probe.
+                # The bulk all_edges dict is never needed because the dry_run block
+                # below short-circuits before _rebuild_entity_from_edges consumes it.
+                stale, total_entities = await self._detect_stale_summaries_dry_run(group_id=group_id)
+                # all_edges stays as the empty dict declared above (never materialised)
+            else:
+                result = await self._detect_stale_summaries_with_edges(group_id=group_id)
+                stale = result.stale
+                all_edges = result.all_edges
+                total_entities = result.total_count
             targets = [{'uuid': s['uuid'], 'name': s['name'], 'old_summary': s['summary']} for s in stale]
 
         stale_entities = len(targets)
@@ -1197,8 +1264,25 @@ class GraphitiBackend:
         Uses ro_query since no writes are performed.
 
         Each record is a dict with keys: label, field, type, entity_type.
+
+        Note on the CALL db.indexes() procedure and the read-only path:
+        ``CALL db.indexes()`` is the *only* stored-procedure call sent on the
+        read-only path in this file — all other ``ro_query`` callers use plain
+        MATCH queries.  Stored procedures are sometimes classified as
+        write-capable by graph databases, so this usage was validated
+        empirically against FalkorDB module v41800 (4.18.0): the call is
+        accepted via ``GRAPH.RO_QUERY`` without error.
+
+        The live verification is pinned in
+        ``fused-memory/tests/test_list_indices_integration.py``
+        (Task 530 / esc-486-49).  If a future FalkorDB upgrade rejects
+        ``CALL`` on the RO path, revert this call to ``graph.query(...)``
+        (the write-capable command) and update the integration test to pin
+        the new behavior.
         """
         graph = self._graph_for(group_id)
+        # CALL db.indexes() is a read-only procedure; FalkorDB accepts it via
+        # GRAPH.RO_QUERY (verified via test_list_indices_integration.py).
         result = await graph.ro_query('CALL db.indexes()')
         indices = []
         for row in (result.result_set or []):

@@ -6,8 +6,9 @@ until conftest.py is extended in step-2.
 from __future__ import annotations
 
 import os
-from unittest.mock import call
+from unittest.mock import AsyncMock, MagicMock, call
 
+import pytest
 from conftest import extract_cypher, extract_params
 
 # ---------------------------------------------------------------------------
@@ -93,6 +94,11 @@ class TestExtractCypher:
         call_args = call(query='MATCH (n) RETURN n')
         assert extract_cypher(call_args) == 'MATCH (n) RETURN n'
 
+    def test_keyword_query_returns_query_among_other_kwargs(self):
+        """When 'query' kwarg is passed alongside other kwargs, returns the 'query' value specifically, not an arbitrary kwarg value."""
+        call_args = call(query='MATCH (n) RETURN n', params={'uuid': 'x'})
+        assert extract_cypher(call_args) == 'MATCH (n) RETURN n'
+
     def test_empty_call_returns_empty_string(self):
         """When neither positional nor keyword query is present, returns empty string."""
         call_args = call()
@@ -124,3 +130,79 @@ class TestExtractParams:
         """When no params argument is present, returns empty dict."""
         call_args = call('MATCH (n) RETURN n')
         assert extract_params(call_args) == {}
+
+
+# ---------------------------------------------------------------------------
+# make_edge_backend factory fixture tests (task-445 step-1)
+# ---------------------------------------------------------------------------
+
+class TestMakeEdgeBackend:
+    """make_edge_backend(backend, *, nodes, edges) wires the two-mock surface.
+
+    Canonical usage::
+
+        backend = make_edge_backend(make_backend(mock_config), nodes=[...], edges={...})
+    """
+
+    def test_returns_same_backend_object(self, make_edge_backend):
+        """make_edge_backend returns the same backend object that was passed in."""
+        backend = MagicMock()
+        result = make_edge_backend(backend, nodes=[], edges={})
+        assert result is backend
+
+    def test_list_entity_nodes_is_async_mock(self, make_edge_backend):
+        """backend.list_entity_nodes is replaced with an AsyncMock."""
+        backend = MagicMock()
+        make_edge_backend(backend, nodes=[], edges={})
+        assert isinstance(backend.list_entity_nodes, AsyncMock)
+
+    def test_get_all_valid_edges_is_async_mock(self, make_edge_backend):
+        """backend.get_all_valid_edges is replaced with an AsyncMock."""
+        backend = MagicMock()
+        make_edge_backend(backend, nodes=[], edges={})
+        assert isinstance(backend.get_all_valid_edges, AsyncMock)
+
+    def test_list_entity_nodes_return_value_equals_nodes_arg(self, make_edge_backend):
+        """list_entity_nodes.return_value equals the nodes kwarg passed to the factory."""
+        nodes = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'fact'}]
+        backend = MagicMock()
+        make_edge_backend(backend, nodes=nodes, edges={})
+        assert backend.list_entity_nodes.return_value == nodes
+
+    def test_get_all_valid_edges_return_value_equals_edges_arg(self, make_edge_backend):
+        """get_all_valid_edges.return_value equals the edges kwarg passed to the factory."""
+        edges = {'u1': [{'uuid': 'e1', 'fact': 'fact', 'name': 'rel'}]}
+        backend = MagicMock()
+        make_edge_backend(backend, nodes=[], edges=edges)
+        assert backend.get_all_valid_edges.return_value == edges
+
+    def test_nodes_is_keyword_only(self, make_edge_backend):
+        """Calling with nodes as a positional argument raises TypeError."""
+        backend = MagicMock()
+        with pytest.raises(TypeError):
+            make_edge_backend(backend, [], {})  # type: ignore[call-arg]
+
+    def test_edges_is_keyword_only(self, make_edge_backend):
+        """Calling with edges as the second positional argument raises TypeError."""
+        backend = MagicMock()
+        nodes = []
+        with pytest.raises(TypeError):
+            make_edge_backend(backend, nodes, {})  # type: ignore[call-arg]
+
+    @pytest.mark.asyncio
+    async def test_awaiting_list_entity_nodes_yields_nodes(self, make_edge_backend):
+        """Awaiting backend.list_entity_nodes() returns the nodes list."""
+        nodes = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'fact'}]
+        backend = MagicMock()
+        make_edge_backend(backend, nodes=nodes, edges={})
+        result = await backend.list_entity_nodes()
+        assert result == nodes
+
+    @pytest.mark.asyncio
+    async def test_awaiting_get_all_valid_edges_yields_edges(self, make_edge_backend):
+        """Awaiting backend.get_all_valid_edges() returns the edges dict."""
+        edges = {'u1': [{'uuid': 'e1', 'fact': 'fact', 'name': 'rel'}]}
+        backend = MagicMock()
+        make_edge_backend(backend, nodes=[], edges=edges)
+        result = await backend.get_all_valid_edges()
+        assert result == edges

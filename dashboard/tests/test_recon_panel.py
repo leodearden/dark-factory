@@ -225,22 +225,27 @@ MOCK_VERDICT = {
     'reviewed_at': '2026-03-19T10:00:00+00:00',
 }
 
-MOCK_RUNS = [
-    {
-        'id': 'run-001',
-        'project_id': 'dark_factory',
-        'run_type': 'full',
-        'trigger_reason': 'staleness_timer',
-        'started_at': '2026-03-19T08:00:00+00:00',
-        'completed_at': '2026-03-19T08:05:00+00:00',
-        'events_processed': 7,
-        'status': 'completed',
-        'duration_seconds': 300.0,
-        'journal_entry_count': 3,
-    }
-]
+def mock_runs() -> list[dict]:
+    """Return a fresh list with a fresh dict on each call (mutation-safe factory)."""
+    return [
+        {
+            'id': 'run-001',
+            'project_id': 'dark_factory',
+            'run_type': 'full',
+            'trigger_reason': 'staleness_timer',
+            'started_at': '2026-03-19T08:00:00+00:00',
+            'completed_at': '2026-03-19T08:05:00+00:00',
+            'events_processed': 7,
+            'status': 'completed',
+            'duration_seconds': 300.0,
+            'journal_entry_count': 3,
+        }
+    ]
 
-MOCK_RUNS_NO_JOURNAL = [{**MOCK_RUNS[0], 'journal_entry_count': 0}]
+
+def mock_runs_no_journal() -> list[dict]:
+    """Return a fresh list with a fresh dict (journal_entry_count=0) on each call."""
+    return [{**mock_runs()[0], 'journal_entry_count': 0}]
 
 MOCK_LAST_ATTEMPTED = {
     'dark_factory': {
@@ -282,7 +287,7 @@ def _patch_recon_data(buffer_stats=_UNSET, burst_state=_UNSET, watermarks=_UNSET
     stack.enter_context(patch(
         'dashboard.app.get_recent_runs',
         new_callable=AsyncMock,
-        return_value=runs if runs is not _UNSET else MOCK_RUNS,
+        return_value=runs if runs is not _UNSET else mock_runs(),
     ))
     stack.enter_context(patch(
         'dashboard.app.get_last_attempted_run',
@@ -383,7 +388,7 @@ class TestReconRoute:
     def test_trigger_formatted_in_html(self, client):
         runs_with_colon = [
             {
-                **MOCK_RUNS_NO_JOURNAL[0],
+                **mock_runs_no_journal()[0],
                 'id': 'run-002',
                 'trigger_reason': 'max_staleness:2026-03-19T08:00:00+00:00',
                 'events_processed': 3,
@@ -558,7 +563,7 @@ class TestReconBadgeAriaLabels:
     def test_run_status_running_aria_label(self, client):
         runs_running = [
             {
-                **MOCK_RUNS_NO_JOURNAL[0],
+                **mock_runs_no_journal()[0],
                 'id': 'run-002',
                 'trigger_reason': 'manual',
                 'completed_at': None,
@@ -574,7 +579,7 @@ class TestReconBadgeAriaLabels:
     def test_run_status_failed_aria_label(self, client):
         runs_failed = [
             {
-                **MOCK_RUNS_NO_JOURNAL[0],
+                **mock_runs_no_journal()[0],
                 'id': 'run-003',
                 'trigger_reason': 'manual',
                 'completed_at': '2026-03-19T08:01:00+00:00',
@@ -590,7 +595,7 @@ class TestReconBadgeAriaLabels:
     def test_run_status_rolled_back_aria_label(self, client):
         runs_rb = [
             {
-                **MOCK_RUNS_NO_JOURNAL[0],
+                **mock_runs_no_journal()[0],
                 'id': 'run-004',
                 'trigger_reason': 'manual',
                 'completed_at': '2026-03-19T08:01:00+00:00',
@@ -606,7 +611,7 @@ class TestReconBadgeAriaLabels:
     def test_run_status_circuit_breaker_aria_label(self, client):
         runs_cb = [
             {
-                **MOCK_RUNS_NO_JOURNAL[0],
+                **mock_runs_no_journal()[0],
                 'id': 'run-005',
                 'trigger_reason': 'manual',
                 'completed_at': '2026-03-19T08:01:00+00:00',
@@ -626,12 +631,12 @@ class TestReconJournalBadge:
     def test_badge_shown_when_count_positive(self, client):
         with _patch_recon_data():
             html = client.get('/partials/recon').text
-        # MOCK_RUNS has journal_entry_count=3
+        # mock_runs() has journal_entry_count=3
         assert 'data-testid="journal-badge"' in html
         assert '>3<' in html or '>\n                    3\n' in html or '3</button>' in html
 
     def test_badge_hidden_when_count_zero(self, client):
-        with _patch_recon_data(runs=MOCK_RUNS_NO_JOURNAL):
+        with _patch_recon_data(runs=mock_runs_no_journal()):
             html = client.get('/partials/recon').text
         assert 'data-testid="journal-badge"' not in html
 
@@ -652,7 +657,7 @@ class TestReconJournalBadge:
     def test_badge_has_aria_label(self, client):
         with _patch_recon_data():
             html = client.get('/partials/recon').text
-        # MOCK_RUNS has journal_entry_count=3
+        # mock_runs() has journal_entry_count=3
         assert 'aria-label="Show 3 journal entries"' in html
 
     def test_badge_has_hover_style(self, client):
@@ -675,7 +680,7 @@ class TestReconJournalBadge:
     def test_badge_aria_label_dynamic_count(self, client):
         runs_5 = [
             {
-                **MOCK_RUNS[0],
+                **mock_runs()[0],
                 'journal_entry_count': 5,
             }
         ]
@@ -694,14 +699,14 @@ class TestReconDetailTrigger:
         assert 'x-data="{ open: false }"' not in html
         assert "x-data='{ open: false }'" not in html
 
-    def test_zero_journal_count_hides_badge_and_detail(self, client):
-        runs_zero = MOCK_RUNS_NO_JOURNAL
+    def test_zero_journal_count_hides_detail_row(self, client):
+        runs_zero = mock_runs_no_journal()
         with _patch_recon_data(runs=runs_zero):
             html = client.get('/partials/recon').text
         assert 'data-testid="run-detail-row"' not in html
 
     def test_positive_journal_count_shows_detail_row(self, client):
-        """Default MOCK_RUNS (journal_entry_count=3): detail row is emitted with x-show and data-testid."""
+        """Default mock_runs() (journal_entry_count=3): detail row is emitted with x-show and data-testid."""
         with _patch_recon_data():
             html = client.get('/partials/recon').text
         assert 'x-show="open"' in html
@@ -907,7 +912,7 @@ class TestRunPanelJournalBadgeRegression:
 
     def test_badge_hidden_with_zero_entries(self, client):
         """Badge not rendered when journal_entry_count == 0."""
-        runs_zero = MOCK_RUNS_NO_JOURNAL
+        runs_zero = mock_runs_no_journal()
         with _patch_recon_data(runs=runs_zero):
             html = client.get('/partials/recon').text
         assert 'data-testid="journal-badge"' not in html
@@ -1127,7 +1132,7 @@ class TestDetailRowJournalGuard:
 
     def test_detail_row_not_emitted_when_journal_count_zero(self, client):
         """When journal_entry_count=0 the detail <tr x-show="open"> must not be emitted."""
-        runs_zero = MOCK_RUNS_NO_JOURNAL
+        runs_zero = mock_runs_no_journal()
         with _patch_recon_data(runs=runs_zero):
             html = client.get('/partials/recon').text
         assert 'x-show="open"' not in html
@@ -1135,14 +1140,14 @@ class TestDetailRowJournalGuard:
 
     def test_no_orphaned_x_cloak_when_journal_count_zero(self, client):
         """When journal_entry_count=0 there must be no x-cloak on orphaned detail row."""
-        runs_zero = MOCK_RUNS_NO_JOURNAL
+        runs_zero = mock_runs_no_journal()
         with _patch_recon_data(runs=runs_zero):
             html = client.get('/partials/recon').text
         assert 'x-cloak' not in html
 
     def test_no_error_when_journal_count_missing(self, client):
         """When journal_entry_count key is absent the template must render 200, no badge, no detail row."""
-        run_no_key = {k: v for k, v in MOCK_RUNS[0].items() if k != 'journal_entry_count'}
+        run_no_key = {k: v for k, v in mock_runs()[0].items() if k != 'journal_entry_count'}
         with _patch_recon_data(runs=[run_no_key]):
             resp = client.get('/partials/recon')
         assert resp.status_code == 200
@@ -1151,14 +1156,14 @@ class TestDetailRowJournalGuard:
         assert 'x-show="open"' not in html
 
     def test_detail_row_emitted_when_journal_count_positive(self, client):
-        """Default MOCK_RUNS (journal_entry_count=3): detail row and hx-get endpoint are present."""
+        """Default mock_runs() (journal_entry_count=3): detail row and hx-get endpoint are present."""
         with _patch_recon_data():
             html = client.get('/partials/recon').text
         assert 'x-show="open"' in html
         assert 'hx-get="/partials/recon/run/run-001"' in html
 
     def test_detail_row_has_x_cloak_when_journal_count_positive(self, client):
-        """Default MOCK_RUNS (journal_entry_count=3): detail row carries x-cloak."""
+        """Default mock_runs() (journal_entry_count=3): detail row carries x-cloak."""
         with _patch_recon_data():
             html = client.get('/partials/recon').text
         assert 'x-cloak' in html
@@ -1166,9 +1171,9 @@ class TestDetailRowJournalGuard:
     def test_mixed_journal_counts_emit_detail_only_for_positive_counts(self, client):
         """Mixed journal counts [3, 0, 1]: detail rows emitted only for runs with count > 0."""
         mixed_runs = [
-            {**MOCK_RUNS[0], 'id': 'run-mix-a', 'journal_entry_count': 3},
-            {**MOCK_RUNS[0], 'id': 'run-mix-b', 'journal_entry_count': 0},
-            {**MOCK_RUNS[0], 'id': 'run-mix-c', 'journal_entry_count': 1},
+            {**mock_runs()[0], 'id': 'run-mix-a', 'journal_entry_count': 3},
+            {**mock_runs()[0], 'id': 'run-mix-b', 'journal_entry_count': 0},
+            {**mock_runs()[0], 'id': 'run-mix-c', 'journal_entry_count': 1},
         ]
         with _patch_recon_data(runs=mixed_runs):
             html = client.get('/partials/recon').text
@@ -1181,8 +1186,8 @@ class TestDetailRowJournalGuard:
         """Per-row scoping: badge and detail row are absent in zero-count tbody, present in positive-count tbody."""
         # Use ids without 'run-' prefix to avoid double prefix in rendered id="run-{run.id}"
         runs = [
-            {**MOCK_RUNS[0], 'id': 'scoped-zero', 'journal_entry_count': 0},
-            {**MOCK_RUNS[0], 'id': 'scoped-pos', 'journal_entry_count': 5},
+            {**mock_runs()[0], 'id': 'scoped-zero', 'journal_entry_count': 0},
+            {**mock_runs()[0], 'id': 'scoped-pos', 'journal_entry_count': 5},
         ]
         with _patch_recon_data(runs=runs):
             html = client.get('/partials/recon').text
@@ -1203,3 +1208,33 @@ class TestDetailRowJournalGuard:
         # Positive-count row: both badge and detail row must be emitted
         assert 'data-testid="journal-badge"' in pos_tbody
         assert 'data-testid="run-detail-row"' in pos_tbody
+
+
+class TestMockRunsFactory:
+    """Verify that mock_runs() is a proper factory: each call returns a fresh list with fresh dicts."""
+
+    def test_mock_runs_returns_fresh_copy_each_call(self):
+        """mock_runs() must allocate new list and new inner dict objects on every call."""
+        # Distinct list identity
+        assert mock_runs() is not mock_runs()
+        # Distinct inner-dict identity
+        assert mock_runs()[0] is not mock_runs()[0]
+        # Mutation of one call's result must not affect the next call
+        first = mock_runs()
+        first[0]['events_processed'] = 999
+        assert mock_runs()[0]['events_processed'] == 7
+
+    def test_mock_runs_no_journal_returns_fresh_copy_each_call(self):
+        """mock_runs_no_journal() must allocate new list and new inner dict objects on every call."""
+        # Distinct list identity
+        assert mock_runs_no_journal() is not mock_runs_no_journal()
+        # Distinct inner-dict identity
+        assert mock_runs_no_journal()[0] is not mock_runs_no_journal()[0]
+        # Mutation of one call's result must not affect the next call
+        first = mock_runs_no_journal()
+        first[0]['events_processed'] = 999
+        assert mock_runs_no_journal()[0]['events_processed'] == 7
+
+    def test_mock_runs_no_journal_has_zero_journal_entry_count(self):
+        """mock_runs_no_journal()[0]['journal_entry_count'] must be 0."""
+        assert mock_runs_no_journal()[0]['journal_entry_count'] == 0
