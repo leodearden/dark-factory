@@ -285,13 +285,7 @@ class UsageGate:
         oauth_token: str | None,
     ) -> None:
         """Mark the matching account as capped."""
-        acct = self._find_account_by_token(oauth_token) if oauth_token else None
-        if acct is None:
-            # Unknown token — try first uncapped account as best guess
-            for a in self._accounts:
-                if not a.capped:
-                    acct = a
-                    break
+        acct = self._resolve_account(oauth_token)
         if acct is None:
             logger.warning(f'Cap detected but no matching account: {reason}')
             return
