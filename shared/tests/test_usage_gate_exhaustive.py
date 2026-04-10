@@ -405,6 +405,77 @@ class TestCapHitNowUsingExtraSemantics:
 
 
 # =========================================================================
+# TestCapConfirmKeywordEnforcement
+# =========================================================================
+
+
+class TestCapConfirmKeywordEnforcement:
+    """Tests asserting CAP_CONFIRM_KEYWORDS secondary check is required.
+
+    detect_cap_hit must require BOTH a matching prefix AND at least one of
+    ['resets', 'usage limit', 'upgrade'] in the combined text, for both
+    CAP_HIT_PREFIXES and NEAR_CAP_PREFIXES (Claude backend). These tests FAIL
+    until step-6 enforces the guard in detect_cap_hit.
+    """
+
+    def test_cap_hit_prefix_without_confirm_keyword_returns_false(self):
+        """Prefix match alone must not trigger detection when no secondary keyword present."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit('', "You've used all the air in the room")
+        acct = gate._accounts[0]
+        assert result is False
+        assert acct.capped is False
+
+    def test_near_cap_prefix_without_confirm_keyword_returns_false(self):
+        """NEAR_CAP prefix alone must not trigger detection when no secondary keyword present."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit('', "You're close to the finish line")
+        acct = gate._accounts[0]
+        assert result is False
+        assert acct.near_cap is False
+
+    def test_cap_hit_prefix_with_resets_keyword_returns_true(self):
+        """Prefix + 'resets' secondary keyword must trigger CAP_HIT detection."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit('', "You've hit your quota. resets in 3h.")
+        acct = gate._accounts[0]
+        assert result is True
+        assert acct.capped is True
+
+    def test_cap_hit_prefix_with_usage_limit_keyword_returns_true(self):
+        """Prefix + 'usage limit' secondary keyword must trigger CAP_HIT detection."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit('', "You've hit your usage limit")
+        acct = gate._accounts[0]
+        assert result is True
+        assert acct.capped is True
+
+    def test_cap_hit_prefix_with_upgrade_keyword_returns_true(self):
+        """Prefix + 'upgrade' secondary keyword must trigger CAP_HIT detection."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit('', "You've used all credits. Upgrade for more.")
+        acct = gate._accounts[0]
+        assert result is True
+        assert acct.capped is True
+
+    def test_near_cap_prefix_with_confirm_keyword_returns_true(self):
+        """NEAR_CAP prefix + secondary keyword must trigger near-cap detection."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit('', "You're close to your usage limit")
+        acct = gate._accounts[0]
+        assert result is True
+        assert acct.near_cap is True
+
+    def test_confirm_keyword_without_prefix_returns_false(self):
+        """Confirm keyword alone (no matching prefix) must not trigger detection."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit(
+            '', 'Your test run resets the state and the upgrade worked',
+        )
+        assert result is False
+
+
+# =========================================================================
 # TestResetTimeParsing
 # =========================================================================
 
