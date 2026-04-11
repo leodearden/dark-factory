@@ -264,3 +264,14 @@ class TestRealTestsDirectoryIsClean:
             f'Unexpected violations in fused-memory/tests/:\n{result.stdout}'
         )
         assert result.stdout == ''
+
+
+class TestHooksIntegration:
+    """hooks/project-checks must invoke the asyncmock style checker."""
+
+    def test_hooks_project_checks_invokes_asyncmock_style_check(self):
+        """hooks/project-checks references check_asyncmock_assertion_style.py and fused-memory/tests."""
+        hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
+        content = hooks_path.read_text(encoding='utf-8')
+        assert 'check_asyncmock_assertion_style.py' in content
+        assert 'fused-memory/tests' in content
