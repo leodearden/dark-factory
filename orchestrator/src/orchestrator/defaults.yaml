@@ -13,6 +13,7 @@ max_verify_attempts: 5
 max_review_cycles: 2
 reviewer_stagger_secs: 2.0
 max_reviewer_retries: 4
+max_amendment_rounds: 1
 
 # Merge conflict reduction
 max_advance_attempts: 3
