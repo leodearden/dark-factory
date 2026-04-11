@@ -1406,6 +1406,49 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
             f'positions: [10]={pos_10}, [8]={pos_8}, [5]={pos_5}, [3]={pos_3}'
         )
 
+    @pytest.mark.asyncio
+    async def test_payload_done_tasks_older_than_30_dropped_from_recently_completed(
+        self, mock_deps, watermark
+    ):
+        """filter_task_tree caps done_tasks at MAX_DONE_TASKS_RETAINED=30; ids 1-5 dropped, 6-35 retained."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [self._make_task(i, 'done') for i in range(1, 36)]  # ids 1..35
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, '### Recently Completed Tasks')
+        assert section, "Payload missing '### Recently Completed Tasks' section"
+
+        # (a) Newest task (id=35) must appear — it is highest-id and always retained
+        assert '- [35] ' in section, (
+            f"Task id=35 not found in Recently Completed section; "
+            f"it should be the first retained entry (highest id).\n"
+            f"Section content:\n{section}"
+        )
+
+        # (b) Oldest task (id=1) must NOT appear — dropped by MAX_DONE_TASKS_RETAINED=30 cap
+        assert '- [1] ' not in section, (
+            f"Task id=1 should be dropped by the MAX_DONE_TASKS_RETAINED=30 cap "
+            f"(retained ids are 35..6, dropped ids are 5..1).\n"
+            f"Section content:\n{section}"
+        )
+
+        # (c) id=6 is the lowest retained (boundary check — pins exact cap cutoff)
+        assert '- [6] ' in section, (
+            f"Task id=6 should be retained (it is at the cap boundary; ids 35..6 are kept).\n"
+            f"Section content:\n{section}"
+        )
+
+        # (d) id=5 is the highest dropped (off-by-one regression guard)
+        assert '- [5] ' not in section, (
+            f"Task id=5 should be dropped (ids 5..1 are cut by MAX_DONE_TASKS_RETAINED=30).\n"
+            f"Section content:\n{section}"
+        )
+
 
 # ── Tests for task 455: MemoryConsolidator filtered task tree injection ─────────
 
