@@ -782,3 +782,12 @@ class TestStewardDefaultConfig:
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.steward_max_retries == 1
+
+    def test_default_steward_wall_clock_timeout_is_1800(self, monkeypatch, tmp_path):
+        """timeouts.steward default must be 1800s (per-invocation wall-clock)."""
+        from orchestrator.config import OrchestratorConfig
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.timeouts.steward == 1800.0
