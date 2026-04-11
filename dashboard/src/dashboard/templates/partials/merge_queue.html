@@ -226,13 +226,6 @@
     renderOutcomeChart();
   }
 
-  document.addEventListener('htmx:afterSettle', function(e) {
-    if (e.detail && e.detail.target) {
-      var sec = e.detail.target.closest('[data-section="merge-queue"]');
-      if (sec) renderAll();
-    }
-  });
-
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', renderAll);
   } else {
