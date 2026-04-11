@@ -307,12 +307,12 @@ def _collect_cancel_errors(done: Iterable[asyncio.Task[Any]]) -> list[asyncio.Ca
     internally without an explicit ``task.cancel()`` call, because the
     runtime transitions the task to the cancelled state in both scenarios.
 
-    # Belt-and-suspenders: in current CPython a coroutine raising
-    # CancelledError causes task.cancelled() to return True, so the
-    # secondary branch (task.exception() returning CancelledError while
-    # task.cancelled() is False) is unreachable in practice. Kept in case
-    # a future runtime routes coroutine-raised CancelledError via
-    # task.exception() instead of task.cancelled().
+    Belt-and-suspenders: in current CPython a coroutine raising
+    CancelledError causes task.cancelled() to return True, so the
+    secondary branch (task.exception() returning CancelledError while
+    task.cancelled() is False) is unreachable in practice. Kept in case
+    a future runtime routes coroutine-raised CancelledError via
+    task.exception() instead of task.cancelled().
     """
     errors: list[asyncio.CancelledError] = []
     for task in done:
@@ -488,10 +488,24 @@ class _EvalScheduler:
 
     async def set_task_status(self, task_id: str, status: str):
         logger.info(f'[eval] Task {task_id} → {status}')
-        self._status_cache[task_id] = status
+        self._set_cached_status(task_id, status)
 
     def get_cached_status(self, task_id: str) -> str | None:
         return self._status_cache.get(task_id)
+
+    def _set_cached_status(self, task_id: str, status: str) -> None:
+        """Write the cached status for a task.
+
+        Write-side counterpart to get_cached_status().  Mirrors the helper on
+        Scheduler for structural symmetry.
+
+        TODO: this is an exact one-liner duplicate of Scheduler._set_cached_status
+        (orchestrator/src/orchestrator/scheduler.py).  The two classes share no
+        base class, so the duplication is unavoidable today.  Revisit if cache
+        management grows (TTL, instrumentation, invalidation) to keep both sites
+        in sync.
+        """
+        self._status_cache[task_id] = status
 
     async def handle_blast_radius_expansion(self, task_id: str, current: list[str], needed: list[str]) -> bool:
         return True  # always allow in eval mode

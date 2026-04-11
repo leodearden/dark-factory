@@ -1,6 +1,7 @@
 """Tests for git operations — worktree lifecycle."""
 
 import asyncio
+import logging
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -8,7 +9,13 @@ from unittest.mock import patch
 import pytest
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, WorktreeInfo, _run
+from orchestrator.git_ops import (
+    GitOps,
+    ScrubResult,
+    WorktreeInfo,
+    _run,
+    scrub_task_dir_from_tree,
+)
 
 
 @pytest.fixture
@@ -42,7 +49,7 @@ async def _inject_uu_state(cwd: Path, path: str, tag: str = '') -> None:
     """
     def _run_sync(cmd, **kwargs):
         return subprocess.run(
-            cmd, cwd=str(cwd), capture_output=True, **kwargs,
+            cmd, cwd=str(cwd), capture_output=True, check=True, **kwargs,
         )
 
     h1 = _run_sync(
@@ -262,11 +269,11 @@ class TestWorktreeLifecycle:
         (worktree_info.path / 'cancel_test.py').write_text('x = 1\n')
         await git_ops.commit(worktree_info.path, 'Add cancel test file')
 
-        # Patch _scrub_task_dir_from_tree to raise CancelledError, simulating
+        # Patch scrub_task_dir_from_tree to raise CancelledError, simulating
         # task cancellation at the point where the merge commit already exists
         # but cleanup has not yet been called.
         with patch(
-            'orchestrator.git_ops._scrub_task_dir_from_tree',
+            'orchestrator.git_ops.scrub_task_dir_from_tree',
             side_effect=asyncio.CancelledError,
         ), pytest.raises(asyncio.CancelledError):
             await git_ops.merge_to_main(worktree_info.path, 'feature-cancel')
@@ -957,9 +964,9 @@ class TestWorkingTreeSync:
         original_run = _run
         recorded: list[list[str]] = []
 
-        async def recording_run(cmd, cwd=None):
+        async def recording_run(cmd, cwd=None, **kwargs):
             recorded.append(list(cmd))
-            return await original_run(cmd, cwd=cwd)
+            return await original_run(cmd, cwd=cwd, **kwargs)
 
         with patch('orchestrator.git_ops._run', side_effect=recording_run):
             result = await git_ops.advance_main(
@@ -977,6 +984,16 @@ class TestWorkingTreeSync:
         assert not any(c[:3] == ['git', 'stash', 'push'] for c in recorded), (
             f'guard should fire before stash push; recorded stash cmds: '
             f'{[c for c in recorded if c[:2] == ["git", "stash"]]}'
+        )
+
+        # Positive-path: confirm the unmerged-state guard was actually entered.
+        # _detect_unmerged_paths calls ['git', 'status', '--porcelain']; this
+        # command does not appear in the pre-guard path (ls-tree / merge-base),
+        # so its presence uniquely certifies that the guard ran rather than
+        # short-circuiting for an unrelated reason.
+        assert any(c[:2] == ['git', 'status'] and '--porcelain' in c for c in recorded), (
+            f'expected _detect_unmerged_paths to invoke git status --porcelain '
+            f'(guard path marker); recorded commands: {recorded}'
         )
 
         # Main ref must NOT have moved
@@ -1116,6 +1133,19 @@ class TestUnmergedDetection:
             f'Expected helper_probe.py in unmerged paths, got: {unmerged}'
         )
 
+    async def test_inject_uu_state_raises_on_non_git_cwd(
+        self, tmp_path: Path,
+    ):
+        """_inject_uu_state raises CalledProcessError when cwd is not a git repo.
+
+        git hash-object exits with rc != 0 in a non-git directory; without
+        check=True the helper silently builds an invalid payload.  With
+        check=True it raises immediately, turning silent corruption into an
+        actionable CalledProcessError that includes stderr.
+        """
+        with pytest.raises(subprocess.CalledProcessError):
+            await _inject_uu_state(tmp_path, 'foo.py')
+
 
 @pytest.mark.asyncio
 class TestSafeStashPopWithRecovery:
@@ -1216,3 +1246,159 @@ class TestSafeStashPopWithRecovery:
         # No unmerged paths remain in project_root
         unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
         assert unmerged == [], f'Expected no unmerged paths after recovery, got: {unmerged}'
+
+
+@pytest.mark.asyncio
+class TestScrubTaskDirFromTree:
+    async def test_scrub_returns_failed_when_git_rm_fails(
+        self, git_ops: GitOps, caplog,
+    ):
+        """scrub_task_dir_from_tree returns FAILED and skips rmtree/commit when git rm fails."""
+        # Create a real worktree for a realistic working directory (no mock yet)
+        worktree_info = await git_ops.create_worktree('scrub-rm-fail')
+
+        # Create a .task/ directory with sentinel content on disk
+        task_dir = worktree_info.path / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        sentinel = task_dir / 'sentinel.txt'
+        sentinel.write_text('keep-me\n')
+
+        commit_calls: list = []
+
+        async def mock_run(cmd, cwd=None):
+            # (a) Fake .task/ contamination detected via ls-tree
+            if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
+                return (0, '.task/tracked.txt', '')
+            # (b) Fail git rm --cached to simulate index corruption / permission error
+            if cmd[:5] == ['git', 'rm', '-r', '--cached', '--']:
+                return (1, '', 'fatal: simulated git rm failure')
+            # Strict — no other git commands should be reached on the failure path
+            pytest.fail(f'unexpected _run call on git-rm failure path: {cmd}')
+
+        with (
+            caplog.at_level(logging.ERROR, logger='orchestrator.git_ops'),
+            patch('orchestrator.git_ops._run', side_effect=mock_run),
+        ):
+            result = await scrub_task_dir_from_tree(worktree_info.path, 'test-rm-fail')
+
+        # Return value must be FAILED — git rm failed, scrub did not complete
+        assert result == ScrubResult.FAILED, (
+            f'Expected ScrubResult.FAILED on git rm failure, got {result!r}'
+        )
+
+        # An ERROR must have been logged containing the context label and the stderr
+        error_msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any(
+            'test-rm-fail' in m and 'simulated git rm failure' in m
+            for m in error_msgs
+        ), f'Expected ERROR log with context and stderr, got: {error_msgs}'
+
+        # Filesystem .task/ must still exist — rmtree must have been skipped
+        assert sentinel.exists(), (
+            'sentinel.txt was deleted — rmtree must be skipped on git rm failure'
+        )
+
+        # No git commit should have been issued (early return before commit step)
+        assert not commit_calls, (
+            f'Expected no commit calls on git rm failure, got: {commit_calls}'
+        )
+
+    async def test_scrub_returns_scrubbed_on_happy_path(
+        self, git_ops: GitOps, caplog,
+    ):
+        """scrub_task_dir_from_tree returns SCRUBBED, runs rmtree, and commits on success."""
+        worktree_info = await git_ops.create_worktree('scrub-happy')
+
+        # Sentinel inside .task/ — must be removed by rmtree after a successful scrub
+        task_dir = worktree_info.path / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        sentinel = task_dir / 'sentinel.txt'
+        sentinel.write_text('remove-me\n')
+
+        commit_calls: list = []
+
+        async def mock_run(cmd, cwd=None):
+            # (a) Fake tracked .task/ file via ls-tree
+            if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
+                return (0, '.task/tracked.txt', '')
+            # (b) git rm --cached succeeds
+            if cmd[:5] == ['git', 'rm', '-r', '--cached', '--']:
+                return (0, '', '')
+            # (c) git commit (amend) succeeds — record and ack
+            if len(cmd) >= 2 and cmd[1] == 'commit':
+                commit_calls.append(list(cmd))
+                return (0, '', '')
+            # Strict — any other command is unexpected on the success path
+            pytest.fail(f'unexpected _run call on scrub happy path: {cmd}')
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.git_ops'),
+            patch('orchestrator.git_ops._run', side_effect=mock_run),
+        ):
+            result = await scrub_task_dir_from_tree(worktree_info.path, 'test-happy')
+
+        # Return value must be SCRUBBED
+        assert result == ScrubResult.SCRUBBED, (
+            f'Expected ScrubResult.SCRUBBED on success, got {result!r}'
+        )
+
+        # No ERROR should have been logged
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not errors, f'Unexpected ERROR log entries: {[r.getMessage() for r in errors]}'
+
+        # Filesystem .task/ must have been cleaned up (rmtree ran)
+        assert not sentinel.exists(), (
+            'sentinel.txt still exists — rmtree must run on a successful scrub'
+        )
+
+        # git commit must have been called exactly once
+        assert len(commit_calls) == 1, (
+            f'Expected exactly one commit call, got: {commit_calls}'
+        )
+
+    async def test_scrub_returns_failed_when_git_commit_fails(
+        self, git_ops: GitOps, caplog,
+    ):
+        """scrub_task_dir_from_tree returns FAILED and logs error when commit fails post-rm."""
+        worktree_info = await git_ops.create_worktree('scrub-commit-fail')
+
+        task_dir = worktree_info.path / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        sentinel = task_dir / 'sentinel.txt'
+        sentinel.write_text('already-removed-by-rmtree\n')
+
+        async def mock_run(cmd, cwd=None):
+            # (a) Fake tracked .task/ file via ls-tree
+            if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
+                return (0, '.task/tracked.txt', '')
+            # (b) git rm --cached succeeds (contamination removed from index)
+            if cmd[:5] == ['git', 'rm', '-r', '--cached', '--']:
+                return (0, '', '')
+            # (c) git commit fails (e.g. locked index, hook failure)
+            if len(cmd) >= 2 and cmd[1] == 'commit':
+                return (1, '', 'fatal: simulated commit failure')
+            # Strict — unexpected command
+            pytest.fail(f'unexpected _run call on commit-failure path: {cmd}')
+
+        with (
+            caplog.at_level(logging.ERROR, logger='orchestrator.git_ops'),
+            patch('orchestrator.git_ops._run', side_effect=mock_run),
+        ):
+            result = await scrub_task_dir_from_tree(worktree_info.path, 'test-commit-fail')
+
+        # Return value must be FAILED — commit did not succeed
+        assert result == ScrubResult.FAILED, (
+            f'Expected ScrubResult.FAILED on commit failure, got {result!r}'
+        )
+
+        # An ERROR must have been logged with context and the commit stderr
+        error_msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any(
+            'test-commit-fail' in m and 'simulated commit failure' in m
+            for m in error_msgs
+        ), f'Expected ERROR log with context and stderr, got: {error_msgs}'
+
+        # Filesystem .task/ must be GONE — rmtree runs before the commit step
+        assert not sentinel.exists(), (
+            'sentinel.txt still exists — rmtree must run before git commit attempt'
+        )

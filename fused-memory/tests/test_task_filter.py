@@ -274,7 +274,7 @@ class TestFormatFilteredTaskTree:
         """
         # 500 active tasks with plausible-length titles
         active = [
-            _make_task(i, 'pending', f'This is a moderately long title for task number {i} in the queue')
+            _make_task(i, 'pending', f'Task title {i}')
             for i in range(1, 501)
         ]
         tree = FilteredTaskTree(
@@ -290,9 +290,64 @@ class TestFormatFilteredTaskTree:
         # Output must not exceed max_chars budget (default 50,000)
         assert len(output) <= 50_000
 
+        # Task 51 is beyond the max_tasks=50 cap — must not appear in body
+        assert 'Task title 51' not in output
+
         # Header must contain the max_tasks-cap omission phrase: pins count + intent,
         # tolerates preposition rewording (e.g. 'omitted by' vs 'omitted due to')
         assert re.search(r'450\s+more active.*max_tasks', output)
+
+    def test_char_budget_clamps_below_max_tasks(self):
+        """When max_chars forces truncation below the max_tasks cap, the truncation notice
+        reflects post-cap survivors, not total active.
+
+        Regression guard for task 480 (esc-480-107).
+        """
+        tree = self._make_tree(active_count=10, done_count=0, cancelled_count=0, other_count=0)
+
+        # max_chars=240 is chosen so that three regimes all exercise in one pass:
+        #   (1) max_tasks=5 caps 10 active tasks to 5 post-cap survivors,
+        #   (2) budget = 240 - 118 (header) - 29 (summary) = 93 admits 2 task lines
+        #       at 37 chars each (36-char line + 1-char newline separator) before
+        #       the accumulator overflows,
+        #   (3) the lazy pop loop fires: first-pass result = 266 > 240, so one line
+        #       is popped, leaving kept_lines=[line1], trimmed_count=4, result=229 <= 240.
+        max_chars = 240
+        output = format_filtered_task_tree(tree, max_tasks=5, max_chars=max_chars)
+
+        # Output must honour the char budget
+        assert len(output) <= max_chars
+
+        # The char-budget clamp branch must have fired — look for the truncation notice
+        match = re.search(r'\.\.\. and (\d+) more active \(truncated for budget\)', output)
+        assert match is not None, f'Expected truncation notice in output: {output!r}'
+        trimmed_count = int(match.group(1))
+
+        # Lower bound: at least one task was dropped by the char-budget clamp, confirming
+        # the lazy pop loop genuinely fired (not just the initial accumulator cycle).
+        # If trimmed_count=0, the budget arithmetic has drifted and the pop regime is
+        # no longer being exercised.
+        assert trimmed_count >= 1, (
+            f'trimmed_count={trimmed_count} should be >= 1; '
+            f'the lazy pop loop did not fire — budget may be too loose or derivation drifted'
+        )
+
+        # At least one task line must survive the lazy pop loop — guards against the
+        # regression where the notice fires but kept_lines ends up empty.
+        assert '- [1]' in output, (
+            'Task 1 line should survive the lazy pop loop; '
+            'if missing, the budget accounting has regressed'
+        )
+
+        # trimmed_count must be exactly 4 (5 post-cap survivors minus 1 kept line after
+        # the lazy pop loop).  Exact equality catches: (a) the total_active bug where
+        # buggy trimmed_count = 10 - 1 = 9, which fails 9 != 4; (b) subtler off-by-one
+        # errors in truncation accounting that the upper bound alone would not catch.
+        assert trimmed_count == 4, (
+            f'trimmed_count={trimmed_count} should be exactly 4 '
+            f'(5 post-cap survivors minus 1 kept line); '
+            f'bug: trimmed_count tracks total_active instead of len(active[:max_tasks])'
+        )
 
     def test_empty_active_and_empty_tree(self):
         """format_filtered_task_tree handles empty FilteredTaskTree gracefully."""

@@ -5,7 +5,9 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import statistics
 import time
+from collections import deque
 from dataclasses import dataclass
 
 from orchestrator.config import OrchestratorConfig
@@ -64,6 +66,8 @@ class ModuleLockTable:
     def __init__(self, config: OrchestratorConfig):
         self._limits: dict[str, int] = {}
         self._held: dict[str, set[str]] = {}  # task_id -> set of held modules
+        # normalized_module -> (owner_task_id, deadline_monotonic)
+        self._parked: dict[str, tuple[str, float]] = {}
         self._config = config
 
     # --- Hierarchy helpers ---
@@ -82,6 +86,65 @@ class ModuleLockTable:
             if any(self._conflicts(held, module) for held in task_modules):
                 count += 1
         return count
+
+    # --- Park (reservation) helpers ---
+
+    def _is_parked_blocks(self, module: str, task_id: str, now: float) -> bool:
+        """Return True iff any active park hierarchically conflicts with *module*
+        and is owned by a different task.
+
+        Expired parks are ignored (they'll be cleaned up on the next prune).
+        """
+        for parked_module, (owner, deadline) in self._parked.items():
+            if owner == task_id:
+                continue
+            if deadline <= now:
+                continue
+            if self._conflicts(parked_module, module):
+                return True
+        return False
+
+    def has_parks(self, task_id: str) -> bool:
+        """Return True if *task_id* currently owns any reservation."""
+        return any(owner == task_id for owner, _ in self._parked.values())
+
+    def install_parks(
+        self, task_id: str, modules: list[str], deadline: float
+    ) -> list[str]:
+        """Install reservations on the normalized form of *modules* for *task_id*.
+
+        Returns the list of normalized modules actually parked.
+        """
+        depth = self._config.lock_depth
+        installed: list[str] = []
+        for m in modules:
+            normalized = normalize_lock(m, depth)
+            if not normalized:
+                continue
+            self._parked[normalized] = (task_id, deadline)
+            installed.append(normalized)
+        return installed
+
+    def clear_parks_for(self, task_id: str) -> None:
+        """Remove every reservation owned by *task_id*."""
+        self._parked = {
+            m: (owner, deadline)
+            for m, (owner, deadline) in self._parked.items()
+            if owner != task_id
+        }
+
+    def prune_expired_parks(self, now: float) -> list[str]:
+        """Drop parks whose deadline has passed. Returns evicted owner task IDs
+        (deduplicated, preserving first-seen order)."""
+        expired_modules = [
+            m for m, (_, deadline) in self._parked.items() if deadline <= now
+        ]
+        evicted: list[str] = []
+        for m in expired_modules:
+            owner, _ = self._parked.pop(m)
+            if owner not in evicted:
+                evicted.append(owner)
+        return evicted
 
     # --- Limit lookup (unchanged) ---
 
@@ -109,16 +172,22 @@ class ModuleLockTable:
         """Non-blocking attempt to acquire all module locks.
 
         Uses hierarchical conflict detection: a lock on ``A/B`` conflicts with
-        ``A/B/C`` (and vice-versa) but NOT with ``A/D``.
+        ``A/B/C`` (and vice-versa) but NOT with ``A/D``.  Also refuses if any
+        requested module hierarchically conflicts with an active reservation
+        owned by a different task (see ``install_parks``).
 
         Returns True if all acquired, False if any unavailable.
         """
         depth = self._config.lock_depth
         normalized = list({normalize_lock(m, depth) for m in modules})
+        now = time.monotonic()
 
-        # Check every requested module against all other tasks' held locks
+        # Check every requested module against all other tasks' held locks and
+        # active reservations owned by other tasks.
         for module in normalized:
             if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
+                return False
+            if self._is_parked_blocks(module, task_id, now):
                 return False
 
         self._held[task_id] = set(normalized)
@@ -143,8 +212,11 @@ class ModuleLockTable:
         if not new_modules:
             return True
 
+        now = time.monotonic()
         for module in new_modules:
             if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
+                return False
+            if self._is_parked_blocks(module, task_id, now):
                 return False
 
         self._held[task_id].update(new_modules)
@@ -166,6 +238,12 @@ class Scheduler:
         self._status_cache: dict[str, str] = {}
         self._fallback_warned: set[str] = set()  # task IDs already warned about fallback
         self._requeue_until: dict[str, float] = {}  # task_id -> monotonic deadline
+        # --- Fairness state (see orchestrator.config.FairnessConfig) ---
+        self._skip_count: dict[str, int] = {}  # task_id -> consecutive top-skip count
+        self._task_start_times: dict[str, float] = {}  # task_id -> monotonic start
+        self._recent_durations: deque[float] = deque(
+            maxlen=config.fairness.median_window
+        )
 
     async def get_tasks(self) -> list[dict]:
         """Fetch all tasks from fused-memory/taskmaster."""
@@ -205,7 +283,7 @@ class Scheduler:
                                     '(external reinstatement)',
                                     tid, s, old,
                                 )
-                            self._status_cache[tid] = s
+                            self._set_cached_status(tid, s)
                     return tasks
         except Exception as e:
             logger.error(f'Failed to fetch tasks: {e}')
@@ -233,13 +311,22 @@ class Scheduler:
                 },
                 timeout=15,
             )
-            self._status_cache[task_id] = status
+            self._set_cached_status(task_id, status)
         except Exception as e:
             logger.error(f'Failed to set task {task_id} status to {status}: {e}')
 
     def get_cached_status(self, task_id: str) -> str | None:
         """Return the last known status for a task, or None if not yet seen."""
         return self._status_cache.get(task_id)
+
+    def _set_cached_status(self, task_id: str, status: str) -> None:
+        """Write the cached status for a task.
+
+        Write-side counterpart to get_cached_status().  All internal cache
+        writes funnel through this single helper, mirroring the single read
+        choke-point so both sides are consistently overridable and testable.
+        """
+        self._status_cache[task_id] = status
 
     async def update_task(self, task_id: str, metadata: str | dict) -> bool:
         """Update task metadata via fused-memory. Returns True on success."""
@@ -301,11 +388,72 @@ class Scheduler:
                 return False
         return True
 
+    def _compute_lease(self) -> float:
+        """Compute a reservation lease from the rolling duration window.
+
+        - Empty history → midpoint of ``[lease_min_secs, lease_max_secs]``
+        - Otherwise → ``median * lease_multiplier``, clamped to bounds.
+        """
+        f = self.config.fairness
+        if not self._recent_durations:
+            return (f.lease_min_secs + f.lease_max_secs) / 2
+        median = statistics.median(self._recent_durations)
+        lease = median * f.lease_multiplier
+        return max(f.lease_min_secs, min(lease, f.lease_max_secs))
+
+    def _bump_skip_and_maybe_park(self, task_id: str, modules: list[str]) -> None:
+        """Increment *task_id*'s skip counter; install a reservation if it
+        has just crossed ``skip_threshold`` and does not already hold parks.
+        """
+        if not task_id:
+            return
+        count = self._skip_count.get(task_id, 0) + 1
+        self._skip_count[task_id] = count
+        if self.event_store:
+            self.event_store.emit(
+                EventType.task_skipped,
+                task_id=task_id,
+                data={'skip_count': count, 'modules': modules},
+            )
+        threshold = self.config.fairness.skip_threshold
+        if count >= threshold and not self.lock_table.has_parks(task_id):
+            lease = self._compute_lease()
+            deadline = time.monotonic() + lease
+            installed = self.lock_table.install_parks(task_id, modules, deadline)
+            logger.info(
+                'Task %s reserved modules %s (skip_count=%d, lease=%.1fs)',
+                task_id, installed, count, lease,
+            )
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.reservation_installed,
+                    task_id=task_id,
+                    data={
+                        'modules': installed,
+                        'skip_count': count,
+                        'lease_secs': lease,
+                    },
+                )
+
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task: pending, deps done, module locks available.
 
         Priority: explicit priority > dependency depth > task ID.
         """
+        # Fairness: evict expired reservations and reset their owners' skip
+        # counts so they can re-accumulate instead of immediately re-parking.
+        now = time.monotonic()
+        evicted = self.lock_table.prune_expired_parks(now)
+        for owner in evicted:
+            self._skip_count.pop(owner, None)
+            logger.info('Task %s reservation expired', owner)
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.reservation_expired,
+                    task_id=owner,
+                    data={},
+                )
+
         tasks = await self.get_tasks()
         if not tasks:
             return None
@@ -353,12 +501,36 @@ class Scheduler:
 
         candidates.sort(key=sort_key)
 
+        # Fairness bookkeeping: remember the strict top candidate so we can
+        # detect Mode-2 starvation (top was passed over in favor of a lower
+        # candidate) and install a reservation after repeated skips.
+        top_task = candidates[0]
+        top_id = str(top_task.get('id', ''))
+        top_modules = self._get_modules(top_task)
+        top_had_parks = self.lock_table.has_parks(top_id)
+
         # Try to acquire module locks
         for task in candidates:
             modules = self._get_modules(task)
             task_id = str(task.get('id', ''))
             if self.lock_table.try_acquire(task_id, modules):
                 self._dispatched.add(task_id)
+                self._task_start_times[task_id] = time.monotonic()
+                if task_id == top_id:
+                    # Top candidate got in — reset its skip counter and clear
+                    # any reservation it may have been holding.
+                    self._skip_count.pop(task_id, None)
+                    if top_had_parks:
+                        self.lock_table.clear_parks_for(task_id)
+                        if self.event_store:
+                            self.event_store.emit(
+                                EventType.reservation_used,
+                                task_id=task_id,
+                                data={'modules': modules},
+                            )
+                else:
+                    # A lower-ranked task won — top was passed over this tick.
+                    self._bump_skip_and_maybe_park(top_id, top_modules)
                 if self.event_store:
                     self.event_store.emit(
                         EventType.lock_acquired,
@@ -367,6 +539,8 @@ class Scheduler:
                     )
                 return TaskAssignment(task_id=task_id, task=task, modules=modules)
 
+        # Loop exhausted with no acquire — top candidate was also skipped.
+        self._bump_skip_and_maybe_park(top_id, top_modules)
         return None
 
     async def handle_blast_radius_expansion(
@@ -415,8 +589,14 @@ class Scheduler:
             self._requeue_until[task_id] = (
                 time.monotonic() + self.config.requeue_cooldown_secs
             )
+        # Fairness: record duration for the rolling median used by _compute_lease.
+        start = self._task_start_times.pop(task_id, None)
+        if start is not None:
+            self._recent_durations.append(time.monotonic() - start)
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
+        # Defensive: clear any reservations still owned by this task.
+        self.lock_table.clear_parks_for(task_id)
         if self.event_store and modules:
             self.event_store.emit(
                 EventType.lock_released,

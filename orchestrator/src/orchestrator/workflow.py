@@ -31,7 +31,7 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.scheduler import TaskAssignment, files_to_modules
+from orchestrator.scheduler import TaskAssignment, files_to_modules, normalize_lock
 from orchestrator.task_status import TERMINAL_STATUSES
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import run_scoped_verification
@@ -82,6 +82,11 @@ class _BriefingLike(Protocol):
         self, plan: dict, iteration_log: list, context: str | None = ...,
         rebase_notice: dict | None = ..., task_id: str | None = ...,
     ) -> str: ...
+    async def build_amender_prompt(
+        self, plan: dict, iteration_log: list[dict],
+        suggestions: list[dict], locked_modules: list[str],
+        context: str | None = ..., task_id: str | None = ...,
+    ) -> str: ...
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = ...,
         task_id: str | None = ...,
@@ -126,6 +131,7 @@ class WorkflowMetrics:
     execute_iterations: int = 0
     verify_attempts: int = 0
     review_cycles: int = 0
+    amendment_rounds: int = 0
     pre_merge_rebase_attempts: int = 0
     pre_merge_rebase_ok: int = 0
     advance_main_retries: int = 0
@@ -750,6 +756,7 @@ class TaskWorkflow:
                 stale_merge.unlink()
 
         review_cycle = 0
+        amendment_round = 0
 
         while True:
             # EXECUTE
@@ -778,6 +785,41 @@ class TaskWorkflow:
                     f'infrastructure errors after retries: {names}'
                 )
             if not reviews.has_blocking_issues:
+                # L2b: try an amendment pass before escalating suggestions.
+                # In-scope suggestions (module-lock members) are applied by
+                # the implementer directly — no architect, no new tasks.
+                # Cap is config.max_amendment_rounds (default 1).
+                in_scope = self._suggestions_in_scope(reviews.suggestions)
+                if (
+                    in_scope
+                    and amendment_round < self.config.max_amendment_rounds
+                ):
+                    amendment_round += 1
+                    logger.info(
+                        'Task %s: amendment round %d, %d in-scope '
+                        'suggestion(s) (of %d total)',
+                        self.task_id, amendment_round,
+                        len(in_scope), len(reviews.suggestions),
+                    )
+                    # Archive pre-amendment reviews so post-mortem can compare
+                    if self.artifacts:
+                        import shutil
+                        reviews_dir = self.artifacts.root / 'reviews'
+                        archive_dir = (
+                            self.artifacts.root
+                            / f'reviews-amend-{amendment_round}'
+                        )
+                        if reviews_dir.exists() and not archive_dir.exists():
+                            shutil.copytree(reviews_dir, archive_dir)
+                            logger.info(
+                                'Task %s: archived reviews to %s',
+                                self.task_id, archive_dir.name,
+                            )
+                    await self._amend(in_scope, amendment_round)
+                    self.metrics.amendment_rounds += 1
+                    continue  # re-loop: EXECUTE → VERIFY → REVIEW
+
+                # Cap exhausted or nothing in-scope — existing DONE path
                 if self.escalation_queue and reviews.suggestions:
                     self._escalate_suggestions(reviews)
                 else:
@@ -1243,6 +1285,41 @@ class TaskWorkflow:
                 'summary': f'Reviewer error: {result.output[:200]}',
             }
 
+    def _suggestions_in_scope(self, suggestions: list[dict]) -> list[dict]:
+        """Filter suggestions to those whose location falls within a module
+        this task already holds a lock for.
+
+        Module-lock membership is the scheduler's own concurrency invariant
+        (see ``scheduler.normalize_lock``). Filtering this way guarantees an
+        amendment pass can't expand the task's lock footprint, and handles
+        new files created inside a locked module by construction (a new path
+        under a locked module normalizes to the same module key).
+        """
+        if not suggestions:
+            return []
+        locked = set(self.modules)
+        if not locked:
+            logger.warning(
+                'Task %s: empty lock set at amendment filter time; '
+                'returning zero in-scope suggestions',
+                self.task_id,
+            )
+            return []
+        depth = self.config.lock_depth
+        in_scope: list[dict] = []
+        for s in suggestions:
+            location = (s.get('location') or '').strip()
+            if not location:
+                continue
+            # Location format is 'src/foo.py:42' — strip the line number
+            file_path = location.split(':', 1)[0].strip()
+            if not file_path:
+                continue
+            module_key = normalize_lock(file_path, depth)
+            if module_key and module_key in locked:
+                in_scope.append(s)
+        return in_scope
+
     async def _replan(self, reviews) -> None:
         """Feed review feedback back to architect for re-planning."""
         assert self.worktree is not None and self.artifacts is not None
@@ -1266,6 +1343,56 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 """
         await self._invoke(ARCHITECT, prompt, self.worktree)
         self.plan = self.artifacts.read_plan()
+
+    async def _amend(
+        self, in_scope: list[dict], amendment_round: int,
+    ) -> None:
+        """Invoke the implementer to apply in-scope review suggestions.
+
+        Amendment passes skip the architect entirely — the plan is frozen,
+        no new steps are added, the implementer patches the existing diff
+        in place. Scope is enforced by the ``_suggestions_in_scope`` filter
+        upstream (module-lock membership) and reinforced in the prompt.
+        """
+        assert self.worktree is not None and self.artifacts is not None
+
+        self.plan = self.artifacts.read_plan()
+        iteration_log, corrupted = self.artifacts.read_iteration_log()
+        if corrupted:
+            self._escalate_corruption(corrupted)
+
+        prompt = await self.briefing.build_amender_prompt(
+            plan=self.plan,
+            iteration_log=iteration_log,
+            suggestions=in_scope,
+            locked_modules=list(self.modules),
+            task_id=self.task_id,
+        )
+        await self._invoke(IMPLEMENTER, prompt, self.worktree)
+
+        head_commit = await self._get_head_commit()
+        self.artifacts.append_iteration_log({
+            'iteration': self.metrics.execute_iterations,
+            'agent': 'implementer',
+            'source': 'amendment',
+            'amendment_round': amendment_round,
+            'suggestions_count': len(in_scope),
+            'commit': head_commit,
+            'summary': (
+                f'Amendment round {amendment_round} '
+                f'({len(in_scope)} suggestions)'
+            ),
+        })
+
+        # Validate plan ownership after the pass — amendment must NOT
+        # overwrite plan.json. If it did, the session_id stamp will mismatch.
+        if not self.artifacts.validate_plan_owner(self.session_id):
+            logger.error(
+                'Task %s: plan.json ownership mismatch after amendment pass '
+                '(round %d) — implementer was instructed not to touch the plan',
+                self.task_id, amendment_round,
+            )
+            self._escalate_plan_overwrite()
 
     async def _submit_to_merge_queue(
         self, branch_name: str, pre_rebased: bool = False,

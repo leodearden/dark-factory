@@ -176,7 +176,7 @@ class TestCollectSnapshot:
             await collect_snapshot(conn, config)
 
         async with conn.execute('SELECT * FROM snapshots') as cur:
-            rows = list(await cur.fetchall())
+            rows = await cur.fetchall()
 
         assert len(rows) == 1
         row = rows[0]
@@ -218,7 +218,7 @@ class TestCollectSnapshot:
     @pytest.mark.asyncio
     async def test_deduplicates_main_project_from_orchestrators(self, burndown_env):
         """If an orchestrator targets the same root, only one row is inserted."""
-        db_path, config, conn = burndown_env
+        _, config, conn = burndown_env
 
         fake_orchestrators = [{'prd': str(config.project_root / 'prd.md'), 'project_root': str(config.project_root)}]
 
@@ -239,7 +239,7 @@ class TestCollectSnapshot:
     @pytest.mark.asyncio
     async def test_snapshots_known_project_roots_when_no_orchestrators(self, burndown_env):
         """Known roots are snapshotted even when no orchestrators are running."""
-        db_path, base_config, conn = burndown_env
+        _, base_config, conn = burndown_env
 
         reify_root = Path('/home/leo/src/reify')
         autopilot_root = Path('/home/leo/src/autopilot-video')
@@ -257,8 +257,8 @@ class TestCollectSnapshot:
         # concurrently, so an ordered side_effect list can race. Look up by path.
         _tasks_map = {
             config.tasks_json: main_tasks,
-            reify_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': reify_tasks,
-            autopilot_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': autopilot_tasks,
+            reify_root / '.taskmaster' / 'tasks' / 'tasks.json': reify_tasks,
+            autopilot_root / '.taskmaster' / 'tasks' / 'tasks.json': autopilot_tasks,
         }
 
         with (
@@ -268,30 +268,30 @@ class TestCollectSnapshot:
             await collect_snapshot(conn, config)
 
         async with conn.execute('SELECT * FROM snapshots') as cur:
-            rows = list(await cur.fetchall())
+            rows = await cur.fetchall()
 
         assert len(rows) == 3
         by_project = {row['project_id']: row for row in rows}
         assert str(base_config.project_root) in by_project
-        assert str(reify_root.resolve()) in by_project
-        assert str(autopilot_root.resolve()) in by_project
+        assert str(reify_root) in by_project
+        assert str(autopilot_root) in by_project
 
         # main project: 1 pending task
         main_row = by_project[str(base_config.project_root)]
         _assert_snapshot_counts(main_row, pending=1)
 
         # reify: 2 done tasks
-        reify_row = by_project[str(reify_root.resolve())]
+        reify_row = by_project[str(reify_root)]
         _assert_snapshot_counts(reify_row, done=2)
 
         # autopilot: 1 in-progress task
-        autopilot_row = by_project[str(autopilot_root.resolve())]
+        autopilot_row = by_project[str(autopilot_root)]
         _assert_snapshot_counts(autopilot_row, in_progress=1)
 
     @pytest.mark.asyncio
     async def test_dedupes_known_root_against_main_project(self, burndown_env):
         """If known_project_roots includes main project_root, only one row is inserted."""
-        db_path, base_config, conn = burndown_env
+        _, base_config, conn = burndown_env
 
         config = DashboardConfig(
             project_root=base_config.project_root,
@@ -358,7 +358,7 @@ class TestCollectSnapshot:
     @pytest.mark.asyncio
     async def test_dedupes_known_root_against_running_orchestrator(self, burndown_env):
         """If known_project_roots includes a root already discovered via orchestrator, no duplicate."""
-        db_path, base_config, conn = burndown_env
+        _, base_config, conn = burndown_env
 
         reify_root = Path('/home/leo/src/reify')
 
@@ -393,7 +393,7 @@ class TestCollectSnapshot:
             await collect_snapshot(conn, config)
 
         async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
-                                (str(reify_root.resolve()),)) as cur:
+                                (str(reify_root),)) as cur:
             row = await cur.fetchone()
             assert row is not None
             count = row[0]
@@ -414,6 +414,7 @@ class TestCollectSnapshot:
         config = DashboardConfig(project_root=link)
 
         async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
             with (
                 patch('dashboard.data.burndown.load_task_tree', return_value=[]),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
@@ -425,12 +426,12 @@ class TestCollectSnapshot:
 
         assert len(rows) == 1
         # project_id must be the resolved real path, not the symlink path
-        assert rows[0][0] == str(real_dir.resolve())
+        assert rows[0]['project_id'] == str(real_dir.resolve())
 
     @pytest.mark.asyncio
     async def test_discovers_config_flag_orchestrator(self, burndown_env):
         """Orchestrators launched with --config (no --prd) are snapshotted."""
-        db_path, config, conn = burndown_env
+        _, config, conn = burndown_env
 
         reify_root = Path('/home/leo/src/reify')
         fake_orchestrators = [
@@ -453,7 +454,7 @@ class TestCollectSnapshot:
             await collect_snapshot(conn, config)
 
         async with conn.execute('SELECT * FROM snapshots ORDER BY project_id') as cur:
-            rows = list(await cur.fetchall())
+            rows = await cur.fetchall()
 
         assert len(rows) == 2
         ids = {row['project_id'] for row in rows}
@@ -500,6 +501,7 @@ class TestCollectSnapshot:
             return _tasks_map[path]
 
         async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
             with (
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
@@ -510,7 +512,7 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
 
-        project_ids = {row[0] for row in rows}
+        project_ids = {row['project_id'] for row in rows}
         # main + root_a + root_c should be present
         assert len(rows) == 3
         assert str(tmp_path.resolve()) in project_ids
@@ -599,6 +601,7 @@ class TestCollectSnapshot:
             return _tasks_map[path]
 
         async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
             with (
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
@@ -609,13 +612,13 @@ class TestCollectSnapshot:
                 rows = list(await cur.fetchall())
 
         assert len(rows) == 2
-        project_ids = {row[0] for row in rows}
+        project_ids = {row['project_id'] for row in rows}
         assert str(tmp_path.resolve()) in project_ids        # (a) main project row
         assert str(good_root.resolve()) in project_ids       # (b) good_root row
         assert str(bad_root.resolve()) not in project_ids    # (c) no bad_root row
 
-        good_row = next(r for r in rows if r[0] == str(good_root.resolve()))
-        assert good_row[1] == 2  # done=2 for good_root
+        good_row = next(r for r in rows if r['project_id'] == str(good_root.resolve()))
+        assert good_row['done'] == 2  # done=2 for good_root
 
     @pytest.mark.asyncio
     async def test_orchestrator_fallback_deduplicates_against_resolved_root(self, tmp_path):
@@ -745,6 +748,7 @@ class TestCollectSnapshot:
 
         raised_oserror = False
         async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
             with (
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
@@ -756,7 +760,7 @@ class TestCollectSnapshot:
 
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
-        project_ids = {row[0] for row in rows}
+        project_ids = {row['project_id'] for row in rows}
 
         if raised_oserror:
             # Pre-fix behavior (task 519 not yet landed): asyncio.gather re-raises
@@ -850,6 +854,55 @@ class TestCollectSnapshot:
         assert warning_records, 'Expected at least one WARNING log record'
         combined = ' '.join(r.getMessage() for r in warning_records)
         assert 'bad_root' in combined or str(bad_root) in combined
+        assert any(r.exc_info for r in warning_records)
+
+    @pytest.mark.asyncio
+    async def test_main_project_failure_skips_all_inserts(self, burndown_env, caplog):
+        """PermissionError on the main project's load_task_tree is isolated via return_exceptions=True.
+
+        The main project is always the first entry in roots_to_snapshot. With no orchestrators
+        and no known_project_roots, a failing load_task_tree for the main project must:
+
+        (a) NOT propagate out of collect_snapshot — return_exceptions=True in Phase 2 absorbs it,
+            and Phase 3's isinstance(tasks, BaseException) guard logs-and-continues.
+        (b) Commit zero rows to the snapshots table — the only root failed, so nothing to insert.
+        (c) Emit a WARNING log record naming the main project with exc_info populated.
+
+        Sibling test to test_continues_when_known_root_unreadable and
+        test_gather_return_exceptions_preserves_healthy_snapshots, covering the
+        previously-untested main-project failure path. Uses path-keyed dispatch so
+        the test does not depend on load_task_tree call ordering.
+        """
+        import logging
+
+        db_path, config, conn = burndown_env
+
+        bad_path = config.tasks_json  # the main project's tasks.json path
+
+        def fake_load(path):
+            if path == bad_path:
+                raise PermissionError('Permission denied')
+            pytest.fail(f'Unexpected load_task_tree call for {path}')
+
+        with (
+            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+        ):
+            # Must NOT raise — return_exceptions=True absorbs the PermissionError.
+            await collect_snapshot(conn, config)
+
+        # (b) zero rows committed — the only root failed, so snapshots is empty.
+        async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 0
+
+        # (c) at least one WARNING record must name the main project and carry exc_info.
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'Expected at least one WARNING log record'
+        combined = ' '.join(r.getMessage() for r in warning_records)
+        assert str(config.project_root) in combined
         assert any(r.exc_info for r in warning_records)
 
     @pytest.mark.asyncio

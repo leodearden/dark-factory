@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -31,10 +32,67 @@ logger = logging.getLogger(__name__)
 
 _CANONICAL_OUTCOMES = ['done', 'conflict', 'blocked', 'already_merged']
 
+# ---------------------------------------------------------------------------
+# Adaptive bucket ladder: (max_hours | None, bucket_minutes)
+# None as max_hours means "catch-all / no upper bound".
+# ---------------------------------------------------------------------------
+BUCKET_LADDER: tuple[tuple[int | None, int], ...] = (
+    (24, 15),      # ≤ 24 h  → 15-min buckets  (≤  97 pts)
+    (168, 60),     # ≤  7 d  → 60-min buckets  (≤ 169 pts)
+    (720, 360),    # ≤ 30 d  →  6-h  buckets   (≤ 121 pts)
+    (None, 1440),  # > 30 d  →  1-d  buckets   (≤ 3 651 pts, covers all=87 600 h)
+)
+
 
 def _cutoff_iso(hours: int) -> str:
     """Return ISO-format cutoff datetime for the given look-back window (hours)."""
     return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+
+
+def _bucket_minutes_for_window(hours: int) -> int:
+    """Return the adaptive bucket width in minutes for the given window length.
+
+    Iterates ``BUCKET_LADDER`` and returns the bucket width for the first tier
+    whose ``max_hours`` bound is not exceeded.  The ladder's final entry has
+    ``max_hours=None`` (catch-all), so this function always returns a value.
+
+    Ladder (from ``BUCKET_LADDER``):
+      <=  24 h → 15 min  (≤ 97 buckets)
+      <= 168 h → 60 min  (≤ 169 buckets)
+      <= 720 h → 360 min (≤ 121 buckets)
+      >  720 h → 1440 min (≤ 3 651 buckets, covers window=all / 87 600 h)
+    """
+    for max_hours, bucket_min in BUCKET_LADDER:
+        if max_hours is None or hours <= max_hours:
+            return bucket_min
+    return 1440  # unreachable — BUCKET_LADDER always ends with (None, ...)
+
+
+def _align_bucket(t: datetime, bucket_min: int) -> datetime:
+    """Floor *t* to the nearest bucket boundary using epoch-based arithmetic.
+
+    Uses 1970-01-01 00:00 UTC as the epoch, which naturally aligns on hour
+    and day boundaries for all four supported bucket widths (15/60/360/1440).
+
+    Uses ``math.floor`` (not ``int``) so that pre-epoch timestamps (negative
+    total_seconds) are floored correctly rather than truncated toward zero.
+    In practice merge events are always post-epoch, but the implementation is
+    correct for all inputs.
+
+    Args:
+        t: A timezone-aware datetime (UTC assumed if no tzinfo).
+        bucket_min: Bucket width in minutes (15, 60, 360, or 1440).
+
+    Returns:
+        A UTC-aware datetime at the start of the bucket containing *t*.
+    """
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=UTC)
+    bucket_sec = bucket_min * 60
+    total_sec = math.floor((t - epoch).total_seconds())
+    aligned_sec = (total_sec // bucket_sec) * bucket_sec
+    return epoch + timedelta(seconds=aligned_sec)
 
 
 # ---------------------------------------------------------------------------
@@ -45,32 +103,48 @@ async def queue_depth_timeseries(
     db: aiosqlite.Connection | None,
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> ChartData:
-    """Approximate merge queue throughput as 15-min bucket counts.
+    """Approximate merge queue throughput as adaptive-width bucket counts.
 
     Returns ChartData with ISO bucket-start labels and integer counts.
-    For a 24h window, this produces exactly ``hours * 4 = 96`` buckets.
-    Buckets are aligned to 15-min boundaries starting from
-    ``floor(now - hours, 15min)``.
+    Bucket width is chosen adaptively via ``_bucket_minutes_for_window`` so
+    the point count stays manageable for all window sizes:
+
+    * ``hours ≤ 24``  → 15-min buckets  (≤ 97 points)
+    * ``hours ≤ 168`` → 60-min buckets  (≤ 169 points)
+    * ``hours ≤ 720`` → 360-min buckets (≤ 121 points)
+    * ``hours > 720`` → 1440-min buckets (≤ 3 651 points, covers window=all)
+
+    Buckets span ``[_align_bucket(now - hours, bm), _align_bucket(now, bm)]``
+    inclusive.  The current bucket is always included.
+
+    Args:
+        db: aiosqlite connection, or None (returns empty ChartData).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp for bucket alignment.  When None (the default),
+            ``datetime.now(UTC)`` is used.  Pass an explicit value in tests to
+            get deterministic bucket counts and eliminate boundary flakiness.
     """
     if db is None:
         return {'labels': [], 'values': []}
 
     async def _query(conn: aiosqlite.Connection) -> ChartData:
-        now = datetime.now(UTC)
-        cutoff = now - timedelta(hours=hours)
+        effective_now = now if now is not None else datetime.now(UTC)
+        cutoff = effective_now - timedelta(hours=hours)
 
-        # Align cutoff to 15-min boundary (floor)
-        cutoff_aligned = cutoff.replace(
-            minute=(cutoff.minute // 15) * 15,
-            second=0,
-            microsecond=0,
-        )
+        # Determine adaptive bucket width for this window
+        bucket_min = _bucket_minutes_for_window(hours)
 
-        # Generate exactly hours*4 buckets
+        # Align both ends to bucket boundaries using epoch-based flooring
+        cutoff_aligned = _align_bucket(cutoff, bucket_min)
+        now_aligned = _align_bucket(effective_now, bucket_min)
+
+        # Generate buckets from cutoff_aligned through now_aligned inclusive
+        num_buckets = int((now_aligned - cutoff_aligned) / timedelta(minutes=bucket_min)) + 1
         buckets = [
-            cutoff_aligned + timedelta(minutes=15 * i)
-            for i in range(hours * 4)
+            cutoff_aligned + timedelta(minutes=bucket_min * i)
+            for i in range(num_buckets)
         ]
 
         # Fetch all merge_attempt events in the window
@@ -88,12 +162,8 @@ async def queue_depth_timeseries(
                 ts = datetime.fromisoformat(ts_str)
                 if ts.tzinfo is None:
                     ts = ts.replace(tzinfo=UTC)
-                # Floor to 15-min bucket
-                bucket = ts.replace(
-                    minute=(ts.minute // 15) * 15,
-                    second=0,
-                    microsecond=0,
-                )
+                # Floor to the adaptive bucket
+                bucket = _align_bucket(ts, bucket_min)
                 key = bucket.isoformat()
                 if key in counts:
                     counts[key] += 1
@@ -314,13 +384,28 @@ async def aggregate_queue_depth_timeseries(
     dbs: list[aiosqlite.Connection | None],
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> ChartData:
     """Aggregate queue depth timeseries across multiple project DBs.
 
-    Counts per bucket are summed across all DBs.
+    Counts per bucket are summed across all DBs.  Bucket width is adaptive
+    to ``hours`` (see ``_bucket_minutes_for_window``).
+
+    Args:
+        dbs: List of aiosqlite connections (None entries are tolerated).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp captured **once** for the entire aggregation
+            call and threaded into every per-DB ``queue_depth_timeseries``
+            query.  When None (the default), ``datetime.now(UTC)`` is resolved
+            here so that all concurrent per-DB coroutines share the same
+            alignment — eliminating the race where concurrent calls to
+            ``datetime.now(UTC)`` inside each per-DB ``_query`` could straddle
+            a bucket boundary and produce divergent label sets.  Pass an
+            explicit value in tests for full determinism.
     """
+    effective_now = now if now is not None else datetime.now(UTC)
     results = await asyncio.gather(
-        *[queue_depth_timeseries(db, hours=hours) for db in dbs],
+        *[queue_depth_timeseries(db, hours=hours, now=effective_now) for db in dbs],
         return_exceptions=True,
     )
 

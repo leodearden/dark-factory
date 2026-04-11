@@ -269,6 +269,12 @@ class Harness:
                     f'Dirty files:\n{dirty}'
                 )
 
+        # Hoisted out of the try block so the finally clause can cancel
+        # in-flight workflow tasks even if an exception fires before the
+        # main loop creates them.
+        active: set[asyncio.Task] = set()
+        task_reports: list[TaskReport] = []
+
         try:
             # 1. Start fused-memory HTTP server
             logger.info('Starting fused-memory HTTP server...')
@@ -352,8 +358,6 @@ class Harness:
 
             # 3. Run workflow slots
             sem = asyncio.Semaphore(self.config.max_concurrent_tasks)
-            active: set[asyncio.Task] = set()
-            task_reports: list[TaskReport] = []
 
             while True:
                 # Pick up any pending review task spawned by _collect_done_reports
@@ -443,6 +447,24 @@ class Harness:
 
         finally:
             # 4. Shutdown
+            # 4a. Cancel any in-flight workflow tasks BEFORE shutting down
+            # usage_gate — otherwise a cap-hit in a still-running agent can
+            # spawn a fresh probe task via _handle_cap_detected AFTER
+            # usage_gate.shutdown() has drained the existing ones, leaving
+            # the event loop alive forever.
+            if active:
+                logger.info(f'Cancelling {len(active)} active workflow task(s)')
+                for t in active:
+                    t.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*active, return_exceptions=True),
+                        timeout=15.0,
+                    )
+                except TimeoutError:
+                    logger.error('Workflow tasks did not drain within 15s')
+                active.clear()
+
             self.report.completed_at = datetime.now(UTC).isoformat()
 
             # Finalize run metrics in SQLite (task_results were written
@@ -462,12 +484,51 @@ class Harness:
                 if self.usage_gate.total_pause_secs > 0:
                     self.report.paused_for_cap = True
                     self.report.cap_pause_duration_secs = self.usage_gate.total_pause_secs
-                await self.usage_gate.shutdown()
+                try:
+                    await self.usage_gate.shutdown()
+                except Exception as e:
+                    logger.warning(f'usage_gate.shutdown() failed: {e}')
             if self.cost_store:
-                await self.cost_store.close()
-            await self._stop_merge_worker()
-            await self._stop_escalation_server()
-            await self.mcp.stop()
+                try:
+                    await self.cost_store.close()
+                except Exception as e:
+                    logger.warning(f'cost_store.close() failed: {e}')
+            try:
+                await self._stop_merge_worker()
+            except Exception as e:
+                logger.warning(f'_stop_merge_worker() failed: {e}')
+            try:
+                await self._stop_escalation_server()
+            except Exception as e:
+                logger.warning(f'_stop_escalation_server() failed: {e}')
+            try:
+                await self.mcp.stop()
+            except Exception as e:
+                logger.warning(f'mcp.stop() failed: {e}')
+
+            # 4b. Last-resort straggler sweep — catches any task the named
+            # cleanup above missed (orphan probe tasks, cost-event
+            # fire-and-forgets, sub-tasks spawned by merge/escalation stop).
+            current = asyncio.current_task()
+            stragglers = [
+                t for t in asyncio.all_tasks()
+                if t is not current and not t.done()
+            ]
+            if stragglers:
+                names = [t.get_name() for t in stragglers]
+                logger.warning(
+                    f'Cancelling {len(stragglers)} straggler task(s): {names}'
+                )
+                for t in stragglers:
+                    t.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*stragglers, return_exceptions=True),
+                        timeout=5.0,
+                    )
+                except TimeoutError:
+                    still = [t.get_name() for t in stragglers if not t.done()]
+                    logger.error(f'Stragglers did not die within 5s: {still}')
 
             # Release singleton lock
             if self._lock_file is not None:

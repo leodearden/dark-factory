@@ -1103,20 +1103,25 @@ class TestRebuildEntitySummariesParallel:
 
         result = await backend.rebuild_entity_summaries(group_id='test', force=True)
 
-        backend.get_all_valid_edges.assert_awaited_once()
+        backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
         backend.refresh_entity_summary.assert_not_awaited()
         assert result['total_entities'] == 2
         assert result['rebuilt'] == 2
 
     @pytest.mark.asyncio
-    async def test_force_list_entity_nodes_called_exactly_once(
+    async def test_force_bulk_fetch_called_exactly_once_and_updates_all_entities(
         self, mock_config, make_backend, make_edge_backend
     ):
-        """Force path: list_entity_nodes is awaited exactly once (single bulk fetch).
+        """Force path: bulk fetches run exactly once and every entity is updated.
 
-        Uses three distinct entities with distinct facts so a regression that returns
-        uuid-1 data for every call would produce incorrect per-entity summaries and
-        fail the final per-uuid assertions.
+        Guards three independent invariants under the force path:
+        1. list_entity_nodes is awaited exactly once (single bulk node fetch).
+        2. get_all_valid_edges is awaited exactly once with the forwarded group_id
+           (single bulk edge fetch, correctly scoped).
+        3. update_node_summary is awaited once per entity and each entity receives
+           its own edge data — uses three distinct entities with distinct facts so
+           a regression that reused uuid-1 data for every call would fail the
+           per-uuid new_summary assertions below.
         """
         backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'summary-1'},
@@ -1133,7 +1138,7 @@ class TestRebuildEntitySummariesParallel:
 
         # list_entity_nodes must be called exactly once — no per-entity re-fetch
         backend.list_entity_nodes.assert_awaited_once()
-        backend.get_all_valid_edges.assert_awaited_once()
+        backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
         assert result['total_entities'] == 3
         assert result['rebuilt'] == 3
         assert backend.update_node_summary.await_count == 3
@@ -1556,3 +1561,76 @@ class TestRebuildEntitySummariesCancellation:
         error_detail = next((d for d in result['details'] if d['status'] == 'error'), None)
         assert error_detail is not None, f"expected an 'error' entry in details; got {result['details']}"
         assert 'per-entity boom' in error_detail['error']
+
+
+# ---------------------------------------------------------------------------
+# Task-511: replace bare assert isinstance(r, dict) with explicit TypeError guard
+# ---------------------------------------------------------------------------
+
+class TestRebuildEntitySummariesTypeGuard:
+    """Regression tests for the explicit TypeError guard in the per-entity accumulation loop.
+
+    The production code in graphiti_client.py's rebuild_entity_summaries contains a loop
+    that gathers results from _rebuild_entity_from_edges.  In the else branch (non-exception
+    result) the code originally used ``assert isinstance(r, dict)`` purely for Pyright type
+    narrowing.  That assert is stripped when Python runs with ``-O``/``PYTHONOPTIMIZE``,
+    leaving a silent footgun: a non-dict return would propagate silently until an
+    AttributeError surfaced on ``r.get(...)`` far from the origin.
+
+    Task-511 replaces the assert with an explicit ``if not isinstance(r, dict): raise TypeError(...)``
+    so the contract check is unconditional.  Pyright still narrows ``r`` to ``dict`` after
+    a conditional raise, so the type-narrowing motivation is preserved.
+
+    See: fused-memory/src/fused_memory/backends/graphiti_client.py – per-entity accumulation loop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_dict_return_raises_typeerror(self, two_entity_backend):
+        """_rebuild_entity_from_edges returning a non-dict value must raise TypeError.
+
+        Patches _rebuild_entity_from_edges to return None (a non-dict) and asserts
+        that rebuild_entity_summaries raises TypeError whose message contains:
+          - the type name ('NoneType')
+          - the entity uuid ('uuid-1')
+          - the entity name ('Alice')
+
+        Also verifies fail-fast behaviour: asyncio.gather awaits all tasks (both
+        entities are gathered), then the processing loop raises on the first bad
+        result without accumulating any details.  The await_count of 2 pins this
+        contract — if the guard were moved inside _rebuild_one the count would drop
+        to 1 (short-circuit before gather completes).
+        """
+        backend = two_entity_backend
+        backend._rebuild_entity_from_edges = AsyncMock(return_value=None)
+
+        with pytest.raises(TypeError) as exc_info:
+            await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+        msg = str(exc_info.value)
+        assert 'NoneType' in msg
+        assert 'uuid-1' in msg
+        assert 'Alice' in msg
+        # Both entities are gathered before the processing loop runs — the TypeError
+        # is raised during result accumulation, not during the gather phase.
+        assert backend._rebuild_entity_from_edges.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_non_none_non_dict_return_raises_typeerror(self, two_entity_backend):
+        """A non-None non-dict return (e.g. a list) must also trigger the TypeError guard.
+
+        This prevents a future contributor from accidentally special-casing ``None``
+        in the guard and missing other invalid return types.  The type name in the
+        message must reflect the actual type of the returned value.
+        """
+        backend = two_entity_backend
+        backend._rebuild_entity_from_edges = AsyncMock(return_value=[])
+
+        with pytest.raises(TypeError) as exc_info:
+            await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+        msg = str(exc_info.value)
+        assert 'list' in msg
+        assert 'uuid-1' in msg
+        assert 'Alice' in msg
+        # Gather still runs both tasks; TypeError is raised in the result loop.
+        assert backend._rebuild_entity_from_edges.await_count == 2

@@ -171,6 +171,109 @@ Review any overlap with your plan steps before continuing — file contents may 
 Execute the next pending steps in TDD order. Commit after each step. Update plan.json status fields. Stop at a logical boundary.
 """
 
+    async def build_amender_prompt(
+        self,
+        plan: dict,
+        iteration_log: list[dict],
+        suggestions: list[dict],
+        locked_modules: list[str],
+        context: str | None = None,
+        task_id: str | None = None,
+    ) -> str:
+        """Build prompt for an amendment pass — implementer applies in-scope
+        review suggestions without re-planning.
+
+        ``suggestions`` is the pre-filtered in-scope list (already restricted
+        to files inside ``locked_modules``). ``locked_modules`` is listed in
+        the prompt so the agent can self-check scope before editing.
+        """
+        effective_tid = task_id or plan.get('task_id')
+        if context is None:
+            context = await self._get_memory_context(effective_tid)
+
+        identity = self._agent_identity(effective_tid, 'implementer')
+
+        log_summary = ''
+        if iteration_log:
+            recent = iteration_log[-3:]
+            log_lines = []
+            for entry in recent:
+                log_lines.append(
+                    f"- Iteration {entry.get('iteration', '?')} "
+                    f"[{entry.get('agent', '?')}]: "
+                    f"{entry.get('summary', 'N/A')}"
+                )
+            log_summary = "## Recent Iterations\n\n" + '\n'.join(log_lines)
+
+        modules_list = '\n'.join(f'- `{m}`' for m in sorted(locked_modules))
+
+        suggestion_blocks = []
+        for i, s in enumerate(suggestions, 1):
+            reviewer = s.get('reviewer', 'unknown')
+            category = s.get('category', '')
+            location = s.get('location', '')
+            description = s.get('description', '')
+            fix = s.get('suggested_fix', '')
+            block = [
+                f'### {i}. [{reviewer}] {category}',
+            ]
+            if location:
+                block.append(f'**Location:** `{location}`')
+            block.append(f'**Issue:** {description}')
+            if fix:
+                block.append(f'**Suggested fix:** {fix}')
+            suggestion_blocks.append('\n'.join(block))
+        suggestions_body = '\n\n'.join(suggestion_blocks)
+
+        return f"""\
+{context}
+
+{identity}
+
+# Amendment Pass
+
+The implementation for this task is complete and verification has passed.
+A code reviewer surfaced the suggestions below, all scoped to modules this
+task already holds locks for. Your job is to apply them as focused
+amendments — small edits that address each point without re-planning or
+expanding the task's concurrency footprint.
+
+## Plan Overview
+
+**Task:** {plan.get('title', 'Unknown')}
+**Analysis:** {plan.get('analysis', 'N/A')}
+
+{log_summary}
+
+## Scope Discipline
+
+This task holds locks for the following modules:
+
+{modules_list}
+
+1. Work ONLY inside these locked modules. Creating new files inside them is
+   allowed; editing files outside them is NOT.
+2. Do NOT modify `.task/plan.json`. The plan is frozen for this pass.
+3. If a suggestion requires touching a file outside the locked modules,
+   skip it and note the reason in your commit message — it will be
+   re-surfaced by the next review cycle or escalated as a follow-up task.
+4. Prefix amendment commit messages with `amend:` so they're distinguishable
+   from the main plan commits.
+
+## Suggestions to Address
+
+{suggestions_body}
+
+# Action
+
+1. Read `.task/plan.json` and `.task/iterations.jsonl` to refresh context on
+   what was already done.
+2. Run `git log --oneline -10` to see recent commits.
+3. Apply each in-scope suggestion above. Commit amendments with `amend:`
+   prefixes, grouping related fixes when sensible.
+4. Run verification for the touched files before finishing.
+"""
+
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = None,
         task_id: str | None = None,

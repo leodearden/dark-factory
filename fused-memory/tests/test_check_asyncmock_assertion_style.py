@@ -6,10 +6,14 @@ also contains assert_not_awaited(). See task 673 (lint guard replacing task-571 
 from __future__ import annotations
 
 import importlib.util
+import re
+import shutil
 import subprocess
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
@@ -269,15 +273,15 @@ class TestRealTestsDirectoryIsClean:
 class TestHooksIntegration:
     """hooks/project-checks must invoke the asyncmock style checker."""
 
-    def test_hooks_project_checks_invokes_asyncmock_style_check(self):
-        """hooks/project-checks references check_asyncmock_assertion_style.py and fused-memory/tests."""
-        hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
-        content = hooks_path.read_text(encoding='utf-8')
-        assert 'check_asyncmock_assertion_style.py' in content
-        assert 'fused-memory/tests' in content
-
     def test_hook_invokes_check_with_python3_not_uv_run(self):
-        """The asyncmock check must be invoked via plain python3, not wrapped in uv run."""
+        """The asyncmock check invocation must use a python3 token, not uv run, and target fused-memory/tests.
+
+        Word-boundary regex r'\\bpython3(?:\\.\\d+)?\\b' accepts plain `python3`, versioned
+        `python3.11`, and absolute paths like `/usr/bin/python3` or `/usr/bin/env python3`,
+        while rejecting bare `python` (Python 2) or `mypython3` (word-boundary failure).
+        The `fused-memory/tests` assertion verifies the scan target is present on the same
+        invocation line, absorbing the purpose of the former existence-check test.
+        """
         hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
         content = hooks_path.read_text(encoding='utf-8')
         invocation_lines = [
@@ -286,29 +290,149 @@ class TestHooksIntegration:
         ]
         assert invocation_lines, 'No invocation of check_asyncmock_assertion_style.py found in hooks/project-checks'
         for line in invocation_lines:
-            assert 'python3 ' in line, (
-                f'Expected plain python3 invocation, got: {line!r}'
+            assert re.search(r'\bpython3(?:\.\d+)?\b', line), (
+                f'Expected a python3 token (plain, versioned, or absolute path), got: {line!r}'
             )
             assert 'uv run' not in line, (
                 f'Found uv run in asyncmock check invocation (should use plain python3): {line!r}'
             )
+            assert 'fused-memory/tests' in line, (
+                f'Expected fused-memory/tests scan target on invocation line, got: {line!r}'
+            )
 
-    def test_hook_has_stdlib_only_rationale_comment(self):
-        """hooks/project-checks must contain a 'stdlib-only' rationale comment near the asyncmock check."""
-        hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
-        content = hooks_path.read_text(encoding='utf-8')
-        assert 'check_asyncmock_assertion_style.py' in content, (
-            'asyncmock check invocation not found in hooks/project-checks'
+    def test_script_runs_under_isolated_python3_proves_stdlib_only(self, tmp_path: Path):
+        """Running the script under python3 -I -S proves it imports only stdlib modules.
+
+        `python3 -I` alone does NOT block venv site-packages on this machine (python 3.14,
+        uv-managed venv): `-I` only disables *user* site-packages (implies `-s`), not system
+        or venv site-packages.  `-I -S` additionally skips site.py, so venv site-packages are
+        never added to sys.path — any accidental third-party import in the script would raise
+        ModuleNotFoundError at interpreter startup, loudly failing this test.
+
+        Requires `python3` on PATH — this mirrors the hook's runtime assumption
+        (hooks/project-checks invokes the script via `python3 ...` without a full path).
+        The test skips cleanly when `python3` is not found so CI environments without it
+        surface 'skipped' rather than a confusing FileNotFoundError.
+
+        Two cases are exercised under isolation:
+          1. Empty directory: no test_*.py → zero targets → exit 0, empty stdout.
+             Proves the stdlib-only invariant at interpreter startup.
+          2. Non-empty directory: a clean test file → parse/scan runs → exit 0, empty stdout.
+             Proves the parse/find_violations code paths also stay stdlib-only; a
+             third-party import added inside a scan-triggered code path would still fail loudly.
+        """
+        if shutil.which('python3') is None:
+            pytest.skip('python3 not found on PATH — cannot verify hook runtime assumption')
+
+        # --- Case 1: empty directory (startup + import isolation) ---
+        result = subprocess.run(
+            ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
+            capture_output=True,
+            text=True,
         )
-        assert 'stdlib-only' in content.lower(), (
-            "hooks/project-checks must contain a 'stdlib-only' rationale comment "
-            'explaining why the asyncmock check bypasses uv'
+        assert result.returncode == 0, (
+            f'Script exited non-zero under python3 -I -S (unexpected import or logic error):\n'
+            f'  stdout: {result.stdout!r}\n'
+            f'  stderr: {result.stderr!r}'
+        )
+        assert result.stdout == '', (
+            f'Expected empty stdout (no scan targets in empty dir), got: {result.stdout!r}'
         )
 
-    def test_script_docstring_notes_stdlib_only(self):
-        """check_asyncmock_assertion_style.py module docstring must mention it is stdlib-only."""
-        source = SCRIPT_PATH.read_text(encoding='utf-8')
-        assert 'stdlib-only' in source.lower(), (
-            "check_asyncmock_assertion_style.py docstring must note that the script is "
-            "'stdlib-only' so maintainers know adding a dependency would break the pre-commit fast path"
+        # --- Case 2: non-empty directory (parse/scan path isolation) ---
+        # Ensures find_violations and AST-parsing paths also stay stdlib-only: a third-party
+        # import inside a code path triggered only during scanning would slip past Case 1.
+        clean_file = tmp_path / 'test_clean.py'
+        clean_file.write_text(_CLEAN_SOURCE_DIFFERENT_FUNCS)
+        result2 = subprocess.run(
+            ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
+            capture_output=True,
+            text=True,
         )
+        assert result2.returncode == 0, (
+            f'Script exited non-zero (non-empty scan) under python3 -I -S:\n'
+            f'  stdout: {result2.stdout!r}\n'
+            f'  stderr: {result2.stderr!r}'
+        )
+        assert result2.stdout == '', (
+            f'Expected empty stdout (clean file, no violations), got: {result2.stdout!r}'
+        )
+
+
+class TestCliErrorHandling:
+    """main() path/read-error handling: fail fast on missing explicit paths,
+    accumulate mid-scan OSErrors without dropping already-collected violations.
+    """
+
+    def test_missing_explicit_file_path_fails_fast_with_exit_2(
+        self, tmp_path: Path, monkeypatch, capsys
+    ):
+        """A missing explicit path → exit 2, no scan work done (no read_text calls).
+
+        bad_file is listed FIRST to prove Phase 1 validation runs across ALL
+        paths before Phase 2 starts — even a valid-first ordering must skip
+        the scan when a later explicit path is missing. The strongest
+        "no scan work done" guarantee is that ``Path.read_text`` is NEVER
+        invoked during a failed Phase 1, which we verify via a spy.
+        """
+        bad_file = tmp_path / 'test_bad.py'
+        bad_file.write_text(_MIXED_STYLE_SOURCE)
+        missing = tmp_path / 'nonexistent.py'  # deliberately NOT created
+
+        real_read_text = Path.read_text
+        read_text_calls: list[str] = []
+
+        def spy_read_text(self, *args, **kwargs):
+            read_text_calls.append(self.name)
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'read_text', spy_read_text)
+
+        exit_code = _checker.main([str(bad_file), str(missing)])
+
+        captured = capsys.readouterr()
+        assert exit_code == 2
+        assert 'nonexistent.py' in captured.err
+        # No violations printed — Phase 2 never ran.
+        assert captured.out == ''
+        # Hard "no scan work done" guarantee: read_text was never called on
+        # any scan target. Current broken main() fails this because it reads
+        # bad_file before hitting the FileNotFoundError on the missing path.
+        assert read_text_calls == [], (
+            f'Phase 1 should fail fast before any read_text call, '
+            f'but read_text was invoked on: {read_text_calls}'
+        )
+
+    def test_transient_os_error_does_not_hide_violations_from_other_files(
+        self, tmp_path: Path, monkeypatch, capsys
+    ):
+        """A mid-scan OSError on one file must not discard violations from other files.
+
+        Both files are discovered via directory mode (rglob) so the failure
+        routes through Phase 2, not Phase 1's explicit-path check.
+        """
+        good_file = tmp_path / 'test_good.py'
+        good_file.write_text(_MIXED_STYLE_SOURCE)
+        broken_file = tmp_path / 'test_broken.py'
+        broken_file.write_text('# placeholder — read_text will be monkeypatched to raise')
+
+        real_read_text = Path.read_text
+
+        def fake_read_text(self, *args, **kwargs):
+            if self.name == 'test_broken.py':
+                raise OSError('simulated transient read error')
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'read_text', fake_read_text)
+
+        exit_code = _checker.main([str(tmp_path)])
+
+        captured = capsys.readouterr()
+        # Read error → fatal exit precedence over plain violations exit (1).
+        assert exit_code == 2
+        # Violation from the readable file IS still reported.
+        assert 'test_good.py' in captured.out
+        assert 'assert_not_awaited' in captured.out
+        # Read failure from the broken file is reported on stderr.
+        assert 'test_broken.py' in captured.err
+        assert 'simulated transient read error' in captured.err

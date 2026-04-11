@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -596,46 +597,72 @@ async def _run_subprocess(
     )
 
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=stdin_data),
-            timeout=timeout_seconds,
-        )
-    except TimeoutError:
-        # Graceful shutdown: SIGTERM first, then SIGKILL after grace period.
-        # SIGTERM lets the Claude CLI flush its final JSON output to stdout
-        # (including session_id and token counts) before exiting.
-        _SIGTERM_GRACE_SECS = 5
-        proc.terminate()  # SIGTERM
         try:
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=_SIGTERM_GRACE_SECS,
+                proc.communicate(input=stdin_data),
+                timeout=timeout_seconds,
             )
         except TimeoutError:
-            # Still alive after grace period — force kill
-            proc.kill()
-            await proc.wait()
-            stdout_text = ''
-            stderr_text = f'Process killed after {timeout_seconds}s timeout (SIGTERM+SIGKILL)'
-        else:
-            stdout_text = stdout.decode() if stdout else ''
-            stderr_text = stderr.decode()[-2000:] if stderr else ''
-            if stdout_text:
-                logger.info(
-                    f'Agent produced {len(stdout_text)} bytes after SIGTERM '
-                    f'(first 500): {stdout_text[:500]}'
+            # Graceful shutdown: SIGTERM first, then SIGKILL after grace period.
+            # SIGTERM lets the Claude CLI flush its final JSON output to stdout
+            # (including session_id and token counts) before exiting.
+            _SIGTERM_GRACE_SECS = 5
+            proc.terminate()  # SIGTERM
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=_SIGTERM_GRACE_SECS,
                 )
-            stderr_text = (
-                f'Process terminated after {timeout_seconds}s timeout (SIGTERM); '
-                + stderr_text
+            except TimeoutError:
+                # Still alive after grace period — force kill
+                proc.kill()
+                await proc.wait()
+                stdout_text = ''
+                stderr_text = f'Process killed after {timeout_seconds}s timeout (SIGTERM+SIGKILL)'
+            else:
+                stdout_text = stdout.decode() if stdout else ''
+                stderr_text = stderr.decode()[-2000:] if stderr else ''
+                if stdout_text:
+                    logger.info(
+                        f'Agent produced {len(stdout_text)} bytes after SIGTERM '
+                        f'(first 500): {stdout_text[:500]}'
+                    )
+                stderr_text = (
+                    f'Process terminated after {timeout_seconds}s timeout (SIGTERM); '
+                    + stderr_text
+                )
+            duration_ms = int(time.monotonic() * 1000) - start_ms
+            return _SubprocessResult(
+                stdout=stdout_text,
+                stderr=stderr_text,
+                returncode=proc.returncode if proc.returncode is not None else 1,
+                duration_ms=duration_ms,
             )
-        duration_ms = int(time.monotonic() * 1000) - start_ms
-        return _SubprocessResult(
-            stdout=stdout_text,
-            stderr=stderr_text,
-            returncode=proc.returncode if proc.returncode is not None else 1,
-            duration_ms=duration_ms,
-        )
+    except asyncio.CancelledError:
+        # Orchestrator shutdown path: the awaiting task was cancelled. The
+        # subprocess itself is *not* automatically killed — we must reap it
+        # here or its asyncio child-watcher thread keeps the event loop
+        # alive after the main coroutine returns. Shield the final wait so
+        # a second cancel can't abandon the waitpid mid-flight.
+        if proc.returncode is None:
+            logger.warning(f'Subprocess cancelled — terminating pid {proc.pid}')
+            with contextlib.suppress(ProcessLookupError):
+                proc.terminate()
+            try:
+                await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5.0))
+            except TimeoutError:
+                logger.warning(
+                    f'pid {proc.pid} did not exit on SIGTERM — killing'
+                )
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                try:
+                    await asyncio.shield(
+                        asyncio.wait_for(proc.wait(), timeout=5.0)
+                    )
+                except TimeoutError:
+                    logger.error(f'pid {proc.pid} unresponsive to SIGKILL')
+        raise
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
 

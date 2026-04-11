@@ -8,7 +8,7 @@ inherits it, agents treat it as state, and cross-task contamination follows.
 
 This module contains multiple redundant safeguards ("belts and braces"):
 
-1. _scrub_task_dir_from_tree() — removes .task/ from the git index in any
+1. scrub_task_dir_from_tree() — removes .task/ from the git index in any
    worktree, amending the current commit.  Called after merges and during
    worktree creation.
 2. _assert_no_task_dir() — hard assertion that a given commit SHA contains
@@ -28,6 +28,7 @@ import asyncio
 import logging
 import shutil
 from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
 from typing import Literal
 
@@ -44,11 +45,29 @@ AdvanceResult = Literal[
 ]
 
 
+class ScrubResult(Enum):
+    """Result of a ``scrub_task_dir_from_tree`` call.
+
+    Distinguishes three outcomes so callers can react precisely:
+
+    - ``CLEAN``   — ``.task/`` was not present in the tree; no action taken.
+    - ``SCRUBBED``— ``.task/`` was found and successfully removed from the index.
+    - ``FAILED``  — ``.task/`` was found but could not be removed (git rm or
+                    git commit failed).  The index may still be contaminated;
+                    ``_assert_no_task_dir`` is the downstream hard gate.
+    """
+    CLEAN = auto()
+    SCRUBBED = auto()
+    FAILED = auto()
+
+
 # ---------------------------------------------------------------------------
 # .task/ contamination helpers
 # ---------------------------------------------------------------------------
 
-async def _scrub_task_dir_from_tree(cwd: Path, context: str, *, amend: bool = True) -> bool:
+async def scrub_task_dir_from_tree(
+    cwd: Path, context: str, *, amend: bool = True,
+) -> ScrubResult:
     """Remove .task/ from the git index if present.
 
     This is the primary defense against .task/ reaching main.  It checks
@@ -65,7 +84,10 @@ async def _scrub_task_dir_from_tree(cwd: Path, context: str, *, amend: bool = Tr
                after create_worktree where HEAD == main's tip).
 
     Returns:
-        True if .task/ was found and removed, False if the tree was clean.
+        ``ScrubResult.CLEAN``    if ``.task/`` was not present in the tree.
+        ``ScrubResult.SCRUBBED`` if ``.task/`` was found and successfully removed.
+        ``ScrubResult.FAILED``   if ``.task/`` was found but removal failed
+                                  (git rm or git commit returned non-zero).
 
     DO NOT REMOVE THIS FUNCTION.  It is the last reliable defense before
     .task/ reaches main via update-ref (which bypasses all git hooks).
@@ -75,11 +97,11 @@ async def _scrub_task_dir_from_tree(cwd: Path, context: str, *, amend: bool = Tr
         cwd=cwd,
     )
     if rc != 0 or not tracked.strip():
-        return False
+        return ScrubResult.CLEAN
 
     files = [f for f in tracked.strip().splitlines() if f.strip()]
     if not files:
-        return False
+        return ScrubResult.CLEAN
 
     logger.warning(
         '.task/ CONTAMINATION detected during %s — removing %d tracked file(s): %s',
@@ -87,7 +109,10 @@ async def _scrub_task_dir_from_tree(cwd: Path, context: str, *, amend: bool = Tr
     )
 
     # Remove from index (not filesystem — .task/ may still be needed as scratch)
-    await _run(['git', 'rm', '-r', '--cached', '--', '.task/'], cwd=cwd)
+    rc, _, err = await _run(['git', 'rm', '-r', '--cached', '--', '.task/'], cwd=cwd)
+    if rc != 0:
+        logger.error('.task/ scrub failed during %s: git rm --cached failed: %s', context, err)
+        return ScrubResult.FAILED
 
     # Also remove from filesystem if present (cleanup inherited contamination)
     task_dir = cwd / '.task'
@@ -114,10 +139,10 @@ async def _scrub_task_dir_from_tree(cwd: Path, context: str, *, amend: bool = Tr
 
     if rc != 0:
         logger.error('.task/ scrub failed during %s: could not commit removal: %s', context, err)
-        return False
+        return ScrubResult.FAILED
 
     logger.info('.task/ scrub completed during %s — %d file(s) removed from tree', context, len(files))
-    return True
+    return ScrubResult.SCRUBBED
 
 
 def _ensure_task_gitignore(worktree: Path) -> None:
@@ -302,12 +327,21 @@ class GitOps:
         # been committed yet.
         # amend=False: HEAD is shared with main — must NOT amend the shared commit.
         # Instead, create a new commit on the branch to remove .task/.
-        scrubbed = await _scrub_task_dir_from_tree(worktree_path, 'worktree-creation', amend=False)
-        if scrubbed:
+        scrub_result = await scrub_task_dir_from_tree(
+            worktree_path, 'worktree-creation', amend=False,
+        )
+        if scrub_result == ScrubResult.SCRUBBED:
             logger.warning(
                 'MAIN IS CONTAMINATED — .task/ was inherited by new worktree %s. '
                 'The contamination has been removed from this worktree, but main '
                 'still carries .task/.  Run: git rm -r --cached .task/ on main.',
+                worktree_path,
+            )
+        elif scrub_result == ScrubResult.FAILED:
+            logger.error(
+                '.task/ scrub FAILED during worktree-creation for %s — the index '
+                'may still be contaminated.  The hard gate at advance_main will '
+                'catch this if contamination reaches main.',
                 worktree_path,
             )
 
@@ -496,10 +530,16 @@ class GitOps:
             # merge commit contains those files.  We MUST remove them
             # before this commit reaches main via advance_main().
             #
-            # _scrub_task_dir_from_tree() checks git ls-tree, runs
+            # scrub_task_dir_from_tree() checks git ls-tree, runs
             # git rm --cached, and amends the merge commit in-place.
             # This is the single most important .task/ defense.
-            await _scrub_task_dir_from_tree(merge_wt, f'post-merge({full_branch})')
+            scrub_result = await scrub_task_dir_from_tree(merge_wt, f'post-merge({full_branch})')
+            if scrub_result == ScrubResult.FAILED:
+                logger.error(
+                    '.task/ scrub FAILED post-merge for %s — index may still be '
+                    'contaminated; _assert_no_task_dir will catch it at advance_main.',
+                    full_branch,
+                )
 
             _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
             return MergeResult(
@@ -747,9 +787,15 @@ class GitOps:
                 )
                 return 'not_descendant'
 
-            await _scrub_task_dir_from_tree(
+            scrub_result = await scrub_task_dir_from_tree(
                 merge_worktree, f'advance_main-retry({attempt + 1})',
             )
+            if scrub_result == ScrubResult.FAILED:
+                logger.error(
+                    '.task/ scrub FAILED during advance_main-retry(%d) — index may '
+                    'be contaminated; _assert_no_task_dir will catch it.',
+                    attempt + 1,
+                )
             _, new_sha, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=merge_worktree,
             )

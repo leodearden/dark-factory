@@ -15,9 +15,42 @@ from unittest.mock import AsyncMock
 import pytest
 
 from fused_memory.backends.graphiti_client import (
+    EdgeDict,
     GraphitiBackend,
     StaleSummaryResult,
 )
+
+# ---------------------------------------------------------------------------
+# task-507: make_stale_list factory fixture
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def make_stale_list():
+    """Factory fixture for the standard Alice/Bob two-entity stale-list shape.
+
+    Follows the factory-fixture convention used throughout this project
+    (make_backend, make_graph_mock, …): returns a callable that produces the
+    test object, allowing keyword overrides at call time.
+
+    Entity conventions:
+      - Alice: uuid='u1', name='Alice'
+      - Bob:   uuid='u2', name='Bob'
+
+    Summary defaults ('summary A' / 'summary B') match the most common values
+    used across the six consumer tests.  Pass keyword arguments to override:
+
+        make_stale_list(alice_summary='old A', bob_summary='old B')
+    """
+
+    def _factory(alice_summary: str = 'summary A', bob_summary: str = 'summary B'):
+        return [
+            {'uuid': 'u1', 'name': 'Alice', 'summary': alice_summary},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': bob_summary},
+        ]
+
+    return _factory
+
 
 # ---------------------------------------------------------------------------
 # step-1: StaleSummaryResult named tuple with backward-compat tuple unpacking
@@ -30,14 +63,14 @@ class TestStaleSummaryResult:
     def test_named_attribute_stale(self):
         """StaleSummaryResult.stale holds the stale list."""
         stale_list = [{'uuid': 'u1', 'name': 'Alice'}]
-        edges = {'u1': [{'fact': 'fact1'}]}
+        edges: dict[str, list[EdgeDict]] = {'u1': [{'uuid': 'e-1', 'fact': 'fact1', 'name': 'knows'}]}
         result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=5)
         assert result.stale is stale_list
 
     def test_named_attribute_all_edges(self):
         """StaleSummaryResult.all_edges holds the edges dict."""
         stale_list: list[dict] = []
-        edges = {'u1': [{'fact': 'fact1'}]}
+        edges: dict[str, list[EdgeDict]] = {'u1': [{'uuid': 'e-1', 'fact': 'fact1', 'name': 'knows'}]}
         result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=3)
         assert result.all_edges is edges
 
@@ -328,15 +361,12 @@ class TestRebuildEntitySummariesForceDryRun:
     """
 
     @pytest.mark.asyncio
-    async def test_force_dry_run_does_not_call_get_all_valid_edges(self, mock_config, make_backend):
+    async def test_force_dry_run_does_not_call_get_all_valid_edges(
+        self, mock_config, make_backend, make_stale_list
+    ):
         """When force=True and dry_run=True, get_all_valid_edges is NOT called."""
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(
-            return_value=[
-                {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
-                {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
-            ]
-        )
+        backend.list_entity_nodes = AsyncMock(return_value=make_stale_list())
         backend.get_all_valid_edges = AsyncMock(return_value={})
         backend._rebuild_entity_from_edges = AsyncMock()
 
@@ -373,7 +403,9 @@ class TestRebuildEntitySummariesForceDryRun:
         assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
 
     @pytest.mark.asyncio
-    async def test_force_no_dry_run_calls_get_all_valid_edges(self, mock_config, make_backend):
+    async def test_force_no_dry_run_calls_get_all_valid_edges(
+        self, mock_config, make_backend, make_stale_list
+    ):
         """Positive complement: force=True, dry_run=False calls get_all_valid_edges exactly once.
 
         This is the paired positive case for test_force_dry_run_does_not_call_get_all_valid_edges.
@@ -381,12 +413,7 @@ class TestRebuildEntitySummariesForceDryRun:
         get_all_valid_edges must be called before processing entities.
         """
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(
-            return_value=[
-                {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
-                {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
-            ]
-        )
+        backend.list_entity_nodes = AsyncMock(return_value=make_stale_list())
         backend.get_all_valid_edges = AsyncMock(return_value={})
         # Mock the inner rebuild to avoid touching real write path
         backend._rebuild_entity_from_edges = AsyncMock(
@@ -418,7 +445,9 @@ class TestRebuildEntitySummariesDataFlow:
         """total_entities in result matches _detect_stale_summaries_with_edges.total_count."""
         backend = make_backend(mock_config)
         stale_list = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'old'}]
-        all_edges = {'u1': [{'fact': 'Alice knows Bob'}]}
+        all_edges: dict[str, list[EdgeDict]] = {
+            'u1': [{'uuid': 'e-1', 'fact': 'Alice knows Bob', 'name': 'knows'}]
+        }
         # total_count=10 means 10 entities exist but only 1 is stale
         detect_result = StaleSummaryResult(stale=stale_list, all_edges=all_edges, total_count=10)
         backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
@@ -441,7 +470,9 @@ class TestRebuildEntitySummariesDataFlow:
         assert result['errors'] == 0
 
     @pytest.mark.asyncio
-    async def test_force_false_dry_run_total_entities_from_detect(self, mock_config, make_backend):
+    async def test_force_false_dry_run_total_entities_from_detect(
+        self, mock_config, make_backend, make_stale_list
+    ):
         """force=False, dry_run=True: total_entities flows from the cheap dry_run probe (task-526).
 
         After task-526 the force=False dry_run=True path routes through
@@ -450,10 +481,7 @@ class TestRebuildEntitySummariesDataFlow:
         in the final result must still come from total_count, not from len(stale_list).
         """
         backend = make_backend(mock_config)
-        stale_list = [
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'old A'},
-            {'uuid': 'u2', 'name': 'Bob', 'summary': 'old B'},
-        ]
+        stale_list = make_stale_list(alice_summary='old A', bob_summary='old B')
         # Mock the new cheap-probe directly: (stale_list, total_count)
         backend._detect_stale_summaries_dry_run = AsyncMock(return_value=(stale_list, 7))
 
@@ -525,7 +553,7 @@ class TestRebuildEntitySummariesDataFlow:
         backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
 
     @pytest.mark.asyncio
-    async def test_force_false_dry_run_fetches_edges_per_entity(self, mock_config, make_backend):
+    async def test_force_false_dry_run_fetches_edges_per_entity(self, mock_config, make_backend, make_stale_list):
         """force=False, dry_run=True: get_valid_edges_for_node awaited once per non-empty-summary entity (post-526).
 
         Positive complement to test_force_false_dry_run_does_not_fetch_edge_map.
@@ -545,10 +573,7 @@ class TestRebuildEntitySummariesDataFlow:
         """
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(
-            return_value=[
-                {'uuid': 'u1', 'name': 'Alice', 'summary': 'some summary 1'},
-                {'uuid': 'u2', 'name': 'Bob', 'summary': 'some summary 2'},
-            ]
+            return_value=make_stale_list(alice_summary='some summary 1', bob_summary='some summary 2')
         )
         backend.get_all_valid_edges = AsyncMock(return_value={})
         # Per-entity probe returns no edges → summaries are stale (non-empty summary,
@@ -609,7 +634,7 @@ class TestRebuildEntitySummariesErrorHandling:
         assert detail['name'] == 'Alice'
 
     @pytest.mark.asyncio
-    async def test_partial_success_one_error_one_rebuilt(self, mock_config, make_backend):
+    async def test_partial_success_one_error_one_rebuilt(self, mock_config, make_backend, make_stale_list):
         """asyncio.gather returns a mix of exceptions and successes without aborting.
 
         With two entities, the first raising and the second succeeding, the result
@@ -619,19 +644,21 @@ class TestRebuildEntitySummariesErrorHandling:
         """
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(
-            return_value=[
-                {'uuid': 'u1', 'name': 'Alice', 'summary': 'stale summary'},
-                {'uuid': 'u2', 'name': 'Bob', 'summary': 'stale summary 2'},
-            ]
+            return_value=make_stale_list(alice_summary='stale summary', bob_summary='stale summary 2')
         )
-        backend.get_all_valid_edges = AsyncMock(return_value={})
+        u2_edges: list[EdgeDict] = [
+            {'uuid': 'e-1', 'fact': 'fact1', 'name': 'knows'},
+            {'uuid': 'e-2', 'fact': 'fact2', 'name': 'knows'},
+            {'uuid': 'e-3', 'fact': 'fact3', 'name': 'knows'},
+        ]
+        backend.get_all_valid_edges = AsyncMock(return_value={'u2': u2_edges})
         backend._rebuild_entity_from_edges = AsyncMock(
             side_effect=[
                 RuntimeError('boom'),
                 {
                     'uuid': 'u2',
                     'name': 'Bob',
-                    'old_summary': 'stale summary 2',
+                    'old_summary': '<echoed-old-summary>',
                     'new_summary': 'Bob summary v2',
                     'edge_count': 3,
                 },
@@ -657,19 +684,27 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['status'] == 'rebuilt'
         assert ok_detail['uuid'] == 'u2'
         assert ok_detail['name'] == 'Bob'
-        assert ok_detail['old_summary'] == 'stale summary 2'
+        assert ok_detail['old_summary'] == '<echoed-old-summary>'
         assert ok_detail['new_summary'] == 'Bob summary v2'
         assert ok_detail['edge_count'] == 3
 
-        # Verify the implementation forwards the entity's summary as old_summary
-        # into _rebuild_entity_from_edges (not just trusting the mock return value).
-        # This pins down the entity→target→helper data-forwarding path.
+        # Two independent forwarding paths are pinned below:
+        # 1. mock→detail: ok_detail['old_summary'] == '<echoed-old-summary>' (above) proves
+        #    the mock return value flows through the detail-assembly path.
+        # 2. fixture→kwarg: assert_any_call(old_summary='stale summary 2') below proves
+        #    list_entity_nodes()[i]['summary'] is forwarded as the old_summary kwarg to
+        #    _rebuild_entity_from_edges — independent of whatever the mock returns.
         backend._rebuild_entity_from_edges.assert_any_call(
-            'u2', 'Bob', [], group_id='test', old_summary='stale summary 2'
+            'u2', 'Bob', u2_edges, group_id='test', old_summary='stale summary 2'
+        )
+        backend._rebuild_entity_from_edges.assert_any_call(
+            'u1', 'Alice', [], group_id='test', old_summary='stale summary'
         )
 
     @pytest.mark.asyncio
-    async def test_force_false_partial_error_uses_detect_total(self, mock_config, make_backend):
+    async def test_force_false_partial_error_uses_detect_total(
+        self, mock_config, make_backend, make_stale_list
+    ):
         """force=False error path: total_entities flows from StaleSummaryResult.total_count.
 
         This exercises the force=False bookkeeping path where total_entities comes
@@ -682,10 +717,7 @@ class TestRebuildEntitySummariesErrorHandling:
         errors=1 and rebuilt=1, with details in target order (u1 first, u2 second).
         """
         backend = make_backend(mock_config)
-        stale_list = [
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'old A'},
-            {'uuid': 'u2', 'name': 'Bob', 'summary': 'old B'},
-        ]
+        stale_list = make_stale_list(alice_summary='old A', bob_summary='old B')
         detect_result = StaleSummaryResult(
             stale=stale_list,
             all_edges={'u1': [], 'u2': []},
@@ -725,6 +757,23 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['uuid'] == 'u2'
         assert ok_detail['name'] == 'Bob'
         assert ok_detail['new_summary'] == 'rebuilt B'
+        assert ok_detail['old_summary'] == 'old B'
+        assert ok_detail['edge_count'] == 0
+
+        backend._detect_stale_summaries_with_edges.assert_awaited_once_with(group_id='test')
+        assert backend._rebuild_entity_from_edges.await_count == 2
+
+        # Symmetrical to the force=True test: pin the force=False forwarding path
+        # where the targets list-comp sets t['old_summary'] = s['summary'] and
+        # _rebuild_one forwards it as the old_summary kwarg to
+        # _rebuild_entity_from_edges. Edges are [] because detect_result.all_edges
+        # maps both uuids to empty lists.
+        backend._rebuild_entity_from_edges.assert_any_call(
+            'u2', 'Bob', [], group_id='test', old_summary='old B'
+        )
+        backend._rebuild_entity_from_edges.assert_any_call(
+            'u1', 'Alice', [], group_id='test', old_summary='old A'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -834,3 +883,28 @@ class TestCanonicalFactsCallerCoverage:
             'edge_count must reflect the raw number of edges supplied, '
             'not the filtered count.'
         )
+
+
+# ---------------------------------------------------------------------------
+# task-507: make_stale_list fixture contract tests
+# ---------------------------------------------------------------------------
+
+
+class TestMakeStaleListFixture:
+    """Direct contract tests for the make_stale_list factory fixture."""
+
+    def test_default_shape(self, make_stale_list):
+        """make_stale_list() with no args returns the standard Alice/Bob two-entity list."""
+        result = make_stale_list()
+        assert result == [
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
+        ]
+
+    def test_custom_summaries(self, make_stale_list):
+        """make_stale_list(alice_summary=..., bob_summary=...) returns overridden summary values."""
+        result = make_stale_list(alice_summary='old A', bob_summary='old B')
+        assert result == [
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'old A'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'old B'},
+        ]

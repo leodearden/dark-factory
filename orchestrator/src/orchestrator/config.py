@@ -162,14 +162,24 @@ class EffortConfig(BaseModel):
 
 
 class TimeoutsConfig(BaseModel):
-    """Wall-clock timeout (seconds) per agent role."""
+    """Wall-clock timeout (seconds) per agent role.
+
+    Note: ``steward`` here is the *per-invocation* wall-clock limit for a
+    single ``invoke_agent`` call.  It is intentionally decoupled from
+    ``OrchestratorConfig.steward_completion_timeout``, which is the workflow
+    grace period that controls how long the workflow waits for the steward to
+    drain the escalation queue after task completion.  Keep ``steward`` ≥
+    ``steward_completion_timeout`` so individual invocations are not silently
+    cut short inside the grace window.  This invariant is enforced at
+    construction time by a ``model_validator`` on ``OrchestratorConfig``.
+    """
 
     architect: float = Field(default=2400.0)
     implementer: float = Field(default=1200.0)
     debugger: float = Field(default=1200.0)
     reviewer: float = Field(default=600.0)
     merger: float = Field(default=600.0)
-    steward: float = Field(default=900.0)
+    steward: float = Field(default=1800.0)
     triage: float = Field(default=300.0)
     module_tagger: float = Field(default=300.0)
     deep_reviewer: float = Field(default=2400.0)
@@ -199,6 +209,33 @@ class ReviewConfig(BaseModel):
     full_review_on_complete: bool = Field(default=True)
     briefing_path: str = Field(default='review/briefing.yaml')
     reports_dir: str = Field(default='data/review-checkpoints')
+
+
+class FairnessConfig(BaseModel):
+    """Scheduler fairness / anti-starvation configuration.
+
+    When a broad-footprint task keeps losing the greedy lock race to narrow
+    tasks, the scheduler increments a per-task skip counter.  Once the counter
+    reaches ``skip_threshold``, the scheduler installs a short-lived
+    reservation ("park") on every module the starved task wants; parked
+    modules refuse ``try_acquire`` from anyone else until the owner acquires
+    or the lease expires.
+    """
+
+    skip_threshold: int = Field(
+        default=4,
+        description='Consecutive top-candidate skips before installing a reservation.',
+    )
+    lease_multiplier: float = Field(
+        default=5.0,
+        description='Lease duration = median(recent task durations) * multiplier.',
+    )
+    lease_min_secs: float = Field(default=60.0)
+    lease_max_secs: float = Field(default=3600.0)
+    median_window: int = Field(
+        default=50,
+        description='Rolling window size for task-duration history.',
+    )
 
 
 class FusedMemoryConfig(BaseModel):
@@ -306,6 +343,12 @@ class OrchestratorConfig(BaseSettings):
     max_review_cycles: int = Field(default=2)
     reviewer_stagger_secs: float = Field(default=2.0)
     max_reviewer_retries: int = Field(default=4)
+    # Max in-workflow amendment rounds after a PASS-with-suggestions review.
+    # Each round reinvokes the implementer with in-scope suggestions (scoped
+    # by module-lock membership), re-verifies, and re-reviews. Remaining
+    # out-of-scope or cap-exhausted suggestions still flow through the
+    # existing escalate_suggestions path.
+    max_amendment_rounds: int = Field(default=1)
 
     # Completion judge — opt-in loop-exit hint after each implementer iteration.
     # Default False: production orchestrator runs unaffected. Eval runner
@@ -340,6 +383,7 @@ class OrchestratorConfig(BaseSettings):
     steward_lifetime_budget: float = Field(default=12.0)
     steward_max_attempts: int = Field(default=1)
     steward_completion_timeout: float = Field(default=900.0)
+    steward_max_timeouts_per_escalation: int = Field(default=3, ge=2, le=5)
 
     # Pre-triage threshold for review suggestions
     suggestion_triage_threshold: int = Field(default=10)
@@ -373,6 +417,9 @@ class OrchestratorConfig(BaseSettings):
     # Review checkpoints
     review: ReviewConfig = Field(default_factory=ReviewConfig)
 
+    # Scheduler fairness / anti-starvation
+    fairness: FairnessConfig = Field(default_factory=FairnessConfig)
+
     # Git
     git: GitConfig = Field(default_factory=GitConfig)
 
@@ -391,6 +438,17 @@ class OrchestratorConfig(BaseSettings):
     @model_validator(mode='after')
     def _resolve_project_root(self) -> 'OrchestratorConfig':
         self.project_root = self.project_root.resolve()
+        return self
+
+    @model_validator(mode='after')
+    def _validate_steward_timeout_invariant(self) -> 'OrchestratorConfig':
+        if self.timeouts.steward < self.steward_completion_timeout:
+            raise ValueError(
+                f'timeouts.steward ({self.timeouts.steward}) must be >= '
+                f'steward_completion_timeout ({self.steward_completion_timeout}); '
+                'a smaller per-invocation wall-clock would silently cut the steward '
+                'short inside the grace window.'
+            )
         return self
 
     def for_module(self, module_path: str) -> ModuleConfig | None:
