@@ -1272,9 +1272,8 @@ class TestScrubTaskDirFromTree:
                 commit_calls.append(list(cmd))
             return await original_run(cmd, cwd=cwd)
 
-        with caplog.at_level(logging.ERROR, logger='orchestrator.git_ops'):
-            with patch('orchestrator.git_ops._run', side_effect=mock_run):
-                result = await _scrub_task_dir_from_tree(worktree_info.path, 'test-rm-fail')
+        with caplog.at_level(logging.ERROR, logger='orchestrator.git_ops'), patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await _scrub_task_dir_from_tree(worktree_info.path, 'test-rm-fail')
 
         # Return value must be False — git rm failed, scrub did not complete
         assert result is False, f'Expected False on git rm failure, got {result!r}'
