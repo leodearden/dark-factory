@@ -1,0 +1,37 @@
+{
+  "variant_name": "variant_b",
+  "diff_id": "rs_real_01",
+  "reviews": {
+    "opus_bug_hunter": {
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:358-373",
+          "category": "test_coverage",
+          "description": "The `duplicate_template_names_emits_diagnostic` test filters diagnostics by message content ('duplicate') but does not assert that the severity is `Error`. If the diagnostic were accidentally downgraded to a warning, the test would still pass, yet downstream compilation would no longer halt on duplicate template names.",
+          "suggested_fix": "Add an assertion like `assert!(duplicate_diags.iter().all(|d| d.severity == reify_types::Severity::Error));` to pin the severity."
+        }
+      ],
+      "reviewer": "opus_bug_hunter",
+      "verdict": "PASS",
+      "summary": "The change replaces a silent-overwrite `.collect()` HashMap construction with an explicit loop that detects duplicate template names and emits an error diagnostic. The implementation is correct: it keeps the first entry (reasonable conflict resolution), continues processing to collect additional diagnostics, and the Tarjan algorithm still operates correctly on all nodes \u2014 the duplicate simply becomes unreachable by name. The new test validates the diagnostic is emitted but could be strengthened by also asserting the severity level. No bugs, runtime failures, or correctness issues found."
+    },
+    "opus_design_critic": {
+      "reviewer": "opus_design_critic",
+      "verdict": "PASS",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-compiler/src/scc.rs:20-24",
+          "category": "diagnostic_consistency",
+          "description": "The duplicate template name diagnostic includes raw array indices ('indices 3 and 7') which are an internal implementation detail. Every other duplicate detection site in the compiler (e.g. 'duplicate entity definition', 'duplicate port name') omits indices and instead relies on source spans or just the name. While SCC operates on compiled IR where spans aren't readily available, exposing indices in user-facing diagnostics is inconsistent and not actionable for end users.",
+          "suggested_fix": "Consider omitting the indices from the message (e.g. \"duplicate template name '{}'\") or, if the indices are valuable for debugging, log them at a trace/debug level and keep the diagnostic message consistent with the rest of the compiler."
+        }
+      ],
+      "summary": "The change correctly replaces a silent-overwrite HashMap::collect() with explicit duplicate-name detection that emits an error diagnostic and keeps the first entry. This follows the established duplicate-detection pattern used throughout the compiler (HashMap::get check \u2192 emit diagnostic \u2192 skip duplicate). The first-wins policy is a sound choice for graph integrity. The only minor inconsistency is that the error message exposes internal array indices, unlike every other duplicate diagnostic in the codebase which uses names or spans only. Overall this is a clean, well-structured fix that prevents a real bug (adjacency graph corruption from silent overwrites)."
+    }
+  },
+  "total_cost_usd": 0.48452465,
+  "wall_clock_ms": 67879,
+  "errors": []
+}

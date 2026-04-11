@@ -1,0 +1,21 @@
+{
+  "diff_id": "py_obvious_copy",
+  "ground_truth": [
+    {
+      "id": "py_copy_1",
+      "location": "orchestrator/src/orchestrator/evals/metrics.py:66",
+      "category": "code_duplication",
+      "severity": "blocking",
+      "description": "_count_diff_changes() is a near-verbatim duplicate of the existing _git_diff_stats() function defined at line 42. Both count lines changed and files modified between a base commit and HEAD using 'git diff --stat'. The new function uses asyncio.create_subprocess_exec while the existing one uses a shared _run() helper, but the logic and return type are identical.",
+      "mutation_type": "obvious_copy"
+    },
+    {
+      "id": "py_copy_2",
+      "location": "orchestrator/src/orchestrator/evals/metrics.py:66",
+      "category": "unused_function",
+      "severity": "suggestion",
+      "description": "The newly added _count_diff_changes() function is defined but never called anywhere in this diff or module. It appears to be dead code that duplicates existing functionality.",
+      "mutation_type": "obvious_copy"
+    }
+  ]
+}

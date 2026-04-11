@@ -1,0 +1,29 @@
+{
+  "diff_id": "py_always_passes",
+  "ground_truth": [
+    {
+      "id": "py_pass_1",
+      "location": "orchestrator/tests/test_event_store.py:34",
+      "category": "weakened_assertion",
+      "severity": "blocking",
+      "description": "Changed 'assert len(rows) == 1' to 'assert len(rows) >= 1'. This weakens the test to pass even when duplicate events are emitted (a real bug). The original assertion verifies exactly one event was written; the new one would pass with any number of events >= 1, masking duplication bugs.",
+      "mutation_type": "always_passes"
+    },
+    {
+      "id": "py_pass_2",
+      "location": "orchestrator/tests/test_event_store.py:35",
+      "category": "fragile_lookup",
+      "severity": "suggestion",
+      "description": "Changed 'rows[0]' to a generator search 'next(r for r in rows if r[\"task_id\"] == \"42\")'. This makes the test tolerant of extra rows, further masking the weakened len assertion. If no matching row exists, it raises StopIteration instead of a clear assertion error.",
+      "mutation_type": "always_passes"
+    },
+    {
+      "id": "py_pass_3",
+      "location": "orchestrator/tests/test_event_store.py:62",
+      "category": "tautological_assertion",
+      "severity": "blocking",
+      "description": "The new test test_emit_returns_event_id has 'assert any(True for r in rows if ...)' which is a tautological assertion — any() with a generator of True values always returns True when there's at least one match, but the generator yields True unconditionally for ALL rows (the 'if' filters the generator but True is always the yielded value). Should be 'assert any(r[\"task_id\"] == \"99\" for r in rows)'.",
+      "mutation_type": "always_passes"
+    }
+  ]
+}

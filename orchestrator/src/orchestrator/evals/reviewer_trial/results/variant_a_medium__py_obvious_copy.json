@@ -1,0 +1,58 @@
+{
+  "variant_name": "variant_a_medium",
+  "diff_id": "py_obvious_copy",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:66-86",
+          "category": "code_duplication",
+          "description": "The new `_count_diff_changes` function is a near-duplicate of the existing `_git_diff_stats` defined just below it (lines 138-165). Both functions shell out to `git diff --stat <base>..HEAD`, parse the summary line, and return a `(lines_changed, files_changed)` tuple. Two functions with nearly identical purpose but diverging parsing logic, parameter names (`repo_path`/`base_ref` vs `worktree`/`base_commit`), and error handling will inevitably drift and confuse future maintainers.",
+          "suggested_fix": "Delete `_count_diff_changes` entirely. If a caller needs this functionality, use the existing `_git_diff_stats`. If there is a reason the new variant is needed (e.g. different arg form), justify it in a docstring and factor out the shared parsing \u2014 do not ship two parallel implementations."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:66",
+          "category": "dead_code",
+          "description": "`_count_diff_changes` has zero call sites. `collect_metrics` (line 102) still calls `_git_diff_stats`, and no other file in the repo references the new symbol. Shipping unreferenced code pollutes the module and has no way of being verified in production.",
+          "suggested_fix": "Either wire it into `collect_metrics` (replacing `_git_diff_stats`) with justification for the change, or drop the function from this diff."
+        },
+        {
+          "severity": "blocking",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:71-85",
+          "category": "error_handling",
+          "description": "Unlike `_git_diff_stats`, the new function has no try/except around the subprocess call or parsing. If `git` is missing, the subprocess errors, `stdout` is malformed, or the summary line contains an unparseable number, an exception will propagate up to `collect_metrics` and fail the entire metrics collection for an eval run. `_git_diff_stats` deliberately swallows errors and returns `(0, 0)` \u2014 the new variant violates that contract silently.",
+          "suggested_fix": "Wrap the body in `try/except Exception: return 0, 0` to match the existing failure contract, or (better) delete the function per the duplication finding."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:78-79",
+          "category": "parsing_fragility",
+          "description": "`files_changed = max(0, len(lines) - 1)` counts output lines minus one and assumes the last line is always the summary and every preceding line is a single-file entry. This breaks if git adds a rename block, a binary-file marker, or if output is truncated (e.g., `...`). The existing `_git_diff_stats` uses a regex against the summary line itself (`r'(\\d+) files? changed'`), which is robust to these cases.",
+          "suggested_fix": "Parse the summary line with the same regex used by `_git_diff_stats` instead of counting lines, or reuse `_git_diff_stats` directly."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:66",
+          "category": "test_coverage",
+          "description": "No unit test is added for `_count_diff_changes`. Given that it re-implements existing parsing logic, a parity test against `_git_diff_stats` would at least prove the duplication is behaviorally equivalent; without one, neither function is verified to produce the same result for edge cases (empty diff, binary files, renames, `.gitattributes`-ignored paths).",
+          "suggested_fix": "If the function is kept, add a parity test using a temporary git repo that creates several commits and asserts both functions return identical tuples. Prefer deleting the new function to avoid the need for duplicated coverage."
+        },
+        {
+          "severity": "suggestion",
+          "location": "orchestrator/src/orchestrator/evals/metrics.py:72-74",
+          "category": "style_consistency",
+          "description": "The new function uses single-quoted strings (`'git'`, `'diff'`, `'--stat'`) and double-space indentation conventions that diverge from the rest of the file's single-line subprocess-exec style. Minor, but inconsistent with the sibling `_git_diff_stats` right below it in the same module.",
+          "suggested_fix": "Match the existing formatting in `_git_diff_stats` (double-quoted strings in this codebase are used elsewhere; or at minimum keep arg formatting consistent with the neighbor function)."
+        }
+      ],
+      "summary": "The diff adds a new private async helper `_count_diff_changes` that is a functional near-duplicate of the existing `_git_diff_stats` defined immediately below it, with no call sites and no tests. It silently drops the try/except safety net used by `_git_diff_stats`, meaning that if git fails or output is malformed any future caller would crash `collect_metrics` instead of getting `(0, 0)`. Its file-counting logic (`len(lines) - 1`) is also more fragile than the regex-based parser in the sibling function. Recommend deleting the new function entirely; if it must stay, it needs to replace `_git_diff_stats` (not live alongside it), regain error handling, and gain parity tests."
+    }
+  },
+  "total_cost_usd": 0.302541,
+  "wall_clock_ms": 84765,
+  "errors": []
+}

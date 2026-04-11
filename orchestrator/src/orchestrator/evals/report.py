@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -74,7 +74,7 @@ def _confidence_label(pool: TaskPool, config: str) -> str:
 def build_report(state: JudgeState) -> dict[str, Any]:
     """Build the full structured report."""
     report: dict[str, Any] = {
-        'generated_at': datetime.now(timezone.utc).isoformat(),
+        'generated_at': datetime.now(UTC).isoformat(),
         'tasks': {},
         'aggregate': {},
     }
@@ -119,10 +119,10 @@ def build_report(state: JudgeState) -> dict[str, Any]:
     agg_ratings = compute_aggregate_ratings(state)
     agg_tiers = compute_tiers(agg_ratings)
     report['aggregate'] = {
-        'leaderboard': sorted(
-            [{'config': c, 'mean_elo': r} for c, r in agg_ratings.items()],
-            key=lambda x: -x['mean_elo'],
-        ),
+        'leaderboard': [
+            {'config': c, 'mean_elo': r}
+            for c, r in sorted(agg_ratings.items(), key=lambda x: -x[1])
+        ],
         'tiers': [
             {'rank': i + 1, 'configs': tier}
             for i, tier in enumerate(agg_tiers)

@@ -13,6 +13,72 @@ Task decomposition happens here, in the interactive session, where you have full
 
 This skill is about driving the **orchestrator** — not about implementing tasks yourself in this session. When the user says "do task 7" or "run the tasks", they mean launch the orchestrator to execute them via its TDD workflow pipeline (worktrees, architect/implementer agents, verification, review, merge). Never implement task code directly in the interactive session unless the user explicitly asks you to bypass the orchestrator.
 
+## Critical: identify the target project FIRST
+
+The orchestrator binary lives in `/home/leo/src/dark-factory/orchestrator` and is **always** invoked from there (because `uv run --project orchestrator` resolves the package path). But the **target project** — the codebase whose tasks the orchestrator operates on — is determined entirely by the **config file**, which sets `project_root` and `fused_memory.project_id`.
+
+When the user invokes /orchestrate, they expect it to operate on the project they are currently in — *not* on dark-factory by default. The orchestrator binary now refuses to start without an explicit target (`--config` flag or `ORCH_CONFIG_PATH` env var) — there is no auto-discovery and no default. Identify the target project before any other action.
+
+### Step 1 — capture the user's cwd
+
+Before any other action, run `pwd` and treat the result as the **target project root** for the entire session. Do not assume it is dark-factory.
+
+```bash
+pwd
+# e.g. /home/leo/src/reify   →   TARGET_PROJECT = /home/leo/src/reify
+```
+
+### Step 2 — find the target project's config (`TARGET_CONFIG`)
+
+First, check whether `ORCH_CONFIG_PATH` is already set in the environment — if direnv loaded the project's `.envrc`, this is automatic and you're done:
+
+```bash
+echo "${ORCH_CONFIG_PATH:-unset}"
+# If a path is shown: that IS your TARGET_CONFIG. Verify it matches TARGET_PROJECT.
+# If "unset": continue below.
+```
+
+If unset, find the config file in the target project. Filenames vary across projects (no auto-discovery — every project chose its own name); check all common locations:
+
+```bash
+ls "$TARGET_PROJECT"/orchestrator.yaml \
+   "$TARGET_PROJECT"/orchestrator-config.yaml \
+   "$TARGET_PROJECT"/config.yaml \
+   "$TARGET_PROJECT"/orchestrator/config.yaml 2>/dev/null
+```
+
+Known locations for the three current projects:
+
+| Project | TARGET_CONFIG |
+|---------|---------------|
+| dark-factory | `/home/leo/src/dark-factory/orchestrator/config.yaml` |
+| reify | `/home/leo/src/reify/orchestrator.yaml` |
+| autopilot-video | `/home/leo/src/autopilot-video/orchestrator-config.yaml` |
+
+Verify the file actually points at the target:
+
+```bash
+grep -E '^project_root|project_id' "$TARGET_CONFIG"
+# Expect: project_root: "/home/leo/src/<target>"
+#         project_id: "<target>"
+```
+
+If no config exists for the target, **stop and ask the user** — the project may need an orchestrator config created before it can be run. See `references/project-setup.md` for the schema.
+
+### Step 3 — use the target everywhere for the rest of the session
+
+Once you've identified `TARGET_PROJECT` and `TARGET_CONFIG`, every command and MCP call below must use them — `--config "$TARGET_CONFIG"` (or `ORCH_CONFIG_PATH="$TARGET_CONFIG"`) is required on every orchestrator invocation:
+
+| Where | Use |
+|-------|-----|
+| Launch / status command | `cd /home/leo/src/dark-factory` (binary lives there) **and** `--config "$TARGET_CONFIG"` |
+| `project_root="..."` in fused-memory MCP calls (`get_tasks`, `add_task`, `set_task_status`, `add_dependency`, `update_task`, etc.) | `"$TARGET_PROJECT"` |
+| Worktree inspection paths | `"$TARGET_PROJECT"/.worktrees/<task-id>` |
+| `project_id` in `add_memory` writes | the `project_id` from `TARGET_CONFIG` (e.g. `"reify"`, `"dark_factory"`, `"autopilot_video"`) |
+| Manual git merge target | `"$TARGET_PROJECT"` (the target's `main` branch, not dark-factory's) |
+
+There are no exceptions — even when the target *is* dark-factory, `--config` (or `ORCH_CONFIG_PATH`) must be set. See `references/project-setup.md` for `.envrc`/direnv ergonomics.
+
 ## Determine what the user wants
 
 The user will be in one of these situations. Read the request and jump to the matching section:
@@ -73,7 +139,7 @@ Iterate until the user is satisfied.
 
 ### 4. Write tasks to Taskmaster
 
-Determine the correct `project_root` — this is where `.taskmaster/tasks/tasks.json` lives. It may be the repo root or a subdirectory.
+Use the `TARGET_PROJECT` you captured at the top of the session as `project_root`. (`.taskmaster/tasks/tasks.json` lives under that directory.) **Never** hardcode `/home/leo/src/dark-factory` here unless the user is actually in dark-factory.
 
 Write each task via fused-memory MCP tools:
 
@@ -81,17 +147,17 @@ Write each task via fused-memory MCP tools:
 add_task(
   title="<title>",
   description="<detailed description>",
-  project_root="<project_root>"
+  project_root="$TARGET_PROJECT"
 )
 ```
 
 Then set dependencies:
 
 ```
-add_dependency(id="2", depends_on="1", project_root="<project_root>")
+add_dependency(id="2", depends_on="1", project_root="$TARGET_PROJECT")
 ```
 
-After all tasks are written, verify with `get_tasks` and show the user the final state.
+After all tasks are written, verify with `get_tasks(project_root="$TARGET_PROJECT")` and show the user the final state.
 
 ### 5. Proceed to execution
 
@@ -105,6 +171,8 @@ Jump to [Execute Tasks](#execute-tasks).
 
 Before launching, verify:
 
+0. **Target project is identified** — you must already have run `pwd` and located `TARGET_CONFIG` per the [Critical: identify the target project FIRST](#critical-identify-the-target-project-first) section. If you haven't, do that now. If you skip it, the orchestrator will refuse to start and emit an educational error pointing here.
+
 1. **Services are reachable** — run a quick health check:
    ```bash
    # FalkorDB speaks Redis protocol, not HTTP — use a raw PING
@@ -116,24 +184,31 @@ Before launching, verify:
 
 2. **Environment** — `OPENAI_API_KEY` must be set (used for embeddings). The orchestrator's Claude agents authenticate via OAuth (Max subscription), not an API key — `ANTHROPIC_API_KEY` is **not** required.
 
-3. **Tasks exist** — verify with `get_tasks`. If the task tree is empty, go to [Decompose PRD](#decompose-prd) first.
+3. **Tasks exist** — verify with `get_tasks(project_root="$TARGET_PROJECT")`. If the task tree is empty, go to [Decompose PRD](#decompose-prd) first. Confirm the returned tasks actually belong to the target project — if you see dark-factory task titles when the user is in reify, your `project_root` is wrong; go fix step 3 above before launching.
 
 ### Launch
 
-Run with no `--prd` to execute existing tasks, or pass a PRD to decompose first:
+The orchestrator binary is invoked from `/home/leo/src/dark-factory` (that's where `uv run --project orchestrator` resolves). `--config` (or `ORCH_CONFIG_PATH`) selects the target project and is **required on every invocation** — no exceptions, no auto-discovery, no defaults.
 
 ```bash
 cd /home/leo/src/dark-factory
-# Run existing tasks (no PRD parsing)
-uv run --project orchestrator orchestrator run
+
+# Run existing tasks against the target project
+uv run --project orchestrator orchestrator run --config "$TARGET_CONFIG"
+
 # Or decompose a PRD first, then run
-uv run --project orchestrator orchestrator run --prd <path-to-prd>
+uv run --project orchestrator orchestrator run --config "$TARGET_CONFIG" --prd <path-to-prd>
+
+# Equivalent form using ORCH_CONFIG_PATH (e.g. when direnv loaded the project's .envrc):
+ORCH_CONFIG_PATH="$TARGET_CONFIG" uv run --project orchestrator orchestrator run
 ```
 
+If you omit both `--config` and `ORCH_CONFIG_PATH`, the orchestrator exits 1 with an educational error message pointing at `references/project-setup.md`. There is no silent fallback — this is the hard guard against the cross-project execution incident that lost work.
+
 **Options:**
+- `--config <path>` — **required** unless `ORCH_CONFIG_PATH` is set. Selects the target project (sets `project_root` and `fused_memory.project_id`). When both are set, `--config` wins.
 - `--prd <path>` — path to PRD markdown file. If omitted, skips PRD parsing and runs existing pending tasks.
-- `--dry-run` — verify task tree and module tags, but don't execute workflows.
-- `--config <path>` — override default config (at `orchestrator/config.yaml`). Useful for adjusting concurrency, models, or budgets.
+- `--dry-run` — verify task tree and module tags, but don't execute workflows. Useful for confirming you're pointed at the right project before committing to a real run.
 - `--verbose` — debug-level logging.
 
 The fused-memory HTTP server runs as a **systemd service** and must already be running before launching the orchestrator. Do **not** start, restart, or stop fused-memory without explicit user permission. Verify it's up: `curl -sf http://localhost:8002/health`.
@@ -174,11 +249,51 @@ If any tasks are blocked, jump to [Resolve Blocks](#resolve-blocks).
 
 ---
 
+## Stop Orchestrator
+
+To stop a running orchestrator gracefully, send SIGTERM to the **python3 orchestrator process** — not the bash wrapper or the `uv` process.
+
+### Find the right PID
+
+```bash
+# List orchestrator processes with their configs
+pgrep -af 'orchestrator run --config'
+```
+
+Look for the `python3` (or `orchestrator`) process whose `--config` matches your target. The output shows a chain like `bash → uv → orchestrator`; you want the innermost `orchestrator` PID.
+
+### Send SIGTERM
+
+```bash
+kill <orchestrator_pid>
+```
+
+The orchestrator handles SIGTERM gracefully:
+1. The main loop is interrupted
+2. In-flight agent tasks are cancelled
+3. The `finally` block runs: metrics are finalized, MCP server is stopped, merge worker and escalation server are shut down
+4. Process exits
+
+Task results are persisted **incrementally** as each task completes (not batched at the end), so completed work is never lost even on ungraceful termination.
+
+### Verify shutdown
+
+```bash
+# Confirm the process tree is gone
+pgrep -af 'orchestrator run --config' | grep "$TARGET_CONFIG"
+```
+
+If children (agent subprocesses) are orphaned, kill them by PID. Do **not** use `pkill` with broad patterns — it may hit other projects' orchestrators.
+
+---
+
 ## Check Status
+
+Identify the target project first (see [Critical: identify the target project FIRST](#critical-identify-the-target-project-first)), then query its status. The `status` subcommand also requires `--config` (or `ORCH_CONFIG_PATH`):
 
 ```bash
 cd /home/leo/src/dark-factory
-uv run --project orchestrator orchestrator status
+uv run --project orchestrator orchestrator status --config "$TARGET_CONFIG"
 ```
 
 This queries the fused-memory task tree and displays each task's status and module assignments:
@@ -189,12 +304,14 @@ This queries the fused-memory task tree and displays each task's status and modu
   [blocked     ] 4: Implement caching layer [backend]
 ```
 
-You can also query tasks directly via fused-memory MCP tools for more detail:
+You can also query tasks directly via fused-memory MCP tools for more detail. Always pass `project_root="$TARGET_PROJECT"` — passing dark-factory's path here will return the wrong project's tasks:
 
 ```
-get_tasks(project_root="/home/leo/src/dark-factory")
-get_task(id="4", project_root="/home/leo/src/dark-factory")
+get_tasks(project_root="$TARGET_PROJECT")
+get_task(id="4", project_root="$TARGET_PROJECT")
 ```
+
+If the returned tasks don't look like the project the user is in (e.g. you see dark-factory titles when the user is in reify), your `project_root` is wrong — re-run step 1 of "identify the target project" before continuing.
 
 ---
 
@@ -204,10 +321,10 @@ Tasks block at specific workflow stages. The approach depends on where it got st
 
 ### Identify the block
 
-1. Check status to find blocked tasks
-2. Look at the task's worktree for artifacts — the orchestrator preserves worktrees for blocked tasks (cleaned up only on success):
+1. Check status to find blocked tasks (using `--config "$TARGET_CONFIG"`)
+2. Look at the task's worktree for artifacts — the orchestrator preserves worktrees for blocked tasks (cleaned up only on success). Worktrees live under the **target** project, not dark-factory:
    ```bash
-   ls /home/leo/src/dark-factory/.worktrees/
+   ls "$TARGET_PROJECT"/.worktrees/
    ```
 3. Inside a blocked task's worktree, check `.task/` for diagnostics:
    - `.task/plan.json` — the TDD plan (shows which steps completed)
@@ -226,20 +343,22 @@ Tasks block at specific workflow stages. The approach depends on where it got st
 
 ### Manual resolution workflow
 
-1. **Navigate to the worktree**: `cd /home/leo/src/dark-factory/.worktrees/<task-id>`
+All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-factory.
+
+1. **Navigate to the worktree**: `cd "$TARGET_PROJECT"/.worktrees/<task-id>`
 2. **Diagnose**: read `.task/plan.json`, check test output, review `git log`
 3. **Fix**: make changes directly in the worktree
-4. **Verify**: run `pytest`, `ruff check`, `pyright`
+4. **Verify**: run the target project's verify commands (look these up in `$TARGET_CONFIG` — Rust projects use `cargo test`/`cargo clippy`, Python projects use `pytest`/`ruff`/`pyright`, etc. — do not assume Python tooling)
 5. **Merge manually** (if the fix is good):
    ```bash
-   cd /home/leo/src/dark-factory
+   cd "$TARGET_PROJECT"
    git merge --no-ff task/<task-id>
    ```
 6. **Update task status**:
    ```
-   set_task_status(id="<task-id>", status="done", project_root="/home/leo/src/dark-factory")
+   set_task_status(id="<task-id>", status="done", project_root="$TARGET_PROJECT")
    ```
-7. **Clean up worktree**:
+7. **Clean up worktree** (from inside `$TARGET_PROJECT`):
    ```bash
    git worktree remove .worktrees/<task-id>
    git branch -d task/<task-id>
@@ -247,13 +366,13 @@ Tasks block at specific workflow stages. The approach depends on where it got st
 
 ### Writing context to help future runs
 
-If the block was caused by missing architectural context, write it to memory so the orchestrator's agents can find it next time:
+If the block was caused by missing architectural context, write it to memory so the orchestrator's agents can find it next time. Use the **target project's** `project_id` (read it from `$TARGET_CONFIG` under `fused_memory.project_id` — e.g. `"reify"`, `"dark_factory"`), not a hardcoded value:
 
 ```
 add_memory(
   content="<the decision or convention that was missing>",
   category="decisions_and_rationale",  # or "preferences_and_norms" for conventions
-  project_id="dark_factory",
+  project_id="<target project_id from TARGET_CONFIG>",
   agent_id="claude-interactive"
 )
 ```
@@ -264,12 +383,12 @@ add_memory(
 
 ## Resume Existing Tasks
 
-If tasks already exist from a prior session, first assess their state before re-running.
+If tasks already exist from a prior session, first assess their state before re-running. Make sure you've identified the target project (see top section) — querying with the wrong `project_root` will return a different project's task tree and silently lead you astray.
 
 ### 1. Audit the task tree
 
 ```
-get_tasks(project_root="<project_root>")
+get_tasks(project_root="$TARGET_PROJECT")
 ```
 
 Review the task tree to understand the current state. **Do not change the status of existing tasks** — they may have been set by the user or another session. If a task's status looks wrong, ask the user before changing it.
@@ -286,7 +405,9 @@ Once the task tree is accurate, jump to [Execute Tasks](#execute-tasks). The orc
 
 ## Configuration
 
-The default config lives at `orchestrator/config.yaml`. Config is auto-discovered: if no `--config` flag is passed, the CLI checks `cwd/config.yaml`, then `cwd/orchestrator/config.yaml`. YAML values support `${VAR_NAME}` and `${VAR_NAME:default}` environment variable expansion.
+The config file is selected via `--config <path>` or `ORCH_CONFIG_PATH=<path>` — there is **no auto-discovery from cwd**. The orchestrator binary refuses to start without one of these set, by design. See `references/project-setup.md` for the rationale, the schema for new project configs, and `.envrc`/direnv ergonomics.
+
+YAML values in the loaded config support `${VAR_NAME}` and `${VAR_NAME:default}` environment variable expansion.
 
 ### Core settings
 

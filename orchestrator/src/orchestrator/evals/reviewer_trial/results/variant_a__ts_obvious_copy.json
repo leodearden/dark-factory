@@ -1,0 +1,51 @@
+{
+  "variant_name": "variant_a",
+  "diff_id": "ts_obvious_copy",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "gui/src/viewport/selection.ts:262",
+          "category": "dead_code_unreachable",
+          "description": "The new functions `focusOnBounds` and `focusOnEntities` are defined inside `createSelection` but are NOT included in the return statement (`return { setHovered, setSelected, refreshSelected, fitToView, flyToEntity, invalidateRect, dispose }`) and NOT added to the `SelectionContext` interface. They are unreachable dead code that no caller can ever invoke.",
+          "suggested_fix": "Add `focusOnBounds` and `focusOnEntities` to both the `SelectionContext` interface and the return object of `createSelection`. E.g.: `interface SelectionContext { ... focusOnBounds: (bounds: Box3, padding?: number) => void; focusOnEntities: (entityPaths: string[]) => void; }` and update the return statement accordingly."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:248-272",
+          "category": "code_duplication",
+          "description": "The camera-positioning logic (compute center, size, maxDim, fov distance, reposition camera along view direction, update controls target) is now duplicated three times: in `fitToView` (line 189-218), `flyToEntity` (line 220-246), and the new `focusOnBounds` (line 248-270). Only the padding multiplier differs. This is a clear DRY violation.",
+          "suggested_fix": "Extract the shared camera-positioning logic into `focusOnBounds(bounds, padding)` and rewrite `fitToView` and `flyToEntity` to call it. `fitToView` would compute the combined box and call `focusOnBounds(box, 1.0)`, `flyToEntity` would compute a single mesh box and call `focusOnBounds(box, 1.0)`, and `focusOnEntities` already does the right thing. This eliminates all three copies."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:248-270",
+          "category": "performance_allocation",
+          "description": "Each call to `focusOnBounds` allocates three new `Vector3` objects (`center`, `size`, `viewDir`). The same pattern exists in `fitToView` and `flyToEntity`. While not a hot path today, if this becomes part of an animation loop or continuous measurement tool, these allocations will create GC pressure.",
+          "suggested_fix": "Hoist reusable Vector3 temporaries to the closure scope (e.g., `const _center = new Vector3(); const _size = new Vector3(); const _viewDir = new Vector3();`) and reuse them across calls, consistent with the existing `ndc` Vector2 pattern at the top of `createSelection`."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:255",
+          "category": "robustness_edge_case",
+          "description": "When the bounding box has zero volume in all dimensions (e.g., a single point), `maxDim` will be 0, and `distance` will be 0. The camera will be placed at the point itself, resulting in an invisible/degenerate view. This edge case also exists in `fitToView` and `flyToEntity` but is worth fixing here since it's new code.",
+          "suggested_fix": "Add a minimum distance guard: `const distance = Math.max(maxDim / (2 * Math.tan(fovRad)), 1.0);` or similar, to ensure the camera is always at a reasonable distance from the target."
+        },
+        {
+          "severity": "suggestion",
+          "location": "gui/src/viewport/selection.ts:275-282",
+          "category": "test_coverage",
+          "description": "No tests accompany these new functions. The `focusOnEntities` function silently no-ops when given entity paths that don't exist in the mesh map, which may be intentional but should be verified by tests. Key scenarios: empty array, all-invalid paths, mix of valid/invalid paths, single entity.",
+          "suggested_fix": "Add unit tests for `focusOnBounds` (empty box, zero-volume box, normal box, custom padding) and `focusOnEntities` (empty array, missing paths, valid paths) using a mock camera/scene setup."
+        }
+      ],
+      "summary": "The diff adds two new functions (`focusOnBounds` and `focusOnEntities`) for camera focus behavior inside `createSelection`, but they are never exposed \u2014 neither added to the `SelectionContext` interface nor to the return object. As written, they are unreachable dead code (blocking). Beyond that, the camera-positioning logic is now duplicated three times across `fitToView`, `flyToEntity`, and `focusOnBounds`; the new `focusOnBounds` should be the single source of truth that the others delegate to. Minor issues include per-call Vector3 allocations and a zero-volume bounding box edge case that can put the camera at distance 0."
+    }
+  },
+  "total_cost_usd": 0.22419450000000002,
+  "wall_clock_ms": 70015,
+  "errors": []
+}

@@ -41,8 +41,9 @@ def mock_config():
     config.fused_memory.url = 'http://localhost:8002'
     config.fused_memory.project_id = 'dark_factory'
     config.steward_lifetime_budget = 12.0
-    config.steward_max_retries = 3
+    config.steward_max_attempts = 3
     config.steward_completion_timeout = 300.0
+    config.timeouts.steward = 900.0
     config.suggestion_triage_threshold = 10
     return config
 
@@ -392,8 +393,8 @@ class TestStewardRetryLogic:
 
         assert steward._retry_counts.get('esc-42-1') == 1
 
-    async def test_auto_escalates_after_max_retries(self, steward, mock_config):
-        mock_config.steward_max_retries = 2
+    async def test_auto_escalates_after_max_attempts(self, steward, mock_config):
+        mock_config.steward_max_attempts = 2
         esc = _make_escalation()
         steward._retry_counts['esc-42-1'] = 2
 
@@ -403,6 +404,23 @@ class TestStewardRetryLogic:
         submitted = steward.escalation_queue.submit.call_args[0][0]
         assert submitted.level == 1
         assert 'Failed after 2 attempts' in submitted.summary
+
+        steward.escalation_queue.resolve.assert_called_once()
+        assert steward.escalation_queue.resolve.call_args[1].get('dismiss') is True
+
+    async def test_auto_escalates_after_one_attempt_with_default_retries(
+        self, steward, mock_config,
+    ):
+        mock_config.steward_max_attempts = 1
+        esc = _make_escalation()
+        steward._retry_counts['esc-42-1'] = 1
+
+        await steward._handle_escalation(esc)
+
+        steward.escalation_queue.submit.assert_called_once()
+        submitted = steward.escalation_queue.submit.call_args[0][0]
+        assert submitted.level == 1
+        assert 'Failed after 1 attempt:' in submitted.summary
 
         steward.escalation_queue.resolve.assert_called_once()
         assert steward.escalation_queue.resolve.call_args[1].get('dismiss') is True
@@ -468,6 +486,68 @@ class TestStewardLifetimeBudget:
 
 
 # ---------------------------------------------------------------------------
+# Timeout Passthrough
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardTimeoutPassthrough:
+
+    async def test_invoke_with_session_passes_timeout_seconds(self, steward, mock_config):
+        """_invoke_with_session must forward config.timeouts.steward as timeout_seconds."""
+        mock_config.timeouts.steward = 900.0
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(session_id='sess-t')
+            await steward._invoke_with_session(
+                prompt='do work',
+                cwd=steward.worktree,
+                mcp_config={},
+                per_invocation_budget=5.0,
+                escalation=_make_escalation(),
+            )
+
+        assert mock_invoke.call_args.kwargs['timeout_seconds'] == pytest.approx(900.0)
+
+    async def test_timeout_seconds_forwarded_across_cap_hit_retry(
+        self, steward, mock_config,
+    ):
+        """Both the initial and cap-hit-recovery invocations must carry timeout_seconds."""
+        mock_config.timeouts.steward = 900.0
+
+        call_count = 0
+
+        def detect_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return call_count == 1  # cap hit on first call only
+
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='token-a')
+        gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
+        gate.on_agent_complete = MagicMock()
+        gate.confirm_account_ok = MagicMock()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
+            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_invoke.return_value = _make_result(session_id='sess-t')
+            await steward._invoke_with_session(
+                prompt='do work',
+                cwd=steward.worktree,
+                mcp_config={},
+                per_invocation_budget=5.0,
+                escalation=_make_escalation(),
+            )
+
+        assert mock_invoke.call_count == 2
+        for call in mock_invoke.call_args_list:
+            assert call.kwargs['timeout_seconds'] == pytest.approx(900.0)
+
+
+# ---------------------------------------------------------------------------
 # Unified Role
 # ---------------------------------------------------------------------------
 
@@ -485,7 +565,7 @@ class TestStewardUnifiedRole:
             await steward._handle_escalation(esc)
             assert mock_invoke.call_args.kwargs['cwd'] == worktree
 
-    async def test_suggestions_use_project_root_cwd(self, steward, mock_config):
+    async def test_suggestions_use_worktree_cwd(self, steward, worktree):
         esc = _make_escalation(category='review_suggestions', severity='info', detail='[]')
         steward.escalation_queue.get.return_value = _make_escalation(
             category='review_suggestions', status='resolved', resolution='triaged',
@@ -493,7 +573,7 @@ class TestStewardUnifiedRole:
         with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
             mock_invoke.return_value = _make_result()
             await steward._handle_escalation(esc)
-            assert mock_invoke.call_args.kwargs['cwd'] == mock_config.project_root
+            assert mock_invoke.call_args.kwargs['cwd'] == worktree
 
     async def test_same_role_for_all_escalation_types(self, steward):
         from orchestrator.agents.roles import STEWARD
@@ -685,3 +765,20 @@ class TestNextEscalation:
             assert '--level' in cmd
             level_idx = cmd.index('--level')
             assert cmd[level_idx + 1] == '0'
+
+
+# ---------------------------------------------------------------------------
+# Config Defaults
+# ---------------------------------------------------------------------------
+
+
+class TestStewardDefaultConfig:
+
+    def test_default_steward_max_attempts_is_one(self, monkeypatch, tmp_path):
+        """steward_max_attempts default must be 1 (the renamed field)."""
+        from orchestrator.config import OrchestratorConfig
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.steward_max_attempts == 1

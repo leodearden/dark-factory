@@ -1,0 +1,51 @@
+{
+  "variant_name": "variant_a",
+  "diff_id": "rs_missing_error_prop",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "blocking",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1978 (lower_string_literal)",
+          "category": "robustness_regression",
+          "description": "Replacing `.unwrap_or(text)` with `.unwrap()` introduces a panic on malformed tree-sitter nodes. The original code had a comment explicitly warning that 'error recovery can produce malformed nodes', and a test `unclosed_string_does_not_panic` in edge_case_tests.rs validates this. The tree-sitter error-recovery path can produce string_literal nodes without matching quotes (e.g. unclosed strings), and `.unwrap()` will panic in that case. All three other quote-stripping sites in this file (lower_field_source at line 646, lower_meta_block at line 1663) consistently use `.unwrap_or()` for this reason.",
+          "suggested_fix": "Restore the safe fallback: `.unwrap_or(text)` instead of `.unwrap()`. This preserves the defensive pattern against tree-sitter error recovery."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1990 (lower_single_quoted_string)",
+          "category": "robustness_panic",
+          "description": "The new `lower_single_quoted_string` method uses `.unwrap()` on the strip_prefix/strip_suffix chain, which will panic if tree-sitter error recovery produces a node without matching single quotes. This is the same error-recovery hazard as in the double-quote case.",
+          "suggested_fix": "Use `.unwrap_or(text)` to match the established defensive pattern in this codebase, or return `None` on malformed input (e.g. use `?` operator after wrapping in Option)."
+        },
+        {
+          "severity": "blocking",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1984-1996 (lower_single_quoted_string)",
+          "category": "dead_code",
+          "description": "The new `lower_single_quoted_string` method has no call site anywhere in the codebase. The `lower_expr` dispatch table at line ~1697 has no match arm for a single-quoted string node kind, and the tree-sitter grammar (grammar.js lines 805-812) only defines `string_literal` with double quotes. This function is unreachable dead code.",
+          "suggested_fix": "Either add a grammar rule for single-quoted strings and a corresponding dispatch arm in `lower_expr`, or remove this method if single-quoted strings are not yet supported."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1984-1996 (lower_single_quoted_string)",
+          "category": "code_duplication",
+          "description": "The body of `lower_single_quoted_string` is identical to `lower_string_literal` except for the quote character (' vs \"). This could be extracted into a shared helper like `strip_quotes(text, quote_char) -> &str` to avoid duplication, especially if more quote styles are added later.",
+          "suggested_fix": "Extract a helper: `fn strip_outer_quotes(text: &str, quote: char) -> &str` that both methods call."
+        },
+        {
+          "severity": "suggestion",
+          "location": "crates/reify-syntax/src/ts_parser.rs:1974 (lower_string_literal)",
+          "category": "stale_comment",
+          "description": "The comment '// Strip outer quotes safely (error recovery can produce malformed nodes)' still exists but the code no longer strips safely \u2014 it now panics via `.unwrap()`. The comment and the code are contradictory.",
+          "suggested_fix": "Either restore the safe unwrap_or (preferred) or update the comment to reflect the new assumption."
+        }
+      ],
+      "summary": "This diff introduces two blocking regressions and one piece of dead code. The most critical issue is replacing `.unwrap_or(text)` with `.unwrap()` in `lower_string_literal`, which removes a deliberate defensive fallback against tree-sitter error recovery producing malformed nodes \u2014 an explicitly documented hazard with an existing test (`unclosed_string_does_not_panic`) that will now fail. The new `lower_single_quoted_string` method has the same `.unwrap()` panic hazard and additionally has no call site: neither the grammar nor the dispatch table reference single-quoted strings, making it unreachable dead code. Both methods also duplicate logic that could share a helper for quote stripping."
+    }
+  },
+  "total_cost_usd": 0.38998520000000003,
+  "wall_clock_ms": 116799,
+  "errors": []
+}

@@ -26,6 +26,12 @@ def _resolve_project_root(prd: str, default_root: Path) -> Path:
     Looks for a ``.taskmaster/`` directory starting from the PRD's parent.
     Falls back to *default_root* (the dashboard's own project root) if no
     ``.taskmaster/`` is found or the PRD path is relative.
+
+    The returned Path is always canonical (symlinks resolved).  This guarantee
+    is now mirrored by ``_resolve_root`` inside :func:`discover_orchestrators`:
+    every branch of that helper also returns a canonical Path, so consumers of
+    either function can rely on canonical-path equality without defensive
+    ``.resolve()`` calls.
     """
     p = Path(prd)
     if not p.is_absolute():
@@ -35,7 +41,7 @@ def _resolve_project_root(prd: str, default_root: Path) -> Path:
     for ancestor in p.parents:
         if (ancestor / '.taskmaster').is_dir():
             return ancestor
-    return default_root
+    return default_root.resolve()
 
 
 def _read_project_root_from_config(config_path: str) -> Path | None:
@@ -168,7 +174,7 @@ def load_task_tree(tasks_json_path: Path) -> list[dict]:
     """
     try:
         raw = tasks_json_path.read_text()
-    except FileNotFoundError:
+    except OSError:
         return []
 
     try:
@@ -296,14 +302,19 @@ def discover_orchestrators(config: DashboardConfig) -> list[dict]:
         return []
 
     def _resolve_root(proc: dict) -> Path:
-        """Resolve project root from process info: prd > config > default."""
+        """Resolve project root from process info: prd > config > default.
+
+        All three branches return a canonical (symlink-resolved) Path so that
+        the ``groups`` dict always uses canonical keys and the ``project_root``
+        emitted in each result entry is canonical without further ``.resolve()``.
+        """
         if proc.get('prd'):
             return _resolve_project_root(proc['prd'], config.project_root)
         if proc.get('config_path'):
             root = _read_project_root_from_config(proc['config_path'])
             if root is not None:
                 return root
-        return config.project_root
+        return config.project_root.resolve()
 
     # Group processes by resolved project root — multiple PIDs targeting the
     # same project are merged into a single entry with a 'pids' list.

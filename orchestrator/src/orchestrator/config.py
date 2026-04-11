@@ -19,6 +19,16 @@ from pydantic_settings import (
 logger = logging.getLogger(__name__)
 
 
+class ConfigRequiredError(Exception):
+    """Raised when no orchestrator config is provided via --config or ORCH_CONFIG_PATH.
+
+    The orchestrator deliberately refuses to auto-detect target projects from cwd,
+    because silent defaults previously caused cross-project execution that lost work
+    (2026-04-06 incident: /orchestrate run from ~/src/reify silently executed
+    dark-factory tasks because cwd-based discovery picked dark-factory's own config).
+    """
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Deep-merge *override* into *base*.  Override values win at leaf level."""
     merged = base.copy()
@@ -103,6 +113,7 @@ class ModelsConfig(BaseModel):
     triage: str = Field(default='sonnet')
     module_tagger: str = Field(default='sonnet')
     deep_reviewer: str = Field(default='opus')
+    judge: str = Field(default='sonnet')
 
 
 class BudgetsConfig(BaseModel):
@@ -117,6 +128,7 @@ class BudgetsConfig(BaseModel):
     triage: float = Field(default=2.0)
     module_tagger: float = Field(default=2.0)
     deep_reviewer: float = Field(default=15.0)
+    judge: float = Field(default=0.50)
 
 
 class TurnsConfig(BaseModel):
@@ -131,6 +143,7 @@ class TurnsConfig(BaseModel):
     triage: int = Field(default=25)
     module_tagger: int = Field(default=30)
     deep_reviewer: int = Field(default=100)
+    judge: int = Field(default=15)
 
 
 class EffortConfig(BaseModel):
@@ -145,6 +158,7 @@ class EffortConfig(BaseModel):
     triage: str = Field(default='medium')
     module_tagger: str = Field(default='medium')
     deep_reviewer: str = Field(default='max')
+    judge: str = Field(default='medium')
 
 
 class TimeoutsConfig(BaseModel):
@@ -159,6 +173,7 @@ class TimeoutsConfig(BaseModel):
     triage: float = Field(default=300.0)
     module_tagger: float = Field(default=300.0)
     deep_reviewer: float = Field(default=2400.0)
+    judge: float = Field(default=300.0)
 
 
 class BackendsConfig(BaseModel):
@@ -173,6 +188,7 @@ class BackendsConfig(BaseModel):
     triage: str = Field(default='claude')
     module_tagger: str = Field(default='claude')
     deep_reviewer: str = Field(default='claude')
+    judge: str = Field(default='claude')
 
 
 class ReviewConfig(BaseModel):
@@ -231,6 +247,9 @@ class GitConfig(BaseModel):
 _OVERRIDABLE_FIELDS = frozenset({
     'test_command', 'lint_command', 'type_check_command',
     'lock_depth', 'max_per_module', 'module_overrides',
+    'verify_command_timeout_secs',
+    'concurrent_verify', 'verify_env',
+    'scope_cargo',
 })
 
 
@@ -245,6 +264,10 @@ class ModuleConfig:
     lock_depth: int | None = None
     max_per_module: int | None = None
     module_overrides: dict[str, int] | None = None
+    verify_command_timeout_secs: float | None = None
+    concurrent_verify: bool | None = None
+    verify_env: dict[str, str] | None = None
+    scope_cargo: bool | None = None
 
 
 def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
@@ -284,15 +307,38 @@ class OrchestratorConfig(BaseSettings):
     reviewer_stagger_secs: float = Field(default=2.0)
     max_reviewer_retries: int = Field(default=4)
 
+    # Completion judge — opt-in loop-exit hint after each implementer iteration.
+    # Default False: production orchestrator runs unaffected. Eval runner
+    # enables this per-task (see evals/runner.py build_eval_orch_config).
+    judge_after_each_iteration: bool = Field(default=False)
+
     # Merge conflict reduction
     max_advance_attempts: int = Field(default=3)
     max_pre_merge_retries: int = Field(default=2)
+    max_merge_retries: int = Field(default=3)
     inter_iteration_rebase: bool = Field(default=True)
     requeue_cooldown_secs: float = Field(default=30.0)
 
+    # Verification timeouts
+    verify_command_timeout_secs: float = Field(default=1800.0)
+    verify_timeout_retries: int = Field(default=2)
+
+    # Verification execution mode + env
+    # When False, test/lint/type run sequentially within a single verify
+    # invocation.  Useful for Rust workspaces where cargo takes an advisory
+    # lock on target/ and the concurrent subcommands serialize anyway.
+    concurrent_verify: bool = Field(default=True)
+    # Extra env vars injected into verify commands (e.g. RUSTC_WRAPPER=sccache).
+    # Distinct from env_overrides, which targets agent invocations, not verify.
+    verify_env: dict[str, str] = Field(default_factory=dict)
+    # When True, task-phase verify for Rust tasks rewrites
+    # ``cargo --workspace`` → ``cargo -p <crate>`` for the touched crates.
+    # Post-merge verify always runs workspace-wide regardless.
+    scope_cargo: bool = Field(default=True)
+
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)
-    steward_max_retries: int = Field(default=3)
+    steward_max_attempts: int = Field(default=1)
     steward_completion_timeout: float = Field(default=900.0)
 
     # Pre-triage threshold for review suggestions
@@ -370,49 +416,49 @@ class OrchestratorConfig(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        config_path = Path(os.environ.get('ORCH_CONFIG_PATH', 'config.yaml'))
+        config_path = Path(os.environ.get('ORCH_CONFIG_PATH', '') or 'config.yaml')
         yaml_settings = YamlSettingsSource(settings_cls, config_path)
         return (init_settings, env_settings, yaml_settings, dotenv_settings)
 
 
-def _find_config(explicit_path: Path | None) -> Path | None:
-    """Find the config file to load, searching standard locations.
-
-    Search order:
-    1. explicit_path (if given and exists)
-    2. ORCH_CONFIG_PATH env var (if set and exists)
-    3. cwd/config.yaml
-    4. cwd/orchestrator/config.yaml
-    """
-    if explicit_path is not None:
-        return explicit_path if explicit_path.exists() else None
-    env_path = os.environ.get('ORCH_CONFIG_PATH')
-    if env_path:
-        p = Path(env_path)
-        if p.exists():
-            return p
-    cwd_config = Path('config.yaml')
-    if cwd_config.exists():
-        return cwd_config
-    orch_config = Path('orchestrator') / 'config.yaml'
-    if orch_config.exists():
-        return orch_config
-    return None
-
-
 def load_config(config_path: Path | None = None) -> OrchestratorConfig:
-    """Load configuration from YAML file, env vars, and defaults."""
-    found = _find_config(config_path)
-    if found:
-        os.environ['ORCH_CONFIG_PATH'] = str(found)
-    elif 'ORCH_CONFIG_PATH' in os.environ:
-        # Clear stale env var so YamlSettingsSource returns {}
-        del os.environ['ORCH_CONFIG_PATH']
-    config = OrchestratorConfig()
-    if found is None:
-        logger.info(
-            'No project config file found (checked config.yaml, orchestrator/config.yaml). '
-            'Using package defaults. Pass --config or set ORCH_CONFIG_PATH to specify.',
+    """Load configuration from an explicit YAML file.
+
+    Resolution order:
+    1. ``config_path`` argument (typically from ``--config`` flag)
+    2. ``ORCH_CONFIG_PATH`` environment variable
+
+    If neither is set, raises :class:`ConfigRequiredError`. The orchestrator does
+    NOT auto-discover from cwd — see ``ConfigRequiredError`` docstring for the
+    rationale.
+    """
+    if config_path is None:
+        env_path = os.environ.get('ORCH_CONFIG_PATH')
+        if not env_path:
+            raise ConfigRequiredError(
+                '--config is required (or set ORCH_CONFIG_PATH).\n\n'
+                'The orchestrator does not auto-detect the target project from cwd; '
+                'this safeguard exists because silent defaults previously caused '
+                'cross-project execution that lost work.\n\n'
+                'Examples:\n'
+                '  uv run --project orchestrator orchestrator run \\\n'
+                '      --config /home/leo/src/reify/orchestrator.yaml\n'
+                '  ORCH_CONFIG_PATH=/home/leo/src/reify/orchestrator.yaml \\\n'
+                '      uv run --project orchestrator orchestrator run\n\n'
+                'See skills/orchestrate/references/project-setup.md for setup '
+                'instructions.'
+            )
+        config_path = Path(env_path)
+
+    if not config_path.exists():
+        raise ConfigRequiredError(
+            f'Config file not found: {config_path}\n\n'
+            f'Pass an explicit --config path or set ORCH_CONFIG_PATH to a valid '
+            f'file. See skills/orchestrate/references/project-setup.md for setup '
+            f'instructions.'
         )
+
+    os.environ['ORCH_CONFIG_PATH'] = str(config_path)
+    config = OrchestratorConfig()
     config._module_configs = _discover_module_configs(config.project_root)
     return config

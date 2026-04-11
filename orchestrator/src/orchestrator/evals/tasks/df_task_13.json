@@ -3,8 +3,8 @@
   "name": "Bug: Reviewers receive empty diff, rubber-stamp PASS",
   "project": "dark-factory",
   "project_root": "/home/leo/src/dark-factory",
-  "pre_task_commit": "e53c9a555cf64117c19aa5834df269fc3e97d8a3",
-  "post_task_commit": "503b9d768296888befcedfc3f0c2135d6b031161",
+  "pre_task_commit": "0b741353c200e7885d0a7d5bf8d81d86939cf5df",
+  "post_task_commit": "506516dee251d162f9665d5e67758ae423177cb2",
   "task_definition": {
     "title": "Bug: Reviewers receive empty diff, rubber-stamp PASS",
     "description": "Reviewers receive an empty diff because git_ops uses dynamic main...HEAD which returns empty when main advances during task execution. Fix by capturing main's SHA at worktree creation time (base_commit), storing it in .task/metadata.json, and using get_diff_from_base(base_commit) in the review stage."

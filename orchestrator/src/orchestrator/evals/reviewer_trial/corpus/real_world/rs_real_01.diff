@@ -1,0 +1,92 @@
+── crates/reify-compiler/src/scc.rs (modified) ──
+ pub(crate) fn detect_recursive_structures(
+     templates: &mut [TopologyTemplate],
+     diagnostics: &mut Vec<reify_types::Diagnostic>,
+ ) -> Vec<HashSet<String>> {
+-    // Build an index: name -> index in templates
+-    let name_to_idx: HashMap<&str, usize> = templates
+-        .iter()
+-        .enumerate()
+-        .map(|(i, t)| (t.name.as_str(), i))
+-        .collect();
++    // Build an index: name -> index in templates.
++    // Use explicit insertion so that duplicates are detected and reported instead of
++    // silently overwriting (which would corrupt the adjacency graph).
++    let mut name_to_idx: HashMap<&str, usize> = HashMap::new();
++    for (i, t) in templates.iter().enumerate() {
++        if let Some(&prev_idx) = name_to_idx.get(t.name.as_str()) {
++            diagnostics.push(reify_types::Diagnostic::error(format!(
++                "duplicate template name '{}': indices {} and {}",
++                t.name, prev_idx, i
++            )));
++            // Keep the first entry (prev wins) — don't overwrite.
++        } else {
++            name_to_idx.insert(t.name.as_str(), i);
++        }
++    }
+ 
+     // Build adjacency list: for each template index, collect the indices of templates it
+     // references via sub_components (only those that exist in the template set).
+     let adjacency: Vec<Vec<usize>> = templates
+         .iter()
+         .map(|t| {
+             t.sub_components
+                 .iter()
+                 .filter_map(|sub| name_to_idx.get(sub.structure_name.as_str()).copied())
+                 .collect()
+         })
+         .collect();
+ 
+     let n = templates.len();
+ 
+     // Tarjan's SCC state
+     let mut st = TarjanState {
+         index: vec![None; n],
+         lowlink: vec![0; n],
+         on_stack: vec![false; n],
+         scc_stack: Vec::new(),
+         index_counter: 0,
+         sccs: Vec::new(),
+     };
+ 
+     for start in 0..n {
+         if st.index[start].is_none() {
+             tarjan_scc_visit(start, &adjacency, &mut st);
+         }
+     }
+ 
+     // Single pass: tag cycle participants, emit diagnostics, and collect cyclic SCCs.
+     let mut in_cycle = vec![false; n];
+     let mut cyclic_sccs: Vec<HashSet<String>> = Vec::new();
+     for scc in &st.sccs {
+         let is_cycle = if scc.len() > 1 {
+             true
+         } else {
+             // Single-node SCC: cycle only if there is a self-edge
+             let v = scc[0];
+             adjacency[v].contains(&v)
+         };
+ 
+         if is_cycle {
+             for &v in scc {
+                 in_cycle[v] = true;
+             }
+             let cycle_path = reconstruct_scc_cycle(scc, &adjacency, templates);
+             diagnostics.push(reify_types::Diagnostic::warning(format!(
+                 "recursive structure cycle detected: {}",
+                 cycle_path
+             )));
+             let scc_names: HashSet<String> =
+                 scc.iter().map(|&v| templates[v].name.clone()).collect();
+             cyclic_sccs.push(scc_names);
+         }
+     }
+ 
+     for (i, template) in templates.iter_mut().enumerate() {
+         if in_cycle[i] {
+             template.is_recursive = true;
+         }
+     }
+ 
+     cyclic_sccs
+ }

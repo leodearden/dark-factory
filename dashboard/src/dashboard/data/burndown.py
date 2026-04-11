@@ -69,14 +69,15 @@ async def collect_snapshot(
 ) -> None:
     """Discover projects and insert one snapshot row per project."""
     now = datetime.now(UTC).isoformat()
-    resolved_root = str(config.project_root.resolve())
+    # config.project_root is already resolved by DashboardConfig.__post_init__
+    resolved_root = str(config.project_root)
 
     # Phase 1 — Discovery (sequential, in-memory):
     # Build the ordered list of (project_id_str, tasks_json_path) tuples to snapshot.
     # Main project is always first; seen_roots dedup is preserved exactly.
-    # Use the resolved (symlink-canonical) path so a symlinked project_root
-    # deduplicates correctly against orchestrator / known_project_roots entries
-    # that surface the real path.
+    # project_root is already canonical (symlink-resolved) so a symlinked
+    # project_root deduplicates correctly against orchestrator /
+    # known_project_roots entries that surface the real path.
     roots_to_snapshot: list[tuple[str, Path]] = []
     seen_roots: set[str] = {resolved_root}
     roots_to_snapshot.append((resolved_root, config.tasks_json))
@@ -99,22 +100,33 @@ async def collect_snapshot(
         roots_to_snapshot.append((root_str, project_root / '.taskmaster' / 'tasks' / 'tasks.json'))
 
     for known_root in config.known_project_roots:
-        resolved = known_root.resolve()
-        root_str = str(resolved)
+        # known_root is already resolved by DashboardConfig.__post_init__,
+        # so .resolve() is unnecessary here.  Per-root error isolation for
+        # load failures (PermissionError, etc.) is handled by Phase 2's
+        # return_exceptions=True and Phase 3's exception check below.
+        root_str = str(known_root)
         if root_str in seen_roots:
             continue
         seen_roots.add(root_str)
-        roots_to_snapshot.append((root_str, resolved / '.taskmaster' / 'tasks' / 'tasks.json'))
+        roots_to_snapshot.append((root_str, known_root / '.taskmaster' / 'tasks' / 'tasks.json'))
 
     # Phase 2 — Parallel read:
     # All load_task_tree calls are independent (separate files), so run them concurrently.
+    # load_task_tree catches OSError internally and returns [] for unreadable files,
+    # but we pass return_exceptions=True as defense-in-depth so a single failing read
+    # cannot sink the entire cycle and drop all snapshots before commit.
     all_tasks = await asyncio.gather(
-        *(asyncio.to_thread(load_task_tree, tasks_json) for _, tasks_json in roots_to_snapshot)
+        *(asyncio.to_thread(load_task_tree, tasks_json) for _, tasks_json in roots_to_snapshot),
+        return_exceptions=True,
     )
 
     # Phase 3 — Sequential insert:
     # aiosqlite serialises writes on a single connection; keep inserts sequential.
+    # Skip any roots whose load raised — log and continue so other snapshots commit.
     for (root_str, _), tasks in zip(roots_to_snapshot, all_tasks, strict=True):
+        if isinstance(tasks, BaseException):
+            logger.warning('Failed to load tasks for %s', root_str, exc_info=tasks)
+            continue
         counts = _count_statuses(tasks)
         await conn.execute(
             'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '

@@ -47,9 +47,11 @@ class MergeRequest:
 class MergeOutcome:
     """Result delivered to the caller via the Future."""
 
-    status: Literal['done', 'conflict', 'blocked', 'already_merged']
+    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance']
     reason: str = ''
     conflict_details: str = ''
+    recovery_branch: str | None = None
+    overlap_files: list[str] | None = None
 
 
 @dataclass
@@ -93,6 +95,23 @@ class MergeWorker:
         self._running = True
         # Per-task CAS re-enqueue counter — prevents infinite loops
         self._cas_retries: dict[str, int] = {}
+        # WIP halt: cleared when halted, set when running
+        self._wip_halt = asyncio.Event()
+        self._wip_halt.set()  # not halted initially
+
+    def halt_for_wip(self, reason: str) -> None:
+        """Halt the merge queue due to a WIP conflict."""
+        logger.warning('Merge queue halted for WIP: %s', reason)
+        self._wip_halt.clear()
+
+    def unhalt_wip(self) -> None:
+        """Resume the merge queue after WIP conflict resolution."""
+        logger.info('Merge queue un-halted (WIP conflict resolved)')
+        self._wip_halt.set()
+
+    @property
+    def is_wip_halted(self) -> bool:
+        return not self._wip_halt.is_set()
 
     def _emit_merge(
         self, task_id: str, outcome: str, *, attempt: int | None = None,
@@ -113,6 +132,7 @@ class MergeWorker:
     async def run(self) -> None:
         """Main loop — runs until ``stop()`` is called."""
         while self._running:
+            await self._wip_halt.wait()  # blocks if halted for WIP conflict
             req = await self._dequeue()
             if req is None:
                 break  # shutdown sentinel
@@ -234,10 +254,11 @@ class MergeWorker:
             )
             if not verify.passed:
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
-                return MergeOutcome(
-                    'blocked',
-                    reason=f'Post-merge verification failed: {verify.summary}',
-                )
+                detail = verify.failure_report()
+                reason = f'Post-merge verification failed: {verify.summary}'
+                if detail:
+                    reason = f'{reason}\n\n{detail}'
+                return MergeOutcome('blocked', reason=reason)
 
         # 5. CAS advance_main
         assert merge_result.merge_commit is not None
@@ -255,6 +276,59 @@ class MergeWorker:
             logger.info(f'Task {req.task_id}: merged to main successfully')
             self._emit_merge(req.task_id, 'done')
             return MergeOutcome('done')
+
+        if result in ('wip_overlap', 'pop_conflict'):
+            # Halt the queue globally — no more merges until resolved
+            self.halt_for_wip(f'advance_main: {result}')
+            if result == 'pop_conflict':
+                recovery = getattr(self._git_ops, '_last_recovery_branch', None)
+                return MergeOutcome(
+                    'done_wip_recovery',
+                    reason=f'Merge advanced but stash pop conflicted. Recovery branch: {recovery}',
+                    recovery_branch=recovery,
+                )
+            else:
+                overlap = getattr(self._git_ops, '_last_overlap_files', None)
+                return MergeOutcome(
+                    'wip_halted',
+                    reason=f'WIP overlaps merge diff: {", ".join(overlap or [])}',
+                    overlap_files=overlap,
+                )
+
+        if result == 'unmerged_state':
+            # Permanent block — pre-existing UU markers in project_root.
+            # Halt the queue and route to human escalation (not steward).
+            self.halt_for_wip(
+                'advance_main: unmerged_state — project_root has unresolved merge '
+                'conflicts. Manual investigation required before any retry.'
+            )
+            self._cas_retries.pop(req.task_id, None)
+            return MergeOutcome(
+                'blocked',
+                reason=(
+                    f'advance_main returned unmerged_state: project_root has '
+                    f'unresolved (UU/AA/DD) merge conflicts — halting queue; '
+                    f'manual investigation required before any retry. '
+                    f'(task {req.task_id})'
+                ),
+            )
+
+        if result == 'pop_conflict_no_advance':
+            # Stash pop conflicted during CAS-failure recovery — merge did NOT land.
+            # Halt queue and return distinct outcome for human-level escalation.
+            self.halt_for_wip('advance_main: pop_conflict_no_advance')
+            recovery = getattr(self._git_ops, '_last_recovery_branch', None)
+            self._cas_retries.pop(req.task_id, None)
+            return MergeOutcome(
+                'wip_recovery_no_advance',
+                reason=(
+                    f'Merge did not advance AND WIP stash pop conflicted. '
+                    f'Recovery branch: {recovery}. '
+                    f'Manual intervention required — do not retry automatically. '
+                    f'(task {req.task_id})'
+                ),
+                recovery_branch=recovery,
+            )
 
         if result in ('not_descendant', 'contaminated', 'stash_failed'):
             # Permanent failure — do NOT re-enqueue
@@ -324,6 +398,9 @@ class SpeculativeMergeWorker:
         # set by the Verifier when it finishes the item before the speculation.
         self._speculation_slot = asyncio.Event()
         self._speculation_slot.set()  # initially free
+        # WIP halt: cleared when halted, set when running
+        self._wip_halt = asyncio.Event()
+        self._wip_halt.set()  # not halted initially
         # Internal tasks created by run()
         self._merger_task: asyncio.Task | None = None
         self._verifier_task: asyncio.Task | None = None
@@ -336,6 +413,20 @@ class SpeculativeMergeWorker:
     # ------------------------------------------------------------------
     # Public API (same interface as MergeWorker)
     # ------------------------------------------------------------------
+
+    def halt_for_wip(self, reason: str) -> None:
+        """Halt the merge queue due to a WIP conflict."""
+        logger.warning('Merge queue halted for WIP: %s', reason)
+        self._wip_halt.clear()
+
+    def unhalt_wip(self) -> None:
+        """Resume the merge queue after WIP conflict resolution."""
+        logger.info('Merge queue un-halted (WIP conflict resolved)')
+        self._wip_halt.set()
+
+    @property
+    def is_wip_halted(self) -> bool:
+        return not self._wip_halt.is_set()
 
     async def run(self) -> None:
         """Start merger and verifier coroutines and wait for both to finish."""
@@ -356,8 +447,9 @@ class SpeculativeMergeWorker:
         """Graceful shutdown: drain queues and resolve all pending Futures."""
         self._running = False
         shutdown = MergeOutcome('blocked', reason='Merge worker shutting down')
-        # Release speculation slot so merger doesn't hang waiting
+        # Release speculation slot and WIP halt so merger doesn't hang waiting
         self._speculation_slot.set()
+        self._wip_halt.set()
 
         # Drain main queue
         while not self._queue.empty():
@@ -466,6 +558,7 @@ class SpeculativeMergeWorker:
 
         try:
             while self._running:
+                await self._wip_halt.wait()  # blocks if halted for WIP conflict
                 # Get next request: use pre-fetched item if available, else block.
                 if prefetched is not None:
                     req = prefetched
@@ -475,6 +568,9 @@ class SpeculativeMergeWorker:
                     if req is None:
                         break  # shutdown sentinel
                     spec_base = None  # fresh dequeue resets speculation chain
+                    # Re-check halt after blocking on queue.get() — the halt
+                    # may have been triggered while we were waiting.
+                    await self._wip_halt.wait()
 
                 self._inflight_req = req  # track for stop() race resolution
                 merge_result_local: MergeResult | None = None
@@ -805,9 +901,12 @@ class SpeculativeMergeWorker:
             if not verify.passed:
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if not req.result.done():
+                    detail = verify.failure_report()
+                    reason = f'Post-merge verification failed: {verify.summary}'
+                    if detail:
+                        reason = f'{reason}\n\n{detail}'
                     req.result.set_result(MergeOutcome(
-                        'blocked',
-                        reason=f'Post-merge verification failed: {verify.summary}',
+                        'blocked', reason=reason,
                     ))
                 return False
         else:
@@ -834,6 +933,67 @@ class SpeculativeMergeWorker:
                 if not req.result.done():
                     req.result.set_result(MergeOutcome('done'))
                 return True
+
+            if result in ('wip_overlap', 'pop_conflict'):
+                # Halt the queue globally — no more merges until resolved
+                self.halt_for_wip(f'advance_main: {result}')
+                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                if result == 'pop_conflict':
+                    recovery = getattr(self._git_ops, '_last_recovery_branch', None)
+                    if not req.result.done():
+                        req.result.set_result(MergeOutcome(
+                            'done_wip_recovery',
+                            reason=f'Merge advanced but stash pop conflicted. Recovery branch: {recovery}',
+                            recovery_branch=recovery,
+                        ))
+                else:
+                    overlap = getattr(self._git_ops, '_last_overlap_files', None)
+                    if not req.result.done():
+                        req.result.set_result(MergeOutcome(
+                            'wip_halted',
+                            reason=f'WIP overlaps merge diff: {", ".join(overlap or [])}',
+                            overlap_files=overlap,
+                        ))
+                return False
+
+            if result == 'unmerged_state':
+                # Pre-existing UU markers — halt queue, human escalation.
+                self.halt_for_wip(
+                    'advance_main: unmerged_state — project_root has unresolved '
+                    'merge conflicts. Manual investigation required before any retry.'
+                )
+                self._cas_retries.pop(req.task_id, None)
+                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                if not req.result.done():
+                    req.result.set_result(MergeOutcome(
+                        'blocked',
+                        reason=(
+                            f'advance_main returned unmerged_state: project_root has '
+                            f'unresolved (UU/AA/DD) merge conflicts — halting queue; '
+                            f'manual investigation required before any retry. '
+                            f'(task {req.task_id})'
+                        ),
+                    ))
+                return False
+
+            if result == 'pop_conflict_no_advance':
+                # Stash pop conflicted during CAS-failure recovery — merge did NOT land.
+                self.halt_for_wip('advance_main: pop_conflict_no_advance')
+                recovery = getattr(self._git_ops, '_last_recovery_branch', None)
+                self._cas_retries.pop(req.task_id, None)
+                await self._git_ops.cleanup_merge_worktree(merge_wt)
+                if not req.result.done():
+                    req.result.set_result(MergeOutcome(
+                        'wip_recovery_no_advance',
+                        reason=(
+                            f'Merge did not advance AND WIP stash pop conflicted. '
+                            f'Recovery branch: {recovery}. '
+                            f'Manual intervention required — do not retry automatically. '
+                            f'(task {req.task_id})'
+                        ),
+                        recovery_branch=recovery,
+                    ))
+                return False
 
             if result in ('not_descendant', 'contaminated', 'stash_failed'):
                 self._cas_retries.pop(req.task_id, None)

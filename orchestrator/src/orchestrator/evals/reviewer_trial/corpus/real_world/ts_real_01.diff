@@ -1,0 +1,193 @@
+── gui/src/__tests__/gotoDefinition.test.ts (modified) ──
+ describe('reifyGotoDefinition', () => {
+   it('returns an extension', () => {
+     const ext = reifyGotoDefinition('file:///test.ri');
+     expect(ext).toBeDefined();
+   });
+ 
+   it('accepts a () => string getter and uses current URI for each request', async () => {
+     let currentUri = 'file:///first.ri';
+     const mockLocation = {
+       uri: 'file:///first.ri',
+       range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+     };
+     mockInvoke.mockResolvedValue(JSON.stringify(mockLocation));
+ 
+     const ext = reifyGotoDefinition(() => currentUri) as any;
+     const mousedownHandler = ext.handlers.mousedown;
+ 
+     const mockEvent = {
+       ctrlKey: true,
+       metaKey: false,
+       clientX: 100,
+       clientY: 50,
+     } as MouseEvent;
+ 
+     const mockView = {
+       posAtCoords: () => 5,
+       state: {
+         doc: {
+           lineAt: () => ({ number: 1, from: 0, to: 10 }),
+           line: () => ({ from: 0 }),
+         },
+       },
+       dispatch: vi.fn(),
++      dom: { isConnected: true },
+     };
+ 
+     // First call uses first URI
+     mousedownHandler(mockEvent, mockView);
+     // Wait for the async requestDefinition to complete
+     await flushMacrotasks();
+     let params = JSON.parse((mockInvoke.mock.calls[0][1] as { params: string }).params);
+     expect(params.textDocument.uri).toBe('file:///first.ri');
+ 
+     // Switch URI
+     currentUri = 'file:///second.ri';
+     mockInvoke.mockClear();
+     mockInvoke.mockResolvedValue(
+       JSON.stringify({
+         uri: 'file:///second.ri',
+         range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+       }),
+     );
+ 
+     // Second call uses updated URI
+     mousedownHandler(mockEvent, mockView);
+     await flushMacrotasks();
+     params = JSON.parse((mockInvoke.mock.calls[0][1] as { params: string }).params);
+     expect(params.textDocument.uri).toBe('file:///second.ri');
+   });
+ });
+ describe('cross-file goto-definition (onNavigate)', () => {
+   it('calls onNavigate callback when definition is in a different file', async () => {
+     const currentUri = 'file:///current.ri';
+     const crossFileLocation = {
+       uri: 'file:///other.ri',
+       range: { start: { line: 5, character: 2 }, end: { line: 5, character: 10 } },
+     };
+     mockInvoke.mockResolvedValue(JSON.stringify(crossFileLocation));
+ 
+     const onNavigate = vi.fn();
+     const ext = reifyGotoDefinition(currentUri, onNavigate) as any;
+     const mousedownHandler = ext.handlers.mousedown;
+ 
+     const mockEvent = {
+       ctrlKey: true,
+       metaKey: false,
+       clientX: 100,
+       clientY: 50,
+     } as MouseEvent;
+ 
+     const mockView = {
+       posAtCoords: () => 5,
+       state: {
+         doc: {
+           lineAt: () => ({ number: 1, from: 0, to: 10 }),
+           line: () => ({ from: 0 }),
+         },
+       },
+       dispatch: vi.fn(),
++      dom: { isConnected: true },
+     };
+ 
+     mousedownHandler(mockEvent, mockView);
+     await flushMacrotasks();
+ 
+     // onNavigate should be called with the cross-file URI, line, character
+     expect(onNavigate).toHaveBeenCalledWith('file:///other.ri', 5, 2);
+     // view.dispatch should NOT be called (different file)
+     expect(mockView.dispatch).not.toHaveBeenCalled();
+   });
+ 
+   it('same-file definition dispatches cursor movement without calling onNavigate', async () => {
+     const currentUri = 'file:///current.ri';
+     const sameFileLocation = {
+       uri: 'file:///current.ri',
+       range: { start: { line: 10, character: 3 }, end: { line: 10, character: 8 } },
+     };
+     mockInvoke.mockResolvedValue(JSON.stringify(sameFileLocation));
+ 
+     const onNavigate = vi.fn();
+     const ext = reifyGotoDefinition(currentUri, onNavigate) as any;
+     const mousedownHandler = ext.handlers.mousedown;
+ 
+     const mockEvent = {
+       ctrlKey: true,
+       metaKey: false,
+       clientX: 100,
+       clientY: 50,
+     } as MouseEvent;
+ 
+     const mockView = {
+       posAtCoords: () => 5,
+       state: {
+         doc: {
+           lineAt: () => ({ number: 1, from: 0, to: 10 }),
+           line: (n: number) => ({ from: (n - 1) * 20 }),
+         },
+       },
+       dispatch: vi.fn(),
++      dom: { isConnected: true },
+     };
+ 
+     mousedownHandler(mockEvent, mockView);
+     await flushMacrotasks();
+ 
+     // onNavigate should NOT be called (same file)
+     expect(onNavigate).not.toHaveBeenCalled();
+     // view.dispatch should be called for same-file navigation
+     expect(mockView.dispatch).toHaveBeenCalledWith({
+       selection: { anchor: expect.any(Number) },
+       scrollIntoView: true,
+     });
+   });
+ });
+── gui/src/editor/gotoDefinition.ts (modified) ──
+ export function reifyGotoDefinition(
+   uri: string | (() => string),
+   onNavigate?: (targetUri: string, line: number, character: number) => void,
+ ): Extension {
+   return EditorView.domEventHandlers({
+     mousedown(event: MouseEvent, view: EditorView) {
+       // Only handle Ctrl+Click (or Cmd+Click on Mac)
+       if (!(event.ctrlKey || event.metaKey)) return false;
+ 
+       const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+       if (pos === null) return false;
+ 
+       const line = view.state.doc.lineAt(pos);
+       const lspLine = line.number - 1;
+       const lspChar = pos - line.from;
+       const currentUri = resolveUri(uri);
+ 
+       // Fire async, don't block the event
+       requestDefinition(currentUri, lspLine, lspChar).then((location) => {
+         if (!location) return;
++        if (!view.dom.isConnected) return;
+ 
+         const resolvedNow = resolveUri(uri);
+         const sameFile = isSameFile(location.uri, resolvedNow);
+ 
+         if (sameFile) {
+           // Same document: navigate to definition in current view
+           const targetLine = view.state.doc.line(location.range.start.line + 1);
+           const targetPos = targetLine.from + location.range.start.character;
+           view.dispatch({
+             selection: { anchor: targetPos },
+             scrollIntoView: true,
+           });
+         } else if (onNavigate) {
+           // Different file: delegate to the onNavigate callback
+           onNavigate(
+             location.uri,
+             location.range.start.line,
+             location.range.start.character,
+           );
+         }
+       });
+ 
+       return true; // Consume the event
+     },
+   });
+ }

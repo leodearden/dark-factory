@@ -1,0 +1,29 @@
+{
+  "diff_id": "rs_leaked_resource",
+  "ground_truth": [
+    {
+      "id": "rs_leak_1",
+      "location": "crates/reify-runtime/src/mesh_export.rs:55",
+      "category": "resource_double_close",
+      "severity": "blocking",
+      "description": "File::from_raw_fd(fd) takes ownership of the file descriptor. When the BufWriter (and its inner File) is dropped at the end of the function, it closes the fd. But the docstring says 'the caller is responsible for closing the fd when done' — the caller will attempt to use or close an already-closed fd, causing EBADF errors or worse (if the fd number has been reused for a different file).",
+      "mutation_type": "leaked_resource"
+    },
+    {
+      "id": "rs_leak_2",
+      "location": "crates/reify-runtime/src/mesh_export.rs:55",
+      "category": "unsafe_without_invariant",
+      "severity": "blocking",
+      "description": "The SAFETY comment says 'caller guarantees fd is valid and open' but there is no actual validation. From_raw_fd is unsafe specifically because the caller must ensure the fd is valid AND that no other code will close it. The function should use ManuallyDrop<File> or std::mem::forget to prevent the File's Drop from closing the fd, or document that the function takes ownership.",
+      "mutation_type": "leaked_resource"
+    },
+    {
+      "id": "rs_leak_3",
+      "location": "crates/reify-runtime/src/mesh_export.rs:71",
+      "category": "error_path_resource_leak",
+      "severity": "suggestion",
+      "description": "If any write_all() call fails with an error, the ? operator returns early. The BufWriter/File will still be dropped (closing the fd), but the caller won't know the fd was closed on error vs success, making cleanup logic error-prone.",
+      "mutation_type": "leaked_resource"
+    }
+  ]
+}

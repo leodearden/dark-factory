@@ -4,12 +4,44 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.mcp_lifecycle import mcp_call
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CompletionJudgeVerdict:
+    """Structured verdict returned by the completion judge agent.
+
+    Distinct from ``evals.judge.JudgeVerdict`` (the Elo pairwise comparison
+    judge) — this verdict exits the implementer loop early when the judge
+    decides the substantive work is complete, regardless of plan.json
+    bookkeeping state.
+    """
+
+    complete: bool
+    reasoning: str
+    uncovered_plan_steps: list[str]
+    substantive_work: bool
+
+
+COMPLETION_JUDGE_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'complete': {'type': 'boolean'},
+        'reasoning': {'type': 'string'},
+        'uncovered_plan_steps': {
+            'type': 'array', 'items': {'type': 'string'},
+        },
+        'substantive_work': {'type': 'boolean'},
+    },
+    'required': ['complete', 'reasoning', 'uncovered_plan_steps', 'substantive_work'],
+    'additionalProperties': False,
+}
 
 
 class BriefingAssembler:
@@ -199,6 +231,72 @@ Execute the next pending steps in TDD order. Commit after each step. Update plan
 Review the diff according to your specialization. Explore the codebase as needed for context. Output your review as pure JSON.
 """
 
+    async def build_completion_judge_prompt(
+        self,
+        plan: dict,
+        iteration_log: list[dict],
+        diff: str,
+        task_id: str | None = None,
+        context: str | None = None,
+    ) -> str:
+        """Build prompt for the completion judge agent."""
+        effective_tid = task_id or plan.get('task_id')
+        if context is None:
+            context = await self._get_memory_context(effective_tid)
+
+        identity = self._agent_identity(effective_tid, 'judge')
+
+        # Truncate diff (same cap as reviewer)
+        if len(diff) > 50000:
+            diff = diff[:50000] + '\n\n... [diff truncated] ...'
+
+        # Last 5 iteration log entries (reviewer uses 3; judge benefits from
+        # seeing more of the arc of work)
+        log_section = ''
+        if iteration_log:
+            recent = iteration_log[-5:]
+            lines = [
+                f"- iter {e.get('iteration', '?')} [{e.get('agent', '?')}]: "
+                f"{e.get('summary', 'N/A')}"
+                for e in recent
+            ]
+            log_section = "## Recent Iterations\n\n" + '\n'.join(lines)
+
+        # Serialize only the plan fields the judge needs
+        plan_json = json.dumps({
+            'task_id': plan.get('task_id'),
+            'title': plan.get('title'),
+            'analysis': plan.get('analysis'),
+            'prerequisites': plan.get('prerequisites', []),
+            'steps': plan.get('steps', []),
+        }, indent=2)
+
+        return f"""\
+{context}
+
+{identity}
+
+# Plan
+
+```json
+{plan_json}
+```
+
+{log_section}
+
+# Code Diff (worktree vs pre-task base)
+
+```diff
+{diff}
+```
+
+# Action
+
+Read the code in the worktree as needed to verify behavior. Then return
+your verdict as JSON matching the schema. Follow the safety rules: if the
+diff is empty or trivial, `substantive_work=false` and `complete=false`.
+"""
+
     async def build_merger_prompt(
         self, conflicts: str, task_intent: str, context: str | None = None
     ) -> str:
@@ -304,10 +402,11 @@ to understand current progress, then continue from where the previous agent left
 # Action
 
 1. Understand the escalation and the task context.
-2. Read the relevant code.
-3. Handle the escalation — fix the issue, or triage suggestions.
-4. Run tests to verify any code changes.
-5. Call `resolve_issue` with a summary of what you did.
+2. Check whether this task's branch is already merged to main (`git merge-base --is-ancestor HEAD main` from the worktree, or `git log --oneline main | head -20`). If the branch is already on main, set the task status to `done` via fused-memory's `set_task_status` tool, then call `resolve_issue` explaining the task was already merged. Do NOT attempt to fix code or re-merge.
+3. Read the relevant code.
+4. Handle the escalation — fix the issue, or triage suggestions.
+5. Run tests to verify any code changes.
+6. Call `resolve_issue` with a summary of what you did.
 """
 
     async def build_steward_continuation_prompt(

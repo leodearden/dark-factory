@@ -176,37 +176,37 @@ def _patch_cost_data(
     """Return an ExitStack that patches all 7 cost data functions in dashboard.app."""
     stack = ExitStack()
     stack.enter_context(patch(
-        'dashboard.app.get_cost_summary',
+        'dashboard.app.aggregate_cost_summary',
         new_callable=AsyncMock,
         return_value=summary if summary is not _UNSET else _MOCK_SUMMARY,
     ))
     stack.enter_context(patch(
-        'dashboard.app.get_cost_by_project',
+        'dashboard.app.aggregate_cost_by_project',
         new_callable=AsyncMock,
         return_value=by_project if by_project is not _UNSET else _MOCK_BY_PROJECT,
     ))
     stack.enter_context(patch(
-        'dashboard.app.get_cost_by_account',
+        'dashboard.app.aggregate_cost_by_account',
         new_callable=AsyncMock,
         return_value=by_account if by_account is not _UNSET else _MOCK_BY_ACCOUNT,
     ))
     stack.enter_context(patch(
-        'dashboard.app.get_cost_by_role',
+        'dashboard.app.aggregate_cost_by_role',
         new_callable=AsyncMock,
         return_value=by_role if by_role is not _UNSET else _MOCK_BY_ROLE,
     ))
     stack.enter_context(patch(
-        'dashboard.app.get_cost_trend',
+        'dashboard.app.aggregate_cost_trend',
         new_callable=AsyncMock,
         return_value=trend if trend is not _UNSET else _MOCK_TREND,
     ))
     stack.enter_context(patch(
-        'dashboard.app.get_account_events',
+        'dashboard.app.aggregate_account_events',
         new_callable=AsyncMock,
         return_value=events if events is not _UNSET else _MOCK_EVENTS,
     ))
     stack.enter_context(patch(
-        'dashboard.app.get_run_cost_breakdown',
+        'dashboard.app.aggregate_run_cost_breakdown',
         new_callable=AsyncMock,
         return_value=runs if runs is not _UNSET else _MOCK_RUNS,
     ))
@@ -573,7 +573,7 @@ class TestTimeWindow:
 
     def test_summary_24h_calls_with_days_1(self, client):
         with patch(
-            'dashboard.app.get_cost_summary',
+            'dashboard.app.aggregate_cost_summary',
             new_callable=AsyncMock,
             return_value=_MOCK_SUMMARY,
         ) as mock_fn:
@@ -584,7 +584,7 @@ class TestTimeWindow:
 
     def test_summary_default_uses_days_7(self, client):
         with patch(
-            'dashboard.app.get_cost_summary',
+            'dashboard.app.aggregate_cost_summary',
             new_callable=AsyncMock,
             return_value=_MOCK_SUMMARY,
         ) as mock_fn:
@@ -594,7 +594,7 @@ class TestTimeWindow:
 
     def test_trend_24h_calls_with_days_1(self, client):
         with patch(
-            'dashboard.app.get_cost_trend',
+            'dashboard.app.aggregate_cost_trend',
             new_callable=AsyncMock,
             return_value=_MOCK_TREND,
         ) as mock_fn:
@@ -605,7 +605,7 @@ class TestTimeWindow:
 
     def test_trend_default_uses_days_7(self, client):
         with patch(
-            'dashboard.app.get_cost_trend',
+            'dashboard.app.aggregate_cost_trend',
             new_callable=AsyncMock,
             return_value=_MOCK_TREND,
         ) as mock_fn:
@@ -615,7 +615,7 @@ class TestTimeWindow:
 
     def test_summary_30d_calls_with_days_30(self, client):
         with patch(
-            'dashboard.app.get_cost_summary',
+            'dashboard.app.aggregate_cost_summary',
             new_callable=AsyncMock,
             return_value=_MOCK_SUMMARY,
         ) as mock_fn:
@@ -625,7 +625,7 @@ class TestTimeWindow:
 
     def test_trend_all_calls_with_days_3650(self, client):
         with patch(
-            'dashboard.app.get_cost_trend',
+            'dashboard.app.aggregate_cost_trend',
             new_callable=AsyncMock,
             return_value=_MOCK_TREND,
         ) as mock_fn:

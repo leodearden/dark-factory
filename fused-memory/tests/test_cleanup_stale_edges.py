@@ -67,12 +67,26 @@ class TestQueryEdgesByTimeRange:
         start = '2026-03-22T17:50:00'
         end = '2026-03-22T18:15:00'
         await backend.query_edges_by_time_range(start=start, end=end, group_id='test')
-        call_args = graph.query.call_args
+        call_args = graph.ro_query.call_args
         assert call_args is not None
         args, kwargs = call_args
         cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
         assert cypher_params.get('start') == start
         assert cypher_params.get('end') == end
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """query_edges_by_time_range uses ro_query (read-only path) and never calls graph.query."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.query_edges_by_time_range(
+            start='2026-03-22T17:50:00',
+            end='2026-03-22T18:15:00',
+            group_id='test',
+        )
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

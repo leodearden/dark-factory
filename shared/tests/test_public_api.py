@@ -13,6 +13,7 @@ class TestTopLevelImports:
             AccountConfig,
             AccountState,
             AgentResult,
+            AllAccountsCappedException,
             CostStore,
             SessionBudgetExhausted,
             UsageCapConfig,
@@ -30,6 +31,7 @@ class TestTopLevelImports:
         assert AccountConfig is not None
         assert UsageCapConfig is not None
         assert CostStore is not None
+        assert AllAccountsCappedException is not None
 
 
 class TestModuleLevelAll:
@@ -42,6 +44,7 @@ class TestModuleLevelAll:
         assert set(cli_invoke.__all__) == {
             'CAP_HIT_RESUME_PROMPT',
             'AgentResult',
+            'AllAccountsCappedException',
             'invoke_claude_agent',
             'invoke_with_cap_retry',
         }
@@ -148,6 +151,51 @@ class TestPackageMetadata:
 
         assert hasattr(shared, '__version__'), 'shared must expose __version__'
         assert shared.__version__ == '0.1.0'
+
+
+class TestOptionalExtras:
+    """Verify that aiohttp is declared as an optional extra, not a core dependency."""
+
+    def test_aiohttp_not_in_core_dependencies(self):
+        import importlib.metadata as meta
+
+        m = meta.metadata('dark-factory-shared')
+        requires = m.get_all('Requires-Dist') or []
+        # Core (unconditional) deps have no 'extra ==' marker
+        core_deps = [r for r in requires if 'extra ==' not in r]
+        core_names = {r.split('>=')[0].split('<=')[0].split('[')[0].split(';')[0].strip()
+                      for r in core_deps}
+        assert 'aiohttp' not in core_names, (
+            f'aiohttp must NOT be a core (unconditional) dependency.\n'
+            f'Core deps found: {core_deps}'
+        )
+
+    def test_vllm_extra_declared(self):
+        import importlib.metadata as meta
+
+        m = meta.metadata('dark-factory-shared')
+        extras = m.get_all('Provides-Extra') or []
+        assert 'vllm' in extras, (
+            f"'vllm' extra not declared in Provides-Extra.\n"
+            f'Declared extras: {extras}'
+        )
+
+    def test_vllm_extra_requires_aiohttp(self):
+        import importlib.metadata as meta
+        import re
+
+        m = meta.metadata('dark-factory-shared')
+        requires = m.get_all('Requires-Dist') or []
+        # Look for an entry that mentions aiohttp and ties it to extra == "vllm"
+        vllm_aiohttp = [
+            r for r in requires
+            if re.search(r'aiohttp', r, re.IGNORECASE)
+            and re.search(r'extra\s*==\s*["\']vllm["\']', r, re.IGNORECASE)
+        ]
+        assert vllm_aiohttp, (
+            f"No Requires-Dist entry found for aiohttp with extra == 'vllm'.\n"
+            f'All Requires-Dist entries: {requires}'
+        )
 
 
 class TestEditableInstallLocation:

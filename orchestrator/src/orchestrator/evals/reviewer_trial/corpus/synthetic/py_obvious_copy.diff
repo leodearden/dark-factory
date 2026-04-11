@@ -1,0 +1,34 @@
+diff --git a/orchestrator/src/orchestrator/evals/metrics.py b/orchestrator/src/orchestrator/evals/metrics.py
+index abc1234..def5678 100644
+--- a/orchestrator/src/orchestrator/evals/metrics.py
++++ b/orchestrator/src/orchestrator/evals/metrics.py
+@@ -63,6 +63,21 @@ async def _git_diff_stats(worktree: Path, base_commit: str) -> tuple[int, int]:
+     return lines_changed, files_changed
+
+
++async def _count_diff_changes(repo_path: Path, base_ref: str) -> tuple[int, int]:
++    """Count lines changed and files modified between base and HEAD.
++
++    Returns (total_lines_changed, file_count).
++    """
++    proc = await asyncio.create_subprocess_exec(
++        'git', 'diff', '--stat', base_ref, 'HEAD',
++        cwd=str(repo_path), stdout=asyncio.subprocess.PIPE,
++        stderr=asyncio.subprocess.PIPE,
++    )
++    stdout, _ = await proc.communicate()
++    lines = stdout.decode().strip().splitlines()
++    files_changed = max(0, len(lines) - 1)  # last line is summary
++    # Parse summary line for total changes
++    summary = lines[-1] if lines else ''
++    total = 0
++    for part in summary.split(','):
++        part = part.strip()
++        if 'insertion' in part or 'deletion' in part:
++            total += int(part.split()[0])
++    return total, files_changed
++
++
+ async def collect_metrics(
+     workflow: TaskWorkflow,
+     worktree: Path,

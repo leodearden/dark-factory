@@ -49,6 +49,16 @@ async def create_eval_worktree(
         cwd=project_root,
     )
 
+    # Defensive: confirm the worktree HEAD actually matches the requested
+    # baseline. Catches any drift in git's worktree handling and prevents
+    # silently evaluating against the wrong commit.
+    head = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree_path)
+    if head != pre_task_commit:
+        raise RuntimeError(
+            f'create_eval_worktree: HEAD mismatch for {task_id}: '
+            f'expected {pre_task_commit}, got {head}'
+        )
+
     logger.info(f'Created eval worktree: {worktree_path} at {pre_task_commit[:10]}')
 
     # Run setup commands to create isolated env

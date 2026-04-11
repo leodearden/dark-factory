@@ -1,0 +1,72 @@
+{
+  "variant_name": "variant_a_medium",
+  "diff_id": "py_real_01",
+  "reviews": {
+    "comprehensive_reviewer": {
+      "reviewer": "comprehensive_reviewer",
+      "verdict": "ISSUES_FOUND",
+      "issues": [
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:267",
+          "category": "encapsulation/architecture",
+          "description": "invoke_with_cap_retry calls `usage_gate._handle_cap_detected(...)` \u2014 a leading-underscore private method \u2014 from outside the UsageGate class. The public entry point is `detect_cap_hit()`, which owns the logic for picking an account, marking capped state, triggering probes, and firing cost events. Reaching into the private method means future refactors inside UsageGate can silently break this call site, and the heuristic path bypasses any invariants `detect_cap_hit()` wants to enforce (e.g. cost event emission happens twice here: once via `_fire_cost_event` inside `_handle_cap_detected`, and again via the explicit `cost_store.save_account_event(...)` block above \u2014 except that block is skipped for the heuristic path).",
+          "suggested_fix": "Expose a public method on UsageGate (e.g. `mark_capped(reason: str, oauth_token: str | None)`) that encapsulates the heuristic cap-as-if-detected path, or extend `detect_cap_hit()` with an explicit `force=True` flag. Then have invoke_with_cap_retry call the public API and decide once whether to save the cap_hit cost event."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:255-286",
+          "category": "robustness/false_positive_risk",
+          "description": "The heuristic triggers on `not success AND cost_usd == 0 AND turns <= 1 AND duration_ms < 5000`. Several non-cap failure modes satisfy all four: (1) `_parse_claude_output` returns `AgentResult(success=False, subtype='error_empty_output', duration_ms=0)` for empty stdout \u2014 the branch doesn't thread the real subprocess duration, so `duration_ms` is always 0; (2) JSON parse failures with a non-zero returncode also return `duration_ms=0`; (3) bad-arg / CLI-not-installed / credentials-parse / VllmBridge start errors can all exit in <5s with 0 cost. Any of these will now be misclassified as a cap hit, causing the loop to mark accounts capped (with `resets_at=None` \u21d2 1-hour default), sleep, fail over, hit the same failure on the next account, and eventually block on probes for an hour. For a systemic CLI error this is an indefinite retry loop disguised as cap failover.",
+          "suggested_fix": "Narrow the heuristic: require an actual output/stderr substring that looks like a cap message but didn't match the known prefixes (e.g. presence of one of CAP_CONFIRM_KEYWORDS \u2014 which is currently defined but never referenced anywhere), OR require `subtype != 'error_empty_output'` AND `duration_ms > 0`, OR cap the number of heuristic-triggered retries per session with a hard fallback to raising. At minimum, don't treat duration_ms==0 as evidence of a cap hit, since the parser sets it to 0 for cases that never ran the subprocess measurement path."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:250-286",
+          "category": "duplication",
+          "description": "The heuristic branch duplicates most of the real cap-hit branch (consecutive_cap_hits increment, full_cycles/cooldown computation, logging, sleep, continue). Any future change to cap-hit handling now has to be made in two places. The cost_store.save_account_event call was also not duplicated \u2014 so heuristic caps are silently missing from the account_events table while real caps are recorded, which will skew dashboards and debugging.",
+          "suggested_fix": "Extract a `_handle_cap_retry(consecutive_cap_hits, num_accounts, result, label, cost_store, ...)` helper (or restructure as a single cap-detected branch that both paths fall through to) so real and heuristic cap hits share backoff, logging, cost event recording, and session-resume decisions."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/tests/test_cap_retry.py, shared/tests/test_cli_invoke.py",
+          "category": "test_coverage",
+          "description": "No tests cover any of this diff's three changes: (a) the heuristic safety net in invoke_with_cap_retry \u2014 no test for the triggering conditions, the warning log, the call to `_handle_cap_detected`, the cooldown/retry behavior, or for non-triggering cases (success, cost>0, turns>1, duration>=5000); (b) the `is_error=true` override in `_parse_claude_output` \u2014 no assertion that a response with `subtype='success'`, `returncode=0`, and `is_error=True` now yields `success=False`; (c) the new `\"You're out of extra usage\"` prefix in `CAP_HIT_PREFIXES` is not asserted by any test. Given that this diff is specifically targeting silent cap-hit misclassification (see project memory `project_extra_usage_cap_detection.md`), regression tests are the whole point.",
+          "suggested_fix": "Add: (1) test_heuristic_triggers_on_zero_cost_instant_exit, test_heuristic_does_not_trigger_on_normal_failure, test_heuristic_resumes_backoff_on_repeated_trigger; (2) test_is_error_true_forces_success_false and test_is_error_false_preserves_existing_logic in test_cli_invoke.py against `_parse_claude_output`; (3) test_detect_cap_hit_matches_out_of_extra_usage in test_usage_gate.py. Cover the concurrent `_handle_cap_detected` private-call path explicitly so any future signature change breaks the test, not production."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:258",
+          "category": "robustness",
+          "description": "`result.cost_usd == 0` uses float equality. In practice cost_usd is either the default 0.0 or a provider-reported decimal, so this usually holds, but the intent is `cost_usd <= 0` or `cost_usd < 1e-6`. A provider returning a tiny floating-point artifact (e.g. 1e-12 for a 0-token early exit) would defeat the check and silently return the bogus \"success\".",
+          "suggested_fix": "Use `result.cost_usd <= 0.0` (or a small epsilon like `< 1e-4`) for the heuristic floor."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:267-271",
+          "category": "robustness",
+          "description": "The heuristic always passes `resets_at=None` to `_handle_cap_detected`. Inside UsageGate this means the probe loop falls back to `datetime.now(UTC) + 1h` as the default target. For a true cap with an unrecognised format this may delay recovery by up to an hour, and for a false positive (see the false-positive-risk finding above) it effectively quarantines the account for an hour per spurious failure.",
+          "suggested_fix": "At minimum, try to parse a resets_at from `result.output`+`result.stderr` via `_parse_resets_at` even on the heuristic path. Better: make the private `_handle_cap_detected` public as suggested elsewhere and have it re-run the normal parse pipeline on the heuristic path so behavior stays consistent with the pattern-matched path."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:262-266",
+          "category": "logging",
+          "description": "The same `result.output` is truncated twice at different lengths (`[:200]` in the logger and `[:120]` when passed to `_handle_cap_detected`). Minor, but if the intent was to keep the log complete and the internal reason short, the trimming is inconsistent and it is easy for a later edit to drift the two truncations further apart. Also note that `result.output` may contain secrets if the CLI ever echoes auth material in its error output; the warning log is INFO-level-visible and will land in orchestrator logs.",
+          "suggested_fix": "Compute `snippet = result.output[:200]` once, reuse, and consider redacting or omitting the echoed CLI output \u2014 the turns/duration/cost values already make this log actionable without the raw message."
+        },
+        {
+          "severity": "suggestion",
+          "location": "shared/src/shared/cli_invoke.py:476-479",
+          "category": "design_coherence",
+          "description": "`is_success = (subtype == 'success' or result.returncode == 0) and not is_error` is correct for the cap-hit case, but the three signals are now overlapping: `subtype`, `returncode`, and `is_error`. This makes the truth table subtle (e.g. `subtype='error_empty_output'` + `returncode=0` + `is_error=False` still yields success=True). A comment on the field or a dedicated helper (`_compute_success`) would make the precedence explicit and give a single place to unit-test it against CLI fixtures.",
+          "suggested_fix": "Extract `_compute_success(subtype, returncode, is_error) -> bool`, document the precedence, and unit-test each of the 8 combinations."
+        }
+      ],
+      "summary": "The diff addresses a real, documented gap (see project_extra_usage_cap_detection.md) and its three pieces \u2014 new prefix, is_error override, and heuristic safety net \u2014 are individually reasonable. However, the heuristic has meaningful robustness concerns: it reaches into `UsageGate._handle_cap_detected` (private API), passes `resets_at=None` unconditionally, and triggers on conditions that also match several non-cap failure modes (empty-output parse branch, JSON-decode branch, CLI startup errors), all of which will now be misclassified as cap hits \u2014 potentially quarantining accounts for ~1 hour per spurious failure and duplicating much of the real cap-hit branch without emitting the matching cost-store cap_hit event. Most importantly, none of the three changes are covered by tests, which is notable because the whole point of this fix is to prevent silent misclassifications. None of the findings block correctness in the common case (real cap hits with the new or old message formats), so they are all suggestions, but addressing the test coverage and the private-method/false-positive risks before landing is strongly recommended."
+    }
+  },
+  "total_cost_usd": 1.067925,
+  "wall_clock_ms": 238822,
+  "errors": []
+}

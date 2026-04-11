@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING
 
 from shared.cost_store import CostStore
 
@@ -20,6 +22,7 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle, mcp_call
 from orchestrator.review_checkpoint import ReviewCheckpoint
+from orchestrator.run_store import RunStore
 from orchestrator.scheduler import Scheduler, files_to_modules
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -41,6 +44,43 @@ except ImportError:
     HAS_STEWARD = False
 
 logger = logging.getLogger(__name__)
+
+
+def _acquire_project_lock(project_root: Path) -> IO:
+    """Acquire an exclusive flock on a per-project lockfile.
+
+    Returns the open file object — caller must keep a reference to it
+    (closing or GC releases the lock).  Raises ``SystemExit(1)`` if
+    another orchestrator instance already holds the lock.
+    """
+    lock_path = project_root / 'data' / 'orchestrator' / 'orchestrator.lock'
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lock_file = open(lock_path, 'w')  # noqa: SIM115
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # Another instance holds the lock — read its diagnostic info
+        try:
+            with open(lock_path) as f:
+                info = f.read().strip()
+        except OSError:
+            info = '(unknown)'
+        logger.error(
+            'Another orchestrator is already running for this project.\n'
+            f'  Lock holder: {info}\n'
+            f'  Lock file:   {lock_path}\n'
+            'Kill the existing instance first, or wait for it to finish.'
+        )
+        lock_file.close()
+        raise SystemExit(1) from None
+
+    # Write diagnostic info for anyone who tries to acquire next
+    lock_file.truncate(0)
+    lock_file.seek(0)
+    lock_file.write(f'PID {os.getpid()} started {datetime.now(UTC).isoformat()}')
+    lock_file.flush()
+    return lock_file
 
 
 @dataclass
@@ -144,14 +184,23 @@ class Harness:
         # Event store — created at run start with a generated run_id
         self.event_store: EventStore | None = None
 
+        # Run store — incremental task result persistence (shares runs.db)
+        self._run_store: RunStore | None = None
+        self._run_id: str | None = None
+
         # Cost store — per-invocation cost tracking (shares runs.db)
         self.cost_store: CostStore | None = None
+
+        # Singleton lock — held for the duration of run()
+        self._lock_file: IO | None = None
 
     async def run(
         self,
         prd_path: Path | None = None,
         dry_run: bool = False,
         delay_secs: int = 0,
+        force_dirty_start: bool = False,
+        retag_modules: bool = False,
     ) -> HarnessReport:
         """Execute the full orchestration pipeline.
 
@@ -161,16 +210,33 @@ class Harness:
         """
         self.report.started_at = datetime.now(UTC).isoformat()
 
-        # 0. Create event store for this run
+        # 0. Singleton lock — prevent concurrent orchestrators on same project
+        self._lock_file = _acquire_project_lock(self.config.project_root)
+
+        # 0a. Create event store and run store for this run
         import uuid
 
         run_id = f'run-{uuid.uuid4().hex[:12]}'
+        self._run_id = run_id
         db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
         try:
             self.event_store = EventStore(db_path, run_id)
             self.scheduler.event_store = self.event_store
         except Exception:
             logger.warning('Failed to create event store', exc_info=True)
+
+        # 0a. Create run store and register this run immediately so
+        # task_results can be written incrementally as tasks complete.
+        try:
+            self._run_store = RunStore(db_path)
+            self._run_store.start_run(
+                run_id,
+                self.config.fused_memory.project_id,
+                self.report.started_at,
+                str(prd_path) if prd_path else '',
+            )
+        except Exception:
+            logger.warning('Failed to create run store', exc_info=True)
 
         # 0b. Create cost store (shares runs.db with EventStore/RunStore)
         try:
@@ -190,17 +256,30 @@ class Harness:
             self.review_checkpoint.cost_store = self.cost_store
             self.review_checkpoint.run_id = run_id
 
-        # 1. Start fused-memory HTTP server
-        logger.info('Starting fused-memory HTTP server...')
-        await self.mcp.start()
-
-        # 1b. Start escalation server
-        await self._start_escalation_server()
-
-        # 1b2. Start merge worker
-        await self._start_merge_worker()
+        # 0c. Refuse to start with dirty working tree (unless forced).
+        # Checked before any servers start to avoid zombie processes on failure.
+        if not force_dirty_start:
+            dirty = await self.git_ops.has_dirty_working_tree()
+            if dirty:
+                self._lock_file.close()
+                self._lock_file = None
+                raise RuntimeError(
+                    'Refusing to start: project_root has uncommitted tracked changes. '
+                    'Commit or stash your work first, or pass --force-dirty-start to override.\n'
+                    f'Dirty files:\n{dirty}'
+                )
 
         try:
+            # 1. Start fused-memory HTTP server
+            logger.info('Starting fused-memory HTTP server...')
+            await self.mcp.start()
+
+            # 1b. Start escalation server
+            await self._start_escalation_server()
+
+            # 1b2. Start merge worker
+            await self._start_merge_worker()
+
             # 1c. Dismiss stale escalations from prior runs (non-fatal)
             try:
                 await self._dismiss_stale_escalations()
@@ -258,7 +337,7 @@ class Harness:
 
             # 2b. Tag tasks with code modules for concurrency locking
             logger.info('Tagging tasks with code modules...')
-            await self._tag_task_modules()
+            await self._tag_task_modules(force=retag_modules)
 
             # 2c. Recover crashed tasks from surviving worktrees
             await self._recover_crashed_tasks()
@@ -366,19 +445,14 @@ class Harness:
             # 4. Shutdown
             self.report.completed_at = datetime.now(UTC).isoformat()
 
-            # Persist run metrics to SQLite
-            try:
-                from orchestrator.run_store import RunStore
-
-                db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
-                store = RunStore(db_path)
-                store.save_run(
-                    self.report,
-                    self.config.fused_memory.project_id,
-                    str(prd_path) if prd_path else '',
-                )
-            except Exception as e:
-                logger.warning(f'Failed to persist run metrics: {e}')
+            # Finalize run metrics in SQLite (task_results were written
+            # incrementally in _collect_done_reports; this updates the
+            # runs row with final aggregates).
+            if self._run_store and self._run_id:
+                try:
+                    self._run_store.finish_run(self._run_id, self.report)
+                except Exception as e:
+                    logger.warning(f'Failed to finalize run metrics: {e}')
 
             # Save HarnessReport alongside review checkpoint reports
             if self.report.review_checkpoints > 0:
@@ -394,6 +468,11 @@ class Harness:
             await self._stop_merge_worker()
             await self._stop_escalation_server()
             await self.mcp.stop()
+
+            # Release singleton lock
+            if self._lock_file is not None:
+                self._lock_file.close()
+                self._lock_file = None
 
         logger.info(self.report.summary())
         return self.report
@@ -448,28 +527,35 @@ class Harness:
         if tagged:
             logger.info(f'Tagged {tagged} tasks with PRD: {resolved_prd}')
 
-    async def _tag_task_modules(self) -> None:
+    async def _tag_task_modules(self, force: bool = False) -> None:
         """Invoke a Claude agent to tag each task with the code modules it touches.
 
         Uses structured output to get a JSON mapping of task_id → [modules],
         then persists via scheduler.update_task().
+
+        When *force* is ``True``, retag all non-done/cancelled tasks even if
+        they already have module metadata.
         """
         tasks = await self.scheduler.get_tasks()
 
-        # Filter to pending tasks that don't already have modules in metadata
-        # (done/cancelled tasks don't need module tags — they won't be executed)
+        skip_statuses = {'done', 'cancelled'}
         untagged = []
         for t in tasks:
-            if t.get('status') not in ('pending', 'in-progress'):
+            if t.get('status') in skip_statuses:
                 continue
-            metadata = t.get('metadata') or {}
-            modules = metadata.get('modules', [])
-            if not modules:
-                untagged.append(t)
+            if not force:
+                metadata = t.get('metadata') or {}
+                modules = metadata.get('modules', [])
+                if modules:
+                    continue
+            untagged.append(t)
 
         if not untagged:
-            logger.info('All tasks already have module tags — skipping')
+            logger.info('No tasks to tag — skipping')
             return
+
+        if force:
+            logger.info(f'Force-retagging {len(untagged)} tasks with module metadata')
 
         # Get top-level directory listing for context
         try:
@@ -640,10 +726,11 @@ Output JSON matching the schema. Every task must appear in the output.
                 continue
 
             # Check if plan has any completed steps
+            # Note: some plans have prerequisites as plain strings (not dicts)
             completed = [
                 s for col in ('prerequisites', 'steps')
                 for s in plan.get(col, [])
-                if s.get('status') == 'done'
+                if isinstance(s, dict) and s.get('status') == 'done'
             ]
 
             if not completed:
@@ -820,6 +907,18 @@ Output JSON matching the schema. Every task must appear in the output.
                 report = t.result()
                 if report:
                     task_reports.append(report)
+                    # Persist task result immediately so it survives crashes
+                    if self._run_store and self._run_id:
+                        try:
+                            self._run_store.save_task_result(
+                                self._run_id, report,
+                                self.config.fused_memory.project_id,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f'Failed to persist task result '
+                                f'{report.task_id}: {e}'
+                            )
                     # Track module merges for review checkpoints
                     if (report.outcome == WorkflowOutcome.DONE
                             and self.review_checkpoint):
@@ -961,26 +1060,29 @@ Output JSON matching the schema. Every task must appear in the output.
         self._escalation_queue.set_notify_callback(self._on_escalation)
         self._escalation_queue.set_resolve_callback(self._on_escalation_resolved)
 
-        mcp_server = create_server(self._escalation_queue, merge_queue=self._merge_queue)  # type: ignore[possibly-undefined]
+        mcp_server = create_server(self._escalation_queue, merge_queue=self._merge_queue, orch_config=self.config)  # type: ignore[possibly-undefined]
         host = self.config.escalation.host
         port = self.config.escalation.port
 
         async def _serve():
-            try:
-                import uvicorn
-                app = mcp_server.http_app()
-                uv_config = uvicorn.Config(
-                    app, host=host, port=port, log_level='warning',
-                )
-                server = uvicorn.Server(uv_config)
-                await server.serve()
-            except Exception as e:
-                logger.error(f'Escalation server error: {e}')
+            import uvicorn
+            app = mcp_server.http_app()
+            uv_config = uvicorn.Config(
+                app, host=host, port=port, log_level='warning',
+            )
+            server = uvicorn.Server(uv_config)
+            await server.serve()
 
         self._escalation_task = asyncio.create_task(_serve(), name='escalation-server')
         logger.info(f'Escalation MCP server starting on {host}:{port}')
-        # Give the server a moment to bind
+        # Give the server a moment to bind, then verify it didn't crash
         await asyncio.sleep(0.5)
+        if self._escalation_task.done():
+            exc = self._escalation_task.exception()
+            if exc:
+                raise RuntimeError(
+                    f'Escalation server failed to start on {host}:{port}: {exc}'
+                ) from exc
 
     async def _dismiss_stale_escalations(self) -> None:
         """Dismiss all pending escalations left over from prior orchestrator runs.
@@ -1005,7 +1107,7 @@ Output JSON matching the schema. Every task must appear in the output.
         """Stop the escalation server."""
         if self._escalation_task is not None:
             self._escalation_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._escalation_task
             self._escalation_task = None
             logger.info('Escalation server stopped')
@@ -1021,3 +1123,12 @@ Output JSON matching the schema. Every task must appear in the output.
         event = self._escalation_events.get(escalation.task_id)
         if event:
             event.set()
+
+        # Un-halt merge queue when a wip_conflict escalation is resolved
+        if (
+            getattr(escalation, 'category', None) == 'wip_conflict'
+            and self._merge_worker is not None
+            and self._merge_worker.is_wip_halted
+        ):
+            self._merge_worker.unhalt_wip()
+            logger.info('Merge queue un-halted: wip_conflict escalation resolved')

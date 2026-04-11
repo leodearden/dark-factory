@@ -9,7 +9,7 @@ Lifecycle:
 - Started lazily on first escalation (not at workflow start).
 - Each escalation either resumes the existing session or creates a fresh one.
 - Budget-capped at $12 lifetime; auto-re-escalates to level-1 on exhaustion.
-- Retries each escalation up to 3 times before re-escalating to level-1.
+- Each escalation gets up to steward_max_attempts total attempts (default 1) before re-escalating to level-1.
 - Stopped by the workflow after task completion + grace period.
 """
 
@@ -218,23 +218,19 @@ class TaskSteward:
 
         # Guard: per-escalation retry limit
         retry_count = self._retry_counts.get(escalation.id, 0)
-        if retry_count >= self.config.steward_max_retries:
+        if retry_count >= self.config.steward_max_attempts:
             self._auto_escalate_to_human(
                 escalation,
-                f'Failed after {retry_count} attempts: {escalation.summary}',
+                f'Failed after {retry_count} attempt{"s" if retry_count != 1 else ""}: {escalation.summary}',
             )
             return
 
-        # CWD: suggestions read from main (post-merge), others from worktree
-        if escalation.category == 'review_suggestions':
-            cwd = self.config.project_root
-        else:
-            cwd = self.worktree
+        cwd = self.worktree
 
         # Pre-triage large suggestion sets before invoking the steward session
         if escalation.category == 'review_suggestions' and escalation.detail:
             try:
-                suggestions = json.loads(escalation.detail)
+                suggestions = json.loads(_strip_hash_prefix(escalation.detail))
             except (json.JSONDecodeError, TypeError):
                 suggestions = []
             if len(suggestions) >= self.config.suggestion_triage_threshold:
@@ -318,7 +314,7 @@ class TaskSteward:
             logger.warning(
                 f'Steward for task {self.task_id}: escalation {escalation.id} '
                 f'still pending (attempt {retry_count + 1}/'
-                f'{self.config.steward_max_retries})'
+                f'{self.config.steward_max_attempts})'
             )
         else:
             self.metrics.escalations_handled += 1
@@ -359,6 +355,7 @@ class TaskSteward:
                 model=self.config.models.steward,
                 max_turns=self.config.max_turns.steward,
                 max_budget_usd=per_invocation_budget,
+                timeout_seconds=self.config.timeouts.steward,
                 allowed_tools=STEWARD.allowed_tools or None,
                 mcp_config=mcp_config,
                 effort=self.config.effort.steward,
@@ -441,7 +438,7 @@ class TaskSteward:
             parse_triage_result,
         )
 
-        suggestions = json.loads(escalation.detail)
+        suggestions = json.loads(_strip_hash_prefix(escalation.detail))
         prompt = build_triage_prompt(suggestions, self.task)
 
         oauth_token = None
@@ -455,7 +452,11 @@ class TaskSteward:
             model=self.config.models.triage,
             max_turns=self.config.max_turns.triage,
             max_budget_usd=self.config.budgets.triage,
-            allowed_tools=['Read', 'Glob', 'Grep'],
+            allowed_tools=[
+                'Read', 'Glob', 'Grep',
+                'mcp__fused-memory__get_tasks',
+                'mcp__fused-memory__search',
+            ],
             output_schema=TRIAGE_OUTPUT_SCHEMA,
             effort=self.config.effort.triage,
             backend=self.config.backends.triage,
@@ -556,3 +557,10 @@ class TaskSteward:
                 logger.warning(
                     f'Failed to patch steward metadata on {escalation_id}: {e}'
                 )
+
+
+def _strip_hash_prefix(detail: str) -> str:
+    """Strip the ``#hash:<hex>#`` content-fingerprint prefix if present."""
+    if detail.startswith('#hash:') and '#' in detail[6:]:
+        return detail[detail.index('#', 6) + 1:]
+    return detail

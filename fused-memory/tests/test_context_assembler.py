@@ -1,8 +1,9 @@
 """Tests for the token-budget context assembler."""
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -136,10 +137,7 @@ async def test_budget_stops_accumulation(mock_memory):
     config = _make_config(token_budget=1_450)  # overhead (1400) + room for ~1 event (~50 tokens)
     assembler = _make_assembler(memory_service=mock_memory, config=config)
 
-    events = [
-        _make_event(payload={'content_preview': f'content {i}'})
-        for i in range(10)
-    ]
+    events = [_make_event(payload={'content_preview': f'content {i}'}) for i in range(10)]
     watermark = _make_watermark()
 
     result = await assembler.assemble(events, watermark, 'test-project')
@@ -215,7 +213,10 @@ async def test_memory_added_searches_by_preview(mock_memory):
     events = [
         _make_event(
             event_type=EventType.memory_added,
-            payload={'content_preview': 'decision about auth', 'category': 'decisions_and_rationale'},
+            payload={
+                'content_preview': 'decision about auth',
+                'category': 'decisions_and_rationale',
+            },
         ),
     ]
     watermark = _make_watermark()
@@ -224,24 +225,29 @@ async def test_memory_added_searches_by_preview(mock_memory):
 
     mock_memory.search.assert_called_once()
     call_kwargs = mock_memory.search.call_args
-    assert call_kwargs.kwargs.get('query') == 'decision about auth' or call_kwargs[1].get('query') == 'decision about auth'
+    assert (
+        call_kwargs.kwargs.get('query') == 'decision about auth'
+        or call_kwargs[1].get('query') == 'decision about auth'
+    )
 
 
 @pytest.mark.asyncio
 async def test_task_status_changed_fetches_task(mock_memory, mock_taskmaster):
     """task_status_changed events fetch the task and search memory hints."""
-    mock_taskmaster.get_task = AsyncMock(return_value={
-        'id': '42',
-        'title': 'Implement auth',
-        'status': 'done',
-        'dependencies': [],
-        'metadata': {
-            'memory_hints': {
-                'queries': ['auth implementation decisions'],
-                'entities': ['AuthService'],
+    mock_taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '42',
+            'title': 'Implement auth',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {
+                'memory_hints': {
+                    'queries': ['auth implementation decisions'],
+                    'entities': ['AuthService'],
+                },
             },
-        },
-    })
+        }
+    )
     mock_memory.search = AsyncMock(return_value=[_make_memory_result()])
 
     assembler = _make_assembler(
@@ -379,10 +385,7 @@ async def test_batch_processing(mock_memory):
     config = _make_config(context_fetch_batch_size=3)
     assembler = _make_assembler(memory_service=mock_memory, config=config)
 
-    events = [
-        _make_event(payload={'content_preview': f'event {i}'})
-        for i in range(7)
-    ]
+    events = [_make_event(payload={'content_preview': f'event {i}'}) for i in range(7)]
     watermark = _make_watermark()
 
     result = await assembler.assemble(events, watermark, 'test-project')
@@ -453,3 +456,202 @@ async def test_first_event_always_included_even_if_over_budget(mock_memory):
     assert len(result.events) >= 1
     # Second event should not be (budget already exceeded)
     assert result.events_remaining >= 1
+
+
+# ---------------------------------------------------------------------------
+# task-512: CancelledError must propagate out of assemble(), not be swallowed
+# ---------------------------------------------------------------------------
+
+
+class TestContextAssemblerCancellation:
+    """CancelledError raised inside gather must propagate, not be silently captured.
+
+    asyncio.gather(return_exceptions=True) captures *all* BaseException subclasses as
+    result values — including asyncio.CancelledError, which is a BaseException but NOT
+    an Exception in Python 3.8+.  The buggy guard ``isinstance(ctx_result, BaseException)``
+    therefore treats cancellation signals as ordinary per-event failures and converts them
+    into empty context lists (``ctx_result = []``), silently swallowing the shutdown signal
+    and letting assemble() return a normal payload instead of propagating the cancel.
+
+    The fix mirrors the 'two-tier check' convention already applied in:
+      - MemoryService.get_entity (memory_service.py:1000-1013)
+      - graphiti_client.rebuild_entity_summaries (graphiti_client.py:1071-1098, task-484)
+
+    Two passes:
+      - Pass 1 (propagation): scan batch_contexts and re-raise any value that is a
+        BaseException but NOT an Exception (CancelledError, KeyboardInterrupt, SystemExit).
+      - Pass 2 (accumulation): the per-event zip loop uses ``isinstance(ctx_result, Exception)``
+        so only application-level failures degrade to empty context.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates_from_context_fetch(self, mock_memory):
+        """CancelledError raised by memory.search must propagate out of assemble().
+
+        The production path:
+          mock_memory.search raises CancelledError
+          → _ctx_memory_added calls self.memory.search → CancelledError propagates
+          → _fetch_context's ``except Exception`` does NOT catch BaseException subclasses
+            that are not Exception (i.e., CancelledError bypasses the except-clause)
+          → asyncio.gather(return_exceptions=True) captures it as a value in batch_contexts
+          → the buggy ``isinstance(ctx_result, BaseException)`` guard converts it to []
+            (current behaviour: assemble() returns normally — test DID NOT RAISE)
+          → the fixed propagation pass detects it and re-raises → pytest.raises passes.
+        """
+        mock_memory.search = AsyncMock(side_effect=asyncio.CancelledError())
+        assembler = _make_assembler(memory_service=mock_memory)
+
+        events = [
+            _make_event(
+                event_type=EventType.memory_added,
+                payload={'content_preview': 'some content'},
+            ),
+        ]
+        watermark = _make_watermark()
+
+        with pytest.raises(asyncio.CancelledError):
+            await assembler.assemble(events, watermark, 'test-project')
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates_alongside_exception(self, mock_memory):
+        """CancelledError must take precedence over per-event RuntimeErrors in the same batch.
+
+        When gather(return_exceptions=True) returns a mix of Exception subclasses and
+        CancelledError, the propagation pass (which runs before per-event accumulation)
+        must still re-raise the CancelledError even if a RuntimeError appears first in
+        the results list. This guards against a regression where someone reorders the
+        guard branches and accidentally promotes RuntimeError accounting before the
+        cancellation check.
+
+        Patches assembler._fetch_context via patch.object to emit a RuntimeError for
+        event_one and a CancelledError for event_two — bypassing _fetch_context's
+        internal ``except Exception`` wrapper and forcing the exact mix into
+        batch_contexts (in deterministic slot order, since gather preserves input-order
+        in its result list regardless of scheduling) that the propagation pass must
+        handle correctly.
+
+        Sister test: TestRebuildEntitySummariesCancellation::
+            test_cancelled_error_propagates_alongside_other_errors
+        """
+        call_count = 0
+
+        async def patched_fetch_context(event, project_id):
+            nonlocal call_count
+            call_count += 1
+            if event.payload['content_preview'] == 'event one':
+                raise RuntimeError('per-event failure')
+            raise asyncio.CancelledError()
+
+        assembler = _make_assembler(memory_service=mock_memory)
+
+        with patch.object(assembler, '_fetch_context', new=patched_fetch_context):
+            events = [
+                _make_event(
+                    event_type=EventType.memory_added,
+                    payload={'content_preview': 'event one'},
+                ),
+                _make_event(
+                    event_type=EventType.memory_added,
+                    payload={'content_preview': 'event two'},
+                ),
+            ]
+            watermark = _make_watermark()
+
+            with pytest.raises(asyncio.CancelledError):
+                await assembler.assemble(events, watermark, 'test-project')
+            assert call_count == 2, (
+                'mixed-batch scenario requires both tasks to dispatch — '
+                'the RuntimeError/CancelledError ordering premise was not exercised'
+            )
+
+    @pytest.mark.asyncio
+    async def test_exception_only_batch_does_not_propagate(self, mock_memory):
+        """Plain RuntimeErrors must be caught by Pass 2, not re-raised by Pass 1.
+
+        Task 575 — guards the ``and not isinstance(ctx_result, Exception)`` clause
+        in the Pass 1 propagation check (context_assembler.py:134).  If that clause
+        were dropped (or the check widened to bare ``isinstance(ctx_result,
+        BaseException)``), a RuntimeError would be re-raised by Pass 1 instead of
+        being swallowed by Pass 2 and degraded to an event-only entry.
+
+        Directly patches assembler._fetch_context — bypassing _fetch_context's own
+        ``except Exception`` wrapper (lines 221-225) — so the RuntimeError lands in
+        batch_contexts exactly as the Pass 1 guard sees it.  assemble() must return
+        normally with all events present in degraded event-only mode and no context
+        items.
+        """
+        call_count = 0
+
+        async def patched_fetch_context(event, project_id):
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError('per-event failure')
+
+        assembler = _make_assembler(memory_service=mock_memory)
+
+        events = [
+            _make_event(
+                event_type=EventType.memory_added,
+                payload={'content_preview': f'event {i}'},
+            )
+            for i in range(3)
+        ]
+        watermark = _make_watermark()
+
+        with patch.object(assembler, '_fetch_context', new=patched_fetch_context):
+            result = await assembler.assemble(events, watermark, 'test-project')
+
+        assert len(result.events) == 3, 'all events must appear in degraded event-only payload'
+        assert len(result.context_items) == 0, 'no context items expected when every fetch fails'
+        assert call_count == 3, 'patched _fetch_context must be called once per event'
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates_from_second_batch(self, mock_memory):
+        """CancelledError raised on the second batch iteration must still propagate.
+
+        Task 575 — guards the while-loop structure in assemble()
+        (context_assembler.py:113-166).  The Pass 1 propagation check runs inside
+        the loop body on every iteration; this test forces two loop iterations and
+        verifies that Pass 1 fires on the second one.  A regression such as an
+        early-continue that skips the propagation check on subsequent iterations
+        would cause assemble() to return normally instead of raising.
+
+        Uses context_fetch_batch_size=10 with 12 events so that the first batch
+        (calls 1-10) succeeds and the CancelledError is raised on call 11 — the
+        first call of the second batch.
+
+        Sister test: test_cancelled_error_propagates_from_context_fetch (single-batch
+        variant) and test_cancelled_error_propagates_alongside_exception (mixed-batch
+        variant in the first batch).
+        """
+        call_count = 0
+
+        async def patched_fetch_context(event, project_id):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 11:
+                raise asyncio.CancelledError()
+            return []
+
+        config = _make_config(context_fetch_batch_size=10)
+        assembler = _make_assembler(memory_service=mock_memory, config=config)
+
+        events = [
+            _make_event(
+                event_type=EventType.memory_added,
+                payload={'content_preview': f'event {i}'},
+            )
+            for i in range(12)
+        ]
+        watermark = _make_watermark()
+
+        with (
+            patch.object(assembler, '_fetch_context', new=patched_fetch_context),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await assembler.assemble(events, watermark, 'test-project')
+
+        assert call_count >= 11, (
+            'first batch (calls 1-10) must complete before the second batch '
+            'dispatches and triggers the CancelledError on call 11'
+        )

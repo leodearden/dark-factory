@@ -1,0 +1,596 @@
+{
+  "summaries": [
+    {
+      "name": "variant_a",
+      "description": "1x opus generalist \u2014 depth replaces breadth",
+      "num_reviewers": 1,
+      "mean_recall": 0.6444,
+      "mean_precision": 0.3627,
+      "mean_f1": 0.4572,
+      "mean_blocking_recall": 0.8444,
+      "total_cost_usd": 5.21,
+      "mean_wall_clock_ms": 119529.0,
+      "by_language": {
+        "python": {
+          "recall": 0.5833,
+          "precision": 0.2944,
+          "f1": 0.3862,
+          "blocking_recall": 0.8333
+        },
+        "rust": {
+          "recall": 0.7778,
+          "precision": 0.454,
+          "f1": 0.5712,
+          "blocking_recall": 0.8333
+        },
+        "typescript": {
+          "recall": 0.5,
+          "precision": 0.3167,
+          "f1": 0.3712,
+          "blocking_recall": 0.8889
+        }
+      },
+      "by_source": {
+        "synthetic": {
+          "recall": 0.7361,
+          "precision": 0.3978,
+          "f1": 0.5113,
+          "blocking_recall": 0.9722
+        },
+        "real_world": {
+          "recall": 0.2778,
+          "precision": 0.2222,
+          "f1": 0.2407,
+          "blocking_recall": 0.3333
+        }
+      },
+      "f1_per_dollar": 0.0878,
+      "blocking_recall_per_dollar": 0.1621
+    },
+    {
+      "name": "variant_b",
+      "description": "2x opus (bug_hunter + design_critic) \u2014 depth + diversity",
+      "num_reviewers": 2,
+      "mean_recall": 0.7278,
+      "mean_precision": 0.3497,
+      "mean_f1": 0.4561,
+      "mean_blocking_recall": 0.7778,
+      "total_cost_usd": 8.08,
+      "mean_wall_clock_ms": 104750.0,
+      "by_language": {
+        "python": {
+          "recall": 0.7222,
+          "precision": 0.2833,
+          "f1": 0.4069,
+          "blocking_recall": 0.8333
+        },
+        "rust": {
+          "recall": 0.8194,
+          "precision": 0.4742,
+          "f1": 0.5708,
+          "blocking_recall": 0.8333
+        },
+        "typescript": {
+          "recall": 0.5556,
+          "precision": 0.2333,
+          "f1": 0.3248,
+          "blocking_recall": 0.5556
+        }
+      },
+      "by_source": {
+        "synthetic": {
+          "recall": 0.8403,
+          "precision": 0.385,
+          "f1": 0.5133,
+          "blocking_recall": 0.9722
+        },
+        "real_world": {
+          "recall": 0.2778,
+          "precision": 0.2083,
+          "f1": 0.2273,
+          "blocking_recall": 0.0
+        }
+      },
+      "f1_per_dollar": 0.0564,
+      "blocking_recall_per_dollar": 0.0963
+    },
+    {
+      "name": "variant_c",
+      "description": "1x opus cross-cutting + 2x sonnet specialists",
+      "num_reviewers": 3,
+      "mean_recall": 0.8722,
+      "mean_precision": 0.2286,
+      "mean_f1": 0.3576,
+      "mean_blocking_recall": 0.8778,
+      "total_cost_usd": 12.05,
+      "mean_wall_clock_ms": 174526.0,
+      "by_language": {
+        "python": {
+          "recall": 1.0,
+          "precision": 0.2336,
+          "f1": 0.3751,
+          "blocking_recall": 1.0
+        },
+        "rust": {
+          "recall": 0.9028,
+          "precision": 0.2616,
+          "f1": 0.4004,
+          "blocking_recall": 0.9167
+        },
+        "typescript": {
+          "recall": 0.5556,
+          "precision": 0.1528,
+          "f1": 0.2368,
+          "blocking_recall": 0.5556
+        }
+      },
+      "by_source": {
+        "synthetic": {
+          "recall": 0.9236,
+          "precision": 0.248,
+          "f1": 0.3854,
+          "blocking_recall": 0.9306
+        },
+        "real_world": {
+          "recall": 0.6667,
+          "precision": 0.151,
+          "f1": 0.2462,
+          "blocking_recall": 0.6667
+        }
+      },
+      "f1_per_dollar": 0.0297,
+      "blocking_recall_per_dollar": 0.0728
+    },
+    {
+      "name": "variant_d",
+      "description": "3x sonnet (data-driven consolidated trim)",
+      "num_reviewers": 3,
+      "mean_recall": 0.8611,
+      "mean_precision": 0.2154,
+      "mean_f1": 0.3409,
+      "mean_blocking_recall": 0.8556,
+      "total_cost_usd": 10.79,
+      "mean_wall_clock_ms": 166651.0,
+      "by_language": {
+        "python": {
+          "recall": 0.9444,
+          "precision": 0.2067,
+          "f1": 0.3374,
+          "blocking_recall": 0.9167
+        },
+        "rust": {
+          "recall": 0.9028,
+          "precision": 0.2348,
+          "f1": 0.3713,
+          "blocking_recall": 1.0
+        },
+        "typescript": {
+          "recall": 0.6111,
+          "precision": 0.1938,
+          "f1": 0.2873,
+          "blocking_recall": 0.4444
+        }
+      },
+      "by_source": {
+        "synthetic": {
+          "recall": 0.8958,
+          "precision": 0.2132,
+          "f1": 0.3424,
+          "blocking_recall": 0.9444
+        },
+        "real_world": {
+          "recall": 0.7222,
+          "precision": 0.2241,
+          "f1": 0.3349,
+          "blocking_recall": 0.5
+        }
+      },
+      "f1_per_dollar": 0.0316,
+      "blocking_recall_per_dollar": 0.0793
+    },
+    {
+      "name": "baseline",
+      "description": "Production panel: 5x sonnet specialists",
+      "num_reviewers": 5,
+      "mean_recall": 0.8889,
+      "mean_precision": 0.1414,
+      "mean_f1": 0.2427,
+      "mean_blocking_recall": 0.8444,
+      "total_cost_usd": 17.69,
+      "mean_wall_clock_ms": 207094.0,
+      "by_language": {
+        "python": {
+          "recall": 1.0,
+          "precision": 0.1386,
+          "f1": 0.2428,
+          "blocking_recall": 1.0
+        },
+        "rust": {
+          "recall": 0.9167,
+          "precision": 0.1592,
+          "f1": 0.2706,
+          "blocking_recall": 0.8333
+        },
+        "typescript": {
+          "recall": 0.6111,
+          "precision": 0.1112,
+          "f1": 0.1867,
+          "blocking_recall": 0.5556
+        }
+      },
+      "by_source": {
+        "synthetic": {
+          "recall": 0.9444,
+          "precision": 0.1456,
+          "f1": 0.2511,
+          "blocking_recall": 0.9722
+        },
+        "real_world": {
+          "recall": 0.6667,
+          "precision": 0.1246,
+          "f1": 0.2088,
+          "blocking_recall": 0.3333
+        }
+      },
+      "f1_per_dollar": 0.0137,
+      "blocking_recall_per_dollar": 0.0477
+    }
+  ],
+  "head_to_heads": [
+    {
+      "variant_a": "baseline",
+      "variant_b": "variant_a",
+      "a_wins": [
+        "py_real_01",
+        "rs_real_01"
+      ],
+      "b_wins": [
+        "py_always_passes",
+        "py_deep_shallow",
+        "py_missing_await",
+        "py_obvious_copy",
+        "py_swapped_args",
+        "rs_heavy_mutation_copy",
+        "rs_iter_vs_recurse",
+        "rs_leaked_resource",
+        "rs_missing_error_prop",
+        "rs_off_by_one",
+        "ts_obvious_copy",
+        "ts_real_01",
+        "ts_shallow_mutate"
+      ],
+      "ties": []
+    },
+    {
+      "variant_a": "baseline",
+      "variant_b": "variant_b",
+      "a_wins": [
+        "py_real_01",
+        "ts_real_01"
+      ],
+      "b_wins": [
+        "py_always_passes",
+        "py_deep_shallow",
+        "py_missing_await",
+        "py_obvious_copy",
+        "py_swapped_args",
+        "rs_heavy_mutation_copy",
+        "rs_iter_vs_recurse",
+        "rs_leaked_resource",
+        "rs_missing_error_prop",
+        "rs_off_by_one",
+        "rs_real_01",
+        "ts_obvious_copy",
+        "ts_shallow_mutate"
+      ],
+      "ties": []
+    },
+    {
+      "variant_a": "baseline",
+      "variant_b": "variant_c",
+      "a_wins": [
+        "rs_iter_vs_recurse",
+        "rs_leaked_resource",
+        "ts_real_01"
+      ],
+      "b_wins": [
+        "py_always_passes",
+        "py_deep_shallow",
+        "py_missing_await",
+        "py_obvious_copy",
+        "py_real_01",
+        "py_swapped_args",
+        "rs_heavy_mutation_copy",
+        "rs_missing_error_prop",
+        "rs_off_by_one",
+        "rs_real_01",
+        "ts_obvious_copy",
+        "ts_shallow_mutate"
+      ],
+      "ties": []
+    },
+    {
+      "variant_a": "baseline",
+      "variant_b": "variant_d",
+      "a_wins": [
+        "rs_iter_vs_recurse",
+        "ts_shallow_mutate"
+      ],
+      "b_wins": [
+        "py_always_passes",
+        "py_deep_shallow",
+        "py_missing_await",
+        "py_obvious_copy",
+        "py_real_01",
+        "py_swapped_args",
+        "rs_heavy_mutation_copy",
+        "rs_missing_error_prop",
+        "rs_off_by_one",
+        "rs_real_01",
+        "ts_obvious_copy",
+        "ts_real_01"
+      ],
+      "ties": [
+        "rs_leaked_resource"
+      ]
+    },
+    {
+      "variant_a": "variant_a",
+      "variant_b": "variant_b",
+      "a_wins": [
+        "py_always_passes",
+        "py_missing_await",
+        "py_real_01",
+        "rs_iter_vs_recurse",
+        "rs_leaked_resource",
+        "rs_missing_error_prop",
+        "rs_off_by_one",
+        "ts_real_01",
+        "ts_shallow_mutate"
+      ],
+      "b_wins": [
+        "py_deep_shallow",
+        "rs_heavy_mutation_copy",
+        "rs_real_01",
+        "ts_obvious_copy"
+      ],
+      "ties": [
+        "py_obvious_copy",
+        "py_swapped_args"
+      ]
+    },
+    {
+      "variant_a": "variant_a",
+      "variant_b": "variant_c",
+      "a_wins": [
+        "py_always_passes",
+        "py_obvious_copy",
+        "rs_heavy_mutation_copy",
+        "rs_iter_vs_recurse",
+        "rs_leaked_resource",
+        "rs_missing_error_prop",
+        "rs_off_by_one",
+        "ts_real_01",
+        "ts_shallow_mutate"
+      ],
+      "b_wins": [
+        "py_deep_shallow",
+        "py_missing_await",
+        "py_real_01",
+        "py_swapped_args",
+        "rs_real_01",
+        "ts_obvious_copy"
+      ],
+      "ties": []
+    },
+    {
+      "variant_a": "variant_a",
+      "variant_b": "variant_d",
+      "a_wins": [
+        "py_always_passes",
+        "py_obvious_copy",
+        "rs_heavy_mutation_copy",
+        "rs_iter_vs_recurse",
+        "rs_leaked_resource",
+        "rs_missing_error_prop",
+        "rs_off_by_one",
+        "ts_real_01",
+        "ts_shallow_mutate"
+      ],
+      "b_wins": [
+        "py_deep_shallow",
+        "py_missing_await",
+        "py_real_01",
+        "py_swapped_args",
+        "rs_real_01",
+        "ts_obvious_copy"
+      ],
+      "ties": []
+    },
+    {
+      "variant_a": "variant_b",
+      "variant_b": "variant_c",
+      "a_wins": [
+        "py_always_passes",
+        "py_deep_shallow",
+        "py_obvious_copy",
+        "rs_heavy_mutation_copy",
+        "rs_iter_vs_recurse",
+        "rs_leaked_resource",
+        "rs_off_by_one",
+        "rs_real_01",
+        "ts_obvious_copy",
+        "ts_shallow_mutate"
+      ],
+      "b_wins": [
+        "py_missing_await",
+        "py_real_01",
+        "py_swapped_args",
+        "rs_missing_error_prop"
+      ],
+      "ties": [
+        "ts_real_01"
+      ]
+    },
+    {
+      "variant_a": "variant_b",
+      "variant_b": "variant_d",
+      "a_wins": [
+        "py_always_passes",
+        "py_deep_shallow",
+        "py_obvious_copy",
+        "rs_heavy_mutation_copy",
+        "rs_iter_vs_recurse",
+        "rs_leaked_resource",
+        "rs_missing_error_prop",
+        "rs_off_by_one",
+        "rs_real_01",
+        "ts_obvious_copy",
+        "ts_shallow_mutate"
+      ],
+      "b_wins": [
+        "py_missing_await",
+        "py_real_01",
+        "py_swapped_args",
+        "ts_real_01"
+      ],
+      "ties": []
+    },
+    {
+      "variant_a": "variant_c",
+      "variant_b": "variant_d",
+      "a_wins": [
+        "py_always_passes",
+        "py_deep_shallow",
+        "py_real_01",
+        "rs_iter_vs_recurse",
+        "rs_missing_error_prop",
+        "rs_off_by_one",
+        "ts_obvious_copy",
+        "ts_shallow_mutate"
+      ],
+      "b_wins": [
+        "py_missing_await",
+        "py_obvious_copy",
+        "rs_leaked_resource",
+        "ts_real_01"
+      ],
+      "ties": [
+        "py_swapped_args",
+        "rs_heavy_mutation_copy",
+        "rs_real_01"
+      ]
+    }
+  ],
+  "missed_by_all": [
+    "ts_shallow_1"
+  ],
+  "per_diff_scores": {
+    "py_missing_await": {
+      "baseline": 0.2667,
+      "variant_a": 0.3333,
+      "variant_b": 0.2857,
+      "variant_c": 0.3636,
+      "variant_d": 0.4
+    },
+    "py_swapped_args": {
+      "baseline": 0.2105,
+      "variant_a": 0.2857,
+      "variant_b": 0.2857,
+      "variant_c": 0.3333,
+      "variant_d": 0.3333
+    },
+    "py_always_passes": {
+      "baseline": 0.2308,
+      "variant_a": 0.5714,
+      "variant_b": 0.5455,
+      "variant_c": 0.4286,
+      "variant_d": 0.3529
+    },
+    "py_obvious_copy": {
+      "baseline": 0.1905,
+      "variant_a": 0.5714,
+      "variant_b": 0.5714,
+      "variant_c": 0.25,
+      "variant_d": 0.2667
+    },
+    "py_deep_shallow": {
+      "baseline": 0.2857,
+      "variant_a": 0.3333,
+      "variant_b": 0.5714,
+      "variant_c": 0.5,
+      "variant_d": 0.3636
+    },
+    "py_real_01": {
+      "baseline": 0.2727,
+      "variant_a": 0.2222,
+      "variant_b": 0.1818,
+      "variant_c": 0.375,
+      "variant_d": 0.3077
+    },
+    "rs_off_by_one": {
+      "baseline": 0.2609,
+      "variant_a": 0.75,
+      "variant_b": 0.6,
+      "variant_c": 0.4286,
+      "variant_d": 0.4
+    },
+    "rs_leaked_resource": {
+      "baseline": 0.25,
+      "variant_a": 0.4,
+      "variant_b": 0.3636,
+      "variant_c": 0.2105,
+      "variant_d": 0.25
+    },
+    "rs_heavy_mutation_copy": {
+      "baseline": 0.2857,
+      "variant_a": 0.8,
+      "variant_b": 1.0,
+      "variant_c": 0.5,
+      "variant_d": 0.5
+    },
+    "rs_iter_vs_recurse": {
+      "baseline": 0.32,
+      "variant_a": 0.7273,
+      "variant_b": 0.4615,
+      "variant_c": 0.3,
+      "variant_d": 0.2857
+    },
+    "rs_missing_error_prop": {
+      "baseline": 0.3529,
+      "variant_a": 0.75,
+      "variant_b": 0.5,
+      "variant_c": 0.6,
+      "variant_d": 0.4286
+    },
+    "rs_real_01": {
+      "baseline": 0.1538,
+      "variant_a": 0.0,
+      "variant_b": 0.5,
+      "variant_c": 0.3636,
+      "variant_d": 0.3636
+    },
+    "ts_shallow_mutate": {
+      "baseline": 0.16,
+      "variant_a": 0.3636,
+      "variant_b": 0.3077,
+      "variant_c": 0.2105,
+      "variant_d": 0.1
+    },
+    "ts_obvious_copy": {
+      "baseline": 0.2,
+      "variant_a": 0.25,
+      "variant_b": 0.6667,
+      "variant_c": 0.5,
+      "variant_d": 0.4286
+    },
+    "ts_real_01": {
+      "baseline": 0.2,
+      "variant_a": 0.5,
+      "variant_b": 0.0,
+      "variant_c": 0.0,
+      "variant_d": 0.3333
+    }
+  },
+  "total_cost_usd": 53.82
+}

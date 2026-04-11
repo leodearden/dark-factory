@@ -1,17 +1,32 @@
-"""Shared test fixtures for dashboard tests."""
-
-from __future__ import annotations
+"""pytest configuration — ensure local src takes precedence over installed package."""
 
 import sqlite3
+import sys
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import aiosqlite
-import pytest
-from starlette.testclient import TestClient
+# ---------------------------------------------------------------------------
+# sys.path guard — MUST stay above all non-stdlib imports.
+#
+# Insert this worktree's src directory at the front of sys.path so that
+# `import dashboard` loads the local (possibly modified) code rather than
+# whatever editable install the dashboard .venv has pinned to the main tree.
+#
+# Do NOT move this block below any third-party or local imports.  If a future
+# maintainer adds `from dashboard import ...` above this block it would
+# silently resolve against the installed editable package instead of the
+# local worktree src/, causing hard-to-diagnose test failures.
+# ---------------------------------------------------------------------------
+_SRC = Path(__file__).parent.parent / 'src'
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+import aiosqlite  # noqa: E402
+import pytest  # noqa: E402
+from starlette.testclient import TestClient  # noqa: E402
 
 # Path to the generated tailwind.css (gitignored, built via `make css`)
 _STATIC_DIR = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'static'
