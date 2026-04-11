@@ -1680,3 +1680,68 @@ class TestCollectSnapshotInsertFailureIsolation:
         assert str(base_config.project_root) in combined, (
             f'Expected main project path in warning, got: {combined!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Explicit rollback on unexpected error (#13)
+# ---------------------------------------------------------------------------
+
+
+class TestCollectSnapshotExplicitRollback:
+    """Verify that an unexpected exception triggers an explicit conn.rollback() before re-raising.
+
+    This test is written in TDD red-phase for step-6 of task 539.  It fails
+    before the outer try/except is added to collect_snapshot, because the
+    current code relies on aiosqlite's implicit rollback-on-close which does
+    not work correctly for a long-lived persistent connection (as used in
+    app.py lifespan).
+    """
+
+    @pytest.mark.asyncio
+    async def test_explicit_rollback_on_unexpected_error(self, burndown_env):
+        """An unexpected exception inside collect_snapshot must trigger conn.rollback()
+        and re-raise the original exception.
+
+        Injection point: patch `dashboard.data.burndown.datetime` so that
+        `datetime.now(UTC).isoformat()` raises RuntimeError('clock failure').
+        This fires before any per-project try/except, so the outer except
+        must catch it, call rollback, then re-raise.
+
+        Asserts:
+        (a) RuntimeError propagates out of collect_snapshot.
+        (b) conn.rollback was called at least once before the re-raise.
+        """
+        from unittest.mock import AsyncMock, patch as _patch
+
+        db_path, config, conn = burndown_env
+
+        # Spy on conn.rollback
+        original_rollback = conn.rollback
+        rollback_calls = []
+
+        async def rollback_spy():
+            rollback_calls.append(1)
+            return await original_rollback()
+
+        conn.rollback = rollback_spy
+
+        # Patch datetime.now to raise RuntimeError — fires before any per-project try/except
+        class _FakeDatetime:
+            @staticmethod
+            def now(tz=None):
+                raise RuntimeError('clock failure')
+
+        try:
+            with (
+                _patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                _patch('dashboard.data.burndown.datetime', _FakeDatetime),
+                pytest.raises(RuntimeError, match='clock failure'),
+            ):
+                await collect_snapshot(conn, config)
+        finally:
+            conn.rollback = original_rollback
+
+        # (b) rollback must have been called before the re-raise
+        assert rollback_calls, (
+            'Expected conn.rollback() to be called before re-raising the RuntimeError'
+        )
