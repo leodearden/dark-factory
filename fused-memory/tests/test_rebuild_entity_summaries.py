@@ -1561,3 +1561,46 @@ class TestRebuildEntitySummariesCancellation:
         error_detail = next((d for d in result['details'] if d['status'] == 'error'), None)
         assert error_detail is not None, f"expected an 'error' entry in details; got {result['details']}"
         assert 'per-entity boom' in error_detail['error']
+
+
+# ---------------------------------------------------------------------------
+# Task-511: replace bare assert isinstance(r, dict) with explicit TypeError guard
+# ---------------------------------------------------------------------------
+
+class TestRebuildEntitySummariesTypeGuard:
+    """Regression tests for the explicit TypeError guard in the per-entity accumulation loop.
+
+    The production code in graphiti_client.py's rebuild_entity_summaries contains a loop
+    that gathers results from _rebuild_entity_from_edges.  In the else branch (non-exception
+    result) the code originally used ``assert isinstance(r, dict)`` purely for Pyright type
+    narrowing.  That assert is stripped when Python runs with ``-O``/``PYTHONOPTIMIZE``,
+    leaving a silent footgun: a non-dict return would propagate silently until an
+    AttributeError surfaced on ``r.get(...)`` far from the origin.
+
+    Task-511 replaces the assert with an explicit ``if not isinstance(r, dict): raise TypeError(...)``
+    so the contract check is unconditional.  Pyright still narrows ``r`` to ``dict`` after
+    a conditional raise, so the type-narrowing motivation is preserved.
+
+    See: fused-memory/src/fused_memory/backends/graphiti_client.py – per-entity accumulation loop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_dict_return_raises_typeerror(self, two_entity_backend):
+        """_rebuild_entity_from_edges returning a non-dict value must raise TypeError.
+
+        Patches _rebuild_entity_from_edges to return None (a non-dict) and asserts
+        that rebuild_entity_summaries raises TypeError whose message contains:
+          - the type name ('NoneType')
+          - the entity uuid ('uuid-1')
+          - the entity name ('Alice')
+        """
+        backend = two_entity_backend
+        backend._rebuild_entity_from_edges = AsyncMock(return_value=None)
+
+        with pytest.raises(TypeError) as exc_info:
+            await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+        msg = str(exc_info.value)
+        assert 'NoneType' in msg
+        assert 'uuid-1' in msg
+        assert 'Alice' in msg
