@@ -176,7 +176,7 @@ class TestCollectSnapshot:
             await collect_snapshot(conn, config)
 
         async with conn.execute('SELECT * FROM snapshots') as cur:
-            rows = list(await cur.fetchall())
+            rows = await cur.fetchall()
 
         assert len(rows) == 1
         row = rows[0]
@@ -268,7 +268,7 @@ class TestCollectSnapshot:
             await collect_snapshot(conn, config)
 
         async with conn.execute('SELECT * FROM snapshots') as cur:
-            rows = list(await cur.fetchall())
+            rows = await cur.fetchall()
 
         assert len(rows) == 3
         by_project = {row['project_id']: row for row in rows}
@@ -453,7 +453,7 @@ class TestCollectSnapshot:
             await collect_snapshot(conn, config)
 
         async with conn.execute('SELECT * FROM snapshots ORDER BY project_id') as cur:
-            rows = list(await cur.fetchall())
+            rows = await cur.fetchall()
 
         assert len(rows) == 2
         ids = {row['project_id'] for row in rows}
