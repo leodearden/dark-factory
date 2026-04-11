@@ -221,8 +221,7 @@ class TestGetAllValidEdges:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_all_valid_edges(group_id='test')
-        called_args = graph.ro_query.call_args
-        cypher = called_args[0][0]
+        cypher = graph.ro_query.call_args.args[0]
         assert 'RETURN DISTINCT' in cypher
 
     @pytest.mark.asyncio
