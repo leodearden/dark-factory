@@ -62,6 +62,21 @@ def _hook_invokes_pyright_in_loop(content: str) -> bool:
     return bool(match and "uv run pyright" in match.group(1))
 
 
+def _load_pyright_config() -> dict:  # type: ignore[type-arg]
+    """Load and return the ``[tool.pyright]`` section of orchestrator/pyproject.toml.
+
+    Returns an empty dict when the section is absent so callers can assert
+    truthiness or membership with clean messages.  The pyproject.toml path is
+    resolved via ``_PACKAGE_ROOT``, mirroring the ``_load_package_defaults``
+    pattern in orchestrator/tests/test_config.py.
+    """
+    toml_path = _PACKAGE_ROOT / "pyproject.toml"
+    assert toml_path.is_file(), f"pyproject.toml not found at {toml_path}"
+    with open(toml_path, "rb") as fh:
+        config = tomllib.load(fh)
+    return config.get("tool", {}).get("pyright", {})
+
+
 # ---------------------------------------------------------------------------
 # (a) Sanity: [tool.pyright] section exists in orchestrator/pyproject.toml
 # ---------------------------------------------------------------------------
@@ -69,11 +84,9 @@ def _hook_invokes_pyright_in_loop(content: str) -> bool:
 
 def test_orchestrator_pyproject_has_pyright_section() -> None:
     """orchestrator/pyproject.toml must have a [tool.pyright] section."""
+    pyright_config = _load_pyright_config()
     toml_path = _PACKAGE_ROOT / "pyproject.toml"
-    assert toml_path.is_file(), f"pyproject.toml not found at {toml_path}"
-    with open(toml_path, "rb") as fh:
-        config = tomllib.load(fh)
-    assert "pyright" in config.get("tool", {}), (
+    assert pyright_config, (
         f"[tool.pyright] section missing from {toml_path}. "
         "The TYPE_CHECKING Protocol conformance block in test_workflow_e2e.py "
         "relies on pyright being configured for this package. See task 699."
@@ -88,22 +101,20 @@ def test_orchestrator_pyproject_has_pyright_section() -> None:
 def test_orchestrator_pyright_include_contains_tests() -> None:
     """[tool.pyright] include must list 'tests' so pyright covers test_workflow_e2e.py.
 
-    If this test fails, the TYPE_CHECKING Protocol conformance block at
-    test_workflow_e2e.py:2094 silently becomes a no-op because pyright no longer
-    type-checks this file. See task 699.
+    If this test fails, the TYPE_CHECKING Protocol conformance block near the
+    bottom of test_workflow_e2e.py silently becomes a no-op because pyright no
+    longer type-checks this file. See task 699.
     """
+    pyright_config = _load_pyright_config()
     toml_path = _PACKAGE_ROOT / "pyproject.toml"
-    assert toml_path.is_file(), f"pyproject.toml not found at {toml_path}"
-    with open(toml_path, "rb") as fh:
-        config = tomllib.load(fh)
-    include = config.get("tool", {}).get("pyright", {}).get("include", [])
+    include = pyright_config.get("include", [])
     assert "tests" in include, (
         f"'tests' is not in [tool.pyright] include = {include!r} "
         f"in {toml_path}. "
         "Without this entry pyright does not type-check test_workflow_e2e.py, "
-        "so the TYPE_CHECKING Protocol conformance block at line 2094 silently "
-        "becomes a no-op. Re-add 'tests' to [tool.pyright] include, or update "
-        "the conformance strategy. See task 699."
+        "so the TYPE_CHECKING Protocol conformance block near the bottom of "
+        "test_workflow_e2e.py silently becomes a no-op. Re-add 'tests' to "
+        "[tool.pyright] include, or update the conformance strategy. See task 699."
     )
 
 
