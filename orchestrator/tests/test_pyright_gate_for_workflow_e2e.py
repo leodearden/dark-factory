@@ -22,12 +22,19 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
+from typing import Any
 
 # Locate package root (orchestrator/) from the tests/ directory.
 _PACKAGE_ROOT = Path(__file__).parent.parent
 
 # Locate repo root (dark-factory/) from orchestrator/tests/.
 _REPO_ROOT = Path(__file__).parents[2]
+
+# Pre-compiled pattern for detecting a PYRIGHT_PACKAGES for-loop in hook content.
+_LOOP_PATTERN = re.compile(
+    r'for\s+\w+\s+in\s+"\$\{PYRIGHT_PACKAGES\[@\]\}"\s*;\s*do(.*?)done',
+    re.DOTALL,
+)
 
 
 def _parse_pyright_packages(content: str) -> list[str] | None:
@@ -41,8 +48,20 @@ def _parse_pyright_packages(content: str) -> list[str] | None:
     Uses ``re.MULTILINE`` with a ``^`` anchor so only a real array declaration
     at the start of a line is matched, not a PYRIGHT_PACKAGES substring that
     appears inside a comment or an unrelated string.
+
+    Bash line continuations (a ``\\`` backslash followed by a newline) are
+    normalized to a single space before matching, so a multi-line declaration
+    such as::
+
+        PYRIGHT_PACKAGES=( \\
+            fused-memory \\
+            orchestrator \\
+        )
+
+    is parsed correctly without stray ``\\`` tokens in the result.
     """
-    match = re.search(r"^PYRIGHT_PACKAGES=\(([^)]*)\)", content, re.MULTILINE)
+    normalized = content.replace("\\\n", " ")
+    match = re.search(r"^PYRIGHT_PACKAGES=\(([^)]*)\)", normalized, re.MULTILINE)
     return match.group(1).split() if match else None
 
 
@@ -55,15 +74,11 @@ def _hook_invokes_pyright_in_loop(content: str) -> bool:
     file (e.g. in a comment) does not falsely pass, and a loop that iterates
     PYRIGHT_PACKAGES but calls some other command inside fails correctly.
     """
-    _LOOP_PATTERN = re.compile(
-        r'for\s+\w+\s+in\s+"\$\{PYRIGHT_PACKAGES\[@\]\}"\s*;\s*do(.*?)done',
-        re.DOTALL,
-    )
     match = _LOOP_PATTERN.search(content)
     return bool(match and "uv run pyright" in match.group(1))
 
 
-def _load_pyright_config() -> dict:  # type: ignore[type-arg]
+def _load_pyright_config() -> dict[str, Any]:
     """Load and return the ``[tool.pyright]`` section of orchestrator/pyproject.toml.
 
     Returns an empty dict when the section is absent so callers can assert
@@ -234,6 +249,55 @@ def test_parse_pyright_packages_returns_none_when_missing() -> None:
     result = _parse_pyright_packages(content)
     assert result is None, (
         f"Expected None when PYRIGHT_PACKAGES is absent, got {result!r}"
+    )
+
+
+def test_parse_pyright_packages_returns_empty_list_when_declared_empty() -> None:
+    """_parse_pyright_packages returns [] (not None) for PYRIGHT_PACKAGES=().
+
+    This pins the intentional empty-vs-None distinction: a present-but-empty
+    declaration PYRIGHT_PACKAGES=() returns an empty list, while an absent
+    declaration returns None.  Callers use this distinction to report
+    'declaration missing' vs 'declaration present but empty' in their messages.
+    """
+    content = "PYRIGHT_PACKAGES=()\n"
+    result = _parse_pyright_packages(content)
+    assert result == [], (
+        f"Expected [] when PYRIGHT_PACKAGES=() is declared empty, got {result!r}. "
+        "The empty-vs-None distinction is intentional: [] means declared-but-empty, "
+        "None means absent."
+    )
+
+
+def test_parse_pyright_packages_handles_line_continuations() -> None:
+    """_parse_pyright_packages correctly parses a Bash array written with line continuations.
+
+    A multi-line PYRIGHT_PACKAGES declaration using ``\\`` continuation tokens:
+
+        PYRIGHT_PACKAGES=( \\
+            fused-memory \\
+            orchestrator \\
+            dashboard \\
+        )
+
+    must return ['fused-memory', 'orchestrator', 'dashboard'] without stray
+    '\\\\' tokens in the result.  Without normalization, .split() on the captured
+    body leaves stray '\\\\' tokens and the result would be
+    ['\\\\', 'fused-memory', '\\\\', 'orchestrator', '\\\\', 'dashboard', '\\\\'],
+    which would hide a real regression because 'orchestrator' happens to survive
+    the split even with the stray tokens.
+    """
+    content = (
+        "PYRIGHT_PACKAGES=( \\\n"
+        "    fused-memory \\\n"
+        "    orchestrator \\\n"
+        "    dashboard \\\n"
+        ")\n"
+    )
+    result = _parse_pyright_packages(content)
+    assert result == ["fused-memory", "orchestrator", "dashboard"], (
+        f"Expected ['fused-memory', 'orchestrator', 'dashboard'], got {result!r}. "
+        "Line-continuation tokens ('\\\\') must be stripped from the result."
     )
 
 
