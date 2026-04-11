@@ -1358,10 +1358,10 @@ class TestRebuildEntitySummariesCancellation:
     therefore treats cancellation signals as ordinary per-entity failures and converts them
     into ``{'status': 'error'}`` detail entries, silently swallowing the shutdown signal.
 
-    The fix mirrors the 'two-tier check' convention already documented in
-    MemoryService.get_entity (memory_service.py:1000-1013):
-      - A propagation pass scans results first and re-raises any value that is a
-        BaseException but NOT an Exception (CancelledError, KeyboardInterrupt, SystemExit).
+    The fix uses the shared 'two-tier check' via propagate_cancellations
+    (fused_memory.utils.async_utils):
+      - Pass 1 (propagate_cancellations): re-raises any value that is a BaseException
+        but NOT an Exception (CancelledError, KeyboardInterrupt, SystemExit).
       - The per-entity accumulator loop then uses ``isinstance(r, Exception)`` so only
         application-level failures are recorded as error detail entries.
     """
@@ -1414,13 +1414,13 @@ class TestRebuildEntitySummariesCancellation:
             await backend.rebuild_entity_summaries(group_id='test', force=True)
 
         # After CancelledError propagated, verify both update_node_summary calls were
-        # attempted by gather.  Pass 1 of the two-tier check (graphiti_client.py:1078-1080)
-        # scans the full results list before any per-entity bookkeeping, so the RuntimeError
-        # in slot 1 is captured by gather(return_exceptions=True) but NEVER reaches the
-        # per-entity error accumulator (Pass 2 at graphiti_client.py:1086-1098) — Pass 1
-        # raises first.  The await_count==2 assertion proves gather scheduled both
-        # coroutines and that we are testing the post-gather propagation path, not a
-        # pre-gather short-circuit.
+        # attempted by gather.  Pass 1 (propagate_cancellations in
+        # fused_memory.utils.async_utils) scans the full results list before any
+        # per-entity bookkeeping, so the RuntimeError in slot 1 is captured by
+        # gather(return_exceptions=True) but NEVER reaches the per-entity error
+        # accumulator (Pass 2) — Pass 1 raises first.  The await_count==2 assertion
+        # proves gather scheduled both coroutines and that we are testing the
+        # post-gather propagation path, not a pre-gather short-circuit.
         assert backend.update_node_summary.await_count == 2
 
     @pytest.mark.asyncio
@@ -1526,11 +1526,12 @@ class TestRebuildEntitySummariesCancellation:
         The task-484 fix changed the per-entity accumulator guard from
         ``isinstance(r, BaseException)`` to ``isinstance(r, Exception)`` so that
         CancelledError (a BaseException but NOT an Exception) is excluded from the
-        per-entity error bookkeeper and handled only by Pass 1 (the propagation pass).
+        per-entity error bookkeeper and handled only by Pass 1 (propagate_cancellations
+        in fused_memory.utils.async_utils).
 
         This narrowing is intentional but must not accidentally exclude ordinary
-        application-level failures (ValueError, etc.) from Pass 2
-        (graphiti_client.py:1086-1098).  If someone over-narrows the guard — e.g. to
+        application-level failures (ValueError, etc.) from Pass 2.
+        If someone over-narrows the guard — e.g. to
         ``isinstance(r, RuntimeError)`` — ordinary failures from other Exception subclasses
         would silently disappear from the result dict.
 
