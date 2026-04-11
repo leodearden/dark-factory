@@ -731,6 +731,31 @@ class TestStewardTimeoutCap:
         assert steward._timeout_counts.get('esc-42-1') == 1
         assert steward._retry_counts.get('esc-42-1', 0) == 0
 
+    async def test_non_timeout_failure_does_not_increment_timeout_count(
+        self, steward, mock_config,
+    ):
+        """Non-timeout failures must NOT touch _timeout_counts (selectivity guard)."""
+        mock_config.steward_max_timeouts_per_escalation = 3
+        mock_config.steward_max_attempts = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False,
+                cost=1.0,
+                turns=3,
+                session_id='sess-normal-fail',
+                stderr='some other error',
+            )
+            await steward._handle_escalation(esc)
+
+        assert steward._timeout_counts.get('esc-42-1', 0) == 0
+        assert steward._retry_counts.get('esc-42-1') == 1
+
 
 # ---------------------------------------------------------------------------
 # Unified Role
