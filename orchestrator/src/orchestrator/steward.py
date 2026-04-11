@@ -9,7 +9,7 @@ Lifecycle:
 - Started lazily on first escalation (not at workflow start).
 - Each escalation either resumes the existing session or creates a fresh one.
 - Budget-capped at $12 lifetime; auto-re-escalates to level-1 on exhaustion.
-- Retries each escalation up to 3 times before re-escalating to level-1.
+- Retries each escalation up to 1 attempt before re-escalating to level-1.
 - Stopped by the workflow after task completion + grace period.
 """
 
@@ -355,6 +355,7 @@ class TaskSteward:
                 model=self.config.models.steward,
                 max_turns=self.config.max_turns.steward,
                 max_budget_usd=per_invocation_budget,
+                timeout_seconds=self.config.timeouts.steward,
                 allowed_tools=STEWARD.allowed_tools or None,
                 mcp_config=mcp_config,
                 effort=self.config.effort.steward,
