@@ -391,8 +391,7 @@ class TestRebuildEntitySummariesForceDryRun:
 
         result = await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=True)
 
-        assert result['total_entities'] == 3
-        assert result['stale_entities'] == 3  # force=True targets all
+        assert result['total_entities'] == len(entities)
         assert result['stale_entities'] == result['total_entities']  # force=True treats every entity as stale
         assert result['skipped'] == 3  # dry_run=True skips all
         assert result['rebuilt'] == 0
@@ -404,6 +403,7 @@ class TestRebuildEntitySummariesForceDryRun:
         assert result['details'] == expected_details
         assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
         backend._rebuild_entity_from_edges.assert_not_awaited()
+        backend.get_all_valid_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_force_no_dry_run_calls_get_all_valid_edges(
