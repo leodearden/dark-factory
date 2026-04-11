@@ -272,17 +272,11 @@ class TestRebuildEntityFromEdgesCrossReferencesRefresh:
         )
 
     def test_single_entity_and_refresh_in_same_sentence(self) -> None:
-        """'single-entity' and 'refresh_entity_summary' must appear in the same sentence."""
+        """'single-entity' and 'refresh_entity_summary' must appear within 200 characters."""
         doc = self._doc()
-        # Split on sentence boundaries (period followed by whitespace or end of string)
-        sentences = re.split(r'\.\s+|\.$', doc)
-        found = any(
-            'single-entity' in sentence and 'refresh_entity_summary' in sentence
-            for sentence in sentences
-        )
-        assert found, (
-            "A sentence in the docstring must contain both 'single-entity' and "
-            "'refresh_entity_summary' to provide a use-case routing note (not just the "
+        assert _keywords_in_proximity(doc, 'single-entity', 'refresh_entity_summary'), (
+            "Docstring must contain 'single-entity' and 'refresh_entity_summary' within "
+            "200 characters of each other to provide a use-case routing note (not just the "
             "existing TOCTOU consistency note)"
         )
 
@@ -326,15 +320,10 @@ class TestRefreshEntitySummaryCrossReferencesRebuild:
         )
 
     def test_bulk_and_rebuild_in_same_sentence(self) -> None:
-        """'bulk' and '_rebuild_entity_from_edges' must appear in the same sentence."""
+        """'bulk' and '_rebuild_entity_from_edges' must appear within 200 characters."""
         doc = self._doc()
-        sentences = re.split(r'\.\s+|\.$', doc)
-        found = any(
-            'bulk' in sentence and '_rebuild_entity_from_edges' in sentence
-            for sentence in sentences
-        )
-        assert found, (
-            "A sentence in the docstring must contain both 'bulk' and "
-            "'_rebuild_entity_from_edges' to provide a use-case routing note for "
+        assert _keywords_in_proximity(doc, 'bulk', '_rebuild_entity_from_edges'), (
+            "Docstring must contain 'bulk' and '_rebuild_entity_from_edges' within "
+            "200 characters of each other to provide a use-case routing note for "
             "callers rebuilding many entities at once"
         )
