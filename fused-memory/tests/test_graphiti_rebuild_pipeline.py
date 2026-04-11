@@ -834,22 +834,6 @@ class TestCanonicalFactsCallerCoverage:
             'edges must be filtered by _canonical_facts before joining.'
         )
 
-        # Invariant assertions — guard different failure modes of the same regression:
-        # a future bug that returned 'Alice knows Bob\n  ' or '\n\nAlice knows Bob'
-        # would still be caught.
-        assert '\n' not in result['new_summary'], (
-            'Single valid fact must produce a single-line summary with no newlines.'
-        )
-        assert '   ' not in result['new_summary'], (
-            'Triple-space whitespace fact must not leak into the written summary.'
-        )
-        assert '\t' not in result['new_summary'], (
-            'Tab whitespace fact must not leak into the written summary.'
-        )
-        assert all(
-            line.strip() for line in result['new_summary'].split('\n') if line
-        ), 'Every non-empty line must have real non-whitespace content.'
-
         # update_node_summary was called with the clean summary
         backend.update_node_summary.assert_awaited_once_with(
             'uuid-1', 'Alice knows Bob', group_id='test'
