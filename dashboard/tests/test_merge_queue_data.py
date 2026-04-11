@@ -334,19 +334,30 @@ class TestQueueDepthTimeseries:
 
     @pytest.mark.asyncio
     async def test_all_window_is_bounded(self, empty_merge_events_conn):
-        """87600h window (window=all) produces ~3651 daily buckets — not 350k."""
+        """87600h window (window=all) produces exactly 3651 daily buckets — not 350k.
+
+        The exact count is deterministic given the fixed ``now`` value:
+        - now_aligned   = 2026-04-11T00:00:00 UTC
+        - cutoff_aligned = 2016-04-14T00:00:00 UTC  (floor of now − 87600 h)
+        - diff = 3650 days → 3650 + 1 = 3651 buckets
+        """
         now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
         result = await queue_depth_timeseries(empty_merge_events_conn, hours=87600, now=now)
 
         labels = result['labels']
-        assert len(labels) >= 3650, f"Expected ≥3650 buckets, got {len(labels)}"
-        assert len(labels) <= 4000, f"Expected ≤4000 buckets, got {len(labels)} (regression guard)"
+        assert len(labels) == 3651, (
+            f"Expected exactly 3651 daily buckets, got {len(labels)} "
+            f"(regression guard against the 350 401-bucket blowup)"
+        )
 
-        # Consecutive labels must be exactly 1 day apart
-        for i in range(1, min(len(labels), 10)):  # spot-check first 10 gaps
+        # ALL consecutive labels must be exactly 1 day apart (UTC, no DST drift)
+        for i in range(1, len(labels)):
             prev = datetime.fromisoformat(labels[i - 1])
             curr = datetime.fromisoformat(labels[i])
-            assert curr - prev == timedelta(days=1)
+            assert curr - prev == timedelta(days=1), (
+                f"Gap at index {i}: {prev.isoformat()} → {curr.isoformat()} "
+                f"is not exactly 1 day"
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -31,6 +32,17 @@ logger = logging.getLogger(__name__)
 
 _CANONICAL_OUTCOMES = ['done', 'conflict', 'blocked', 'already_merged']
 
+# ---------------------------------------------------------------------------
+# Adaptive bucket ladder: (max_hours | None, bucket_minutes)
+# None as max_hours means "catch-all / no upper bound".
+# ---------------------------------------------------------------------------
+BUCKET_LADDER: tuple[tuple[int | None, int], ...] = (
+    (24, 15),      # ≤ 24 h  → 15-min buckets  (≤  97 pts)
+    (168, 60),     # ≤  7 d  → 60-min buckets  (≤ 169 pts)
+    (720, 360),    # ≤ 30 d  →  6-h  buckets   (≤ 121 pts)
+    (None, 1440),  # > 30 d  →  1-d  buckets   (≤ 3 651 pts, covers all=87 600 h)
+)
+
 
 def _cutoff_iso(hours: int) -> str:
     """Return ISO-format cutoff datetime for the given look-back window (hours)."""
@@ -40,19 +52,20 @@ def _cutoff_iso(hours: int) -> str:
 def _bucket_minutes_for_window(hours: int) -> int:
     """Return the adaptive bucket width in minutes for the given window length.
 
-    Ladder:
+    Iterates ``BUCKET_LADDER`` and returns the bucket width for the first tier
+    whose ``max_hours`` bound is not exceeded.  The ladder's final entry has
+    ``max_hours=None`` (catch-all), so this function always returns a value.
+
+    Ladder (from ``BUCKET_LADDER``):
       <=  24 h → 15 min  (≤ 97 buckets)
       <= 168 h → 60 min  (≤ 169 buckets)
       <= 720 h → 360 min (≤ 121 buckets)
       >  720 h → 1440 min (≤ 3 651 buckets, covers window=all / 87 600 h)
     """
-    if hours <= 24:
-        return 15
-    if hours <= 168:
-        return 60
-    if hours <= 720:
-        return 360
-    return 1440
+    for max_hours, bucket_min in BUCKET_LADDER:
+        if max_hours is None or hours <= max_hours:
+            return bucket_min
+    return 1440  # unreachable — BUCKET_LADDER always ends with (None, ...)
 
 
 def _align_bucket(t: datetime, bucket_min: int) -> datetime:
@@ -60,6 +73,11 @@ def _align_bucket(t: datetime, bucket_min: int) -> datetime:
 
     Uses 1970-01-01 00:00 UTC as the epoch, which naturally aligns on hour
     and day boundaries for all four supported bucket widths (15/60/360/1440).
+
+    Uses ``math.floor`` (not ``int``) so that pre-epoch timestamps (negative
+    total_seconds) are floored correctly rather than truncated toward zero.
+    In practice merge events are always post-epoch, but the implementation is
+    correct for all inputs.
 
     Args:
         t: A timezone-aware datetime (UTC assumed if no tzinfo).
@@ -72,7 +90,7 @@ def _align_bucket(t: datetime, bucket_min: int) -> datetime:
     if t.tzinfo is None:
         t = t.replace(tzinfo=UTC)
     bucket_sec = bucket_min * 60
-    total_sec = int((t - epoch).total_seconds())
+    total_sec = math.floor((t - epoch).total_seconds())
     aligned_sec = (total_sec // bucket_sec) * bucket_sec
     return epoch + timedelta(seconds=aligned_sec)
 

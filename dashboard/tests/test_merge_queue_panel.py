@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
@@ -343,3 +344,59 @@ class TestMergeQueueWindowAll:
         bm = _bucket_minutes_for_window(87600)
         N = (87600 * 60 // bm) + 1
         assert N < 10_000, f"_bucket_minutes_for_window(87600) yields {N} points — regression!"
+
+    def test_window_all_real_aggregator_bounded_response(self, client, tmp_path):
+        """Integration: real aggregate_queue_depth_timeseries with a real empty DB.
+
+        Does NOT mock the depth aggregator — the real code path runs and must
+        return quickly.  Regression guard: the old hard-coded 15-min bucket
+        would allocate 350 401 buckets in-memory even for an empty DB, causing
+        this test to timeout or OOM; the adaptive ladder allocates ~3 651.
+
+        Only the four non-depth aggregators are mocked so the test does not
+        need to populate their respective data.  All five aggregators share the
+        same ``events`` table, so with the proper schema they would also work
+        on the empty DB — but mocking them keeps the test focused on the
+        depth-aggregator regression.
+        """
+        from dashboard.config import DashboardConfig
+
+        _EVENTS_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    task_id TEXT,
+    event_type TEXT NOT NULL,
+    phase TEXT,
+    role TEXT,
+    data TEXT DEFAULT '{}',
+    cost_usd REAL,
+    duration_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp);
+"""
+
+        # Create a real empty runs.db with the events schema.
+        runs_db = tmp_path / 'data' / 'orchestrator' / 'runs.db'
+        runs_db.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(runs_db))
+        conn.executescript(_EVENTS_SCHEMA)
+        conn.commit()
+        conn.close()
+
+        # Point the app at our temp project root so _cost_dbs opens the real DB.
+        test_config = DashboardConfig(project_root=tmp_path)
+
+        with patch.object(client.app.state, 'config', test_config), \
+             patch('dashboard.app.aggregate_outcome_distribution',
+                   new_callable=AsyncMock, return_value=MOCK_OUTCOMES), \
+             patch('dashboard.app.aggregate_latency_stats',
+                   new_callable=AsyncMock, return_value=MOCK_LATENCY), \
+             patch('dashboard.app.aggregate_recent_merges',
+                   new_callable=AsyncMock, return_value=MOCK_RECENT), \
+             patch('dashboard.app.aggregate_speculative_stats',
+                   new_callable=AsyncMock, return_value=MOCK_SPEC):
+            resp = client.get('/partials/merge-queue?window=all')
+
+        assert resp.status_code == 200
