@@ -393,7 +393,7 @@ class TestCollectSnapshot:
             await collect_snapshot(conn, config)
 
         async with conn.execute('SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
-                                (str(reify_root.resolve()),)) as cur:
+                                (str(reify_root),)) as cur:
             row = await cur.fetchone()
             assert row is not None
             count = row[0]
