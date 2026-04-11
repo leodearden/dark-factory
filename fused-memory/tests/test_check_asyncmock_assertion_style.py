@@ -99,3 +99,46 @@ def func_b():
 '''
         violations = find_violations(source, 'test_module_scoped.py')
         assert violations == []
+
+
+class TestFindViolationsNestedFunctions:
+    """Inner function assertions must not leak into the outer function's tally."""
+
+    def test_inner_assert_not_awaited_does_not_pollute_outer_scope(self):
+        """Outer has assert_not_called only; inner nested has assert_not_awaited only — no violation."""
+        source = '''\
+async def outer():
+    mock.a.assert_not_called()
+
+    async def inner():
+        mock.b.assert_not_awaited()
+'''
+        violations = find_violations(source, 'test_nested.py')
+        assert violations == []
+
+    def test_inner_assert_not_called_does_not_pollute_outer_scope(self):
+        """Outer has assert_not_awaited only; inner nested has assert_not_called only — no violation."""
+        source = '''\
+async def outer():
+    mock.a.assert_not_awaited()
+
+    async def inner():
+        mock.b.assert_not_called()
+'''
+        violations = find_violations(source, 'test_nested_flip.py')
+        assert violations == []
+
+    def test_nested_function_itself_can_violate(self):
+        """Inner function mixing both styles produces a violation scoped to the inner function."""
+        source = '''\
+def outer():
+    mock.a.assert_not_awaited()
+
+    def inner():
+        mock.b.assert_not_called()
+        mock.c.assert_not_awaited()
+'''
+        violations = find_violations(source, 'test_inner_violation.py')
+        # inner() mixes both styles; outer() only has assert_not_awaited — outer is clean
+        assert len(violations) == 1
+        assert violations[0].lineno == 5  # assert_not_called in inner()
