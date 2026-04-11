@@ -87,21 +87,26 @@ async def queue_depth_timeseries(
     hours: int = 24,
     now: datetime | None = None,
 ) -> ChartData:
-    """Approximate merge queue throughput as 15-min bucket counts.
+    """Approximate merge queue throughput as adaptive-width bucket counts.
 
     Returns ChartData with ISO bucket-start labels and integer counts.
-    Buckets span ``[floor(now - hours, 15min), floor(now, 15min)]`` inclusive,
-    so for a 24h window this typically produces ``hours * 4 + 1 = 97`` buckets.
-    The current 15-min bucket (containing events up to ~15 minutes old) is
-    always included.
+    Bucket width is chosen adaptively via ``_bucket_minutes_for_window`` so
+    the point count stays manageable for all window sizes:
+
+    * ``hours ≤ 24``  → 15-min buckets  (≤ 97 points)
+    * ``hours ≤ 168`` → 60-min buckets  (≤ 169 points)
+    * ``hours ≤ 720`` → 360-min buckets (≤ 121 points)
+    * ``hours > 720`` → 1440-min buckets (≤ 3 651 points, covers window=all)
+
+    Buckets span ``[_align_bucket(now - hours, bm), _align_bucket(now, bm)]``
+    inclusive.  The current bucket is always included.
 
     Args:
         db: aiosqlite connection, or None (returns empty ChartData).
         hours: Look-back window in hours (default 24).
         now: Reference timestamp for bucket alignment.  When None (the default),
             ``datetime.now(UTC)`` is used.  Pass an explicit value in tests to
-            get deterministic bucket counts and eliminate minute-boundary
-            flakiness.
+            get deterministic bucket counts and eliminate boundary flakiness.
     """
     if db is None:
         return {'labels': [], 'values': []}
@@ -110,24 +115,17 @@ async def queue_depth_timeseries(
         effective_now = now if now is not None else datetime.now(UTC)
         cutoff = effective_now - timedelta(hours=hours)
 
-        # Align cutoff to 15-min boundary (floor)
-        cutoff_aligned = cutoff.replace(
-            minute=(cutoff.minute // 15) * 15,
-            second=0,
-            microsecond=0,
-        )
+        # Determine adaptive bucket width for this window
+        bucket_min = _bucket_minutes_for_window(hours)
 
-        # Align effective_now to 15-min boundary (floor) — the current bucket
-        now_aligned = effective_now.replace(
-            minute=(effective_now.minute // 15) * 15,
-            second=0,
-            microsecond=0,
-        )
+        # Align both ends to bucket boundaries using epoch-based flooring
+        cutoff_aligned = _align_bucket(cutoff, bucket_min)
+        now_aligned = _align_bucket(effective_now, bucket_min)
 
         # Generate buckets from cutoff_aligned through now_aligned inclusive
-        num_buckets = int((now_aligned - cutoff_aligned) / timedelta(minutes=15)) + 1
+        num_buckets = int((now_aligned - cutoff_aligned) / timedelta(minutes=bucket_min)) + 1
         buckets = [
-            cutoff_aligned + timedelta(minutes=15 * i)
+            cutoff_aligned + timedelta(minutes=bucket_min * i)
             for i in range(num_buckets)
         ]
 
@@ -146,12 +144,8 @@ async def queue_depth_timeseries(
                 ts = datetime.fromisoformat(ts_str)
                 if ts.tzinfo is None:
                     ts = ts.replace(tzinfo=UTC)
-                # Floor to 15-min bucket
-                bucket = ts.replace(
-                    minute=(ts.minute // 15) * 15,
-                    second=0,
-                    microsecond=0,
-                )
+                # Floor to the adaptive bucket
+                bucket = _align_bucket(ts, bucket_min)
                 key = bucket.isoformat()
                 if key in counts:
                     counts[key] += 1
