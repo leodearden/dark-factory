@@ -253,6 +253,7 @@ def _make_steward(*, config_overrides=None, suggestion_count=15):
     config.project_root = Path('/tmp/project')
     config.steward_lifetime_budget = 12.0
     config.steward_max_attempts = 3
+    config.steward_max_timeouts_per_escalation = 3
     config.suggestion_triage_threshold = 10
     config.models.triage = 'sonnet'
     config.budgets.triage = 2.0

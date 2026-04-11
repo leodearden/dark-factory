@@ -18,8 +18,10 @@ class TestTopLevelImports:
             SessionBudgetExhausted,
             UsageCapConfig,
             UsageGate,
+            files_to_modules,
             invoke_claude_agent,
             invoke_with_cap_retry,
+            normalize_lock,
         )
 
         assert AgentResult is not None
@@ -31,6 +33,8 @@ class TestTopLevelImports:
         assert AccountConfig is not None
         assert UsageCapConfig is not None
         assert CostStore is not None
+        assert normalize_lock is not None
+        assert files_to_modules is not None
         assert AllAccountsCappedException is not None
 
 
@@ -80,13 +84,26 @@ class TestModuleLevelAll:
         assert hasattr(async_sqlite_base, '__all__'), 'async_sqlite_base must define __all__'
         assert set(async_sqlite_base.__all__) == {'apply_wal_pragmas', 'AsyncSqliteBase'}
 
+    def test_locking_all(self):
+        from shared import locking
+
+        assert hasattr(locking, '__all__'), 'locking must define __all__'
+        assert set(locking.__all__) == {'normalize_lock', 'files_to_modules'}
+
 
 class TestInitAllCompleteness:
     """Verify that shared.__all__ covers the union of all module __all__ entries."""
 
     def test_init_all_covers_all_module_symbols(self):
         import shared
-        from shared import async_sqlite_base, cli_invoke, config_models, cost_store, usage_gate
+        from shared import (
+            async_sqlite_base,
+            cli_invoke,
+            config_models,
+            cost_store,
+            locking,
+            usage_gate,
+        )
 
         union = (
             set(cli_invoke.__all__)
@@ -94,6 +111,7 @@ class TestInitAllCompleteness:
             | set(config_models.__all__)
             | set(cost_store.__all__)
             | set(async_sqlite_base.__all__)
+            | set(locking.__all__)
         )
         assert set(shared.__all__) == union, (
             f'shared.__all__ must equal union of submodule __all__.\n'
@@ -103,7 +121,14 @@ class TestInitAllCompleteness:
 
     def test_no_private_symbols_in_any_all(self):
         import shared
-        from shared import async_sqlite_base, cli_invoke, config_models, cost_store, usage_gate
+        from shared import (
+            async_sqlite_base,
+            cli_invoke,
+            config_models,
+            cost_store,
+            locking,
+            usage_gate,
+        )
 
         for module, name in [
             (shared, 'shared'),
@@ -112,6 +137,7 @@ class TestInitAllCompleteness:
             (config_models, 'config_models'),
             (cost_store, 'cost_store'),
             (async_sqlite_base, 'async_sqlite_base'),
+            (locking, 'locking'),
         ]:
             private = [s for s in module.__all__ if s.startswith('_')]
             assert private == [], (
