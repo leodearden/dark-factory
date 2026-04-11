@@ -37,6 +37,7 @@ from fused_memory.models.scope import Scope
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services.durable_queue import DurableWriteQueue
+from fused_memory.utils.async_utils import propagate_cancellations
 
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -997,14 +998,20 @@ class MemoryService:
             return_exceptions=True,
         )
 
-        # Log all failures then re-raise the first exception found.
+        # Two-tier check for asyncio.gather(return_exceptions=True) results.
         # Both coroutines have already settled at this point (no orphans).
-        # Two-tier check:
-        #   Detection guard: isinstance(r, BaseException) — catches CancelledError /
-        #     KeyboardInterrupt / SystemExit that gather() captured as values.
-        #   Logging guard:   isinstance(r, Exception) — log only application errors,
-        #     not cancellation signals (CancelledError should not appear in logs).
-        first_exc = next((r for r in results if isinstance(r, BaseException)), None)
+        #
+        # Pass 1: propagate_cancellations handles structured-cancellation signals
+        #   (CancelledError, KeyboardInterrupt, SystemExit) before any per-call logging.
+        #   Cancellation takes precedence over application-level failures regardless
+        #   of position in the results list.
+        #   See fused_memory.utils.async_utils.propagate_cancellations for the shared
+        #   Pass 1 guard contract.
+        #
+        # Pass 2: log each captured Exception and raise the first — these are
+        #   application-level failures from the Graphiti backend.
+        propagate_cancellations(results)
+        first_exc = next((r for r in results if isinstance(r, Exception)), None)
         if first_exc is not None:
             for r in results:
                 if isinstance(r, Exception):
