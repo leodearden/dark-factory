@@ -46,7 +46,7 @@ HARDCODED_EXPECTED_ENV_LINE = (
 #   sed 's|__UV_PATH__|$UV_PATH|g'       (global, unanchored, literal substitution)
 # Both sentinels contain no regex metacharacters and no '|', so str.replace is
 # semantically identical to the sed command.
-HARDCODED_REPO_ROOT = "/home/leo/src/dark-factory"
+HARDCODED_SERVICE_REPO_ROOT = "/home/leo/src/dark-factory"
 HARDCODED_UV_PATH = "/home/leo/.local/bin/uv"
 
 
@@ -253,7 +253,7 @@ def test_template_renders_to_hardcoded_file() -> None:
     byte-for-byte.
 
     Substitution semantics (mirroring setup-host.sh):
-        sed 's|__REPO_ROOT__|$REPO_ROOT|g'  →  str.replace('__REPO_ROOT__', HARDCODED_REPO_ROOT)
+        sed 's|__REPO_ROOT__|$REPO_ROOT|g'  →  str.replace('__REPO_ROOT__', HARDCODED_SERVICE_REPO_ROOT)
         sed 's|__UV_PATH__|$UV_PATH|g'      →  str.replace('__UV_PATH__', HARDCODED_UV_PATH)
 
     Both sentinels contain no regex metacharacters and no '|', so str.replace is
@@ -265,7 +265,7 @@ def test_template_renders_to_hardcoded_file() -> None:
     """
     rendered = (
         TEMPLATE.read_text(encoding="utf-8")
-        .replace("__REPO_ROOT__", HARDCODED_REPO_ROOT)
+        .replace("__REPO_ROOT__", HARDCODED_SERVICE_REPO_ROOT)
         .replace("__UV_PATH__", HARDCODED_UV_PATH)
     )
     hardcoded = HARDCODED.read_text(encoding="utf-8")
