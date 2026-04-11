@@ -1,6 +1,7 @@
 """Tests for git operations — worktree lifecycle."""
 
 import asyncio
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,6 +27,43 @@ async def _setup_repo(repo: Path):
     (repo / 'README.md').write_text('# Test\n')
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+async def _inject_uu_state(cwd: Path, path: str, tag: str = '') -> None:
+    """Inject unmerged (stage 1/2/3) index entries for *path* via index surgery.
+
+    Uses ``git hash-object -w --stdin`` to write three blob objects and
+    ``git update-index --index-info`` to register them at stages 1, 2, 3.
+    The resulting UU entry is detectable by ``_detect_unmerged_paths`` without
+    creating an actual conflicting merge commit or setting MERGE_HEAD.
+
+    *tag* is interpolated into the blob content so that multiple calls in the
+    same repository produce distinct shas even for different paths.
+    """
+    def _run_sync(cmd, **kwargs):
+        return subprocess.run(
+            cmd, cwd=str(cwd), capture_output=True, **kwargs,
+        )
+
+    h1 = _run_sync(
+        ['git', 'hash-object', '-w', '--stdin'],
+        input=f'version base{tag}\n'.encode(),
+    ).stdout.decode().strip()
+    h2 = _run_sync(
+        ['git', 'hash-object', '-w', '--stdin'],
+        input=f'version ours{tag}\n'.encode(),
+    ).stdout.decode().strip()
+    h3 = _run_sync(
+        ['git', 'hash-object', '-w', '--stdin'],
+        input=f'version theirs{tag}\n'.encode(),
+    ).stdout.decode().strip()
+
+    index_info = (
+        f'100644 {h1} 1\t{path}\n'
+        f'100644 {h2} 2\t{path}\n'
+        f'100644 {h3} 3\t{path}\n'
+    )
+    _run_sync(['git', 'update-index', '--index-info'], input=index_info.encode())
 
 
 @pytest.fixture
