@@ -280,10 +280,11 @@ class TestHooksIntegration:
         `python3.11`, and absolute paths like `/usr/bin/python3` or `/usr/bin/env python3`,
         while rejecting bare `python` (Python 2) or `mypython3` (word-boundary failure).
 
-        The `not line.lstrip().startswith('#')` filter excludes bash-style comment lines that
-        happen to mention the script name (e.g. `# See check_asyncmock_assertion_style.py`).
-        Without it, such a comment line would be included in invocation_lines and then fail
-        the python3/no-uv-run assertions, producing a spurious test failure on a benign edit.
+        The filter checks `'check_asyncmock_assertion_style.py' in line.split('#')[0]` so that
+        the script name must appear in the non-comment portion of the line. This excludes both
+        full-line bash comments (`# See check_asyncmock_assertion_style.py`) and inline comments
+        (`echo ok # run check_asyncmock_assertion_style.py`). Without this, either comment form
+        would land in invocation_lines and fail the python3/no-uv-run assertions on a benign edit.
 
         The `fused-memory/tests` scan-target assertion is applied at file level (not per line)
         so a future shell-variable refactor like `TESTS_DIR=fused-memory/tests; python3 .../check.py
@@ -294,8 +295,7 @@ class TestHooksIntegration:
         content = hooks_path.read_text(encoding='utf-8')
         invocation_lines = [
             line for line in content.splitlines()
-            if 'check_asyncmock_assertion_style.py' in line
-            and not line.lstrip().startswith('#')
+            if 'check_asyncmock_assertion_style.py' in line.split('#')[0]
         ]
         assert invocation_lines, 'No invocation of check_asyncmock_assertion_style.py found in hooks/project-checks'
         assert 'fused-memory/tests' in content, (
