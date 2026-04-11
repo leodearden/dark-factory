@@ -49,6 +49,7 @@ class StewardMetrics:
     total_duration_ms: int = 0
     escalations_handled: int = 0
     escalations_reescalated: int = 0
+    timeouts_recovered: int = 0
 
 
 class TaskSteward:
