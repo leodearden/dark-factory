@@ -1799,3 +1799,9 @@ class TestExtractSectionHelper:
         payload = '### Start\nbody line\n### Next\nother'
         result = _extract_section(payload, '### Start')
         assert result == '### Start\nbody line'
+
+    def test_extracts_empty_section_for_adjacent_headers(self):
+        """Adjacent headers with no body between them yield the header text only."""
+        payload = '### Empty\n### Next\nbody'
+        result = _extract_section(payload, '### Empty')
+        assert result == '### Empty'
