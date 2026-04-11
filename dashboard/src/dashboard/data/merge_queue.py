@@ -25,7 +25,7 @@ import aiosqlite
 
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.db import with_db
-from dashboard.data.performance import _percentile
+from dashboard.data.stats_utils import percentile
 
 logger = logging.getLogger(__name__)
 
@@ -45,20 +45,30 @@ async def queue_depth_timeseries(
     db: aiosqlite.Connection | None,
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> ChartData:
     """Approximate merge queue throughput as 15-min bucket counts.
 
     Returns ChartData with ISO bucket-start labels and integer counts.
-    For a 24h window, this produces exactly ``hours * 4 = 96`` buckets.
-    Buckets are aligned to 15-min boundaries starting from
-    ``floor(now - hours, 15min)``.
+    Buckets span ``[floor(now - hours, 15min), floor(now, 15min)]`` inclusive,
+    so for a 24h window this typically produces ``hours * 4 + 1 = 97`` buckets.
+    The current 15-min bucket (containing events up to ~15 minutes old) is
+    always included.
+
+    Args:
+        db: aiosqlite connection, or None (returns empty ChartData).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp for bucket alignment.  When None (the default),
+            ``datetime.now(UTC)`` is used.  Pass an explicit value in tests to
+            get deterministic bucket counts and eliminate minute-boundary
+            flakiness.
     """
     if db is None:
         return {'labels': [], 'values': []}
 
     async def _query(conn: aiosqlite.Connection) -> ChartData:
-        now = datetime.now(UTC)
-        cutoff = now - timedelta(hours=hours)
+        effective_now = now if now is not None else datetime.now(UTC)
+        cutoff = effective_now - timedelta(hours=hours)
 
         # Align cutoff to 15-min boundary (floor)
         cutoff_aligned = cutoff.replace(
@@ -67,10 +77,18 @@ async def queue_depth_timeseries(
             microsecond=0,
         )
 
-        # Generate exactly hours*4 buckets
+        # Align effective_now to 15-min boundary (floor) — the current bucket
+        now_aligned = effective_now.replace(
+            minute=(effective_now.minute // 15) * 15,
+            second=0,
+            microsecond=0,
+        )
+
+        # Generate buckets from cutoff_aligned through now_aligned inclusive
+        num_buckets = int((now_aligned - cutoff_aligned) / timedelta(minutes=15)) + 1
         buckets = [
             cutoff_aligned + timedelta(minutes=15 * i)
-            for i in range(hours * 4)
+            for i in range(num_buckets)
         ]
 
         # Fetch all merge_attempt events in the window
@@ -195,9 +213,9 @@ def _compute_latency_stats(durations: list[float]) -> dict:
     if not durations:
         return {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
     return {
-        'p50': round(_percentile(durations, 50)),
-        'p95': round(_percentile(durations, 95)),
-        'p99': round(_percentile(durations, 99)),
+        'p50': round(percentile(durations, 50)),
+        'p95': round(percentile(durations, 95)),
+        'p99': round(percentile(durations, 99)),
         'count': len(durations),
         'mean_ms': sum(durations) / len(durations),
     }
@@ -314,13 +332,27 @@ async def aggregate_queue_depth_timeseries(
     dbs: list[aiosqlite.Connection | None],
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> ChartData:
     """Aggregate queue depth timeseries across multiple project DBs.
 
     Counts per bucket are summed across all DBs.
+
+    Args:
+        dbs: List of aiosqlite connections (None entries are tolerated).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp captured **once** for the entire aggregation
+            call and threaded into every per-DB ``queue_depth_timeseries``
+            query.  When None (the default), ``datetime.now(UTC)`` is resolved
+            here so that all concurrent per-DB coroutines share the same
+            alignment — eliminating the race where concurrent calls to
+            ``datetime.now(UTC)`` inside each per-DB ``_query`` could straddle
+            a 15-min boundary and produce divergent label sets.  Pass an
+            explicit value in tests for full determinism.
     """
+    effective_now = now if now is not None else datetime.now(UTC)
     results = await asyncio.gather(
-        *[queue_depth_timeseries(db, hours=hours) for db in dbs],
+        *[queue_depth_timeseries(db, hours=hours, now=effective_now) for db in dbs],
         return_exceptions=True,
     )
 

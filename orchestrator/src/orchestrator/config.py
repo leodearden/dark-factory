@@ -162,14 +162,23 @@ class EffortConfig(BaseModel):
 
 
 class TimeoutsConfig(BaseModel):
-    """Wall-clock timeout (seconds) per agent role."""
+    """Wall-clock timeout (seconds) per agent role.
+
+    Note: ``steward`` here is the *per-invocation* wall-clock limit for a
+    single ``invoke_agent`` call.  It is intentionally decoupled from
+    ``OrchestratorConfig.steward_completion_timeout``, which is the workflow
+    grace period that controls how long the workflow waits for the steward to
+    drain the escalation queue after task completion.  Keep ``steward`` ≥
+    ``steward_completion_timeout`` so individual invocations are not silently
+    cut short inside the grace window.
+    """
 
     architect: float = Field(default=2400.0)
     implementer: float = Field(default=1200.0)
     debugger: float = Field(default=1200.0)
     reviewer: float = Field(default=600.0)
     merger: float = Field(default=600.0)
-    steward: float = Field(default=900.0)
+    steward: float = Field(default=1800.0)
     triage: float = Field(default=300.0)
     module_tagger: float = Field(default=300.0)
     deep_reviewer: float = Field(default=2400.0)
@@ -338,7 +347,7 @@ class OrchestratorConfig(BaseSettings):
 
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)
-    steward_max_retries: int = Field(default=1)
+    steward_max_attempts: int = Field(default=1)
     steward_completion_timeout: float = Field(default=900.0)
 
     # Pre-triage threshold for review suggestions

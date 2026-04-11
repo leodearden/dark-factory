@@ -27,9 +27,15 @@ logger = logging.getLogger(__name__)
 class StaleSummaryResult(NamedTuple):
     """Structured return type for _detect_stale_summaries_with_edges.
 
-    Inherits from tuple for full backward-compatibility: callers using
-    ``stale, all_edges, total = await self._detect_stale_summaries_with_edges(...)``
-    continue to work unchanged.
+    Use named attribute access — the canonical idiom after Task 438/465:
+
+    - ``result.stale`` — list of stale entity dicts (each has uuid, name, summary, etc.)
+    - ``result.all_edges`` — dict[uuid, list[dict]] of valid edges for every scanned entity
+    - ``result.total_count`` — total number of entity nodes scanned
+
+    Because StaleSummaryResult is a NamedTuple (a tuple subclass), positional
+    unpacking still works at runtime, but named access is the preferred idiom
+    across the codebase.
     """
 
     stale: list[dict]
@@ -1344,8 +1350,8 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
         """
-        client = self._require_client()
-        graph = cast(Any, client.driver)._get_graph(graph_name)
+        driver = self._require_driver()
+        graph: Any = driver._get_graph(graph_name)
         result = await graph.ro_query('MATCH (n) RETURN count(n) as count')
         return result.result_set[0][0] if result.result_set else 0
 

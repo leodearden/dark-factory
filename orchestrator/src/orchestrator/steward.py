@@ -9,7 +9,7 @@ Lifecycle:
 - Started lazily on first escalation (not at workflow start).
 - Each escalation either resumes the existing session or creates a fresh one.
 - Budget-capped at $12 lifetime; auto-re-escalates to level-1 on exhaustion.
-- Retries each escalation up to 1 attempt before re-escalating to level-1.
+- Each escalation gets up to steward_max_attempts total attempts (default 1) before re-escalating to level-1.
 - Stopped by the workflow after task completion + grace period.
 """
 
@@ -49,6 +49,7 @@ class StewardMetrics:
     total_duration_ms: int = 0
     escalations_handled: int = 0
     escalations_reescalated: int = 0
+    timeouts_recovered: int = 0
 
 
 class TaskSteward:
@@ -218,10 +219,10 @@ class TaskSteward:
 
         # Guard: per-escalation retry limit
         retry_count = self._retry_counts.get(escalation.id, 0)
-        if retry_count >= self.config.steward_max_retries:
+        if retry_count >= self.config.steward_max_attempts:
             self._auto_escalate_to_human(
                 escalation,
-                f'Failed after {retry_count} attempts: {escalation.summary}',
+                f'Failed after {retry_count} attempt{"s" if retry_count != 1 else ""}: {escalation.summary}',
             )
             return
 
@@ -304,6 +305,18 @@ class TaskSteward:
                 },
             )
 
+        # Timeout-kill: treat as recoverable — do NOT consume retry budget.
+        # The escalation remains pending so the run loop re-queues it naturally.
+        if _is_timeout_kill(result):
+            self.metrics.timeouts_recovered += 1
+            logger.warning(
+                f'Steward for task {self.task_id}: invocation timed out after '
+                f'{self.config.timeouts.steward:.0f}s — treating as recoverable, '
+                f'retry_count NOT incremented (escalation remains pending: '
+                f'{escalation.id})'
+            )
+            return
+
         # Patch resolution metadata
         self._patch_resolution_metadata(escalation.id, result)
 
@@ -314,7 +327,7 @@ class TaskSteward:
             logger.warning(
                 f'Steward for task {self.task_id}: escalation {escalation.id} '
                 f'still pending (attempt {retry_count + 1}/'
-                f'{self.config.steward_max_retries})'
+                f'{self.config.steward_max_attempts})'
             )
         else:
             self.metrics.escalations_handled += 1
@@ -564,3 +577,26 @@ def _strip_hash_prefix(detail: str) -> str:
     if detail.startswith('#hash:') and '#' in detail[6:]:
         return detail[detail.index('#', 6) + 1:]
     return detail
+
+
+def _is_timeout_kill(result) -> bool:
+    """Return True when *result* represents a process killed by a wall-clock timeout.
+
+    Matches stderr patterns emitted by both subprocess paths:
+    - ``shared/src/shared/cli_invoke.py`` (SIGTERM+SIGKILL / SIGTERM)
+    - ``orchestrator/src/orchestrator/agents/invoke.py`` (codex/gemini local)
+
+    Examples::
+
+        'Process killed after 900.0s timeout (SIGTERM+SIGKILL)'
+        'Process terminated after 900.0s timeout (SIGTERM); stream closed'
+        'Process killed after 900.0s timeout'
+    """
+    if result.success:
+        return False
+    stderr = result.stderr or ''
+    has_marker = (
+        'Process killed after' in stderr
+        or 'Process terminated after' in stderr
+    )
+    return has_marker and 'timeout' in stderr

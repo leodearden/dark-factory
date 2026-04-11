@@ -1,6 +1,7 @@
 """Tests for git operations — worktree lifecycle."""
 
 import asyncio
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,6 +27,43 @@ async def _setup_repo(repo: Path):
     (repo / 'README.md').write_text('# Test\n')
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+async def _inject_uu_state(cwd: Path, path: str, tag: str = '') -> None:
+    """Inject unmerged (stage 1/2/3) index entries for *path* via index surgery.
+
+    Uses ``git hash-object -w --stdin`` to write three blob objects and
+    ``git update-index --index-info`` to register them at stages 1, 2, 3.
+    The resulting UU entry is detectable by ``_detect_unmerged_paths`` without
+    creating an actual conflicting merge commit or setting MERGE_HEAD.
+
+    *tag* is interpolated into the blob content so that multiple calls in the
+    same repository produce distinct shas even for different paths.
+    """
+    def _run_sync(cmd, **kwargs):
+        return subprocess.run(
+            cmd, cwd=str(cwd), capture_output=True, check=True, **kwargs,
+        )
+
+    h1 = _run_sync(
+        ['git', 'hash-object', '-w', '--stdin'],
+        input=f'version base{tag}\n'.encode(),
+    ).stdout.decode().strip()
+    h2 = _run_sync(
+        ['git', 'hash-object', '-w', '--stdin'],
+        input=f'version ours{tag}\n'.encode(),
+    ).stdout.decode().strip()
+    h3 = _run_sync(
+        ['git', 'hash-object', '-w', '--stdin'],
+        input=f'version theirs{tag}\n'.encode(),
+    ).stdout.decode().strip()
+
+    index_info = (
+        f'100644 {h1} 1\t{path}\n'
+        f'100644 {h2} 2\t{path}\n'
+        f'100644 {h3} 3\t{path}\n'
+    )
+    _run_sync(['git', 'update-index', '--index-info'], input=index_info.encode())
 
 
 @pytest.fixture
@@ -817,8 +855,6 @@ class TestWorkingTreeSync:
 
         No stash must be created and main ref must not advance.
         """
-        import subprocess
-
         # Step 1: prepare a valid merge commit via a clean worktree
         wt = await git_ops.create_worktree('uu-guard-advance')
         (wt.path / 'new_feature.py').write_text('feature = True\n')
@@ -838,27 +874,7 @@ class TestWorkingTreeSync:
 
         # Step 2: inject unmerged (stage 1/2/3) entries into the index without
         # doing an actual merge commit or setting MERGE_HEAD.
-        def _run_sync(cmd, **kwargs):
-            return subprocess.run(
-                cmd, cwd=str(git_ops.project_root), capture_output=True, **kwargs,
-            )
-
-        h1 = _run_sync(
-            ['git', 'hash-object', '-w', '--stdin'], input=b'version base\n',
-        ).stdout.decode().strip()
-        h2 = _run_sync(
-            ['git', 'hash-object', '-w', '--stdin'], input=b'version ours\n',
-        ).stdout.decode().strip()
-        h3 = _run_sync(
-            ['git', 'hash-object', '-w', '--stdin'], input=b'version theirs\n',
-        ).stdout.decode().strip()
-
-        index_info = (
-            f'100644 {h1} 1\tuu_conflict_test.py\n'
-            f'100644 {h2} 2\tuu_conflict_test.py\n'
-            f'100644 {h3} 3\tuu_conflict_test.py\n'
-        )
-        _run_sync(['git', 'update-index', '--index-info'], input=index_info.encode())
+        await _inject_uu_state(git_ops.project_root, 'uu_conflict_test.py')
 
         # Verify the UU state is detectable
         unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
@@ -886,19 +902,19 @@ class TestWorkingTreeSync:
     ):
         """advance_main with full speculative-worker call shape returns 'unmerged_state' without stash.
 
+        Uses the full merge_queue.py call shape (branch, expected_main) and dirties
+        README.md so the working-tree protection block is armed.  Without the
+        unmerged-state guard, advance_main would reach the stash block and return
+        'stash_failed' (git stash push fails on a UU index with 'you have unmerged
+        paths') -- the guard must fire first so we see 'unmerged_state' instead,
+        and no stash entry is ever attempted.
+
         Mirrors the real caller in merge_queue.py:265-270:
             result = await self._git_ops.advance_main(
                 merge_result.merge_commit, merge_wt,
                 branch=req.branch, max_attempts=..., expected_main=main_sha,
             )
-
-        Using a real expected_main (current main SHA) so that -- without the guard --
-        the full happy path (update-ref, read-tree, stash-pop) would succeed.
-        Dirties README.md so the stash path is armed; 'stash list unchanged' proves
-        the guard short-circuited before any stash creation.
         """
-        import subprocess
-
         # Step 1: prepare a valid merge commit via a clean worktree
         wt = await git_ops.create_worktree('uu-guard-spec')
         (wt.path / 'new_spec_feature.py').write_text('spec_feature = True\n')
@@ -924,27 +940,7 @@ class TestWorkingTreeSync:
 
         # Step 3: inject unmerged (stage 1/2/3) entries on 'uu_conflict_spec.py'
         # via index surgery -- no real conflicting merge needed.
-        def _run_sync(cmd, **kwargs):
-            return subprocess.run(
-                cmd, cwd=str(git_ops.project_root), capture_output=True, **kwargs,
-            )
-
-        h1 = _run_sync(
-            ['git', 'hash-object', '-w', '--stdin'], input=b'version base spec\n',
-        ).stdout.decode().strip()
-        h2 = _run_sync(
-            ['git', 'hash-object', '-w', '--stdin'], input=b'version ours spec\n',
-        ).stdout.decode().strip()
-        h3 = _run_sync(
-            ['git', 'hash-object', '-w', '--stdin'], input=b'version theirs spec\n',
-        ).stdout.decode().strip()
-
-        index_info = (
-            f'100644 {h1} 1\tuu_conflict_spec.py\n'
-            f'100644 {h2} 2\tuu_conflict_spec.py\n'
-            f'100644 {h3} 3\tuu_conflict_spec.py\n'
-        )
-        _run_sync(['git', 'update-index', '--index-info'], input=index_info.encode())
+        await _inject_uu_state(git_ops.project_root, 'uu_conflict_spec.py', tag=' spec')
 
         # Precondition: confirm injected UU state is detectable
         unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
@@ -954,15 +950,44 @@ class TestWorkingTreeSync:
         # expected_main is the REAL current main SHA -- without the guard the CAS
         # would succeed and the ref would advance.  A passing test therefore certifies
         # the guard fires BEFORE the entire happy path, not just before CAS.
-        result = await git_ops.advance_main(
-            merge_result.merge_commit,
-            merge_result.merge_worktree,
-            branch='uu-guard-spec',
-            expected_main=main_before.strip(),
-        )
+        #
+        # Orthogonal probe: record every _run invocation during advance_main to
+        # assert that git stash push was never attempted (decisive narrowing that
+        # the unmerged-state guard short-circuited the working-tree protection block).
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None, **kwargs):
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await git_ops.advance_main(
+                merge_result.merge_commit,
+                merge_result.merge_worktree,
+                branch='uu-guard-spec',
+                expected_main=main_before.strip(),
+            )
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
         assert result == 'unmerged_state'
+
+        # Decisive narrowing: the guard returned before the working-tree protection
+        # block had any chance to invoke git stash push.
+        assert not any(c[:3] == ['git', 'stash', 'push'] for c in recorded), (
+            f'guard should fire before stash push; recorded stash cmds: '
+            f'{[c for c in recorded if c[:2] == ["git", "stash"]]}'
+        )
+
+        # Positive-path: confirm the unmerged-state guard was actually entered.
+        # _detect_unmerged_paths calls ['git', 'status', '--porcelain']; this
+        # command does not appear in the pre-guard path (ls-tree / merge-base),
+        # so its presence uniquely certifies that the guard ran rather than
+        # short-circuiting for an unrelated reason.
+        assert any(c[:2] == ['git', 'status'] and '--porcelain' in c for c in recorded), (
+            f'expected _detect_unmerged_paths to invoke git status --porcelain '
+            f'(guard path marker); recorded commands: {recorded}'
+        )
 
         # Main ref must NOT have moved
         _, main_after, _ = await _run(
@@ -970,8 +995,9 @@ class TestWorkingTreeSync:
         )
         assert main_before.strip() == main_after.strip()
 
-        # No stash was created -- load-bearing assertion: proves the guard fired
-        # BEFORE the working-tree protection block attempted any stash.
+        # Corroborating: stash list is unchanged (the guard returned before the stash
+        # block, and even if the stash block had been entered it would have failed to
+        # create an entry -- the decisive narrowing is the recording-_run probe above).
         _, stash_after, _ = await _run(
             ['git', 'stash', 'list'], cwd=git_ops.project_root,
         )
@@ -1089,6 +1115,29 @@ class TestUnmergedDetection:
         unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
         assert 'README.md' in unmerged
         assert len(unmerged) >= 1
+
+    async def test_inject_uu_state_helper_creates_unmerged_entries(
+        self, git_ops: GitOps,
+    ):
+        """_inject_uu_state creates detectable UU index entries for the given path."""
+        await _inject_uu_state(git_ops.project_root, 'helper_probe.py')
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert 'helper_probe.py' in unmerged, (
+            f'Expected helper_probe.py in unmerged paths, got: {unmerged}'
+        )
+
+    async def test_inject_uu_state_raises_on_non_git_cwd(
+        self, tmp_path: Path,
+    ):
+        """_inject_uu_state raises CalledProcessError when cwd is not a git repo.
+
+        git hash-object exits with rc != 0 in a non-git directory; without
+        check=True the helper silently builds an invalid payload.  With
+        check=True it raises immediately, turning silent corruption into an
+        actionable CalledProcessError that includes stderr.
+        """
+        with pytest.raises(subprocess.CalledProcessError):
+            await _inject_uu_state(tmp_path, 'foo.py')
 
 
 @pytest.mark.asyncio

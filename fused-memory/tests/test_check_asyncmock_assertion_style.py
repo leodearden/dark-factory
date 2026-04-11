@@ -276,6 +276,43 @@ class TestHooksIntegration:
         assert 'check_asyncmock_assertion_style.py' in content
         assert 'fused-memory/tests' in content
 
+    def test_hook_invokes_check_with_python3_not_uv_run(self):
+        """The asyncmock check must be invoked via plain python3, not wrapped in uv run."""
+        hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
+        content = hooks_path.read_text(encoding='utf-8')
+        invocation_lines = [
+            line for line in content.splitlines()
+            if 'check_asyncmock_assertion_style.py' in line
+        ]
+        assert invocation_lines, 'No invocation of check_asyncmock_assertion_style.py found in hooks/project-checks'
+        for line in invocation_lines:
+            assert 'python3 ' in line, (
+                f'Expected plain python3 invocation, got: {line!r}'
+            )
+            assert 'uv run' not in line, (
+                f'Found uv run in asyncmock check invocation (should use plain python3): {line!r}'
+            )
+
+    def test_hook_has_stdlib_only_rationale_comment(self):
+        """hooks/project-checks must contain a 'stdlib-only' rationale comment near the asyncmock check."""
+        hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
+        content = hooks_path.read_text(encoding='utf-8')
+        assert 'check_asyncmock_assertion_style.py' in content, (
+            'asyncmock check invocation not found in hooks/project-checks'
+        )
+        assert 'stdlib-only' in content.lower(), (
+            "hooks/project-checks must contain a 'stdlib-only' rationale comment "
+            'explaining why the asyncmock check bypasses uv'
+        )
+
+    def test_script_docstring_notes_stdlib_only(self):
+        """check_asyncmock_assertion_style.py module docstring must mention it is stdlib-only."""
+        source = SCRIPT_PATH.read_text(encoding='utf-8')
+        assert 'stdlib-only' in source.lower(), (
+            "check_asyncmock_assertion_style.py docstring must note that the script is "
+            "'stdlib-only' so maintainers know adding a dependency would break the pre-commit fast path"
+        )
+
 
 class TestCliErrorHandling:
     """main() path/read-error handling: fail fast on missing explicit paths,

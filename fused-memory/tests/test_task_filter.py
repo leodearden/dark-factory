@@ -274,7 +274,7 @@ class TestFormatFilteredTaskTree:
         """
         # 500 active tasks with plausible-length titles
         active = [
-            _make_task(i, 'pending', f'This is a moderately long title for task number {i} in the queue')
+            _make_task(i, 'pending', f'Task title {i}')
             for i in range(1, 501)
         ]
         tree = FilteredTaskTree(
@@ -290,9 +290,46 @@ class TestFormatFilteredTaskTree:
         # Output must not exceed max_chars budget (default 50,000)
         assert len(output) <= 50_000
 
+        # Task 51 is beyond the max_tasks=50 cap — must not appear in body
+        assert 'Task title 51' not in output
+
         # Header must contain the max_tasks-cap omission phrase: pins count + intent,
         # tolerates preposition rewording (e.g. 'omitted by' vs 'omitted due to')
         assert re.search(r'450\s+more active.*max_tasks', output)
+
+    def test_char_budget_clamps_below_max_tasks(self):
+        """With few active tasks, max_chars=200 forces the char-budget clamp branch.
+
+        trimmed_count in the truncation notice must reflect only tasks surviving the
+        max_tasks cap (here: all 10), not the full active_tasks list.  With max_tasks=50
+        and 10 active tasks, every task survives the cap, so trimmed_count <= 10.
+        """
+        active = [_make_task(i, 'pending', f'Task title {i}') for i in range(1, 11)]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=10,
+        )
+
+        max_chars = 200
+        output = format_filtered_task_tree(tree, max_tasks=50, max_chars=max_chars)
+
+        # Output must honour the char budget
+        assert len(output) <= max_chars
+
+        # The char-budget clamp branch must have fired — look for the truncation notice
+        match = re.search(r'\.\.\. and (\d+) more active \(truncated for budget\)', output)
+        assert match is not None, f'Expected truncation notice in output: {output!r}'
+        trimmed_count = int(match.group(1))
+
+        # trimmed_count must reflect tasks surviving the max_tasks cap (= 10 here),
+        # not some inflated value tied to the full list.
+        assert trimmed_count <= 10, (
+            f'trimmed_count={trimmed_count} exceeds surviving task count (10); '
+            f'bug: trimmed_count tracks full list instead of post-cap survivors'
+        )
 
     def test_empty_active_and_empty_tree(self):
         """format_filtered_task_tree handles empty FilteredTaskTree gracefully."""
