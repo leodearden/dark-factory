@@ -433,6 +433,31 @@ class TestExtractInlineScript:
         assert 'mergeQueueDepthChart' in body
         assert 'alpine:init' not in body
 
+    def test_raises_assertion_when_no_script_contains_sentinel(self):
+        """AssertionError is raised (with sentinel in message) when no script
+        block carries the mergeQueueDepthChart sentinel.
+
+        Guards against future regressions that silently drop the sentinel from
+        the partial's script or change the canvas id — a clear error message
+        pointing at the missing sentinel is more actionable than a downstream
+        AttributeError on a None return value.
+        """
+        import pytest
+        html = (
+            '<html><head>\n'
+            '<script>\n'
+            "document.addEventListener('alpine:init', () => { console.log('init'); });\n"
+            '</script>\n'
+            '</head><body>\n'
+            '<script>\n'
+            "document.addEventListener('htmx:configRequest', (e) => { e.detail.headers['X-CSRFToken'] = 'tok'; });\n"
+            '</script>\n'
+            '</body></html>'
+        )
+        with pytest.raises(AssertionError) as excinfo:
+            _extract_inline_script(html)
+        assert 'mergeQueueDepthChart' in str(excinfo.value)
+
     def test_window_all_real_aggregator_bounded_response(self, client, tmp_path):
         """Integration: real aggregate_queue_depth_timeseries with a real empty DB.
 
