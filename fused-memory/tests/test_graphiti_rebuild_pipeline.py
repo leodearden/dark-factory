@@ -471,7 +471,9 @@ class TestRebuildEntitySummariesDataFlow:
         assert result['errors'] == 0
 
     @pytest.mark.asyncio
-    async def test_force_false_dry_run_total_entities_from_detect(self, mock_config, make_backend):
+    async def test_force_false_dry_run_total_entities_from_detect(
+        self, mock_config, make_backend, make_stale_list
+    ):
         """force=False, dry_run=True: total_entities flows from the cheap dry_run probe (task-526).
 
         After task-526 the force=False dry_run=True path routes through
@@ -480,10 +482,7 @@ class TestRebuildEntitySummariesDataFlow:
         in the final result must still come from total_count, not from len(stale_list).
         """
         backend = make_backend(mock_config)
-        stale_list = [
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'old A'},
-            {'uuid': 'u2', 'name': 'Bob', 'summary': 'old B'},
-        ]
+        stale_list = make_stale_list(alice_summary='old A', bob_summary='old B')
         # Mock the new cheap-probe directly: (stale_list, total_count)
         backend._detect_stale_summaries_dry_run = AsyncMock(return_value=(stale_list, 7))
 
