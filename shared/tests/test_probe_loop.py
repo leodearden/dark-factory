@@ -578,11 +578,8 @@ class TestProbeLoopCostEvents:
         assert mock_write.await_count == 1
         assert mock_write.call_args[0][1] == 'resumed'
 
-    async def test_probe_count_is_zero_in_event_label(self):
-        """After successful probe, probe_count is reset to 0 BEFORE the cost event.
-
-        So the event label says 'probe #0 confirmed'.
-        """
+    async def test_label_reflects_probe_count_on_first_try(self):
+        """After a successful first-try probe, the label should reflect the probe number that confirmed (1, not 0)."""
         store = make_mock_cost_store()
         gate = make_gate(
             ['a'],
@@ -606,8 +603,38 @@ class TestProbeLoopCostEvents:
             )
 
         details = json.loads(mock_write.call_args[0][2])
-        # probe_count was reset to 0 before json.dumps, so label = 'probe #0 confirmed'
-        assert details['label'] == 'probe #0 confirmed'
+        assert details['label'] == 'probe #1 confirmed'
+
+    async def test_label_reflects_actual_probe_count_after_multiple_failures(self):
+        """With probe_count=0 and [False, False, True] side_effect: iteration 1 increments to 1
+        then fails, iteration 2 increments to 2 then fails, iteration 3 increments to 3 then
+        succeeds — label should read 'probe #3 confirmed'."""
+        store = make_mock_cost_store()
+        gate = make_gate(
+            ['a'],
+            cost_store=store,
+            probe_interval_secs=0,
+            max_probe_interval_secs=0,
+        )
+        acct = _capped_account(
+            gate,
+            resets_at=datetime.now(UTC) - timedelta(minutes=1),
+            probe_count=0,
+        )
+
+        gate._run_probe = AsyncMock(side_effect=[False, False, True])
+
+        with patch.object(
+            gate, '_write_cost_event', new_callable=AsyncMock,
+        ) as mock_write:
+            await asyncio.wait_for(
+                gate._account_resume_probe_loop(acct), timeout=5,
+            )
+
+        assert mock_write.await_count == 1
+        details = json.loads(mock_write.call_args[0][2])
+        assert details['label'] == 'probe #3 confirmed'
+        assert gate._run_probe.await_count == 3
 
 
 # ---------------------------------------------------------------------------
