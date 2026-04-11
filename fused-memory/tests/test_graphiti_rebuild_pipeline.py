@@ -756,6 +756,18 @@ class TestRebuildEntitySummariesErrorHandling:
         backend._detect_stale_summaries_with_edges.assert_awaited_once_with(group_id='test')
         assert backend._rebuild_entity_from_edges.await_count == 2
 
+        # Symmetrical to the force=True test: pin the force=False forwarding path
+        # where t['old_summary'] = s['summary'] (graphiti_client.py:1169) flows
+        # through _rebuild_one into _rebuild_entity_from_edges' old_summary kwarg
+        # (graphiti_client.py:1189). Edges are [] because detect_result.all_edges
+        # maps both uuids to empty lists.
+        backend._rebuild_entity_from_edges.assert_any_call(
+            'u2', 'Bob', [], group_id='test', old_summary='old B'
+        )
+        backend._rebuild_entity_from_edges.assert_any_call(
+            'u1', 'Alice', [], group_id='test', old_summary='old A'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-4: regression — whitespace-only fact must not cause false stale detection
