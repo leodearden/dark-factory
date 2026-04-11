@@ -132,3 +132,47 @@ def test_workflow_e2e_conformance_block_is_present() -> None:
             "pyright to enforce _SchedulerLike conformance on FakeScheduler and "
             "_EvalScheduler. See task 699."
         )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _parse_pyright_packages helper
+# ---------------------------------------------------------------------------
+
+
+def test_parse_pyright_packages_extracts_listed_packages() -> None:
+    """_parse_pyright_packages extracts the list of packages from PYRIGHT_PACKAGES=(...)."""
+    content = "PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard)\n"
+    result = _parse_pyright_packages(content)
+    assert result == ["fused-memory", "orchestrator", "dashboard"], (
+        f"Expected ['fused-memory', 'orchestrator', 'dashboard'], got {result!r}"
+    )
+
+
+def test_parse_pyright_packages_distinguishes_from_all_packages() -> None:
+    """_parse_pyright_packages must read PYRIGHT_PACKAGES, not ALL_PACKAGES.
+
+    This is the critical regression canary: if orchestrator is in ALL_PACKAGES
+    but removed from PYRIGHT_PACKAGES, the naive ``'orchestrator' in content``
+    check still passes (ALL_PACKAGES names it), silently disabling pyright
+    for orchestrator. The helper must parse the PYRIGHT_PACKAGES array specifically.
+    """
+    content = (
+        "ALL_PACKAGES=(shared escalation fused-memory orchestrator dashboard)\n"
+        "PYRIGHT_PACKAGES=(fused-memory dashboard)\n"
+    )
+    result = _parse_pyright_packages(content)
+    assert result is not None, "PYRIGHT_PACKAGES declaration should be found in content"
+    assert "orchestrator" not in result, (
+        f"'orchestrator' found in {result!r} but should not be — "
+        "it was deliberately removed from PYRIGHT_PACKAGES. "
+        "This confirms the helper reads from PYRIGHT_PACKAGES, not ALL_PACKAGES."
+    )
+
+
+def test_parse_pyright_packages_returns_none_when_missing() -> None:
+    """_parse_pyright_packages returns None when PYRIGHT_PACKAGES is absent."""
+    content = "ALL_PACKAGES=(shared escalation fused-memory orchestrator dashboard)\n"
+    result = _parse_pyright_packages(content)
+    assert result is None, (
+        f"Expected None when PYRIGHT_PACKAGES is absent, got {result!r}"
+    )
