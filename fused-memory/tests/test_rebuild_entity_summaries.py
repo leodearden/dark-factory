@@ -1524,25 +1524,35 @@ class TestRebuildEntitySummariesCancellation:
         per-entity error bookkeeper and handled only by Pass 1 (the propagation pass).
 
         This narrowing is intentional but must not accidentally exclude ordinary
-        application-level failures (RuntimeError, ValueError, etc.) from Pass 2
+        application-level failures (ValueError, etc.) from Pass 2
         (graphiti_client.py:1086-1098).  If someone over-narrows the guard — e.g. to
         ``isinstance(r, RuntimeError)`` — ordinary failures from other Exception subclasses
         would silently disappear from the result dict.
 
+        Uses ValueError (not RuntimeError) to prove the guard is isinstance(r, Exception)
+        and is not over-narrowed to RuntimeError.  RuntimeError accumulation is already
+        covered by test_partial_failure_in_update_does_not_cancel_others.
+
         Uses force=True (same mock surface as the other tests in this class) because
         both branches converge on the same Pass 2 accumulator.  The force=False branch's
-        RuntimeError accumulation is already covered by test_partial_failure_continues
+        ValueError accumulation is already covered by test_partial_failure_continues
         (TestRebuildEntitySummaries class).
         """
         backend = two_entity_backend
-        # First entity's rebuild raises RuntimeError; second succeeds
+        # First entity's rebuild raises ValueError; second succeeds
         backend.update_node_summary = AsyncMock(
-            side_effect=[RuntimeError('per-entity boom'), None]
+            side_effect=[ValueError('per-entity boom'), None]
         )
 
         result = await backend.rebuild_entity_summaries(group_id='test', force=True)
 
         assert result['errors'] == 1
         assert result['rebuilt'] == 1
-        error_detail = next(d for d in result['details'] if d['status'] == 'error')
+        # Pin down the full result counter shape: without these, a regression where both
+        # counters incremented for the same entity (e.g. total_entities=1/skipped=1) would
+        # still satisfy errors==1/rebuilt==1 and slip through.
+        assert result['total_entities'] == 2
+        assert result['skipped'] == 0
+        error_detail = next((d for d in result['details'] if d['status'] == 'error'), None)
+        assert error_detail is not None, f"expected an 'error' entry in details; got {result['details']}"
         assert 'per-entity boom' in error_detail['error']
