@@ -602,6 +602,22 @@ class TestCapConfirmKeywordEnforcement:
         assert result is True
         assert acct.capped is True
 
+    def test_non_cap_upgrade_message_returns_false(self):
+        """Non-cap 'upgrade' message must NOT be misclassified as a cap hit.
+
+        The bare word 'upgrade' is a common English verb that appears in many
+        unrelated CLI messages (e.g. tool version announcements).  A message like
+        "You've used the CLI. Upgrade to v2 for more features." matches the
+        'You've used' prefix AND the broad bare 'upgrade' keyword — so it would
+        produce a false cap-hit under the old ['resets', 'usage limit', 'upgrade']
+        guard.  After narrowing to 'upgrade your plan' this test must return False.
+        """
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit('', "You've used the CLI. Upgrade to v2 for more features.")
+        acct = gate._accounts[0]
+        assert result is False
+        assert acct.capped is False
+
     def test_near_cap_prefix_with_confirm_keyword_returns_true(self):
         """NEAR_CAP prefix + secondary keyword must trigger near-cap detection."""
         gate = make_gate(['a'])
