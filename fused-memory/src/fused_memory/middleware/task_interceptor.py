@@ -1,14 +1,20 @@
 """Intercepts task state transitions for targeted reconciliation."""
 
 import asyncio
-import hashlib
+import json
 import logging
-import time
 import uuid as uuid_mod
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
+from fused_memory.middleware.task_curator import (
+    CandidateTask,
+    CuratorDecision,
+    TaskCurator,
+    _flatten_task_tree,
+    _to_pool_entry,
+)
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
@@ -19,14 +25,10 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 
 if TYPE_CHECKING:
     from fused_memory.config.schema import FusedMemoryConfig
-    from fused_memory.middleware.task_dedup import TaskDeduplicator
     from fused_memory.middleware.task_file_committer import TaskFileCommitter
     from fused_memory.reconciliation.targeted import TargetedReconciler
 
 logger = logging.getLogger(__name__)
-
-# Dedup cache: suppress identical add_task calls within this window (seconds).
-_DEDUP_CACHE_TTL = 300
 
 
 class TaskInterceptor:
@@ -49,11 +51,10 @@ class TaskInterceptor:
         self.task_committer = task_committer
         self._background_tasks: set[asyncio.Task] = set()
 
-        # Layer 1: in-memory title-hash cache  {hash -> (task_result, timestamp)}
-        self._dedup_cache: dict[str, tuple[dict, float]] = {}
-        # Layer 2: Qdrant vector similarity (created lazily)
+        # Task curator: LLM-judged drop/combine/create gate. Lazy-initialized in
+        # _get_curator() because it pulls in a Qdrant client + embedder.
         self._config = config
-        self._deduplicator: TaskDeduplicator | None = None
+        self._curator: TaskCurator | None = None
 
     async def _ensure_taskmaster(self) -> TaskmasterBackend:
         """Return a connected TaskmasterBackend, or raise with a structured error."""
@@ -300,90 +301,116 @@ class TaskInterceptor:
 
         return result
 
-    # ── Dedup helpers ─────────��─────────────────────────────────────────
+    # ── Curator helpers ────────────────────────────────────────────────
 
-    @staticmethod
-    def _title_hash(title: str) -> str:
-        """Deterministic hash of a normalized title for the dedup cache."""
-        normalized = ' '.join(title.lower().split())
-        return hashlib.sha256(normalized.encode()).hexdigest()[:16]
-
-    def _check_dedup_cache(self, title: str) -> dict | None:
-        """Layer 1: check the in-memory title-hash cache.
-
-        Returns the cached task result if a matching title was created
-        within the TTL window, otherwise None.  Also evicts stale entries.
-        """
-        now = time.monotonic()
-        # Lazy eviction
-        stale = [k for k, (_, ts) in self._dedup_cache.items() if now - ts > _DEDUP_CACHE_TTL]
-        for k in stale:
-            del self._dedup_cache[k]
-
-        h = self._title_hash(title)
-        entry = self._dedup_cache.get(h)
-        if entry is not None:
-            cached_result, ts = entry
-            if now - ts <= _DEDUP_CACHE_TTL:
-                return cached_result
-            del self._dedup_cache[h]
-        return None
-
-    def _store_dedup_cache(self, title: str, result: dict) -> None:
-        self._dedup_cache[self._title_hash(title)] = (result, time.monotonic())
-
-    async def _get_deduplicator(self) -> 'TaskDeduplicator | None':
-        """Lazily create the Qdrant-backed deduplicator."""
-        if self._deduplicator is not None:
-            return self._deduplicator
-        if self._config is None:
+    async def _get_curator(self) -> TaskCurator | None:
+        """Lazily construct the task curator gate."""
+        if self._curator is not None:
+            return self._curator
+        if self._config is None or not self._config.curator.enabled:
             return None
         try:
-            from fused_memory.middleware.task_dedup import TaskDeduplicator
+            from pathlib import Path as _Path
 
-            self._deduplicator = TaskDeduplicator(self._config)
-            return self._deduplicator
+            cwd = None
+            if self.taskmaster is not None:
+                pr = getattr(self.taskmaster.config, 'project_root', None)
+                if pr:
+                    cwd = _Path(pr)
+            self._curator = TaskCurator(
+                config=self._config,
+                taskmaster=self.taskmaster,
+                cwd=cwd,
+            )
+            return self._curator
         except Exception:
-            logger.warning('Failed to create TaskDeduplicator', exc_info=True)
+            logger.warning('Failed to create TaskCurator', exc_info=True)
             return None
 
     @staticmethod
-    def _flatten_tasks(tasks_data: dict) -> list[tuple[str, str, str]]:
-        """Flatten a get_tasks response into (id, normalized_title, status) tuples.
+    def _build_candidate(kwargs: dict[str, Any]) -> CandidateTask | None:
+        """Extract a CandidateTask from add_task / add_subtask kwargs.
 
-        Walks all top-level tasks and their subtasks recursively so that every
-        task in the tree is represented exactly once.
+        Returns None if there's no title (e.g. pure prompt-only add_task) —
+        the curator cannot judge a candidate it cannot read.
         """
-        result: list[tuple[str, str, str]] = []
+        title = str(kwargs.get('title') or '').strip()
+        if not title:
+            return None
 
-        def _walk(task_list: list) -> None:
-            for task in task_list:
-                tid = str(task.get('id', ''))
-                title = ' '.join(task.get('title', '').lower().split())
-                status = task.get('status', 'unknown')
-                result.append((tid, title, status))
-                subtasks = task.get('subtasks', [])
-                if subtasks:
-                    _walk(subtasks)
+        meta = kwargs.get('metadata') or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
 
-        _walk(tasks_data.get('tasks', []))
-        return result
+        files = meta.get('files_to_modify') or meta.get('modules') or []
+        if isinstance(files, str):
+            files = [files]
+        files = [str(f) for f in files if f]
 
-    @staticmethod
-    def _build_pre_title_index(
-        pre_flattened: list[tuple[str, str, str]],
-    ) -> dict[str, tuple[str, str]]:
-        """Build hash→(task_id, title) index from a flattened pre-snapshot.
+        return CandidateTask(
+            title=title,
+            description=str(kwargs.get('description') or ''),
+            details=str(kwargs.get('details') or ''),
+            files_to_modify=files,
+            priority=str(kwargs.get('priority') or 'medium'),
+            spawned_from=meta.get('spawned_from'),
+            spawn_context=str(meta.get('spawn_context') or 'manual'),
+        )
 
-        Used to detect exact-title duplicates among newly-created tasks.
-        First occurrence wins when the same normalized title appears multiple times.
+    async def _execute_combine(
+        self,
+        project_root: str,
+        decision: CuratorDecision,
+    ) -> dict | None:
+        """Apply a curator combine decision to the target task.
+
+        Returns the update_task result on success, None on failure (caller
+        falls back to create). Combine is implemented via Taskmaster's
+        ``update_task`` with a ``prompt`` that instructs a verbatim replacement
+        plus metadata carrying the combine marker.
         """
-        index: dict[str, tuple[str, str]] = {}
-        for tid, title, _ in pre_flattened:
-            if title:
-                h = hashlib.sha256(title.encode()).hexdigest()[:16]
-                index.setdefault(h, (tid, title))
-        return index
+        if decision.rewritten_task is None or decision.target_id is None:
+            return None
+        rt = decision.rewritten_task
+        tm = await self._ensure_taskmaster()
+
+        files_block = '\n'.join(f'  - {f}' for f in rt.files_to_modify)
+        combine_prompt = (
+            'Replace this task with EXACTLY the following fields, verbatim. '
+            'Do not paraphrase, do not merge with existing content, do not add '
+            'commentary. The task curator already produced this coherent '
+            "rewrite that subsumes a duplicate task's work.\n\n"
+            f'TITLE: {rt.title}\n\n'
+            f'DESCRIPTION: {rt.description}\n\n'
+            f'PRIORITY: {rt.priority}\n\n'
+            f'FILES_TO_MODIFY:\n{files_block}\n\n'
+            f'DETAILS:\n{rt.details}\n'
+        )
+        combine_metadata = json.dumps({
+            'curator_action': 'combine',
+            'curator_justification': decision.justification[:500],
+            'combined_at': datetime.now(UTC).isoformat(),
+        })
+
+        try:
+            return await tm.update_task(
+                task_id=decision.target_id,
+                project_root=project_root,
+                prompt=combine_prompt,
+                metadata=combine_metadata,
+                append=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                'task_curator: combine update failed for target=%s: %s',
+                decision.target_id, exc,
+            )
+            return None
 
     async def _dedupe_bulk_created(
         self,
@@ -391,12 +418,12 @@ class TaskInterceptor:
         pre_snapshot: dict,
         parent_task_id: str | None = None,
     ) -> dict:
-        """Post-hoc dedup after a bulk task-creation operation.
+        """Post-hoc curator pass after a bulk task-creation operation.
 
-        Reads the current task tree, diffs it against pre_snapshot, removes any
-        new tasks whose normalized title matches a pre-existing one (Layer 1: hash)
-        or is semantically similar to one (Layer 2: Qdrant vector), then records
-        survivors in both dedup stores for future protection.
+        Reads the current task tree, diffs against pre_snapshot, and invokes
+        the curator on each newly-created task. Drop → remove the new task.
+        Combine → rewrite the target, then remove the new task. Create → keep
+        and record.
 
         Returns {'removed': [...], 'kept': [...], 'errors': []}
         """
@@ -407,95 +434,113 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
 
-        # Build pre-snapshot index (step-4: extracted into _build_pre_title_index)
-        pre_flattened = self._flatten_tasks(pre_snapshot)
-        pre_ids = {tid for tid, _, _ in pre_flattened}
-        pre_title_index = self._build_pre_title_index(pre_flattened)
-
-        # Get post-snapshot and find newly-created tasks (not in pre-snapshot)
+        pre_ids = {
+            str(t.get('id', '')) for t in _flatten_task_tree(pre_snapshot)
+            if t.get('id')
+        }
         post_snapshot = await tm.get_tasks(project_root)
-        post_flattened = self._flatten_tasks(post_snapshot)
-        new_tasks = [
-            (tid, title, status)
-            for tid, title, status in post_flattened
-            if tid not in pre_ids
+        new_task_dicts = [
+            t for t in _flatten_task_tree(post_snapshot)
+            if str(t.get('id', '')) and str(t.get('id', '')) not in pre_ids
         ]
-
-        if not new_tasks:
+        if not new_task_dicts:
             return {'removed': removed, 'kept': kept, 'errors': errors}
 
-        # Lazy-load the vector deduplicator once for all new tasks (step-6)
-        deduplicator = await self._get_deduplicator()
+        curator = await self._get_curator()
+        if curator is None:
+            for t in new_task_dicts:
+                kept.append({
+                    'task_id': str(t.get('id', '')),
+                    'title': str(t.get('title', '')),
+                })
+            return {'removed': removed, 'kept': kept, 'errors': errors}
 
-        for tid, title, _status in new_tasks:
-            is_dup = False
-
-            # Layer 1: exact normalized-title hash match against pre-existing titles
-            if title:
-                h = self._title_hash(title)
-                if h in pre_title_index:
-                    is_dup = True
-                    matched_id, matched_title = pre_title_index[h]
-                    try:
-                        await tm.remove_task(tid, project_root)
-                        removed.append({
-                            'task_id': tid,
-                            'title': title,
-                            'reason': 'exact_title_match',
-                            'matched_task_id': matched_id,
-                        })
-                        logger.warning(
-                            'bulk_dedup: removed duplicate task %s '
-                            '(title matches pre-existing task %s: %r)',
-                            tid, matched_id, title,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            'bulk_dedup: remove_task failed for %s: %s', tid, exc,
-                        )
-                        errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
-
-            # Layer 2: vector similarity check (step-6) — only if Layer 1 missed
-            if not is_dup and title and deduplicator is not None:
-                try:
-                    match = await deduplicator.find_duplicate(title, project_id)
-                    if match is not None:
-                        is_dup = True
-                        try:
-                            await tm.remove_task(tid, project_root)
-                            removed.append({
-                                'task_id': tid,
-                                'title': title,
-                                'reason': 'vector_similarity',
-                                'matched_task_id': match['task_id'],
-                                'similarity_score': match['score'],
-                            })
-                            logger.warning(
-                                'bulk_dedup: removed duplicate task %s '
-                                '(vector similarity %.3f vs task %s: %r)',
-                                tid, match['score'], match['task_id'], title,
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                'bulk_dedup: remove_task failed for %s: %s', tid, exc,
-                            )
-                            errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
-                except Exception as exc:
-                    logger.warning('bulk_dedup: find_duplicate failed for %s: %s', tid, exc)
-
-            # Record survivors in dedup stores (step-8)
-            if not is_dup:
+        for t in new_task_dicts:
+            tid = str(t.get('id', ''))
+            title = str(t.get('title', ''))
+            pool_entry = _to_pool_entry(t, source='module', lock_depth=2)
+            files = pool_entry.files_to_modify if pool_entry is not None else []
+            candidate = CandidateTask(
+                title=title,
+                description=str(t.get('description', '') or ''),
+                details=str(t.get('details', '') or ''),
+                files_to_modify=files,
+                priority=str(t.get('priority', 'medium')),
+                spawned_from=parent_task_id,
+                spawn_context='expand' if parent_task_id else 'parse_prd',
+            )
+            if not candidate.title:
                 kept.append({'task_id': tid, 'title': title})
-                # Layer 1: populate cache so future add_task/bulk calls dedup against it
-                self._store_dedup_cache(title, {'id': tid, 'title': title})
-                # Layer 2: fire-and-forget embedding write (same pattern as add_task)
-                if deduplicator is not None:
+                continue
+
+            try:
+                decision = await curator.curate(candidate, project_id, project_root)
+            except Exception as exc:
+                logger.warning('bulk_curator: curate() failed for %s: %s', tid, exc)
+                kept.append({'task_id': tid, 'title': title})
+                continue
+
+            if decision.action == 'drop' and decision.target_id:
+                try:
+                    await tm.remove_task(tid, project_root)
+                    removed.append({
+                        'task_id': tid,
+                        'title': title,
+                        'reason': 'curator_drop',
+                        'matched_task_id': decision.target_id,
+                        'justification': decision.justification[:200],
+                    })
+                    logger.warning(
+                        'bulk_curator: dropped duplicate task %s (matched %s): %s',
+                        tid, decision.target_id, decision.justification[:80],
+                    )
+                except Exception as exc:
+                    errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
+                continue
+
+            if decision.action == 'combine' and decision.target_id:
+                combine_result = await self._execute_combine(project_root, decision)
+                if combine_result is None:
+                    kept.append({'task_id': tid, 'title': title})
+                    continue
+                try:
+                    await tm.remove_task(tid, project_root)
+                except Exception as exc:
+                    errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
+                    continue
+                removed.append({
+                    'task_id': tid,
+                    'title': title,
+                    'reason': 'curator_combine',
+                    'matched_task_id': decision.target_id,
+                    'justification': decision.justification[:200],
+                })
+                if decision.rewritten_task is not None:
+                    rt_candidate = CandidateTask(
+                        title=decision.rewritten_task.title,
+                        description=decision.rewritten_task.description,
+                        details=decision.rewritten_task.details,
+                        files_to_modify=decision.rewritten_task.files_to_modify,
+                        priority=decision.rewritten_task.priority,
+                    )
                     bg = asyncio.create_task(
-                        deduplicator.record_task(tid, title, project_id),
-                        name=f'bulk-dedup-record-{tid}',
+                        curator.reembed_task(
+                            decision.target_id, rt_candidate, project_id,
+                        ),
+                        name=f'curator-reembed-{decision.target_id}',
                     )
                     self._background_tasks.add(bg)
                     bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+                continue
+
+            # action == 'create' or degenerate fall-through
+            kept.append({'task_id': tid, 'title': title})
+            bg = asyncio.create_task(
+                curator.record_task(tid, candidate, project_id),
+                name=f'curator-record-{tid}',
+            )
+            self._background_tasks.add(bg)
+            bg.add_done_callback(lambda t: self._background_tasks.discard(t))
 
         return {'removed': removed, 'kept': kept, 'errors': errors}
 
@@ -504,38 +549,73 @@ class TaskInterceptor:
     async def add_task(self, project_root: str, **kwargs: Any) -> dict:
         # Extract metadata before forwarding — taskmaster's add_task doesn't accept it
         metadata = kwargs.pop('metadata', None)
-        title = kwargs.get('title') or kwargs.get('prompt') or ''
+        if metadata is not None:
+            kwargs_for_candidate = dict(kwargs)
+            kwargs_for_candidate['metadata'] = metadata
+        else:
+            kwargs_for_candidate = kwargs
+        candidate = self._build_candidate(kwargs_for_candidate)
+        project_id = resolve_project_id(project_root)
 
-        # ── Dedup Layer 1: in-memory title-hash cache ────────────────
-        if title:
-            cached = self._check_dedup_cache(title)
-            if cached is not None:
-                task_id = cached.get('id', '?')
+        # ── Curator gate: drop / combine / create ────────────────────
+        curator = await self._get_curator()
+        if curator is not None and candidate is not None:
+            decision = await curator.curate(candidate, project_id, project_root)
+
+            if decision.action == 'drop' and decision.target_id:
                 logger.warning(
-                    'task_dedup: exact title match in cache — returning existing task %s '
-                    'instead of creating duplicate: %s',
-                    task_id, title[:80],
+                    'task_curator: drop — returning existing task %s instead of '
+                    'creating duplicate: %s',
+                    decision.target_id, candidate.title[:80],
                 )
-                return cached
+                return {
+                    'id': decision.target_id,
+                    'title': candidate.title,
+                    'deduplicated': True,
+                    'action': 'drop',
+                    'justification': decision.justification,
+                }
 
-        # ── Dedup Layer 2: Qdrant vector similarity ──────────────────
-        if title:
-            deduplicator = await self._get_deduplicator()
-            if deduplicator is not None:
-                project_id = resolve_project_id(project_root)
-                match = await deduplicator.find_duplicate(title, project_id)
-                if match is not None:
+            if decision.action == 'combine' and decision.target_id:
+                combine_result = await self._execute_combine(project_root, decision)
+                if combine_result is not None:
                     logger.warning(
-                        'task_dedup: similar task found (score=%.3f) — returning '
-                        'existing task %s instead of creating duplicate: %s',
-                        match['score'], match['task_id'], title[:80],
+                        'task_curator: combine — folded candidate into task %s: %s',
+                        decision.target_id, decision.justification[:120],
                     )
+                    # Re-embed target so the corpus reflects the rewrite.
+                    if decision.rewritten_task is not None:
+                        rt = decision.rewritten_task
+                        rt_candidate = CandidateTask(
+                            title=rt.title,
+                            description=rt.description,
+                            details=rt.details,
+                            files_to_modify=rt.files_to_modify,
+                            priority=rt.priority,
+                        )
+                        bg = asyncio.create_task(
+                            curator.reembed_task(
+                                decision.target_id, rt_candidate, project_id,
+                            ),
+                            name=f'curator-reembed-{decision.target_id}',
+                        )
+                        self._background_tasks.add(bg)
+                        bg.add_done_callback(
+                            lambda t: self._background_tasks.discard(t),
+                        )
                     return {
-                        'id': match['task_id'],
-                        'title': match['task_title'],
+                        'id': decision.target_id,
+                        'title': (
+                            decision.rewritten_task.title
+                            if decision.rewritten_task else candidate.title
+                        ),
                         'deduplicated': True,
-                        'similarity_score': match['score'],
+                        'action': 'combine',
+                        'justification': decision.justification,
                     }
+                # combine failed → fall through to create
+
+            # action == 'create' or degenerate — proceed to Taskmaster
 
         # ── Create task ──────────────────────────────────────────────
         tm = await self._ensure_taskmaster()
@@ -548,24 +628,21 @@ class TaskInterceptor:
         if metadata and task_id:
             try:
                 await tm.update_task(
-                    task_id=task_id, metadata=metadata, project_root=project_root
+                    task_id=task_id, metadata=metadata, project_root=project_root,
                 )
             except Exception as e:
-                logger.warning(f'add_task: metadata update for task {task_id} failed: {e}')
-
-        # ── Record in dedup stores ────────────���──────────────────────
-        if title and isinstance(result, dict):
-            self._store_dedup_cache(title, result)
-            deduplicator = await self._get_deduplicator()
-            if deduplicator is not None and task_id:
-                project_id = resolve_project_id(project_root)
-                # Fire-and-forget — don't block on embedding write
-                bg = asyncio.create_task(
-                    deduplicator.record_task(task_id, title, project_id),
-                    name=f'dedup-record-{task_id}',
+                logger.warning(
+                    f'add_task: metadata update for task {task_id} failed: {e}',
                 )
-                self._background_tasks.add(bg)
-                bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+
+        # Record survivor in the curator corpus so future checks see it.
+        if curator is not None and candidate is not None and task_id:
+            bg = asyncio.create_task(
+                curator.record_task(task_id, candidate, project_id),
+                name=f'curator-record-{task_id}',
+            )
+            self._background_tasks.add(bg)
+            bg.add_done_callback(lambda t: self._background_tasks.discard(t))
 
         event = self._make_event(
             EventType.task_created,
@@ -577,11 +654,11 @@ class TaskInterceptor:
         return result
 
     async def update_task(
-        self, task_id: str, project_root: str, **kwargs: Any
+        self, task_id: str, project_root: str, **kwargs: Any,
     ) -> dict:
         tm = await self._ensure_taskmaster()
         result = await tm.update_task(
-            task_id=task_id, project_root=project_root, **kwargs
+            task_id=task_id, project_root=project_root, **kwargs,
         )
         event = self._make_event(
             EventType.task_modified,
@@ -590,14 +667,97 @@ class TaskInterceptor:
         )
         await self.buffer.push(event)
         self._schedule_commit(project_root, f'update_task({task_id})')
+
+        # Re-embed if any corpus-relevant field changed. Taskmaster's update_task
+        # accepts a free-form ``prompt`` for AI-driven edits, so we can't know
+        # exactly what changed without re-fetching. Re-embed unconditionally when
+        # the caller passed any of these hints.
+        should_reembed = any(
+            k in kwargs for k in ('prompt', 'title', 'description', 'details')
+        )
+        if should_reembed:
+            curator = await self._get_curator()
+            if curator is not None:
+                try:
+                    refreshed = await tm.get_task(task_id, project_root)
+                    task_data = (
+                        refreshed.get('data') if isinstance(refreshed, dict) else None
+                    )
+                    if isinstance(task_data, dict):
+                        refreshed = task_data
+                    if isinstance(refreshed, dict):
+                        candidate = CandidateTask(
+                            title=str(refreshed.get('title', '') or ''),
+                            description=str(refreshed.get('description', '') or ''),
+                            details=str(refreshed.get('details', '') or ''),
+                            files_to_modify=[],
+                            priority=str(refreshed.get('priority', 'medium')),
+                        )
+                        if candidate.title:
+                            project_id = resolve_project_id(project_root)
+                            bg = asyncio.create_task(
+                                curator.reembed_task(
+                                    task_id, candidate, project_id,
+                                ),
+                                name=f'curator-reembed-{task_id}',
+                            )
+                            self._background_tasks.add(bg)
+                            bg.add_done_callback(
+                                lambda t: self._background_tasks.discard(t),
+                            )
+                except Exception:
+                    logger.debug(
+                        'task_curator: reembed_task on update failed for %s',
+                        task_id, exc_info=True,
+                    )
         return result
 
     async def add_subtask(
-        self, parent_id: str, project_root: str, **kwargs: Any
+        self, parent_id: str, project_root: str, **kwargs: Any,
     ) -> dict:
+        candidate = self._build_candidate(kwargs)
+        project_id = resolve_project_id(project_root)
+
+        # Curator gate for subtasks — previously bypassed entirely.
+        curator = await self._get_curator()
+        if curator is not None and candidate is not None:
+            candidate.spawned_from = str(parent_id)
+            candidate.spawn_context = candidate.spawn_context or 'manual'
+            decision = await curator.curate(candidate, project_id, project_root)
+            if decision.action == 'drop' and decision.target_id:
+                logger.warning(
+                    'task_curator: drop (subtask) — returning existing task %s '
+                    'instead of creating duplicate: %s',
+                    decision.target_id, candidate.title[:80],
+                )
+                return {
+                    'id': decision.target_id,
+                    'title': candidate.title,
+                    'deduplicated': True,
+                    'action': 'drop',
+                    'justification': decision.justification,
+                }
+            if decision.action == 'combine' and decision.target_id:
+                combine_result = await self._execute_combine(project_root, decision)
+                if combine_result is not None:
+                    logger.warning(
+                        'task_curator: combine (subtask) — folded into task %s',
+                        decision.target_id,
+                    )
+                    return {
+                        'id': decision.target_id,
+                        'title': (
+                            decision.rewritten_task.title
+                            if decision.rewritten_task else candidate.title
+                        ),
+                        'deduplicated': True,
+                        'action': 'combine',
+                        'justification': decision.justification,
+                    }
+
         tm = await self._ensure_taskmaster()
         result = await tm.add_subtask(
-            parent_id=parent_id, project_root=project_root, **kwargs
+            parent_id=parent_id, project_root=project_root, **kwargs,
         )
         event = self._make_event(
             EventType.task_created,
@@ -606,6 +766,17 @@ class TaskInterceptor:
         )
         await self.buffer.push(event)
         self._schedule_commit(project_root, f'add_subtask({parent_id})')
+
+        # Record the new subtask in the curator corpus.
+        if curator is not None and candidate is not None and isinstance(result, dict):
+            new_id = str(result.get('id', ''))
+            if new_id:
+                bg = asyncio.create_task(
+                    curator.record_task(new_id, candidate, project_id),
+                    name=f'curator-record-{new_id}',
+                )
+                self._background_tasks.add(bg)
+                bg.add_done_callback(lambda t: self._background_tasks.discard(t))
         return result
 
     async def remove_task(
