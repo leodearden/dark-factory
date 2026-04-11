@@ -3,6 +3,7 @@ Stage 3: Cross-System Integrity Check — read-only verification."""
 
 from __future__ import annotations
 
+import heapq
 import json
 
 from fused_memory.models.reconciliation import (
@@ -211,19 +212,17 @@ def _format_flagged(items: list[dict]) -> str:
     return '\n'.join(lines)
 
 
-def _select_proactive_sample(all_tasks: list[dict], n: int) -> list[dict]:
+def _select_proactive_sample(tasks: list[dict], n: int) -> list[dict]:
     """Select the top-N tasks for proactive spot-checking.
 
     Sorted by status priority (in-progress > blocked > review > pending > done),
     then by task ID descending (proxy for recency — higher ID = more recently created).
     Returns at most n tasks; fewer if the task list is smaller than n.
 
-    Non-dict elements in all_tasks are filtered out defensively, matching the
-    isinstance(t, dict) guard pattern used by active_tasks/done_tasks derivations.
+    Input must contain only dict elements; callers should pass
+    FilteredTaskTree.active_tasks/done_tasks/cancelled_tasks fields, which
+    filter_task_tree already pre-validates to be dict-only.
     """
-    # Filter out non-dict elements before sorting so sort_key never crashes
-    tasks = [t for t in all_tasks if isinstance(t, dict)]
-
     # Import from task_filter — the single source of truth for status priority
     from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY  # noqa: PLC0415
 
@@ -238,5 +237,4 @@ def _select_proactive_sample(all_tasks: list[dict], n: int) -> list[dict]:
             tid_int = 0
         return (priority, -tid_int)
 
-    sorted_tasks = sorted(tasks, key=sort_key)
-    return sorted_tasks[:n]
+    return heapq.nsmallest(n, tasks, key=sort_key)
