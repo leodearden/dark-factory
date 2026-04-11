@@ -247,3 +247,20 @@ class TestCliDirectoryScan:
         assert 'test_example.py' in output
         assert 'conftest.py' in output
         assert 'other_file.py' not in output
+
+
+class TestRealTestsDirectoryIsClean:
+    """Regression guard: fused-memory/tests/ must produce zero violations."""
+
+    def test_real_fused_memory_tests_directory_is_clean_under_check(self):
+        """fused-memory/tests/ contains no mixed assert_not_called/assert_not_awaited functions."""
+        tests_dir = Path(__file__).parent
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), str(tests_dir)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f'Unexpected violations in fused-memory/tests/:\n{result.stdout}'
+        )
+        assert result.stdout == ''
