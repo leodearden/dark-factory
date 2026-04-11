@@ -192,6 +192,30 @@ def func_b():
 '''
 
 
+def _assert_violation_output(stdout: str, bad_file: Path) -> None:
+    """Assert that checker stdout matches the violation-report contract.
+
+    Checks: full bad_file path present, line-3 reference present,
+    assert_not_awaited keyword present, assert_not_called keyword present.
+
+    Shared by TestCliExitCodes (sys.executable) and TestHooksIntegration
+    Case 3 (python3 -I -S) so both tests track the same output contract
+    from a single source of truth.
+    """
+    assert str(bad_file) in stdout, (
+        f'Expected bad_file path in violation output, got: {stdout!r}'
+    )
+    assert ':3:' in stdout, (
+        f'Expected line-3 reference in violation output, got: {stdout!r}'
+    )
+    assert 'assert_not_awaited' in stdout, (
+        f'Expected assert_not_awaited in violation output, got: {stdout!r}'
+    )
+    assert 'assert_not_called' in stdout, (
+        f'Expected assert_not_called in violation output, got: {stdout!r}'
+    )
+
+
 class TestCliExitCodes:
     """CLI exit-code contract: 1 on violations, 0 on clean input."""
 
@@ -205,12 +229,7 @@ class TestCliExitCodes:
             text=True,
         )
         assert result.returncode == 1
-        output = result.stdout
-        assert str(bad_file) in output
-        # assert_not_called is on line 3 of _MIXED_STYLE_SOURCE
-        assert ':3:' in output
-        assert 'assert_not_awaited' in output
-        assert 'assert_not_called' in output
+        _assert_violation_output(result.stdout, bad_file)
 
     def test_cli_main_exits_zero_on_clean_file(self, tmp_path: Path):
         """Clean file (styles in different functions) → returncode 0, stdout empty."""
@@ -387,15 +406,7 @@ class TestHooksIntegration:
             f'  stdout: {result3.stdout!r}\n'
             f'  stderr: {result3.stderr!r}'
         )
-        assert result3.stdout != '', (
-            'Expected non-empty stdout (violation report), got empty'
-        )
-        assert 'test_bad.py' in result3.stdout, (
-            f'Expected test_bad.py filename in violation output, got: {result3.stdout!r}'
-        )
-        assert 'assert_not_awaited' in result3.stdout, (
-            f'Expected assert_not_awaited violation in output, got: {result3.stdout!r}'
-        )
+        _assert_violation_output(result3.stdout, bad_file)
 
 
 class TestCliErrorHandling:
