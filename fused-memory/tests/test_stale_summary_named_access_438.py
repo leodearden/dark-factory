@@ -29,7 +29,7 @@ class TestDetectStaleSummariesNamedAccess:
     async def test_detect_stale_summaries_named_access(self, mock_config, make_backend):
         """detect_stale_summaries returns the stale list from a StaleSummaryResult."""
         backend = make_backend(mock_config)
-        stale_list = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'old'}]
+        stale_list = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'old', 'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 1, 'summary_line_count': 1}]
         detect_result = StaleSummaryResult(
             stale=stale_list,
             all_edges={},
