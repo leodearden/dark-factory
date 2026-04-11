@@ -193,3 +193,34 @@ def test_parse_pyright_packages_returns_none_when_missing() -> None:
     assert result is None, (
         f"Expected None when PYRIGHT_PACKAGES is absent, got {result!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _hook_invokes_pyright_in_loop helper
+# ---------------------------------------------------------------------------
+
+
+def test_hook_invokes_pyright_in_loop_detects_loop_body() -> None:
+    """_hook_invokes_pyright_in_loop returns True when uv run pyright is inside the loop body."""
+    content = (
+        'for pkg in "${PYRIGHT_PACKAGES[@]}"; do\n'
+        '    (cd "$dir" && uv run pyright)\n'
+        "done\n"
+    )
+    assert _hook_invokes_pyright_in_loop(content) is True
+
+
+def test_hook_invokes_pyright_in_loop_rejects_bare_pyright() -> None:
+    """_hook_invokes_pyright_in_loop returns False when uv run pyright appears outside any loop."""
+    content = "uv run pyright\n"
+    assert _hook_invokes_pyright_in_loop(content) is False
+
+
+def test_hook_invokes_pyright_in_loop_rejects_loop_without_pyright() -> None:
+    """_hook_invokes_pyright_in_loop returns False when the PYRIGHT_PACKAGES loop lacks pyright."""
+    content = (
+        'for pkg in "${PYRIGHT_PACKAGES[@]}"; do\n'
+        '    echo "$pkg"\n'
+        "done\n"
+    )
+    assert _hook_invokes_pyright_in_loop(content) is False
