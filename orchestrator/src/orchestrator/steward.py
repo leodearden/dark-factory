@@ -221,7 +221,7 @@ class TaskSteward:
         if retry_count >= self.config.steward_max_retries:
             self._auto_escalate_to_human(
                 escalation,
-                f'Failed after {retry_count} attempts: {escalation.summary}',
+                f'Failed after {retry_count} attempt{"s" if retry_count != 1 else ""}: {escalation.summary}',
             )
             return
 
