@@ -314,6 +314,33 @@ class TestHooksIntegration:
             "'stdlib-only' so maintainers know adding a dependency would break the pre-commit fast path"
         )
 
+    def test_script_runs_under_isolated_python3_proves_stdlib_only(self, tmp_path: Path):
+        """Running the script under python3 -I -S proves it imports only stdlib modules.
+
+        `python3 -I` alone does NOT block venv site-packages on this machine (python 3.14,
+        uv-managed venv): `-I` only disables *user* site-packages (implies `-s`), not system
+        or venv site-packages.  `-I -S` additionally skips site.py, so venv site-packages are
+        never added to sys.path — any accidental third-party import in the script would raise
+        ModuleNotFoundError at interpreter startup, loudly failing this test.
+
+        An empty tmp_path directory has no test_*.py or conftest.py files, so the scanner
+        finds zero targets → exits 0 with empty stdout.  This proves the stdlib-only contract
+        at the process level rather than by pinning documentation strings.
+        """
+        result = subprocess.run(
+            ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f'Script exited non-zero under python3 -I -S (unexpected import or logic error):\n'
+            f'  stdout: {result.stdout!r}\n'
+            f'  stderr: {result.stderr!r}'
+        )
+        assert result.stdout == '', (
+            f'Expected empty stdout (no scan targets in empty dir), got: {result.stdout!r}'
+        )
+
 
 class TestCliErrorHandling:
     """main() path/read-error handling: fail fast on missing explicit paths,
