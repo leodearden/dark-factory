@@ -169,17 +169,13 @@ class TestMergeQueueTimeWindow:
         return call.kwargs.get('hours') or call.args[1]
 
     def test_window_24h_forwards_hours_24(self, client):
-        with _patch_merge_queue_data() as stack:
+        with _patch_merge_queue_data() as _, \
+             patch('dashboard.app.aggregate_queue_depth_timeseries',
+                   new_callable=AsyncMock,
+                   return_value=MOCK_DEPTH) as mock_depth:
             client.get('/partials/merge-queue?window=24h')
-            # Inspect patch objects from the stack
-        import dashboard.app as app_mod
-        with _patch_merge_queue_data() as _:
-            with patch('dashboard.app.aggregate_queue_depth_timeseries',
-                       new_callable=AsyncMock,
-                       return_value=MOCK_DEPTH) as mock_depth:
-                client.get('/partials/merge-queue?window=24h')
-                hours = mock_depth.call_args.kwargs.get('hours')
-                assert hours == 24
+            hours = mock_depth.call_args.kwargs.get('hours')
+            assert hours == 24
 
     def test_window_7d_forwards_hours_168(self, client):
         with patch('dashboard.app.aggregate_queue_depth_timeseries',

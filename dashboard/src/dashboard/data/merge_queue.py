@@ -101,7 +101,7 @@ async def queue_depth_timeseries(
                 continue
 
         labels = [b.isoformat() for b in buckets]
-        values = [counts[lbl] for lbl in labels]
+        values: list[int | float] = [counts[lbl] for lbl in labels]
         return {'labels': labels, 'values': values}
 
     return await with_db(db, _query, {'labels': [], 'values': []})
@@ -145,7 +145,7 @@ async def outcome_distribution(
 
         # Canonical outcomes first, then unknowns alphabetically
         labels: list[str] = []
-        values: list[int] = []
+        values: list[int | float] = []
         for outcome in _CANONICAL_OUTCOMES:
             if outcome in counts:
                 labels.append(outcome)
@@ -327,7 +327,7 @@ async def aggregate_queue_depth_timeseries(
     # Collect all valid results
     valid: list[ChartData] = []
     for r in results:
-        if isinstance(r, Exception):
+        if isinstance(r, BaseException):
             logger.warning('aggregate_queue_depth_timeseries: error from one DB: %s', r)
             continue
         valid.append(r)
@@ -347,9 +347,9 @@ async def aggregate_queue_depth_timeseries(
         return {'labels': [], 'values': []}
 
     # Sum counts per label
-    total_counts: dict[str, int] = {lbl: 0 for lbl in labels}
+    total_counts: dict[str, int | float] = {lbl: 0 for lbl in labels}
     for v in valid:
-        for lbl, cnt in zip(v['labels'], v['values']):
+        for lbl, cnt in zip(v['labels'], v['values'], strict=False):
             if lbl in total_counts:
                 total_counts[lbl] += cnt
 
@@ -370,12 +370,12 @@ async def aggregate_outcome_distribution(
         return_exceptions=True,
     )
 
-    merged: dict[str, int] = {}
+    merged: dict[str, int | float] = {}
     for r in results:
-        if isinstance(r, Exception):
+        if isinstance(r, BaseException):
             logger.warning('aggregate_outcome_distribution: error from one DB: %s', r)
             continue
-        for lbl, cnt in zip(r['labels'], r['values']):
+        for lbl, cnt in zip(r['labels'], r['values'], strict=False):
             merged[lbl] = merged.get(lbl, 0) + cnt
 
     if not merged:
@@ -383,7 +383,7 @@ async def aggregate_outcome_distribution(
 
     # Re-apply canonical ordering
     labels: list[str] = []
-    values: list[int] = []
+    values: list[int | float] = []
     for outcome in _CANONICAL_OUTCOMES:
         if outcome in merged:
             labels.append(outcome)
@@ -410,7 +410,7 @@ async def aggregate_latency_stats(
         return_exceptions=True,
     )
     for r in gather_results:
-        if isinstance(r, Exception):
+        if isinstance(r, BaseException):
             logger.warning('aggregate_latency_stats: error from one DB: %s', r)
             continue
         all_durations.extend(r)
@@ -433,7 +433,7 @@ async def aggregate_recent_merges(
     )
     merged: list[dict] = []
     for r in gather_results:
-        if isinstance(r, Exception):
+        if isinstance(r, BaseException):
             logger.warning('aggregate_recent_merges: error from one DB: %s', r)
             continue
         merged.extend(r)
@@ -458,7 +458,7 @@ async def aggregate_speculative_stats(
     hit_count = 0
     discard_count = 0
     for r in gather_results:
-        if isinstance(r, Exception):
+        if isinstance(r, BaseException):
             logger.warning('aggregate_speculative_stats: error from one DB: %s', r)
             continue
         hit_count += r['hit_count']
