@@ -83,6 +83,7 @@ class TaskSteward:
         self._stopped = False
         self._task: asyncio.Task | None = None
         self._retry_counts: dict[str, int] = {}
+        self._timeout_counts: dict[str, int] = {}
         self.metrics = StewardMetrics()
 
     # ------------------------------------------------------------------
@@ -226,6 +227,15 @@ class TaskSteward:
             )
             return
 
+        # Guard: per-escalation timeout-kill cap
+        timeout_count = self._timeout_counts.get(escalation.id, 0)
+        if timeout_count >= self.config.steward_max_timeouts_per_escalation:
+            self._auto_escalate_to_human(
+                escalation,
+                f'Invocation repeatedly timed out ({timeout_count}/{self.config.steward_max_timeouts_per_escalation})',
+            )
+            return
+
         cwd = self.worktree
 
         # Pre-triage large suggestion sets before invoking the steward session
@@ -309,11 +319,16 @@ class TaskSteward:
         # The escalation remains pending so the run loop re-queues it naturally.
         if _is_timeout_kill(result):
             self.metrics.timeouts_recovered += 1
+            self._timeout_counts[escalation.id] = (
+                self._timeout_counts.get(escalation.id, 0) + 1
+            )
             logger.warning(
                 f'Steward for task {self.task_id}: invocation timed out after '
                 f'{self.config.timeouts.steward:.0f}s — treating as recoverable, '
                 f'retry_count NOT incremented (escalation remains pending: '
-                f'{escalation.id})'
+                f'{escalation.id}, timeout_count: '
+                f'{self._timeout_counts[escalation.id]}/'
+                f'{self.config.steward_max_timeouts_per_escalation})'
             )
             return
 
@@ -331,6 +346,10 @@ class TaskSteward:
             )
         else:
             self.metrics.escalations_handled += 1
+            # Clean up per-escalation counters on successful resolution so the
+            # steward dict does not accumulate stale entries indefinitely.
+            self._retry_counts.pop(escalation.id, None)
+            self._timeout_counts.pop(escalation.id, None)
 
     # ------------------------------------------------------------------
     # Session-aware invocation with cap-hit recovery
