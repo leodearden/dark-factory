@@ -442,12 +442,11 @@ class TestNearCapStateDistinction:
 
 
 class TestCapHitNowUsingExtraSemantics:
-    """Behavioral tests asserting 'You're now using extra' triggers CAP_HIT, not NEAR_CAP.
+    """Asserts that 'You're now using extra' prefix routes to CAP_HIT (acct.capped=True), not NEAR_CAP.
 
-    'You're now using extra compute credits' means the account has crossed the
-    base plan's hard cap and is billing overage — semantically equivalent to a
-    cap hit, not merely a warning. These tests FAIL until step-3 moves the
-    prefix from NEAR_CAP_PREFIXES to CAP_HIT_PREFIXES.
+    Semantically 'now using extra compute credits' means the account has crossed
+    its base plan's hard cap and is billing overage, so it must close the gate
+    and trigger the resume probe loop, not merely flag near_cap.
     """
 
     # All messages include 'resets' as a secondary keyword so they remain valid
@@ -501,18 +500,22 @@ class TestCapHitNowUsingExtraSemantics:
 
 
 class TestCapConfirmKeywordEnforcement:
-    """Tests asserting CAP_CONFIRM_KEYWORDS secondary check is required.
+    """Asserts that detect_cap_hit requires BOTH a matching prefix AND at least one CAP_CONFIRM_KEYWORDS entry.
 
-    detect_cap_hit must require BOTH a matching prefix AND at least one of
-    ['resets', 'usage limit', 'upgrade'] in the combined text, for both
-    CAP_HIT_PREFIXES and NEAR_CAP_PREFIXES (Claude backend). These tests FAIL
-    until step-6 enforces the guard in detect_cap_hit.
+    The secondary keyword guard ('resets', 'usage limit', 'upgrade') must be
+    present in the combined text before routing to _handle_cap_detected or
+    _handle_near_cap_warning. This is the defense-in-depth guard against false
+    positives on ambiguous generic prefixes like 'You've used' or 'You're close
+    to'.
     """
 
     def test_cap_hit_prefix_without_confirm_keyword_returns_false(self):
         """Prefix match alone must not trigger detection when no secondary keyword present."""
         gate = make_gate(['a'])
-        result = gate.detect_cap_hit('', "You've used all the air in the room")
+        # Exercises the 'You've used' prefix false-positive scenario from commit 5e01a8ee3f:
+        # generic verb-use of 'used' (e.g. 'used this tool correctly' / 'used the --verbose
+        # flag incorrectly') must not be misclassified as a cap hit.
+        result = gate.detect_cap_hit('', "You've used the --verbose flag incorrectly")
         acct = gate._accounts[0]
         assert result is False
         assert acct.capped is False
