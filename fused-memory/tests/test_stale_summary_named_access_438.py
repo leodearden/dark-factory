@@ -56,7 +56,7 @@ class TestDetectStaleSummariesNamedAccess:
 
         returned = await backend.detect_stale_summaries(group_id='t')
 
-        assert returned == []
+        assert returned is detect_result.stale
         backend._detect_stale_summaries_with_edges.assert_awaited_once_with(group_id='t')
 
     @pytest.mark.asyncio
