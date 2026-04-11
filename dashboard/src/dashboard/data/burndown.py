@@ -69,6 +69,19 @@ async def collect_snapshot(
     config: DashboardConfig,
 ) -> None:
     """Discover projects and insert one snapshot row per project."""
+    try:
+        await _collect_snapshot_impl(conn, config)
+    except Exception:
+        with contextlib.suppress(Exception):
+            await conn.rollback()
+        raise
+
+
+async def _collect_snapshot_impl(
+    conn: aiosqlite.Connection,
+    config: DashboardConfig,
+) -> None:
+    """Internal implementation of collect_snapshot — called inside the outer try/except."""
     now = datetime.now(UTC).isoformat()
     # config.project_root is already resolved by DashboardConfig.__post_init__
     resolved_root = str(config.project_root)
