@@ -394,8 +394,13 @@ class TestNearCapStateDistinction:
         field assignment), then a near-cap warning arrives via ``detect_cap_hit`` with an
         explicit token so ``_resolve_account`` returns the already-capped account.  This
         mirrors the defensive case the probe-loop fix guards against.
+
+        ``asyncio.sleep`` is patched so the test is robust against a future minimum-interval
+        change in the probe loop — the patch is scoped to the probe-loop call so the outer
+        ``asyncio.wait_for`` timeout (which uses event-loop timer handles, not sleep) is
+        unaffected.
         """
-        gate = make_gate(['a'], probe_interval_secs=0, max_probe_interval_secs=0)
+        gate = make_gate(['a'])
         acct = gate._accounts[0]
 
         # (1) Cap the account via the real detection path (sets capped=True, near_cap=False,
@@ -417,8 +422,11 @@ class TestNearCapStateDistinction:
         # (3) Override _run_probe to return success immediately
         gate._run_probe = AsyncMock(return_value=True)
 
-        # (4) Run the probe loop — it should detect resets_at in the past, fire probe, succeed
-        await asyncio.wait_for(gate._account_resume_probe_loop(acct), timeout=5)
+        # (4) Run the probe loop — it should detect resets_at in the past, fire probe, succeed.
+        #     asyncio.sleep is patched to a no-op so the test won't hang if a future change
+        #     adds a minimum-interval floor; wait_for's 5s timeout remains active.
+        with patch('shared.usage_gate.asyncio.sleep', new_callable=AsyncMock):
+            await asyncio.wait_for(gate._account_resume_probe_loop(acct), timeout=5)
 
         # (5) Account must be uncapped AND near_cap must be cleared — FAIL-BEFORE-FIX assertion
         assert acct.capped is False
