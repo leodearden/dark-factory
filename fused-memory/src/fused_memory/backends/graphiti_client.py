@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, NamedTuple, TypedDict, cast
 from urllib.parse import urlparse
@@ -820,7 +821,7 @@ class GraphitiBackend:
         }
 
     @staticmethod
-    def _canonical_facts(edges: list[EdgeDict]) -> list[str]:
+    def _canonical_facts(edges: Sequence[Mapping[str, Any]]) -> list[str]:
         """Deduplicate edge facts preserving insertion order, skipping missing/falsy values.
 
         Args:
