@@ -1191,11 +1191,17 @@ class TestConfirmAccountOk:
         gate = make_gate(['a'])
         gate._accounts[0].near_cap = True
         gate._accounts[0].probe_in_flight = False
+        # NOTE: probe_count=3 with probe_in_flight=False is unreachable in real execution
+        # (probe_count only advances inside the probe loop while capped, and is reset to 0
+        # on success).  The value is set here purely to verify that confirm_account_ok does
+        # NOT touch unrelated fields when the probe_in_flight branch is skipped — these
+        # assertions are "no side effects on unrelated fields" invariant checks, not a
+        # realistic-state test.
         gate._accounts[0].probe_count = 3
         gate._open.clear()
         gate.confirm_account_ok(gate._accounts[0].token)
         assert gate._accounts[0].near_cap is False
-        # probe_count and gate should NOT change (only near_cap is cleared in this branch)
+        # Verify no side effects on probe-related fields (invariant check, not realistic state)
         assert gate._accounts[0].probe_count == 3
         assert gate._open.is_set() is False
 
