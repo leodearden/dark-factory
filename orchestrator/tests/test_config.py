@@ -320,19 +320,19 @@ class TestStewardTimeoutInvariant:
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        with pytest.raises(ValidationError, match='Raise timeouts.steward'):
+        with pytest.raises(ValidationError, match=r'Raise timeouts\.steward to >= steward_completion_timeout'):
             OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=600.0))
 
     def test_env_var_override_triggers_invariant(self, monkeypatch, tmp_path):
         """ORCH_TIMEOUTS__STEWARD env-var override is caught by the mode='after' validator.
 
-        Regression guard: pins that pydantic-settings env-sourced overrides flow through
-        the model_validator(mode='after'), which sees the fully-merged settings dict.
+        Regression guard: pins that pydantic-settings env-sourced overrides
+        are merged into the model before mode='after' validators run.
         A future pydantic-settings source-ordering regression would cause this test to fail.
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_TIMEOUTS__STEWARD', '300')
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         # defaults.yaml: steward_completion_timeout=900.0, timeouts.steward=1800
         # env override: timeouts.steward=300 → 300 < 900 → validator must fire
         with pytest.raises(ValidationError, match='steward'):
