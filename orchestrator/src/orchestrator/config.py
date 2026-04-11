@@ -342,6 +342,12 @@ class OrchestratorConfig(BaseSettings):
     max_review_cycles: int = Field(default=2)
     reviewer_stagger_secs: float = Field(default=2.0)
     max_reviewer_retries: int = Field(default=4)
+    # Max in-workflow amendment rounds after a PASS-with-suggestions review.
+    # Each round reinvokes the implementer with in-scope suggestions (scoped
+    # by module-lock membership), re-verifies, and re-reviews. Remaining
+    # out-of-scope or cap-exhausted suggestions still flow through the
+    # existing escalate_suggestions path.
+    max_amendment_rounds: int = Field(default=1)
 
     # Completion judge — opt-in loop-exit hint after each implementer iteration.
     # Default False: production orchestrator runs unaffected. Eval runner
