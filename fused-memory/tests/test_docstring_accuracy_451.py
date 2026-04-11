@@ -29,6 +29,23 @@ def _keywords_in_proximity(doc: str, kw1: str, kw2: str, max_distance: int = 200
     return min(abs(p1 - p2) for p1 in pos1 for p2 in pos2) < max_distance
 
 
+def _returns_section_text(doc: str) -> str | None:
+    """Return the text of the Returns: section, bounded by the next section header.
+
+    Finds 'Returns:' in doc, then clips the slice at the next Google/numpy-style
+    section header (blank line + capitalised identifier + colon, e.g. 'Raises:',
+    'Note:', 'Example:', 'Args:').  Returns None if no 'Returns:' header exists.
+    """
+    returns_idx = doc.find('Returns:')
+    if returns_idx == -1:
+        return None
+    after_returns = doc[returns_idx + len('Returns:'):]
+    match = re.search(r'\n\s*\n\s*[A-Z]\w+:', after_returns)
+    if match:
+        return doc[returns_idx:returns_idx + len('Returns:') + match.start()]
+    return doc[returns_idx:]
+
+
 # ---------------------------------------------------------------------------
 # Helper: _keywords_in_proximity
 # ---------------------------------------------------------------------------
