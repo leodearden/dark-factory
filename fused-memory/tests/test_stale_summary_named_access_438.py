@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from fused_memory.backends.graphiti_client import (
+    EdgeDict,
     StaleSummaryResult,
 )
 
@@ -94,8 +95,8 @@ class TestRebuildEntitySummariesNamedAccess:
         """rebuild_entity_summaries routes per-entity edges from result.all_edges correctly."""
         backend = make_backend(mock_config)
         stale_list = [{'uuid': 'u1', 'name': 'A', 'summary': 'old', 'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 1, 'summary_line_count': 1}]
-        per_entity_edges = [{'fact': 'new'}]
-        all_edges = {'u1': per_entity_edges}
+        per_entity_edges: list[EdgeDict] = [{'uuid': 'e-1', 'fact': 'new', 'name': 'knows'}]
+        all_edges: dict[str, list[EdgeDict]] = {'u1': per_entity_edges}
 
         detect_result = StaleSummaryResult(
             stale=stale_list,

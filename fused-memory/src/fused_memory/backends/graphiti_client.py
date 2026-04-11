@@ -4,8 +4,9 @@ import asyncio
 import contextlib
 import logging
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any, NamedTuple, cast
+from typing import Any, NamedTuple, TypedDict, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
@@ -24,13 +25,25 @@ from fused_memory.config.schema import FusedMemoryConfig
 logger = logging.getLogger(__name__)
 
 
+class EdgeDict(TypedDict):
+    """Normalised edge dict returned by GraphitiBackend._edge_dict.
+
+    Consumed by get_valid_edges_for_node, get_all_valid_edges,
+    _canonical_facts, and _rebuild_entity_from_edges.
+    """
+
+    uuid: str
+    fact: str
+    name: str
+
+
 class StaleSummaryResult(NamedTuple):
     """Structured return type for _detect_stale_summaries_with_edges.
 
     Use named attribute access — the canonical idiom after Task 438/465:
 
     - ``result.stale`` — list of stale entity dicts (each has uuid, name, summary, etc.)
-    - ``result.all_edges`` — dict[uuid, list[dict]] of valid edges for every scanned entity
+    - ``result.all_edges`` — dict[uuid, list[EdgeDict]] of valid edges for every scanned entity
     - ``result.total_count`` — total number of entity nodes scanned
 
     Because StaleSummaryResult is a NamedTuple (a tuple subclass), positional
@@ -39,7 +52,7 @@ class StaleSummaryResult(NamedTuple):
     """
 
     stale: list[dict]
-    all_edges: dict[str, list[dict]]
+    all_edges: dict[str, list[EdgeDict]]
     total_count: int
 
 
@@ -439,7 +452,7 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
-    async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[dict]:
+    async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[EdgeDict]:
         """Return all currently-valid RELATES_TO edges for an Entity node.
 
         Matches the node as either source or target (undirected) and filters
@@ -464,7 +477,7 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
-    async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[dict]]:
+    async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[EdgeDict]]:
         """Return all currently-valid RELATES_TO edges grouped by entity UUID.
 
         Bulk variant of get_valid_edges_for_node that issues a single Cypher query
@@ -497,7 +510,7 @@ class GraphitiBackend:
             'RETURN DISTINCT n.uuid, e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher)
-        grouped: dict[str, list[dict]] = {}
+        grouped: dict[str, list[EdgeDict]] = {}
         for row in (result.result_set or []):
             entity_uuid = row[0]
             grouped.setdefault(entity_uuid, []).append(self._edge_dict(row[1], row[2], row[3]))
@@ -783,21 +796,32 @@ class GraphitiBackend:
         return rows[0][0]
 
     @staticmethod
-    def _edge_dict(uuid: str, fact: str | None, name: str | None) -> dict:
+    def _edge_dict(uuid: str, fact: str | None, name: str | None) -> EdgeDict:
         """Build a normalised edge dict, coercing NULL fact/name to empty string.
 
         Args:
-            uuid: Edge UUID.
+            uuid: Edge UUID. Must not be None — a NULL uuid from the graph would
+                propagate silently through downstream callers and is treated as
+                a hard error.
             fact: Edge fact text, or None when the property is NULL in the graph.
             name: Edge name, or None when the property is NULL in the graph.
 
         Returns:
-            Dict with keys: uuid, fact, name. fact and name default to '' when None.
+            EdgeDict with keys: uuid, fact, name. fact and name default to '' when None.
+
+        Raises:
+            ValueError: If uuid is None.
         """
-        return {'uuid': uuid, 'fact': fact or '', 'name': name or ''}
+        if uuid is None:
+            raise ValueError('edge uuid must not be None')
+        return {
+            'uuid': uuid,
+            'fact': fact if fact is not None else '',
+            'name': name if name is not None else '',
+        }
 
     @staticmethod
-    def _canonical_facts(edges: list[dict]) -> list[str]:
+    def _canonical_facts(edges: Sequence[Mapping[str, Any]]) -> list[str]:
         """Deduplicate edge facts preserving insertion order, skipping missing/falsy values.
 
         Args:
@@ -908,7 +932,7 @@ class GraphitiBackend:
         Returns:
             StaleSummaryResult with fields:
               .stale       - list of stale entity dicts
-              .all_edges   - dict[uuid, list[dict]] of valid edges for all entities
+              .all_edges   - dict[uuid, list[EdgeDict]] of valid edges for all entities
               .total_count - total number of entity nodes scanned
         """
         entities = await self.list_entity_nodes(group_id=group_id)
@@ -1036,7 +1060,7 @@ class GraphitiBackend:
         return result.stale
 
     async def _rebuild_entity_from_edges(
-        self, uuid: str, name: str, edges: list[dict], *, group_id: str,
+        self, uuid: str, name: str, edges: list[EdgeDict], *, group_id: str,
         old_summary: str,
     ) -> dict[str, Any]:
         """Rebuild one Entity node's summary from pre-fetched edges.
@@ -1120,7 +1144,7 @@ class GraphitiBackend:
         """
         # Declare before if/else for explicit scoping — all branches assign these.
         targets: list[dict] = []
-        all_edges: dict[str, list[dict]] = {}
+        all_edges: dict[str, list[EdgeDict]] = {}
         total_entities: int = 0
 
         if force:

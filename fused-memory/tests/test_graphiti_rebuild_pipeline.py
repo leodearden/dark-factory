@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from fused_memory.backends.graphiti_client import (
+    EdgeDict,
     GraphitiBackend,
     StaleSummaryResult,
 )
@@ -30,14 +31,14 @@ class TestStaleSummaryResult:
     def test_named_attribute_stale(self):
         """StaleSummaryResult.stale holds the stale list."""
         stale_list = [{'uuid': 'u1', 'name': 'Alice'}]
-        edges = {'u1': [{'fact': 'fact1'}]}
+        edges: dict[str, list[EdgeDict]] = {'u1': [{'uuid': 'e-1', 'fact': 'fact1', 'name': 'knows'}]}
         result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=5)
         assert result.stale is stale_list
 
     def test_named_attribute_all_edges(self):
         """StaleSummaryResult.all_edges holds the edges dict."""
         stale_list: list[dict] = []
-        edges = {'u1': [{'fact': 'fact1'}]}
+        edges: dict[str, list[EdgeDict]] = {'u1': [{'uuid': 'e-1', 'fact': 'fact1', 'name': 'knows'}]}
         result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=3)
         assert result.all_edges is edges
 
@@ -418,7 +419,9 @@ class TestRebuildEntitySummariesDataFlow:
         """total_entities in result matches _detect_stale_summaries_with_edges.total_count."""
         backend = make_backend(mock_config)
         stale_list = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'old'}]
-        all_edges = {'u1': [{'fact': 'Alice knows Bob'}]}
+        all_edges: dict[str, list[EdgeDict]] = {
+            'u1': [{'uuid': 'e-1', 'fact': 'Alice knows Bob', 'name': 'knows'}]
+        }
         # total_count=10 means 10 entities exist but only 1 is stale
         detect_result = StaleSummaryResult(stale=stale_list, all_edges=all_edges, total_count=10)
         backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
