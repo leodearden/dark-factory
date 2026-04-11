@@ -192,6 +192,30 @@ def func_b():
 '''
 
 
+def _assert_violation_output(stdout: str, bad_file: Path) -> None:
+    """Assert that checker stdout matches the violation-report contract.
+
+    Checks: full bad_file path present, line-3 reference present,
+    assert_not_awaited keyword present, assert_not_called keyword present.
+
+    Shared by TestCliExitCodes (sys.executable) and TestHooksIntegration
+    Case 3 (python3 -I -S) so both tests track the same output contract
+    from a single source of truth.
+    """
+    assert str(bad_file) in stdout, (
+        f'Expected bad_file path in violation output, got: {stdout!r}'
+    )
+    assert ':3:' in stdout, (
+        f'Expected line-3 reference in violation output, got: {stdout!r}'
+    )
+    assert 'assert_not_awaited' in stdout, (
+        f'Expected assert_not_awaited in violation output, got: {stdout!r}'
+    )
+    assert 'assert_not_called' in stdout, (
+        f'Expected assert_not_called in violation output, got: {stdout!r}'
+    )
+
+
 class TestCliExitCodes:
     """CLI exit-code contract: 1 on violations, 0 on clean input."""
 
@@ -205,12 +229,7 @@ class TestCliExitCodes:
             text=True,
         )
         assert result.returncode == 1
-        output = result.stdout
-        assert str(bad_file) in output
-        # assert_not_called is on line 3 of _MIXED_STYLE_SOURCE
-        assert ':3:' in output
-        assert 'assert_not_awaited' in output
-        assert 'assert_not_called' in output
+        _assert_violation_output(result.stdout, bad_file)
 
     def test_cli_main_exits_zero_on_clean_file(self, tmp_path: Path):
         """Clean file (styles in different functions) → returncode 0, stdout empty."""
@@ -279,25 +298,34 @@ class TestHooksIntegration:
         Word-boundary regex r'\\bpython3(?:\\.\\d+)?\\b' accepts plain `python3`, versioned
         `python3.11`, and absolute paths like `/usr/bin/python3` or `/usr/bin/env python3`,
         while rejecting bare `python` (Python 2) or `mypython3` (word-boundary failure).
-        The `fused-memory/tests` assertion verifies the scan target is present on the same
-        invocation line, absorbing the purpose of the former existence-check test.
+
+        The filter checks `'check_asyncmock_assertion_style.py' in line.split('#')[0]` so that
+        the script name must appear in the non-comment portion of the line. This excludes both
+        full-line bash comments (`# See check_asyncmock_assertion_style.py`) and inline comments
+        (`echo ok # run check_asyncmock_assertion_style.py`). Without this, either comment form
+        would land in invocation_lines and fail the python3/no-uv-run assertions on a benign edit.
+
+        The `fused-memory/tests` scan-target assertion is applied at file level (not per line)
+        so a future shell-variable refactor like `TESTS_DIR=fused-memory/tests; python3 .../check.py
+        "$TESTS_DIR"` does not break the test — the literal still appears in the hook file, just
+        not necessarily on the same line as the python3 invocation.
         """
         hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
         content = hooks_path.read_text(encoding='utf-8')
         invocation_lines = [
             line for line in content.splitlines()
-            if 'check_asyncmock_assertion_style.py' in line
+            if 'check_asyncmock_assertion_style.py' in line.split('#')[0]
         ]
         assert invocation_lines, 'No invocation of check_asyncmock_assertion_style.py found in hooks/project-checks'
+        assert 'fused-memory/tests' in content, (
+            'Expected fused-memory/tests scan target to appear somewhere in hooks/project-checks'
+        )
         for line in invocation_lines:
             assert re.search(r'\bpython3(?:\.\d+)?\b', line), (
                 f'Expected a python3 token (plain, versioned, or absolute path), got: {line!r}'
             )
             assert 'uv run' not in line, (
                 f'Found uv run in asyncmock check invocation (should use plain python3): {line!r}'
-            )
-            assert 'fused-memory/tests' in line, (
-                f'Expected fused-memory/tests scan target on invocation line, got: {line!r}'
             )
 
     def test_script_runs_under_isolated_python3_proves_stdlib_only(self, tmp_path: Path):
@@ -314,17 +342,22 @@ class TestHooksIntegration:
         The test skips cleanly when `python3` is not found so CI environments without it
         surface 'skipped' rather than a confusing FileNotFoundError.
 
-        Two cases are exercised under isolation:
+        Three cases are exercised under isolation:
           1. Empty directory: no test_*.py → zero targets → exit 0, empty stdout.
              Proves the stdlib-only invariant at interpreter startup.
           2. Non-empty directory: a clean test file → parse/scan runs → exit 0, empty stdout.
              Proves the parse/find_violations code paths also stay stdlib-only; a
              third-party import added inside a scan-triggered code path would still fail loudly.
+          3. Violation file: bad test file → parse/scan runs → exit 1, stdout has violation.
+             Proves the print-violations branch (script lines 172-173) also stays stdlib-only;
+             a third-party import added only inside the violation-formatting code path would
+             slip past Cases 1 and 2 but fail loudly here.
         """
         if shutil.which('python3') is None:
             pytest.skip('python3 not found on PATH — cannot verify hook runtime assumption')
 
         # --- Case 1: empty directory (startup + import isolation) ---
+        # Uses PATH python3 (not sys.executable) on purpose: mirrors the hook's runtime.
         result = subprocess.run(
             ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
             capture_output=True,
@@ -357,6 +390,23 @@ class TestHooksIntegration:
         assert result2.stdout == '', (
             f'Expected empty stdout (clean file, no violations), got: {result2.stdout!r}'
         )
+
+        # --- Case 3: violation file (print-violations branch isolation) ---
+        # Scans bad_file directly (not tmp_path) so this case is self-contained and
+        # does not depend on Case 2's test_clean.py artifact remaining in tmp_path.
+        bad_file = tmp_path / 'test_bad.py'
+        bad_file.write_text(_MIXED_STYLE_SOURCE)
+        result3 = subprocess.run(
+            ['python3', '-I', '-S', str(SCRIPT_PATH), str(bad_file)],
+            capture_output=True,
+            text=True,
+        )
+        assert result3.returncode == 1, (
+            f'Script should exit 1 (violations found) under python3 -I -S, got {result3.returncode}:\n'
+            f'  stdout: {result3.stdout!r}\n'
+            f'  stderr: {result3.stderr!r}'
+        )
+        _assert_violation_output(result3.stdout, bad_file)
 
 
 class TestCliErrorHandling:
