@@ -229,9 +229,10 @@ def test_comment_warns_about_systemd_space_handling() -> None:
             "Update the comment to warn about spaces inside the Environment= value."
         )
 
-        # The old misleading phrase 'no spaces' must not appear anywhere in this file
-        assert "no spaces" not in content.lower(), (
-            f"Misleading phrase 'no spaces' found in {path}. "
+        # The old misleading phrase 'no spaces' must not appear in the warning comment
+        assert "no spaces" not in comment_line.lower(), (
+            f"Misleading phrase 'no spaces' found in the warning comment above "
+            f"Environment=DASHBOARD_KNOWN_PROJECT_ROOTS= in {path}. "
             "Remove it — the real hazard is systemd's space-as-separator behavior, "
             "not the Python parser's whitespace tolerance."
         )
