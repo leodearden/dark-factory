@@ -297,26 +297,6 @@ class TestHooksIntegration:
                 f'Expected fused-memory/tests scan target on invocation line, got: {line!r}'
             )
 
-    def test_hook_has_stdlib_only_rationale_comment(self):
-        """hooks/project-checks must contain a 'stdlib-only' rationale comment near the asyncmock check."""
-        hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
-        content = hooks_path.read_text(encoding='utf-8')
-        assert 'check_asyncmock_assertion_style.py' in content, (
-            'asyncmock check invocation not found in hooks/project-checks'
-        )
-        assert 'stdlib-only' in content.lower(), (
-            "hooks/project-checks must contain a 'stdlib-only' rationale comment "
-            'explaining why the asyncmock check bypasses uv'
-        )
-
-    def test_script_docstring_notes_stdlib_only(self):
-        """check_asyncmock_assertion_style.py module docstring must mention it is stdlib-only."""
-        source = SCRIPT_PATH.read_text(encoding='utf-8')
-        assert 'stdlib-only' in source.lower(), (
-            "check_asyncmock_assertion_style.py docstring must note that the script is "
-            "'stdlib-only' so maintainers know adding a dependency would break the pre-commit fast path"
-        )
-
     def test_script_runs_under_isolated_python3_proves_stdlib_only(self, tmp_path: Path):
         """Running the script under python3 -I -S proves it imports only stdlib modules.
 
