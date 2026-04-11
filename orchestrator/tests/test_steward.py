@@ -92,7 +92,7 @@ def steward(worktree, mock_config, mock_queue, mock_mcp, mock_briefing):
 
 def _make_result(
     cost=1.0, turns=5, session_id='sess-abc', success=True,
-    duration_ms=5000, stderr='',
+    duration_ms=5000, stderr='', timed_out=False,
 ):
     from shared.cli_invoke import AgentResult
     return AgentResult(
@@ -103,6 +103,7 @@ def _make_result(
         duration_ms=duration_ms,
         turns=turns,
         session_id=session_id,
+        timed_out=timed_out,
     )
 
 
@@ -693,6 +694,61 @@ class TestStewardTimeoutKillRecovery:
         steward.escalation_queue.submit.assert_not_called()
         assert steward._retry_counts.get('esc-42-77', 0) == 0
         assert steward.metrics.timeouts_recovered == 1
+
+    async def test_structured_timed_out_flag_triggers_recovery(
+        self, steward, mock_config,
+    ):
+        """timed_out=True with empty stderr must still trigger recovery (primary signal)."""
+        mock_config.steward_max_attempts = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False,
+                stderr='',  # empty — only structured field can drive recovery
+                timed_out=True,
+                cost=1.5,
+                turns=3,
+                session_id='sess-killed',
+            )
+            await steward._handle_escalation(esc)
+
+        assert steward._retry_counts.get('esc-42-1', 0) == 0
+        assert steward.metrics.timeouts_recovered == 1
+        assert steward._timeout_counts.get('esc-42-1') == 1
+
+    async def test_partial_stderr_match_is_not_treated_as_timeout(
+        self, steward, mock_config,
+    ):
+        """Contains 'Process killed after' but lacks 'timeout' token and timed_out=False.
+
+        Pins the AND-discipline of the stderr fallback: a future loosening
+        (e.g. removing the 'timeout' token check) would fail this test.
+        """
+        mock_config.steward_max_attempts = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False,
+                stderr='note: previously Process killed after foo',
+                timed_out=False,
+                cost=0.5,
+            )
+            await steward._handle_escalation(esc)
+
+        # Consumed a retry (not treated as timeout)
+        assert steward._retry_counts.get('esc-42-1', 0) == 1
+        assert steward.metrics.timeouts_recovered == 0
+        assert steward._timeout_counts.get('esc-42-1', 0) == 0
 
 
 # ---------------------------------------------------------------------------
