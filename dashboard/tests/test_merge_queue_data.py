@@ -94,6 +94,8 @@ async def empty_merge_events_conn(empty_merge_events_db):
 # ---------------------------------------------------------------------------
 
 from dashboard.data.merge_queue import (  # noqa: E402
+    _align_bucket,
+    _bucket_minutes_for_window,
     aggregate_latency_stats,
     aggregate_outcome_distribution,
     aggregate_queue_depth_timeseries,
@@ -105,6 +107,74 @@ from dashboard.data.merge_queue import (  # noqa: E402
     recent_merges,
     speculative_stats,
 )
+
+# ---------------------------------------------------------------------------
+# TestBucketMinutesForWindow
+# ---------------------------------------------------------------------------
+
+class TestBucketMinutesForWindow:
+    @pytest.mark.parametrize('hours,expected', [
+        (1, 15),
+        (24, 15),
+        (25, 60),
+        (168, 60),
+        (169, 360),
+        (720, 360),
+        (721, 1440),
+        (87600, 1440),
+    ])
+    def test_ladder_tiers(self, hours, expected):
+        assert _bucket_minutes_for_window(hours) == expected
+
+
+# ---------------------------------------------------------------------------
+# TestAlignBucket
+# ---------------------------------------------------------------------------
+
+class TestAlignBucket:
+    def test_15min_alignment(self):
+        """12:07:30 → 15-min bucket 12:00:00."""
+        t = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        result = _align_bucket(t, 15)
+        assert result == datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+
+    def test_60min_alignment(self):
+        """12:07:30 → 60-min bucket 12:00:00."""
+        t = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        result = _align_bucket(t, 60)
+        assert result == datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+
+    def test_360min_alignment_at_12_07(self):
+        """12:07:30 → 360-min (6h) bucket 12:00:00."""
+        t = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        result = _align_bucket(t, 360)
+        assert result == datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+
+    def test_360min_alignment_at_14_07(self):
+        """14:07:30 → 360-min (6h) bucket 12:00:00."""
+        t = datetime(2026, 4, 11, 14, 7, 30, tzinfo=UTC)
+        result = _align_bucket(t, 360)
+        assert result == datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+
+    def test_1440min_alignment_at_23_50(self):
+        """23:50:00 → 1440-min (1d) bucket 00:00:00 same day."""
+        t = datetime(2026, 4, 11, 23, 50, 0, tzinfo=UTC)
+        result = _align_bucket(t, 1440)
+        assert result == datetime(2026, 4, 11, 0, 0, 0, tzinfo=UTC)
+
+    def test_1440min_alignment_at_00_02(self):
+        """00:02:00 → 1440-min (1d) bucket 00:00:00 same day."""
+        t = datetime(2026, 4, 11, 0, 2, 0, tzinfo=UTC)
+        result = _align_bucket(t, 1440)
+        assert result == datetime(2026, 4, 11, 0, 0, 0, tzinfo=UTC)
+
+    def test_1440min_alignment_preserves_timezone(self):
+        """Result is UTC-aware."""
+        t = datetime(2026, 4, 11, 15, 30, 0, tzinfo=UTC)
+        result = _align_bucket(t, 1440)
+        assert result.tzinfo is not None
+        assert result == datetime(2026, 4, 11, 0, 0, 0, tzinfo=UTC)
+
 
 # ---------------------------------------------------------------------------
 # TestQueueDepthTimeseries
