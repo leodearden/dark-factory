@@ -310,11 +310,16 @@ class TaskSteward:
         # The escalation remains pending so the run loop re-queues it naturally.
         if _is_timeout_kill(result):
             self.metrics.timeouts_recovered += 1
+            self._timeout_counts[escalation.id] = (
+                self._timeout_counts.get(escalation.id, 0) + 1
+            )
             logger.warning(
                 f'Steward for task {self.task_id}: invocation timed out after '
                 f'{self.config.timeouts.steward:.0f}s — treating as recoverable, '
                 f'retry_count NOT incremented (escalation remains pending: '
-                f'{escalation.id})'
+                f'{escalation.id}, timeout_count: '
+                f'{self._timeout_counts[escalation.id]}/'
+                f'{self.config.steward_max_timeouts_per_escalation})'
             )
             return
 
