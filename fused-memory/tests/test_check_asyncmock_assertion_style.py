@@ -70,3 +70,32 @@ async def test_only_not_awaited():
 '''
         violations = find_violations(source, 'test_only_not_awaited.py')
         assert violations == []
+
+
+class TestFindViolationsPerFunctionScoping:
+    """Rule is per-function, not per-class or per-module."""
+
+    def test_scopes_per_function_not_per_class_or_module(self):
+        """Two methods in the same class — each style in a different method — no violation."""
+        source = '''\
+class TestMyClass:
+    def method_a(self):
+        backend.get_edges.assert_not_awaited()
+
+    def method_b(self):
+        backend.get_nodes.assert_not_called()
+'''
+        violations = find_violations(source, 'test_scoped.py')
+        assert violations == []
+
+    def test_module_level_functions_scoped_independently(self):
+        """Module-level assert_not_awaited in func_a + assert_not_called in func_b — no violation."""
+        source = '''\
+def func_a():
+    mock.foo.assert_not_awaited()
+
+def func_b():
+    mock.bar.assert_not_called()
+'''
+        violations = find_violations(source, 'test_module_scoped.py')
+        assert violations == []
