@@ -8,6 +8,7 @@ connection; route handlers read via DbPool (read-only).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -126,30 +127,37 @@ async def collect_snapshot(
         return_exceptions=True,
     )
 
-    # Phase 3 — Sequential insert:
+    # Phase 3 — Sequential insert (per-project commit):
     # aiosqlite serialises writes on a single connection; keep inserts sequential.
+    # Each project gets its own INSERT + commit so a DB failure on one project
+    # cannot roll back rows that were already committed for earlier projects.
+    # Main project is always roots_to_snapshot[0], so its commit fires first.
     # Skip any roots whose load raised — log and continue so other snapshots commit.
     for (root_str, _), tasks in zip(roots_to_snapshot, all_tasks, strict=True):
         if isinstance(tasks, BaseException):
             logger.warning('Failed to load tasks for %s', root_str, exc_info=tasks)
             continue
         counts = _count_statuses(tasks)
-        await conn.execute(
-            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            (
-                root_str,
-                now,
-                counts['pending'],
-                counts['in_progress'],
-                counts['blocked'],
-                counts['deferred'],
-                counts['cancelled'],
-                counts['done'],
-            ),
-        )
-
-    await conn.commit()
+        try:
+            await conn.execute(
+                'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                (
+                    root_str,
+                    now,
+                    counts['pending'],
+                    counts['in_progress'],
+                    counts['blocked'],
+                    counts['deferred'],
+                    counts['cancelled'],
+                    counts['done'],
+                ),
+            )
+            await conn.commit()
+        except Exception:
+            logger.warning('Failed to insert snapshot for %s', root_str, exc_info=True)
+            with contextlib.suppress(Exception):
+                await conn.rollback()
 
 
 async def downsample(conn: aiosqlite.Connection) -> None:
