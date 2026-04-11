@@ -376,7 +376,7 @@ class TestRunEvalMatrixCancellation:
             )
 
         # (d) Identity check: BOTH distinct instances must appear — not the same one twice
-        logged_exc_vals = {record.exc_info[1] for record in cancel_records}
+        logged_exc_vals = {record.exc_info[1] for record in cancel_records if record.exc_info is not None}
         assert logged_exc_vals == {ce_a, ce_b}, (
             f'Expected both CancelledError instances to be logged (identity check). '
             f'Logged exc_val set: {logged_exc_vals!r}  '
