@@ -1745,3 +1745,57 @@ class TestCollectSnapshotExplicitRollback:
         assert rollback_calls, (
             'Expected conn.rollback() to be called before re-raising the RuntimeError'
         )
+
+
+# ---------------------------------------------------------------------------
+# Docstring contract (#13 — partial-failure semantics)
+# ---------------------------------------------------------------------------
+
+
+class TestCollectSnapshotDocstringContract:
+    """Verify that collect_snapshot's docstring documents all four partial-failure facts.
+
+    This test is written in TDD red-phase for step-8 of task 539.  It fails
+    before the docstring is updated, because the current one-liner says nothing
+    about main-first commit order, orchestrator degradation, per-project
+    best-effort inserts, or explicit rollback.
+    """
+
+    def test_docstring_documents_partial_failure_semantics(self):
+        """collect_snapshot.__doc__ must mention all four partial-failure facts.
+
+        Assertions are intentionally flexible on exact wording:
+        (a) main project is committed first (before extras can fail).
+        (b) orchestrator discovery is best-effort / degrades on failure.
+        (c) extra inserts are per-project / best-effort.
+        (d) an explicit rollback is performed on unexpected errors.
+        """
+        doc = (collect_snapshot.__doc__ or '').lower()
+
+        # (a) main committed first
+        assert 'main' in doc and ('first' in doc or 'before' in doc or 'commit' in doc), (
+            'Docstring must mention that the main project is committed first; '
+            f'got: {collect_snapshot.__doc__!r}'
+        )
+
+        # (b) orchestrator discovery degradation
+        assert 'orchestrator' in doc and (
+            'best-effort' in doc or 'skip' in doc or 'degrad' in doc or 'fail' in doc
+        ), (
+            'Docstring must mention orchestrator discovery degradation; '
+            f'got: {collect_snapshot.__doc__!r}'
+        )
+
+        # (c) per-project / best-effort extras
+        assert 'per-project' in doc or (
+            'extra' in doc and ('best-effort' in doc or 'isolated' in doc or 'independent' in doc)
+        ), (
+            'Docstring must mention per-project or best-effort extra inserts; '
+            f'got: {collect_snapshot.__doc__!r}'
+        )
+
+        # (d) explicit rollback
+        assert 'rollback' in doc, (
+            'Docstring must mention explicit rollback on unexpected error; '
+            f'got: {collect_snapshot.__doc__!r}'
+        )
