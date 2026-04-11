@@ -1593,6 +1593,12 @@ class TestRebuildEntitySummariesTypeGuard:
           - the type name ('NoneType')
           - the entity uuid ('uuid-1')
           - the entity name ('Alice')
+
+        Also verifies fail-fast behaviour: asyncio.gather awaits all tasks (both
+        entities are gathered), then the processing loop raises on the first bad
+        result without accumulating any details.  The await_count of 2 pins this
+        contract — if the guard were moved inside _rebuild_one the count would drop
+        to 1 (short-circuit before gather completes).
         """
         backend = two_entity_backend
         backend._rebuild_entity_from_edges = AsyncMock(return_value=None)
@@ -1604,3 +1610,27 @@ class TestRebuildEntitySummariesTypeGuard:
         assert 'NoneType' in msg
         assert 'uuid-1' in msg
         assert 'Alice' in msg
+        # Both entities are gathered before the processing loop runs — the TypeError
+        # is raised during result accumulation, not during the gather phase.
+        assert backend._rebuild_entity_from_edges.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_non_none_non_dict_return_raises_typeerror(self, two_entity_backend):
+        """A non-None non-dict return (e.g. a list) must also trigger the TypeError guard.
+
+        This prevents a future contributor from accidentally special-casing ``None``
+        in the guard and missing other invalid return types.  The type name in the
+        message must reflect the actual type of the returned value.
+        """
+        backend = two_entity_backend
+        backend._rebuild_entity_from_edges = AsyncMock(return_value=[])
+
+        with pytest.raises(TypeError) as exc_info:
+            await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+        msg = str(exc_info.value)
+        assert 'list' in msg
+        assert 'uuid-1' in msg
+        assert 'Alice' in msg
+        # Gather still runs both tasks; TypeError is raised in the result loop.
+        assert backend._rebuild_entity_from_edges.await_count == 2
