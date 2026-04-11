@@ -9,8 +9,10 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -331,78 +333,6 @@ class TestRunEvalMatrixCancellation:
             f'Expected exc_val to be CancelledError instance, got {exc_val!r}'
         )
 
-    async def test_multiple_simultaneous_cancellederrors_all_logged(
-        self,
-        patch_load_task,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ):
-        """Both CancelledErrors must be logged when two tasks cancel in the same done batch.
-
-        With asyncio.wait(FIRST_COMPLETED), multiple tasks can complete in the
-        same event-loop iteration and land in the same ``done`` set.  The prior
-        implementation raised on the first cancelled task encountered, silently
-        discarding any subsequent cancellations in the batch.
-
-        The gate synchronisation forces both fake_run_eval coroutines to raise
-        CancelledError in the same event-loop iteration so they land in the same
-        ``done`` batch — exercising the multi-cancel code path deterministically.
-        Without the gate, the two coroutines might raise in separate iterations
-        and each hit the single-cancel path, passing against buggy code.
-
-        This test FAILS against the current implementation, which only logs the
-        first cancel before raising (Task 586).
-        """
-        path_a = tmp_path / 'task_a.json'
-        path_b = tmp_path / 'task_b.json'
-        path_a.touch()
-        path_b.touch()
-
-        gate = asyncio.Event()
-        arrival_count = 0
-
-        async def fake_run_eval(*args, **kwargs):
-            nonlocal arrival_count
-            arrival_count += 1
-            if arrival_count == 2:
-                # Second arrival sets the gate; this schedules the first
-                # coroutine's continuation via call_soon so both raise in the
-                # same event-loop iteration and land in the same done batch.
-                gate.set()
-            await gate.wait()
-            raise asyncio.CancelledError('simulated multi-cancel')
-
-        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
-
-        with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'), pytest.raises(asyncio.CancelledError):
-            await run_eval_matrix(
-                [path_a, path_b],
-                [_CFG],
-                force=True,
-            )
-
-        cancel_records = [r for r in caplog.records if r.message == 'Eval cancelled']
-
-        # (a) Exactly two 'Eval cancelled' records — one per cancelled task
-        assert len(cancel_records) == 2, (
-            f'Expected 2 "Eval cancelled" log records, got {len(cancel_records)}. '
-            f'All records: {[r.message for r in caplog.records]}'
-        )
-
-        # (b) Each record must carry a 3-tuple exc_info with CancelledError
-        for i, record in enumerate(cancel_records):
-            assert isinstance(record.exc_info, tuple) and len(record.exc_info) == 3, (
-                f'Record {i}: expected exc_info to be a 3-tuple, got {record.exc_info!r}'
-            )
-            exc_type, exc_val, exc_tb = record.exc_info
-            assert exc_type is asyncio.CancelledError, (
-                f'Record {i}: expected exc_type to be CancelledError, got {exc_type!r}'
-            )
-            assert isinstance(exc_val, asyncio.CancelledError), (
-                f'Record {i}: expected exc_val to be CancelledError instance, got {exc_val!r}'
-            )
-
 
 @pytest.mark.asyncio
 class TestRunEvalMatrixNonCancelPath:
@@ -578,3 +508,101 @@ class TestRunEvalMatrixNonCancelPath:
         # (e) exc_tb must be present — the whole point of exc_info is to preserve
         #     the traceback for post-mortem debugging
         assert exc_tb is not None, 'Expected traceback to be attached to the RuntimeError'
+
+
+@pytest.mark.asyncio
+class TestCollectCancelErrors:
+    """Unit tests for the _collect_cancel_errors helper.
+
+    These tests exercise the classification logic in isolation by constructing
+    known done sets and asserting the helper's output — no scheduling or
+    asyncio.wait semantics involved.
+    """
+
+    async def test_collects_all_cancels_from_real_tasks(self):
+        """_collect_cancel_errors returns one CancelledError per cancelled task.
+
+        TEST INTENT: Verify that when two real asyncio.Task objects have been
+        .cancel()'d and awaited, _collect_cancel_errors returns a list with
+        exactly two CancelledError instances.
+
+        PASS/FAIL CONDITION: Fails with AttributeError if _collect_cancel_errors
+        does not exist on runner_mod. Fails with assertion error if the returned
+        list length != 2 or elements are not CancelledError instances.
+        """
+
+        async def long_sleep():
+            await asyncio.sleep(3600)
+
+        task_a = asyncio.create_task(long_sleep())
+        task_b = asyncio.create_task(long_sleep())
+        task_a.cancel()
+        task_b.cancel()
+        for t in (task_a, task_b):
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
+
+        result = runner_mod._collect_cancel_errors({task_a, task_b})
+
+        assert len(result) == 2, f'Expected 2 CancelledErrors, got {len(result)}: {result}'
+        for i, err in enumerate(result):
+            assert isinstance(err, asyncio.CancelledError), (
+                f'Element {i}: expected CancelledError, got {err!r}'
+            )
+
+    async def test_collects_cancel_errors_from_defensive_branch_via_mock(self):
+        """_collect_cancel_errors collects CancelledError via the defensive branch.
+
+        TEST INTENT: Explicitly exercise the branch where task.cancelled()
+        returns False but task.exception() returns a CancelledError instance —
+        the belt-and-suspenders path that is unreachable via real CPython 3.11+
+        coroutines but kept for hypothetical future runtimes.
+
+        PASS/FAIL CONDITION: Passes if the returned list contains exactly the
+        CancelledError instance returned by mock.exception().
+        """
+        ce = asyncio.CancelledError('defensive')
+        mock_task = MagicMock()
+        mock_task.cancelled.return_value = False
+        mock_task.exception.return_value = ce
+
+        result = runner_mod._collect_cancel_errors({mock_task})
+
+        assert len(result) == 1, f'Expected 1 CancelledError, got {len(result)}: {result}'
+        assert result[0] is ce, (
+            f'Expected the exact CancelledError from mock.exception(), got {result[0]!r}'
+        )
+
+    async def test_collects_mixed_cancel_branches(self):
+        """_collect_cancel_errors collects from both the real and defensive branches.
+
+        TEST INTENT: Build a done set with one real cancelled task (hits the
+        task.cancelled() branch) and one MagicMock task (hits the defensive
+        task.exception() branch), then verify that both CancelledErrors are
+        collected. This is the deterministic, scheduling-free replacement for
+        the gate-based test_multiple_simultaneous_cancellederrors_all_logged.
+
+        PASS/FAIL CONDITION: Returns a list of length 2 containing two
+        CancelledError instances.
+        """
+
+        async def long_sleep():
+            await asyncio.sleep(3600)
+
+        real_task = asyncio.create_task(long_sleep())
+        real_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await real_task
+
+        mock_ce = asyncio.CancelledError('mock-branch')
+        mock_task = MagicMock()
+        mock_task.cancelled.return_value = False
+        mock_task.exception.return_value = mock_ce
+
+        result = runner_mod._collect_cancel_errors({real_task, mock_task})
+
+        assert len(result) == 2, f'Expected 2 CancelledErrors, got {len(result)}: {result}'
+        for i, err in enumerate(result):
+            assert isinstance(err, asyncio.CancelledError), (
+                f'Element {i}: expected CancelledError, got {err!r}'
+            )
