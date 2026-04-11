@@ -126,6 +126,7 @@ class _SubprocessResult:
     stderr: str
     returncode: int
     duration_ms: int
+    timed_out: bool = False
 
 
 async def invoke_claude_agent(
