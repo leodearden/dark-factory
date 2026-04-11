@@ -513,6 +513,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             output='Agent produced no output',
             subtype='error_empty_output',
             stderr=result.stderr,
+            timed_out=result.timed_out,
         )
 
     try:
@@ -523,6 +524,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             output=result.stdout,
             subtype='text_output',
             stderr=result.stderr,
+            timed_out=result.timed_out,
         )
 
     cost = data.get('cost_usd', data.get('total_cost_usd', 0.0))
@@ -569,6 +571,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_create_tokens=cache_create_tokens,
+        timed_out=result.timed_out,
     )
 
 
