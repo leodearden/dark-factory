@@ -210,6 +210,33 @@ class ReviewConfig(BaseModel):
     reports_dir: str = Field(default='data/review-checkpoints')
 
 
+class FairnessConfig(BaseModel):
+    """Scheduler fairness / anti-starvation configuration.
+
+    When a broad-footprint task keeps losing the greedy lock race to narrow
+    tasks, the scheduler increments a per-task skip counter.  Once the counter
+    reaches ``skip_threshold``, the scheduler installs a short-lived
+    reservation ("park") on every module the starved task wants; parked
+    modules refuse ``try_acquire`` from anyone else until the owner acquires
+    or the lease expires.
+    """
+
+    skip_threshold: int = Field(
+        default=4,
+        description='Consecutive top-candidate skips before installing a reservation.',
+    )
+    lease_multiplier: float = Field(
+        default=5.0,
+        description='Lease duration = median(recent task durations) * multiplier.',
+    )
+    lease_min_secs: float = Field(default=60.0)
+    lease_max_secs: float = Field(default=3600.0)
+    median_window: int = Field(
+        default=50,
+        description='Rolling window size for task-duration history.',
+    )
+
+
 class FusedMemoryConfig(BaseModel):
     """Fused-memory HTTP server connection."""
 
@@ -381,6 +408,9 @@ class OrchestratorConfig(BaseSettings):
 
     # Review checkpoints
     review: ReviewConfig = Field(default_factory=ReviewConfig)
+
+    # Scheduler fairness / anti-starvation
+    fairness: FairnessConfig = Field(default_factory=FairnessConfig)
 
     # Git
     git: GitConfig = Field(default_factory=GitConfig)

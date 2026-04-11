@@ -68,6 +68,12 @@ class EventType(StrEnum):
     task_started = 'task_started'
     task_completed = 'task_completed'
 
+    # Scheduler fairness
+    task_skipped = 'task_skipped'
+    reservation_installed = 'reservation_installed'
+    reservation_expired = 'reservation_expired'
+    reservation_used = 'reservation_used'
+
 
 class EventStore:
     """Append-only SQLite event store.
