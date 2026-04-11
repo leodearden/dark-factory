@@ -1614,13 +1614,21 @@ class TestSchedulerInternalRouting:
     async def test_set_task_status_reads_via_get_cached_status(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """set_task_status() must read the cached value via get_cached_status()."""
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value={}))
-        scheduler._status_cache['42'] = 'in-progress'
+        """set_task_status() must read the cached value via get_cached_status().
 
-        with patch.object(scheduler, 'get_cached_status', wraps=scheduler.get_cached_status) as spy:
-            await scheduler.set_task_status('42', 'done')
-            spy.assert_called_with('42')
+        Stronger invariant: the return value must actually drive the transition
+        gate.  Patching get_cached_status to return 'done' causes done->blocked
+        to be rejected (is_valid_transition('done', 'blocked') is False), so
+        mcp_call is never invoked.  A spy-only assertion would pass even if the
+        production code read _status_cache directly alongside a vestigial
+        get_cached_status() call; this form does not.
+        """
+        mcp_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+
+        with patch.object(scheduler, 'get_cached_status', return_value='done'):
+            await scheduler.set_task_status('42', 'blocked')
+            mcp_mock.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_get_tasks_reads_via_get_cached_status(
@@ -1645,3 +1653,70 @@ class TestSchedulerInternalRouting:
         with patch.object(scheduler, 'get_cached_status', wraps=scheduler.get_cached_status) as spy:
             await scheduler.get_tasks()
             spy.assert_any_call('42')
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_writes_via_set_cached_status(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """set_task_status() must write the new status via _set_cached_status().
+
+        Instance-level rebinding works because Python's attribute lookup finds
+        the instance attribute before the class method, so the production call
+        self._set_cached_status(...) resolves to the recorder.
+
+        The read of scheduler._set_cached_status raises AttributeError until
+        step 3 adds the helper — that is the TDD failing-state signal.
+        """
+        mcp_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+
+        # Pre-seed the cache so is_valid_transition('pending', 'in-progress')
+        # is True regardless of future gate tightening for None->* transitions.
+        scheduler._status_cache['42'] = 'pending'
+
+        recorded: list[tuple[str, str]] = []
+        original = scheduler._set_cached_status  # AttributeError until step 3
+
+        def recorder(task_id: str, status: str) -> None:
+            recorded.append((task_id, status))
+            original(task_id, status)
+
+        scheduler._set_cached_status = recorder  # type: ignore[method-assign]
+
+        await scheduler.set_task_status('42', 'in-progress')
+        assert ('42', 'in-progress') in recorded
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_writes_via_set_cached_status(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """get_tasks() must write the cached status via _set_cached_status().
+
+        Fails (AttributeError on recorder install or missed assertion) until
+        step 5 routes the get_tasks write through the helper.
+        """
+        import json
+
+        tasks_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': json.dumps({'tasks': [{'id': '42', 'status': 'pending', 'title': 'T'}]}),
+                    }
+                ]
+            }
+        }
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value=tasks_response))
+
+        recorded: list[tuple[str, str]] = []
+        original = scheduler._set_cached_status  # AttributeError until step 3
+
+        def recorder(task_id: str, status: str) -> None:
+            recorded.append((task_id, status))
+            original(task_id, status)
+
+        scheduler._set_cached_status = recorder  # type: ignore[method-assign]
+
+        await scheduler.get_tasks()
+        assert ('42', 'pending') in recorded

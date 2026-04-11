@@ -283,7 +283,7 @@ class Scheduler:
                                     '(external reinstatement)',
                                     tid, s, old,
                                 )
-                            self._status_cache[tid] = s
+                            self._set_cached_status(tid, s)
                     return tasks
         except Exception as e:
             logger.error(f'Failed to fetch tasks: {e}')
@@ -311,13 +311,22 @@ class Scheduler:
                 },
                 timeout=15,
             )
-            self._status_cache[task_id] = status
+            self._set_cached_status(task_id, status)
         except Exception as e:
             logger.error(f'Failed to set task {task_id} status to {status}: {e}')
 
     def get_cached_status(self, task_id: str) -> str | None:
         """Return the last known status for a task, or None if not yet seen."""
         return self._status_cache.get(task_id)
+
+    def _set_cached_status(self, task_id: str, status: str) -> None:
+        """Write the cached status for a task.
+
+        Write-side counterpart to get_cached_status().  All internal cache
+        writes funnel through this single helper, mirroring the single read
+        choke-point so both sides are consistently overridable and testable.
+        """
+        self._status_cache[task_id] = status
 
     async def update_task(self, task_id: str, metadata: str | dict) -> bool:
         """Update task metadata via fused-memory. Returns True on success."""
