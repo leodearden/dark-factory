@@ -941,3 +941,14 @@ class TestStewardDefaultConfig:
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.timeouts.steward == 1800.0
+
+    def test_default_steward_max_timeouts_per_escalation_is_3(
+        self, monkeypatch, tmp_path,
+    ):
+        """steward_max_timeouts_per_escalation default must be 3."""
+        from orchestrator.config import OrchestratorConfig
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.steward_max_timeouts_per_escalation == 3
