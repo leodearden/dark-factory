@@ -442,12 +442,11 @@ class TestNearCapStateDistinction:
 
 
 class TestCapHitNowUsingExtraSemantics:
-    """Behavioral tests asserting 'You're now using extra' triggers CAP_HIT, not NEAR_CAP.
+    """Asserts that 'You're now using extra' prefix routes to CAP_HIT (acct.capped=True), not NEAR_CAP.
 
-    'You're now using extra compute credits' means the account has crossed the
-    base plan's hard cap and is billing overage — semantically equivalent to a
-    cap hit, not merely a warning. These tests FAIL until step-3 moves the
-    prefix from NEAR_CAP_PREFIXES to CAP_HIT_PREFIXES.
+    Semantically 'now using extra compute credits' means the account has crossed
+    its base plan's hard cap and is billing overage, so it must close the gate
+    and trigger the resume probe loop, not merely flag near_cap.
     """
 
     # All messages include 'resets' as a secondary keyword so they remain valid
