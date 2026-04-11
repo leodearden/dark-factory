@@ -11,10 +11,10 @@ import pytest
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
     GitOps,
+    ScrubResult,
     WorktreeInfo,
     _run,
     _scrub_task_dir_from_tree,
-    ScrubResult,
 )
 
 
