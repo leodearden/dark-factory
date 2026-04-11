@@ -21,6 +21,7 @@ from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.utils.async_utils import propagate_cancellations
 
 logger = logging.getLogger(__name__)
 
@@ -1193,21 +1194,22 @@ class GraphitiBackend:
                 *(_rebuild_one(t) for t in targets), return_exceptions=True
             )
 
-            # Two-tier check — mirrors the convention in MemoryService.get_entity
-            # (memory_service.py:1000-1013).
-            # Pass 1: propagate structured-cancellation signals immediately.
-            # asyncio.gather(return_exceptions=True) captures *all* BaseException
-            # subclasses, including CancelledError (a BaseException but NOT an Exception
-            # in Python 3.8+).  Re-raising here preserves the structured-cancellation
-            # contract and prevents callers from silently ignoring shutdown signals.
-            for r in results:
-                if isinstance(r, BaseException) and not isinstance(r, Exception):
-                    logger.warning(
-                        'rebuild_entity_summaries: cancellation signal received '
-                        'group=%s rebuilt_so_far=%d errors_so_far=%d; propagating',
-                        group_id, rebuilt, errors,
-                    )
-                    raise r
+            # Two-tier check for asyncio.gather(return_exceptions=True) results.
+            # Pass 1: delegates to propagate_cancellations (fused_memory.utils.async_utils)
+            # — the shared Pass 1 guard used by all gather(return_exceptions=True) callsites.
+            # The try/except wrapper preserves the per-batch warning log (which needs
+            # group_id and per-batch counters that are local to this callsite).
+            # See fused_memory.utils.async_utils.propagate_cancellations for the shared
+            # Pass 1 guard contract.
+            try:
+                propagate_cancellations(results)
+            except BaseException:
+                logger.warning(
+                    'rebuild_entity_summaries: cancellation signal received '
+                    'group=%s rebuilt_so_far=%d errors_so_far=%d; propagating',
+                    group_id, rebuilt, errors,
+                )
+                raise
 
             # Pass 2: per-entity accumulation.  Using isinstance(r, Exception) instead
             # of BaseException ensures that only application-level failures (RuntimeError,
