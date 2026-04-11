@@ -227,6 +227,14 @@ class TaskSteward:
             )
             return
 
+        # Guard: per-escalation timeout-kill cap
+        timeout_count = self._timeout_counts.get(escalation.id, 0)
+        if timeout_count >= self.config.steward_max_timeouts_per_escalation:
+            self._auto_escalate_to_human(
+                escalation, 'Invocation repeatedly timed out',
+            )
+            return
+
         cwd = self.worktree
 
         # Pre-triage large suggestion sets before invoking the steward session

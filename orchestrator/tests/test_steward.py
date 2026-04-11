@@ -777,7 +777,10 @@ class TestStewardTimeoutCap:
         assert 'repeatedly timed out' in submitted_esc.summary.lower()
         # Original escalation was dismissed
         steward.escalation_queue.resolve.assert_called_once_with(
-            esc.id, resolution='dismissed', dismiss=True,
+            esc.id,
+            'Auto-dismissed: re-escalated to level 1 — Invocation repeatedly timed out',
+            dismiss=True,
+            resolved_by='steward',
         )
 
 
