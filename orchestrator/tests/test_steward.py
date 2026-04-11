@@ -509,6 +509,43 @@ class TestStewardTimeoutPassthrough:
 
         assert mock_invoke.call_args.kwargs['timeout_seconds'] == pytest.approx(900.0)
 
+    async def test_timeout_seconds_forwarded_across_cap_hit_retry(
+        self, steward, mock_config,
+    ):
+        """Both the initial and cap-hit-recovery invocations must carry timeout_seconds."""
+        mock_config.timeouts.steward = 900.0
+
+        call_count = 0
+
+        def detect_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return call_count == 1  # cap hit on first call only
+
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='token-a')
+        gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
+        gate.on_agent_complete = MagicMock()
+        gate.confirm_account_ok = MagicMock()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
+            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_invoke.return_value = _make_result(session_id='sess-t')
+            await steward._invoke_with_session(
+                prompt='do work',
+                cwd=steward.worktree,
+                mcp_config={},
+                per_invocation_budget=5.0,
+                escalation=_make_escalation(),
+            )
+
+        assert mock_invoke.call_count == 2
+        for call in mock_invoke.call_args_list:
+            assert call.kwargs['timeout_seconds'] == pytest.approx(900.0)
+
 
 # ---------------------------------------------------------------------------
 # Unified Role
