@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 from collections import defaultdict
 from pathlib import Path
 
 import aiosqlite
 
 from dashboard.data.db import with_db
+from dashboard.data.stats_utils import percentile
 
 logger = logging.getLogger(__name__)
 
@@ -31,18 +31,6 @@ def _load_escalations(escalations_dir: Path) -> list[dict]:
         except (json.JSONDecodeError, OSError):
             continue
     return results
-
-
-def _percentile(sorted_values: list[float], p: float) -> float:
-    """Compute the p-th percentile from a sorted list."""
-    if not sorted_values:
-        return 0.0
-    k = (len(sorted_values) - 1) * (p / 100.0)
-    f = math.floor(k)
-    c = math.ceil(k)
-    if f == c:
-        return sorted_values[int(k)]
-    return sorted_values[f] * (c - k) + sorted_values[c] * (k - f)
 
 
 # ---------------------------------------------------------------------------
@@ -327,10 +315,10 @@ async def get_time_centiles(
                 continue
 
             result[project_id] = {
-                'p50': round(_percentile(durations, 50)),
-                'p75': round(_percentile(durations, 75)),
-                'p90': round(_percentile(durations, 90)),
-                'p95': round(_percentile(durations, 95)),
+                'p50': round(percentile(durations, 50)),
+                'p75': round(percentile(durations, 75)),
+                'p90': round(percentile(durations, 90)),
+                'p95': round(percentile(durations, 95)),
                 'count': len(durations),
             }
 

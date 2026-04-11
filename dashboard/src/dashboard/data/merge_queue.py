@@ -25,7 +25,7 @@ import aiosqlite
 
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.db import with_db
-from dashboard.data.performance import _percentile
+from dashboard.data.stats_utils import percentile
 
 logger = logging.getLogger(__name__)
 
@@ -195,9 +195,9 @@ def _compute_latency_stats(durations: list[float]) -> dict:
     if not durations:
         return {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
     return {
-        'p50': round(_percentile(durations, 50)),
-        'p95': round(_percentile(durations, 95)),
-        'p99': round(_percentile(durations, 99)),
+        'p50': round(percentile(durations, 50)),
+        'p95': round(percentile(durations, 95)),
+        'p99': round(percentile(durations, 99)),
         'count': len(durations),
         'mean_ms': sum(durations) / len(durations),
     }
