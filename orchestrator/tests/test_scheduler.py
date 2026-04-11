@@ -8,6 +8,7 @@ import pytest
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules
+from tests.conftest import _spy_set_cached_status
 
 
 @pytest.fixture
@@ -1663,9 +1664,6 @@ class TestSchedulerInternalRouting:
         Instance-level rebinding works because Python's attribute lookup finds
         the instance attribute before the class method, so the production call
         self._set_cached_status(...) resolves to the recorder.
-
-        The read of scheduler._set_cached_status raises AttributeError until
-        step 3 adds the helper — that is the TDD failing-state signal.
         """
         mcp_mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
@@ -1674,14 +1672,7 @@ class TestSchedulerInternalRouting:
         # is True regardless of future gate tightening for None->* transitions.
         scheduler._status_cache['42'] = 'pending'
 
-        recorded: list[tuple[str, str]] = []
-        original = scheduler._set_cached_status  # AttributeError until step 3
-
-        def recorder(task_id: str, status: str) -> None:
-            recorded.append((task_id, status))
-            original(task_id, status)
-
-        scheduler._set_cached_status = recorder  # type: ignore[method-assign]
+        recorded = _spy_set_cached_status(scheduler)
 
         await scheduler.set_task_status('42', 'in-progress')
         assert ('42', 'in-progress') in recorded
@@ -1692,8 +1683,7 @@ class TestSchedulerInternalRouting:
     ):
         """get_tasks() must write the cached status via _set_cached_status().
 
-        Fails (AttributeError on recorder install or missed assertion) until
-        step 5 routes the get_tasks write through the helper.
+        Verifies get_tasks() writes via the _set_cached_status chokepoint.
         """
         import json
 
@@ -1709,14 +1699,40 @@ class TestSchedulerInternalRouting:
         }
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value=tasks_response))
 
-        recorded: list[tuple[str, str]] = []
-        original = scheduler._set_cached_status  # AttributeError until step 3
-
-        def recorder(task_id: str, status: str) -> None:
-            recorded.append((task_id, status))
-            original(task_id, status)
-
-        scheduler._set_cached_status = recorder  # type: ignore[method-assign]
+        recorded = _spy_set_cached_status(scheduler)
 
         await scheduler.get_tasks()
         assert ('42', 'pending') in recorded
+
+
+class TestSpySetCachedStatus:
+    """Unit tests for the _spy_set_cached_status helper in conftest.py."""
+
+    def test_spy_returns_empty_list_initially(self):
+        """Installing the spy on a fresh object returns an empty list."""
+
+        class Dummy:
+            def _set_cached_status(self, task_id: str, status: str) -> None:
+                pass
+
+        d = Dummy()
+        recorded = _spy_set_cached_status(d)
+        assert recorded == []
+
+    def test_spy_captures_and_forwards_call(self):
+        """The spy captures the call AND forwards it to the original method."""
+
+        class Dummy:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def _set_cached_status(self, task_id: str, status: str) -> None:
+                self.calls.append((task_id, status))
+
+        d = Dummy()
+        recorded = _spy_set_cached_status(d)
+        d._set_cached_status('t1', 's1')
+        # spy captures the call
+        assert ('t1', 's1') in recorded
+        # original is also called (forwarding, not just capturing)
+        assert ('t1', 's1') in d.calls
