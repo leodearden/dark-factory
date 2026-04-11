@@ -82,6 +82,79 @@ class TestKeywordsInProximityHelper:
         )
 
 
+
+# ---------------------------------------------------------------------------
+# Helper: _returns_section_text
+# ---------------------------------------------------------------------------
+
+
+class TestReturnsSectionTextHelper:
+    """Unit tests for the _returns_section_text module-level helper.
+
+    Verifies that the helper correctly bounds the Returns section to avoid the
+    scope-leak where doc[returns_idx:] bleeds into subsequent Raises:/Note:/Example:
+    sections.
+
+    Asserts:
+      (a) returns the full Returns section when no following section header exists
+      (b) returns bounded section when followed by Raises: (scope-leak regression case)
+      (c) returns bounded section when followed by Note:
+      (d) returns bounded section when followed by Example:
+      (e) returns None when no Returns: header exists
+      (f) regression baseline: returns non-empty string for detect_stale_summaries docstring
+    """
+
+    def test_returns_only_section(self) -> None:
+        """Returns the full Returns section when no following section header exists."""
+        doc = 'Docstring intro.\n\nReturns:\n    foo: The foo value.\n'
+        result = _returns_section_text(doc)
+        assert result is not None
+        assert 'foo' in result
+
+    def test_bounded_by_raises(self) -> None:
+        """Returns section is bounded before a following Raises: section.
+
+        This is the scope-leak regression case: the old doc[returns_idx:] approach
+        would include 'ValueError' from the Raises section, masking a regression
+        where the key was removed from Returns.
+        """
+        doc = 'Intro.\n\nReturns:\n    foo: bar\n\nRaises:\n    ValueError: something.\n'
+        result = _returns_section_text(doc)
+        assert result is not None
+        assert 'foo' in result
+        assert 'ValueError' not in result
+
+    def test_bounded_by_note(self) -> None:
+        """Returns section is bounded before a following Note: section."""
+        doc = 'Intro.\n\nReturns:\n    foo: bar\n\nNote:\n    Some note.\n'
+        result = _returns_section_text(doc)
+        assert result is not None
+        assert 'foo' in result
+        assert 'Some note' not in result
+
+    def test_bounded_by_example(self) -> None:
+        """Returns section is bounded before a following Example: section."""
+        doc = 'Intro.\n\nReturns:\n    foo: bar\n\nExample:\n    example_code()\n'
+        result = _returns_section_text(doc)
+        assert result is not None
+        assert 'foo' in result
+        assert 'example_code' not in result
+
+    def test_none_when_no_returns_section(self) -> None:
+        """Returns None when the docstring has no Returns: header."""
+        doc = 'Intro.\n\nArgs:\n    x: some arg\n'
+        result = _returns_section_text(doc)
+        assert result is None
+
+    def test_regression_baseline_detect_stale_summaries(self) -> None:
+        """Regression baseline: returns non-empty string for detect_stale_summaries docstring."""
+        doc = GraphitiBackend.detect_stale_summaries.__doc__
+        assert doc is not None, 'detect_stale_summaries must have a docstring'
+        result = _returns_section_text(doc)
+        assert result is not None, "detect_stale_summaries docstring must have a Returns: section"
+        assert result.strip() != '', 'Returns section must not be blank'
+
+
 # ---------------------------------------------------------------------------
 # step-1: detect_stale_summaries Returns section must include 'summary' key
 # ---------------------------------------------------------------------------
