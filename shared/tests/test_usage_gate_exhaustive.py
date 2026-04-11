@@ -320,6 +320,44 @@ class TestNearCapStateDistinction:
         gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 1h.")
         assert gate._open.is_set() is True
 
+    def test_near_cap_marks_correct_account_by_token(self):
+        """NEAR_CAP message with oauth_token=token_b must set near_cap only on account b."""
+        gate = make_gate(['a', 'b'])
+        token_b = gate._accounts[1].token
+        result = gate.detect_cap_hit(
+            '', "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token=token_b,
+        )
+        assert result is True
+        assert gate._accounts[0].near_cap is False
+        assert gate._accounts[1].near_cap is True
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[1].capped is False
+
+    def test_near_cap_unknown_token_falls_back_to_first_uncapped(self):
+        """NEAR_CAP with an unrecognised oauth_token falls back to the first uncapped account."""
+        gate = make_gate(['a', 'b'])
+        result = gate.detect_cap_hit(
+            '', "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token='unknown-token',
+        )
+        assert result is True
+        assert gate._accounts[0].near_cap is True
+        assert gate._accounts[1].near_cap is False
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[1].capped is False
+
+    def test_near_cap_no_oauth_token_falls_back_to_first_uncapped(self):
+        """NEAR_CAP with oauth_token=None falls back to the first uncapped account."""
+        gate = make_gate(['a', 'b'])
+        result = gate.detect_cap_hit(
+            '', "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token=None,
+        )
+        assert result is True
+        assert gate._accounts[0].near_cap is True
+        assert gate._accounts[1].near_cap is False
+
     def test_near_cap_does_not_start_resume_probe(self):
         """NEAR_CAP must NOT launch a resume probe task."""
         gate = make_gate(['a'], wait_for_reset=True)
@@ -376,6 +414,25 @@ class TestNearCapStateDistinction:
         # (6) Re-detect near_cap — proves the flag can be set again after the clear
         gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 2h.")
         assert acct.near_cap is True
+
+    def test_near_cap_multi_account_isolation_keeps_gate_open(self):
+        """Multi-account: NEAR_CAP on one account leaves the other untouched and gate open.
+
+        Verifies two acceptance criteria together:
+        - Exactly one account gets near_cap=True (the resolved account); the other stays False.
+        - The gate remains open (_open.is_set() is True) because near-cap never closes the gate.
+        """
+        gate = make_gate(['a', 'b'])
+        gate.detect_cap_hit(
+            '', "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token=None,  # routes to first uncapped account ('a')
+        )
+        near_cap_count = sum(a.near_cap for a in gate._accounts)
+        assert near_cap_count == 1
+        assert gate._accounts[0].near_cap is True
+        assert gate._accounts[1].near_cap is False
+        assert all(not a.capped for a in gate._accounts)
+        assert gate._open.is_set() is True
 
 
 # =========================================================================
