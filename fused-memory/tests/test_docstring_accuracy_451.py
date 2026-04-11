@@ -208,10 +208,8 @@ class TestDetectStaleSummariesReturnsIncludesSummaryKey:
         Uses a word-boundary check to avoid false positives from 'summary_line_count'
         which also contains 'summary' as a prefix.
         """
-        doc = self._doc()
-        returns_idx = doc.find('Returns:')
-        assert returns_idx != -1, "Docstring must have a 'Returns:' section"
-        returns_text = doc[returns_idx:]
+        returns_text = _returns_section_text(self._doc())
+        assert returns_text is not None, "Docstring must have a 'Returns:' section"
         # Match 'summary' as a standalone key — not as a prefix of 'summary_line_count'
         # The negative lookahead (?!_) rejects 'summary_line_count', 'summary_lines', etc.
         has_standalone_summary = re.search(r'\bsummary\b(?!_)', returns_text) is not None
@@ -223,10 +221,8 @@ class TestDetectStaleSummariesReturnsIncludesSummaryKey:
 
     def test_returns_section_retains_existing_keys(self) -> None:
         """All six pre-existing keys must remain in the Returns section."""
-        doc = self._doc()
-        returns_idx = doc.find('Returns:')
-        assert returns_idx != -1, "Docstring must have a 'Returns:' section"
-        returns_text = doc[returns_idx:]
+        returns_text = _returns_section_text(self._doc())
+        assert returns_text is not None, "Docstring must have a 'Returns:' section"
         for key in ('uuid', 'name', 'duplicate_count', 'stale_line_count',
                     'valid_fact_count', 'summary_line_count'):
             assert key in returns_text, (
