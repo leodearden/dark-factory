@@ -1228,7 +1228,12 @@ class GraphitiBackend:
                     })
                 else:
                     rebuilt += 1
-                    assert isinstance(r, dict)
+                    if not isinstance(r, dict):
+                        raise TypeError(
+                            f'rebuild_entity_summaries: _rebuild_entity_from_edges returned '
+                            f'unexpected type {type(r).__name__!r} for node={t["uuid"]} '
+                            f'name={t["name"]!r}'
+                        )
                     details.append({
                         'uuid': t['uuid'],
                         'name': t['name'],
