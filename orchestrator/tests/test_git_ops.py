@@ -11,10 +11,10 @@ import pytest
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
     GitOps,
+    ScrubResult,
     WorktreeInfo,
     _run,
-    _scrub_task_dir_from_tree,
-    _ScrubResult,
+    scrub_task_dir_from_tree,
 )
 
 
@@ -269,11 +269,11 @@ class TestWorktreeLifecycle:
         (worktree_info.path / 'cancel_test.py').write_text('x = 1\n')
         await git_ops.commit(worktree_info.path, 'Add cancel test file')
 
-        # Patch _scrub_task_dir_from_tree to raise CancelledError, simulating
+        # Patch scrub_task_dir_from_tree to raise CancelledError, simulating
         # task cancellation at the point where the merge commit already exists
         # but cleanup has not yet been called.
         with patch(
-            'orchestrator.git_ops._scrub_task_dir_from_tree',
+            'orchestrator.git_ops.scrub_task_dir_from_tree',
             side_effect=asyncio.CancelledError,
         ), pytest.raises(asyncio.CancelledError):
             await git_ops.merge_to_main(worktree_info.path, 'feature-cancel')
@@ -1253,7 +1253,7 @@ class TestScrubTaskDirFromTree:
     async def test_scrub_returns_failed_when_git_rm_fails(
         self, git_ops: GitOps, caplog,
     ):
-        """_scrub_task_dir_from_tree returns FAILED and skips rmtree/commit when git rm fails."""
+        """scrub_task_dir_from_tree returns FAILED and skips rmtree/commit when git rm fails."""
         # Create a real worktree for a realistic working directory (no mock yet)
         worktree_info = await git_ops.create_worktree('scrub-rm-fail')
 
@@ -1279,11 +1279,11 @@ class TestScrubTaskDirFromTree:
             caplog.at_level(logging.ERROR, logger='orchestrator.git_ops'),
             patch('orchestrator.git_ops._run', side_effect=mock_run),
         ):
-            result = await _scrub_task_dir_from_tree(worktree_info.path, 'test-rm-fail')
+            result = await scrub_task_dir_from_tree(worktree_info.path, 'test-rm-fail')
 
         # Return value must be FAILED — git rm failed, scrub did not complete
-        assert result == _ScrubResult.FAILED, (
-            f'Expected _ScrubResult.FAILED on git rm failure, got {result!r}'
+        assert result == ScrubResult.FAILED, (
+            f'Expected ScrubResult.FAILED on git rm failure, got {result!r}'
         )
 
         # An ERROR must have been logged containing the context label and the stderr
@@ -1306,7 +1306,7 @@ class TestScrubTaskDirFromTree:
     async def test_scrub_returns_scrubbed_on_happy_path(
         self, git_ops: GitOps, caplog,
     ):
-        """_scrub_task_dir_from_tree returns SCRUBBED, runs rmtree, and commits on success."""
+        """scrub_task_dir_from_tree returns SCRUBBED, runs rmtree, and commits on success."""
         worktree_info = await git_ops.create_worktree('scrub-happy')
 
         # Sentinel inside .task/ — must be removed by rmtree after a successful scrub
@@ -1335,11 +1335,11 @@ class TestScrubTaskDirFromTree:
             caplog.at_level(logging.INFO, logger='orchestrator.git_ops'),
             patch('orchestrator.git_ops._run', side_effect=mock_run),
         ):
-            result = await _scrub_task_dir_from_tree(worktree_info.path, 'test-happy')
+            result = await scrub_task_dir_from_tree(worktree_info.path, 'test-happy')
 
         # Return value must be SCRUBBED
-        assert result == _ScrubResult.SCRUBBED, (
-            f'Expected _ScrubResult.SCRUBBED on success, got {result!r}'
+        assert result == ScrubResult.SCRUBBED, (
+            f'Expected ScrubResult.SCRUBBED on success, got {result!r}'
         )
 
         # No ERROR should have been logged
@@ -1359,7 +1359,7 @@ class TestScrubTaskDirFromTree:
     async def test_scrub_returns_failed_when_git_commit_fails(
         self, git_ops: GitOps, caplog,
     ):
-        """_scrub_task_dir_from_tree returns FAILED and logs error when commit fails post-rm."""
+        """scrub_task_dir_from_tree returns FAILED and logs error when commit fails post-rm."""
         worktree_info = await git_ops.create_worktree('scrub-commit-fail')
 
         task_dir = worktree_info.path / '.task'
@@ -1384,11 +1384,11 @@ class TestScrubTaskDirFromTree:
             caplog.at_level(logging.ERROR, logger='orchestrator.git_ops'),
             patch('orchestrator.git_ops._run', side_effect=mock_run),
         ):
-            result = await _scrub_task_dir_from_tree(worktree_info.path, 'test-commit-fail')
+            result = await scrub_task_dir_from_tree(worktree_info.path, 'test-commit-fail')
 
         # Return value must be FAILED — commit did not succeed
-        assert result == _ScrubResult.FAILED, (
-            f'Expected _ScrubResult.FAILED on commit failure, got {result!r}'
+        assert result == ScrubResult.FAILED, (
+            f'Expected ScrubResult.FAILED on commit failure, got {result!r}'
         )
 
         # An ERROR must have been logged with context and the commit stderr
