@@ -948,15 +948,34 @@ class TestWorkingTreeSync:
         # expected_main is the REAL current main SHA -- without the guard the CAS
         # would succeed and the ref would advance.  A passing test therefore certifies
         # the guard fires BEFORE the entire happy path, not just before CAS.
-        result = await git_ops.advance_main(
-            merge_result.merge_commit,
-            merge_result.merge_worktree,
-            branch='uu-guard-spec',
-            expected_main=main_before.strip(),
-        )
+        #
+        # Orthogonal probe: record every _run invocation during advance_main to
+        # assert that git stash push was never attempted (decisive narrowing that
+        # the unmerged-state guard short-circuited the working-tree protection block).
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await git_ops.advance_main(
+                merge_result.merge_commit,
+                merge_result.merge_worktree,
+                branch='uu-guard-spec',
+                expected_main=main_before.strip(),
+            )
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
         assert result == 'unmerged_state'
+
+        # Decisive narrowing: the guard returned before the working-tree protection
+        # block had any chance to invoke git stash push.
+        assert not any(c[:3] == ['git', 'stash', 'push'] for c in recorded), (
+            f'guard should fire before stash push; recorded stash cmds: '
+            f'{[c for c in recorded if c[:2] == ["git", "stash"]]}'
+        )
 
         # Main ref must NOT have moved
         _, main_after, _ = await _run(
