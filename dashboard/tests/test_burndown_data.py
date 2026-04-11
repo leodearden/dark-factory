@@ -1461,3 +1461,222 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
             f'Expected "orchestrator" in warning message, got: {combined!r}'
         )
         assert any(r.exc_info for r in warning_records)
+
+
+# ---------------------------------------------------------------------------
+# DB-side insert failure isolation (#11)
+# ---------------------------------------------------------------------------
+
+
+class TestCollectSnapshotInsertFailureIsolation:
+    """Verify that a DB-side INSERT failure is isolated to the offending project.
+
+    These tests are written in TDD red-phase for step-4 of task 539.  They
+    fail before the per-project commit + try/except is added to Phase 3,
+    because the current single trailing commit means any INSERT failure rolls
+    back ALL previously buffered inserts (or propagates before commit runs).
+    """
+
+    # ------------------------------------------------------------------
+    # Helper: build a conn.execute wrapper that raises for a target project
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_execute_wrapper(original_execute, failing_project_ids: set):
+        """Return an async wrapper around original_execute that raises OperationalError
+        when an INSERT INTO snapshots targets one of the failing_project_ids."""
+
+        async def execute_wrapper(sql, params=()):
+            if (
+                'INSERT INTO snapshots' in sql
+                and params
+                and params[0] in failing_project_ids
+            ):
+                raise aiosqlite.OperationalError('mock disk full')
+            return await original_execute(sql, params)
+
+        return execute_wrapper
+
+    @pytest.mark.asyncio
+    async def test_db_error_on_extra_insert_preserves_main_snapshot(
+        self, burndown_env, caplog
+    ):
+        """OperationalError on an extra's INSERT must not roll back the main row.
+
+        After step-4: main row is committed before the extra is attempted;
+        the extra's failure is caught per-project with a WARNING, and
+        collect_snapshot does not raise.
+        """
+        import logging
+
+        db_path, base_config, conn = burndown_env
+        extra_root = Path('/fake/project/insert_fail_extra_a')
+        config = DashboardConfig(
+            project_root=base_config.project_root,
+            known_project_roots=[extra_root],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        extra_tasks = [{'status': 'done'}]
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            extra_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_tasks,
+        }
+
+        extra_id = str(extra_root.resolve())
+        original_execute = conn.execute
+        conn.execute = self._make_execute_wrapper(original_execute, {extra_id})
+        try:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                # Must NOT raise despite the extra's INSERT failing
+                await collect_snapshot(conn, config)
+        finally:
+            conn.execute = original_execute
+
+        async with conn.execute('SELECT project_id FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
+
+        project_ids = {row['project_id'] for row in rows}
+        # Main row must be committed (extra's failure must not roll it back)
+        assert str(base_config.project_root) in project_ids, (
+            f'Main project missing from committed rows: {project_ids}'
+        )
+        # Extra must NOT be present (its INSERT failed)
+        assert extra_id not in project_ids
+
+        # A WARNING naming the failing extra must be logged
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'Expected a WARNING for the failing extra INSERT'
+        combined = ' '.join(r.getMessage() for r in warning_records)
+        assert 'insert_fail_extra_a' in combined or extra_id in combined, (
+            f'Expected extra path in warning message, got: {combined!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_db_error_on_extra_insert_preserves_other_extras(
+        self, burndown_env, caplog
+    ):
+        """OperationalError on the middle extra must not affect main or flanking extras.
+
+        Main + 3 extras; middle extra_b's INSERT raises.  After step-4:
+        main + extra_a + extra_c are committed, extra_b is absent, and
+        exactly one WARNING names extra_b.
+        """
+        import logging
+
+        db_path, base_config, conn = burndown_env
+        extra_a = Path('/fake/project/insert_multi_a')
+        extra_b = Path('/fake/project/insert_multi_b')   # the failing one
+        extra_c = Path('/fake/project/insert_multi_c')
+        config = DashboardConfig(
+            project_root=base_config.project_root,
+            known_project_roots=[extra_a, extra_b, extra_c],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        extra_a_tasks = [{'status': 'done'}]
+        extra_b_tasks = [{'status': 'done'}, {'status': 'done'}]
+        extra_c_tasks = [{'status': 'in-progress'}]
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            extra_a.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_a_tasks,
+            extra_b.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_b_tasks,
+            extra_c.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_c_tasks,
+        }
+
+        extra_b_id = str(extra_b.resolve())
+        original_execute = conn.execute
+        conn.execute = self._make_execute_wrapper(original_execute, {extra_b_id})
+        try:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                await collect_snapshot(conn, config)
+        finally:
+            conn.execute = original_execute
+
+        async with conn.execute('SELECT project_id FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
+
+        project_ids = {row['project_id'] for row in rows}
+        assert len(rows) == 3, (
+            f'Expected 3 rows (main + extra_a + extra_c), got {len(rows)}: {project_ids}'
+        )
+        assert str(base_config.project_root) in project_ids
+        assert str(extra_a.resolve()) in project_ids
+        assert str(extra_c.resolve()) in project_ids
+        assert extra_b_id not in project_ids
+
+        # Exactly one WARNING naming extra_b
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and (
+                'insert_multi_b' in r.getMessage() or extra_b_id in r.getMessage()
+            )
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING naming extra_b, got {len(warning_records)}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_db_error_on_main_insert_preserves_extras(
+        self, burndown_env, caplog
+    ):
+        """OperationalError on the main project's INSERT must not prevent extras from being committed.
+
+        After step-4: main's failure is caught per-project; the loop continues
+        and extra is committed.  A WARNING must name the main project.
+        """
+        import logging
+
+        db_path, base_config, conn = burndown_env
+        extra_root = Path('/fake/project/insert_fail_main_extra')
+        config = DashboardConfig(
+            project_root=base_config.project_root,
+            known_project_roots=[extra_root],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        extra_tasks = [{'status': 'done'}]
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            extra_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_tasks,
+        }
+
+        main_id = str(base_config.project_root)
+        original_execute = conn.execute
+        conn.execute = self._make_execute_wrapper(original_execute, {main_id})
+        try:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                await collect_snapshot(conn, config)
+        finally:
+            conn.execute = original_execute
+
+        async with conn.execute('SELECT project_id FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
+
+        project_ids = {row['project_id'] for row in rows}
+        # Extra must be committed (main's failure must not prevent it)
+        assert str(extra_root.resolve()) in project_ids, (
+            f'Extra missing from committed rows: {project_ids}'
+        )
+        # Main must NOT be present (its INSERT failed)
+        assert main_id not in project_ids
+
+        # A WARNING naming the main project must be logged
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'Expected a WARNING for the failing main INSERT'
+        combined = ' '.join(r.getMessage() for r in warning_records)
+        assert str(base_config.project_root) in combined, (
+            f'Expected main project path in warning, got: {combined!r}'
+        )
