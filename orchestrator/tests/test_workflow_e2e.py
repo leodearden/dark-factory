@@ -14,8 +14,6 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
 import pytest
-
-from tests.conftest import _spy_set_cached_status
 from escalation.queue import EscalationQueue
 
 from orchestrator.agents.invoke import AgentResult
@@ -25,6 +23,7 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
+from tests.conftest import _spy_set_cached_status
 
 # ---------------------------------------------------------------------------
 # Fixtures
