@@ -1014,6 +1014,58 @@ class TestDiscoverOrchestrators:
         assert set(result[0]["pids"]) == {111, 222}
         assert result[0]["project_root"] == str(real_dir)
 
+    def test_bare_fallback_canonicalizes_non_canonical_config_project_root(self, tmp_path):
+        """_resolve_root fallback branch must resolve config.project_root to a canonical Path.
+
+        DashboardConfig.__post_init__ normally guarantees config.project_root is canonical,
+        but _resolve_root must not silently depend on that caller invariant.  This test
+        simulates a future break by mutating config.project_root to a symlink *after*
+        construction, then checks that the fallback branch still produces a canonical key
+        so that bare processes group correctly with PRD processes that resolve to the same
+        real directory.
+
+        Fleet: process A has a PRD under real_dir (canonical) and process B is bare
+        (no prd, no config_path → fallback).  Before the fix the groups dict gets two
+        distinct keys (real_dir and link) → two result entries.  After the fix both
+        resolve to real_dir → one merged entry with both PIDs.
+        """
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        real_dir = tmp_path / "proj"
+        real_dir.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real_dir)
+
+        # Write tasks.json so discover_orchestrators can load task data
+        _write_tasks_json(real_dir, [
+            {"id": "1", "title": "T", "status": "done", "priority": "high", "dependencies": [], "metadata": {}},
+        ])
+
+        # Construct with the canonical path (satisfies __post_init__), then mutate to symlink
+        config = DashboardConfig(project_root=real_dir)
+        config.project_root = link  # simulate a future invariant break
+
+        # Process A: PRD under real_dir — _resolve_project_root walks up to find .taskmaster
+        prd_path = str(real_dir / "docs" / "prd.md")
+        # Process B: bare — no prd, no config_path — fallback to config.project_root (now a symlink)
+        mock_procs = [
+            {"pid": 101, "prd": prd_path, "config_path": None, "running": True, "started": "Apr10"},
+            {"pid": 202, "prd": None, "config_path": None, "running": True, "started": "Apr10"},
+        ]
+        with patch("dashboard.data.orchestrator.find_running_orchestrators", return_value=mock_procs):
+            result = discover_orchestrators(config)
+
+        # Both processes must group under the single canonical root
+        assert len(result) == 1, (
+            f"Expected 1 grouped entry but got {len(result)}; "
+            "the fallback branch likely returned a non-canonical path"
+        )
+        assert set(result[0]["pids"]) == {101, 202}
+        assert result[0]["project_root"] == str(real_dir)
+
 
 class TestResolveProjectRoot:
     """Tests for _resolve_project_root — finds project root from PRD path."""

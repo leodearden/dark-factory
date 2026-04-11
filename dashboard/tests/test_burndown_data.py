@@ -52,6 +52,46 @@ def _insert_snapshot(
     )
 
 
+def _assert_snapshot_counts(
+    row,
+    *,
+    pending: int = 0,
+    in_progress: int = 0,
+    blocked: int = 0,
+    deferred: int = 0,
+    cancelled: int = 0,
+    done: int = 0,
+) -> None:
+    """Assert that a snapshot row matches the expected count values by column name.
+
+    Requires the row to be an aiosqlite.Row (name-based access).  Each count
+    column is checked individually so that mismatch messages identify which
+    column failed and what values were expected vs. actual.
+    """
+    assert row['pending'] == pending, (
+        f'pending: expected {pending}, got {row["pending"]}'
+    )
+    assert row['in_progress'] == in_progress, (
+        f'in_progress: expected {in_progress}, got {row["in_progress"]}'
+    )
+    assert row['blocked'] == blocked, (
+        f'blocked: expected {blocked}, got {row["blocked"]}'
+    )
+    assert row['deferred'] == deferred, (
+        f'deferred: expected {deferred}, got {row["deferred"]}'
+    )
+    assert row['cancelled'] == cancelled, (
+        f'cancelled: expected {cancelled}, got {row["cancelled"]}'
+    )
+    assert row['done'] == done, (
+        f'done: expected {done}, got {row["done"]}'
+    )
+
+
+def _fake_load(tasks_map):
+    return lambda path: tasks_map[path]
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -64,6 +104,7 @@ async def burndown_env(tmp_path):
     _create_burndown_db(db_path)
     config = DashboardConfig(project_root=tmp_path)
     async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
         yield db_path, config, conn
 
 
@@ -139,14 +180,8 @@ class TestCollectSnapshot:
 
         assert len(rows) == 1
         row = rows[0]
-        # row: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
-        assert row[1] == str(config.project_root)  # project_id
-        assert row[3] == 1   # pending
-        assert row[4] == 1   # in_progress
-        assert row[5] == 0   # blocked
-        assert row[6] == 0   # deferred
-        assert row[7] == 0   # cancelled
-        assert row[8] == 2   # done
+        assert row['project_id'] == str(config.project_root)
+        _assert_snapshot_counts(row, pending=1, in_progress=1, done=2)
 
     @pytest.mark.asyncio
     async def test_symlinked_root_deduplicates_with_orchestrator(self, tmp_path):
@@ -226,11 +261,8 @@ class TestCollectSnapshot:
             autopilot_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': autopilot_tasks,
         }
 
-        def fake_load(path):
-            return _tasks_map[path]
-
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
         ):
             await collect_snapshot(conn, config)
@@ -238,39 +270,23 @@ class TestCollectSnapshot:
         async with conn.execute('SELECT * FROM snapshots') as cur:
             rows = list(await cur.fetchall())
 
-        # row: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
         assert len(rows) == 3
-        by_project = {row[1]: row for row in rows}
+        by_project = {row['project_id']: row for row in rows}
         assert str(base_config.project_root) in by_project
         assert str(reify_root.resolve()) in by_project
         assert str(autopilot_root.resolve()) in by_project
 
         # main project: 1 pending task
         main_row = by_project[str(base_config.project_root)]
-        assert main_row[3] == 1  # pending
-        assert main_row[4] == 0  # in_progress
-        assert main_row[5] == 0  # blocked
-        assert main_row[6] == 0  # deferred
-        assert main_row[7] == 0  # cancelled
-        assert main_row[8] == 0  # done
+        _assert_snapshot_counts(main_row, pending=1)
 
         # reify: 2 done tasks
         reify_row = by_project[str(reify_root.resolve())]
-        assert reify_row[3] == 0  # pending
-        assert reify_row[4] == 0  # in_progress
-        assert reify_row[5] == 0  # blocked
-        assert reify_row[6] == 0  # deferred
-        assert reify_row[7] == 0  # cancelled
-        assert reify_row[8] == 2  # done
+        _assert_snapshot_counts(reify_row, done=2)
 
         # autopilot: 1 in-progress task
         autopilot_row = by_project[str(autopilot_root.resolve())]
-        assert autopilot_row[3] == 0  # pending
-        assert autopilot_row[4] == 1  # in_progress
-        assert autopilot_row[5] == 0  # blocked
-        assert autopilot_row[6] == 0  # deferred
-        assert autopilot_row[7] == 0  # cancelled
-        assert autopilot_row[8] == 0  # done
+        _assert_snapshot_counts(autopilot_row, in_progress=1)
 
     @pytest.mark.asyncio
     async def test_dedupes_known_root_against_main_project(self, burndown_env):
@@ -288,15 +304,24 @@ class TestCollectSnapshot:
         ):
             await collect_snapshot(conn, config)
 
-        # Total row count (no WHERE) catches both same-id duplicates AND the
-        # symlink case where two rows with different project_id strings are
-        # inserted for the same physical directory.
+        # PRIMARY: exact-key invariant — this project_id has exactly one row.
+        # Catches bugs where the main-project row is omitted while a differently-
+        # keyed row (e.g. non-resolved path, trailing slash) is inserted instead.
+        async with conn.execute(
+            'SELECT COUNT(*) FROM snapshots WHERE project_id = ?',
+            (str(base_config.project_root),),
+        ) as cur:
+            row = await cur.fetchone()
+            assert row is not None
+            assert row[0] == 1
+
+        # SECONDARY: total row count (no WHERE) catches both same-id duplicates
+        # AND the symlink case where two rows with different project_id strings
+        # are inserted for the same physical directory.
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
             row = await cur.fetchone()
             assert row is not None
-            count = row[0]
-
-        assert count == 1
+            assert row[0] == 1
 
     @pytest.mark.asyncio
     async def test_symlinked_root_deduplicates_with_known_roots(self, tmp_path):
@@ -352,16 +377,17 @@ class TestCollectSnapshot:
         # load_task_tree call for the known_project_roots entry that resolves to the same root.
         # Path-keyed dispatch because asyncio.gather fires calls concurrently —
         # an ordered side_effect list can race on thread scheduling.
+        # NOTE: the orchestrator entry's key intentionally omits .resolve() because
+        # _read_project_root_from_config is mocked to return the raw (unresolved)
+        # reify_root, and production burndown.py passes that raw value through to the
+        # tasks.json path construction (see roots_to_snapshot.append around line 100).
         _tasks_map = {
             config.tasks_json: [],
             reify_root / '.taskmaster' / 'tasks' / 'tasks.json': [{'status': 'done'}],
         }
 
-        def fake_load(path):
-            return _tasks_map[path]
-
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
         ):
@@ -420,11 +446,8 @@ class TestCollectSnapshot:
             reify_root / '.taskmaster' / 'tasks' / 'tasks.json': reify_tasks,
         }
 
-        def fake_load(path):
-            return _tasks_map[path]
-
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
             patch('dashboard.data.burndown._read_project_root_from_config', return_value=reify_root),
         ):
@@ -434,13 +457,12 @@ class TestCollectSnapshot:
             rows = list(await cur.fetchall())
 
         assert len(rows) == 2
-        ids = {row[1] for row in rows}
+        ids = {row['project_id'] for row in rows}
         assert str(config.project_root) in ids  # main project
         assert str(reify_root) in ids            # config-discovered project
         # Check reify row counts
-        reify_row = next(r for r in rows if r[1] == str(reify_root))
-        assert reify_row[3] == 1  # pending
-        assert reify_row[8] == 1  # done
+        reify_row = next(r for r in rows if r['project_id'] == str(reify_root))
+        _assert_snapshot_counts(reify_row, pending=1, done=1)
 
     @pytest.mark.asyncio
     async def test_continues_when_known_root_unreadable(self, tmp_path):
@@ -634,8 +656,8 @@ class TestCollectSnapshot:
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
-        reify_root = Path('/home/leo/src/reify')
-        autopilot_root = Path('/home/leo/src/autopilot-video')
+        reify_root = tmp_path / 'reify'
+        autopilot_root = tmp_path / 'autopilot'
 
         config = DashboardConfig(
             project_root=tmp_path,
@@ -644,15 +666,17 @@ class TestCollectSnapshot:
 
         # 3 distinct roots: main project + 2 known roots (no orchestrators)
         n_roots = 3
-        barrier = threading.Barrier(n_roots, timeout=2.0)
+        barrier = threading.Barrier(n_roots, timeout=10.0)
 
         def fake_load(path):
             try:
                 barrier.wait()
             except threading.BrokenBarrierError:
                 pytest.fail(
-                    'load_task_tree calls did not run concurrently '
-                    '(barrier timed out — calls appear to be sequential)'
+                    'load_task_tree calls did not reach the barrier within 10s — '
+                    'possible causes: (1) sequential execution (calls not running '
+                    'concurrently via asyncio.gather); (2) severe scheduler latency '
+                    '(threads starved by contention or a slow CI host)'
                 )
             return []
 
@@ -662,6 +686,78 @@ class TestCollectSnapshot:
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
                 await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+                row = await cur.fetchone()
+                assert row is not None
+                assert row[0] == 3
+
+    @pytest.mark.asyncio
+    async def test_gather_partial_failure_skips_bad_project(self, tmp_path):
+        """One load_task_tree raises OSError; collect_snapshot must either raise
+        cleanly (pre-fix: asyncio.gather propagates the first exception) OR skip
+        the bad project and insert healthy rows (post-fix: return_exceptions=True).
+        Either branch holds the invariant: the failing project never appears in
+        the snapshot table, and no other project is silently corrupted.
+
+        This test will exercise different branches before and after Task 519
+        lands. Once 519 is confirmed done a follow-up task can tighten it to
+        only the post-fix branch.
+        """
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        reify_root = Path('/home/leo/src/reify')
+        autopilot_root = Path('/home/leo/src/autopilot-video')
+
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[reify_root, autopilot_root],
+        )
+
+        # The path that will raise OSError — reify is the failing root.
+        bad_path = reify_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
+
+        # Only map the two healthy roots; the failing root is intentionally absent.
+        _tasks_map = {
+            config.tasks_json: [],
+            autopilot_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': [{'status': 'done'}],
+        }
+
+        def fake_load(path):
+            if path == bad_path:
+                raise OSError('mock disk error')
+            return _tasks_map[path]
+
+        raised_oserror = False
+        async with aiosqlite.connect(str(db_path)) as conn:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            ):
+                try:
+                    await collect_snapshot(conn, config)
+                except OSError:
+                    raised_oserror = True
+
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+        project_ids = {row[0] for row in rows}
+
+        if raised_oserror:
+            # Pre-fix behavior (task 519 not yet landed): asyncio.gather re-raises
+            # the first OSError, so Phase 3 never runs and no rows are inserted.
+            # The invariant is: the failing project's data never appears in the
+            # table, and no partial state is committed.
+            assert len(rows) == 0
+        else:
+            # Post-fix behavior (task 519 landed): return_exceptions=True + per-
+            # project skip means healthy projects are still snapshotted and the
+            # failing project is cleanly excluded.
+            assert len(rows) == 2
+            assert str(reify_root.resolve()) not in project_ids
+            assert str(config.project_root.resolve()) in project_ids
+            assert str(autopilot_root.resolve()) in project_ids
 
     @pytest.mark.asyncio
     async def test_gather_return_exceptions_preserves_healthy_snapshots(self, tmp_path, caplog):
@@ -703,6 +799,7 @@ class TestCollectSnapshot:
             return _tasks_map[path]
 
         async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
             with (
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
@@ -717,8 +814,7 @@ class TestCollectSnapshot:
         # (a) three rows: main + good_root_1 + good_root_2
         assert len(rows) == 3
 
-        # row layout: id, project_id, ts, pending, in_progress, blocked, deferred, cancelled, done
-        by_project = {row[1]: row for row in rows}
+        by_project = {row['project_id']: row for row in rows}
 
         # (b) bad_root must NOT appear
         assert str(bad_root.resolve()) not in by_project
@@ -730,10 +826,10 @@ class TestCollectSnapshot:
 
         # (d) per-root done counts must reflect the supplied task lists
         good_1_row = by_project[str(good_root_1.resolve())]
-        assert good_1_row[8] == 2  # done=2 for good_root_1
+        _assert_snapshot_counts(good_1_row, done=2)
 
         good_2_row = by_project[str(good_root_2.resolve())]
-        assert good_2_row[8] == 1  # done=1 for good_root_2
+        _assert_snapshot_counts(good_2_row, done=1)
 
         # (e) at least one WARNING record must name the bad root and carry exc_info
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -958,3 +1054,65 @@ class TestBurndownEnvFixture:
             row = await cur.fetchone()
         assert row is not None
         assert row[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# _assert_snapshot_counts helper
+# ---------------------------------------------------------------------------
+
+
+class TestAssertSnapshotCounts:
+    @pytest.mark.asyncio
+    async def test_passes_on_matching_counts(self, burndown_env):
+        """Helper returns None when every count column matches."""
+        db_path, config, conn = burndown_env
+        await conn.execute(
+            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            ('test_proj', '2024-01-01T00:00:00', 1, 0, 0, 0, 0, 2),
+        )
+        await conn.commit()
+
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute('SELECT * FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
+
+        assert len(rows) == 1
+        result = _assert_snapshot_counts(rows[0], pending=1, done=2)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_raises_on_mismatched_count(self, burndown_env):
+        """Helper raises AssertionError when a count column doesn't match the expected value."""
+        db_path, config, conn = burndown_env
+        await conn.execute(
+            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            ('test_proj', '2024-01-01T00:00:00', 0, 0, 0, 0, 0, 2),
+        )
+        await conn.commit()
+
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute('SELECT * FROM snapshots') as cur:
+            row = await cur.fetchone()
+
+        with pytest.raises(AssertionError):
+            _assert_snapshot_counts(row, done=3)  # actual done=2, expected 3
+
+    @pytest.mark.asyncio
+    async def test_default_zeros_match_all_zero_row(self, burndown_env):
+        """Helper returns None when all counts are 0 and no kwargs are passed (defaults are 0)."""
+        db_path, config, conn = burndown_env
+        await conn.execute(
+            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            ('test_proj', '2024-01-01T00:00:00', 0, 0, 0, 0, 0, 0),
+        )
+        await conn.commit()
+
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute('SELECT * FROM snapshots') as cur:
+            row = await cur.fetchone()
+
+        result = _assert_snapshot_counts(row)  # all defaults are 0
+        assert result is None

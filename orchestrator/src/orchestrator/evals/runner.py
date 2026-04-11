@@ -403,7 +403,7 @@ async def run_eval_matrix(
             for task in done:
                 exc = task.exception()
                 if exc is not None:
-                    logger.error(f'Eval failed: {exc}')
+                    logger.error('Eval failed', exc_info=exc)
                 else:
                     r = task.result()
                     if r is not None:

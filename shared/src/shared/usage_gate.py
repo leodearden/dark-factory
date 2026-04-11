@@ -44,14 +44,16 @@ CAP_HIT_PREFIXES = [
     "You've hit your",
     "You've used",
     "You're out of extra",
+    "You're now using extra",
 ]
-# Secondary confirmation — must also appear in the same text
+# Secondary confirmation — at least one of these keywords must also appear in
+# the same text for a CAP_HIT or NEAR_CAP prefix match to be accepted
+# (defense-in-depth against ambiguous prefix false positives).
 CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade"]
 
 # Patterns for near-cap warnings (pause proactively)
 NEAR_CAP_PREFIXES = [
     "You're close to",
-    "You're now using extra",
 ]
 
 # Codex (OpenAI) cap-hit patterns
@@ -255,18 +257,24 @@ class UsageGate:
                     )
                     return True
 
-        for prefix in CAP_HIT_PREFIXES:
-            if prefix.lower() in combined.lower():
-                resets_at = _parse_resets_at(combined)
-                reason = _extract_cap_message(combined, prefix) or f'Cap detected: {prefix}'
-                self._handle_cap_detected(reason, resets_at, oauth_token)
-                return True
+        # Claude cap/near-cap detection: require both a prefix match AND a
+        # secondary confirmation keyword (defence against false positives on
+        # generic prefixes like "You've used" or "You're close to").
+        combined_lower = combined.lower()
+        has_confirm_keyword = any(kw in combined_lower for kw in CAP_CONFIRM_KEYWORDS)
+        if has_confirm_keyword:
+            for prefix in CAP_HIT_PREFIXES:
+                if prefix.lower() in combined_lower:
+                    resets_at = _parse_resets_at(combined)
+                    reason = _extract_cap_message(combined, prefix) or f'Cap detected: {prefix}'
+                    self._handle_cap_detected(reason, resets_at, oauth_token)
+                    return True
 
-        for prefix in NEAR_CAP_PREFIXES:
-            if prefix.lower() in combined.lower():
-                reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
-                self._handle_near_cap_warning(reason, oauth_token)
-                return True
+            for prefix in NEAR_CAP_PREFIXES:
+                if prefix.lower() in combined_lower:
+                    reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
+                    self._handle_near_cap_warning(reason, oauth_token)
+                    return True
 
         return False
 
@@ -277,13 +285,7 @@ class UsageGate:
         oauth_token: str | None,
     ) -> None:
         """Mark the matching account as capped."""
-        acct = self._find_account_by_token(oauth_token) if oauth_token else None
-        if acct is None:
-            # Unknown token — try first uncapped account as best guess
-            for a in self._accounts:
-                if not a.capped:
-                    acct = a
-                    break
+        acct = self._resolve_account(oauth_token)
         if acct is None:
             logger.warning(f'Cap detected but no matching account: {reason}')
             return
@@ -314,12 +316,7 @@ class UsageGate:
         oauth_token: str | None,
     ) -> None:
         """Record a near-cap warning without blocking the account."""
-        acct = self._find_account_by_token(oauth_token) if oauth_token else None
-        if acct is None:
-            for a in self._accounts:
-                if not a.capped:
-                    acct = a
-                    break
+        acct = self._resolve_account(oauth_token)
         if acct is None:
             logger.warning(f'Near-cap warning but no matching account: {reason}')
             return
@@ -334,6 +331,28 @@ class UsageGate:
             if acct.token == token:
                 return acct
         return None
+
+    def _resolve_account(self, oauth_token: str | None) -> AccountState | None:
+        """Look up an account by token, falling back to the first uncapped account.
+
+        Steps:
+        1. If ``oauth_token`` is provided, try an exact token match via
+           ``_find_account_by_token``.
+        2. If no account was found (unknown token or ``None`` token), iterate
+           ``_accounts`` and return the first account that is not capped.
+        3. Return ``None`` if neither step resolves an account.
+
+        The caller is responsible for emitting any 'no matching account' warning
+        and for deciding the appropriate early-return behaviour.  This helper
+        intentionally does not log.
+        """
+        acct = self._find_account_by_token(oauth_token) if oauth_token else None
+        if acct is None:
+            for a in self._accounts:
+                if not a.capped:
+                    acct = a
+                    break
+        return acct
 
     def _start_account_resume_probe(self, acct: AccountState) -> None:
         """Start an async resume probe for a specific account."""
@@ -472,6 +491,7 @@ class UsageGate:
 
             if ok:
                 acct.capped = False
+                acct.near_cap = False
                 acct.probing = True  # gate: let one real task confirm first
                 acct.probe_count = 0
                 if acct.pause_started_at:
@@ -608,10 +628,18 @@ class UsageGate:
         return None
 
     def confirm_account_ok(self, oauth_token: str | None) -> None:
-        """Clear the probing gate after a successful invocation.
+        """Clear near_cap and the probing gate after a successful invocation.
 
-        Called by ``invoke_with_cap_retry`` when an invocation succeeds
-        (no cap detected). Allows other tasks to use this account.
+        Called by ``invoke_with_cap_retry`` when an invocation succeeds (no cap
+        detected).
+
+        Always clears ``near_cap`` on the matched account — a successful
+        invocation proves the account is healthy, so any prior near-cap warning
+        is stale and should be discarded unconditionally.
+
+        Additionally, if ``probe_in_flight`` was set (a probe cycle was in
+        progress), clears that flag, resets ``probe_count``, and opens the
+        shared ``_open`` event so other tasks may use this account.
         """
         acct = self._find_account_by_token(oauth_token) if oauth_token else None
         if acct is None:
