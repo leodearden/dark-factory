@@ -278,7 +278,14 @@ class TestHooksIntegration:
         assert 'fused-memory/tests' in content
 
     def test_hook_invokes_check_with_python3_not_uv_run(self):
-        """The asyncmock check must be invoked via plain python3, not wrapped in uv run."""
+        """The asyncmock check invocation must use a python3 token, not uv run, and target fused-memory/tests.
+
+        Word-boundary regex r'\\bpython3(?:\\.\\d+)?\\b' accepts plain `python3`, versioned
+        `python3.11`, and absolute paths like `/usr/bin/python3` or `/usr/bin/env python3`,
+        while rejecting bare `python` (Python 2) or `mypython3` (word-boundary failure).
+        The `fused-memory/tests` assertion verifies the scan target is present on the same
+        invocation line, absorbing the purpose of the former existence-check test.
+        """
         hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
         content = hooks_path.read_text(encoding='utf-8')
         invocation_lines = [
@@ -287,11 +294,14 @@ class TestHooksIntegration:
         ]
         assert invocation_lines, 'No invocation of check_asyncmock_assertion_style.py found in hooks/project-checks'
         for line in invocation_lines:
-            assert 'python3 ' in line, (
-                f'Expected plain python3 invocation, got: {line!r}'
+            assert re.search(r'\bpython3(?:\.\d+)?\b', line), (
+                f'Expected a python3 token (plain, versioned, or absolute path), got: {line!r}'
             )
             assert 'uv run' not in line, (
                 f'Found uv run in asyncmock check invocation (should use plain python3): {line!r}'
+            )
+            assert 'fused-memory/tests' in line, (
+                f'Expected fused-memory/tests scan target on invocation line, got: {line!r}'
             )
 
     def test_hook_has_stdlib_only_rationale_comment(self):
