@@ -1103,20 +1103,25 @@ class TestRebuildEntitySummariesParallel:
 
         result = await backend.rebuild_entity_summaries(group_id='test', force=True)
 
-        backend.get_all_valid_edges.assert_awaited_once()
+        backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
         backend.refresh_entity_summary.assert_not_awaited()
         assert result['total_entities'] == 2
         assert result['rebuilt'] == 2
 
     @pytest.mark.asyncio
-    async def test_force_list_entity_nodes_called_exactly_once(
+    async def test_force_bulk_fetch_called_exactly_once_and_updates_all_entities(
         self, mock_config, make_backend, make_edge_backend
     ):
-        """Force path: list_entity_nodes is awaited exactly once (single bulk fetch).
+        """Force path: bulk fetches run exactly once and every entity is updated.
 
-        Uses three distinct entities with distinct facts so a regression that returns
-        uuid-1 data for every call would produce incorrect per-entity summaries and
-        fail the final per-uuid assertions.
+        Guards three independent invariants under the force path:
+        1. list_entity_nodes is awaited exactly once (single bulk node fetch).
+        2. get_all_valid_edges is awaited exactly once with the forwarded group_id
+           (single bulk edge fetch, correctly scoped).
+        3. update_node_summary is awaited once per entity and each entity receives
+           its own edge data — uses three distinct entities with distinct facts so
+           a regression that reused uuid-1 data for every call would fail the
+           per-uuid new_summary assertions below.
         """
         backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'summary-1'},
@@ -1133,7 +1138,7 @@ class TestRebuildEntitySummariesParallel:
 
         # list_entity_nodes must be called exactly once — no per-entity re-fetch
         backend.list_entity_nodes.assert_awaited_once()
-        backend.get_all_valid_edges.assert_awaited_once()
+        backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
         assert result['total_entities'] == 3
         assert result['rebuilt'] == 3
         assert backend.update_node_summary.await_count == 3
