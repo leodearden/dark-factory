@@ -606,3 +606,43 @@ class TestCollectCancelErrors:
             assert isinstance(err, asyncio.CancelledError), (
                 f'Element {i}: expected CancelledError, got {err!r}'
             )
+
+    def test_docstring_has_no_comment_prefixed_lines(self):
+        """The _collect_cancel_errors docstring must not contain lines starting with '# '.
+
+        TEST INTENT: The 'Belt-and-suspenders' paragraph in the docstring was
+        originally written as a block of ``#`` comments and pulled into the
+        docstring without stripping the prefixes.  Inside a docstring ``#`` is
+        not a comment marker — Sphinx and help() render it as a literal hash.
+        This test ensures all six offending lines are fixed.
+
+        PASS/FAIL CONDITION: Fails if any line in the docstring, after stripping
+        leading whitespace, starts with ``# `` (hash + space).  Passes once the
+        '# ' prefixes are removed while the prose is preserved verbatim.
+
+        NOTE: The assertion targets ``# `` (hash + space) rather than a bare
+        ``#`` to avoid false positives on legitimate inline hash references such
+        as 'issue #42' or '#3 in the list'.
+        """
+        doc = runner_mod._collect_cancel_errors.__doc__
+        assert doc is not None, '_collect_cancel_errors must have a docstring'
+        assert doc.strip(), '_collect_cancel_errors docstring must not be empty'
+
+        # Content-preservation guard: the prose must still be present after
+        # the prefix fix so we know the lines were not simply deleted.
+        assert 'Belt-and-suspenders' in doc, (
+            "Expected 'Belt-and-suspenders' paragraph to be present in docstring "
+            '(content must be preserved, only the # prefixes removed)'
+        )
+
+        offending = [
+            line
+            for line in doc.splitlines()
+            if line.lstrip().startswith('# ')
+        ]
+        assert not offending, (
+            f'Found {len(offending)} line(s) in _collect_cancel_errors.__doc__ '
+            f'that start with "# " after stripping whitespace — these are '
+            f'comment-style prefixes inside a docstring and must be removed:\n'
+            + '\n'.join(f'  {line!r}' for line in offending)
+        )
