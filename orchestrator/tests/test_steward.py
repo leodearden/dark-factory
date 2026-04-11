@@ -43,6 +43,7 @@ def mock_config():
     config.steward_lifetime_budget = 12.0
     config.steward_max_attempts = 3
     config.steward_completion_timeout = 300.0
+    config.steward_max_timeouts_per_escalation = 3
     config.timeouts.steward = 1800.0
     config.suggestion_triage_threshold = 10
     return config
@@ -1113,3 +1114,12 @@ class TestStewardDefaultConfig:
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.steward_max_timeouts_per_escalation == 3
+
+    def test_timeout_cap_default_respects_policy_window(self, monkeypatch, tmp_path):
+        """Default steward_max_timeouts_per_escalation must be in the policy range [2, 5]."""
+        from orchestrator.config import OrchestratorConfig
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert 2 <= config.steward_max_timeouts_per_escalation <= 5
