@@ -511,7 +511,7 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
 
-        project_ids = {row[0] for row in rows}
+        project_ids = {row['project_id'] for row in rows}
         # main + root_a + root_c should be present
         assert len(rows) == 3
         assert str(tmp_path.resolve()) in project_ids
