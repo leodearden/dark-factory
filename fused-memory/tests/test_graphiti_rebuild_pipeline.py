@@ -387,6 +387,7 @@ class TestRebuildEntitySummariesForceDryRun:
         ]
         backend.list_entity_nodes = AsyncMock(return_value=entities)
         backend.get_all_valid_edges = AsyncMock(return_value={})
+        backend._rebuild_entity_from_edges = AsyncMock()
 
         result = await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=True)
 
@@ -401,6 +402,7 @@ class TestRebuildEntitySummariesForceDryRun:
         ]
         assert result['details'] == expected_details
         assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
+        backend._rebuild_entity_from_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_force_no_dry_run_calls_get_all_valid_edges(
