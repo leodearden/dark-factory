@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from escalation.models import Escalation
 
-from orchestrator.steward import StewardMetrics, TaskSteward
+from orchestrator.steward import StewardMetrics, TaskSteward, _is_timeout_kill
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -552,6 +552,41 @@ class TestStewardTimeoutPassthrough:
         assert mock_invoke.call_count == 2
         for call in mock_invoke.call_args_list:
             assert call.kwargs['timeout_seconds'] == pytest.approx(900.0)
+
+
+# ---------------------------------------------------------------------------
+# _is_timeout_kill helper — unit test each branch directly
+# ---------------------------------------------------------------------------
+
+
+class TestIsTimeoutKill:
+    """Pin each branch of the _is_timeout_kill helper with direct calls."""
+
+    def test_success_true_short_circuits_to_false(self):
+        """success=True must return False regardless of timed_out or stderr."""
+        result = _make_result(success=True, timed_out=True, stderr='Process killed after 900.0s timeout')
+        assert _is_timeout_kill(result) is False
+
+    def test_timed_out_true_returns_true_via_structured_path(self):
+        """timed_out=True with empty stderr must return True (primary signal)."""
+        result = _make_result(success=False, timed_out=True, stderr='')
+        assert _is_timeout_kill(result) is True
+
+    def test_stderr_fallback_marker_and_token_matches(self):
+        """Marker phrase + 'timeout' token in stderr → fallback returns True."""
+        result = _make_result(
+            success=False, timed_out=False,
+            stderr='Process killed after 900.0s timeout (SIGTERM+SIGKILL)',
+        )
+        assert _is_timeout_kill(result) is True
+
+    def test_partial_stderr_missing_timeout_token_does_not_match(self):
+        """Marker present but 'timeout' token absent and timed_out=False → False."""
+        result = _make_result(
+            success=False, timed_out=False,
+            stderr='Process killed after foo',  # no 'timeout' token
+        )
+        assert _is_timeout_kill(result) is False
 
 
 # ---------------------------------------------------------------------------

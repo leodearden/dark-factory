@@ -604,12 +604,16 @@ def _is_timeout_kill(result) -> bool:
     Primary signal: the structured ``timed_out`` field on ``AgentResult`` (set by
     both subprocess helpers at the exact moment a wall-clock timeout fires).
 
-    Belt-and-braces fallback: stderr marker+token check for legacy ``AgentResult``
-    instances that pre-date the ``timed_out`` field (e.g. hand-constructed in tests
-    or returned by older fused-memory reconciliation call sites).  The fallback
-    requires BOTH a marker phrase AND the literal token 'timeout' (AND-discipline
-    ensures a substring like 'previously Process killed after foo' is not
-    incorrectly matched).
+    Note: a successful-but-timed-out result (SIGTERM grace path producing valid
+    JSON + returncode 0) is intentionally NOT classified as a timeout kill —
+    success short-circuits before the structured check.
+
+    Belt-and-braces fallback: stderr marker+token check for duck-typed result
+    stand-ins (e.g. hand-constructed in tests or returned by older fused-memory
+    reconciliation call sites) where ``getattr(result, 'timed_out', False)``
+    returns False.  The fallback requires BOTH a marker phrase AND the literal
+    token 'timeout' (AND-discipline ensures a substring like 'previously Process
+    killed after foo' is not incorrectly matched).
 
     Fallback stderr examples::
 
