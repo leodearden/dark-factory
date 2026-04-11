@@ -83,6 +83,7 @@ class TaskSteward:
         self._stopped = False
         self._task: asyncio.Task | None = None
         self._retry_counts: dict[str, int] = {}
+        self._timeout_counts: dict[str, int] = {}
         self.metrics = StewardMetrics()
 
     # ------------------------------------------------------------------
