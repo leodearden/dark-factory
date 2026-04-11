@@ -113,7 +113,12 @@ def test_orchestrator_pyright_include_contains_tests() -> None:
 
 
 def test_project_checks_hook_invokes_pyright_on_orchestrator() -> None:
-    """hooks/project-checks must list 'orchestrator' in PYRIGHT_PACKAGES and invoke pyright.
+    """hooks/project-checks must list 'orchestrator' in PYRIGHT_PACKAGES and loop over it.
+
+    Uses _parse_pyright_packages to read the PYRIGHT_PACKAGES=(...) array
+    specifically (not ALL_PACKAGES, which is used for ruff).  Uses
+    _hook_invokes_pyright_in_loop to verify that ``uv run pyright`` appears
+    inside the loop body — not merely somewhere in the file.
 
     If this test fails, the commit-gate that enforces the TYPE_CHECKING Protocol
     conformance block in test_workflow_e2e.py no longer exists for the orchestrator
@@ -126,15 +131,23 @@ def test_project_checks_hook_invokes_pyright_on_orchestrator() -> None:
         "This hook is the commit-time gate for pyright on orchestrator. See task 699."
     )
     content = hook_path.read_text()
-    assert "orchestrator" in content, (
-        f"'orchestrator' does not appear in {hook_path}. "
-        "The hook must list orchestrator in PYRIGHT_PACKAGES so that "
-        "`uv run pyright` is invoked from orchestrator/ on main-branch commits. "
-        "See task 699."
+    packages = _parse_pyright_packages(content)
+    assert packages is not None, (
+        f"PYRIGHT_PACKAGES=(...) declaration not found in {hook_path}. "
+        "The hook must declare PYRIGHT_PACKAGES so pyright runs on each listed "
+        "package on main-branch commits. See task 699."
     )
-    assert "uv run pyright" in content, (
-        f"'uv run pyright' does not appear in {hook_path}. "
-        "The hook must invoke pyright to enforce Protocol conformance. See task 699."
+    assert "orchestrator" in packages, (
+        f"'orchestrator' not in PYRIGHT_PACKAGES={packages} in {hook_path}. "
+        "Without this, pyright never runs on orchestrator and the TYPE_CHECKING "
+        "Protocol conformance block in test_workflow_e2e.py silently becomes "
+        "un-enforced. Note that ALL_PACKAGES (used for ruff) is NOT sufficient — "
+        "pyright must be wired to PYRIGHT_PACKAGES specifically. See task 699."
+    )
+    assert _hook_invokes_pyright_in_loop(content), (
+        f"{hook_path} declares PYRIGHT_PACKAGES but does not iterate it with "
+        "'uv run pyright' in the loop body. The hook must loop over "
+        "PYRIGHT_PACKAGES and invoke pyright inside the loop. See task 699."
     )
 
 
