@@ -14,7 +14,7 @@ from orchestrator.git_ops import (
     WorktreeInfo,
     _run,
     _scrub_task_dir_from_tree,
-    _ScrubResult,
+    ScrubResult,
 )
 
 
@@ -1282,8 +1282,8 @@ class TestScrubTaskDirFromTree:
             result = await _scrub_task_dir_from_tree(worktree_info.path, 'test-rm-fail')
 
         # Return value must be FAILED — git rm failed, scrub did not complete
-        assert result == _ScrubResult.FAILED, (
-            f'Expected _ScrubResult.FAILED on git rm failure, got {result!r}'
+        assert result == ScrubResult.FAILED, (
+            f'Expected ScrubResult.FAILED on git rm failure, got {result!r}'
         )
 
         # An ERROR must have been logged containing the context label and the stderr
@@ -1338,8 +1338,8 @@ class TestScrubTaskDirFromTree:
             result = await _scrub_task_dir_from_tree(worktree_info.path, 'test-happy')
 
         # Return value must be SCRUBBED
-        assert result == _ScrubResult.SCRUBBED, (
-            f'Expected _ScrubResult.SCRUBBED on success, got {result!r}'
+        assert result == ScrubResult.SCRUBBED, (
+            f'Expected ScrubResult.SCRUBBED on success, got {result!r}'
         )
 
         # No ERROR should have been logged
@@ -1387,8 +1387,8 @@ class TestScrubTaskDirFromTree:
             result = await _scrub_task_dir_from_tree(worktree_info.path, 'test-commit-fail')
 
         # Return value must be FAILED — commit did not succeed
-        assert result == _ScrubResult.FAILED, (
-            f'Expected _ScrubResult.FAILED on commit failure, got {result!r}'
+        assert result == ScrubResult.FAILED, (
+            f'Expected ScrubResult.FAILED on commit failure, got {result!r}'
         )
 
         # An ERROR must have been logged with context and the commit stderr
