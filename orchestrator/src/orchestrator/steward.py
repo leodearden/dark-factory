@@ -601,11 +601,17 @@ def _strip_hash_prefix(detail: str) -> str:
 def _is_timeout_kill(result) -> bool:
     """Return True when *result* represents a process killed by a wall-clock timeout.
 
-    Matches stderr patterns emitted by both subprocess paths:
-    - ``shared/src/shared/cli_invoke.py`` (SIGTERM+SIGKILL / SIGTERM)
-    - ``orchestrator/src/orchestrator/agents/invoke.py`` (codex/gemini local)
+    Primary signal: the structured ``timed_out`` field on ``AgentResult`` (set by
+    both subprocess helpers at the exact moment a wall-clock timeout fires).
 
-    Examples::
+    Belt-and-braces fallback: stderr marker+token check for legacy ``AgentResult``
+    instances that pre-date the ``timed_out`` field (e.g. hand-constructed in tests
+    or returned by older fused-memory reconciliation call sites).  The fallback
+    requires BOTH a marker phrase AND the literal token 'timeout' (AND-discipline
+    ensures a substring like 'previously Process killed after foo' is not
+    incorrectly matched).
+
+    Fallback stderr examples::
 
         'Process killed after 900.0s timeout (SIGTERM+SIGKILL)'
         'Process terminated after 900.0s timeout (SIGTERM); stream closed'
@@ -613,6 +619,8 @@ def _is_timeout_kill(result) -> bool:
     """
     if result.success:
         return False
+    if getattr(result, 'timed_out', False):
+        return True
     stderr = result.stderr or ''
     has_marker = (
         'Process killed after' in stderr
