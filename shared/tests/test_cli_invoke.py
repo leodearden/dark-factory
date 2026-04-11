@@ -52,6 +52,14 @@ class TestAgentResultAccountNameField:
         assert result.account_name == ''
 
 
+class TestAgentResultTimedOutField:
+
+    def test_agent_result_has_timed_out_field_defaults_false(self):
+        """AgentResult has timed_out field that defaults to False."""
+        result = AgentResult(success=True, output='ok')
+        assert result.timed_out is False
+
+
 @pytest.mark.asyncio
 class TestAccountNameThreading:
 
