@@ -420,7 +420,7 @@ class TestStewardRetryLogic:
         steward.escalation_queue.submit.assert_called_once()
         submitted = steward.escalation_queue.submit.call_args[0][0]
         assert submitted.level == 1
-        assert 'Failed after 1 attempts' in submitted.summary
+        assert 'Failed after 1 attempt:' in submitted.summary
 
         steward.escalation_queue.resolve.assert_called_once()
         assert steward.escalation_queue.resolve.call_args[1].get('dismiss') is True
