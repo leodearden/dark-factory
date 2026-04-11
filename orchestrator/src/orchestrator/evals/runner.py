@@ -307,12 +307,12 @@ def _collect_cancel_errors(done: Iterable[asyncio.Task[Any]]) -> list[asyncio.Ca
     internally without an explicit ``task.cancel()`` call, because the
     runtime transitions the task to the cancelled state in both scenarios.
 
-    # Belt-and-suspenders: in current CPython a coroutine raising
-    # CancelledError causes task.cancelled() to return True, so the
-    # secondary branch (task.exception() returning CancelledError while
-    # task.cancelled() is False) is unreachable in practice. Kept in case
-    # a future runtime routes coroutine-raised CancelledError via
-    # task.exception() instead of task.cancelled().
+    Belt-and-suspenders: in current CPython a coroutine raising
+    CancelledError causes task.cancelled() to return True, so the
+    secondary branch (task.exception() returning CancelledError while
+    task.cancelled() is False) is unreachable in practice. Kept in case
+    a future runtime routes coroutine-raised CancelledError via
+    task.exception() instead of task.cancelled().
     """
     errors: list[asyncio.CancelledError] = []
     for task in done:
