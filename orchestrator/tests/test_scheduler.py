@@ -1653,3 +1653,66 @@ class TestSchedulerInternalRouting:
         with patch.object(scheduler, 'get_cached_status', wraps=scheduler.get_cached_status) as spy:
             await scheduler.get_tasks()
             spy.assert_any_call('42')
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_writes_via_set_cached_status(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """set_task_status() must write the new status via _set_cached_status().
+
+        Instance-level rebinding works because Python's attribute lookup finds
+        the instance attribute before the class method, so the production call
+        self._set_cached_status(...) resolves to the recorder.
+
+        The read of scheduler._set_cached_status raises AttributeError until
+        step 3 adds the helper — that is the TDD failing-state signal.
+        """
+        mcp_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+
+        recorded: list[tuple[str, str]] = []
+        original = scheduler._set_cached_status  # AttributeError until step 3
+
+        def recorder(task_id: str, status: str) -> None:
+            recorded.append((task_id, status))
+            original(task_id, status)
+
+        scheduler._set_cached_status = recorder  # type: ignore[method-assign]
+
+        await scheduler.set_task_status('42', 'in-progress')
+        assert ('42', 'in-progress') in recorded
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_writes_via_set_cached_status(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """get_tasks() must write the cached status via _set_cached_status().
+
+        Fails (AttributeError on recorder install or missed assertion) until
+        step 5 routes the get_tasks write through the helper.
+        """
+        import json
+
+        tasks_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': json.dumps({'tasks': [{'id': '42', 'status': 'pending', 'title': 'T'}]}),
+                    }
+                ]
+            }
+        }
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value=tasks_response))
+
+        recorded: list[tuple[str, str]] = []
+        original = scheduler._set_cached_status  # AttributeError until step 3
+
+        def recorder(task_id: str, status: str) -> None:
+            recorded.append((task_id, status))
+            original(task_id, status)
+
+        scheduler._set_cached_status = recorder  # type: ignore[method-assign]
+
+        await scheduler.get_tasks()
+        assert ('42', 'pending') in recorded
