@@ -8,6 +8,7 @@ import pytest
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules
+from tests.conftest import _spy_set_cached_status
 
 
 @pytest.fixture
@@ -1720,3 +1721,36 @@ class TestSchedulerInternalRouting:
 
         await scheduler.get_tasks()
         assert ('42', 'pending') in recorded
+
+
+class TestSpySetCachedStatus:
+    """Unit tests for the _spy_set_cached_status helper in conftest.py."""
+
+    def test_spy_returns_empty_list_initially(self):
+        """Installing the spy on a fresh object returns an empty list."""
+
+        class Dummy:
+            def _set_cached_status(self, task_id: str, status: str) -> None:
+                pass
+
+        d = Dummy()
+        recorded = _spy_set_cached_status(d)
+        assert recorded == []
+
+    def test_spy_captures_and_forwards_call(self):
+        """The spy captures the call AND forwards it to the original method."""
+
+        class Dummy:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def _set_cached_status(self, task_id: str, status: str) -> None:
+                self.calls.append((task_id, status))
+
+        d = Dummy()
+        recorded = _spy_set_cached_status(d)
+        d._set_cached_status('t1', 's1')
+        # spy captures the call
+        assert ('t1', 's1') in recorded
+        # original is also called (forwarding, not just capturing)
+        assert ('t1', 's1') in d.calls
