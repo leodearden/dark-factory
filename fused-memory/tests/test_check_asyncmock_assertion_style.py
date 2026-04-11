@@ -323,12 +323,16 @@ class TestHooksIntegration:
         The test skips cleanly when `python3` is not found so CI environments without it
         surface 'skipped' rather than a confusing FileNotFoundError.
 
-        Two cases are exercised under isolation:
+        Three cases are exercised under isolation:
           1. Empty directory: no test_*.py → zero targets → exit 0, empty stdout.
              Proves the stdlib-only invariant at interpreter startup.
           2. Non-empty directory: a clean test file → parse/scan runs → exit 0, empty stdout.
              Proves the parse/find_violations code paths also stay stdlib-only; a
              third-party import added inside a scan-triggered code path would still fail loudly.
+          3. Violation file: bad test file → parse/scan runs → exit 1, stdout has violation.
+             Proves the print-violations branch (script lines 172-173) also stays stdlib-only;
+             a third-party import added only inside the violation-formatting code path would
+             slip past Cases 1 and 2 but fail loudly here.
         """
         if shutil.which('python3') is None:
             pytest.skip('python3 not found on PATH — cannot verify hook runtime assumption')
@@ -365,6 +369,31 @@ class TestHooksIntegration:
         )
         assert result2.stdout == '', (
             f'Expected empty stdout (clean file, no violations), got: {result2.stdout!r}'
+        )
+
+        # --- Case 3: violation file (print-violations branch isolation) ---
+        # Scans bad_file directly (not tmp_path) so this case is self-contained and
+        # does not depend on Case 2's test_clean.py artifact remaining in tmp_path.
+        bad_file = tmp_path / 'test_bad.py'
+        bad_file.write_text(_MIXED_STYLE_SOURCE)
+        result3 = subprocess.run(
+            ['python3', '-I', '-S', str(SCRIPT_PATH), str(bad_file)],
+            capture_output=True,
+            text=True,
+        )
+        assert result3.returncode == 1, (
+            f'Script should exit 1 (violations found) under python3 -I -S, got {result3.returncode}:\n'
+            f'  stdout: {result3.stdout!r}\n'
+            f'  stderr: {result3.stderr!r}'
+        )
+        assert result3.stdout != '', (
+            'Expected non-empty stdout (violation report), got empty'
+        )
+        assert 'test_bad.py' in result3.stdout, (
+            f'Expected test_bad.py filename in violation output, got: {result3.stdout!r}'
+        )
+        assert 'assert_not_awaited' in result3.stdout, (
+            f'Expected assert_not_awaited violation in output, got: {result3.stdout!r}'
         )
 
 
