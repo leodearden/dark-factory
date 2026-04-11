@@ -737,17 +737,23 @@ class TestRunProbe:
 
         assert result is False
 
-    async def test_cancelled_error_returns_false(self):
-        """CancelledError -> returns False."""
+    async def test_cancelled_error_propagates(self):
+        """CancelledError must propagate so shutdown() can drain the probe task.
+
+        Previously _run_probe swallowed the cancel and returned False, which
+        left ``_account_resume_probe_loop`` looping forever and made
+        ``UsageGate.shutdown()`` hang waiting for the task to finish.
+        """
         gate, acct = await self._make_probing_gate()
 
         async def cancel_exec(*args, **kwargs):
             raise asyncio.CancelledError()
 
-        with patch('asyncio.create_subprocess_exec', side_effect=cancel_exec):
-            result = await gate._run_probe(acct)
-
-        assert result is False
+        with (
+            patch('asyncio.create_subprocess_exec', side_effect=cancel_exec),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await gate._run_probe(acct)
 
     async def test_general_exception_returns_false(self):
         """General exception (e.g., FileNotFoundError) -> returns False."""
