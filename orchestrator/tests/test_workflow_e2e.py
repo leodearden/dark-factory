@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
 import pytest
@@ -22,6 +23,7 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
+from tests.conftest import _spy_set_cached_status
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -359,6 +361,10 @@ class FakeScheduler:
         self, task_id: str, current: list[str], needed: list[str]
     ) -> bool:
         return True
+
+    def get_cached_status(self, task_id: str) -> str | None:
+        history = self.statuses.get(task_id)
+        return history[-1] if history else None
 
     def release(self, task_id: str) -> None:
         pass
@@ -1005,6 +1011,7 @@ class TestPostMergeFailure:
             )
 
         monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify_fn)
+        monkeypatch.setattr('orchestrator.merge_queue.run_scoped_verification', verify_fn)
 
         # Capture pre-merge main ref
         _, pre_merge_sha, _ = await _run(
@@ -1014,7 +1021,9 @@ class TestPostMergeFailure:
         outcome = await workflow.run()
 
         assert outcome == WorkflowOutcome.BLOCKED
-        assert scheduler.statuses['42'][-1] == 'blocked'
+        # merge_phase=True suppresses scheduler status transition —
+        # the orchestrator's outer loop handles the final status update.
+        assert scheduler.statuses['42'][-1] == 'in-progress'
 
         # Main should NOT have advanced — update-ref was never called
         _, post_sha, _ = await _run(
@@ -1936,3 +1945,201 @@ class TestGhostLoopGuard:
         assert outcome == WorkflowOutcome.DONE
         # The implementer must NOT have been called (ghost-loop skipped)
         assert 'implementer' not in stub.calls
+
+
+# ---------------------------------------------------------------------------
+# Tests: WIP Recovery No Advance (pop_conflict on CAS-failure path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestWipRecoveryNoAdvance:
+    """wip_recovery_no_advance outcome creates L1 wip_conflict escalation and returns BLOCKED."""
+
+    async def test_workflow_handles_wip_recovery_no_advance_creates_level1_escalation(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        """When advance_main returns pop_conflict_no_advance, the workflow creates a
+        level-1 wip_conflict escalation and returns BLOCKED (not DONE — the merge
+        did NOT land on main).
+        """
+        recovery_branch = 'wip/recovery-no-advance-test'
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+        monkeypatch.setattr(
+            'orchestrator.merge_queue.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        async def _fake_advance(*args, **kwargs):
+            git_ops._last_recovery_branch = recovery_branch
+            return 'pop_conflict_no_advance'
+
+        monkeypatch.setattr(git_ops, 'advance_main', _fake_advance)
+
+        # Run the workflow as a separate task; it will block waiting on _escalation_event
+        workflow_task = asyncio.create_task(workflow.run())
+
+        # Poll until the wip_conflict escalation appears (meaning handler reached its wait)
+        for _ in range(200):
+            escs = queue.get_by_task('42')
+            if any(e.category == 'wip_conflict' for e in escs):
+                break
+            await asyncio.sleep(0.05)
+        else:
+            workflow_task.cancel()
+            pytest.fail('Timeout: wip_conflict escalation never created within 10s')
+
+        # Fire the event to unblock _handle_wip_recovery_no_advance
+        assert workflow._escalation_event is not None, 'Handler must have set _escalation_event'
+        workflow._escalation_event.set()
+
+        outcome = await workflow_task
+
+        # Merge did NOT land — must return BLOCKED, not DONE
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        wip_escs = [e for e in queue.get_by_task('42') if e.category == 'wip_conflict']
+        assert len(wip_escs) == 1
+        esc = wip_escs[0]
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert recovery_branch in (esc.summary + esc.detail)
+        # Detail must explain merge did not advance (not the same as done_wip_recovery)
+        assert 'did not advance' in esc.detail.lower() or 'merge did not' in esc.detail.lower()
+
+
+# ---------------------------------------------------------------------------
+# Protocol conformance — see TYPE_CHECKING block at the bottom of this file.
+# Static assertions (pyright-verified) replaced the old hasattr/isinstance
+# runtime checks, which only tested attribute presence, not method signatures.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Tests: FakeScheduler.get_cached_status
+# ---------------------------------------------------------------------------
+
+
+class TestFakeSchedulerCachedStatus:
+    """FakeScheduler.get_cached_status returns the last status set for a task."""
+
+    def test_get_cached_status_returns_none_before_any_set(self):
+        """Before any set_task_status call, get_cached_status returns None."""
+        fake = FakeScheduler()
+        assert fake.get_cached_status('x') is None
+
+    @pytest.mark.asyncio
+    async def test_get_cached_status_returns_last_set_status(self):
+        """get_cached_status returns the most recent status after multiple sets."""
+        fake = FakeScheduler()
+        await fake.set_task_status('x', 'in-progress')
+        await fake.set_task_status('x', 'done')
+        assert fake.get_cached_status('x') == 'done'
+
+
+# ---------------------------------------------------------------------------
+# Tests: _EvalScheduler.get_cached_status
+# ---------------------------------------------------------------------------
+
+
+class TestEvalSchedulerCachedStatus:
+    """_EvalScheduler.get_cached_status tracks status set via set_task_status."""
+
+    def test_eval_scheduler_get_cached_status_returns_none_initially(self):
+        """Before any set_task_status call, get_cached_status returns None."""
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.runner import _EvalScheduler
+
+        sched = _EvalScheduler(OrchestratorConfig())
+        assert sched.get_cached_status('99') is None
+
+    @pytest.mark.asyncio
+    async def test_eval_scheduler_get_cached_status_tracks_set_task_status(self):
+        """get_cached_status returns the status written by set_task_status."""
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.runner import _EvalScheduler
+
+        sched = _EvalScheduler(OrchestratorConfig())
+        await sched.set_task_status('99', 'done')
+        assert sched.get_cached_status('99') == 'done'
+
+    @pytest.mark.asyncio
+    async def test_eval_scheduler_uses_status_cache_attribute(self):
+        """_EvalScheduler uses _status_cache (not _cache) to match Scheduler naming."""
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.runner import _EvalScheduler
+
+        sched = _EvalScheduler(OrchestratorConfig())
+        await sched.set_task_status('99', 'done')
+        assert sched._status_cache == {'99': 'done'}
+        assert not hasattr(sched, '_cache')
+
+    @pytest.mark.asyncio
+    async def test_eval_scheduler_set_task_status_writes_via_set_cached_status(self):
+        """_EvalScheduler.set_task_status() must write via _set_cached_status()."""
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.runner import _EvalScheduler
+
+        sched = _EvalScheduler(OrchestratorConfig())
+
+        recorded = _spy_set_cached_status(sched)
+
+        await sched.set_task_status('99', 'done')
+        assert ('99', 'done') in recorded
+
+
+# ---------------------------------------------------------------------------
+# Static Protocol conformance checks (pyright-verified)
+#
+# This block MUST live at the bottom of the file, after the FakeScheduler class
+# definition (line ~361). Placing it at the top would require forward-referencing
+# FakeScheduler() before its definition, which forces a # type: ignore[name-defined]
+# suppression. pyright then infers the expression type as Unknown, which trivially
+# satisfies any Protocol — making the check catch nothing. Keeping the block here
+# allows pyright to resolve FakeScheduler to its concrete class and verify full
+# structural conformance (parameter names, types, return types, positional-only
+# markers), not just attribute presence.
+#
+# CI gate — how enforcement actually reaches this file:
+#   • hooks/project-checks (invoked by hooks/pre-commit on main-branch commits)
+#     iterates over PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard) and
+#     runs `uv run pyright` from each package directory, failing the commit on
+#     any error.
+#   • [tool.pyright] include = ["src", "tests"] in orchestrator/pyproject.toml
+#     ensures every file under orchestrator/tests/ — including this one — is
+#     type-checked when pyright runs from orchestrator/.
+#   Both legs of the gate are pinned by tests/test_pyright_gate_for_workflow_e2e.py,
+#   so accidental removal of either fails at normal pytest time.
+#
+# Experimental verification: enforcement was confirmed in commit 357fa4d6a5 and
+# re-verified during task 699 by temporarily mutating FakeScheduler.get_cached_status
+# to return `int | None`; pyright flagged line 2098 with reportAssignmentType as
+# expected, then the file was reverted.
+#
+# Runtime belt-and-braces: TestFakeSchedulerCachedStatus and
+# TestEvalSchedulerCachedStatus (above) provide runtime coverage of
+# get_cached_status behaviour — the static conformance block only catches
+# signature drift, not behavioural regressions.
+# ---------------------------------------------------------------------------
+
+if TYPE_CHECKING:
+    from orchestrator.evals.runner import _EvalScheduler as _EvalSchedulerStatic
+    from orchestrator.workflow import _SchedulerLike
+
+    _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()
+    _eval_scheduler_conforms: _SchedulerLike = _EvalSchedulerStatic(OrchestratorConfig())

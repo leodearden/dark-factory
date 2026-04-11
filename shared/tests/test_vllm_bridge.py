@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-import aiohttp
 import pytest
-from aiohttp import web
+
+# Skip entire module when aiohttp is not installed (optional [vllm] extra)
+pytest.importorskip('aiohttp')
+
+import aiohttp  # noqa: E402
+from aiohttp import web  # noqa: E402
 
 from shared.vllm_bridge import (
     VllmBridge,

@@ -79,11 +79,9 @@ class TestAddMemory:
         )
         assert SourceStore.mem0 in result.stores_written
         assert result.category == MemoryCategory.preferences_and_norms
-        # Mem0 now routed through durable queue
-        service.durable_queue.enqueue.assert_called_once()
-        call_kwargs = service.durable_queue.enqueue.call_args[1]
-        assert call_kwargs['operation'] == 'mem0_add'
-        assert call_kwargs['group_id'].startswith('mem0_')
+        # Mem0 is now a direct synchronous call — NOT enqueued
+        service.mem0.add.assert_called_once()
+        service.durable_queue.enqueue.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_dual_write(self, service):
@@ -95,11 +93,26 @@ class TestAddMemory:
         )
         assert SourceStore.graphiti in result.stores_written
         assert SourceStore.mem0 in result.stores_written
-        # Both stores go through the queue now
-        assert service.durable_queue.enqueue.call_count == 2
+        # Graphiti still goes through the durable queue; Mem0 is now a direct call
+        assert service.durable_queue.enqueue.call_count == 1
         ops = [c[1]['operation'] for c in service.durable_queue.enqueue.call_args_list]
-        assert 'add_memory_graphiti' in ops
-        assert 'mem0_add' in ops
+        assert ops == ['add_memory_graphiti']
+        service.mem0.add.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dual_write_returns_mem0_memory_ids(self, service):
+        """dual_write=True must still return Mem0 memory_ids synchronously."""
+        result = await service.add_memory(
+            content='We decided to use PostgreSQL for its JSON support',
+            category='decisions_and_rationale',
+            project_id='test',
+            dual_write=True,
+        )
+        assert result.memory_ids == ['mem0-1'], (
+            f'Expected memory_ids=[\'mem0-1\'] for dual_write, got {result.memory_ids!r}'
+        )
+        assert SourceStore.graphiti in result.stores_written
+        assert SourceStore.mem0 in result.stores_written
 
     @pytest.mark.asyncio
     async def test_auto_classification(self, service):
@@ -110,12 +123,52 @@ class TestAddMemory:
         # Should auto-classify — with heuristic-only config, entities_and_relations
         assert result.category is not None
 
+    @pytest.mark.asyncio
+    async def test_mem0_primary_returns_memory_ids(self, service):
+        """add_memory must return the server-assigned Mem0 IDs synchronously.
+
+        The fixture has svc.mem0.add returning {'results': [{'id': 'mem0-1'}]}.
+        After the fix (direct synchronous call instead of durable-queue enqueue),
+        result.memory_ids must be ['mem0-1'].
+        """
+        result = await service.add_memory(
+            content='Always use type hints',
+            category='preferences_and_norms',
+            project_id='test',
+        )
+        assert result.memory_ids == ['mem0-1'], (
+            f'Expected memory_ids=[\'mem0-1\'], got {result.memory_ids!r}. '
+            'The Mem0 write path must be synchronous so IDs are available to the caller.'
+        )
 
     @pytest.mark.asyncio
-    async def test_mem0_enqueue_error_surfaced_in_response(self, service):
-        """Mem0 enqueue errors must appear in the response message."""
-        service.durable_queue.enqueue = AsyncMock(
-            side_effect=ValueError('sqlite disk full')
+    async def test_mem0_add_called_with_scope(self, service):
+        """mem0.add must be called with correct scope and metadata kwargs."""
+        from fused_memory.models.scope import Scope
+
+        await service.add_memory(
+            content='Always use type hints',
+            category='preferences_and_norms',
+            project_id='test',
+            agent_id='a1',
+            session_id='s1',
+        )
+
+        service.mem0.add.assert_called_once()
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['content'] == 'Always use type hints'
+        scope: Scope = call_kwargs['scope']
+        assert scope.project_id == 'test'
+        assert scope.agent_id == 'a1'
+        assert scope.session_id == 's1'
+        metadata = call_kwargs['metadata']
+        assert metadata.get('category') == 'preferences_and_norms'
+
+    @pytest.mark.asyncio
+    async def test_mem0_direct_error_surfaced_in_response(self, service):
+        """Mem0 direct-call errors must appear in the response message."""
+        service.mem0.add = AsyncMock(
+            side_effect=RuntimeError('qdrant write failed')
         )
 
         result = await service.add_memory(
@@ -130,13 +183,13 @@ class TestAddMemory:
 
     @pytest.mark.asyncio
     async def test_success_false_when_only_targeted_store_fails(self, service):
-        """success must be False when the only targeted store's enqueue fails.
+        """success must be False when the only targeted store's direct call fails.
 
-        For a Mem0-only write (preferences_and_norms), if enqueue raises,
+        For a Mem0-only write (preferences_and_norms), if mem0.add raises,
         _graphiti_error is None and _mem0_error is set.
         """
-        service.durable_queue.enqueue = AsyncMock(
-            side_effect=ValueError('sqlite disk full')
+        service.mem0.add = AsyncMock(
+            side_effect=ValueError('qdrant unreachable')
         )
         mock_journal = MagicMock()
         mock_journal.log_write_op = AsyncMock()
@@ -153,6 +206,51 @@ class TestAddMemory:
         assert call_kwargs['success'] is False, (
             'Expected success=False when the only targeted store (Mem0) enqueue fails, '
             f'but got success={call_kwargs["success"]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_memory_ids_logged_to_write_journal(self, service):
+        """write_journal.log_write_op result_summary must contain the real memory_ids."""
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        mock_journal.log_backend_op = AsyncMock()
+        service._write_journal = mock_journal
+
+        await service.add_memory(
+            content='Always use type hints',
+            category='preferences_and_norms',
+            project_id='test',
+        )
+
+        mock_journal.log_write_op.assert_called_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs['result_summary']['memory_ids'] == ['mem0-1'], (
+            f'Expected memory_ids=[\'mem0-1\'] in write journal, '
+            f'got {call_kwargs["result_summary"]["memory_ids"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_memory_ids_emitted_in_reconciliation_event(self, service):
+        """ReconciliationEvent payload must include the real memory_ids."""
+        pushed_events: list = []
+
+        class FakeBuffer:
+            async def push(self, event):
+                pushed_events.append(event)
+
+        service.set_event_buffer(FakeBuffer())
+
+        await service.add_memory(
+            content='Always use type hints',
+            category='preferences_and_norms',
+            project_id='test',
+        )
+
+        assert len(pushed_events) == 1, f'Expected 1 event, got {len(pushed_events)}'
+        event = pushed_events[0]
+        assert event.payload['memory_ids'] == ['mem0-1'], (
+            f'Expected memory_ids=[\'mem0-1\'] in reconciliation event, '
+            f'got {event.payload["memory_ids"]!r}'
         )
 
 
@@ -235,6 +333,23 @@ class TestDurableWriteDispatcher:
             'content': 'Always use type hints',
             'metadata': {'category': 'preferences_and_norms'},
             'project_id': 'test',
+        }
+        await service._execute_durable_write('mem0_add', payload)
+        service.mem0.add.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_mem0_add_queue_operation_still_dispatches(self, service):
+        """Backward-compat: in-flight 'mem0_add' queue items must still drain.
+
+        The add_memory() path no longer enqueues 'mem0_add', but items
+        written to the queue before this fix must still execute correctly
+        so no data is lost on restart.
+        """
+        payload = {
+            'content': 'Legacy queued content',
+            'metadata': {'category': 'preferences_and_norms'},
+            'project_id': 'test',
+            'agent_id': 'legacy-agent',
         }
         await service._execute_durable_write('mem0_add', payload)
         service.mem0.add.assert_called_once()
@@ -1093,6 +1208,39 @@ class TestGetEntity:
             await service.get_entity('entity', project_id='test')
 
         # CancelledError is BaseException, NOT Exception — logging guard must not fire.
+        assert mock_logger.warning.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_takes_precedence_over_exception(self, service):
+        """CancelledError takes precedence over RuntimeError even when RuntimeError comes first.
+
+        Scenario: search_nodes() raises RuntimeError('boom') — it is at results[0].
+                  search() raises CancelledError — it is at results[1].
+
+        Under the OLD code, `next((r for r in results if isinstance(r, BaseException)), None)`
+        picks the first match by position: RuntimeError IS a BaseException subclass, so it
+        wins and RuntimeError is raised.
+
+        Under the NEW code (propagate_cancellations called first), the helper scans the
+        full sequence for bare-BaseException (BaseException but NOT Exception). RuntimeError
+        IS an Exception so it is skipped; CancelledError is not an Exception, so it is raised.
+
+        This aligns get_entity with the convention in graphiti_client.rebuild_entity_summaries
+        and context_assembler.assemble where cancellation signals always take precedence over
+        per-call application errors — structured concurrency semantics.
+        """
+        service.graphiti.search_nodes = AsyncMock(
+            side_effect=RuntimeError('boom')
+        )
+        service.graphiti.search = AsyncMock(
+            side_effect=asyncio.CancelledError()
+        )
+
+        with patch('fused_memory.services.memory_service.logger') as mock_logger, \
+             pytest.raises(asyncio.CancelledError):
+            await service.get_entity('entity', project_id='test')
+
+        # Cancellation propagates before the per-call warning loop executes.
         assert mock_logger.warning.call_count == 0
 
     # ------------------------------------------------------------------

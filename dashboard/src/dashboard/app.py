@@ -31,15 +31,22 @@ from dashboard.data.burndown import (
 )
 from dashboard.data.chart_utils import ChartData, group_top_n
 from dashboard.data.costs import (
-    get_account_events,
-    get_cost_by_account,
-    get_cost_by_project,
-    get_cost_by_role,
-    get_cost_summary,
-    get_cost_trend,
-    get_run_cost_breakdown,
+    aggregate_account_events,
+    aggregate_cost_by_account,
+    aggregate_cost_by_project,
+    aggregate_cost_by_role,
+    aggregate_cost_summary,
+    aggregate_cost_trend,
+    aggregate_run_cost_breakdown,
 )
 from dashboard.data.db import DbPool
+from dashboard.data.merge_queue import (
+    aggregate_latency_stats,
+    aggregate_outcome_distribution,
+    aggregate_queue_depth_timeseries,
+    aggregate_recent_merges,
+    aggregate_speculative_stats,
+)
 from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.performance import (
     get_completion_paths,
@@ -537,15 +544,26 @@ async def partials_performance(request: Request):
 # Costs partials
 # ---------------------------------------------------------------------------
 
+
+async def _cost_dbs(config: DashboardConfig, pool: DbPool) -> list[aiosqlite.Connection | None]:
+    """Collect DB connections for all known project runs.db files."""
+    paths = [config.runs_db]
+    for root in config.known_project_roots:
+        p = root / 'data' / 'orchestrator' / 'runs.db'
+        if p.resolve() != config.runs_db.resolve():
+            paths.append(p)
+    return [await pool.get(p) for p in paths]
+
+
 @app.get('/costs/partials/summary')
 async def costs_partials_summary(request: Request):
     """Cost summary: 4 metric cards aggregated across all projects."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
+    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     try:
-        summary = await get_cost_summary(db, days=days)
+        summary = await aggregate_cost_summary(dbs, days=days)
     except Exception as exc:
         logger.warning('Error fetching cost summary: %s', exc)
         summary = {}
@@ -560,10 +578,10 @@ async def costs_partials_by_project(request: Request):
     """Cost by project: horizontal stacked bar chart."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
+    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     try:
-        by_project = await get_cost_by_project(db, days=days)
+        by_project = await aggregate_cost_by_project(dbs, days=days)
     except Exception as exc:
         logger.warning('Error fetching cost by project: %s', exc)
         by_project = {}
@@ -578,10 +596,10 @@ async def costs_partials_by_account(request: Request):
     """Cost by account: doughnut chart + table."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
+    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     try:
-        by_account = await get_cost_by_account(db, days=days)
+        by_account = await aggregate_cost_by_account(dbs, days=days)
     except Exception as exc:
         logger.warning('Error fetching cost by account: %s', exc)
         by_account = {}
@@ -596,10 +614,10 @@ async def costs_partials_by_role(request: Request):
     """Cost by role: horizontal stacked bar chart."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
+    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     try:
-        by_role = await get_cost_by_role(db, days=days)
+        by_role = await aggregate_cost_by_role(dbs, days=days)
     except Exception as exc:
         logger.warning('Error fetching cost by role: %s', exc)
         by_role = {}
@@ -614,10 +632,10 @@ async def costs_partials_trend(request: Request):
     """Cost trend: daily line chart."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
+    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     try:
-        trend = await get_cost_trend(db, days=days)
+        trend = await aggregate_cost_trend(dbs, days=days)
     except Exception as exc:
         logger.warning('Error fetching cost trend: %s', exc)
         trend = {}
@@ -632,10 +650,10 @@ async def costs_partials_events(request: Request):
     """Account events feed."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
+    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     try:
-        events = await get_account_events(db, days=days)
+        events = await aggregate_account_events(dbs, days=days)
     except Exception as exc:
         logger.warning('Error fetching account events: %s', exc)
         events = []
@@ -650,16 +668,65 @@ async def costs_partials_runs(request: Request):
     """Run cost breakdown: expandable drilldown table."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
+    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     try:
-        runs = await get_run_cost_breakdown(db, days=days)
+        runs = await aggregate_run_cost_breakdown(dbs, days=days)
     except Exception as exc:
         logger.warning('Error fetching run cost breakdown: %s', exc)
         runs = []
     return templates.TemplateResponse(
         request, 'partials/costs/runs.html',
         context={'runs': runs},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Merge queue partial
+# ---------------------------------------------------------------------------
+
+
+@app.get('/partials/merge-queue')
+async def partials_merge_queue(request: Request):
+    """Merge queue operational status card."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    dbs = await _cost_dbs(config, pool)
+    days = _parse_window(request)
+    hours = days * 24
+    window_raw = request.query_params.get('window', '7d')
+
+    depth, outcomes, latency, recent, spec = await asyncio.gather(
+        aggregate_queue_depth_timeseries(dbs, hours=hours),
+        aggregate_outcome_distribution(dbs, hours=hours),
+        aggregate_latency_stats(dbs, hours=hours),
+        aggregate_recent_merges(dbs, limit=20),
+        aggregate_speculative_stats(dbs, hours=hours),
+        return_exceptions=True,
+    )
+
+    depth = _safe_gather_result(depth, {'labels': [], 'values': []}, 'merge_queue.depth')
+    outcomes = _safe_gather_result(outcomes, {'labels': [], 'values': []}, 'merge_queue.outcomes')
+    latency = _safe_gather_result(
+        latency, {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0},
+        'merge_queue.latency',
+    )
+    recent = _safe_gather_result(recent, [], 'merge_queue.recent')
+    spec = _safe_gather_result(
+        spec, {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0},
+        'merge_queue.speculative',
+    )
+
+    return templates.TemplateResponse(
+        request, 'partials/merge_queue.html',
+        context={
+            'depth_timeseries': depth,
+            'outcomes': outcomes,
+            'latency': latency,
+            'recent': recent,
+            'speculative': spec,
+            'window': window_raw,
+        },
     )
 
 

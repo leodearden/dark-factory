@@ -23,7 +23,7 @@ import json
 import logging
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from orchestrator.evals.metrics import EvalMetrics, compute_composite
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 # Commit 594658fbe3 replaced the 5× sonnet panel with the 1× opus reviewer.
 # Override via ``--cutoff`` if this is off.
-CUTOFF = datetime(2026, 4, 8, 10, 32, 0, tzinfo=timezone.utc)
+CUTOFF = datetime(2026, 4, 8, 10, 32, 0, tzinfo=UTC)
 
 RESULTS_DIR = Path(__file__).parent / 'results'
 RE_REVIEWS_DIR = RESULTS_DIR / 're_reviews'
@@ -84,18 +84,18 @@ class RereviewOutcome:
     @classmethod
     def ok(
         cls, run_id: str, cost: float, blocking: int, suggestions: int,
-    ) -> 'RereviewOutcome':
+    ) -> RereviewOutcome:
         return cls(
             status='done', run_id=run_id, cost=cost,
             blocking=blocking, suggestions=suggestions,
         )
 
     @classmethod
-    def skip(cls, run_id: str, message: str) -> 'RereviewOutcome':
+    def skip(cls, run_id: str, message: str) -> RereviewOutcome:
         return cls(status='skip', run_id=run_id, message=message)
 
     @classmethod
-    def error(cls, run_id: str, message: str) -> 'RereviewOutcome':
+    def error(cls, run_id: str, message: str) -> RereviewOutcome:
         return cls(status='error', run_id=run_id, message=message)
 
 
@@ -152,7 +152,7 @@ def enumerate_candidates(cutoff: datetime, force: bool) -> list[Candidate]:
         if data.get('outcome') != 'done':
             continue
 
-        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
         if mtime >= cutoff:
             continue
 
@@ -296,7 +296,7 @@ async def rereview_one(cand: Candidate) -> RereviewOutcome:
         'reviewer': name,
         'review': review,
         'cost_usd': cost,
-        'timestamp': datetime.now(tz=timezone.utc).isoformat(),
+        'timestamp': datetime.now(tz=UTC).isoformat(),
         'base_commit': cand.base_commit,
         'diff_len': len(diff_text),
     })
@@ -330,7 +330,7 @@ async def rereview_one(cand: Candidate) -> RereviewOutcome:
         'cost_usd': cost,
         'blocking': blocking,
         'suggestions': suggestions,
-        'ts': datetime.now(tz=timezone.utc).isoformat(),
+        'ts': datetime.now(tz=UTC).isoformat(),
     })
     return RereviewOutcome.ok(cand.run_id, cost, blocking, suggestions)
 
@@ -357,14 +357,12 @@ async def run_rereviews(cands: list[Candidate]) -> list[RereviewOutcome]:
     tasks = [asyncio.create_task(_gated(i, c)) for i, c in enumerate(cands)]
 
     outcomes: list[RereviewOutcome] = []
-    done = 0
     spent = 0.0
     errors = 0
     skipped = 0
-    for coro in asyncio.as_completed(tasks):
+    for done, coro in enumerate(asyncio.as_completed(tasks), 1):
         r = await coro
         outcomes.append(r)
-        done += 1
         if r.status == 'done':
             spent += r.cost
         elif r.status == 'error':
@@ -373,7 +371,7 @@ async def run_rereviews(cands: list[Candidate]) -> list[RereviewOutcome]:
                 'run_id': r.run_id,
                 'status': 'error',
                 'message': r.message,
-                'ts': datetime.now(tz=timezone.utc).isoformat(),
+                'ts': datetime.now(tz=UTC).isoformat(),
             })
         elif r.status == 'skip':
             skipped += 1
@@ -436,7 +434,7 @@ async def _amain() -> int:
             print(f'Invalid --cutoff: {args.cutoff}', file=sys.stderr)
             return 2
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+            parsed = parsed.replace(tzinfo=UTC)
         cutoff = parsed
 
     cands = enumerate_candidates(cutoff=cutoff, force=args.force)

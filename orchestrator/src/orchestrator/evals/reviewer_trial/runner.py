@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from orchestrator.agents.invoke import invoke_agent
@@ -189,7 +189,7 @@ async def run_panel(
     # Gather results
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for r in results:
-        if isinstance(r, Exception):
+        if isinstance(r, BaseException):
             errors.append(str(r))
             continue
         name, review, cost = r
@@ -265,7 +265,7 @@ async def run_trial(
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for r in results:
-        if isinstance(r, Exception):
+        if isinstance(r, BaseException):
             logger.error('Panel run failed: %s', r)
         else:
             all_results.append(r)

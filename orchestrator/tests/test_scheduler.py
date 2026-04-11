@@ -1,12 +1,14 @@
 """Tests for scheduler module lock logic."""
 
 
-from unittest.mock import AsyncMock
+import time
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules
+from tests.conftest import _spy_set_cached_status
 
 
 @pytest.fixture
@@ -378,7 +380,10 @@ class TestStatusTransitionGuard:
 
 
 class TestGetTasksSeedsCache:
-    """get_tasks() should populate the _status_cache so pre-existing terminal tasks are guarded."""
+    """get_tasks() should populate the status cache so pre-existing terminal tasks are guarded.
+
+    Uses get_cached_status() to verify cache contents.
+    """
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
@@ -426,7 +431,7 @@ class TestGetTasksSeedsCache:
         set_mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', set_mock)
         await scheduler.set_task_status('42', 'cancelled')
-        assert scheduler._status_cache.get('42') == 'cancelled'
+        assert scheduler.get_cached_status('42') == 'cancelled'
 
         # Step 2: Simulate store reinstatement — task 42 is now 'pending'
         reinstated_response = {
@@ -444,7 +449,7 @@ class TestGetTasksSeedsCache:
 
         # Step 3: get_tasks() must resync cache to match store
         await scheduler.get_tasks()
-        assert scheduler._status_cache.get('42') == 'pending', (
+        assert scheduler.get_cached_status('42') == 'pending', (
             'get_tasks() must trust store reinstatement of cancelled -> pending'
         )
 
@@ -464,7 +469,7 @@ class TestGetTasksSeedsCache:
         set_mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', set_mock)
         await scheduler.set_task_status('42', 'in-progress')
-        assert scheduler._status_cache.get('42') == 'in-progress'
+        assert scheduler.get_cached_status('42') == 'in-progress'
 
         # Simulate taskmaster reporting a different non-terminal status ('blocked')
         update_response = {
@@ -483,7 +488,7 @@ class TestGetTasksSeedsCache:
         await scheduler.get_tasks()
 
         # Non-terminal cache entry SHOULD be updated
-        assert scheduler._status_cache.get('42') == 'blocked', (
+        assert scheduler.get_cached_status('42') == 'blocked', (
             'get_tasks() should update non-terminal cache entries'
         )
 
@@ -1070,10 +1075,12 @@ class TestCancelledTaskResync:
     """Regression: externally reinstated cancelled tasks must not spin-loop.
 
     Reproduces the bug where 15 cancelled tasks were reinstated to pending in
-    the store, but the scheduler's _status_cache still held 'cancelled'.  The
+    the store, but the scheduler's status cache still held 'cancelled'.  The
     terminal guard rejected every cancelled->in-progress transition, and the
     task was immediately reacquired — an infinite spin that starved pending
     tasks (156k+ rejections for a single task).
+
+    Uses get_cached_status() to verify cache contents.
     """
 
     @pytest.fixture
@@ -1091,7 +1098,7 @@ class TestCancelledTaskResync:
 
         # 1. Orchestrator cancels the task — cache records 'cancelled'
         await scheduler.set_task_status('64', 'cancelled')
-        assert scheduler._status_cache['64'] == 'cancelled'
+        assert scheduler.get_cached_status('64') == 'cancelled'
 
         # 2. External process reinstates to pending (store returns pending)
         reinstated_task = {
@@ -1125,7 +1132,7 @@ class TestCancelledTaskResync:
 
         # 4. Cache must now show 'pending' (resynced from store)
         #    so that set_task_status('in-progress') is NOT rejected
-        assert scheduler._status_cache['64'] == 'pending'
+        assert scheduler.get_cached_status('64') == 'pending'
 
         # 5. Transition to in-progress must succeed (not be silently dropped)
         ip_mock = AsyncMock(return_value={})
@@ -1136,7 +1143,7 @@ class TestCancelledTaskResync:
             'set_task_status(in-progress) must issue MCP call after reinstatement — '
             'was silently rejected by stale terminal guard before fix'
         )
-        assert scheduler._status_cache['64'] == 'in-progress'
+        assert scheduler.get_cached_status('64') == 'in-progress'
 
     @pytest.mark.asyncio
     async def test_spin_loop_does_not_occur(
@@ -1274,3 +1281,458 @@ class TestRequeueCooldown:
 
         a2 = await scheduler.acquire_next()
         assert a2 is not None and a2.task_id == '99'
+
+
+class TestFairness:
+    """Scheduler anti-starvation (Mode-2 cross-module race) fairness.
+
+    The strict top candidate's consecutive-skip counter is incremented whenever
+    a lower-ranked task takes its slot (or when the full loop fails). Once the
+    counter reaches ``skip_threshold``, the scheduler installs a reservation
+    on each of the top candidate's normalized modules.  Reserved modules
+    refuse ``try_acquire`` from everyone except the owner until the owner
+    acquires or the lease expires.
+    """
+
+    # ---- ModuleLockTable park-level unit tests ----
+
+    def test_install_and_block_non_owner(self):
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        lt = ModuleLockTable(config)
+        lt.install_parks('owner', ['backend'], deadline=time.monotonic() + 60)
+        assert not lt.try_acquire('other', ['backend'])
+        # Owner can still acquire its own park.
+        assert lt.try_acquire('owner', ['backend'])
+
+    def test_park_hierarchical_blocks_child(self):
+        """A park on a parent module blocks acquire of any child."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        lt = ModuleLockTable(config)
+        lt.install_parks('A', ['autopilot/analyze'], deadline=time.monotonic() + 60)
+        assert not lt.try_acquire('B', ['autopilot/analyze/asr'])
+
+    def test_park_hierarchical_blocks_parent(self):
+        """A park on a child blocks acquire of its parent."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        lt = ModuleLockTable(config)
+        lt.install_parks(
+            'A', ['autopilot/analyze/asr'], deadline=time.monotonic() + 60
+        )
+        assert not lt.try_acquire('B', ['autopilot/analyze'])
+
+    def test_park_siblings_dont_conflict(self):
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        lt = ModuleLockTable(config)
+        lt.install_parks(
+            'A', ['autopilot/analyze/asr'], deadline=time.monotonic() + 60
+        )
+        assert lt.try_acquire('B', ['autopilot/analyze/speech'])
+
+    def test_clear_parks_for_owner(self):
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        lt = ModuleLockTable(config)
+        lt.install_parks('A', ['backend', 'frontend'], deadline=time.monotonic() + 60)
+        assert lt.has_parks('A')
+        lt.clear_parks_for('A')
+        assert not lt.has_parks('A')
+        # Unrelated tasks can now acquire.
+        assert lt.try_acquire('B', ['backend'])
+
+    def test_prune_expired_returns_owner_and_drops(self):
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        lt = ModuleLockTable(config)
+        lt.install_parks('A', ['backend'], deadline=0.0)  # already expired
+        lt.install_parks('B', ['frontend'], deadline=time.monotonic() + 60)
+        evicted = lt.prune_expired_parks(time.monotonic())
+        assert evicted == ['A']
+        # A's park is gone, B's remains.
+        assert not lt.has_parks('A')
+        assert lt.has_parks('B')
+
+    def test_expired_park_does_not_block(self):
+        """An expired park (not yet pruned) must not block acquires."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        lt = ModuleLockTable(config)
+        lt.install_parks('A', ['backend'], deadline=0.0)
+        # Lease expired; try_acquire from other should succeed without
+        # explicit pruning.
+        assert lt.try_acquire('B', ['backend'])
+
+    # ---- Scheduler lease computation ----
+
+    def test_compute_lease_midpoint_on_empty_history(self):
+        config = OrchestratorConfig(max_per_module=1)
+        config.fairness.lease_min_secs = 100.0
+        config.fairness.lease_max_secs = 300.0
+        s = Scheduler(config)
+        assert s._compute_lease() == 200.0
+
+    def test_compute_lease_uses_median_and_multiplier(self):
+        config = OrchestratorConfig(max_per_module=1)
+        config.fairness.lease_multiplier = 5.0
+        config.fairness.lease_min_secs = 0.0
+        config.fairness.lease_max_secs = 10_000.0
+        s = Scheduler(config)
+        s._recent_durations.extend([10.0, 20.0, 30.0])  # median 20.0
+        assert s._compute_lease() == 100.0
+
+    def test_compute_lease_clamps_to_min(self):
+        config = OrchestratorConfig(max_per_module=1)
+        config.fairness.lease_multiplier = 1.0
+        config.fairness.lease_min_secs = 100.0
+        config.fairness.lease_max_secs = 1000.0
+        s = Scheduler(config)
+        s._recent_durations.append(5.0)  # 5s * 1.0 = 5s, below floor
+        assert s._compute_lease() == 100.0
+
+    def test_compute_lease_clamps_to_max(self):
+        config = OrchestratorConfig(max_per_module=1)
+        config.fairness.lease_multiplier = 5.0
+        config.fairness.lease_min_secs = 60.0
+        config.fairness.lease_max_secs = 1000.0
+        s = Scheduler(config)
+        s._recent_durations.append(500.0)  # 500 * 5 = 2500, above ceiling
+        assert s._compute_lease() == 1000.0
+
+    # ---- Mode-2 integration: skip-count promotion ----
+
+    @pytest.fixture
+    def fair_config(self) -> OrchestratorConfig:
+        """OrchestratorConfig tuned for quick fairness testing."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.skip_threshold = 3
+        config.fairness.lease_min_secs = 60.0
+        config.fairness.lease_max_secs = 600.0
+        return config
+
+    @staticmethod
+    def _broad_task():
+        return {
+            'id': 'A',
+            'title': 'Broad task',
+            'status': 'pending',
+            'priority': 'high',
+            'dependencies': [],
+            'metadata': {'modules': ['compiler/src', 'eval/src']},
+        }
+
+    @staticmethod
+    def _narrow_task(tid: str, module: str, priority: str = 'medium'):
+        return {
+            'id': tid,
+            'title': f'Narrow task {tid}',
+            'status': 'pending',
+            'priority': priority,
+            'dependencies': [],
+            'metadata': {'modules': [module]},
+        }
+
+    @pytest.mark.asyncio
+    async def test_skip_count_increments_when_top_passed_over(self, fair_config):
+        """A (broad, top) fails, B (narrow, lower) succeeds → A's skip_count = 1."""
+        scheduler = Scheduler(fair_config)
+        # Seed compiler/src lock so A can't acquire (eval/src free, but broad lock fails).
+        scheduler.lock_table.try_acquire('seed', ['compiler/src'])
+        scheduler._dispatched.add('seed')  # seed task isn't in the candidate list
+
+        a = self._broad_task()
+        b = self._narrow_task('B', 'eval/src', priority='medium')
+        scheduler.get_tasks = AsyncMock(return_value=[a, b])
+
+        result = await scheduler.acquire_next()
+        # B (lower priority, narrow) won.
+        assert result is not None
+        assert result.task_id == 'B'
+        # A's skip counter was incremented.
+        assert scheduler._skip_count.get('A') == 1
+
+    @pytest.mark.asyncio
+    async def test_skip_count_resets_on_successful_acquire(self, fair_config):
+        """If the top candidate acquires, its skip counter is cleared."""
+        scheduler = Scheduler(fair_config)
+        scheduler._skip_count['A'] = 2
+        a = self._broad_task()
+        scheduler.get_tasks = AsyncMock(return_value=[a])
+
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == 'A'
+        assert 'A' not in scheduler._skip_count
+
+    @pytest.mark.asyncio
+    async def test_reservation_installed_after_threshold(self, fair_config):
+        """After skip_threshold consecutive skips, A's modules are parked."""
+        scheduler = Scheduler(fair_config)
+        scheduler.lock_table.try_acquire('seed', ['compiler/src'])
+        scheduler._dispatched.add('seed')
+
+        a = self._broad_task()
+        b = self._narrow_task('B', 'eval/src', priority='medium')
+        scheduler.get_tasks = AsyncMock(return_value=[a, b])
+
+        # Run skip_threshold ticks. Between ticks, free up 'eval/src' (via
+        # release of B) so there's a fresh acquire each time for B.
+        threshold = fair_config.fairness.skip_threshold
+        for _ in range(threshold):
+            result = await scheduler.acquire_next()
+            assert result is not None and result.task_id == 'B'
+            scheduler.release('B')
+
+        assert scheduler._skip_count['A'] == threshold
+        assert scheduler.lock_table.has_parks('A')
+
+    @pytest.mark.asyncio
+    async def test_reservation_blocks_lower_ranked_tasks(self, fair_config):
+        """Once A's park is installed, B can no longer take A's modules."""
+        scheduler = Scheduler(fair_config)
+        # Manually install a park for A on compiler/src + eval/src.
+        scheduler.lock_table.install_parks(
+            'A',
+            ['compiler/src', 'eval/src'],
+            deadline=time.monotonic() + 300,
+        )
+        # B wants compiler/src only — should be blocked by A's park.
+        assert not scheduler.lock_table.try_acquire('B', ['compiler/src'])
+        # Unrelated module is fine.
+        assert scheduler.lock_table.try_acquire('C', ['other/src'])
+
+    @pytest.mark.asyncio
+    async def test_owner_acquires_despite_own_park(self, fair_config):
+        """The park owner can still acquire its own reserved modules."""
+        scheduler = Scheduler(fair_config)
+        scheduler.lock_table.install_parks(
+            'A', ['compiler/src', 'eval/src'], deadline=time.monotonic() + 300
+        )
+        a = self._broad_task()
+        scheduler.get_tasks = AsyncMock(return_value=[a])
+
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == 'A'
+        # Parks were cleared on successful acquire.
+        assert not scheduler.lock_table.has_parks('A')
+
+    @pytest.mark.asyncio
+    async def test_reservation_expires_and_skip_count_resets(
+        self, fair_config, monkeypatch
+    ):
+        """When a lease expires without acquire, the park drops and the owner's
+        skip counter resets so they can re-accumulate instead of loop-parking."""
+        scheduler = Scheduler(fair_config)
+        # Install a park with a deadline already in the past.
+        scheduler.lock_table.install_parks(
+            'A', ['compiler/src', 'eval/src'], deadline=0.0
+        )
+        scheduler._skip_count['A'] = 5
+
+        # Tick the scheduler with no candidates — this triggers prune.
+        scheduler.get_tasks = AsyncMock(return_value=[])
+        await scheduler.acquire_next()
+
+        assert not scheduler.lock_table.has_parks('A')
+        assert 'A' not in scheduler._skip_count
+
+    def test_release_records_duration(self, fair_config, monkeypatch):
+        """Scheduler.release() appends (end - start) to the rolling window."""
+        scheduler = Scheduler(fair_config)
+        # Seed as if acquire_next had recorded a start time.
+        scheduler._task_start_times['A'] = 100.0
+        monkeypatch.setattr(time, 'monotonic', lambda: 150.0)
+
+        scheduler.release('A')
+
+        assert list(scheduler._recent_durations) == [50.0]
+
+    @pytest.mark.asyncio
+    async def test_mode2_broad_task_eventually_wins(self, fair_config):
+        """End-to-end Mode-2 regression guard.
+
+        Broad high-priority A is starved by narrow medium-priority B on
+        compiler/src.  After skip_threshold ticks, A's reservation parks
+        compiler/src; B can no longer grab it; the next tick frees the
+        seed lock on compiler/src and A runs.
+        """
+        scheduler = Scheduler(fair_config)
+
+        # Seed: block compiler/src with a long-running task.
+        scheduler.lock_table.try_acquire('seed', ['compiler/src'])
+        scheduler._dispatched.add('seed')
+
+        a = self._broad_task()
+        b = self._narrow_task('B', 'eval/src', priority='medium')
+        scheduler.get_tasks = AsyncMock(return_value=[a, b])
+
+        threshold = fair_config.fairness.skip_threshold
+        # skip_threshold ticks: B wins, A's skip counter climbs.
+        for _ in range(threshold):
+            result = await scheduler.acquire_next()
+            assert result is not None and result.task_id == 'B'
+            scheduler.release('B')
+
+        # A's reservation is now installed.
+        assert scheduler.lock_table.has_parks('A')
+
+        # Release the seed task. Now compiler/src is free, but B is blocked
+        # by A's park on it.
+        scheduler.release('seed')
+        scheduler._dispatched.discard('seed')
+
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == 'A'
+        # And A's park was cleaned up on successful acquire.
+        assert not scheduler.lock_table.has_parks('A')
+
+
+class TestGetCachedStatus:
+    """get_cached_status() exposes the internal status cache via a public method."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def test_get_cached_status_returns_none_for_unknown_task(self, scheduler: Scheduler):
+        """get_cached_status returns None when the task has never been seen."""
+        assert scheduler.get_cached_status('unknown') is None
+
+    @pytest.mark.asyncio
+    async def test_get_cached_status_returns_status_after_set_task_status(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """get_cached_status returns the last status written via set_task_status."""
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value={}))
+        await scheduler.set_task_status('42', 'in-progress')
+        assert scheduler.get_cached_status('42') == 'in-progress'
+
+
+class TestSchedulerInternalRouting:
+    """Scheduler internal call sites route reads through get_cached_status."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_reads_via_get_cached_status(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """set_task_status() must read the cached value via get_cached_status().
+
+        Stronger invariant: the return value must actually drive the transition
+        gate.  Patching get_cached_status to return 'done' causes done->blocked
+        to be rejected (is_valid_transition('done', 'blocked') is False), so
+        mcp_call is never invoked.  A spy-only assertion would pass even if the
+        production code read _status_cache directly alongside a vestigial
+        get_cached_status() call; this form does not.
+        """
+        mcp_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+
+        with patch.object(scheduler, 'get_cached_status', return_value='done'):
+            await scheduler.set_task_status('42', 'blocked')
+            mcp_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_reads_via_get_cached_status(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """get_tasks() must read the cached value via get_cached_status() for reinstatement detection."""
+        import json
+        scheduler._status_cache['42'] = 'cancelled'
+
+        tasks_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': json.dumps({'tasks': [{'id': '42', 'status': 'pending', 'title': 'T'}]}),
+                    }
+                ]
+            }
+        }
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value=tasks_response))
+
+        with patch.object(scheduler, 'get_cached_status', wraps=scheduler.get_cached_status) as spy:
+            await scheduler.get_tasks()
+            spy.assert_any_call('42')
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_writes_via_set_cached_status(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """set_task_status() must write the new status via _set_cached_status().
+
+        Instance-level rebinding works because Python's attribute lookup finds
+        the instance attribute before the class method, so the production call
+        self._set_cached_status(...) resolves to the recorder.
+        """
+        mcp_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+
+        # Pre-seed the cache so is_valid_transition('pending', 'in-progress')
+        # is True regardless of future gate tightening for None->* transitions.
+        scheduler._status_cache['42'] = 'pending'
+
+        recorded = _spy_set_cached_status(scheduler)
+
+        await scheduler.set_task_status('42', 'in-progress')
+        assert ('42', 'in-progress') in recorded
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_writes_via_set_cached_status(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """get_tasks() must write the cached status via _set_cached_status().
+
+        Verifies get_tasks() writes via the _set_cached_status chokepoint.
+        """
+        import json
+
+        tasks_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': json.dumps({'tasks': [{'id': '42', 'status': 'pending', 'title': 'T'}]}),
+                    }
+                ]
+            }
+        }
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value=tasks_response))
+
+        recorded = _spy_set_cached_status(scheduler)
+
+        await scheduler.get_tasks()
+        assert ('42', 'pending') in recorded
+
+
+class TestSpySetCachedStatus:
+    """Unit tests for the _spy_set_cached_status helper in conftest.py."""
+
+    def test_spy_returns_empty_list_initially(self):
+        """Installing the spy on a fresh object returns an empty list."""
+
+        class Dummy:
+            def _set_cached_status(self, task_id: str, status: str) -> None:
+                pass
+
+        d = Dummy()
+        recorded = _spy_set_cached_status(d)
+        assert recorded == []
+
+    def test_spy_captures_and_forwards_call(self):
+        """The spy captures the call AND forwards it to the original method."""
+
+        class Dummy:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def _set_cached_status(self, task_id: str, status: str) -> None:
+                self.calls.append((task_id, status))
+
+        d = Dummy()
+        recorded = _spy_set_cached_status(d)
+        d._set_cached_status('t1', 's1')
+        # spy captures the call
+        assert ('t1', 's1') in recorded
+        # original is also called (forwarding, not just capturing)
+        assert ('t1', 's1') in d.calls

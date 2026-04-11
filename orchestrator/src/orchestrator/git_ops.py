@@ -8,7 +8,7 @@ inherits it, agents treat it as state, and cross-task contamination follows.
 
 This module contains multiple redundant safeguards ("belts and braces"):
 
-1. _scrub_task_dir_from_tree() — removes .task/ from the git index in any
+1. scrub_task_dir_from_tree() — removes .task/ from the git index in any
    worktree, amending the current commit.  Called after merges and during
    worktree creation.
 2. _assert_no_task_dir() — hard assertion that a given commit SHA contains
@@ -28,6 +28,7 @@ import asyncio
 import logging
 import shutil
 from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
 from typing import Literal
 
@@ -40,14 +41,33 @@ logger = logging.getLogger(__name__)
 AdvanceResult = Literal[
     'advanced', 'cas_failed', 'not_descendant', 'contaminated',
     'stash_failed', 'wip_overlap', 'pop_conflict',
+    'unmerged_state', 'pop_conflict_no_advance',
 ]
+
+
+class ScrubResult(Enum):
+    """Result of a ``scrub_task_dir_from_tree`` call.
+
+    Distinguishes three outcomes so callers can react precisely:
+
+    - ``CLEAN``   — ``.task/`` was not present in the tree; no action taken.
+    - ``SCRUBBED``— ``.task/`` was found and successfully removed from the index.
+    - ``FAILED``  — ``.task/`` was found but could not be removed (git rm or
+                    git commit failed).  The index may still be contaminated;
+                    ``_assert_no_task_dir`` is the downstream hard gate.
+    """
+    CLEAN = auto()
+    SCRUBBED = auto()
+    FAILED = auto()
 
 
 # ---------------------------------------------------------------------------
 # .task/ contamination helpers
 # ---------------------------------------------------------------------------
 
-async def _scrub_task_dir_from_tree(cwd: Path, context: str, *, amend: bool = True) -> bool:
+async def scrub_task_dir_from_tree(
+    cwd: Path, context: str, *, amend: bool = True,
+) -> ScrubResult:
     """Remove .task/ from the git index if present.
 
     This is the primary defense against .task/ reaching main.  It checks
@@ -64,7 +84,10 @@ async def _scrub_task_dir_from_tree(cwd: Path, context: str, *, amend: bool = Tr
                after create_worktree where HEAD == main's tip).
 
     Returns:
-        True if .task/ was found and removed, False if the tree was clean.
+        ``ScrubResult.CLEAN``    if ``.task/`` was not present in the tree.
+        ``ScrubResult.SCRUBBED`` if ``.task/`` was found and successfully removed.
+        ``ScrubResult.FAILED``   if ``.task/`` was found but removal failed
+                                  (git rm or git commit returned non-zero).
 
     DO NOT REMOVE THIS FUNCTION.  It is the last reliable defense before
     .task/ reaches main via update-ref (which bypasses all git hooks).
@@ -74,11 +97,11 @@ async def _scrub_task_dir_from_tree(cwd: Path, context: str, *, amend: bool = Tr
         cwd=cwd,
     )
     if rc != 0 or not tracked.strip():
-        return False
+        return ScrubResult.CLEAN
 
     files = [f for f in tracked.strip().splitlines() if f.strip()]
     if not files:
-        return False
+        return ScrubResult.CLEAN
 
     logger.warning(
         '.task/ CONTAMINATION detected during %s — removing %d tracked file(s): %s',
@@ -86,7 +109,10 @@ async def _scrub_task_dir_from_tree(cwd: Path, context: str, *, amend: bool = Tr
     )
 
     # Remove from index (not filesystem — .task/ may still be needed as scratch)
-    await _run(['git', 'rm', '-r', '--cached', '--', '.task/'], cwd=cwd)
+    rc, _, err = await _run(['git', 'rm', '-r', '--cached', '--', '.task/'], cwd=cwd)
+    if rc != 0:
+        logger.error('.task/ scrub failed during %s: git rm --cached failed: %s', context, err)
+        return ScrubResult.FAILED
 
     # Also remove from filesystem if present (cleanup inherited contamination)
     task_dir = cwd / '.task'
@@ -113,10 +139,10 @@ async def _scrub_task_dir_from_tree(cwd: Path, context: str, *, amend: bool = Tr
 
     if rc != 0:
         logger.error('.task/ scrub failed during %s: could not commit removal: %s', context, err)
-        return False
+        return ScrubResult.FAILED
 
     logger.info('.task/ scrub completed during %s — %d file(s) removed from tree', context, len(files))
-    return True
+    return ScrubResult.SCRUBBED
 
 
 def _ensure_task_gitignore(worktree: Path) -> None:
@@ -301,12 +327,21 @@ class GitOps:
         # been committed yet.
         # amend=False: HEAD is shared with main — must NOT amend the shared commit.
         # Instead, create a new commit on the branch to remove .task/.
-        scrubbed = await _scrub_task_dir_from_tree(worktree_path, 'worktree-creation', amend=False)
-        if scrubbed:
+        scrub_result = await scrub_task_dir_from_tree(
+            worktree_path, 'worktree-creation', amend=False,
+        )
+        if scrub_result == ScrubResult.SCRUBBED:
             logger.warning(
                 'MAIN IS CONTAMINATED — .task/ was inherited by new worktree %s. '
                 'The contamination has been removed from this worktree, but main '
                 'still carries .task/.  Run: git rm -r --cached .task/ on main.',
+                worktree_path,
+            )
+        elif scrub_result == ScrubResult.FAILED:
+            logger.error(
+                '.task/ scrub FAILED during worktree-creation for %s — the index '
+                'may still be contaminated.  The hard gate at advance_main will '
+                'catch this if contamination reaches main.',
                 worktree_path,
             )
 
@@ -495,10 +530,16 @@ class GitOps:
             # merge commit contains those files.  We MUST remove them
             # before this commit reaches main via advance_main().
             #
-            # _scrub_task_dir_from_tree() checks git ls-tree, runs
+            # scrub_task_dir_from_tree() checks git ls-tree, runs
             # git rm --cached, and amends the merge commit in-place.
             # This is the single most important .task/ defense.
-            await _scrub_task_dir_from_tree(merge_wt, f'post-merge({full_branch})')
+            scrub_result = await scrub_task_dir_from_tree(merge_wt, f'post-merge({full_branch})')
+            if scrub_result == ScrubResult.FAILED:
+                logger.error(
+                    '.task/ scrub FAILED post-merge for %s — index may still be '
+                    'contaminated; _assert_no_task_dir will catch it at advance_main.',
+                    full_branch,
+                )
 
             _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
             return MergeResult(
@@ -650,6 +691,15 @@ class GitOps:
           (permanent; stop retrying).
         * ``'stash_failed'`` — ``git stash push`` failed before the advance
           (permanent; halt merge to prevent code loss).
+        * ``'pop_conflict_no_advance'`` — CAS ``update-ref`` failed AND the
+          subsequent stash pop conflicted.  The merge did NOT land.  WIP is
+          preserved on a ``wip/recovery-*`` branch; routes to a human-level
+          escalation.
+        * ``'unmerged_state'`` — ``project_root`` already has unresolved merge
+          conflicts in its index (UU/AA/DD paths detected via
+          ``git status --porcelain``).  Halts immediately; manual cleanup of
+          the conflict markers is required before retrying.  Routes to a
+          human-level escalation, not the steward corrective loop.
 
         When *branch* is provided and a rebase fails, the method will abort
         the rebase, reset to current main, and re-merge *branch* before
@@ -737,9 +787,15 @@ class GitOps:
                 )
                 return 'not_descendant'
 
-            await _scrub_task_dir_from_tree(
+            scrub_result = await scrub_task_dir_from_tree(
                 merge_worktree, f'advance_main-retry({attempt + 1})',
             )
+            if scrub_result == ScrubResult.FAILED:
+                logger.error(
+                    '.task/ scrub FAILED during advance_main-retry(%d) — index may '
+                    'be contaminated; _assert_no_task_dir will catch it.',
+                    attempt + 1,
+                )
             _, new_sha, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=merge_worktree,
             )
@@ -753,6 +809,24 @@ class GitOps:
                 f'{self.config.main_branch}'
             )
             return 'not_descendant'
+
+        # ── Pre-advance unmerged state guard ────────────────────────
+        # Belt-and-braces: reject immediately if project_root already has
+        # unresolved merge conflicts in the index.  Any git stash push in
+        # this state would fail with "fatal: needs merge", producing
+        # 'stash_failed' and hiding the real problem.  Detecting here
+        # produces a distinct 'unmerged_state' code that routes to a
+        # human-escalation path instead of the steward corrective loop.
+        _unmerged_entry_paths = await self._detect_unmerged_paths(self.project_root)
+        if _unmerged_entry_paths:
+            logger.critical(
+                'CRITICAL: project_root has %d pre-existing unresolved merge '
+                'conflict(s) (%s) — halting advance_main to prevent data loss. '
+                'Manual cleanup required before retrying.',
+                len(_unmerged_entry_paths),
+                ', '.join(_unmerged_entry_paths[:10]),
+            )
+            return 'unmerged_state'
 
         # ── Working-tree protection ──────────────────────────────────
         # When project_root has main checked out, update-ref will desync
@@ -786,12 +860,12 @@ class GitOps:
                 wt_dir = self.config.worktree_dir
                 _, unstaged_files, _ = await _run(
                     ['git', 'diff', '--name-only', '--',
-                     '.', f':!.task', f':!{wt_dir}'],
+                     '.', ':!.task', f':!{wt_dir}'],
                     cwd=self.project_root,
                 )
                 _, staged_files, _ = await _run(
                     ['git', 'diff', '--name-only', '--cached', '--',
-                     '.', f':!.task', f':!{wt_dir}'],
+                     '.', ':!.task', f':!{wt_dir}'],
                     cwd=self.project_root,
                 )
                 dirty_tracked = {
@@ -848,9 +922,24 @@ class GitOps:
             update_cmd.append(expected_main)
         rc, _, err = await _run(update_cmd, cwd=self.project_root)
         if rc != 0:
-            # Restore stash before returning — ref didn't move
+            # Restore stash before returning — ref didn't move.
+            # Use _safe_stash_pop_with_recovery so that a pop conflict here
+            # does NOT leave UU markers in project_root and is escalated to
+            # humans rather than silently cascading to 'stash_failed' on the
+            # next cycle.
             if did_stash:
-                await _run(['git', 'stash', 'pop'], cwd=self.project_root)
+                pop_ok, recovery = await self._safe_stash_pop_with_recovery(
+                    branch or merge_sha[:8],
+                )
+                if not pop_ok:
+                    self._last_recovery_branch = recovery
+                    logger.critical(
+                        'CRITICAL: stash pop conflicted during CAS-failure recovery '
+                        '(task %s). WIP preserved on recovery branch: %s. '
+                        'Halting — manual intervention required.',
+                        branch or merge_sha[:8], recovery,
+                    )
+                    return 'pop_conflict_no_advance'
             if expected_main is not None:
                 logger.warning(
                     f'CAS update-ref failed (expected {expected_main[:8]}): {err}'
@@ -877,16 +966,10 @@ class GitOps:
                 )
 
             if did_stash:
-                pop_rc, _, pop_err = await _run(
-                    ['git', 'stash', 'pop'],
-                    cwd=self.project_root,
+                pop_ok, recovery = await self._safe_stash_pop_with_recovery(
+                    branch or merge_sha[:8],
                 )
-                if pop_rc != 0:
-                    # Pop conflict: merge landed but WIP conflicts with it.
-                    # Preserve WIP on a recovery branch, clean up working tree.
-                    recovery = await self._create_recovery_branch_from_stash(
-                        branch or merge_sha[:8],
-                    )
+                if not pop_ok:
                     self._last_recovery_branch = recovery
                     logger.warning(
                         'Stash pop conflicted after merge advance (task %s). '
@@ -927,6 +1010,34 @@ class GitOps:
         )
         return name
 
+    async def _safe_stash_pop_with_recovery(
+        self, label: str,
+    ) -> tuple[bool, str | None]:
+        """Pop ``stash@{0}`` and preserve WIP on a recovery branch if it conflicts.
+
+        1. Run ``git stash pop``.
+        2. Check return code AND ``_detect_unmerged_paths`` — either signal
+           is sufficient to declare failure (belt-and-braces).
+        3. On failure: call ``_create_recovery_branch_from_stash(label)``
+           which saves the stash to a branch, drops the stash entry, and
+           resets the working tree to HEAD.
+        4. Return ``(True, None)`` on clean pop, or
+           ``(False, recovery_branch_name)`` on conflict.
+        """
+        pop_rc, _, pop_err = await _run(['git', 'stash', 'pop'], cwd=self.project_root)
+        unmerged = await self._detect_unmerged_paths(self.project_root)
+
+        if pop_rc != 0 or unmerged:
+            logger.warning(
+                'Stash pop failed (rc=%d, unmerged=%s, err=%s) for label %r — '
+                'creating recovery branch to preserve WIP.',
+                pop_rc, unmerged or [], pop_err, label,
+            )
+            recovery = await self._create_recovery_branch_from_stash(label)
+            return (False, recovery)
+
+        return (True, None)
+
     async def has_dirty_working_tree(self) -> str:
         """Return names of tracked dirty files, or empty string if clean.
 
@@ -942,6 +1053,29 @@ class GitOps:
         )
         files = {f.strip() for f in (unstaged + '\n' + staged).splitlines() if f.strip()}
         return '\n'.join(sorted(files))
+
+    async def _detect_unmerged_paths(self, cwd: Path) -> list[str]:
+        """Return sorted list of file paths that are in an unmerged state.
+
+        Uses ``git status --porcelain`` XY parsing — a path is unmerged if
+        either the index (X) or working-tree (Y) column is ``U``, OR if both
+        columns are the same add/delete marker (``AA`` or ``DD``).
+
+        Returns an empty list when the tree is clean or fully merged.
+        """
+        _, porcelain, _ = await _run(
+            ['git', 'status', '--porcelain'],
+            cwd=cwd,
+        )
+        unmerged: list[str] = []
+        for line in porcelain.splitlines():
+            if len(line) < 4:
+                continue
+            xy = line[:2]
+            path = line[3:]
+            if 'U' in xy or xy in ('AA', 'DD'):
+                unmerged.append(path.strip())
+        return sorted(unmerged)
 
     async def get_conflict_details(self, cwd: Path) -> str:
         """Parse conflict markers and return structured description."""

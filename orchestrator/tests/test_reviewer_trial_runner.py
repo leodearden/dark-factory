@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest, GroundTruthIssue
+from orchestrator.evals.reviewer_trial.corpus import CorpusDiff
 from orchestrator.evals.reviewer_trial.runner import (
     REVIEW_SCHEMA,
     PanelRunResult,

@@ -1,6 +1,10 @@
 """pytest configuration — ensure local src takes precedence over installed package."""
+import asyncio
 import sys
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Protocol
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -10,6 +14,137 @@ import pytest
 _SRC = Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+
+from shared.config_models import AccountConfig, UsageCapConfig  # noqa: E402
+from shared.usage_gate import AccountState, UsageGate  # noqa: E402
+
+
+class _SupportsSetCachedStatus(Protocol):
+    """Structural type for objects that expose the _set_cached_status chokepoint."""
+
+    def _set_cached_status(self, task_id: str, status: str) -> None: ...
+
+
+def _spy_set_cached_status(obj: _SupportsSetCachedStatus) -> list[tuple[str, str]]:
+    """Install a recording spy on obj._set_cached_status and return the capture list.
+
+    The helper installs an instance-level rebind on ``obj`` that intercepts every
+    call to ``_set_cached_status``, appends ``(task_id, status)`` to a shared list,
+    and then forwards the call to the original method.  Python's attribute lookup
+    finds the instance attribute before the class method, so production code that
+    calls ``self._set_cached_status(...)`` transparently routes through the recorder.
+
+    This is used to verify the ``_set_cached_status`` write-side chokepoint
+    invariant: production code must route all status-cache writes through
+    ``_set_cached_status()`` rather than writing to ``_status_cache`` directly.
+
+    Parameters
+    ----------
+    obj:
+        Any object satisfying ``_SupportsSetCachedStatus`` — i.e. it has a
+        ``_set_cached_status(self, task_id: str, status: str) -> None`` method.
+        Both ``orchestrator.scheduler.Scheduler`` and
+        ``orchestrator.evals.runner._EvalScheduler`` qualify.
+
+    Returns
+    -------
+    list[tuple[str, str]]
+        The shared capture list.  Initially empty; each ``_set_cached_status``
+        call appends ``(task_id, status)`` to it.
+    """
+    recorded: list[tuple[str, str]] = []
+    original = obj._set_cached_status
+
+    def recorder(task_id: str, status: str) -> None:
+        recorded.append((task_id, status))
+        original(task_id, status)
+
+    obj._set_cached_status = recorder  # type: ignore[method-assign]
+    return recorded
+
+
+def build_usage_gate(
+    account_configs: list[AccountConfig],
+    tokens: Sequence[str | None],
+    *,
+    wait_for_reset: bool = False,
+    session_budget_usd: float | None = None,
+    probe_interval_secs: int = 300,
+    max_probe_interval_secs: int = 1800,
+) -> UsageGate:
+    """Create a UsageGate with tokens pre-injected (no os.environ lookup).
+
+    Bypasses UsageGate.__init__ via __new__ and sets all private attrs directly,
+    then injects AccountState entries from the parallel ``tokens`` list rather
+    than reading from environment variables.  This is the canonical pattern for
+    constructing test gates — both _make_gate (test_usage_gate.py) and
+    _make_reify_gate (test_reify_multi_account.py) delegate to this helper.
+
+    Parameters
+    ----------
+    account_configs:
+        List of AccountConfig instances (same shape as UsageCapConfig.accounts).
+    tokens:
+        Parallel list of OAuth token strings (or None for default-credential
+        accounts).  Must be the same length as ``account_configs``.
+    wait_for_reset:
+        Forwarded to UsageCapConfig.
+    session_budget_usd:
+        Forwarded to UsageCapConfig.
+    probe_interval_secs:
+        Forwarded to UsageCapConfig.
+    max_probe_interval_secs:
+        Forwarded to UsageCapConfig.
+
+    Raises
+    ------
+    TypeError
+        If ``tokens`` is a bare ``str`` instead of a list/tuple.
+    ValueError
+        If ``account_configs`` and ``tokens`` have different lengths.
+    """
+    if isinstance(tokens, str):
+        raise TypeError(
+            f'tokens must be a list/tuple of str|None, not a bare str; '
+            f'got {tokens!r}. Did you forget to wrap it in a list?'
+        )
+    if len(account_configs) != len(tokens):
+        raise ValueError(
+            f'account_configs and tokens must have the same length; '
+            f'got {len(account_configs)} account(s) and {len(tokens)} token(s)'
+        )
+
+    config = UsageCapConfig(
+        wait_for_reset=wait_for_reset,
+        session_budget_usd=session_budget_usd,
+        probe_interval_secs=probe_interval_secs,
+        max_probe_interval_secs=max_probe_interval_secs,
+        accounts=account_configs,
+    )
+
+    gate = UsageGate.__new__(UsageGate)
+    gate._config = config
+    gate._open = asyncio.Event()
+    gate._open.set()
+    gate._lock = asyncio.Lock()
+    gate._cumulative_cost = 0.0
+    gate._paused_reason = ''
+    gate._pause_started_at = None
+    gate._total_pause_secs = 0.0
+    gate._cost_store = None
+    gate._project_id = None
+    gate._run_id = None
+    gate._last_account_name = None
+    gate._background_tasks = set()
+    gate._probe_config_dir = MagicMock()
+    # Mock _run_probe so tests don't spawn real `claude` processes.
+    # Tests that need specific probe behaviour can override this attribute.
+    gate._run_probe = AsyncMock(return_value=True)
+    gate._accounts = [
+        AccountState(name=cfg.name, token=tok)
+        for cfg, tok in zip(account_configs, tokens, strict=True)
+    ]
+    return gate
 
 
 @pytest.fixture(autouse=True)

@@ -336,7 +336,12 @@ REVIEWER_COMPREHENSIVE = _reviewer_role(
     'Unnecessary allocations? Hot path considerations? Resource cleanup?\n\n'
     '5. **Robustness and error handling**: Error handling at boundaries? '
     'Failure modes? Race conditions? Resource leaks? Graceful degradation?\n\n'
-    'You are responsible for ALL five areas above. Produce findings under each.',
+    'You are responsible for ALL five areas above. Produce findings under each.\n\n'
+    '**Scope adjustment for shell test scaffolding:** For bash test files '
+    '(tests/infra/*.sh, scripts/test_*.sh, *_test.sh, test_helpers.sh, e2e/*.sh) '
+    'only flag correctness bugs — e.g. broken assertions, wrong exit codes, tests '
+    'that silently pass on failure. Skip style, architecture, robustness, and '
+    'performance analysis on these files; the ROI is too low.',
 )
 
 
@@ -486,6 +491,11 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
 - **convention** — Pattern-level insight for future agents. Write via `add_memory`
   with category `preferences_and_norms`.
 - **dismiss** — Not actionable, already covered, or noise.
+
+**Deduplication:** Before creating any task, call `get_tasks` to check for existing
+pending or in-progress tasks with the same intent.  If a match exists, skip creation
+and cite the existing task ID.  Same module + same fix intent = duplicate even if
+wording differs.
 
 ## Rules
 

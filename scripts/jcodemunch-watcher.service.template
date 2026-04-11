@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=__UV_PATH__x --with "jcodemunch-mcp[watch]" \
+ExecStart=__UV_PATH__x --python 3.12 --with "jcodemunch-mcp[watch]" \
   jcodemunch-mcp watch-claude \
   --repos __REPO_ROOT__
 

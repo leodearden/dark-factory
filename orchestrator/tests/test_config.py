@@ -5,11 +5,13 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from orchestrator.config import (
     ConfigRequiredError,
     ModuleConfig,
     OrchestratorConfig,
+    TimeoutsConfig,
     _deep_merge,
     _discover_module_configs,
     load_config,
@@ -28,7 +30,8 @@ class TestDefaults:
     def test_default_values(self, monkeypatch, tmp_path):
         """Package defaults.yaml is loaded via settings_customise_sources."""
         monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        # Ensure no external config is loaded - must unset env before instantiation
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         defaults = _load_package_defaults()
         # Values from package defaults.yaml (not Pydantic field defaults)
@@ -76,6 +79,20 @@ class TestDefaults:
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         config = OrchestratorConfig(project_root=Path('.'))
         assert config.project_root.is_absolute() is True
+
+    def test_steward_timeout_default_is_1800(self, monkeypatch, tmp_path):
+        """timeouts.steward default is 1800s and satisfies the steward_completion_timeout invariant.
+
+        Documents the decoupling invariant: per-invocation wall-clock must be
+        >= the workflow grace period (steward_completion_timeout) so a single
+        invocation is never silently cut short inside the drain window.
+        Equality is permitted; the validator on OrchestratorConfig enforces >=.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.timeouts.steward == 1800.0
+        assert config.timeouts.steward >= config.steward_completion_timeout
 
 
 class TestYamlLoading:
@@ -258,3 +275,65 @@ class TestPathResolution:
         resolved = (config.project_root / config.fused_memory.config_path).resolve()
         assert str(resolved).startswith(str(tmp_path))
         assert '..' not in resolved.parts
+
+
+class TestStewardTimeoutInvariant:
+    """OrchestratorConfig must reject configs where timeouts.steward < steward_completion_timeout."""
+
+    def test_direct_init_violation_raises_validation_error(self, monkeypatch, tmp_path):
+        """Directly instantiating OrchestratorConfig with a violating config raises ValidationError."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        with pytest.raises(ValidationError, match='steward'):
+            OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=600.0))
+
+    def test_yaml_load_violation_raises_validation_error(self, tmp_path, monkeypatch):
+        """Loading a YAML config with timeouts.steward < steward_completion_timeout raises ValidationError."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        bad_yaml = tmp_path / 'bad.yaml'
+        bad_yaml.write_text(yaml.dump({
+            'timeouts': {'steward': 600.0},
+            'steward_completion_timeout': 900.0,
+        }))
+        with pytest.raises(ValidationError, match='steward'):
+            load_config(bad_yaml)
+
+    def test_equal_values_allowed(self, monkeypatch, tmp_path):
+        """timeouts.steward == steward_completion_timeout is valid (invariant is >=, not strict >)."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=900.0))
+        assert config.timeouts.steward == config.steward_completion_timeout
+
+    def test_greater_value_allowed(self, monkeypatch, tmp_path):
+        """timeouts.steward > steward_completion_timeout is valid."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=1800.0))
+        assert config.timeouts.steward > config.steward_completion_timeout
+
+    def test_error_message_contains_remediation_hint(self, monkeypatch, tmp_path):
+        """ValidationError message must include operator-actionable remediation hint.
+
+        Guards against future refactors silently dropping the guidance text.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        with pytest.raises(ValidationError, match=r'Raise timeouts\.steward to >= steward_completion_timeout'):
+            OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=600.0))
+
+    def test_env_var_override_triggers_invariant(self, monkeypatch, tmp_path):
+        """ORCH_TIMEOUTS__STEWARD env-var override is caught by the mode='after' validator.
+
+        Regression guard: pins that pydantic-settings env-sourced overrides
+        are merged into the model before mode='after' validators run.
+        A future pydantic-settings source-ordering regression would cause this test to fail.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_TIMEOUTS__STEWARD', '300')
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        # defaults.yaml: steward_completion_timeout=900.0, timeouts.steward=1800
+        # env override: timeouts.steward=300 → 300 < 900 → validator must fire
+        with pytest.raises(ValidationError, match='steward'):
+            OrchestratorConfig()

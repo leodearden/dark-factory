@@ -16,8 +16,16 @@ for pkg in "${ALL_PACKAGES[@]}"; do
 done
 
 # ruff check (runs from repo root, all packages at once)
-if ! ruff check --quiet "${DIRS[@]}"; then
+if ! uv run ruff check --quiet "${DIRS[@]}"; then
     echo "pre-commit: ruff check failed. Fix lint errors before committing to main."
+    exit 1
+fi
+
+# asyncmock assertion-style check (fused-memory/tests only)
+# Script is stdlib-only (ast/argparse/pathlib/sys) — invoked via plain python3 to skip uv env-resolution overhead.
+echo "pre-commit: asyncmock assertion-style check..."
+if ! (cd "$ROOT" && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests); then
+    echo "pre-commit: asyncmock style check failed. Use assert_not_awaited() instead of assert_not_called() on AsyncMocks."
     exit 1
 fi
 

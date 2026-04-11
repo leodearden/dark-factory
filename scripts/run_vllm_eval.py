@@ -34,8 +34,8 @@ from uuid import uuid4
 
 sys.path.insert(0, "/home/leo/src/runpod-toolkit")
 sys.path.insert(0, "/home/leo/src/dark-factory/orchestrator/src")
-from runpod_toolkit.config import RunPodConfig
-from runpod_toolkit.compute import RunPodClient, PodStatus
+from runpod_toolkit.config import RunPodConfig  # type: ignore[import]
+from runpod_toolkit.compute import RunPodClient, PodStatus  # type: ignore[import]
 from orchestrator.evals.configs import (
     get_config_by_name,
     VLLM_EVAL_CONFIGS,
@@ -47,7 +47,8 @@ from orchestrator.evals.configs import (
 # ---------------------------------------------------------------------------
 
 SSH_KEY = os.path.expanduser("~/.ssh/id_runpod")
-SSH_PUBKEY = open(SSH_KEY + ".pub").read().strip()
+with open(SSH_KEY + ".pub") as _fh:
+    SSH_PUBKEY = _fh.read().strip()
 
 PROJECT_ROOT = Path("/home/leo/src/dark-factory")
 ORCHESTRATOR_DIR = PROJECT_ROOT / "orchestrator"
@@ -81,6 +82,12 @@ def _load_runpod_api_key() -> str:
         "RUNPOD_API_KEY not found. Add `RUNPOD_API_KEY=rpa_...` to "
         f"{PROJECT_ROOT}/.env or export it in your shell."
     )
+
+# H200 variants to try in priority order when a config requests H200.
+H200_VARIANTS = [
+    "NVIDIA H200",      # RunPod id for H200 SXM (141 GB)
+    "NVIDIA H200 NVL",  # H200 NVL (143 GB)
+]
 
 # Fallback GPU types when neither the config nor --gpu-type provides one.
 GPU_TYPES = [
@@ -559,6 +566,7 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
             "TOOL_CALL_PARSER",
             "QUANTIZATION",
             "TP_SIZE",
+            "PP_SIZE",
             "MAX_MODEL_LEN",
             "GPU_MEMORY_UTIL",
             "MAX_NUM_SEQS",
@@ -582,7 +590,7 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
     if args.gpu_type:
         gpu_types_to_try = [args.gpu_type]
     elif cfg.gpu_type:
-        gpu_types_to_try = [cfg.gpu_type]
+        gpu_types_to_try = H200_VARIANTS if cfg.gpu_type == "NVIDIA H200" else [cfg.gpu_type]
     else:
         gpu_types_to_try = GPU_TYPES
 
@@ -773,11 +781,11 @@ def _connect_workstation(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle
     on a local or LAN machine (e.g. leo-workstation:8000). The returned
     PodHandle has pod=None and tunnel_proc=None so tear_down_pod is a no-op.
     """
-    import urllib.request, urllib.parse
+    import urllib.request
+    import urllib.parse
 
     vllm_url = args.vllm_url
     parsed = urllib.parse.urlparse(vllm_url)
-    host = parsed.hostname or "localhost"
     port = parsed.port or 8000
 
     # Health check

@@ -37,6 +37,7 @@ from fused_memory.models.scope import Scope
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services.durable_queue import DurableWriteQueue
+from fused_memory.utils.async_utils import propagate_cancellations
 
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -617,27 +618,30 @@ class MemoryService:
                 logger.error(f'Graphiti enqueue failed: {e}')
                 _graphiti_error = f'{type(e).__name__}: {e}'
 
-        # Mem0: enqueue via durable queue (retry + dead-letter on failure)
+        # Mem0: direct synchronous call so memory_ids are returned to the caller.
+        # The durable-queue path cannot return server-assigned IDs because Mem0
+        # assigns IDs server-side and the queue worker has no path back to the caller.
+        # Durability is retained via write_journal (log_backend_op captures every call).
+        # The _execute_durable_write 'mem0_add' dispatcher is kept intact for backward
+        # compat — any in-flight queue items from before this fix still drain correctly.
         if write_mem0:
             try:
-                assert self.durable_queue is not None
-                await self.durable_queue.enqueue(
-                    group_id=f'mem0_{scope.project_id}',
-                    operation='mem0_add',
-                    payload={
-                        'content': content,
-                        'metadata': meta,
-                        'project_id': project_id,
-                        'agent_id': agent_id,
-                        'session_id': session_id,
-                        '_causation_id': causation_id,
-                        '_write_op_id': write_op_id,
-                    },
+                mem0_result = await self._journaled_backend_call(
+                    write_op_id=write_op_id,
+                    causation_id=causation_id,
+                    backend='mem0',
+                    operation='add',
+                    payload={'content': content[:200]},
+                    coro=self.mem0.add(content=content, scope=scope, metadata=meta),
                 )
-                # Durably persisted to SQLite — report as queued
+                memory_ids.extend(
+                    r['id']
+                    for r in (mem0_result or {}).get('results', [])
+                    if isinstance(r, dict) and 'id' in r
+                )
                 stores_written.append(SourceStore.mem0)
             except Exception as e:
-                logger.error(f'Mem0 enqueue failed: {e}')
+                logger.error(f'Mem0 write failed: {e}')
                 _mem0_error = str(e)
 
         # Layer 1 journal entry
@@ -994,14 +998,20 @@ class MemoryService:
             return_exceptions=True,
         )
 
-        # Log all failures then re-raise the first exception found.
+        # Two-tier check for asyncio.gather(return_exceptions=True) results.
         # Both coroutines have already settled at this point (no orphans).
-        # Two-tier check:
-        #   Detection guard: isinstance(r, BaseException) — catches CancelledError /
-        #     KeyboardInterrupt / SystemExit that gather() captured as values.
-        #   Logging guard:   isinstance(r, Exception) — log only application errors,
-        #     not cancellation signals (CancelledError should not appear in logs).
-        first_exc = next((r for r in results if isinstance(r, BaseException)), None)
+        #
+        # Pass 1: propagate_cancellations handles structured-cancellation signals
+        #   (CancelledError, KeyboardInterrupt, SystemExit) before any per-call logging.
+        #   Cancellation takes precedence over application-level failures regardless
+        #   of position in the results list.
+        #   See fused_memory.utils.async_utils.propagate_cancellations for the shared
+        #   Pass 1 guard contract.
+        #
+        # Pass 2: log each captured Exception and raise the first — these are
+        #   application-level failures from the Graphiti backend.
+        propagate_cancellations(results)
+        first_exc = next((r for r in results if isinstance(r, Exception)), None)
         if first_exc is not None:
             for r in results:
                 if isinstance(r, Exception):
@@ -1302,7 +1312,12 @@ class MemoryService:
                         agent_id=agent_id,
                         session_id=session_id,
                         params={'force': force, 'dry_run': dry_run},
-                        result_summary=result if success else None,
+                        result_summary={
+                            'total_entities': result.get('total_entities', 0),
+                            'stale_entities': result.get('stale_entities', 0),
+                            'rebuilt': result.get('rebuilt', 0),
+                            'errors': result.get('errors', 0),
+                        } if success else None,
                         success=success,
                         error=error_msg,
                     )

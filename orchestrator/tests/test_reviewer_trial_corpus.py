@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -92,8 +91,9 @@ class TestCorpusManifest:
 
     def test_get_diff(self) -> None:
         manifest = CorpusManifest(diffs=[_make_diff('d1'), _make_diff('d2')])
-        assert manifest.get_diff('d1') is not None
-        assert manifest.get_diff('d1').diff_id == 'd1'
+        d1 = manifest.get_diff('d1')
+        assert d1 is not None
+        assert d1.diff_id == 'd1'
         assert manifest.get_diff('nonexistent') is None
 
     def test_save_and_load(self, tmp_path: Path) -> None:

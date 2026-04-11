@@ -67,8 +67,12 @@ class TestIntegrationFlow:
         assert stats['counts'].get('completed', 0) == 1
 
     @pytest.mark.asyncio
-    async def test_add_memory_mem0_processed_via_queue(self, integrated_service):
-        """add_memory with mem0 category -> enqueued -> worker processes -> mem0 called."""
+    async def test_add_memory_mem0_direct_call_returns_ids(self, integrated_service):
+        """add_memory with mem0 category -> direct synchronous mem0.add call -> IDs returned.
+
+        Mem0 writes are no longer enqueued; mem0.add is called inline so
+        memory_ids are available to the caller before add_memory returns.
+        """
         svc = integrated_service
 
         result = await svc.add_memory(
@@ -77,13 +81,13 @@ class TestIntegrationFlow:
             project_id='test',
         )
         assert SourceStore.mem0 in result.stores_written
-
-        # Wait for worker to process
-        await asyncio.sleep(1.0)
-
+        # IDs are now returned synchronously — no sleep needed
         svc.mem0.add.assert_called_once()
+        assert result.memory_ids == ['mem0-1']
+        # No queue item created for Mem0 — queue should have 0 items
         stats = await svc.durable_queue.get_stats()
-        assert stats['counts'].get('completed', 0) == 1
+        assert stats['counts'].get('pending', 0) == 0
+        assert stats['counts'].get('completed', 0) == 0
 
     @pytest.mark.asyncio
     async def test_add_episode_uuid_survives_full_flow(self, integrated_service):

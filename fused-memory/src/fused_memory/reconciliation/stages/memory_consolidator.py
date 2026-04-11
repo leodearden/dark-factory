@@ -17,6 +17,7 @@ from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.task_filter import FilteredTaskTree, format_filtered_task_tree
 
 if TYPE_CHECKING:
     pass
@@ -39,6 +40,9 @@ class MemoryConsolidator(BaseStage):
     # Token-budget assembled payload — set by harness when using ContextAssembler.
     # When set, assemble_payload() uses this instead of the generic time-windowed fetch.
     assembled_payload: AssembledPayload | None = None
+
+    # Active task tree — set by harness before run() (task 455)
+    filtered_task_tree: FilteredTaskTree | None = None
 
     def get_system_prompt(self) -> str:
         return STAGE1_SYSTEM_PROMPT
@@ -129,7 +133,10 @@ class MemoryConsolidator(BaseStage):
                 f'These are recent targeted reconciliation writes that must be preserved.\n'
             )
 
-        # 7. Format
+        # 7. Active task tree (task 455)
+        task_tree_section = self._build_task_tree_section()
+
+        # 8. Format
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}
 
@@ -147,7 +154,7 @@ class MemoryConsolidator(BaseStage):
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -193,6 +200,9 @@ Review the above data and perform memory consolidation:
                 f'These are recent targeted reconciliation writes that must be preserved.\n'
             )
 
+        # Active task tree (task 455)
+        task_tree_section = self._build_task_tree_section()
+
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}
 
@@ -207,7 +217,7 @@ Review the above data and perform memory consolidation:
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -218,6 +228,16 @@ Review the above data and perform memory consolidation:
 
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
 """
+
+    def _build_task_tree_section(self) -> str:
+        """Return the Active Task Tree prompt section, or empty string if no tree set.
+
+        Eliminates the duplicate block across assemble_payload and
+        _format_assembled_payload. (task 455)
+        """
+        if self.filtered_task_tree is None:
+            return ''
+        return '\n' + format_filtered_task_tree(self.filtered_task_tree) + '\n'
 
     def _assemble_remediation_payload(self) -> str:
         """Focused payload for remediation runs — findings only, no full data."""

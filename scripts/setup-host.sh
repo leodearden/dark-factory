@@ -209,7 +209,7 @@ if command -v claude &>/dev/null; then
   if claude mcp list --scope user 2>/dev/null | grep -q jcodemunch; then
     ok "jcodemunch MCP already in user config"
   else
-    claude mcp add --scope user jcodemunch uvx jcodemunch-mcp
+    claude mcp add --scope user jcodemunch -- uvx --python 3.12 jcodemunch-mcp
     ok "jcodemunch MCP added to user config"
   fi
 fi
@@ -234,9 +234,21 @@ info "Installing skim (context compression)"
 if command -v skim &>/dev/null; then
   ok "skim already installed ($(skim --version 2>/dev/null))"
 else
+  # Find cargo: may be on PATH, in ~/.cargo/bin, or only in a rustup toolchain
+  CARGO=""
   if command -v cargo &>/dev/null; then
-    cargo install rskim --quiet
-    ok "skim installed via cargo"
+    CARGO="cargo"
+  elif [ -x "$HOME/.cargo/bin/cargo" ]; then
+    CARGO="$HOME/.cargo/bin/cargo"
+  else
+    # Fall back to rustup stable toolchain
+    RUSTUP_CARGO="$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo"
+    [ -x "$RUSTUP_CARGO" ] && CARGO="$RUSTUP_CARGO"
+  fi
+
+  if [ -n "$CARGO" ]; then
+    $CARGO install rskim --quiet
+    ok "skim installed via cargo ($CARGO)"
   else
     warn "cargo not found — install Rust (rustup.rs) then: cargo install rskim"
   fi

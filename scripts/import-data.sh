@@ -191,11 +191,11 @@ else
   warn "Qdrant: not responding"
 fi
 
-# Fused-memory
-if curl -sf http://localhost:8002/mcp &>/dev/null; then
-  ok "Fused-memory: healthy (http://localhost:8002/mcp)"
+# Fused-memory (/health is the REST liveness endpoint; /mcp requires SSE Accept header)
+if curl -sf http://localhost:8002/health &>/dev/null; then
+  ok "Fused-memory: healthy (http://localhost:8002/health)"
 else
-  warn "Fused-memory: not responding (may still be starting)"
+  warn "Fused-memory: not responding (may still be starting — check: journalctl --user -u fused-memory)"
 fi
 
 # Event buffer status

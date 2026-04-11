@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from dataclasses import dataclass, field, asdict
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from orchestrator.evals.reviewer_trial.corpus import CorpusManifest
@@ -57,7 +58,7 @@ class TrialReport:
     total_cost_usd: float = 0.0
 
 
-def _mean(values: list[float]) -> float:
+def _mean(values: Sequence[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 

@@ -99,7 +99,11 @@ class TestEscalateSuggestions:
         assert esc.category == 'review_suggestions'
         assert esc.severity == 'info'
         assert esc.task_id == '42'
-        assert json.loads(esc.detail) == suggestions
+        # Detail is prefixed with content fingerprint: #hash:<hex16>#<json>
+        detail = esc.detail
+        assert detail.startswith('#hash:')
+        json_start = detail.index('#', 6) + 1
+        assert json.loads(detail[json_start:]) == suggestions
 
     def test_noop_without_queue(self):
         wf = _make_workflow(escalation_queue=None)
@@ -248,7 +252,7 @@ def _make_steward(*, config_overrides=None, suggestion_count=15):
     config = MagicMock()
     config.project_root = Path('/tmp/project')
     config.steward_lifetime_budget = 12.0
-    config.steward_max_retries = 3
+    config.steward_max_attempts = 3
     config.suggestion_triage_threshold = 10
     config.models.triage = 'sonnet'
     config.budgets.triage = 2.0

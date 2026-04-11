@@ -4,7 +4,7 @@ import re
 
 from .test_helpers import _get_opening_tag
 
-_SECTIONS = ('orchestrators', 'performance', 'memory', 'memory-graphs', 'recon')
+_SECTIONS = ('orchestrators', 'performance', 'merge-queue', 'memory', 'memory-graphs', 'recon')
 
 # Character class used to capture data-section and data-updated-for attribute values.
 # Broadened to [a-z0-9][a-z0-9-]* so that digit-containing names (e.g. 'v2-panel') are captured.
