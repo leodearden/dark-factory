@@ -42,7 +42,7 @@ async def _inject_uu_state(cwd: Path, path: str, tag: str = '') -> None:
     """
     def _run_sync(cmd, **kwargs):
         return subprocess.run(
-            cmd, cwd=str(cwd), capture_output=True, **kwargs,
+            cmd, cwd=str(cwd), capture_output=True, check=True, **kwargs,
         )
 
     h1 = _run_sync(
