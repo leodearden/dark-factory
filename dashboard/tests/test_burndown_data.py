@@ -218,7 +218,7 @@ class TestCollectSnapshot:
     @pytest.mark.asyncio
     async def test_deduplicates_main_project_from_orchestrators(self, burndown_env):
         """If an orchestrator targets the same root, only one row is inserted."""
-        db_path, config, conn = burndown_env
+        _, config, conn = burndown_env
 
         fake_orchestrators = [{'prd': str(config.project_root / 'prd.md'), 'project_root': str(config.project_root)}]
 
@@ -239,7 +239,7 @@ class TestCollectSnapshot:
     @pytest.mark.asyncio
     async def test_snapshots_known_project_roots_when_no_orchestrators(self, burndown_env):
         """Known roots are snapshotted even when no orchestrators are running."""
-        db_path, base_config, conn = burndown_env
+        _, base_config, conn = burndown_env
 
         reify_root = Path('/home/leo/src/reify')
         autopilot_root = Path('/home/leo/src/autopilot-video')
@@ -291,7 +291,7 @@ class TestCollectSnapshot:
     @pytest.mark.asyncio
     async def test_dedupes_known_root_against_main_project(self, burndown_env):
         """If known_project_roots includes main project_root, only one row is inserted."""
-        db_path, base_config, conn = burndown_env
+        _, base_config, conn = burndown_env
 
         config = DashboardConfig(
             project_root=base_config.project_root,
@@ -358,7 +358,7 @@ class TestCollectSnapshot:
     @pytest.mark.asyncio
     async def test_dedupes_known_root_against_running_orchestrator(self, burndown_env):
         """If known_project_roots includes a root already discovered via orchestrator, no duplicate."""
-        db_path, base_config, conn = burndown_env
+        _, base_config, conn = burndown_env
 
         reify_root = Path('/home/leo/src/reify')
 
@@ -430,7 +430,7 @@ class TestCollectSnapshot:
     @pytest.mark.asyncio
     async def test_discovers_config_flag_orchestrator(self, burndown_env):
         """Orchestrators launched with --config (no --prd) are snapshotted."""
-        db_path, config, conn = burndown_env
+        _, config, conn = burndown_env
 
         reify_root = Path('/home/leo/src/reify')
         fake_orchestrators = [
