@@ -75,7 +75,12 @@ def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
 
 
 def test_template_sets_known_project_roots() -> None:
-    """scripts/dashboard.service.template must declare DASHBOARD_KNOWN_PROJECT_ROOTS with __REPO_ROOT__ sentinel."""
+    """scripts/dashboard.service.template must declare DASHBOARD_KNOWN_PROJECT_ROOTS with __REPO_ROOT__ sentinel.
+
+    Kept for targeted diagnostics — this property is subsumed by
+    test_template_renders_to_hardcoded_file, but this test pinpoints which
+    specific invariant broke if the render test fails.
+    """
     content = TEMPLATE.read_text(encoding="utf-8")
     assert TEMPLATE_EXPECTED_ENV_LINE in content, (
         f"Expected line not found in {TEMPLATE}:\n  {TEMPLATE_EXPECTED_ENV_LINE!r}\n"
@@ -85,7 +90,12 @@ def test_template_sets_known_project_roots() -> None:
 
 
 def test_hardcoded_service_file_sets_known_project_roots() -> None:
-    """dashboard/dark-factory-dashboard.service must declare DASHBOARD_KNOWN_PROJECT_ROOTS with literal path."""
+    """dashboard/dark-factory-dashboard.service must declare DASHBOARD_KNOWN_PROJECT_ROOTS with literal path.
+
+    Kept for targeted diagnostics — this property is subsumed by
+    test_template_renders_to_hardcoded_file, but this test pinpoints which
+    specific invariant broke if the render test fails.
+    """
     content = HARDCODED.read_text(encoding="utf-8")
     assert HARDCODED_EXPECTED_ENV_LINE in content, (
         f"Expected line not found in {HARDCODED}:\n  {HARDCODED_EXPECTED_ENV_LINE!r}\n"
@@ -159,6 +169,10 @@ def test_known_project_roots_uses_comma_separator_not_colon() -> None:
     guards both the literal-path form (``/home/leo/src/dark-factory:``) and the
     template's ``__REPO_ROOT__:`` sentinel form in a single, position-independent
     pass.
+
+    Kept for targeted diagnostics — this property is subsumed by
+    test_template_renders_to_hardcoded_file, but this test pinpoints which
+    specific invariant broke if the render test fails.
     """
     for path in (TEMPLATE, HARDCODED):
         _assert_known_project_roots_comma_separated(path)
