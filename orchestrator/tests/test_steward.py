@@ -706,6 +706,31 @@ class TestStewardTimeoutCap:
         """_timeout_counts must be an empty dict right after construction."""
         assert steward._timeout_counts == {}
 
+    async def test_timeout_kill_increments_timeout_count(
+        self, steward, mock_config,
+    ):
+        """A SIGTERM+SIGKILL timeout must increment _timeout_counts but NOT _retry_counts."""
+        mock_config.steward_max_timeouts_per_escalation = 3
+        mock_config.steward_max_attempts = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False,
+                cost=0.0,
+                turns=0,
+                session_id='sess-killed',
+                stderr='Process killed after 900.0s timeout (SIGTERM+SIGKILL)',
+            )
+            await steward._handle_escalation(esc)
+
+        assert steward._timeout_counts.get('esc-42-1') == 1
+        assert steward._retry_counts.get('esc-42-1', 0) == 0
+
 
 # ---------------------------------------------------------------------------
 # Unified Role
