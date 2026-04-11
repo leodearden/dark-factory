@@ -646,14 +646,19 @@ class TestRebuildEntitySummariesErrorHandling:
         backend.list_entity_nodes = AsyncMock(
             return_value=make_stale_list(alice_summary='stale summary', bob_summary='stale summary 2')
         )
-        backend.get_all_valid_edges = AsyncMock(return_value={})
+        u2_edges: list[EdgeDict] = [
+            {'uuid': 'e-1', 'fact': 'fact1', 'name': 'knows'},
+            {'uuid': 'e-2', 'fact': 'fact2', 'name': 'knows'},
+            {'uuid': 'e-3', 'fact': 'fact3', 'name': 'knows'},
+        ]
+        backend.get_all_valid_edges = AsyncMock(return_value={'u2': u2_edges})
         backend._rebuild_entity_from_edges = AsyncMock(
             side_effect=[
                 RuntimeError('boom'),
                 {
                     'uuid': 'u2',
                     'name': 'Bob',
-                    'old_summary': 'stale summary 2',
+                    'old_summary': '<echoed-old-summary>',
                     'new_summary': 'Bob summary v2',
                     'edge_count': 3,
                 },
@@ -679,16 +684,18 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['status'] == 'rebuilt'
         assert ok_detail['uuid'] == 'u2'
         assert ok_detail['name'] == 'Bob'
-        assert ok_detail['old_summary'] == 'stale summary 2'
+        assert ok_detail['old_summary'] == '<echoed-old-summary>'
         assert ok_detail['new_summary'] == 'Bob summary v2'
         assert ok_detail['edge_count'] == 3
 
-        # Verify the implementation reads old_summary from the entity dict and forwards
-        # it as the old_summary kwarg to _rebuild_entity_from_edges. The ok_detail['old_summary']
-        # assertion above reflects the mock return value; this assertion independently pins
-        # the input forwarding path.
+        # Two independent forwarding paths are pinned below:
+        # 1. mock→detail: ok_detail['old_summary'] == '<echoed-old-summary>' (above) proves
+        #    the mock return value flows through the detail-assembly path.
+        # 2. fixture→kwarg: assert_any_call(old_summary='stale summary 2') below proves
+        #    list_entity_nodes()[i]['summary'] is forwarded as the old_summary kwarg to
+        #    _rebuild_entity_from_edges — independent of whatever the mock returns.
         backend._rebuild_entity_from_edges.assert_any_call(
-            'u2', 'Bob', [], group_id='test', old_summary='stale summary 2'
+            'u2', 'Bob', u2_edges, group_id='test', old_summary='stale summary 2'
         )
         backend._rebuild_entity_from_edges.assert_any_call(
             'u1', 'Alice', [], group_id='test', old_summary='stale summary'
