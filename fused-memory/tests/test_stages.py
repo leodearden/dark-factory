@@ -1755,6 +1755,22 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
             "Active task id=2 should NOT be in Recently Completed section"
         )
 
+        # (e) Symmetric cross-boundary check: done-task ids must NOT leak into
+        #     the Active Task Tree section. This is the counterpart to (d) above
+        #     and converts this test from a partial duplicate of
+        #     test_payload_recently_completed_tasks_sorted_desc into a genuine
+        #     cross-section-boundary assertion.
+        active_section = _extract_section(payload, '### Active Task Tree')
+        assert '- [10] ' not in active_section, (
+            "Done task id=10 should NOT appear in Active Task Tree section"
+        )
+        assert '- [11] ' not in active_section, (
+            "Done task id=11 should NOT appear in Active Task Tree section"
+        )
+        assert '- [12] ' not in active_section, (
+            "Done task id=12 should NOT appear in Active Task Tree section"
+        )
+
 
 class TestExtractSectionHelper:
     """Unit tests for the _extract_section module-level helper."""
