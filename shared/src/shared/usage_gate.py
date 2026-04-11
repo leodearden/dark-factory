@@ -490,6 +490,7 @@ class UsageGate:
             ok = await self._run_probe(acct)
 
             if ok:
+                confirmed_probe_num = acct.probe_count
                 acct.capped = False
                 acct.near_cap = False
                 acct.probing = True  # gate: let one real task confirm first
@@ -504,7 +505,7 @@ class UsageGate:
                 if self._cost_store:
                     await self._write_cost_event(
                         acct.name, 'resumed',
-                        json.dumps({'label': f'probe #{acct.probe_count} confirmed'}),
+                        json.dumps({'label': f'probe #{confirmed_probe_num} confirmed'}),
                     )
                 return
             else:
@@ -628,24 +629,21 @@ class UsageGate:
         return None
 
     def confirm_account_ok(self, oauth_token: str | None) -> None:
-        """Clear near_cap and the probing gate after a successful invocation.
+        """Clear near_cap and (if applicable) the probing gate after a successful invocation.
 
         Called by ``invoke_with_cap_retry`` when an invocation succeeds (no cap
-        detected).
+        detected).  Two effects:
 
-        Always clears ``near_cap`` on the matched account — a successful
-        invocation proves the account is healthy, so any prior near-cap warning
-        is stale and should be discarded unconditionally.
-
-        Additionally, if ``probe_in_flight`` was set (a probe cycle was in
-        progress), clears that flag, resets ``probe_count``, and opens the
-        shared ``_open`` event so other tasks may use this account.
+        1. **Always** clears any stale ``near_cap`` flag on the matched account.
+        2. If ``probe_in_flight`` was set (a probe cycle was in progress), clears
+           that flag, resets ``probe_count``, and opens the shared ``_open`` event
+           so other tasks may use this account.
         """
         acct = self._find_account_by_token(oauth_token) if oauth_token else None
         if acct is None:
             return
-        # A successful invocation proves the account is healthy — clear stale
-        # near_cap regardless of whether a probe cycle was in progress.
+        # A successful invocation clears any stale near_cap flag; it will be
+        # re-set on the next near-cap warning if still applicable.
         acct.near_cap = False
         if acct.probe_in_flight:
             acct.probe_in_flight = False

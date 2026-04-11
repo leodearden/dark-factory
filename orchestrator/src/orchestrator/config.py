@@ -347,7 +347,7 @@ class OrchestratorConfig(BaseSettings):
 
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)
-    steward_max_retries: int = Field(default=1)
+    steward_max_attempts: int = Field(default=1)
     steward_completion_timeout: float = Field(default=900.0)
 
     # Pre-triage threshold for review suggestions

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
 import pytest
@@ -351,7 +352,6 @@ class FakeScheduler:
 
     def __init__(self):
         self.statuses: dict[str, list[str]] = {}
-        self._status_cache: dict[str, str] = {}
 
     async def set_task_status(self, task_id: str, status: str) -> None:
         self.statuses.setdefault(task_id, []).append(status)
@@ -360,6 +360,10 @@ class FakeScheduler:
         self, task_id: str, current: list[str], needed: list[str]
     ) -> bool:
         return True
+
+    def get_cached_status(self, task_id: str) -> str | None:
+        history = self.statuses.get(task_id)
+        return history[-1] if history else None
 
     def release(self, task_id: str) -> None:
         pass
@@ -2019,33 +2023,98 @@ class TestWipRecoveryNoAdvance:
 
 
 # ---------------------------------------------------------------------------
-# Tests: Protocol Conformance — _SchedulerLike test doubles
+# Protocol conformance — see TYPE_CHECKING block at the bottom of this file.
+# Static assertions (pyright-verified) replaced the old hasattr/isinstance
+# runtime checks, which only tested attribute presence, not method signatures.
 # ---------------------------------------------------------------------------
 
 
-class TestSchedulerProtocolConformance:
-    """Verify that test doubles satisfy the _SchedulerLike Protocol."""
+# ---------------------------------------------------------------------------
+# Tests: FakeScheduler.get_cached_status
+# ---------------------------------------------------------------------------
 
-    def test_fake_scheduler_has_status_cache(self):
-        """FakeScheduler must have _status_cache to satisfy _SchedulerLike."""
+
+class TestFakeSchedulerCachedStatus:
+    """FakeScheduler.get_cached_status returns the last status set for a task."""
+
+    def test_get_cached_status_returns_none_before_any_set(self):
+        """Before any set_task_status call, get_cached_status returns None."""
         fake = FakeScheduler()
-        assert hasattr(fake, '_status_cache'), (
-            'FakeScheduler is missing _status_cache required by the _SchedulerLike Protocol'
-        )
-        assert isinstance(fake._status_cache, dict), (
-            '_status_cache must be a dict[str, str]'
-        )
+        assert fake.get_cached_status('x') is None
 
-    def test_eval_scheduler_has_status_cache(self):
-        """_EvalScheduler must have _status_cache to satisfy _SchedulerLike."""
+    @pytest.mark.asyncio
+    async def test_get_cached_status_returns_last_set_status(self):
+        """get_cached_status returns the most recent status after multiple sets."""
+        fake = FakeScheduler()
+        await fake.set_task_status('x', 'in-progress')
+        await fake.set_task_status('x', 'done')
+        assert fake.get_cached_status('x') == 'done'
+
+
+# ---------------------------------------------------------------------------
+# Tests: _EvalScheduler.get_cached_status
+# ---------------------------------------------------------------------------
+
+
+class TestEvalSchedulerCachedStatus:
+    """_EvalScheduler.get_cached_status tracks status set via set_task_status."""
+
+    def test_eval_scheduler_get_cached_status_returns_none_initially(self):
+        """Before any set_task_status call, get_cached_status returns None."""
         from orchestrator.config import OrchestratorConfig
         from orchestrator.evals.runner import _EvalScheduler
 
-        cfg = OrchestratorConfig()
-        sched = _EvalScheduler(cfg)
-        assert hasattr(sched, '_status_cache'), (
-            '_EvalScheduler is missing _status_cache required by the _SchedulerLike Protocol'
-        )
-        assert isinstance(sched._status_cache, dict), (
-            '_status_cache must be a dict[str, str]'
-        )
+        sched = _EvalScheduler(OrchestratorConfig())
+        assert sched.get_cached_status('99') is None
+
+    @pytest.mark.asyncio
+    async def test_eval_scheduler_get_cached_status_tracks_set_task_status(self):
+        """get_cached_status returns the status written by set_task_status."""
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.runner import _EvalScheduler
+
+        sched = _EvalScheduler(OrchestratorConfig())
+        await sched.set_task_status('99', 'done')
+        assert sched.get_cached_status('99') == 'done'
+
+
+# ---------------------------------------------------------------------------
+# Static Protocol conformance checks (pyright-verified)
+#
+# This block MUST live at the bottom of the file, after the FakeScheduler class
+# definition (line ~361). Placing it at the top would require forward-referencing
+# FakeScheduler() before its definition, which forces a # type: ignore[name-defined]
+# suppression. pyright then infers the expression type as Unknown, which trivially
+# satisfies any Protocol — making the check catch nothing. Keeping the block here
+# allows pyright to resolve FakeScheduler to its concrete class and verify full
+# structural conformance (parameter names, types, return types, positional-only
+# markers), not just attribute presence.
+#
+# CI gate — how enforcement actually reaches this file:
+#   • hooks/project-checks (invoked by hooks/pre-commit on main-branch commits)
+#     iterates over PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard) and
+#     runs `uv run pyright` from each package directory, failing the commit on
+#     any error.
+#   • [tool.pyright] include = ["src", "tests"] in orchestrator/pyproject.toml
+#     ensures every file under orchestrator/tests/ — including this one — is
+#     type-checked when pyright runs from orchestrator/.
+#   Both legs of the gate are pinned by tests/test_pyright_gate_for_workflow_e2e.py,
+#   so accidental removal of either fails at normal pytest time.
+#
+# Experimental verification: enforcement was confirmed in commit 357fa4d6a5 and
+# re-verified during task 699 by temporarily mutating FakeScheduler.get_cached_status
+# to return `int | None`; pyright flagged line 2098 with reportAssignmentType as
+# expected, then the file was reverted.
+#
+# Runtime belt-and-braces: TestFakeSchedulerCachedStatus and
+# TestEvalSchedulerCachedStatus (above) provide runtime coverage of
+# get_cached_status behaviour — the static conformance block only catches
+# signature drift, not behavioural regressions.
+# ---------------------------------------------------------------------------
+
+if TYPE_CHECKING:
+    from orchestrator.evals.runner import _EvalScheduler as _EvalSchedulerStatic
+    from orchestrator.workflow import _SchedulerLike
+
+    _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()
+    _eval_scheduler_conforms: _SchedulerLike = _EvalSchedulerStatic(OrchestratorConfig())

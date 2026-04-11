@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -294,6 +295,36 @@ async def run_eval(
     return result
 
 
+def _collect_cancel_errors(done: Iterable[asyncio.Task[Any]]) -> list[asyncio.CancelledError]:
+    """Return all CancelledErrors from a completed asyncio.wait done-set.
+
+    Iterates every task in *done* and collects cancellation errors so that
+    callers can log every failure before raising, rather than discarding all
+    but the first (Task 586 fix).
+
+    The primary branch — ``task.cancelled() is True`` — covers all known
+    CPython 3.11+ cases, including coroutines that raise CancelledError
+    internally without an explicit ``task.cancel()`` call, because the
+    runtime transitions the task to the cancelled state in both scenarios.
+
+    # Belt-and-suspenders: in current CPython a coroutine raising
+    # CancelledError causes task.cancelled() to return True, so the
+    # secondary branch (task.exception() returning CancelledError while
+    # task.cancelled() is False) is unreachable in practice. Kept in case
+    # a future runtime routes coroutine-raised CancelledError via
+    # task.exception() instead of task.cancelled().
+    """
+    errors: list[asyncio.CancelledError] = []
+    for task in done:
+        if task.cancelled():
+            errors.append(asyncio.CancelledError())
+        else:
+            exc = task.exception()
+            if isinstance(exc, asyncio.CancelledError):
+                errors.append(exc)
+    return errors
+
+
 async def run_eval_matrix(
     task_paths: list[Path],
     configs: list[EvalConfig] | None = None,
@@ -378,17 +409,7 @@ async def run_eval_matrix(
             # shutdown signal fires while two evals are parked at the same
             # await point).  The old code raised on the first cancel it saw,
             # silently discarding subsequent cancels in the batch.
-            cancel_errors: list[asyncio.CancelledError] = []
-            for task in done:
-                if task.cancelled():
-                    # task.cancel() was called and the coroutine propagated it.
-                    cancel_errors.append(asyncio.CancelledError())
-                else:
-                    exc = task.exception()
-                    if isinstance(exc, asyncio.CancelledError):
-                        # Defensive branch: coroutine raised CancelledError
-                        # internally without task.cancel() being called first.
-                        cancel_errors.append(exc)
+            cancel_errors = _collect_cancel_errors(done)
             if cancel_errors:
                 for ce in cancel_errors:
                     logger.error('Eval cancelled', exc_info=ce)
@@ -460,13 +481,17 @@ class _EvalScheduler:
 
     def __init__(self, config: OrchestratorConfig):
         self.config = config
-        self._status_cache: dict[str, str] = {}
+        self._cache: dict[str, str] = {}
 
     async def get_tasks(self):
         return []
 
     async def set_task_status(self, task_id: str, status: str):
         logger.info(f'[eval] Task {task_id} → {status}')
+        self._cache[task_id] = status
+
+    def get_cached_status(self, task_id: str) -> str | None:
+        return self._cache.get(task_id)
 
     async def handle_blast_radius_expansion(self, task_id: str, current: list[str], needed: list[str]) -> bool:
         return True  # always allow in eval mode

@@ -14,6 +14,164 @@ import re
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
 
+
+def _keywords_in_proximity(doc: str, kw1: str, kw2: str, max_distance: int = 200) -> bool:
+    """Return True iff kw1 and kw2 appear within max_distance chars of each other in doc.
+
+    Uses re.finditer to locate all occurrences of each keyword; returns True iff
+    the minimum pairwise character distance is strictly less than max_distance.
+    Immune to sentence-tokenisation artefacts like 'e.g.' or 'i.e.'.
+    """
+    pos1 = [m.start() for m in re.finditer(re.escape(kw1), doc)]
+    pos2 = [m.start() for m in re.finditer(re.escape(kw2), doc)]
+    if not pos1 or not pos2:
+        return False
+    return min(abs(p1 - p2) for p1 in pos1 for p2 in pos2) < max_distance
+
+
+def _returns_section_text(doc: str) -> str | None:
+    """Return the text of the Returns: section, bounded by the next section header.
+
+    Finds 'Returns:' in doc, then clips the slice at the next Google/numpy-style
+    section header (blank line + capitalised identifier + colon, e.g. 'Raises:',
+    'Note:', 'Example:', 'Args:').  Returns None if no 'Returns:' header exists.
+    """
+    returns_idx = doc.find('Returns:')
+    if returns_idx == -1:
+        return None
+    after_returns = doc[returns_idx + len('Returns:'):]
+    match = re.search(r'\n\s*\n\s*[A-Z]\w+:', after_returns)
+    if match:
+        return doc[returns_idx:returns_idx + len('Returns:') + match.start()]
+    return doc[returns_idx:]
+
+
+# ---------------------------------------------------------------------------
+# Helper: _keywords_in_proximity
+# ---------------------------------------------------------------------------
+
+
+class TestKeywordsInProximityHelper:
+    """Unit tests for the _keywords_in_proximity module-level helper.
+
+    Verifies proximity-based keyword co-occurrence detection, specifically
+    targeting the 'e.g.' splitter regression case that motivated the helper.
+
+    Asserts:
+      (a) returns True when keywords are adjacent
+      (b) returns True within 200 chars across an 'e.g.' boundary (regression case)
+      (c) returns False when keywords are > 200 chars apart
+      (d) returns False when one keyword is absent
+      (e) regression baseline against actual refresh_entity_summary docstring
+    """
+
+    def test_adjacent_keywords_return_true(self) -> None:
+        """Keywords directly adjacent are within any positive distance."""
+        assert _keywords_in_proximity('foo bar', 'foo', 'bar') is True
+
+    def test_within_200_across_eg_boundary(self) -> None:
+        """Keywords within 200 chars around an 'e.g.' boundary are found.
+
+        This is the regression case: re.split(r'\\.\\s+|\\.\\$') splits
+        'e.g. _rebuild_entity_from_edges' at the period, destroying co-occurrence.
+        The proximity approach is immune because it never tokenises into sentences.
+        """
+        doc = 'For bulk use (e.g. _rebuild_entity_from_edges) supply edges'
+        assert _keywords_in_proximity(doc, 'bulk', '_rebuild_entity_from_edges') is True
+
+    def test_far_keywords_return_false(self) -> None:
+        """Keywords separated by more than 200 chars return False."""
+        doc = 'bulk ' + 'x' * 300 + ' _rebuild_entity_from_edges'
+        assert _keywords_in_proximity(doc, 'bulk', '_rebuild_entity_from_edges') is False
+
+    def test_missing_keyword_returns_false(self) -> None:
+        """Returns False when one keyword is not present in the doc."""
+        assert _keywords_in_proximity('foo bar baz', 'foo', 'qux') is False
+
+    def test_regression_baseline_refresh_docstring(self) -> None:
+        """Regression baseline: 'bulk' and '_rebuild_entity_from_edges' co-occur
+        within 200 chars in the actual refresh_entity_summary docstring."""
+        doc = GraphitiBackend.refresh_entity_summary.__doc__
+        assert doc is not None, 'refresh_entity_summary must have a docstring'
+        assert _keywords_in_proximity(doc, 'bulk', '_rebuild_entity_from_edges'), (
+            "'bulk' and '_rebuild_entity_from_edges' must be within 200 chars in "
+            "refresh_entity_summary docstring"
+        )
+
+
+
+# ---------------------------------------------------------------------------
+# Helper: _returns_section_text
+# ---------------------------------------------------------------------------
+
+
+class TestReturnsSectionTextHelper:
+    """Unit tests for the _returns_section_text module-level helper.
+
+    Verifies that the helper correctly bounds the Returns section to avoid the
+    scope-leak where doc[returns_idx:] bleeds into subsequent Raises:/Note:/Example:
+    sections.
+
+    Asserts:
+      (a) returns the full Returns section when no following section header exists
+      (b) returns bounded section when followed by Raises: (scope-leak regression case)
+      (c) returns bounded section when followed by Note:
+      (d) returns bounded section when followed by Example:
+      (e) returns None when no Returns: header exists
+      (f) regression baseline: returns non-empty string for detect_stale_summaries docstring
+    """
+
+    def test_returns_only_section(self) -> None:
+        """Returns the full Returns section when no following section header exists."""
+        doc = 'Docstring intro.\n\nReturns:\n    foo: The foo value.\n'
+        result = _returns_section_text(doc)
+        assert result is not None
+        assert 'foo' in result
+
+    def test_bounded_by_raises(self) -> None:
+        """Returns section is bounded before a following Raises: section.
+
+        This is the scope-leak regression case: the old doc[returns_idx:] approach
+        would include 'ValueError' from the Raises section, masking a regression
+        where the key was removed from Returns.
+        """
+        doc = 'Intro.\n\nReturns:\n    foo: bar\n\nRaises:\n    ValueError: something.\n'
+        result = _returns_section_text(doc)
+        assert result is not None
+        assert 'foo' in result
+        assert 'ValueError' not in result
+
+    def test_bounded_by_note(self) -> None:
+        """Returns section is bounded before a following Note: section."""
+        doc = 'Intro.\n\nReturns:\n    foo: bar\n\nNote:\n    Some note.\n'
+        result = _returns_section_text(doc)
+        assert result is not None
+        assert 'foo' in result
+        assert 'Some note' not in result
+
+    def test_bounded_by_example(self) -> None:
+        """Returns section is bounded before a following Example: section."""
+        doc = 'Intro.\n\nReturns:\n    foo: bar\n\nExample:\n    example_code()\n'
+        result = _returns_section_text(doc)
+        assert result is not None
+        assert 'foo' in result
+        assert 'example_code' not in result
+
+    def test_none_when_no_returns_section(self) -> None:
+        """Returns None when the docstring has no Returns: header."""
+        doc = 'Intro.\n\nArgs:\n    x: some arg\n'
+        result = _returns_section_text(doc)
+        assert result is None
+
+    def test_regression_baseline_detect_stale_summaries(self) -> None:
+        """Regression baseline: returns non-empty string for detect_stale_summaries docstring."""
+        doc = GraphitiBackend.detect_stale_summaries.__doc__
+        assert doc is not None, 'detect_stale_summaries must have a docstring'
+        result = _returns_section_text(doc)
+        assert result is not None, "detect_stale_summaries docstring must have a Returns: section"
+        assert result.strip() != '', 'Returns section must not be blank'
+
+
 # ---------------------------------------------------------------------------
 # step-1: detect_stale_summaries Returns section must include 'summary' key
 # ---------------------------------------------------------------------------
@@ -50,10 +208,8 @@ class TestDetectStaleSummariesReturnsIncludesSummaryKey:
         Uses a word-boundary check to avoid false positives from 'summary_line_count'
         which also contains 'summary' as a prefix.
         """
-        doc = self._doc()
-        returns_idx = doc.find('Returns:')
-        assert returns_idx != -1, "Docstring must have a 'Returns:' section"
-        returns_text = doc[returns_idx:]
+        returns_text = _returns_section_text(self._doc())
+        assert returns_text is not None, "Docstring must have a 'Returns:' section"
         # Match 'summary' as a standalone key — not as a prefix of 'summary_line_count'
         # The negative lookahead (?!_) rejects 'summary_line_count', 'summary_lines', etc.
         has_standalone_summary = re.search(r'\bsummary\b(?!_)', returns_text) is not None
@@ -65,10 +221,8 @@ class TestDetectStaleSummariesReturnsIncludesSummaryKey:
 
     def test_returns_section_retains_existing_keys(self) -> None:
         """All six pre-existing keys must remain in the Returns section."""
-        doc = self._doc()
-        returns_idx = doc.find('Returns:')
-        assert returns_idx != -1, "Docstring must have a 'Returns:' section"
-        returns_text = doc[returns_idx:]
+        returns_text = _returns_section_text(self._doc())
+        assert returns_text is not None, "Docstring must have a 'Returns:' section"
         for key in ('uuid', 'name', 'duplicate_count', 'stale_line_count',
                     'valid_fact_count', 'summary_line_count'):
             assert key in returns_text, (
@@ -114,17 +268,11 @@ class TestRebuildEntityFromEdgesCrossReferencesRefresh:
         )
 
     def test_single_entity_and_refresh_in_same_sentence(self) -> None:
-        """'single-entity' and 'refresh_entity_summary' must appear in the same sentence."""
+        """'single-entity' and 'refresh_entity_summary' must appear within 200 characters."""
         doc = self._doc()
-        # Split on sentence boundaries (period followed by whitespace or end of string)
-        sentences = re.split(r'\.\s+|\.$', doc)
-        found = any(
-            'single-entity' in sentence and 'refresh_entity_summary' in sentence
-            for sentence in sentences
-        )
-        assert found, (
-            "A sentence in the docstring must contain both 'single-entity' and "
-            "'refresh_entity_summary' to provide a use-case routing note (not just the "
+        assert _keywords_in_proximity(doc, 'single-entity', 'refresh_entity_summary'), (
+            "Docstring must contain 'single-entity' and 'refresh_entity_summary' within "
+            "200 characters of each other to provide a use-case routing note (not just the "
             "existing TOCTOU consistency note)"
         )
 
@@ -168,15 +316,10 @@ class TestRefreshEntitySummaryCrossReferencesRebuild:
         )
 
     def test_bulk_and_rebuild_in_same_sentence(self) -> None:
-        """'bulk' and '_rebuild_entity_from_edges' must appear in the same sentence."""
+        """'bulk' and '_rebuild_entity_from_edges' must appear within 200 characters."""
         doc = self._doc()
-        sentences = re.split(r'\.\s+|\.$', doc)
-        found = any(
-            'bulk' in sentence and '_rebuild_entity_from_edges' in sentence
-            for sentence in sentences
-        )
-        assert found, (
-            "A sentence in the docstring must contain both 'bulk' and "
-            "'_rebuild_entity_from_edges' to provide a use-case routing note for "
+        assert _keywords_in_proximity(doc, 'bulk', '_rebuild_entity_from_edges'), (
+            "Docstring must contain 'bulk' and '_rebuild_entity_from_edges' within "
+            "200 characters of each other to provide a use-case routing note for "
             "callers rebuilding many entities at once"
         )

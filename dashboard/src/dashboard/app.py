@@ -40,6 +40,13 @@ from dashboard.data.costs import (
     aggregate_run_cost_breakdown,
 )
 from dashboard.data.db import DbPool
+from dashboard.data.merge_queue import (
+    aggregate_latency_stats,
+    aggregate_outcome_distribution,
+    aggregate_queue_depth_timeseries,
+    aggregate_recent_merges,
+    aggregate_speculative_stats,
+)
 from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.performance import (
     get_completion_paths,
@@ -671,6 +678,55 @@ async def costs_partials_runs(request: Request):
     return templates.TemplateResponse(
         request, 'partials/costs/runs.html',
         context={'runs': runs},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Merge queue partial
+# ---------------------------------------------------------------------------
+
+
+@app.get('/partials/merge-queue')
+async def partials_merge_queue(request: Request):
+    """Merge queue operational status card."""
+    config = request.app.state.config
+    pool: DbPool = request.app.state.db
+    dbs = await _cost_dbs(config, pool)
+    days = _parse_window(request)
+    hours = days * 24
+    window_raw = request.query_params.get('window', '7d')
+
+    depth, outcomes, latency, recent, spec = await asyncio.gather(
+        aggregate_queue_depth_timeseries(dbs, hours=hours),
+        aggregate_outcome_distribution(dbs, hours=hours),
+        aggregate_latency_stats(dbs, hours=hours),
+        aggregate_recent_merges(dbs, limit=20),
+        aggregate_speculative_stats(dbs, hours=hours),
+        return_exceptions=True,
+    )
+
+    depth = _safe_gather_result(depth, {'labels': [], 'values': []}, 'merge_queue.depth')
+    outcomes = _safe_gather_result(outcomes, {'labels': [], 'values': []}, 'merge_queue.outcomes')
+    latency = _safe_gather_result(
+        latency, {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0},
+        'merge_queue.latency',
+    )
+    recent = _safe_gather_result(recent, [], 'merge_queue.recent')
+    spec = _safe_gather_result(
+        spec, {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0},
+        'merge_queue.speculative',
+    )
+
+    return templates.TemplateResponse(
+        request, 'partials/merge_queue.html',
+        context={
+            'depth_timeseries': depth,
+            'outcomes': outcomes,
+            'latency': latency,
+            'recent': recent,
+            'speculative': spec,
+            'window': window_raw,
+        },
     )
 
 

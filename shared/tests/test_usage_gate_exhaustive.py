@@ -320,6 +320,44 @@ class TestNearCapStateDistinction:
         gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 1h.")
         assert gate._open.is_set() is True
 
+    def test_near_cap_marks_correct_account_by_token(self):
+        """NEAR_CAP message with oauth_token=token_b must set near_cap only on account b."""
+        gate = make_gate(['a', 'b'])
+        token_b = gate._accounts[1].token
+        result = gate.detect_cap_hit(
+            '', "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token=token_b,
+        )
+        assert result is True
+        assert gate._accounts[0].near_cap is False
+        assert gate._accounts[1].near_cap is True
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[1].capped is False
+
+    def test_near_cap_unknown_token_falls_back_to_first_uncapped(self):
+        """NEAR_CAP with an unrecognised oauth_token falls back to the first uncapped account."""
+        gate = make_gate(['a', 'b'])
+        result = gate.detect_cap_hit(
+            '', "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token='unknown-token',
+        )
+        assert result is True
+        assert gate._accounts[0].near_cap is True
+        assert gate._accounts[1].near_cap is False
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[1].capped is False
+
+    def test_near_cap_no_oauth_token_falls_back_to_first_uncapped(self):
+        """NEAR_CAP with oauth_token=None falls back to the first uncapped account."""
+        gate = make_gate(['a', 'b'])
+        result = gate.detect_cap_hit(
+            '', "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token=None,
+        )
+        assert result is True
+        assert gate._accounts[0].near_cap is True
+        assert gate._accounts[1].near_cap is False
+
     def test_near_cap_does_not_start_resume_probe(self):
         """NEAR_CAP must NOT launch a resume probe task."""
         gate = make_gate(['a'], wait_for_reset=True)
@@ -376,6 +414,25 @@ class TestNearCapStateDistinction:
         # (6) Re-detect near_cap — proves the flag can be set again after the clear
         gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 2h.")
         assert acct.near_cap is True
+
+    def test_near_cap_multi_account_isolation_keeps_gate_open(self):
+        """Multi-account: NEAR_CAP on one account leaves the other untouched and gate open.
+
+        Verifies two acceptance criteria together:
+        - Exactly one account gets near_cap=True (the resolved account); the other stays False.
+        - The gate remains open (_open.is_set() is True) because near-cap never closes the gate.
+        """
+        gate = make_gate(['a', 'b'])
+        gate.detect_cap_hit(
+            '', "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token=None,  # routes to first uncapped account ('a')
+        )
+        near_cap_count = sum(a.near_cap for a in gate._accounts)
+        assert near_cap_count == 1
+        assert gate._accounts[0].near_cap is True
+        assert gate._accounts[1].near_cap is False
+        assert all(not a.capped for a in gate._accounts)
+        assert gate._open.is_set() is True
 
 
 # =========================================================================
@@ -1134,11 +1191,17 @@ class TestConfirmAccountOk:
         gate = make_gate(['a'])
         gate._accounts[0].near_cap = True
         gate._accounts[0].probe_in_flight = False
+        # NOTE: probe_count=3 with probe_in_flight=False is unreachable in real execution
+        # (probe_count only advances inside the probe loop while capped, and is reset to 0
+        # on success).  The value is set here purely to verify that confirm_account_ok does
+        # NOT touch unrelated fields when the probe_in_flight branch is skipped — these
+        # assertions are "no side effects on unrelated fields" invariant checks, not a
+        # realistic-state test.
         gate._accounts[0].probe_count = 3
         gate._open.clear()
         gate.confirm_account_ok(gate._accounts[0].token)
         assert gate._accounts[0].near_cap is False
-        # probe_count and gate should NOT change (only near_cap is cleared in this branch)
+        # Verify no side effects on probe-related fields (invariant check, not realistic state)
         assert gate._accounts[0].probe_count == 3
         assert gate._open.is_set() is False
 
@@ -1154,7 +1217,29 @@ class TestConfirmAccountOk:
         gate.confirm_account_ok('completely-unknown-token')
         assert gate._accounts[0].near_cap is True
 
-    def test_confirm_account_ok_on_capped_account(self):
+    def test_near_cap_resets_after_confirm_then_warning(self):
+        """Locks in the clear/re-detect contract for near_cap.
+
+        Sequence: NEAR_CAP warning → confirm_account_ok → NEAR_CAP warning again.
+        After the first warning near_cap is True; after confirm_account_ok it is
+        False; after the second warning it must flip back to True.  This guards
+        against a future change that accidentally latches near_cap (i.e. stops
+        re-detection after a clear) or that makes the clear irreversible.
+        """
+        gate = make_gate(['a'])
+        # Step 1: trigger a NEAR_CAP warning — near_cap should become True
+        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 4h.")
+        assert gate._accounts[0].near_cap is True
+
+        # Step 2: a successful invocation clears near_cap
+        gate.confirm_account_ok(gate._accounts[0].token)
+        assert gate._accounts[0].near_cap is False
+
+        # Step 3: the same NEAR_CAP warning fires again — near_cap must be re-set to True
+        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 4h.")
+        assert gate._accounts[0].near_cap is True
+
+    def test_confirm_account_ok_on_capped_account_behavior(self):
         """confirm_account_ok clears near_cap even when the account is capped.
 
         Regression guard: a successful invocation proves the account is healthy, so

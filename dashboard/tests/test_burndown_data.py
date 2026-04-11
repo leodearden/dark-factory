@@ -334,7 +334,6 @@ class TestCollectSnapshot:
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
-        from dashboard.config import DashboardConfig
         # project_root is the symlink; known_project_roots contains the resolved real path
         config = DashboardConfig(
             project_root=link,
@@ -465,8 +464,10 @@ class TestCollectSnapshot:
         _assert_snapshot_counts(reify_row, pending=1, done=1)
 
     @pytest.mark.asyncio
-    async def test_continues_when_known_root_unreadable(self, tmp_path):
+    async def test_continues_when_known_root_unreadable(self, tmp_path, caplog):
         """PermissionError on one known root is skipped; other roots are still snapshotted."""
+        import logging
+
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
@@ -502,6 +503,7 @@ class TestCollectSnapshot:
             with (
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
             ):
                 await collect_snapshot(conn, config)
 
@@ -516,6 +518,18 @@ class TestCollectSnapshot:
         assert str(root_c.resolve()) in project_ids
         # root_b should NOT be present
         assert str(root_b.resolve()) not in project_ids
+
+        # Warning contract: exactly one 'Failed to load tasks' warning naming root_b only
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.getMessage().startswith('Failed to load tasks')
+        ]
+        assert len(warning_records) == 1
+        combined = warning_records[0].getMessage()
+        assert 'root_b' in combined or str(root_b) in combined
+        assert 'root_a' not in combined
+        assert 'root_c' not in combined
+        assert warning_records[0].exc_info is not None
 
     @pytest.mark.asyncio
     async def test_logs_warning_when_known_root_unreadable(self, tmp_path, caplog):
@@ -837,6 +851,92 @@ class TestCollectSnapshot:
         combined = ' '.join(r.getMessage() for r in warning_records)
         assert 'bad_root' in combined or str(bad_root) in combined
         assert any(r.exc_info for r in warning_records)
+
+    @pytest.mark.asyncio
+    async def test_skips_known_root_on_resolve_error(self, tmp_path, caplog):
+        """OSError raised from Path.resolve for one known_project_roots entry is
+        absorbed by Phase 2's return_exceptions=True: a warning is logged naming
+        the failing root, and the remaining known roots are still snapshotted.
+
+        This test injects the OSError through a patched Path.resolve that selectively
+        raises for paths under bad_root. The mocked load_task_tree calls path.resolve()
+        as its first action so the patch actually fires during the gather-driven load
+        pipeline — fake_load stands in for any real operation inside load_task_tree
+        that might touch Path.resolve (canonicalization, symlink checks, etc.).
+        """
+        import logging
+
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        root_a = Path('/fake/project/resolve_root_a')
+        bad_root = Path('/fake/project/resolve_bad_root')
+        root_c = Path('/fake/project/resolve_root_c')
+
+        config = DashboardConfig(
+            project_root=tmp_path,
+            known_project_roots=[root_a, bad_root, root_c],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        root_a_tasks = [{'status': 'done'}]
+        root_c_tasks = [{'status': 'in-progress'}]
+
+        # Capture bad_prefix BEFORE patching so __post_init__ resolve() succeeds normally
+        bad_prefix = str(bad_root.resolve())
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            root_a.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': root_a_tasks,
+            root_c.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': root_c_tasks,
+        }
+
+        original_resolve = Path.resolve
+
+        def bad_resolve(self, *args, **kwargs):
+            if str(self).startswith(bad_prefix):
+                raise OSError('simulated Path.resolve failure')
+            return original_resolve(self, *args, **kwargs)
+
+        def fake_load(path):
+            # Synthetic: call resolve() so the patched Path.resolve actually fires
+            # during the load pipeline. Real load_task_tree does not call resolve,
+            # but any Path operation — read_text, stat, symlink walk — could raise
+            # OSError. This injection point stands in for that broader category.
+            path.resolve()
+            return _tasks_map[path]
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with (
+                patch.object(Path, 'resolve', bad_resolve),
+                patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                await collect_snapshot(conn, config)
+
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+
+        project_ids = {row['project_id'] for row in rows}
+        # Three rows: main + root_a + root_c. bad_root is absorbed by return_exceptions.
+        assert len(rows) == 3
+        assert str(tmp_path.resolve()) in project_ids
+        assert str(root_a.resolve()) in project_ids
+        assert str(root_c.resolve()) in project_ids
+        assert str(bad_root.resolve()) not in project_ids
+
+        # Warning contract: exactly one 'Failed to load tasks' warning naming bad_root.
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.getMessage().startswith('Failed to load tasks')
+        ]
+        assert len(warning_records) == 1
+        combined = warning_records[0].getMessage()
+        assert 'resolve_bad_root' in combined or bad_prefix in combined
+        assert 'resolve_root_a' not in combined
+        assert 'resolve_root_c' not in combined
+        assert warning_records[0].exc_info is not None
 
 # ---------------------------------------------------------------------------
 # downsample

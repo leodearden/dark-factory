@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -415,21 +417,24 @@ class TestLoadTaskTree:
         result = load_task_tree(tasks_json)
         assert result[0]['dependencies'] == [1, 2]
 
+    @pytest.mark.skipif(
+        sys.platform == 'win32' or getattr(os, 'getuid', lambda: -1)() == 0,
+        reason='chmod is not reliable on Windows or when running as root',
+    )
     def test_permission_error_returns_empty_list(self, tmp_path):
-        """PermissionError raised by Path.read_text is handled; returns empty list."""
+        """OSError raised when reading an unreadable tasks.json is handled; returns []."""
         import json
-        from pathlib import Path
-        from unittest.mock import patch
 
         from dashboard.data.orchestrator import load_task_tree
 
         tasks_json = tmp_path / 'tasks.json'
         tasks_json.write_text(json.dumps({'tasks': [{'id': '1', 'status': 'done'}]}))
-
-        with patch.object(Path, 'read_text', side_effect=PermissionError('Permission denied')):
+        tasks_json.chmod(0o000)
+        try:
             result = load_task_tree(tasks_json)
-
-        assert result == []
+            assert result == []
+        finally:
+            tasks_json.chmod(0o644)
 
 
 class TestReadTaskArtifacts:

@@ -68,9 +68,8 @@ class TestStaleSummaryResult:
     def test_no_legacy_edges_attribute(self):
         """StaleSummaryResult must NOT expose the old 'edges' field name.
 
-        The rename edges → all_edges was applied in task 438. This test locks
-        in that the old alias is truly absent, so any accidental re-exposure
-        would be caught immediately.
+        StaleSummaryResult uses all_edges (not edges) as the field name; this test
+        prevents silent re-aliasing.
         """
         result = StaleSummaryResult(stale=[], all_edges={}, total_count=0)
         assert not hasattr(result, 'edges')
@@ -186,6 +185,23 @@ class TestCanonicalFacts:
         ]
         result = GraphitiBackend._canonical_facts(edges)
         assert result == ['  hello  ', 'A knows B']
+
+    def test_all_whitespace_edges_returns_empty_list(self):
+        """All-whitespace input returns an empty list — the boundary case.
+
+        All-whitespace input is the boundary case — if every edge is
+        whitespace-only, _canonical_facts must return an empty list (no
+        spurious empty string, no pre-strip value leakage).
+
+        This is distinct from test_whitespace_only_fact_is_filtered (which
+        mixes whitespace-only and valid edges) and from
+        test_whitespace_variants_all_filtered (which also mixes).  This test
+        covers the pure all-whitespace case where no valid fact is present,
+        ensuring the result is [] rather than ['', '  ', etc.].
+        """
+        edges = [{'fact': '   '}, {'fact': '\t'}]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == []
 
 
 # ---------------------------------------------------------------------------
@@ -733,6 +749,12 @@ class TestCanonicalFactsStalenessRegression:
         After the fix, _canonical_facts filters out '   ', returns ['A knows B'],
         and the joined canonical string 'A knows B' matches the stored summary —
         so the entity is NOT stale.
+
+        The total_count assertion (added in task-492) strengthens this regression
+        guard: stale==[] alone could pass trivially if the entity loop never ran
+        (e.g. if list_entity_nodes returned zero entities).  total_count=1 pins
+        that exactly one entity was scanned and _canonical_facts was actually
+        exercised on its edges.
         """
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(
@@ -751,4 +773,64 @@ class TestCanonicalFactsStalenessRegression:
         assert result.stale == [], (
             'Entity should NOT be flagged stale when its only non-whitespace '
             'fact matches the stored summary.'
+        )
+        assert result.total_count == 1, (
+            'total_count must confirm the entity was actually scanned; '
+            'stale==[] alone could pass if the loop never ran.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task-492: caller-coverage — _rebuild_entity_from_edges whitespace filter
+# ---------------------------------------------------------------------------
+
+
+class TestCanonicalFactsCallerCoverage:
+    """_canonical_facts is exercised correctly via the bulk-rebuild call site.
+
+    Caller-coverage gap (task-492): _canonical_facts is called by
+    refresh_entity_summary, _detect_stale_summaries_with_edges,
+    _detect_stale_summaries_dry_run, and _rebuild_entity_from_edges.  Only
+    the stale-detection path had a whitespace-regression test before this
+    task.  This class pins that the bulk-rebuild path also filters
+    whitespace-only facts — a regression in _canonical_facts would corrupt
+    every summary written through the batch path, not just stale-detection
+    results.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rebuild_entity_from_edges_filters_whitespace_only_facts(
+        self, mock_config, make_backend
+    ):
+        """_rebuild_entity_from_edges must not write whitespace-only lines to the summary."""
+        backend = make_backend(mock_config)
+        backend.update_node_summary = AsyncMock()
+
+        edges = [
+            {'uuid': 'e1', 'fact': '   ', 'name': 'edge1'},
+            {'uuid': 'e2', 'fact': '\t', 'name': 'edge2'},
+            {'uuid': 'e3', 'fact': 'Alice knows Bob', 'name': 'knows'},
+            {'uuid': 'e4', 'fact': '\n  \t', 'name': 'edge4'},
+        ]
+
+        result = await backend._rebuild_entity_from_edges(
+            'uuid-1', 'Alice', edges, group_id='test', old_summary='old'
+        )
+
+        # Exact match — only the one real fact, no whitespace-only lines
+        assert result['new_summary'] == 'Alice knows Bob', (
+            'new_summary must contain only real-content facts; whitespace-only '
+            'edges must be filtered by _canonical_facts before joining.'
+        )
+
+        # update_node_summary was called with the clean summary
+        backend.update_node_summary.assert_awaited_once_with(
+            'uuid-1', 'Alice knows Bob', group_id='test'
+        )
+
+        # edge_count is the raw count (includes whitespace-filtered edges),
+        # matching the documented contract in TestRebuildEntityFromEdgesOldSummary.
+        assert result['edge_count'] == 4, (
+            'edge_count must reflect the raw number of edges supplied, '
+            'not the filtered count.'
         )

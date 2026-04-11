@@ -237,6 +237,10 @@ class Scheduler:
         except Exception as e:
             logger.error(f'Failed to set task {task_id} status to {status}: {e}')
 
+    def get_cached_status(self, task_id: str) -> str | None:
+        """Return the last known status for a task, or None if not yet seen."""
+        return self._status_cache.get(task_id)
+
     async def update_task(self, task_id: str, metadata: str | dict) -> bool:
         """Update task metadata via fused-memory. Returns True on success."""
         # fused-memory update_task expects metadata as a JSON string
