@@ -902,16 +902,18 @@ class TestWorkingTreeSync:
     ):
         """advance_main with full speculative-worker call shape returns 'unmerged_state' without stash.
 
+        Uses the full merge_queue.py call shape (branch, expected_main) and dirties
+        README.md so the working-tree protection block is armed.  Without the
+        unmerged-state guard, advance_main would reach the stash block and return
+        'stash_failed' (git stash push fails on a UU index with 'you have unmerged
+        paths') -- the guard must fire first so we see 'unmerged_state' instead,
+        and no stash entry is ever attempted.
+
         Mirrors the real caller in merge_queue.py:265-270:
             result = await self._git_ops.advance_main(
                 merge_result.merge_commit, merge_wt,
                 branch=req.branch, max_attempts=..., expected_main=main_sha,
             )
-
-        Using a real expected_main (current main SHA) so that -- without the guard --
-        the full happy path (update-ref, read-tree, stash-pop) would succeed.
-        Dirties README.md so the stash path is armed; 'stash list unchanged' proves
-        the guard short-circuited before any stash creation.
         """
         # Step 1: prepare a valid merge commit via a clean worktree
         wt = await git_ops.create_worktree('uu-guard-spec')
