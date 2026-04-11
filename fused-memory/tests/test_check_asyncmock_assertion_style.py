@@ -338,6 +338,7 @@ class TestHooksIntegration:
             pytest.skip('python3 not found on PATH — cannot verify hook runtime assumption')
 
         # --- Case 1: empty directory (startup + import isolation) ---
+        # Uses PATH python3 (not sys.executable) on purpose: mirrors the hook's runtime.
         result = subprocess.run(
             ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
             capture_output=True,
