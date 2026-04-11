@@ -42,9 +42,9 @@ def _extract_section(payload: str, header: str) -> str:
     Locates *header* in *payload*, then slices from that position to the start
     of the next markdown header (any level) or end-of-string, whichever comes first.
     """
-    if header not in payload:
+    start = payload.find(header)
+    if start == -1:
         return ''
-    start = payload.index(header)
     end = payload.find('\n#', start + 1)
     if end == -1:
         end = len(payload)
