@@ -82,22 +82,28 @@ async def collect_snapshot(
     seen_roots: set[str] = {resolved_root}
     roots_to_snapshot.append((resolved_root, config.tasks_json))
 
-    orchestrators = await asyncio.to_thread(find_running_orchestrators)
-    for proc in orchestrators:
-        if proc.get('prd'):
-            project_root = _resolve_project_root(proc['prd'], config.project_root)
-        elif proc.get('config_path'):
-            resolved = _read_project_root_from_config(proc['config_path'])
-            if resolved is None:
+    try:
+        orchestrators = await asyncio.to_thread(find_running_orchestrators)
+        for proc in orchestrators:
+            if proc.get('prd'):
+                project_root = _resolve_project_root(proc['prd'], config.project_root)
+            elif proc.get('config_path'):
+                resolved = _read_project_root_from_config(proc['config_path'])
+                if resolved is None:
+                    continue
+                project_root = resolved
+            else:
                 continue
-            project_root = resolved
-        else:
-            continue
-        root_str = str(project_root.resolve())
-        if root_str in seen_roots:
-            continue
-        seen_roots.add(root_str)
-        roots_to_snapshot.append((root_str, project_root / '.taskmaster' / 'tasks' / 'tasks.json'))
+            root_str = str(project_root.resolve())
+            if root_str in seen_roots:
+                continue
+            seen_roots.add(root_str)
+            roots_to_snapshot.append((root_str, project_root / '.taskmaster' / 'tasks' / 'tasks.json'))
+    except Exception:
+        logger.warning(
+            'Orchestrator discovery failed; skipping orchestrator-discovered extras',
+            exc_info=True,
+        )
 
     for known_root in config.known_project_roots:
         # known_root is already resolved by DashboardConfig.__post_init__,
