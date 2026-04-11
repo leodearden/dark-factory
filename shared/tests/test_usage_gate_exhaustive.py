@@ -245,7 +245,7 @@ class TestCapDetectionPatterns:
                 True,
             ),
             (
-                "You've used all available credits. Upgrade for more capacity.",
+                "You've used all available credits. Upgrade your plan for more capacity.",
                 True,
             ),
             (
@@ -594,10 +594,10 @@ class TestCapConfirmKeywordEnforcement:
         assert result is True
         assert acct.capped is True
 
-    def test_cap_hit_prefix_with_upgrade_keyword_returns_true(self):
-        """Prefix + 'upgrade' secondary keyword must trigger CAP_HIT detection."""
+    def test_cap_hit_prefix_with_upgrade_your_plan_keyword_returns_true(self):
+        """Prefix + 'upgrade your plan' secondary keyword must trigger CAP_HIT detection."""
         gate = make_gate(['a'])
-        result = gate.detect_cap_hit('', "You've used all credits. Upgrade for more.")
+        result = gate.detect_cap_hit('', "You've used all credits. Upgrade your plan for more.")
         acct = gate._accounts[0]
         assert result is True
         assert acct.capped is True
