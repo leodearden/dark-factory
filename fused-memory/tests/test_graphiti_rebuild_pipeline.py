@@ -554,7 +554,7 @@ class TestRebuildEntitySummariesDataFlow:
         backend.get_all_valid_edges.assert_awaited_once_with(group_id='test')
 
     @pytest.mark.asyncio
-    async def test_force_false_dry_run_fetches_edges_per_entity(self, mock_config, make_backend):
+    async def test_force_false_dry_run_fetches_edges_per_entity(self, mock_config, make_backend, make_stale_list):
         """force=False, dry_run=True: get_valid_edges_for_node awaited once per non-empty-summary entity (post-526).
 
         Positive complement to test_force_false_dry_run_does_not_fetch_edge_map.
@@ -574,10 +574,7 @@ class TestRebuildEntitySummariesDataFlow:
         """
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(
-            return_value=[
-                {'uuid': 'u1', 'name': 'Alice', 'summary': 'some summary 1'},
-                {'uuid': 'u2', 'name': 'Bob', 'summary': 'some summary 2'},
-            ]
+            return_value=make_stale_list(alice_summary='some summary 1', bob_summary='some summary 2')
         )
         backend.get_all_valid_edges = AsyncMock(return_value={})
         # Per-entity probe returns no edges → summaries are stale (non-empty summary,
