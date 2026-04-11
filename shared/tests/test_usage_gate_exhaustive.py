@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -563,6 +564,71 @@ class TestCapConfirmKeywordEnforcement:
             '', 'Your test run resets the state and the upgrade worked',
         )
         assert result is False
+
+    def test_detect_cap_hit_cap_prefix_without_confirm_logs_debug(self, caplog):
+        """CAP_HIT prefix without confirm keyword → returns False AND emits debug breadcrumb.
+
+        When a CAP_HIT prefix is present but no CAP_CONFIRM_KEYWORDS keyword,
+        detect_cap_hit must emit a logger.debug('Cap-like prefix ...') breadcrumb
+        to help diagnose silent false-negatives in production.
+        """
+        gate = make_gate(['a'])
+        prefix = CAP_HIT_PREFIXES[0]  # e.g. "You've hit your"
+        msg = f'{prefix} some message with no confirm keyword'
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
+            result = gate.detect_cap_hit('', msg)
+        assert result is False
+        debug_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any('Cap-like prefix' in m and prefix in m for m in debug_msgs), (
+            f"Expected 'Cap-like prefix' debug breadcrumb containing {prefix!r} in {debug_msgs!r}"
+        )
+
+    def test_detect_cap_hit_near_cap_prefix_without_confirm_logs_debug(self, caplog):
+        """NEAR_CAP prefix without confirm keyword → returns False AND emits debug breadcrumb.
+
+        Same as the CAP_HIT variant but for NEAR_CAP_PREFIXES.
+        """
+        gate = make_gate(['a'])
+        prefix = NEAR_CAP_PREFIXES[0]  # "You're close to"
+        msg = f'{prefix} the end of the road'
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
+            result = gate.detect_cap_hit('', msg)
+        assert result is False
+        debug_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any('Cap-like prefix' in m and prefix in m for m in debug_msgs), (
+            f"Expected 'Cap-like prefix' debug breadcrumb containing {prefix!r} in {debug_msgs!r}"
+        )
+
+    def test_detect_cap_hit_no_prefix_no_debug_log(self, caplog):
+        """Unrelated string → no 'Cap-like prefix' debug log emitted.
+
+        Regression guard: the debug breadcrumb must NOT fire when the input
+        contains neither a CAP_HIT nor NEAR_CAP prefix.
+        """
+        gate = make_gate(['a'])
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
+            gate.detect_cap_hit('', 'Task completed successfully')
+        debug_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert not any('Cap-like prefix' in m for m in debug_msgs), (
+            f"Unexpected 'Cap-like prefix' debug breadcrumb in {debug_msgs!r}"
+        )
+
+    def test_detect_cap_hit_normal_path_no_debug_log(self, caplog):
+        """Prefix + confirm keyword → returns True and no 'Cap-like prefix' debug log.
+
+        Regression guard: when the normal detection path succeeds (prefix AND
+        confirm keyword both present), no debug breadcrumb should be emitted.
+        """
+        gate = make_gate(['a'])
+        prefix = CAP_HIT_PREFIXES[0]  # e.g. "You've hit your"
+        msg = f'{prefix} usage limit'  # 'usage limit' is a CAP_CONFIRM_KEYWORDS entry
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
+            result = gate.detect_cap_hit('', msg)
+        assert result is True
+        debug_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert not any('Cap-like prefix' in m for m in debug_msgs), (
+            f"Unexpected 'Cap-like prefix' debug breadcrumb on happy path in {debug_msgs!r}"
+        )
 
 
 # =========================================================================
