@@ -611,13 +611,13 @@ class TestCollectSnapshot:
                 rows = list(await cur.fetchall())
 
         assert len(rows) == 2
-        project_ids = {row[0] for row in rows}
+        project_ids = {row['project_id'] for row in rows}
         assert str(tmp_path.resolve()) in project_ids        # (a) main project row
         assert str(good_root.resolve()) in project_ids       # (b) good_root row
         assert str(bad_root.resolve()) not in project_ids    # (c) no bad_root row
 
-        good_row = next(r for r in rows if r[0] == str(good_root.resolve()))
-        assert good_row[1] == 2  # done=2 for good_root
+        good_row = next(r for r in rows if r['project_id'] == str(good_root.resolve()))
+        assert good_row['done'] == 2  # done=2 for good_root
 
     @pytest.mark.asyncio
     async def test_orchestrator_fallback_deduplicates_against_resolved_root(self, tmp_path):
