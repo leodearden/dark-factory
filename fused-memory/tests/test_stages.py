@@ -36,6 +36,21 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 _MOCK_TYPES = (AsyncMock, MagicMock)
 
 
+def _extract_section(payload: str, header: str) -> str:
+    """Return the body of *header* up to the next '\\n#' boundary, or '' if absent.
+
+    Locates *header* in *payload*, then slices from that position to the start
+    of the next markdown header (any level) or end-of-string, whichever comes first.
+    """
+    if header not in payload:
+        return ''
+    start = payload.index(header)
+    end = payload.find('\n#', start + 1)
+    if end == -1:
+        end = len(payload)
+    return payload[start:end]
+
+
 class TestMockTypesConstant:
     """Validate the _MOCK_TYPES constant that TestProjectIdValidation depends on."""
 
@@ -1400,12 +1415,7 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
         )
 
         # (b) done tasks appear in descending id order: 10, 8, 5, 3
-        recently_idx = payload.index('### Recently Completed Tasks')
-        # Find the next section after Recently Completed
-        next_section_idx = payload.find('\n#', recently_idx + 1)
-        if next_section_idx == -1:
-            next_section_idx = len(payload)
-        section_text = payload[recently_idx:next_section_idx]
+        section_text = _extract_section(payload, '### Recently Completed Tasks')
 
         pos_10 = section_text.find('[10]')
         pos_8 = section_text.find('[8]')
@@ -1573,13 +1583,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         assert 'Task 20' in payload
         # Recently Completed: done_count > 0 but done_tasks=[] (harness path)
         # Either the section is absent (future-proof) OR it mentions the count '5'
-        recently_section = ''
-        if '### Recently Completed Tasks' in payload:
-            recently_idx = payload.index('### Recently Completed Tasks')
-            next_section_idx = payload.find('\n#', recently_idx + 1)
-            if next_section_idx == -1:
-                next_section_idx = len(payload)
-            recently_section = payload[recently_idx:next_section_idx]
+        recently_section = _extract_section(payload, '### Recently Completed Tasks')
         assert '### Recently Completed Tasks' not in payload or '5' in recently_section, (
             "Expected '### Recently Completed Tasks' absent or done_count '5' in section body"
         )
@@ -1731,13 +1735,8 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
             "Payload missing '### Recently Completed Tasks' header in fallback path"
         )
 
-        # (b) Extract the Recently Completed section body (same pattern as
-        #     test_payload_recently_completed_tasks_sorted_desc lines 1403-1408)
-        recently_idx = payload.index('### Recently Completed Tasks')
-        next_section_idx = payload.find('\n#', recently_idx + 1)
-        if next_section_idx == -1:
-            next_section_idx = len(payload)
-        recently_section = payload[recently_idx:next_section_idx]
+        # (b) Extract the Recently Completed section body
+        recently_section = _extract_section(payload, '### Recently Completed Tasks')
 
         # (c) Done-task ids must appear INSIDE the Recently Completed section (scoped)
         assert '[10]' in recently_section, "Done task id=10 not found in Recently Completed section"
@@ -1746,10 +1745,51 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
 
         # (d) Active-task ids must NOT appear inside the Recently Completed section —
         #     cross-validates that section extraction is correctly bounded.
-        #     Use bracket-id form '[1]'/[2]' which avoids substring collision with '[10]'/'[11]'.
-        assert '[1]' not in recently_section, (
+        #     Anchored to the rendered task-line prefix '- [N] ' (matches
+        #     _render_task_line format '- [{tid}] ({status}) {title} deps=...')
+        #     to avoid false negatives from 'deps=[1]' or similar substrings.
+        assert '- [1] ' not in recently_section, (
             "Active task id=1 should NOT be in Recently Completed section"
         )
-        assert '[2]' not in recently_section, (
+        assert '- [2] ' not in recently_section, (
             "Active task id=2 should NOT be in Recently Completed section"
         )
+
+        # (e) Symmetric cross-boundary check: done-task ids must NOT leak into
+        #     the Active Task Tree section. This is the counterpart to (d) above
+        #     and converts this test from a partial duplicate of
+        #     test_payload_recently_completed_tasks_sorted_desc into a genuine
+        #     cross-section-boundary assertion.
+        active_section = _extract_section(payload, '### Active Task Tree')
+        assert '- [10] ' not in active_section, (
+            "Done task id=10 should NOT appear in Active Task Tree section"
+        )
+        assert '- [11] ' not in active_section, (
+            "Done task id=11 should NOT appear in Active Task Tree section"
+        )
+        assert '- [12] ' not in active_section, (
+            "Done task id=12 should NOT appear in Active Task Tree section"
+        )
+
+
+class TestExtractSectionHelper:
+    """Unit tests for the _extract_section module-level helper."""
+
+    def test_extracts_section_bounded_by_next_header(self):
+        """Helper returns content from header up to (not including) the next '\\n#' boundary."""
+        payload = '### First Section\nline one\nline two\n### Second Section\nother content'
+        result = _extract_section(payload, '### First Section')
+        assert result == '### First Section\nline one\nline two'
+        assert '### Second Section' not in result
+
+    def test_extracts_section_to_eof_when_no_next_header(self):
+        """When no subsequent '#' header exists, helper returns from header through end-of-string."""
+        payload = '### Only Section\nsome content here\nmore lines'
+        result = _extract_section(payload, '### Only Section')
+        assert result == '### Only Section\nsome content here\nmore lines'
+
+    def test_returns_empty_string_when_header_absent(self):
+        """When the header does not appear in payload, helper returns ''."""
+        payload = '### Other Section\nsome content'
+        result = _extract_section(payload, '### Missing Header')
+        assert result == ''
