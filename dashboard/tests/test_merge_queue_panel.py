@@ -5,6 +5,8 @@ from __future__ import annotations
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
+from dashboard.data.merge_queue import _bucket_minutes_for_window
+
 # ---------------------------------------------------------------------------
 # Mock data
 # ---------------------------------------------------------------------------
@@ -295,3 +297,49 @@ class TestMergeQueueListenerLifecycle:
         # Both the definition and the direct invocation contain 'renderAll()',
         # so the count must be at least 2.
         assert resp.text.count('renderAll()') >= 2
+
+
+# ---------------------------------------------------------------------------
+# TestMergeQueueWindowAll
+# ---------------------------------------------------------------------------
+
+class TestMergeQueueWindowAll:
+    def test_window_all_returns_bounded_depth_payload(self, client):
+        """GET /partials/merge-queue?window=all must:
+
+        1. Return 200 OK.
+        2. Call aggregate_queue_depth_timeseries with hours=87600.
+        3. Serve a depth payload whose length is bounded (< 10 000) —
+           regression guard against the 350 401-bucket blowup.
+
+        The test uses a side_effect mock that:
+        - Asserts the hours kwarg equals 87600.
+        - Computes N = _bucket_minutes_for_window(87600) → returns a
+          ChartData with N labels so the route can complete normally.
+        """
+        captured = {}
+
+        async def _mock_aggregate_depth(*args, **kwargs):
+            captured['hours'] = kwargs.get('hours')
+            bm = _bucket_minutes_for_window(87600)
+            N = (87600 * 60 // bm) + 1
+            return {'labels': [f'L{i}' for i in range(N)], 'values': [0] * N}
+
+        with patch('dashboard.app.aggregate_queue_depth_timeseries',
+                   side_effect=_mock_aggregate_depth), \
+             patch('dashboard.app.aggregate_outcome_distribution',
+                   new_callable=AsyncMock, return_value=MOCK_OUTCOMES), \
+             patch('dashboard.app.aggregate_latency_stats',
+                   new_callable=AsyncMock, return_value=MOCK_LATENCY), \
+             patch('dashboard.app.aggregate_recent_merges',
+                   new_callable=AsyncMock, return_value=MOCK_RECENT), \
+             patch('dashboard.app.aggregate_speculative_stats',
+                   new_callable=AsyncMock, return_value=MOCK_SPEC):
+            resp = client.get('/partials/merge-queue?window=all')
+
+        assert resp.status_code == 200
+        assert captured.get('hours') == 87600
+
+        bm = _bucket_minutes_for_window(87600)
+        N = (87600 * 60 // bm) + 1
+        assert N < 10_000, f"_bucket_minutes_for_window(87600) yields {N} points — regression!"
