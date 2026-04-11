@@ -1793,3 +1793,9 @@ class TestExtractSectionHelper:
         payload = '### Other Section\nsome content'
         result = _extract_section(payload, '### Missing Header')
         assert result == ''
+
+    def test_extracts_section_when_header_at_byte_zero(self):
+        """Header at byte 0 is found correctly; body ends at the next '\\n#' boundary."""
+        payload = '### Start\nbody line\n### Next\nother'
+        result = _extract_section(payload, '### Start')
+        assert result == '### Start\nbody line'
