@@ -447,7 +447,9 @@ class OrchestratorConfig(BaseSettings):
                 f'timeouts.steward ({self.timeouts.steward}) must be >= '
                 f'steward_completion_timeout ({self.steward_completion_timeout}); '
                 'a smaller per-invocation wall-clock would silently cut the steward '
-                'short inside the grace window.'
+                'short inside the grace window. '
+                'Raise timeouts.steward to >= steward_completion_timeout, or lower '
+                'steward_completion_timeout in your orchestrator.yaml.'
             )
         return self
 
