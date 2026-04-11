@@ -498,6 +498,12 @@ class _EvalScheduler:
 
         Write-side counterpart to get_cached_status().  Mirrors the helper on
         Scheduler for structural symmetry.
+
+        TODO: this is an exact one-liner duplicate of Scheduler._set_cached_status
+        (orchestrator/src/orchestrator/scheduler.py).  The two classes share no
+        base class, so the duplication is unavoidable today.  Revisit if cache
+        management grows (TTL, instrumentation, invalidation) to keep both sites
+        in sync.
         """
         self._status_cache[task_id] = status
 

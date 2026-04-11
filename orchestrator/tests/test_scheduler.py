@@ -1670,6 +1670,10 @@ class TestSchedulerInternalRouting:
         mcp_mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
 
+        # Pre-seed the cache so is_valid_transition('pending', 'in-progress')
+        # is True regardless of future gate tightening for None->* transitions.
+        scheduler._status_cache['42'] = 'pending'
+
         recorded: list[tuple[str, str]] = []
         original = scheduler._set_cached_status  # AttributeError until step 3
 

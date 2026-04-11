@@ -323,8 +323,8 @@ class Scheduler:
         """Write the cached status for a task.
 
         Write-side counterpart to get_cached_status().  All internal cache
-        writes funnel through this helper so a future subclass can override
-        both the read and write hooks symmetrically.
+        writes funnel through this single helper, mirroring the single read
+        choke-point so both sides are consistently overridable and testable.
         """
         self._status_cache[task_id] = status
 
