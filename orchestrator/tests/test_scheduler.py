@@ -1614,13 +1614,21 @@ class TestSchedulerInternalRouting:
     async def test_set_task_status_reads_via_get_cached_status(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """set_task_status() must read the cached value via get_cached_status()."""
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value={}))
-        scheduler._status_cache['42'] = 'in-progress'
+        """set_task_status() must read the cached value via get_cached_status().
 
-        with patch.object(scheduler, 'get_cached_status', wraps=scheduler.get_cached_status) as spy:
-            await scheduler.set_task_status('42', 'done')
-            spy.assert_called_with('42')
+        Stronger invariant: the return value must actually drive the transition
+        gate.  Patching get_cached_status to return 'done' causes done->blocked
+        to be rejected (is_valid_transition('done', 'blocked') is False), so
+        mcp_call is never invoked.  A spy-only assertion would pass even if the
+        production code read _status_cache directly alongside a vestigial
+        get_cached_status() call; this form does not.
+        """
+        mcp_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+
+        with patch.object(scheduler, 'get_cached_status', return_value='done'):
+            await scheduler.set_task_status('42', 'blocked')
+            mcp_mock.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_get_tasks_reads_via_get_cached_status(
