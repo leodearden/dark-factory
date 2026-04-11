@@ -37,6 +37,46 @@ def _cutoff_iso(hours: int) -> str:
     return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
 
 
+def _bucket_minutes_for_window(hours: int) -> int:
+    """Return the adaptive bucket width in minutes for the given window length.
+
+    Ladder:
+      <=  24 h → 15 min  (≤ 97 buckets)
+      <= 168 h → 60 min  (≤ 169 buckets)
+      <= 720 h → 360 min (≤ 121 buckets)
+      >  720 h → 1440 min (≤ 3 651 buckets, covers window=all / 87 600 h)
+    """
+    if hours <= 24:
+        return 15
+    if hours <= 168:
+        return 60
+    if hours <= 720:
+        return 360
+    return 1440
+
+
+def _align_bucket(t: datetime, bucket_min: int) -> datetime:
+    """Floor *t* to the nearest bucket boundary using epoch-based arithmetic.
+
+    Uses 1970-01-01 00:00 UTC as the epoch, which naturally aligns on hour
+    and day boundaries for all four supported bucket widths (15/60/360/1440).
+
+    Args:
+        t: A timezone-aware datetime (UTC assumed if no tzinfo).
+        bucket_min: Bucket width in minutes (15, 60, 360, or 1440).
+
+    Returns:
+        A UTC-aware datetime at the start of the bucket containing *t*.
+    """
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=UTC)
+    bucket_sec = bucket_min * 60
+    total_sec = int((t - epoch).total_seconds())
+    aligned_sec = (total_sec // bucket_sec) * bucket_sec
+    return epoch + timedelta(seconds=aligned_sec)
+
+
 # ---------------------------------------------------------------------------
 # 1. Queue depth timeseries (15-min bins)
 # ---------------------------------------------------------------------------
