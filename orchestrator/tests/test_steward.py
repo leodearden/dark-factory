@@ -407,6 +407,23 @@ class TestStewardRetryLogic:
         steward.escalation_queue.resolve.assert_called_once()
         assert steward.escalation_queue.resolve.call_args[1].get('dismiss') is True
 
+    async def test_auto_escalates_after_one_attempt_with_default_retries(
+        self, steward, mock_config,
+    ):
+        mock_config.steward_max_retries = 1
+        esc = _make_escalation()
+        steward._retry_counts['esc-42-1'] = 1
+
+        await steward._handle_escalation(esc)
+
+        steward.escalation_queue.submit.assert_called_once()
+        submitted = steward.escalation_queue.submit.call_args[0][0]
+        assert submitted.level == 1
+        assert 'Failed after 1 attempts' in submitted.summary
+
+        steward.escalation_queue.resolve.assert_called_once()
+        assert steward.escalation_queue.resolve.call_args[1].get('dismiss') is True
+
     async def test_different_escalations_have_independent_counts(self, steward):
         for esc_id in ('esc-42-1', 'esc-42-2'):
             esc = _make_escalation(id=esc_id)
