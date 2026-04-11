@@ -7,11 +7,7 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
-from fused_memory.middleware.task_curator import (
-    CandidateTask,
-    CuratorDecision,
-    RewrittenTask,
-)
+from fused_memory.middleware.task_curator import CuratorDecision, RewrittenTask
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.event_buffer import EventBuffer
 

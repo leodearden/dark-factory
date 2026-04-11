@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from shared.cli_invoke import AgentResult
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.task_curator import (
     CURATOR_OUTPUT_SCHEMA,
     CandidateTask,
     CuratorDecision,
-    RewrittenTask,
     TaskCurator,
     _flatten_task_tree,
     _parse_decision,
@@ -22,8 +21,6 @@ from fused_memory.middleware.task_curator import (
     _to_pool_entry,
     _trim_pool,
 )
-from shared.cli_invoke import AgentResult
-
 
 # ----------------------------------------------------------------------
 # Pure helper tests
@@ -364,12 +361,6 @@ class TestCuratorOutputSchema:
 # ----------------------------------------------------------------------
 # TaskCurator.curate() — idempotency cache + fallback behavior
 # ----------------------------------------------------------------------
-
-
-@dataclass
-class _FakeEmbedder:
-    async def create(self, text: str):  # noqa: ARG002 - signature-match shim
-        return [0.0] * 1536
 
 
 def _make_config() -> FusedMemoryConfig:

@@ -33,9 +33,10 @@ from shared.locking import files_to_modules
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from shared.usage_gate import UsageGate
+
     from fused_memory.backends.taskmaster_client import TaskmasterBackend
     from fused_memory.config.schema import FusedMemoryConfig
-    from shared.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
 
