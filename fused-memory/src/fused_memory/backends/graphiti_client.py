@@ -1351,7 +1351,7 @@ class GraphitiBackend:
         Uses ro_query since no writes are performed.
         """
         driver = self._require_driver()
-        graph = driver._get_graph(graph_name)
+        graph: Any = driver._get_graph(graph_name)
         result = await graph.ro_query('MATCH (n) RETURN count(n) as count')
         return result.result_set[0][0] if result.result_set else 0
 
