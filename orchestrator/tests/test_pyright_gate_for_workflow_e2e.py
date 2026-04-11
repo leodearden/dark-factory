@@ -29,6 +29,12 @@ _PACKAGE_ROOT = Path(__file__).parent.parent
 # Locate repo root (dark-factory/) from orchestrator/tests/.
 _REPO_ROOT = Path(__file__).parents[2]
 
+# Pre-compiled pattern for detecting a PYRIGHT_PACKAGES for-loop in hook content.
+_LOOP_PATTERN = re.compile(
+    r'for\s+\w+\s+in\s+"\$\{PYRIGHT_PACKAGES\[@\]\}"\s*;\s*do(.*?)done',
+    re.DOTALL,
+)
+
 
 def _parse_pyright_packages(content: str) -> list[str] | None:
     """Parse PYRIGHT_PACKAGES=(...) from hook file content, return the list or None.
@@ -67,10 +73,6 @@ def _hook_invokes_pyright_in_loop(content: str) -> bool:
     file (e.g. in a comment) does not falsely pass, and a loop that iterates
     PYRIGHT_PACKAGES but calls some other command inside fails correctly.
     """
-    _LOOP_PATTERN = re.compile(
-        r'for\s+\w+\s+in\s+"\$\{PYRIGHT_PACKAGES\[@\]\}"\s*;\s*do(.*?)done',
-        re.DOTALL,
-    )
     match = _LOOP_PATTERN.search(content)
     return bool(match and "uv run pyright" in match.group(1))
 
