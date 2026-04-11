@@ -88,13 +88,17 @@ def steward(worktree, mock_config, mock_queue, mock_mcp, mock_briefing):
     )
 
 
-def _make_result(cost=1.0, turns=5, session_id='sess-abc', success=True):
+def _make_result(
+    cost=1.0, turns=5, session_id='sess-abc', success=True,
+    duration_ms=5000, stderr='',
+):
     from shared.cli_invoke import AgentResult
     return AgentResult(
         success=success,
         output='done',
+        stderr=stderr,
         cost_usd=cost,
-        duration_ms=5000,
+        duration_ms=duration_ms,
         turns=turns,
         session_id=session_id,
     )
@@ -545,6 +549,39 @@ class TestStewardTimeoutPassthrough:
         assert mock_invoke.call_count == 2
         for call in mock_invoke.call_args_list:
             assert call.kwargs['timeout_seconds'] == pytest.approx(900.0)
+
+
+# ---------------------------------------------------------------------------
+# Timeout-kill recovery
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardTimeoutKillRecovery:
+    """Timeout-killed invocations must NOT consume the retry budget."""
+
+    async def test_timeout_kill_does_not_increment_retry_count(self, steward, mock_config):
+        """A SIGTERM+SIGKILL timeout must leave _retry_counts unchanged."""
+        mock_config.steward_max_retries = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        # Queue returns pending after the invocation (not resolved)
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False,
+                cost=1.5,
+                turns=3,
+                session_id='sess-killed',
+                stderr='Process killed after 900.0s timeout (SIGTERM+SIGKILL)',
+            )
+            await steward._handle_escalation(esc)
+
+        assert steward._retry_counts.get('esc-42-1', 0) == 0
+        steward.escalation_queue.submit.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
