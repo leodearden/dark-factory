@@ -313,6 +313,16 @@ class TestStewardTimeoutInvariant:
         config = OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=1800.0))
         assert config.timeouts.steward > config.steward_completion_timeout
 
+    def test_error_message_contains_remediation_hint(self, monkeypatch, tmp_path):
+        """ValidationError message must include operator-actionable remediation hint.
+
+        Guards against future refactors silently dropping the guidance text.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        with pytest.raises(ValidationError, match='Raise timeouts.steward'):
+            OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=600.0))
+
     def test_env_var_override_triggers_invariant(self, monkeypatch, tmp_path):
         """ORCH_TIMEOUTS__STEWARD env-var override is caught by the mode='after' validator.
 
