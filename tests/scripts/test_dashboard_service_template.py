@@ -199,7 +199,7 @@ def test_comment_warns_about_systemd_space_handling() -> None:
     The check is intent-based, not prose-pinning:
     - The line immediately above Environment=DASHBOARD_KNOWN_PROJECT_ROOTS= (skipping blanks)
       must be a '#' comment that mentions both 'systemd' and 'space' (case-insensitive).
-    - The old misleading phrase 'no spaces' must not appear anywhere in either file.
+    - The old misleading phrase 'no spaces' must not appear in the warning comment line above Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=.
 
     This is stronger than an exact-string match: any future copy-edit that preserves the
     warning intent (systemd treats spaces as separators) will pass, while edits that remove
