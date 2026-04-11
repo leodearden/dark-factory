@@ -646,7 +646,12 @@ class TestRebuildEntitySummariesErrorHandling:
         backend.list_entity_nodes = AsyncMock(
             return_value=make_stale_list(alice_summary='stale summary', bob_summary='stale summary 2')
         )
-        backend.get_all_valid_edges = AsyncMock(return_value={})
+        u2_edges: list[EdgeDict] = [
+            {'uuid': 'e-1', 'fact': 'fact1', 'name': 'knows'},
+            {'uuid': 'e-2', 'fact': 'fact2', 'name': 'knows'},
+            {'uuid': 'e-3', 'fact': 'fact3', 'name': 'knows'},
+        ]
+        backend.get_all_valid_edges = AsyncMock(return_value={'u2': u2_edges})
         backend._rebuild_entity_from_edges = AsyncMock(
             side_effect=[
                 RuntimeError('boom'),
@@ -688,7 +693,7 @@ class TestRebuildEntitySummariesErrorHandling:
         # assertion above reflects the mock return value; this assertion independently pins
         # the input forwarding path.
         backend._rebuild_entity_from_edges.assert_any_call(
-            'u2', 'Bob', [], group_id='test', old_summary='stale summary 2'
+            'u2', 'Bob', u2_edges, group_id='test', old_summary='stale summary 2'
         )
         backend._rebuild_entity_from_edges.assert_any_call(
             'u1', 'Alice', [], group_id='test', old_summary='stale summary'
