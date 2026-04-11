@@ -244,3 +244,26 @@ class TestIndexWiring:
     def test_index_contains_poll_base(self, client):
         resp = client.get('/')
         assert 'data-poll-base' in resp.text
+
+
+# ---------------------------------------------------------------------------
+# TestMergeQueueListenerLifecycle
+# ---------------------------------------------------------------------------
+
+class TestMergeQueueListenerLifecycle:
+    def test_inline_script_has_no_persistent_htmx_after_settle_listener(self, client):
+        """The persistent document.addEventListener('htmx:afterSettle', ...) block
+        must not be present in the rendered partial — it accumulates zombie listeners
+        on every htmx re-swap (every 15s polling cycle) with no cleanup."""
+        with _patch_merge_queue_data():
+            resp = client.get('/partials/merge-queue')
+        assert resp.status_code == 200
+        assert 'htmx:afterSettle' not in resp.text
+
+    def test_render_all_invoked_directly_in_iife(self, client):
+        """renderAll() must be called directly within the IIFE (not only inside
+        a document.addEventListener callback) so charts render after htmx swap."""
+        with _patch_merge_queue_data():
+            resp = client.get('/partials/merge-queue')
+        assert resp.status_code == 200
+        assert 'renderAll()' in resp.text
