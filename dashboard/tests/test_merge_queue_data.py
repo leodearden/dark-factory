@@ -94,6 +94,8 @@ async def empty_merge_events_conn(empty_merge_events_db):
 # ---------------------------------------------------------------------------
 
 from dashboard.data.merge_queue import (  # noqa: E402
+    _align_bucket,
+    _bucket_minutes_for_window,
     aggregate_latency_stats,
     aggregate_outcome_distribution,
     aggregate_queue_depth_timeseries,
@@ -105,6 +107,74 @@ from dashboard.data.merge_queue import (  # noqa: E402
     recent_merges,
     speculative_stats,
 )
+
+# ---------------------------------------------------------------------------
+# TestBucketMinutesForWindow
+# ---------------------------------------------------------------------------
+
+class TestBucketMinutesForWindow:
+    @pytest.mark.parametrize('hours,expected', [
+        (1, 15),
+        (24, 15),
+        (25, 60),
+        (168, 60),
+        (169, 360),
+        (720, 360),
+        (721, 1440),
+        (87600, 1440),
+    ])
+    def test_ladder_tiers(self, hours, expected):
+        assert _bucket_minutes_for_window(hours) == expected
+
+
+# ---------------------------------------------------------------------------
+# TestAlignBucket
+# ---------------------------------------------------------------------------
+
+class TestAlignBucket:
+    def test_15min_alignment(self):
+        """12:07:30 → 15-min bucket 12:00:00."""
+        t = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        result = _align_bucket(t, 15)
+        assert result == datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+
+    def test_60min_alignment(self):
+        """12:07:30 → 60-min bucket 12:00:00."""
+        t = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        result = _align_bucket(t, 60)
+        assert result == datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+
+    def test_360min_alignment_at_12_07(self):
+        """12:07:30 → 360-min (6h) bucket 12:00:00."""
+        t = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        result = _align_bucket(t, 360)
+        assert result == datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+
+    def test_360min_alignment_at_14_07(self):
+        """14:07:30 → 360-min (6h) bucket 12:00:00."""
+        t = datetime(2026, 4, 11, 14, 7, 30, tzinfo=UTC)
+        result = _align_bucket(t, 360)
+        assert result == datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+
+    def test_1440min_alignment_at_23_50(self):
+        """23:50:00 → 1440-min (1d) bucket 00:00:00 same day."""
+        t = datetime(2026, 4, 11, 23, 50, 0, tzinfo=UTC)
+        result = _align_bucket(t, 1440)
+        assert result == datetime(2026, 4, 11, 0, 0, 0, tzinfo=UTC)
+
+    def test_1440min_alignment_at_00_02(self):
+        """00:02:00 → 1440-min (1d) bucket 00:00:00 same day."""
+        t = datetime(2026, 4, 11, 0, 2, 0, tzinfo=UTC)
+        result = _align_bucket(t, 1440)
+        assert result == datetime(2026, 4, 11, 0, 0, 0, tzinfo=UTC)
+
+    def test_1440min_alignment_preserves_timezone(self):
+        """Result is UTC-aware."""
+        t = datetime(2026, 4, 11, 15, 30, 0, tzinfo=UTC)
+        result = _align_bucket(t, 1440)
+        assert result.tzinfo is not None
+        assert result == datetime(2026, 4, 11, 0, 0, 0, tzinfo=UTC)
+
 
 # ---------------------------------------------------------------------------
 # TestQueueDepthTimeseries
@@ -189,6 +259,105 @@ class TestQueueDepthTimeseries:
         assert len(result['labels']) == 97
         assert len(result['values']) == 97
         assert all(v == 0 for v in result['values'])
+
+    @pytest.mark.asyncio
+    async def test_7d_uses_1h_buckets(self, merge_events_db):
+        """7d window (168h) produces 169 buckets spaced exactly 1 hour apart."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+
+        # Insert two events 12 hours before now (in the same 1h bucket)
+        event_time = now - timedelta(hours=12)
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        for i in range(2):
+            _insert_event(conn_sync, event_type='merge_attempt',
+                          timestamp=event_time + timedelta(minutes=i * 15),
+                          data={'outcome': 'done'})
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await queue_depth_timeseries(db, hours=168, now=now)
+
+        labels = result['labels']
+        values = result['values']
+
+        assert len(labels) == 169
+        assert len(values) == 169
+
+        # Consecutive labels must be exactly 1 hour apart
+        for i in range(1, len(labels)):
+            prev = datetime.fromisoformat(labels[i - 1])
+            curr = datetime.fromisoformat(labels[i])
+            assert curr - prev == timedelta(hours=1)
+
+        # Both events fall in the same 1h bucket (floor of event_time to hour)
+        bucket_label = _align_bucket(event_time, 60).isoformat()
+        assert bucket_label in labels
+        idx = labels.index(bucket_label)
+        assert values[idx] == 2
+
+    @pytest.mark.asyncio
+    async def test_30d_uses_6h_buckets(self, merge_events_db):
+        """30d window (720h) produces 121 buckets spaced exactly 6 hours apart."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+
+        # Insert one event ~5 days before now (inside a specific 6h bucket)
+        event_time = now - timedelta(days=5, hours=2)
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        _insert_event(conn_sync, event_type='merge_attempt',
+                      timestamp=event_time,
+                      data={'outcome': 'done'})
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await queue_depth_timeseries(db, hours=720, now=now)
+
+        labels = result['labels']
+        values = result['values']
+
+        assert len(labels) == 121
+
+        # Consecutive labels must be exactly 6 hours apart
+        for i in range(1, len(labels)):
+            prev = datetime.fromisoformat(labels[i - 1])
+            curr = datetime.fromisoformat(labels[i])
+            assert curr - prev == timedelta(hours=6)
+
+        # Event falls in its 6h bucket
+        bucket_label = _align_bucket(event_time, 360).isoformat()
+        assert bucket_label in labels
+        idx = labels.index(bucket_label)
+        assert values[idx] == 1
+
+    @pytest.mark.asyncio
+    async def test_all_window_is_bounded(self, empty_merge_events_conn):
+        """87600h window (window=all) produces exactly 3651 daily buckets — not 350k.
+
+        The exact count is deterministic given the fixed ``now`` value:
+        - now_aligned   = 2026-04-11T00:00:00 UTC
+        - cutoff_aligned = 2016-04-14T00:00:00 UTC  (floor of now − 87600 h)
+        - diff = 3650 days → 3650 + 1 = 3651 buckets
+        """
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        result = await queue_depth_timeseries(empty_merge_events_conn, hours=87600, now=now)
+
+        labels = result['labels']
+        assert len(labels) == 3651, (
+            f"Expected exactly 3651 daily buckets, got {len(labels)} "
+            f"(regression guard against the 350 401-bucket blowup)"
+        )
+
+        # ALL consecutive labels must be exactly 1 day apart (UTC, no DST drift)
+        for i in range(1, len(labels)):
+            prev = datetime.fromisoformat(labels[i - 1])
+            curr = datetime.fromisoformat(labels[i])
+            assert curr - prev == timedelta(days=1), (
+                f"Gap at index {i}: {prev.isoformat()} → {curr.isoformat()} "
+                f"is not exactly 1 day"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -678,3 +847,62 @@ class TestMultiDbAggregation:
         assert result['discard_count'] == 1
         assert result['total'] == 3
         assert result['hit_rate'] == pytest.approx(2 / 3, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_aggregate_7d_uses_1h_buckets(self, tmp_path):
+        """aggregate_queue_depth_timeseries at hours=168 produces 169 buckets,
+        summing counts across two DBs into the same 1h bucket."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        event_time = now - timedelta(hours=12)  # 12h before now
+
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': event_time + timedelta(minutes=5),
+             'data': {'outcome': 'done'}},
+        ])
+        db2 = self._make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': event_time + timedelta(minutes=10),
+             'data': {'outcome': 'conflict'}},
+            {'event_type': 'merge_attempt',
+             'timestamp': event_time + timedelta(minutes=15),
+             'data': {'outcome': 'conflict'}},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=168, now=now)
+
+        labels = result['labels']
+        values = result['values']
+
+        assert len(labels) == 169
+
+        # All 3 events share the same 1h bucket
+        bucket_label = _align_bucket(event_time, 60).isoformat()
+        assert bucket_label in labels
+        idx = labels.index(bucket_label)
+        assert values[idx] == 3  # 1 + 2
+
+    @pytest.mark.asyncio
+    async def test_aggregate_all_window_bounded(self, tmp_path):
+        """aggregate_queue_depth_timeseries at hours=87600 produces ≤4000 buckets."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+
+        db1 = self._make_db(tmp_path, 'runs1.db', [])
+        db2 = self._make_db(tmp_path, 'runs2.db', [])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=87600, now=now)
+
+        assert len(result['labels']) >= 3650
+        assert len(result['labels']) <= 4000
