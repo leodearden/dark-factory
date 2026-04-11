@@ -260,6 +260,94 @@ class TestQueueDepthTimeseries:
         assert len(result['values']) == 97
         assert all(v == 0 for v in result['values'])
 
+    @pytest.mark.asyncio
+    async def test_7d_uses_1h_buckets(self, merge_events_db):
+        """7d window (168h) produces 169 buckets spaced exactly 1 hour apart."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+
+        # Insert two events 12 hours before now (in the same 1h bucket)
+        event_time = now - timedelta(hours=12)
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        for i in range(2):
+            _insert_event(conn_sync, event_type='merge_attempt',
+                          timestamp=event_time + timedelta(minutes=i * 15),
+                          data={'outcome': 'done'})
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await queue_depth_timeseries(db, hours=168, now=now)
+
+        labels = result['labels']
+        values = result['values']
+
+        assert len(labels) == 169
+        assert len(values) == 169
+
+        # Consecutive labels must be exactly 1 hour apart
+        for i in range(1, len(labels)):
+            prev = datetime.fromisoformat(labels[i - 1])
+            curr = datetime.fromisoformat(labels[i])
+            assert curr - prev == timedelta(hours=1)
+
+        # Both events fall in the same 1h bucket (floor of event_time to hour)
+        bucket_label = _align_bucket(event_time, 60).isoformat()
+        assert bucket_label in labels
+        idx = labels.index(bucket_label)
+        assert values[idx] == 2
+
+    @pytest.mark.asyncio
+    async def test_30d_uses_6h_buckets(self, merge_events_db):
+        """30d window (720h) produces 121 buckets spaced exactly 6 hours apart."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+
+        # Insert one event ~5 days before now (inside a specific 6h bucket)
+        event_time = now - timedelta(days=5, hours=2)
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        _insert_event(conn_sync, event_type='merge_attempt',
+                      timestamp=event_time,
+                      data={'outcome': 'done'})
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await queue_depth_timeseries(db, hours=720, now=now)
+
+        labels = result['labels']
+        values = result['values']
+
+        assert len(labels) == 121
+
+        # Consecutive labels must be exactly 6 hours apart
+        for i in range(1, len(labels)):
+            prev = datetime.fromisoformat(labels[i - 1])
+            curr = datetime.fromisoformat(labels[i])
+            assert curr - prev == timedelta(hours=6)
+
+        # Event falls in its 6h bucket
+        bucket_label = _align_bucket(event_time, 360).isoformat()
+        assert bucket_label in labels
+        idx = labels.index(bucket_label)
+        assert values[idx] == 1
+
+    @pytest.mark.asyncio
+    async def test_all_window_is_bounded(self, empty_merge_events_conn):
+        """87600h window (window=all) produces ~3651 daily buckets — not 350k."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        result = await queue_depth_timeseries(empty_merge_events_conn, hours=87600, now=now)
+
+        labels = result['labels']
+        assert len(labels) >= 3650, f"Expected ≥3650 buckets, got {len(labels)}"
+        assert len(labels) <= 4000, f"Expected ≤4000 buckets, got {len(labels)} (regression guard)"
+
+        # Consecutive labels must be exactly 1 day apart
+        for i in range(1, min(len(labels), 10)):  # spot-check first 10 gaps
+            prev = datetime.fromisoformat(labels[i - 1])
+            curr = datetime.fromisoformat(labels[i])
+            assert curr - prev == timedelta(days=1)
+
 
 # ---------------------------------------------------------------------------
 # TestOutcomeDistribution
