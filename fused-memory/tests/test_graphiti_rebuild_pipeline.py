@@ -757,9 +757,9 @@ class TestRebuildEntitySummariesErrorHandling:
         assert backend._rebuild_entity_from_edges.await_count == 2
 
         # Symmetrical to the force=True test: pin the force=False forwarding path
-        # where t['old_summary'] = s['summary'] (graphiti_client.py:1169) flows
-        # through _rebuild_one into _rebuild_entity_from_edges' old_summary kwarg
-        # (graphiti_client.py:1189). Edges are [] because detect_result.all_edges
+        # where the targets list-comp sets t['old_summary'] = s['summary'] and
+        # _rebuild_one forwards it as the old_summary kwarg to
+        # _rebuild_entity_from_edges. Edges are [] because detect_result.all_edges
         # maps both uuids to empty lists.
         backend._rebuild_entity_from_edges.assert_any_call(
             'u2', 'Bob', [], group_id='test', old_summary='old B'
