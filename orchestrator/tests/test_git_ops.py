@@ -957,9 +957,9 @@ class TestWorkingTreeSync:
         original_run = _run
         recorded: list[list[str]] = []
 
-        async def recording_run(cmd, cwd=None):
+        async def recording_run(cmd, cwd=None, **kwargs):
             recorded.append(list(cmd))
-            return await original_run(cmd, cwd=cwd)
+            return await original_run(cmd, cwd=cwd, **kwargs)
 
         with patch('orchestrator.git_ops._run', side_effect=recording_run):
             result = await git_ops.advance_main(
