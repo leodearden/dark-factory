@@ -473,14 +473,14 @@ class TestContextAssemblerCancellation:
     into empty context lists (``ctx_result = []``), silently swallowing the shutdown signal
     and letting assemble() return a normal payload instead of propagating the cancel.
 
-    The fix mirrors the 'two-tier check' convention already applied in:
-      - MemoryService.get_entity (memory_service.py:1000-1013)
-      - graphiti_client.rebuild_entity_summaries (graphiti_client.py:1071-1098, task-484)
+    The fix uses the shared 'two-tier check' via propagate_cancellations
+    (fused_memory.utils.async_utils), the same Pass 1 guard used by all
+    gather(return_exceptions=True) callsites in this codebase.
 
     Two passes:
-      - Pass 1 (propagation): scan batch_contexts and re-raise any value that is a
-        BaseException but NOT an Exception (CancelledError, KeyboardInterrupt, SystemExit).
-      - Pass 2 (accumulation): the per-event zip loop uses ``isinstance(ctx_result, Exception)``
+      - Pass 1 (propagate_cancellations): re-raise any value that is a BaseException
+        but NOT an Exception (CancelledError, KeyboardInterrupt, SystemExit).
+      - Pass 2 (accumulation): the per-event zip loop uses ``isinstance(ctx_result, BaseException)``
         so only application-level failures degrade to empty context.
     """
 
