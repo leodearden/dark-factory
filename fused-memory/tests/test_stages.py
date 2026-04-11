@@ -42,9 +42,9 @@ def _extract_section(payload: str, header: str) -> str:
     Locates *header* in *payload*, then slices from that position to the start
     of the next markdown header (any level) or end-of-string, whichever comes first.
     """
-    if header not in payload:
+    start = payload.find(header)
+    if start == -1:
         return ''
-    start = payload.index(header)
     end = payload.find('\n#', start + 1)
     if end == -1:
         end = len(payload)
@@ -1793,3 +1793,21 @@ class TestExtractSectionHelper:
         payload = '### Other Section\nsome content'
         result = _extract_section(payload, '### Missing Header')
         assert result == ''
+
+    def test_extracts_section_when_header_at_byte_zero(self):
+        """Header at byte 0 is found correctly; body ends at the next '\\n#' boundary."""
+        payload = '### Start\nbody line\n### Next\nother'
+        result = _extract_section(payload, '### Start')
+        assert result == '### Start\nbody line'
+
+    def test_extracts_empty_section_for_adjacent_headers(self):
+        """Adjacent headers with no body between them yield the header text only."""
+        payload = '### Empty\n### Next\nbody'
+        result = _extract_section(payload, '### Empty')
+        assert result == '### Empty'
+
+    def test_extracts_first_occurrence_when_header_repeats(self):
+        """First-occurrence semantics: slice ends at the second '\\n#' boundary, not EOF."""
+        payload = '### Dup\nfirst body\n### Dup\nsecond body'
+        result = _extract_section(payload, '### Dup')
+        assert result == '### Dup\nfirst body'
