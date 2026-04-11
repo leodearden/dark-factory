@@ -1203,12 +1203,19 @@ class GraphitiBackend:
             # Pass 1 guard contract.
             try:
                 propagate_cancellations(results)
-            except BaseException:
-                logger.warning(
-                    'rebuild_entity_summaries: cancellation signal received '
-                    'group=%s rebuilt_so_far=%d errors_so_far=%d; propagating',
-                    group_id, rebuilt, errors,
-                )
+            except BaseException as e:
+                # Gate the warning on the helper's documented raise contract:
+                # propagate_cancellations only raises bare BaseExceptions (not
+                # Exception subclasses).  If that contract ever widens (e.g. a
+                # validation error on the input sequence), we re-raise silently
+                # rather than mislabelling a regular Exception as a
+                # "cancellation signal".
+                if not isinstance(e, Exception):
+                    logger.warning(
+                        'rebuild_entity_summaries: cancellation signal received '
+                        'group=%s rebuilt_so_far=%d errors_so_far=%d; propagating',
+                        group_id, rebuilt, errors,
+                    )
                 raise
 
             # Pass 2: per-entity accumulation.  Using isinstance(r, Exception) instead

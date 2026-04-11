@@ -34,7 +34,7 @@ from collections.abc import Sequence
 from typing import Any
 
 
-def propagate_cancellations(results: Sequence[Any]) -> None:
+def propagate_cancellations(results: Sequence[Any]) -> None:  # Sequence, not list: callers may wrap/slice gather's return value
     """Re-raise the first bare BaseException found in *results*, if any.
 
     This is Pass 1 of the two-tier check convention for
