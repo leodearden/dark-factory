@@ -59,8 +59,6 @@ class TaskKnowledgeSync(BaseStage):
         if self.filtered_task_tree is not None:
             # Harness path: tree already fetched and filtered before run()
             filtered = self.filtered_task_tree
-            # Use active_tasks for proactive sample (no done/cancelled in the list)
-            sample_pool: list[dict] = filtered.active_tasks
         else:
             # Fallback path: self-fetch via taskmaster
             tasks_data: dict = {}
@@ -70,10 +68,6 @@ class TaskKnowledgeSync(BaseStage):
                 except Exception:
                     tasks_data = {}
             filtered = filter_task_tree(tasks_data)
-            all_tasks: list = tasks_data.get('tasks', [])
-            if not isinstance(all_tasks, list):
-                all_tasks = []
-            sample_pool = all_tasks
 
         # Render "Recently Completed Tasks" section
         if filtered.done_tasks:
@@ -96,7 +90,10 @@ class TaskKnowledgeSync(BaseStage):
 
         proactive_sample_section = ''
         if not self.remediation_mode:
-            sample = _select_proactive_sample(sample_pool, self.MIN_TASK_SAMPLE)
+            sample = _select_proactive_sample(
+                filtered.active_tasks + filtered.done_tasks + filtered.cancelled_tasks,
+                self.MIN_TASK_SAMPLE,
+            )
             proactive_sample_section = (
                 f'\n### Proactive Task Sample ({len(sample)} tasks)\n'
                 f'{format_task_list(sample)}\n'
