@@ -490,6 +490,7 @@ class UsageGate:
             ok = await self._run_probe(acct)
 
             if ok:
+                confirmed_probe_num = acct.probe_count
                 acct.capped = False
                 acct.near_cap = False
                 acct.probing = True  # gate: let one real task confirm first
@@ -504,7 +505,7 @@ class UsageGate:
                 if self._cost_store:
                     await self._write_cost_event(
                         acct.name, 'resumed',
-                        json.dumps({'label': f'probe #{acct.probe_count} confirmed'}),
+                        json.dumps({'label': f'probe #{confirmed_probe_num} confirmed'}),
                     )
                 return
             else:
