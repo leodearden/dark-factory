@@ -400,8 +400,6 @@ class TestRebuildEntitySummariesDataFlow:
     @pytest.mark.asyncio
     async def test_total_entities_flows_from_detect_step(self, mock_config, make_backend):
         """total_entities in result matches _detect_stale_summaries_with_edges.total_count."""
-        from fused_memory.backends.graphiti_client import StaleSummaryResult
-
         backend = make_backend(mock_config)
         stale_list = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'old'}]
         all_edges = {'u1': [{'fact': 'Alice knows Bob'}]}
@@ -667,8 +665,6 @@ class TestRebuildEntitySummariesErrorHandling:
         and succeeding for the second, the gather/zip accumulator must record
         errors=1 and rebuilt=1, with details in target order (u1 first, u2 second).
         """
-        from fused_memory.backends.graphiti_client import StaleSummaryResult
-
         backend = make_backend(mock_config)
         stale_list = [
             {'uuid': 'u1', 'name': 'Alice', 'summary': 'old A'},
