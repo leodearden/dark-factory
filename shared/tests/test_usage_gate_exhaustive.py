@@ -385,22 +385,34 @@ class TestNearCapStateDistinction:
 
     @pytest.mark.asyncio
     async def test_near_cap_round_trip_via_probe_loop(self):
-        """Round-trip: near_cap set → capped → probe succeeds → near_cap cleared → re-detected.
+        """Round-trip: capped via real path → near-cap warning arrives → probe succeeds → near_cap cleared → re-detected.
 
         This FAILS before the fix (probe loop doesn't clear near_cap) and PASSES after
         ``acct.near_cap = False`` is added to ``_account_resume_probe_loop``'s success branch.
+
+        The account is capped first via the real ``_handle_cap_detected`` path (not manual
+        field assignment), then a near-cap warning arrives via ``detect_cap_hit`` with an
+        explicit token so ``_resolve_account`` returns the already-capped account.  This
+        mirrors the defensive case the probe-loop fix guards against.
         """
         gate = make_gate(['a'], probe_interval_secs=0, max_probe_interval_secs=0)
         acct = gate._accounts[0]
 
-        # (1) Set near_cap via detect_cap_hit with a NEAR_CAP message
-        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 1h.")
-        assert acct.near_cap is True
-        assert acct.capped is False
+        # (1) Cap the account via the real detection path (sets capped=True, near_cap=False,
+        #     pause_started_at, resets_at, and closes the global gate).
+        gate._handle_cap_detected('test', datetime.now(UTC) - timedelta(minutes=1), acct.token)
+        assert acct.capped is True
+        assert acct.pause_started_at is not None  # real path sets this; manual block skipped it
 
-        # (2) Mark account capped with a past resets_at (so probe loop skips sleeping)
-        acct.capped = True
-        acct.resets_at = datetime.now(UTC) - timedelta(minutes=1)
+        # (2) Simulate a near-cap warning arriving after the account was capped — uses
+        #     oauth_token=acct.token so _resolve_account returns the capped account via
+        #     token match (the fallback scan filters on `not a.capped` but token match does not).
+        gate.detect_cap_hit(
+            '', "You're close to reaching your usage limit. Your plan resets in 1h.",
+            oauth_token=acct.token,
+        )
+        assert acct.near_cap is True
+        assert acct.capped is True
 
         # (3) Override _run_probe to return success immediately
         gate._run_probe = AsyncMock(return_value=True)
