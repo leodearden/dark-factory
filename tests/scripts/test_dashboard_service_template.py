@@ -47,7 +47,7 @@ HARDCODED_EXPECTED_ENV_LINE = (
 # Both sentinels contain no regex metacharacters and no '|', so str.replace is
 # semantically identical to the sed command.
 HARDCODED_SERVICE_REPO_ROOT = "/home/leo/src/dark-factory"
-HARDCODED_UV_PATH = "/home/leo/.local/bin/uv"
+HARDCODED_SERVICE_UV_PATH = "/home/leo/.local/bin/uv"
 
 
 def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
@@ -117,8 +117,8 @@ def test_comma_separator_helper_rejects_empty_value(
 
     An empty DASHBOARD_KNOWN_PROJECT_ROOTS would silently produce a single empty-string
     root after split(','), which is a misconfiguration.  A whitespace-only value is
-    equally broken (systemd treats spaces inside an Environment= value as separators
-    between variable assignments, so the entire value would be discarded).
+    equally broken: systemd splits unquoted Environment= values on whitespace, so a
+    whitespace-only value reduces to an empty assignment.
     """
     # Bad: empty value — regex matches, group(1) is '', helper should raise
     empty_file = tmp_path / "empty.service"
@@ -137,6 +137,14 @@ def test_comma_separator_helper_rejects_empty_value(
     )
     with pytest.raises(AssertionError):
         _assert_known_project_roots_comma_separated(whitespace_file)
+
+    # Good: single-root value — helper must not raise (guards against over-tightening the empty check to require a comma)
+    good_file = tmp_path / "single_root.service"
+    good_file.write_text(
+        "[Service]\nEnvironment=DASHBOARD_KNOWN_PROJECT_ROOTS=/a\n",
+        encoding="utf-8",
+    )
+    _assert_known_project_roots_comma_separated(good_file)
 
 
 def test_comma_separator_helper_detects_colon_in_any_position(
@@ -254,7 +262,7 @@ def test_template_renders_to_hardcoded_file() -> None:
 
     Substitution semantics (mirroring setup-host.sh):
         sed 's|__REPO_ROOT__|$REPO_ROOT|g'  →  str.replace('__REPO_ROOT__', HARDCODED_SERVICE_REPO_ROOT)
-        sed 's|__UV_PATH__|$UV_PATH|g'      →  str.replace('__UV_PATH__', HARDCODED_UV_PATH)
+        sed 's|__UV_PATH__|$UV_PATH|g'      →  str.replace('__UV_PATH__', HARDCODED_SERVICE_UV_PATH)
 
     Both sentinels contain no regex metacharacters and no '|', so str.replace is
     semantically identical to the sed command (global, unanchored, literal substitution).
@@ -266,7 +274,7 @@ def test_template_renders_to_hardcoded_file() -> None:
     rendered = (
         TEMPLATE.read_text(encoding="utf-8")
         .replace("__REPO_ROOT__", HARDCODED_SERVICE_REPO_ROOT)
-        .replace("__UV_PATH__", HARDCODED_UV_PATH)
+        .replace("__UV_PATH__", HARDCODED_SERVICE_UV_PATH)
     )
     hardcoded = HARDCODED.read_text(encoding="utf-8")
     assert rendered == hardcoded, (

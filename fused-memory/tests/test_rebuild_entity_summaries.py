@@ -1034,6 +1034,37 @@ class TestDetectStaleSummariesBulk:
 # N+1 fix step-9: rebuild_entity_summaries parallel + no re-fetch
 # ---------------------------------------------------------------------------
 
+@pytest.fixture
+def two_entity_backend(mock_config, make_backend, make_edge_backend):
+    """Shared backend pre-configured with the canonical Alice/Bob two-entity setup.
+
+    Provides:
+      - make_backend(mock_config) instantiation (GraphitiBackend with mocked client)
+      - list_entity_nodes returning Alice (uuid-1/stale1) and Bob (uuid-2/stale2)
+      - get_all_valid_edges returning current1/current2 edges for each entity
+
+    Function-scoped (pytest default) so each test gets a fresh backend with fresh
+    AsyncMock.await_count counters — important for await_count assertions in both
+    TestRebuildEntitySummariesParallel and TestRebuildEntitySummariesCancellation.
+
+    The list_entity_nodes and get_all_valid_edges mocks are exercised by force=True
+    consumers (TestRebuildEntitySummariesParallel.test_partial_failure_in_update_does_not_cancel_others
+    and all TestRebuildEntitySummariesCancellation tests except test_cancelled_error_propagates_force_false).
+    force=False consumers may intentionally supersede those lower-level mocks by stubbing
+    _detect_stale_summaries_with_edges directly (see test_cancelled_error_propagates_force_false).
+
+    Tests supply their own update_node_summary side_effect to exercise the specific
+    scenario under test.
+    """
+    return make_edge_backend(make_backend(mock_config), nodes=[
+        {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
+        {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
+    ], edges={
+        'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
+        'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
+    })
+
+
 class TestRebuildEntitySummariesParallel:
     """rebuild_entity_summaries uses _rebuild_entity_from_edges (no re-fetch) + asyncio.gather."""
 
@@ -1233,20 +1264,14 @@ class TestRebuildEntitySummariesParallel:
 
     @pytest.mark.asyncio
     async def test_partial_failure_in_update_does_not_cancel_others(
-        self, mock_config, make_backend, make_edge_backend
+        self, two_entity_backend
     ):
         """If update_node_summary fails for one entity, others still complete.
 
         asyncio.gather with return_exceptions=True ensures partial failures are
         captured rather than propagated, so the gather completes for all entities.
         """
-        backend = make_edge_backend(make_backend(mock_config), nodes=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
-            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
-        ], edges={
-            'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
-            'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
-        })
+        backend = two_entity_backend
         # First entity's write fails, second succeeds
         backend.update_node_summary = AsyncMock(side_effect=[
             RuntimeError('FalkorDB timeout'),
@@ -1335,30 +1360,6 @@ class TestRebuildEntitySummariesCancellation:
       - The per-entity accumulator loop then uses ``isinstance(r, Exception)`` so only
         application-level failures are recorded as error detail entries.
     """
-
-    @pytest.fixture
-    def two_entity_backend(self, mock_config, make_backend, make_edge_backend):
-        """Shared backend pre-configured with the canonical Alice/Bob two-entity setup.
-
-        Provides:
-          - make_backend(mock_config) instantiation (GraphitiBackend with mocked client)
-          - list_entity_nodes returning Alice (uuid-1/stale1) and Bob (uuid-2/stale2)
-          - get_all_valid_edges returning current1/current2 edges for each entity
-
-        Function-scoped (pytest default) so each test gets a fresh backend with fresh
-        AsyncMock.await_count counters — important for the await_count==2 assertion in
-        test_cancelled_error_propagates_alongside_other_errors.
-
-        Tests supply their own update_node_summary side_effect to exercise the specific
-        scenario under test.
-        """
-        return make_edge_backend(make_backend(mock_config), nodes=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
-            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
-        ], edges={
-            'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
-            'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
-        })
 
     @pytest.mark.asyncio
     async def test_cancelled_error_propagates(self, two_entity_backend):
@@ -1473,6 +1474,11 @@ class TestRebuildEntitySummariesCancellation:
         in TestRebuildEntitySummaries.test_rebuilds_only_stale_entities (line ~259).
         """
         backend = two_entity_backend
+        # Intentionally supersede the fixture's lower-level list_entity_nodes /
+        # get_all_valid_edges mocks by stubbing _detect_stale_summaries_with_edges
+        # directly.  This isolates the test surface to the gather + two-tier check
+        # path, mirroring the pattern in
+        # TestRebuildEntitySummaries.test_rebuilds_only_stale_entities (line ~259).
         backend._detect_stale_summaries_with_edges = AsyncMock(
             return_value=StaleSummaryResult(
                 stale=[
@@ -1498,6 +1504,16 @@ class TestRebuildEntitySummariesCancellation:
         with pytest.raises(asyncio.CancelledError):
             await backend.rebuild_entity_summaries(group_id='test', force=False)
 
+        # After CancelledError propagated, verify the force=False gather path was actually
+        # exercised: _detect_stale_summaries_with_edges was awaited exactly once (bulk fetch
+        # of stale entities + their edges) and update_node_summary was awaited twice (one per
+        # entity, scheduled by asyncio.gather before the Pass 1 propagation check).  This
+        # guards against a future refactor where CancelledError could escape from a different
+        # code path (e.g. before gather is reached) while the pytest.raises still reports DID
+        # RAISE — mirroring the rationale in test_cancelled_error_propagates_alongside_other_errors.
+        assert backend._detect_stale_summaries_with_edges.await_count == 1
+        assert backend.update_node_summary.await_count == 2
+
     @pytest.mark.asyncio
     async def test_runtime_error_still_accumulates_in_errors(self, two_entity_backend):
         """Regression guard: Exception subclasses must still accumulate after the BaseException→Exception narrowing.
@@ -1508,25 +1524,35 @@ class TestRebuildEntitySummariesCancellation:
         per-entity error bookkeeper and handled only by Pass 1 (the propagation pass).
 
         This narrowing is intentional but must not accidentally exclude ordinary
-        application-level failures (RuntimeError, ValueError, etc.) from Pass 2
+        application-level failures (ValueError, etc.) from Pass 2
         (graphiti_client.py:1086-1098).  If someone over-narrows the guard — e.g. to
         ``isinstance(r, RuntimeError)`` — ordinary failures from other Exception subclasses
         would silently disappear from the result dict.
 
+        Uses ValueError (not RuntimeError) to prove the guard is isinstance(r, Exception)
+        and is not over-narrowed to RuntimeError.  RuntimeError accumulation is already
+        covered by test_partial_failure_in_update_does_not_cancel_others.
+
         Uses force=True (same mock surface as the other tests in this class) because
         both branches converge on the same Pass 2 accumulator.  The force=False branch's
-        RuntimeError accumulation is already covered by test_partial_failure_continues
+        ValueError accumulation is already covered by test_partial_failure_continues
         (TestRebuildEntitySummaries class).
         """
         backend = two_entity_backend
-        # First entity's rebuild raises RuntimeError; second succeeds
+        # First entity's rebuild raises ValueError; second succeeds
         backend.update_node_summary = AsyncMock(
-            side_effect=[RuntimeError('per-entity boom'), None]
+            side_effect=[ValueError('per-entity boom'), None]
         )
 
         result = await backend.rebuild_entity_summaries(group_id='test', force=True)
 
         assert result['errors'] == 1
         assert result['rebuilt'] == 1
-        error_detail = next(d for d in result['details'] if d['status'] == 'error')
+        # Pin down the full result counter shape: without these, a regression where both
+        # counters incremented for the same entity (e.g. total_entities=1/skipped=1) would
+        # still satisfy errors==1/rebuilt==1 and slip through.
+        assert result['total_entities'] == 2
+        assert result['skipped'] == 0
+        error_detail = next((d for d in result['details'] if d['status'] == 'error'), None)
+        assert error_detail is not None, f"expected an 'error' entry in details; got {result['details']}"
         assert 'per-entity boom' in error_detail['error']

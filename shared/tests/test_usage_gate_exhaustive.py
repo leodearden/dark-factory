@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -563,6 +564,71 @@ class TestCapConfirmKeywordEnforcement:
             '', 'Your test run resets the state and the upgrade worked',
         )
         assert result is False
+
+    def test_detect_cap_hit_cap_prefix_without_confirm_logs_debug(self, caplog):
+        """CAP_HIT prefix without confirm keyword → returns False AND emits debug breadcrumb.
+
+        When a CAP_HIT prefix is present but no CAP_CONFIRM_KEYWORDS keyword,
+        detect_cap_hit must emit a logger.debug('Cap-like prefix ...') breadcrumb
+        to help diagnose silent false-negatives in production.
+        """
+        gate = make_gate(['a'])
+        prefix = CAP_HIT_PREFIXES[0]  # e.g. "You've hit your"
+        msg = f'{prefix} some message with no confirm keyword'
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
+            result = gate.detect_cap_hit('', msg)
+        assert result is False
+        debug_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any('Cap-like prefix' in m and prefix in m for m in debug_msgs), (
+            f"Expected 'Cap-like prefix' debug breadcrumb containing {prefix!r} in {debug_msgs!r}"
+        )
+
+    def test_detect_cap_hit_near_cap_prefix_without_confirm_logs_debug(self, caplog):
+        """NEAR_CAP prefix without confirm keyword → returns False AND emits debug breadcrumb.
+
+        Same as the CAP_HIT variant but for NEAR_CAP_PREFIXES.
+        """
+        gate = make_gate(['a'])
+        prefix = NEAR_CAP_PREFIXES[0]  # "You're close to"
+        msg = f'{prefix} the end of the road'
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
+            result = gate.detect_cap_hit('', msg)
+        assert result is False
+        debug_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any('Cap-like prefix' in m and prefix in m for m in debug_msgs), (
+            f"Expected 'Cap-like prefix' debug breadcrumb containing {prefix!r} in {debug_msgs!r}"
+        )
+
+    def test_detect_cap_hit_no_prefix_no_debug_log(self, caplog):
+        """Unrelated string → no 'Cap-like prefix' debug log emitted.
+
+        Regression guard: the debug breadcrumb must NOT fire when the input
+        contains neither a CAP_HIT nor NEAR_CAP prefix.
+        """
+        gate = make_gate(['a'])
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
+            gate.detect_cap_hit('', 'Task completed successfully')
+        debug_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert not any('Cap-like prefix' in m for m in debug_msgs), (
+            f"Unexpected 'Cap-like prefix' debug breadcrumb in {debug_msgs!r}"
+        )
+
+    def test_detect_cap_hit_normal_path_no_debug_log(self, caplog):
+        """Prefix + confirm keyword → returns True and no 'Cap-like prefix' debug log.
+
+        Regression guard: when the normal detection path succeeds (prefix AND
+        confirm keyword both present), no debug breadcrumb should be emitted.
+        """
+        gate = make_gate(['a'])
+        prefix = CAP_HIT_PREFIXES[0]  # e.g. "You've hit your"
+        msg = f'{prefix} usage limit'  # 'usage limit' is a CAP_CONFIRM_KEYWORDS entry
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
+            result = gate.detect_cap_hit('', msg)
+        assert result is True
+        debug_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert not any('Cap-like prefix' in m for m in debug_msgs), (
+            f"Unexpected 'Cap-like prefix' debug breadcrumb on happy path in {debug_msgs!r}"
+        )
 
 
 # =========================================================================
@@ -1191,11 +1257,17 @@ class TestConfirmAccountOk:
         gate = make_gate(['a'])
         gate._accounts[0].near_cap = True
         gate._accounts[0].probe_in_flight = False
+        # NOTE: probe_count=3 with probe_in_flight=False is unreachable in real execution
+        # (probe_count only advances inside the probe loop while capped, and is reset to 0
+        # on success).  The value is set here purely to verify that confirm_account_ok does
+        # NOT touch unrelated fields when the probe_in_flight branch is skipped — these
+        # assertions are "no side effects on unrelated fields" invariant checks, not a
+        # realistic-state test.
         gate._accounts[0].probe_count = 3
         gate._open.clear()
         gate.confirm_account_ok(gate._accounts[0].token)
         assert gate._accounts[0].near_cap is False
-        # probe_count and gate should NOT change (only near_cap is cleared in this branch)
+        # Verify no side effects on probe-related fields (invariant check, not realistic state)
         assert gate._accounts[0].probe_count == 3
         assert gate._open.is_set() is False
 
@@ -1211,7 +1283,29 @@ class TestConfirmAccountOk:
         gate.confirm_account_ok('completely-unknown-token')
         assert gate._accounts[0].near_cap is True
 
-    def test_confirm_account_ok_on_capped_account(self):
+    def test_near_cap_resets_after_confirm_then_warning(self):
+        """Locks in the clear/re-detect contract for near_cap.
+
+        Sequence: NEAR_CAP warning → confirm_account_ok → NEAR_CAP warning again.
+        After the first warning near_cap is True; after confirm_account_ok it is
+        False; after the second warning it must flip back to True.  This guards
+        against a future change that accidentally latches near_cap (i.e. stops
+        re-detection after a clear) or that makes the clear irreversible.
+        """
+        gate = make_gate(['a'])
+        # Step 1: trigger a NEAR_CAP warning — near_cap should become True
+        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 4h.")
+        assert gate._accounts[0].near_cap is True
+
+        # Step 2: a successful invocation clears near_cap
+        gate.confirm_account_ok(gate._accounts[0].token)
+        assert gate._accounts[0].near_cap is False
+
+        # Step 3: the same NEAR_CAP warning fires again — near_cap must be re-set to True
+        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 4h.")
+        assert gate._accounts[0].near_cap is True
+
+    def test_confirm_account_ok_on_capped_account_behavior(self):
         """confirm_account_ok clears near_cap even when the account is capped.
 
         Regression guard: a successful invocation proves the account is healthy, so

@@ -275,6 +275,18 @@ class UsageGate:
                     reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
                     self._handle_near_cap_warning(reason, oauth_token)
                     return True
+        else:
+            # No confirm keyword — the prefix guard above would have blocked
+            # detection anyway, but if a cap-like prefix IS present, emit a
+            # debug breadcrumb so silent false-negatives leave a trace
+            # (e.g. stderr truncation or Claude changes its message format).
+            for prefix in (*CAP_HIT_PREFIXES, *NEAR_CAP_PREFIXES):
+                if prefix.lower() in combined_lower:
+                    logger.debug(
+                        'Cap-like prefix %r seen but no confirm keyword; ignoring',
+                        prefix,
+                    )
+                    break  # first match is sufficient; avoid log spam
 
         return False
 
@@ -560,6 +572,15 @@ class UsageGate:
             + (stdout_bytes.decode(errors='replace') if stdout_bytes else '')
         )
 
+        # NOTE — intentional asymmetry with detect_cap_hit:
+        # This loop does NOT apply the CAP_CONFIRM_KEYWORDS guard used by
+        # detect_cap_hit.  The probe runs only while an account is already
+        # capped; any whiff of a cap prefix in the probe output means the
+        # account is still capped and we must NOT unpause it.  Being
+        # conservative here avoids the far worse outcome of unpausing a
+        # capped account and burning quota on a still-limited account.
+        # Do not 'fix' this asymmetry without understanding the safety-margin
+        # implications — see test_probe_prefix_only_without_confirm_keyword_still_returns_false.
         for prefixes in (CAP_HIT_PREFIXES, NEAR_CAP_PREFIXES):
             for prefix in prefixes:
                 if prefix.lower() in combined.lower():
@@ -629,24 +650,21 @@ class UsageGate:
         return None
 
     def confirm_account_ok(self, oauth_token: str | None) -> None:
-        """Clear near_cap and the probing gate after a successful invocation.
+        """Clear near_cap and (if applicable) the probing gate after a successful invocation.
 
         Called by ``invoke_with_cap_retry`` when an invocation succeeds (no cap
-        detected).
+        detected).  Two effects:
 
-        Always clears ``near_cap`` on the matched account — a successful
-        invocation proves the account is healthy, so any prior near-cap warning
-        is stale and should be discarded unconditionally.
-
-        Additionally, if ``probe_in_flight`` was set (a probe cycle was in
-        progress), clears that flag, resets ``probe_count``, and opens the
-        shared ``_open`` event so other tasks may use this account.
+        1. **Always** clears any stale ``near_cap`` flag on the matched account.
+        2. If ``probe_in_flight`` was set (a probe cycle was in progress), clears
+           that flag, resets ``probe_count``, and opens the shared ``_open`` event
+           so other tasks may use this account.
         """
         acct = self._find_account_by_token(oauth_token) if oauth_token else None
         if acct is None:
             return
-        # A successful invocation proves the account is healthy — clear stale
-        # near_cap regardless of whether a probe cycle was in progress.
+        # A successful invocation clears any stale near_cap flag; it will be
+        # re-set on the next near-cap warning if still applicable.
         acct.near_cap = False
         if acct.probe_in_flight:
             acct.probe_in_flight = False

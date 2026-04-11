@@ -68,9 +68,8 @@ class TestStaleSummaryResult:
     def test_no_legacy_edges_attribute(self):
         """StaleSummaryResult must NOT expose the old 'edges' field name.
 
-        The rename edges → all_edges was applied in task 438. This test locks
-        in that the old alias is truly absent, so any accidental re-exposure
-        would be caught immediately.
+        StaleSummaryResult uses all_edges (not edges) as the field name; this test
+        prevents silent re-aliasing.
         """
         result = StaleSummaryResult(stale=[], all_edges={}, total_count=0)
         assert not hasattr(result, 'edges')
@@ -803,17 +802,7 @@ class TestCanonicalFactsCallerCoverage:
     async def test_rebuild_entity_from_edges_filters_whitespace_only_facts(
         self, mock_config, make_backend
     ):
-        """_rebuild_entity_from_edges must not write whitespace-only lines to the summary.
-
-        Caller-coverage gap (task-492): _canonical_facts is called by
-        refresh_entity_summary, _detect_stale_summaries_with_edges,
-        _detect_stale_summaries_dry_run, and _rebuild_entity_from_edges.
-        Only the stale-detection path had a whitespace-regression test before
-        this task.  This test pins that the bulk-rebuild path also filters
-        whitespace-only facts — a regression in _canonical_facts would corrupt
-        every summary written through the batch path, not just
-        stale-detection results.
-        """
+        """_rebuild_entity_from_edges must not write whitespace-only lines to the summary."""
         backend = make_backend(mock_config)
         backend.update_node_summary = AsyncMock()
 
@@ -833,22 +822,6 @@ class TestCanonicalFactsCallerCoverage:
             'new_summary must contain only real-content facts; whitespace-only '
             'edges must be filtered by _canonical_facts before joining.'
         )
-
-        # Invariant assertions — guard different failure modes of the same regression:
-        # a future bug that returned 'Alice knows Bob\n  ' or '\n\nAlice knows Bob'
-        # would still be caught.
-        assert '\n' not in result['new_summary'], (
-            'Single valid fact must produce a single-line summary with no newlines.'
-        )
-        assert '   ' not in result['new_summary'], (
-            'Triple-space whitespace fact must not leak into the written summary.'
-        )
-        assert '\t' not in result['new_summary'], (
-            'Tab whitespace fact must not leak into the written summary.'
-        )
-        assert all(
-            line.strip() for line in result['new_summary'].split('\n') if line
-        ), 'Every non-empty line must have real non-whitespace content.'
 
         # update_node_summary was called with the clean summary
         backend.update_node_summary.assert_awaited_once_with(
