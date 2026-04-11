@@ -88,6 +88,35 @@ def test_hardcoded_service_file_sets_known_project_roots() -> None:
     )
 
 
+def test_comma_separator_helper_rejects_empty_value(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_assert_known_project_roots_comma_separated must reject an empty or whitespace-only value.
+
+    An empty DASHBOARD_KNOWN_PROJECT_ROOTS would silently produce a single empty-string
+    root after split(','), which is a misconfiguration.  A whitespace-only value is
+    equally broken (systemd treats spaces inside an Environment= value as separators
+    between variable assignments, so the entire value would be discarded).
+    """
+    # Bad: empty value — regex matches, group(1) is '', helper should raise
+    empty_file = tmp_path / "empty.service"
+    empty_file.write_text(
+        "[Service]\nEnvironment=DASHBOARD_KNOWN_PROJECT_ROOTS=\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _assert_known_project_roots_comma_separated(empty_file)
+
+    # Bad: whitespace-only value — group(1) is '   ', strip() is '', helper should raise
+    whitespace_file = tmp_path / "whitespace.service"
+    whitespace_file.write_text(
+        "[Service]\nEnvironment=DASHBOARD_KNOWN_PROJECT_ROOTS=   \n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _assert_known_project_roots_comma_separated(whitespace_file)
+
+
 def test_comma_separator_helper_detects_colon_in_any_position(
     tmp_path: pathlib.Path,
 ) -> None:
