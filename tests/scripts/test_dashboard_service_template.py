@@ -117,8 +117,8 @@ def test_comma_separator_helper_rejects_empty_value(
 
     An empty DASHBOARD_KNOWN_PROJECT_ROOTS would silently produce a single empty-string
     root after split(','), which is a misconfiguration.  A whitespace-only value is
-    equally broken (systemd treats spaces inside an Environment= value as separators
-    between variable assignments, so the entire value would be discarded).
+    equally broken: systemd splits unquoted Environment= values on whitespace, so a
+    whitespace-only value reduces to an empty assignment.
     """
     # Bad: empty value — regex matches, group(1) is '', helper should raise
     empty_file = tmp_path / "empty.service"
