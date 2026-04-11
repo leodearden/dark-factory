@@ -366,6 +366,7 @@ def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
             output='Agent produced no output',
             subtype='error_empty_output',
             stderr=result.stderr,
+            timed_out=result.timed_out,
         )
 
     # Parse JSONL — collect all events
@@ -389,6 +390,7 @@ def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
                 output=result.stdout,
                 subtype='text_output',
                 stderr=result.stderr,
+                timed_out=result.timed_out,
             )
 
     # Find completion events and collect text
@@ -446,6 +448,7 @@ def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
         session_id=session_id,
         subtype='success' if result.returncode == 0 and not is_error else 'error',
         stderr=result.stderr,
+        timed_out=result.timed_out,
     )
 
 
@@ -526,6 +529,7 @@ def _parse_gemini_output(result: _SubprocessResult, model: str) -> AgentResult:
             output='Agent produced no output',
             subtype='error_empty_output',
             stderr=result.stderr,
+            timed_out=result.timed_out,
         )
 
     try:
@@ -536,6 +540,7 @@ def _parse_gemini_output(result: _SubprocessResult, model: str) -> AgentResult:
             output=result.stdout,
             subtype='text_output',
             stderr=result.stderr,
+            timed_out=result.timed_out,
         )
 
     # Gemini output: {"response": "...", "stats": {"input_tokens": N, "output_tokens": N}}
@@ -557,6 +562,7 @@ def _parse_gemini_output(result: _SubprocessResult, model: str) -> AgentResult:
         structured_output=data.get('structured_output'),
         subtype='success' if result.returncode == 0 else 'error',
         stderr=result.stderr,
+        timed_out=result.timed_out,
     )
 
 
@@ -635,6 +641,7 @@ async def _run_subprocess_local(
             stderr=f'Process killed after {timeout_seconds}s timeout',
             returncode=1,
             duration_ms=duration_ms,
+            timed_out=True,
         )
 
     duration_ms = int(time.monotonic() * 1000) - start_ms

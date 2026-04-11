@@ -81,6 +81,7 @@ class AgentResult:
     - ``subtype``: provider-specific result subtype (e.g. ``"success"``, ``"error"``)
     - ``stderr``: captured stderr from the CLI process
     - ``account_name``: the OAuth account used for this invocation
+    - ``timed_out``: True when the subprocess was killed by a wall-clock timeout
     """
 
     success: bool
@@ -97,6 +98,7 @@ class AgentResult:
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
     cache_create_tokens: int | None = None
+    timed_out: bool = False
 
 
 def _to_token_count(v: int | None) -> int | None:
@@ -124,6 +126,7 @@ class _SubprocessResult:
     stderr: str
     returncode: int
     duration_ms: int
+    timed_out: bool = False
 
 
 async def invoke_claude_agent(
@@ -510,6 +513,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             output='Agent produced no output',
             subtype='error_empty_output',
             stderr=result.stderr,
+            timed_out=result.timed_out,
         )
 
     try:
@@ -520,6 +524,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             output=result.stdout,
             subtype='text_output',
             stderr=result.stderr,
+            timed_out=result.timed_out,
         )
 
     cost = data.get('cost_usd', data.get('total_cost_usd', 0.0))
@@ -566,6 +571,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_create_tokens=cache_create_tokens,
+        timed_out=result.timed_out,
     )
 
 
@@ -637,6 +643,7 @@ async def _run_subprocess(
                 stderr=stderr_text,
                 returncode=proc.returncode if proc.returncode is not None else 1,
                 duration_ms=duration_ms,
+                timed_out=True,
             )
     except asyncio.CancelledError:
         # Orchestrator shutdown path: the awaiting task was cancelled. The

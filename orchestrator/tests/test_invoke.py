@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
 
-from orchestrator.agents.invoke import invoke_with_cap_retry
+from orchestrator.agents.invoke import (
+    _parse_codex_output,
+    _parse_gemini_output,
+    _run_subprocess_local,
+    _SubprocessResult,
+    invoke_with_cap_retry,
+)
 
 
 def _make_result(
@@ -207,3 +214,101 @@ class TestCapHitResume:
             assert 'resume_session_id' not in third_call.kwargs
             assert third_call.kwargs.get('prompt') == 'original'
             assert got.success is True
+
+
+# ── _run_subprocess_local timed_out, _parse_codex_output, _parse_gemini_output ─
+
+
+@pytest.mark.asyncio
+class TestRunSubprocessLocalTimedOut:
+
+    async def test_run_subprocess_local_sets_timed_out_on_timeout(self, tmp_path):
+        """_run_subprocess_local sets timed_out=True when TimeoutError fires."""
+        proc = MagicMock()
+        proc.communicate = AsyncMock(side_effect=TimeoutError)
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = None
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with patch('orchestrator.agents.invoke.asyncio.create_subprocess_exec',
+                   side_effect=fake_exec):
+            result = await _run_subprocess_local(
+                ['fake'], cwd=tmp_path, env={}, backend='codex', model='gpt-5.4',
+                max_budget_usd=1.0, timeout_seconds=0.1,
+            )
+
+        assert result.timed_out is True
+        assert 'Process killed after' in result.stderr
+        assert result.returncode == 1
+
+
+class TestParseCodexOutputThreadsTimedOut:
+
+    def test_timed_out_threads_through_empty_stdout_path(self):
+        """_parse_codex_output propagates timed_out=True for empty-stdout result."""
+        sub = _SubprocessResult(stdout='', stderr='timeout', returncode=1,
+                                duration_ms=100, timed_out=True)
+        agent = _parse_codex_output(sub, 'gpt-5.4')
+        assert agent.timed_out is True
+
+    def test_timed_out_threads_through_json_decode_error_path(self):
+        """_parse_codex_output propagates timed_out=True when all lines fail to parse."""
+        sub = _SubprocessResult(stdout='not json at all', stderr='', returncode=1,
+                                duration_ms=100, timed_out=True)
+        agent = _parse_codex_output(sub, 'gpt-5.4')
+        assert agent.timed_out is True
+
+    def test_timed_out_threads_through_normal_parse_path(self):
+        """_parse_codex_output propagates timed_out=True for valid JSONL stream."""
+        jsonl = json.dumps({'type': 'thread.started', 'thread_id': 'tid-1'}) + '\n'
+        jsonl += json.dumps({
+            'type': 'item.completed',
+            'item': {'type': 'agent_message', 'text': 'hello'},
+        }) + '\n'
+        jsonl += json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 5}}) + '\n'
+        sub = _SubprocessResult(stdout=jsonl, stderr='', returncode=0,
+                                duration_ms=100, timed_out=True)
+        agent = _parse_codex_output(sub, 'gpt-5.4')
+        assert agent.timed_out is True
+
+    def test_timed_out_false_passes_through(self):
+        """_parse_codex_output propagates timed_out=False (negative case)."""
+        sub = _SubprocessResult(stdout='', stderr='err', returncode=1,
+                                duration_ms=100, timed_out=False)
+        agent = _parse_codex_output(sub, 'gpt-5.4')
+        assert agent.timed_out is False
+
+
+class TestParseGeminiOutputThreadsTimedOut:
+
+    def test_timed_out_threads_through_empty_stdout_path(self):
+        """_parse_gemini_output propagates timed_out=True for empty-stdout result."""
+        sub = _SubprocessResult(stdout='', stderr='timeout', returncode=1,
+                                duration_ms=100, timed_out=True)
+        agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
+        assert agent.timed_out is True
+
+    def test_timed_out_threads_through_json_decode_error_path(self):
+        """_parse_gemini_output propagates timed_out=True for non-JSON stdout."""
+        sub = _SubprocessResult(stdout='not json', stderr='', returncode=1,
+                                duration_ms=100, timed_out=True)
+        agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
+        assert agent.timed_out is True
+
+    def test_timed_out_threads_through_normal_parse_path(self):
+        """_parse_gemini_output propagates timed_out=True for valid JSON result."""
+        data = json.dumps({'response': 'hi', 'stats': {'input_tokens': 10, 'output_tokens': 5}})
+        sub = _SubprocessResult(stdout=data, stderr='', returncode=0,
+                                duration_ms=100, timed_out=True)
+        agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
+        assert agent.timed_out is True
+
+    def test_timed_out_false_passes_through(self):
+        """_parse_gemini_output propagates timed_out=False (negative case)."""
+        sub = _SubprocessResult(stdout='', stderr='err', returncode=1,
+                                duration_ms=100, timed_out=False)
+        agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
+        assert agent.timed_out is False
