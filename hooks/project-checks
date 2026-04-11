@@ -23,7 +23,7 @@ fi
 
 # asyncmock assertion-style check (fused-memory/tests only)
 echo "pre-commit: asyncmock assertion-style check..."
-if ! (cd "$ROOT" && uv run python fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests); then
+if ! (cd "$ROOT" && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests); then
     echo "pre-commit: asyncmock style check failed. Use assert_not_awaited() instead of assert_not_called() on AsyncMocks."
     exit 1
 fi
