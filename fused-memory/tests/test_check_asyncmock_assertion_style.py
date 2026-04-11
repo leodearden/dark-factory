@@ -270,13 +270,6 @@ class TestRealTestsDirectoryIsClean:
 class TestHooksIntegration:
     """hooks/project-checks must invoke the asyncmock style checker."""
 
-    def test_hooks_project_checks_invokes_asyncmock_style_check(self):
-        """hooks/project-checks references check_asyncmock_assertion_style.py and fused-memory/tests."""
-        hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
-        content = hooks_path.read_text(encoding='utf-8')
-        assert 'check_asyncmock_assertion_style.py' in content
-        assert 'fused-memory/tests' in content
-
     def test_hook_invokes_check_with_python3_not_uv_run(self):
         """The asyncmock check invocation must use a python3 token, not uv run, and target fused-memory/tests.
 
