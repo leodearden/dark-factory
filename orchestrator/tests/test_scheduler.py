@@ -1664,9 +1664,6 @@ class TestSchedulerInternalRouting:
         Instance-level rebinding works because Python's attribute lookup finds
         the instance attribute before the class method, so the production call
         self._set_cached_status(...) resolves to the recorder.
-
-        The read of scheduler._set_cached_status raises AttributeError until
-        step 3 adds the helper — that is the TDD failing-state signal.
         """
         mcp_mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
@@ -1675,14 +1672,7 @@ class TestSchedulerInternalRouting:
         # is True regardless of future gate tightening for None->* transitions.
         scheduler._status_cache['42'] = 'pending'
 
-        recorded: list[tuple[str, str]] = []
-        original = scheduler._set_cached_status  # AttributeError until step 3
-
-        def recorder(task_id: str, status: str) -> None:
-            recorded.append((task_id, status))
-            original(task_id, status)
-
-        scheduler._set_cached_status = recorder  # type: ignore[method-assign]
+        recorded = _spy_set_cached_status(scheduler)
 
         await scheduler.set_task_status('42', 'in-progress')
         assert ('42', 'in-progress') in recorded
