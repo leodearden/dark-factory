@@ -1805,3 +1805,9 @@ class TestExtractSectionHelper:
         payload = '### Empty\n### Next\nbody'
         result = _extract_section(payload, '### Empty')
         assert result == '### Empty'
+
+    def test_extracts_first_occurrence_when_header_repeats(self):
+        """First-occurrence semantics: slice ends at the second '\\n#' boundary, not EOF."""
+        payload = '### Dup\nfirst body\n### Dup\nsecond body'
+        result = _extract_section(payload, '### Dup')
+        assert result == '### Dup\nfirst body'
