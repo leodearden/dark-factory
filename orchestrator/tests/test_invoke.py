@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
 
-from orchestrator.agents.invoke import invoke_with_cap_retry
+from orchestrator.agents.invoke import (
+    _parse_codex_output,
+    _parse_gemini_output,
+    _run_subprocess_local,
+    _SubprocessResult,
+    invoke_with_cap_retry,
+)
 
 
 def _make_result(
@@ -210,16 +217,6 @@ class TestCapHitResume:
 
 
 # ── _run_subprocess_local timed_out, _parse_codex_output, _parse_gemini_output ─
-
-
-import json
-
-from orchestrator.agents.invoke import (
-    _SubprocessResult,
-    _parse_codex_output,
-    _parse_gemini_output,
-    _run_subprocess_local,
-)
 
 
 @pytest.mark.asyncio
