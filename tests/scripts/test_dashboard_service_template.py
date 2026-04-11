@@ -60,6 +60,11 @@ def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
         f"Environment=DASHBOARD_KNOWN_PROJECT_ROOTS= line not found in {path}"
     )
     value = match.group(1)
+    assert value.strip() != "", (
+        f"DASHBOARD_KNOWN_PROJECT_ROOTS is empty or whitespace-only in {path}. "
+        "An empty value would silently produce a single empty-string root after "
+        "split(','), which is a misconfiguration."
+    )
     assert ":" not in value, (
         f"Colon-separated DASHBOARD_KNOWN_PROJECT_ROOTS found in {path}. "
         "Use commas — the parser at "
