@@ -694,6 +694,20 @@ class TestStewardTimeoutKillRecovery:
 
 
 # ---------------------------------------------------------------------------
+# Timeout Cap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardTimeoutCap:
+    """_timeout_counts tracks consecutive timeout-kills; cap triggers auto-escalation."""
+
+    def test_timeout_counts_dict_initialized_empty(self, steward):
+        """_timeout_counts must be an empty dict right after construction."""
+        assert steward._timeout_counts == {}
+
+
+# ---------------------------------------------------------------------------
 # Unified Role
 # ---------------------------------------------------------------------------
 
