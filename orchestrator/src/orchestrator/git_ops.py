@@ -540,6 +540,12 @@ class GitOps:
                     'contaminated; _assert_no_task_dir will catch it at advance_main.',
                     full_branch,
                 )
+                await self.cleanup_merge_worktree(merge_wt)
+                return MergeResult(
+                    success=False,
+                    details=f'.task/ scrub failed post-merge for {full_branch}',
+                    pre_merge_sha=pre_merge_sha,
+                )
 
             _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
             return MergeResult(
