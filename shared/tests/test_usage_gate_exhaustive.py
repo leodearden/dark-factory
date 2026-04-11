@@ -334,6 +334,19 @@ class TestNearCapStateDistinction:
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
 
+    def test_near_cap_unknown_token_falls_back_to_first_uncapped(self):
+        """NEAR_CAP with an unrecognised oauth_token falls back to the first uncapped account."""
+        gate = make_gate(['a', 'b'])
+        result = gate.detect_cap_hit(
+            '', "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token='unknown-token',
+        )
+        assert result is True
+        assert gate._accounts[0].near_cap is True
+        assert gate._accounts[1].near_cap is False
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[1].capped is False
+
     def test_near_cap_does_not_start_resume_probe(self):
         """NEAR_CAP must NOT launch a resume probe task."""
         gate = make_gate(['a'], wait_for_reset=True)
