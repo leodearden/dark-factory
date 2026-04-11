@@ -425,7 +425,7 @@ class TestCollectSnapshot:
 
         assert len(rows) == 1
         # project_id must be the resolved real path, not the symlink path
-        assert rows[0][0] == str(real_dir.resolve())
+        assert rows[0]['project_id'] == str(real_dir.resolve())
 
     @pytest.mark.asyncio
     async def test_discovers_config_flag_orchestrator(self, burndown_env):
