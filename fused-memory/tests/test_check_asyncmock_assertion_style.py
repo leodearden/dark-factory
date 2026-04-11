@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import shutil
 import subprocess
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
@@ -306,10 +309,22 @@ class TestHooksIntegration:
         never added to sys.path — any accidental third-party import in the script would raise
         ModuleNotFoundError at interpreter startup, loudly failing this test.
 
-        An empty tmp_path directory has no test_*.py or conftest.py files, so the scanner
-        finds zero targets → exits 0 with empty stdout.  This proves the stdlib-only contract
-        at the process level rather than by pinning documentation strings.
+        Requires `python3` on PATH — this mirrors the hook's runtime assumption
+        (hooks/project-checks invokes the script via `python3 ...` without a full path).
+        The test skips cleanly when `python3` is not found so CI environments without it
+        surface 'skipped' rather than a confusing FileNotFoundError.
+
+        Two cases are exercised under isolation:
+          1. Empty directory: no test_*.py → zero targets → exit 0, empty stdout.
+             Proves the stdlib-only invariant at interpreter startup.
+          2. Non-empty directory: a clean test file → parse/scan runs → exit 0, empty stdout.
+             Proves the parse/find_violations code paths also stay stdlib-only; a
+             third-party import added inside a scan-triggered code path would still fail loudly.
         """
+        if shutil.which('python3') is None:
+            pytest.skip('python3 not found on PATH — cannot verify hook runtime assumption')
+
+        # --- Case 1: empty directory (startup + import isolation) ---
         result = subprocess.run(
             ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
             capture_output=True,
@@ -322,6 +337,25 @@ class TestHooksIntegration:
         )
         assert result.stdout == '', (
             f'Expected empty stdout (no scan targets in empty dir), got: {result.stdout!r}'
+        )
+
+        # --- Case 2: non-empty directory (parse/scan path isolation) ---
+        # Ensures find_violations and AST-parsing paths also stay stdlib-only: a third-party
+        # import inside a code path triggered only during scanning would slip past Case 1.
+        clean_file = tmp_path / 'test_clean.py'
+        clean_file.write_text(_CLEAN_SOURCE_DIFFERENT_FUNCS)
+        result2 = subprocess.run(
+            ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+        assert result2.returncode == 0, (
+            f'Script exited non-zero (non-empty scan) under python3 -I -S:\n'
+            f'  stdout: {result2.stdout!r}\n'
+            f'  stderr: {result2.stderr!r}'
+        )
+        assert result2.stdout == '', (
+            f'Expected empty stdout (clean file, no violations), got: {result2.stdout!r}'
         )
 
 
