@@ -1430,7 +1430,7 @@ class TestMergeToMainScrubFailure:
 
         with patch(
             'orchestrator.git_ops._scrub_task_dir_from_tree',
-            side_effect=fake_scrub,
+            new=fake_scrub,
         ):
             result = await git_ops.merge_to_main(worktree_info.path, 'scrub-fail-branch')
 
@@ -1489,3 +1489,8 @@ class TestMergeToMainScrubFailure:
             assert not leak_dirs, (
                 f'Leaked merge worktree directories on disk: {leak_dirs}'
             )
+
+    # Happy-path coverage: TestWorktreeLifecycle::test_merge_to_main (line 198)
+    # exercises merge_to_main with the real _scrub_task_dir_from_tree on a branch
+    # that has no .task/ content, verifying result.success is True and advance_main
+    # proceeds normally.  No additional happy-path test is needed here.
