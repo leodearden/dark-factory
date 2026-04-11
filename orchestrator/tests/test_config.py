@@ -78,6 +78,19 @@ class TestDefaults:
         config = OrchestratorConfig(project_root=Path('.'))
         assert config.project_root.is_absolute() is True
 
+    def test_steward_timeout_default_is_1800(self, monkeypatch, tmp_path):
+        """timeouts.steward default is 1800s and exceeds steward_completion_timeout.
+
+        Documents the decoupling invariant: per-invocation wall-clock must be
+        strictly greater than the workflow grace period so a single invocation
+        cannot silently blow past the drain window.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.timeouts.steward == 1800.0
+        assert config.timeouts.steward > config.steward_completion_timeout
+
 
 class TestYamlLoading:
     def test_load_config_raises_when_explicit_path_nonexistent(self, tmp_path: Path):
