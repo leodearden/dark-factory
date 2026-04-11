@@ -24,16 +24,6 @@ from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
-if TYPE_CHECKING:
-    # Static-only conformance checks — verified by pyright, never executed at runtime.
-    # Assigning test doubles to _SchedulerLike-typed variables catches method signature
-    # drift (parameter names, types, return types, positional-only markers) that
-    # hasattr/isinstance checks cannot detect.
-    from orchestrator.evals.runner import _EvalScheduler as _ES
-    from orchestrator.workflow import _SchedulerLike
-
-    _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()  # type: ignore[name-defined]  # noqa: F821
-    _eval_scheduler_conforms: _SchedulerLike = _ES(OrchestratorConfig())
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1958,7 +1948,7 @@ class TestGhostLoopGuard:
 
 
 # ---------------------------------------------------------------------------
-# Protocol conformance — see TYPE_CHECKING block at the top of this file.
+# Protocol conformance — see TYPE_CHECKING block at the bottom of this file.
 # Static assertions (pyright-verified) replaced the old hasattr/isinstance
 # runtime checks, which only tested attribute presence, not method signatures.
 # ---------------------------------------------------------------------------
@@ -2011,3 +2001,24 @@ class TestEvalSchedulerCachedStatus:
         sched = _EvalScheduler(OrchestratorConfig())
         await sched.set_task_status('99', 'done')
         assert sched.get_cached_status('99') == 'done'
+
+
+# ---------------------------------------------------------------------------
+# Static Protocol conformance checks (pyright-verified)
+#
+# This block MUST live at the bottom of the file, after the FakeScheduler class
+# definition (line ~361). Placing it at the top would require forward-referencing
+# FakeScheduler() before its definition, which forces a # type: ignore[name-defined]
+# suppression. pyright then infers the expression type as Unknown, which trivially
+# satisfies any Protocol — making the check catch nothing. Keeping the block here
+# allows pyright to resolve FakeScheduler to its concrete class and verify full
+# structural conformance (parameter names, types, return types, positional-only
+# markers), not just attribute presence.
+# ---------------------------------------------------------------------------
+
+if TYPE_CHECKING:
+    from orchestrator.evals.runner import _EvalScheduler as _EvalSchedulerStatic
+    from orchestrator.workflow import _SchedulerLike
+
+    _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()
+    _eval_scheduler_conforms: _SchedulerLike = _EvalSchedulerStatic(OrchestratorConfig())
