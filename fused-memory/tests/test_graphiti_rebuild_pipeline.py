@@ -731,6 +731,9 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['old_summary'] == 'old B'
         assert ok_detail['edge_count'] == 0
 
+        backend._detect_stale_summaries_with_edges.assert_awaited_once_with(group_id='test')
+        assert backend._rebuild_entity_from_edges.await_count == 2
+
 
 # ---------------------------------------------------------------------------
 # step-4: regression — whitespace-only fact must not cause false stale detection
