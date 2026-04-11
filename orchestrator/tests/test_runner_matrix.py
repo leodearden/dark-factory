@@ -289,6 +289,102 @@ class TestRunEvalMatrixCancellation:
         )
 
 
+    async def test_all_collected_cancels_logged_in_caller_loop(
+        self,
+        single_task_matrix_case,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Each CancelledError returned by _collect_cancel_errors must be logged.
+
+        REGRESSION GUARD (Task 586 / Task 714):
+        runner.py:412-420 contains a ``for ce in cancel_errors:`` loop that calls
+        ``logger.error('Eval cancelled', exc_info=ce)`` once per item.  If that loop
+        were collapsed to a single-element call such as::
+
+            logger.error('Eval cancelled', exc_info=cancel_errors[0])
+
+        the second (and any further) CancelledError in a batch would be silently
+        dropped, reintroducing the original Task 586 bug.
+
+        This test monkeypatches ``_collect_cancel_errors`` to return a fixed
+        2-element list of distinct CancelledError instances, then drives
+        ``run_eval_matrix`` end-to-end.  The fake_run_eval returns a valid
+        EvalResult; its return value is never inspected because the hijacked
+        helper fires on the first asyncio.wait iteration and causes the loop
+        to raise.
+
+        HOW TO VERIFY THIS TEST CATCHES THE REGRESSION:
+        Temporarily replace the loop in runner.py with::
+
+            logger.error('Eval cancelled', exc_info=cancel_errors[0])
+
+        and re-run.  The assertion '2 caplog records' will fail with
+        'Expected 2 records, got 1'.
+
+        PASS/FAIL CONDITION (current correct code):
+          (a) pytest.raises(CancelledError) — the loop raises cancel_errors[0]
+          (b) Exactly 2 caplog records with message == 'Eval cancelled'
+          (c) Each record carries a 3-tuple exc_info whose exc_type is CancelledError
+          (d) The set of exc_info[1] identities == {ce_a, ce_b} — both instances
+              were logged, not the same one twice
+        """
+        _task_path, run_matrix = single_task_matrix_case
+
+        ce_a = asyncio.CancelledError('first-cancel')
+        ce_b = asyncio.CancelledError('second-cancel')
+
+        # Monkeypatch _collect_cancel_errors to return a deterministic 2-element
+        # list.  Because the first non-empty return causes the monitor loop to
+        # raise immediately, we never reach a second iteration — a simple lambda
+        # that always returns the same list is sufficient.
+        monkeypatch.setattr(runner_mod, '_collect_cancel_errors', lambda _done: [ce_a, ce_b])
+
+        async def fake_run_eval(*args, **kwargs) -> EvalResult:
+            return EvalResult(
+                task_id='task_a',
+                config_name=_CFG.name,
+                outcome='success',
+                metrics={},
+                worktree_path='/tmp/stub',
+            )
+
+        with (
+            caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await run_matrix(fake_run_eval)
+
+        cancel_records = [r for r in caplog.records if r.message == 'Eval cancelled']
+
+        # (b) Exactly 2 records — one per cancel error
+        assert len(cancel_records) == 2, (
+            f'Expected 2 "Eval cancelled" log records (one per CancelledError in the '
+            f'batch), got {len(cancel_records)}.  '
+            f'A regression that collapses the for-loop to a single logger.error call '
+            f'would produce 1 record here.'
+        )
+
+        # (c) Each record must carry a proper exc_info 3-tuple
+        for i, record in enumerate(cancel_records):
+            assert isinstance(record.exc_info, tuple) and len(record.exc_info) == 3, (
+                f'Record {i}: expected exc_info to be a 3-tuple, got {record.exc_info!r}'
+            )
+            exc_type, _exc_val, _exc_tb = record.exc_info
+            assert exc_type is asyncio.CancelledError, (
+                f'Record {i}: expected exc_type CancelledError, got {exc_type!r}'
+            )
+
+        # (d) Identity check: BOTH distinct instances must appear — not the same one twice
+        logged_exc_vals = {record.exc_info[1] for record in cancel_records}
+        assert logged_exc_vals == {ce_a, ce_b}, (
+            f'Expected both CancelledError instances to be logged (identity check). '
+            f'Logged exc_val set: {logged_exc_vals!r}  '
+            f'Expected: {{{ce_a!r}, {ce_b!r}}}.  '
+            f'A regression that logs cancel_errors[0] twice would produce '
+            f'{{{ce_a!r}}} here.'
+        )
+
     async def test_cancelled_error_log_carries_exc_info(
         self, single_task_matrix_case, caplog: pytest.LogCaptureFixture
     ):
