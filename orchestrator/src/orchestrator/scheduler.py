@@ -198,7 +198,7 @@ class Scheduler:
                         tid = str(t.get('id', ''))
                         s = t.get('status', '')
                         if tid and s:
-                            old = self._status_cache.get(tid)
+                            old = self.get_cached_status(tid)
                             if old in TERMINAL_STATUSES and old != s:
                                 logger.info(
                                     'Task %s: store status %s overrides cached %s '
