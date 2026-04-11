@@ -1,15 +1,15 @@
-"""Regression tests for StaleSummaryResult.all_edges field rename and named-access refactor.
+"""Regression tests for detect_stale_summaries and rebuild_entity_summaries named-attribute access.
 
 Task 438: Fix StaleSummaryResult positional unpacking at both call sites.
 
 Locks in:
-  (a) The renamed field ``all_edges`` exists on StaleSummaryResult.
-  (b) ``detect_stale_summaries`` uses named attribute access (``result.stale``).
-  (c) ``rebuild_entity_summaries`` uses named attribute access and routes the
-      per-entity edge list correctly from the renamed ``all_edges`` field.
+  (a) ``detect_stale_summaries`` uses named attribute access (``result.stale``).
+  (b) ``rebuild_entity_summaries`` uses named attribute access and routes the
+      per-entity edge list correctly from the ``all_edges`` field.
 
-Any accidental reversion of the ``edges`` → ``all_edges`` rename would break tests
-(a) and (b) at NamedTuple construction time (unexpected keyword argument).
+Structural field contract (all_edges, tuple unpacking) is covered in
+test_graphiti_rebuild_pipeline.py::TestStaleSummaryResult. This file focuses on
+integration behaviour of detect_stale_summaries and rebuild_entity_summaries.
 """
 from __future__ import annotations
 
