@@ -689,6 +689,9 @@ class TestRebuildEntitySummariesErrorHandling:
         backend._rebuild_entity_from_edges.assert_any_call(
             'u2', 'Bob', [], group_id='test', old_summary='stale summary 2'
         )
+        backend._rebuild_entity_from_edges.assert_any_call(
+            'u1', 'Alice', [], group_id='test', old_summary='stale summary'
+        )
 
     @pytest.mark.asyncio
     async def test_force_false_partial_error_uses_detect_total(
