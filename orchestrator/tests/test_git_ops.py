@@ -855,8 +855,6 @@ class TestWorkingTreeSync:
 
         No stash must be created and main ref must not advance.
         """
-        import subprocess
-
         # Step 1: prepare a valid merge commit via a clean worktree
         wt = await git_ops.create_worktree('uu-guard-advance')
         (wt.path / 'new_feature.py').write_text('feature = True\n')
@@ -876,27 +874,7 @@ class TestWorkingTreeSync:
 
         # Step 2: inject unmerged (stage 1/2/3) entries into the index without
         # doing an actual merge commit or setting MERGE_HEAD.
-        def _run_sync(cmd, **kwargs):
-            return subprocess.run(
-                cmd, cwd=str(git_ops.project_root), capture_output=True, **kwargs,
-            )
-
-        h1 = _run_sync(
-            ['git', 'hash-object', '-w', '--stdin'], input=b'version base\n',
-        ).stdout.decode().strip()
-        h2 = _run_sync(
-            ['git', 'hash-object', '-w', '--stdin'], input=b'version ours\n',
-        ).stdout.decode().strip()
-        h3 = _run_sync(
-            ['git', 'hash-object', '-w', '--stdin'], input=b'version theirs\n',
-        ).stdout.decode().strip()
-
-        index_info = (
-            f'100644 {h1} 1\tuu_conflict_test.py\n'
-            f'100644 {h2} 2\tuu_conflict_test.py\n'
-            f'100644 {h3} 3\tuu_conflict_test.py\n'
-        )
-        _run_sync(['git', 'update-index', '--index-info'], input=index_info.encode())
+        await _inject_uu_state(git_ops.project_root, 'uu_conflict_test.py')
 
         # Verify the UU state is detectable
         unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
@@ -935,8 +913,6 @@ class TestWorkingTreeSync:
         Dirties README.md so the stash path is armed; 'stash list unchanged' proves
         the guard short-circuited before any stash creation.
         """
-        import subprocess
-
         # Step 1: prepare a valid merge commit via a clean worktree
         wt = await git_ops.create_worktree('uu-guard-spec')
         (wt.path / 'new_spec_feature.py').write_text('spec_feature = True\n')
@@ -962,27 +938,7 @@ class TestWorkingTreeSync:
 
         # Step 3: inject unmerged (stage 1/2/3) entries on 'uu_conflict_spec.py'
         # via index surgery -- no real conflicting merge needed.
-        def _run_sync(cmd, **kwargs):
-            return subprocess.run(
-                cmd, cwd=str(git_ops.project_root), capture_output=True, **kwargs,
-            )
-
-        h1 = _run_sync(
-            ['git', 'hash-object', '-w', '--stdin'], input=b'version base spec\n',
-        ).stdout.decode().strip()
-        h2 = _run_sync(
-            ['git', 'hash-object', '-w', '--stdin'], input=b'version ours spec\n',
-        ).stdout.decode().strip()
-        h3 = _run_sync(
-            ['git', 'hash-object', '-w', '--stdin'], input=b'version theirs spec\n',
-        ).stdout.decode().strip()
-
-        index_info = (
-            f'100644 {h1} 1\tuu_conflict_spec.py\n'
-            f'100644 {h2} 2\tuu_conflict_spec.py\n'
-            f'100644 {h3} 3\tuu_conflict_spec.py\n'
-        )
-        _run_sync(['git', 'update-index', '--index-info'], input=index_info.encode())
+        await _inject_uu_state(git_ops.project_root, 'uu_conflict_spec.py', tag=' spec')
 
         # Precondition: confirm injected UU state is detectable
         unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
