@@ -252,13 +252,24 @@ class TestIndexWiring:
 
 class TestMergeQueueListenerLifecycle:
     def test_inline_script_has_no_persistent_htmx_after_settle_listener(self, client):
-        """The persistent document.addEventListener('htmx:afterSettle', ...) block
-        must not be present in the rendered partial — it accumulates zombie listeners
-        on every htmx re-swap (every 15s polling cycle) with no cleanup."""
+        """The inline script must have exactly one document.addEventListener call,
+        and it must be the DOMContentLoaded one.
+
+        The original zombie-listener bug added a persistent
+        document.addEventListener('htmx:afterSettle', ...) block that accumulated
+        on every htmx re-swap (every 15s polling cycle) with no cleanup.  A
+        narrow 'htmx:afterSettle' not-in check would miss a future reintroduction
+        under a different event name (htmx:load, htmx:afterSwap, …).  The
+        count-based invariant guards against ANY extra document-level listener
+        regardless of event name, and the DOMContentLoaded presence check ensures
+        the one permitted listener is the expected one.
+        """
         with _patch_merge_queue_data():
             resp = client.get('/partials/merge-queue')
         assert resp.status_code == 200
-        assert 'htmx:afterSettle' not in resp.text
+        # Exactly one document-level listener is allowed (the DOMContentLoaded one).
+        assert resp.text.count('document.addEventListener(') == 1
+        assert 'DOMContentLoaded' in resp.text
 
     def test_render_all_invoked_directly_in_iife(self, client):
         """renderAll() must be called directly within the IIFE (not only inside
