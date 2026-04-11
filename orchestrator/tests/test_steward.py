@@ -41,7 +41,7 @@ def mock_config():
     config.fused_memory.url = 'http://localhost:8002'
     config.fused_memory.project_id = 'dark_factory'
     config.steward_lifetime_budget = 12.0
-    config.steward_max_retries = 3
+    config.steward_max_attempts = 3
     config.steward_completion_timeout = 300.0
     config.timeouts.steward = 900.0
     config.suggestion_triage_threshold = 10
@@ -393,8 +393,8 @@ class TestStewardRetryLogic:
 
         assert steward._retry_counts.get('esc-42-1') == 1
 
-    async def test_auto_escalates_after_max_retries(self, steward, mock_config):
-        mock_config.steward_max_retries = 2
+    async def test_auto_escalates_after_max_attempts(self, steward, mock_config):
+        mock_config.steward_max_attempts = 2
         esc = _make_escalation()
         steward._retry_counts['esc-42-1'] = 2
 
@@ -411,7 +411,7 @@ class TestStewardRetryLogic:
     async def test_auto_escalates_after_one_attempt_with_default_retries(
         self, steward, mock_config,
     ):
-        mock_config.steward_max_retries = 1
+        mock_config.steward_max_attempts = 1
         esc = _make_escalation()
         steward._retry_counts['esc-42-1'] = 1
 
@@ -773,15 +773,6 @@ class TestNextEscalation:
 
 
 class TestStewardDefaultConfig:
-
-    def test_default_steward_max_retries_is_one(self, monkeypatch, tmp_path):
-        """steward_max_retries default must be 1 (one attempt, zero retries)."""
-        from orchestrator.config import OrchestratorConfig
-
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        config = OrchestratorConfig()
-        assert config.steward_max_retries == 1
 
     def test_default_steward_max_attempts_is_one(self, monkeypatch, tmp_path):
         """steward_max_attempts default must be 1 (the renamed field)."""

@@ -9,7 +9,7 @@ Lifecycle:
 - Started lazily on first escalation (not at workflow start).
 - Each escalation either resumes the existing session or creates a fresh one.
 - Budget-capped at $12 lifetime; auto-re-escalates to level-1 on exhaustion.
-- Retries each escalation up to 1 attempt before re-escalating to level-1.
+- Each escalation gets up to steward_max_attempts total attempts (default 1) before re-escalating to level-1.
 - Stopped by the workflow after task completion + grace period.
 """
 
@@ -218,7 +218,7 @@ class TaskSteward:
 
         # Guard: per-escalation retry limit
         retry_count = self._retry_counts.get(escalation.id, 0)
-        if retry_count >= self.config.steward_max_retries:
+        if retry_count >= self.config.steward_max_attempts:
             self._auto_escalate_to_human(
                 escalation,
                 f'Failed after {retry_count} attempt{"s" if retry_count != 1 else ""}: {escalation.summary}',
@@ -314,7 +314,7 @@ class TaskSteward:
             logger.warning(
                 f'Steward for task {self.task_id}: escalation {escalation.id} '
                 f'still pending (attempt {retry_count + 1}/'
-                f'{self.config.steward_max_retries})'
+                f'{self.config.steward_max_attempts})'
             )
         else:
             self.metrics.escalations_handled += 1
