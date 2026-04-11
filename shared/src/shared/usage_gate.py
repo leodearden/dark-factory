@@ -642,8 +642,8 @@ class UsageGate:
         acct = self._find_account_by_token(oauth_token) if oauth_token else None
         if acct is None:
             return
-        # A successful invocation proves the account is healthy — clear stale
-        # near_cap regardless of whether a probe cycle was in progress.
+        # A successful invocation clears any stale near_cap flag; it will be
+        # re-set on the next near-cap warning if still applicable.
         acct.near_cap = False
         if acct.probe_in_flight:
             acct.probe_in_flight = False
