@@ -265,3 +265,36 @@ def test_hook_invokes_pyright_in_loop_rejects_loop_without_pyright() -> None:
         "done\n"
     )
     assert _hook_invokes_pyright_in_loop(content) is False
+
+
+# ---------------------------------------------------------------------------
+# Meta-test: no stale line-number citations in this file's own docstrings
+# ---------------------------------------------------------------------------
+
+
+def test_module_docstrings_do_not_cite_stale_line_numbers() -> None:
+    """This file must not contain line-number citations into test_workflow_e2e.py.
+
+    Line numbers go stale every time test_workflow_e2e.py is edited. The block
+    existence is pinned by content in test_workflow_e2e_conformance_block_is_present,
+    so line numbers add no value and only mislead. This meta-test catches any
+    future regression to line-number citations without requiring a code reviewer
+    to notice.
+
+    The regex patterns used here deliberately do not self-match:
+    - ``test_workflow_e2e\\.py:\\d+`` contains ``\\d+`` literal characters
+    - ``\\bline 2\\d{3}\\b`` requires a literal ``line 2XXX`` with real digits
+    """
+    content = Path(__file__).read_text()
+    pattern = re.compile(
+        r"test_workflow_e2e\.py:\d+"
+        r"|test_workflow_e2e\.py.*?\bline \d+"
+        r"|\bline 2\d{3}\b"
+    )
+    matches = pattern.findall(content)
+    assert not matches, (
+        f"Stale line-number citations found in {__file__}: {matches}. "
+        "Refer to the if TYPE_CHECKING Protocol conformance block by content, "
+        "not line number — line numbers go stale every time "
+        "test_workflow_e2e.py is edited."
+    )
