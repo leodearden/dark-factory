@@ -985,8 +985,9 @@ class TestWorkingTreeSync:
         )
         assert main_before.strip() == main_after.strip()
 
-        # No stash was created -- load-bearing assertion: proves the guard fired
-        # BEFORE the working-tree protection block attempted any stash.
+        # Corroborating: stash list is unchanged (the guard returned before the stash
+        # block, and even if the stash block had been entered it would have failed to
+        # create an entry -- the decisive narrowing is the recording-_run probe above).
         _, stash_after, _ = await _run(
             ['git', 'stash', 'list'], cwd=git_ops.project_root,
         )
