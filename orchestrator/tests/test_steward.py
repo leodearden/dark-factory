@@ -782,3 +782,12 @@ class TestStewardDefaultConfig:
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.steward_max_retries == 1
+
+    def test_default_steward_max_attempts_is_one(self, monkeypatch, tmp_path):
+        """steward_max_attempts default must be 1 (the renamed field)."""
+        from orchestrator.config import OrchestratorConfig
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.steward_max_attempts == 1
