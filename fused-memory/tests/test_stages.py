@@ -1551,11 +1551,13 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': []}
 
     def _make_tree(self, tasks: list[dict], done_count: int = 0, cancelled_count: int = 0,
-                   done_tasks: list[dict] | None = None):
+                   done_tasks: list[dict] | None = None,
+                   cancelled_tasks: list[dict] | None = None):
         from fused_memory.reconciliation.task_filter import FilteredTaskTree
         return FilteredTaskTree(
             active_tasks=tasks,
             done_tasks=done_tasks or [],
+            cancelled_tasks=cancelled_tasks or [],
             done_count=done_count,
             cancelled_count=cancelled_count,
             other_count=0,
@@ -1640,6 +1642,38 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         mock_deps['taskmaster'].get_tasks.assert_not_called()
         # Proactive Task Sample section must be present
         assert '### Proactive Task Sample' in payload
+
+    @pytest.mark.asyncio
+    async def test_proactive_sample_includes_done_and_cancelled_via_harness_path(
+        self, mock_deps, watermark,
+    ):
+        """When filtered_task_tree has done_tasks and cancelled_tasks, proactive sample
+        can include tasks from those lists (not just active_tasks)."""
+        done_tasks = [self._make_task(tid, 'done') for tid in range(2, 7)]   # ids 2-6
+        cancelled_task = self._make_task(7, 'cancelled')
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        stage.filtered_task_tree = self._make_tree(
+            [self._make_task(1, 'in-progress')],  # only 1 active task
+            done_count=5,
+            cancelled_count=1,
+            done_tasks=done_tasks,
+            cancelled_tasks=[cancelled_task],
+        )
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        mock_deps['taskmaster'].get_tasks.assert_not_called()
+        proactive_section = _extract_section(payload, '### Proactive Task Sample')
+        assert proactive_section, "### Proactive Task Sample section must be present"
+        # At least one done task id (2-6) must appear inside the proactive sample section —
+        # demonstrating that done tasks are reachable via the unified pool.
+        done_ids_present = any(f'[{tid}]' in proactive_section for tid in range(2, 7))
+        assert done_ids_present, (
+            f'Expected at least one done task id (2-6) in proactive sample section. '
+            f'Section was:\n{proactive_section!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_recently_completed_shows_done_tasks_from_harness_tree(
