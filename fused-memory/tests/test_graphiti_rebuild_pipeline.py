@@ -635,7 +635,7 @@ class TestRebuildEntitySummariesErrorHandling:
         assert detail['name'] == 'Alice'
 
     @pytest.mark.asyncio
-    async def test_partial_success_one_error_one_rebuilt(self, mock_config, make_backend):
+    async def test_partial_success_one_error_one_rebuilt(self, mock_config, make_backend, make_stale_list):
         """asyncio.gather returns a mix of exceptions and successes without aborting.
 
         With two entities, the first raising and the second succeeding, the result
@@ -645,10 +645,7 @@ class TestRebuildEntitySummariesErrorHandling:
         """
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(
-            return_value=[
-                {'uuid': 'u1', 'name': 'Alice', 'summary': 'stale summary'},
-                {'uuid': 'u2', 'name': 'Bob', 'summary': 'stale summary 2'},
-            ]
+            return_value=make_stale_list(alice_summary='stale summary', bob_summary='stale summary 2')
         )
         backend.get_all_valid_edges = AsyncMock(return_value={})
         backend._rebuild_entity_from_edges = AsyncMock(
