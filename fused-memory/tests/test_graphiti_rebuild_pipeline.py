@@ -404,7 +404,9 @@ class TestRebuildEntitySummariesForceDryRun:
         assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
 
     @pytest.mark.asyncio
-    async def test_force_no_dry_run_calls_get_all_valid_edges(self, mock_config, make_backend):
+    async def test_force_no_dry_run_calls_get_all_valid_edges(
+        self, mock_config, make_backend, make_stale_list
+    ):
         """Positive complement: force=True, dry_run=False calls get_all_valid_edges exactly once.
 
         This is the paired positive case for test_force_dry_run_does_not_call_get_all_valid_edges.
@@ -412,12 +414,7 @@ class TestRebuildEntitySummariesForceDryRun:
         get_all_valid_edges must be called before processing entities.
         """
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(
-            return_value=[
-                {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
-                {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
-            ]
-        )
+        backend.list_entity_nodes = AsyncMock(return_value=make_stale_list())
         backend.get_all_valid_edges = AsyncMock(return_value={})
         # Mock the inner rebuild to avoid touching real write path
         backend._rebuild_entity_from_edges = AsyncMock(
