@@ -500,12 +500,13 @@ class TestCapHitNowUsingExtraSemantics:
 
 
 class TestCapConfirmKeywordEnforcement:
-    """Tests asserting CAP_CONFIRM_KEYWORDS secondary check is required.
+    """Asserts that detect_cap_hit requires BOTH a matching prefix AND at least one CAP_CONFIRM_KEYWORDS entry.
 
-    detect_cap_hit must require BOTH a matching prefix AND at least one of
-    ['resets', 'usage limit', 'upgrade'] in the combined text, for both
-    CAP_HIT_PREFIXES and NEAR_CAP_PREFIXES (Claude backend). These tests FAIL
-    until step-6 enforces the guard in detect_cap_hit.
+    The secondary keyword guard ('resets', 'usage limit', 'upgrade') must be
+    present in the combined text before routing to _handle_cap_detected or
+    _handle_near_cap_warning. This is the defense-in-depth guard against false
+    positives on ambiguous generic prefixes like 'You've used' or 'You're close
+    to'.
     """
 
     def test_cap_hit_prefix_without_confirm_keyword_returns_false(self):
