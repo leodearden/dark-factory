@@ -68,7 +68,32 @@ async def collect_snapshot(
     conn: aiosqlite.Connection,
     config: DashboardConfig,
 ) -> None:
-    """Discover projects and insert one snapshot row per project."""
+    """Discover projects and insert one snapshot row per project.
+
+    Partial-failure semantics:
+
+    - **Main project committed first**: the main project is always
+      roots_to_snapshot[0], so its per-project INSERT + commit fires before
+      any extra project is attempted.  A DB failure on an extra cannot roll
+      back a row that is already committed.
+
+    - **Orchestrator discovery is best-effort**: the block that calls
+      find_running_orchestrators and iterates the results is wrapped in
+      try/except.  If it raises, a WARNING is logged and the function
+      degrades gracefully — the main project and known_project_roots are
+      still snapshotted.
+
+    - **Extra inserts are per-project / isolated**: each project in Phase 3
+      gets its own INSERT + commit wrapped in try/except.  A disk-full or
+      constraint error on one project is logged as a WARNING and the loop
+      continues; other projects are unaffected.
+
+    - **Explicit rollback on unexpected error**: if an exception escapes all
+      inner guards (e.g., a failure before Phase 3 begins), conn.rollback()
+      is called explicitly before re-raising.  This leaves the connection in
+      a clean state for the caller — critical for the long-lived writer
+      connection in app.py which is reused across retry cycles.
+    """
     try:
         await _collect_snapshot_impl(conn, config)
     except Exception:
