@@ -2077,6 +2077,17 @@ class TestEvalSchedulerCachedStatus:
         await sched.set_task_status('99', 'done')
         assert sched.get_cached_status('99') == 'done'
 
+    @pytest.mark.asyncio
+    async def test_eval_scheduler_uses_status_cache_attribute(self):
+        """_EvalScheduler uses _status_cache (not _cache) to match Scheduler naming."""
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.runner import _EvalScheduler
+
+        sched = _EvalScheduler(OrchestratorConfig())
+        await sched.set_task_status('99', 'done')
+        assert sched._status_cache == {'99': 'done'}
+        assert not hasattr(sched, '_cache')
+
 
 # ---------------------------------------------------------------------------
 # Static Protocol conformance checks (pyright-verified)
