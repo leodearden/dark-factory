@@ -281,6 +281,18 @@ class TestGetAllValidEdges:
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.get_all_valid_edges(group_id='test')
 
+    @pytest.mark.asyncio
+    async def test_none_result_set_returns_empty_dict(self, mock_config, make_backend, make_graph_mock):
+        """result_set=None from the driver is treated as empty — returns {}."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        # Override the awaited return value to have result_set=None, simulating
+        # a driver that returns None instead of an empty list.
+        graph.ro_query.return_value.result_set = None
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result == {}
+
 
 # ---------------------------------------------------------------------------
 # GraphitiBackend._edge_dict: edge dict normalisation helper
