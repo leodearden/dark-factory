@@ -42,7 +42,7 @@ async def _inject_uu_state(cwd: Path, path: str, tag: str = '') -> None:
     """
     def _run_sync(cmd, **kwargs):
         return subprocess.run(
-            cmd, cwd=str(cwd), capture_output=True, **kwargs,
+            cmd, cwd=str(cwd), capture_output=True, check=True, **kwargs,
         )
 
     h1 = _run_sync(
@@ -957,9 +957,9 @@ class TestWorkingTreeSync:
         original_run = _run
         recorded: list[list[str]] = []
 
-        async def recording_run(cmd, cwd=None):
+        async def recording_run(cmd, cwd=None, **kwargs):
             recorded.append(list(cmd))
-            return await original_run(cmd, cwd=cwd)
+            return await original_run(cmd, cwd=cwd, **kwargs)
 
         with patch('orchestrator.git_ops._run', side_effect=recording_run):
             result = await git_ops.advance_main(
@@ -977,6 +977,16 @@ class TestWorkingTreeSync:
         assert not any(c[:3] == ['git', 'stash', 'push'] for c in recorded), (
             f'guard should fire before stash push; recorded stash cmds: '
             f'{[c for c in recorded if c[:2] == ["git", "stash"]]}'
+        )
+
+        # Positive-path: confirm the unmerged-state guard was actually entered.
+        # _detect_unmerged_paths calls ['git', 'status', '--porcelain']; this
+        # command does not appear in the pre-guard path (ls-tree / merge-base),
+        # so its presence uniquely certifies that the guard ran rather than
+        # short-circuiting for an unrelated reason.
+        assert any(c[:2] == ['git', 'status'] and '--porcelain' in c for c in recorded), (
+            f'expected _detect_unmerged_paths to invoke git status --porcelain '
+            f'(guard path marker); recorded commands: {recorded}'
         )
 
         # Main ref must NOT have moved
@@ -1115,6 +1125,19 @@ class TestUnmergedDetection:
         assert 'helper_probe.py' in unmerged, (
             f'Expected helper_probe.py in unmerged paths, got: {unmerged}'
         )
+
+    async def test_inject_uu_state_raises_on_non_git_cwd(
+        self, tmp_path: Path,
+    ):
+        """_inject_uu_state raises CalledProcessError when cwd is not a git repo.
+
+        git hash-object exits with rc != 0 in a non-git directory; without
+        check=True the helper silently builds an invalid payload.  With
+        check=True it raises immediately, turning silent corruption into an
+        actionable CalledProcessError that includes stderr.
+        """
+        with pytest.raises(subprocess.CalledProcessError):
+            await _inject_uu_state(tmp_path, 'foo.py')
 
 
 @pytest.mark.asyncio
