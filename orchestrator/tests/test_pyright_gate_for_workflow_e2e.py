@@ -237,6 +237,23 @@ def test_parse_pyright_packages_returns_none_when_missing() -> None:
     )
 
 
+def test_parse_pyright_packages_returns_empty_list_when_declared_empty() -> None:
+    """_parse_pyright_packages returns [] (not None) for PYRIGHT_PACKAGES=().
+
+    This pins the intentional empty-vs-None distinction: a present-but-empty
+    declaration PYRIGHT_PACKAGES=() returns an empty list, while an absent
+    declaration returns None.  Callers use this distinction to report
+    'declaration missing' vs 'declaration present but empty' in their messages.
+    """
+    content = "PYRIGHT_PACKAGES=()\n"
+    result = _parse_pyright_packages(content)
+    assert result == [], (
+        f"Expected [] when PYRIGHT_PACKAGES=() is declared empty, got {result!r}. "
+        "The empty-vs-None distinction is intentional: [] means declared-but-empty, "
+        "None means absent."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unit tests for _hook_invokes_pyright_in_loop helper
 # ---------------------------------------------------------------------------
