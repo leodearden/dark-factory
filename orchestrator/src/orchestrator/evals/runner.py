@@ -6,9 +6,9 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from collections.abc import Iterable
 from typing import Any
 
 from shared.usage_gate import UsageGate

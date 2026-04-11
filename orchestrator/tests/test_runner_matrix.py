@@ -9,12 +9,12 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
-
-from unittest.mock import MagicMock
 
 import orchestrator.evals.runner as runner_mod
 from orchestrator.evals.configs import EvalConfig
@@ -539,10 +539,8 @@ class TestCollectCancelErrors:
         task_a.cancel()
         task_b.cancel()
         for t in (task_a, task_b):
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await t
-            except asyncio.CancelledError:
-                pass
 
         result = runner_mod._collect_cancel_errors({task_a, task_b})
 
@@ -593,10 +591,8 @@ class TestCollectCancelErrors:
 
         real_task = asyncio.create_task(long_sleep())
         real_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await real_task
-        except asyncio.CancelledError:
-            pass
 
         mock_ce = asyncio.CancelledError('mock-branch')
         mock_task = MagicMock()
