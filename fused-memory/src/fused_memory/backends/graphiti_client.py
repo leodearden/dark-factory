@@ -820,6 +820,14 @@ class GraphitiBackend:
         Summary regeneration uses simple fact concatenation (deduped), consistent
         with Graphiti's own _extract_entity_summaries_batch pattern — no LLM call.
 
+        For bulk use see ``_rebuild_entity_from_edges``, which accepts
+        caller-supplied edges, name, and old_summary to avoid per-entity
+        ``get_node_text`` and ``get_valid_edges_for_node`` round-trips when
+        rebuilding many entities at once.  The two methods are an intentional
+        fork: ``refresh_entity_summary`` is self-contained for single-entity
+        callers; ``_rebuild_entity_from_edges`` is batch-internal and consumes
+        pre-fetched data from the ``rebuild_entity_summaries`` pipeline.
+
         Args:
             node_uuid: UUID of the Entity node to refresh.
             group_id: Project graph to target.
