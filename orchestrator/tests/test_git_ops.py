@@ -1090,6 +1090,16 @@ class TestUnmergedDetection:
         assert 'README.md' in unmerged
         assert len(unmerged) >= 1
 
+    async def test_inject_uu_state_helper_creates_unmerged_entries(
+        self, git_ops: GitOps,
+    ):
+        """_inject_uu_state creates detectable UU index entries for the given path."""
+        await _inject_uu_state(git_ops.project_root, 'helper_probe.py')
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert 'helper_probe.py' in unmerged, (
+            f'Expected helper_probe.py in unmerged paths, got: {unmerged}'
+        )
+
 
 @pytest.mark.asyncio
 class TestSafeStashPopWithRecovery:
