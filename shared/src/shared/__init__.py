@@ -9,6 +9,7 @@ from shared.cli_invoke import (
 )
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
+from shared.locking import files_to_modules, normalize_lock
 from shared.usage_gate import AccountState, SessionBudgetExhausted, UsageGate
 
 __version__ = '0.1.0'
@@ -26,4 +27,6 @@ __all__ = [
     'UsageGate',
     'AccountState',
     'SessionBudgetExhausted',
+    'normalize_lock',
+    'files_to_modules',
 ]

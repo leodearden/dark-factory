@@ -8,6 +8,8 @@ import logging
 import time
 from dataclasses import dataclass
 
+from shared.locking import files_to_modules, normalize_lock
+
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp_lifecycle import mcp_call
@@ -15,29 +17,13 @@ from orchestrator.task_status import TERMINAL_STATUSES, is_valid_transition
 
 logger = logging.getLogger(__name__)
 
-
-def normalize_lock(module: str, depth: int = 2) -> str:
-    """Normalize a module path to a fixed depth for lock granularity.
-
-    e.g. normalize_lock('crates/reify-types/src/persistent.rs') -> 'crates/reify-types'
-    """
-    if not module:
-        return module
-    parts = module.strip('/').split('/')
-    return '/'.join(parts[:depth])
-
-
-def files_to_modules(files: list[str], depth: int) -> list[str]:
-    """Derive unique module locks from a list of file paths.
-
-    Each file path is normalized to ``depth`` components, then deduplicated.
-    """
-    modules: set[str] = set()
-    for f in files:
-        normalized = normalize_lock(f, depth)
-        if normalized:
-            modules.add(normalized)
-    return sorted(modules)
+__all__ = [
+    'normalize_lock',
+    'files_to_modules',
+    'TaskAssignment',
+    'ModuleLockTable',
+    'Scheduler',
+]
 
 
 @dataclass
