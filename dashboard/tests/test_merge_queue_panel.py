@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
@@ -52,6 +53,20 @@ MOCK_SPEC = {
 }
 
 _UNSET = object()
+
+
+def _extract_inline_script(html: str) -> str:
+    """Extract the body of the first inline <script> block from rendered HTML.
+
+    Used by TestMergeQueueListenerLifecycle to scope assertions against the
+    partial's own <script> block rather than the full response text.  This
+    prevents spurious failures if the route ever wraps the partial in a
+    base layout that itself contains document.addEventListener calls (e.g.
+    the alpine:init listener in base.html / burndown.html / costs.html).
+    """
+    match = re.search(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
+    assert match is not None, 'No inline <script> block found in response HTML'
+    return match.group(1)
 
 
 def _patch_merge_queue_data(
@@ -263,13 +278,21 @@ class TestMergeQueueListenerLifecycle:
         count-based invariant guards against ANY extra document-level listener
         regardless of event name, and the DOMContentLoaded presence check ensures
         the one permitted listener is the expected one.
+
+        The count assertion is scoped to the partial's own inline <script> block
+        via _extract_inline_script so that future base-layout wrapping (e.g.
+        the alpine:init document.addEventListener call in base.html, burndown.html,
+        or costs.html) does not cause spurious failures when the zombie-listener
+        bug is NOT reintroduced.
         """
         with _patch_merge_queue_data():
             resp = client.get('/partials/merge-queue')
         assert resp.status_code == 200
+        script_body = _extract_inline_script(resp.text)
         # Exactly one document-level listener is allowed (the DOMContentLoaded one).
-        assert resp.text.count('document.addEventListener(') == 1
-        assert 'DOMContentLoaded' in resp.text
+        # Scoped to the partial's own <script> block, not the full response text.
+        assert script_body.count('document.addEventListener(') == 1
+        assert 'DOMContentLoaded' in script_body
 
     def test_render_all_invoked_directly_in_iife(self, client):
         """renderAll() must be called directly within the IIFE so charts render
@@ -280,18 +303,21 @@ class TestMergeQueueListenerLifecycle:
         ``function renderAll() {``, so deleting the direct-invocation line would
         not have caused it to fail.
 
-        The trailing-semicolon check ``'renderAll();'`` is the disambiguator:
-        the definition line ends with `` {``, not ``;``, so the semicoloned form
-        only appears on the actual call site.  The count check is a belt-and-
-        suspenders guard ensuring both the definition and the direct invocation
-        are present (neither was accidentally deleted).
+        The trailing-semicolon form ``renderAll();`` is the disambiguator: the
+        definition line ends with `` {``, not ``;``, so only the actual call site
+        contains the semicoloned form.  ``count == 1`` is strictly tighter than
+        ``>= 2``: it catches the original regression (no direct invocation →
+        count becomes 0) AND prevents accidental double-invocation, AND is immune
+        to drift from HTML comments or documentation text that happens to mention
+        ``renderAll()``.
+
+        Both assertions are scoped to the partial's own inline <script> block via
+        _extract_inline_script to avoid false failures from any outer layout.
         """
         with _patch_merge_queue_data():
             resp = client.get('/partials/merge-queue')
         assert resp.status_code == 200
-        # Trailing semicolon uniquely identifies the direct invocation (not the
-        # function definition line, which ends with ' {').
-        assert 'renderAll();' in resp.text
-        # Both the definition and the direct invocation contain 'renderAll()',
-        # so the count must be at least 2.
-        assert resp.text.count('renderAll()') >= 2
+        script_body = _extract_inline_script(resp.text)
+        # Exactly one direct invocation of renderAll() must appear in the script.
+        # Trailing semicolon uniquely identifies the call site vs. the definition.
+        assert script_body.count('renderAll();') == 1
