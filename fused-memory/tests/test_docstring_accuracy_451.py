@@ -15,6 +15,59 @@ import re
 from fused_memory.backends.graphiti_client import GraphitiBackend
 
 # ---------------------------------------------------------------------------
+# Helper: _keywords_in_proximity
+# ---------------------------------------------------------------------------
+
+
+class TestKeywordsInProximityHelper:
+    """Unit tests for the _keywords_in_proximity module-level helper.
+
+    Verifies proximity-based keyword co-occurrence detection, specifically
+    targeting the 'e.g.' splitter regression case that motivated the helper.
+
+    Asserts:
+      (a) returns True when keywords are adjacent
+      (b) returns True within 200 chars across an 'e.g.' boundary (regression case)
+      (c) returns False when keywords are > 200 chars apart
+      (d) returns False when one keyword is absent
+      (e) regression baseline against actual refresh_entity_summary docstring
+    """
+
+    def test_adjacent_keywords_return_true(self) -> None:
+        """Keywords directly adjacent are within any positive distance."""
+        assert _keywords_in_proximity('foo bar', 'foo', 'bar') is True
+
+    def test_within_200_across_eg_boundary(self) -> None:
+        """Keywords within 200 chars around an 'e.g.' boundary are found.
+
+        This is the regression case: re.split(r'\\.\\s+|\\.\\$') splits
+        'e.g. _rebuild_entity_from_edges' at the period, destroying co-occurrence.
+        The proximity approach is immune because it never tokenises into sentences.
+        """
+        doc = 'For bulk use (e.g. _rebuild_entity_from_edges) supply edges'
+        assert _keywords_in_proximity(doc, 'bulk', '_rebuild_entity_from_edges') is True
+
+    def test_far_keywords_return_false(self) -> None:
+        """Keywords separated by more than 200 chars return False."""
+        doc = 'bulk ' + 'x' * 300 + ' _rebuild_entity_from_edges'
+        assert _keywords_in_proximity(doc, 'bulk', '_rebuild_entity_from_edges') is False
+
+    def test_missing_keyword_returns_false(self) -> None:
+        """Returns False when one keyword is not present in the doc."""
+        assert _keywords_in_proximity('foo bar baz', 'foo', 'qux') is False
+
+    def test_regression_baseline_refresh_docstring(self) -> None:
+        """Regression baseline: 'bulk' and '_rebuild_entity_from_edges' co-occur
+        within 200 chars in the actual refresh_entity_summary docstring."""
+        doc = GraphitiBackend.refresh_entity_summary.__doc__
+        assert doc is not None, 'refresh_entity_summary must have a docstring'
+        assert _keywords_in_proximity(doc, 'bulk', '_rebuild_entity_from_edges'), (
+            "'bulk' and '_rebuild_entity_from_edges' must be within 200 chars in "
+            "refresh_entity_summary docstring"
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-1: detect_stale_summaries Returns section must include 'summary' key
 # ---------------------------------------------------------------------------
 
