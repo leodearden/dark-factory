@@ -1,8 +1,9 @@
 """Regression tests that guard the CI enforcement of the TYPE_CHECKING Protocol
 conformance block in test_workflow_e2e.py.
 
-The ``if TYPE_CHECKING:`` block at test_workflow_e2e.py:2094-2099 is invisible to
-pytest — pyright must be wired into the commit gate for it to catch Protocol drift.
+The ``if TYPE_CHECKING:`` Protocol conformance block near the bottom of
+test_workflow_e2e.py is invisible to pytest — pyright must be wired into the
+commit gate for it to catch Protocol drift.
 These tests pin the two preconditions that make the gate effective:
 
 1. orchestrator/pyproject.toml declares ``[tool.pyright] include = ["src", "tests"]``
