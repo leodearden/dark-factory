@@ -836,3 +836,62 @@ class TestMultiDbAggregation:
         assert result['discard_count'] == 1
         assert result['total'] == 3
         assert result['hit_rate'] == pytest.approx(2 / 3, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_aggregate_7d_uses_1h_buckets(self, tmp_path):
+        """aggregate_queue_depth_timeseries at hours=168 produces 169 buckets,
+        summing counts across two DBs into the same 1h bucket."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        event_time = now - timedelta(hours=12)  # 12h before now
+
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': event_time + timedelta(minutes=5),
+             'data': {'outcome': 'done'}},
+        ])
+        db2 = self._make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': event_time + timedelta(minutes=10),
+             'data': {'outcome': 'conflict'}},
+            {'event_type': 'merge_attempt',
+             'timestamp': event_time + timedelta(minutes=15),
+             'data': {'outcome': 'conflict'}},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=168, now=now)
+
+        labels = result['labels']
+        values = result['values']
+
+        assert len(labels) == 169
+
+        # All 3 events share the same 1h bucket
+        bucket_label = _align_bucket(event_time, 60).isoformat()
+        assert bucket_label in labels
+        idx = labels.index(bucket_label)
+        assert values[idx] == 3  # 1 + 2
+
+    @pytest.mark.asyncio
+    async def test_aggregate_all_window_bounded(self, tmp_path):
+        """aggregate_queue_depth_timeseries at hours=87600 produces ≤4000 buckets."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+
+        db1 = self._make_db(tmp_path, 'runs1.db', [])
+        db2 = self._make_db(tmp_path, 'runs2.db', [])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=87600, now=now)
+
+        assert len(result['labels']) >= 3650
+        assert len(result['labels']) <= 4000
