@@ -1474,6 +1474,11 @@ class TestRebuildEntitySummariesCancellation:
         in TestRebuildEntitySummaries.test_rebuilds_only_stale_entities (line ~259).
         """
         backend = two_entity_backend
+        # Intentionally supersede the fixture's lower-level list_entity_nodes /
+        # get_all_valid_edges mocks by stubbing _detect_stale_summaries_with_edges
+        # directly.  This isolates the test surface to the gather + two-tier check
+        # path, mirroring the pattern in
+        # TestRebuildEntitySummaries.test_rebuilds_only_stale_entities (line ~259).
         backend._detect_stale_summaries_with_edges = AsyncMock(
             return_value=StaleSummaryResult(
                 stale=[
@@ -1498,6 +1503,16 @@ class TestRebuildEntitySummariesCancellation:
 
         with pytest.raises(asyncio.CancelledError):
             await backend.rebuild_entity_summaries(group_id='test', force=False)
+
+        # After CancelledError propagated, verify the force=False gather path was actually
+        # exercised: _detect_stale_summaries_with_edges was awaited exactly once (bulk fetch
+        # of stale entities + their edges) and update_node_summary was awaited twice (one per
+        # entity, scheduled by asyncio.gather before the Pass 1 propagation check).  This
+        # guards against a future refactor where CancelledError could escape from a different
+        # code path (e.g. before gather is reached) while the pytest.raises still reports DID
+        # RAISE — mirroring the rationale in test_cancelled_error_propagates_alongside_other_errors.
+        assert backend._detect_stale_summaries_with_edges.await_count == 1
+        assert backend.update_node_summary.await_count == 2
 
     @pytest.mark.asyncio
     async def test_runtime_error_still_accumulates_in_errors(self, two_entity_backend):
