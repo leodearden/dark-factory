@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
 import pytest
+
+from tests.conftest import _spy_set_cached_status
 from escalation.queue import EscalationQueue
 
 from orchestrator.agents.invoke import AgentResult
@@ -2090,24 +2092,13 @@ class TestEvalSchedulerCachedStatus:
 
     @pytest.mark.asyncio
     async def test_eval_scheduler_set_task_status_writes_via_set_cached_status(self):
-        """_EvalScheduler.set_task_status() must write via _set_cached_status().
-
-        The read of sched._set_cached_status raises AttributeError until step 7
-        adds the helper — that is the TDD failing-state signal.
-        """
+        """_EvalScheduler.set_task_status() must write via _set_cached_status()."""
         from orchestrator.config import OrchestratorConfig
         from orchestrator.evals.runner import _EvalScheduler
 
         sched = _EvalScheduler(OrchestratorConfig())
 
-        recorded: list[tuple[str, str]] = []
-        original = sched._set_cached_status  # AttributeError until step 7
-
-        def recorder(task_id: str, status: str) -> None:
-            recorded.append((task_id, status))
-            original(task_id, status)
-
-        sched._set_cached_status = recorder  # type: ignore[method-assign]
+        recorded = _spy_set_cached_status(sched)
 
         await sched.set_task_status('99', 'done')
         assert ('99', 'done') in recorded
