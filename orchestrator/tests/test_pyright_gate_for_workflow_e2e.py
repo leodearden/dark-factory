@@ -18,6 +18,7 @@ See task 699 and commit 357fa4d6a5 for full context.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -26,6 +27,22 @@ _PACKAGE_ROOT = Path(__file__).parent.parent
 
 # Locate repo root (dark-factory/) from orchestrator/tests/.
 _REPO_ROOT = Path(__file__).parents[2]
+
+
+def _parse_pyright_packages(content: str) -> list[str] | None:
+    """Parse PYRIGHT_PACKAGES=(...) from hook file content, return the list or None.
+
+    Returns the whitespace-split list of package names inside the Bash array
+    declaration.  Returns None (not an empty list) when no PYRIGHT_PACKAGES
+    declaration is found, so callers can distinguish ``missing declaration``
+    from ``declaration present but empty``.
+
+    Uses ``re.MULTILINE`` with a ``^`` anchor so only a real array declaration
+    at the start of a line is matched, not a PYRIGHT_PACKAGES substring that
+    appears inside a comment or an unrelated string.
+    """
+    match = re.search(r"^PYRIGHT_PACKAGES=\(([^)]*)\)", content, re.MULTILINE)
+    return match.group(1).split() if match else None
 
 
 # ---------------------------------------------------------------------------
