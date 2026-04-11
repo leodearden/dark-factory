@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
+from typing import Any
 
 # Locate package root (orchestrator/) from the tests/ directory.
 _PACKAGE_ROOT = Path(__file__).parent.parent
@@ -77,7 +78,7 @@ def _hook_invokes_pyright_in_loop(content: str) -> bool:
     return bool(match and "uv run pyright" in match.group(1))
 
 
-def _load_pyright_config() -> dict:  # type: ignore[type-arg]
+def _load_pyright_config() -> dict[str, Any]:
     """Load and return the ``[tool.pyright]`` section of orchestrator/pyproject.toml.
 
     Returns an empty dict when the section is absent so callers can assert
