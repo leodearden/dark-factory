@@ -332,13 +332,27 @@ async def aggregate_queue_depth_timeseries(
     dbs: list[aiosqlite.Connection | None],
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> ChartData:
     """Aggregate queue depth timeseries across multiple project DBs.
 
     Counts per bucket are summed across all DBs.
+
+    Args:
+        dbs: List of aiosqlite connections (None entries are tolerated).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp captured **once** for the entire aggregation
+            call and threaded into every per-DB ``queue_depth_timeseries``
+            query.  When None (the default), ``datetime.now(UTC)`` is resolved
+            here so that all concurrent per-DB coroutines share the same
+            alignment — eliminating the race where concurrent calls to
+            ``datetime.now(UTC)`` inside each per-DB ``_query`` could straddle
+            a 15-min boundary and produce divergent label sets.  Pass an
+            explicit value in tests for full determinism.
     """
+    effective_now = now if now is not None else datetime.now(UTC)
     results = await asyncio.gather(
-        *[queue_depth_timeseries(db, hours=hours) for db in dbs],
+        *[queue_depth_timeseries(db, hours=hours, now=effective_now) for db in dbs],
         return_exceptions=True,
     )
 
