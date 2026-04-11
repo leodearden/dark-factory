@@ -1030,6 +1030,13 @@ class GraphitiBackend:
         Accepts the edges already fetched by the bulk call, avoiding a
         per-entity get_valid_edges_for_node round-trip.
 
+        For single-entity use (not bulk) see ``refresh_entity_summary``, which
+        fetches its own name/old_summary via ``get_node_text`` and its own valid
+        edges via ``get_valid_edges_for_node``.  This method exists as the
+        bulk-optimised counterpart: it accepts caller-supplied edges and
+        old_summary to eliminate per-entity DB round-trips when rebuilding many
+        entities at once.
+
         .. note:: TOCTOU / eventual-consistency risk:
             The ``edges`` argument is pre-fetched by the caller in a single
             bulk query.  By the time this method runs (potentially after a
