@@ -512,7 +512,10 @@ class TestCapConfirmKeywordEnforcement:
     def test_cap_hit_prefix_without_confirm_keyword_returns_false(self):
         """Prefix match alone must not trigger detection when no secondary keyword present."""
         gate = make_gate(['a'])
-        result = gate.detect_cap_hit('', "You've used all the air in the room")
+        # Exercises the 'You've used' prefix false-positive scenario from commit 5e01a8ee3f:
+        # generic verb-use of 'used' (e.g. 'used this tool correctly' / 'used the --verbose
+        # flag incorrectly') must not be misclassified as a cap hit.
+        result = gate.detect_cap_hit('', "You've used the --verbose flag incorrectly")
         acct = gate._accounts[0]
         assert result is False
         assert acct.capped is False
