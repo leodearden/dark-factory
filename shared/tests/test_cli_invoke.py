@@ -60,6 +60,14 @@ class TestAgentResultTimedOutField:
         assert result.timed_out is False
 
 
+class TestSubprocessResultTimedOutField:
+
+    def test_subprocess_result_has_timed_out_field_defaults_false(self):
+        """_SubprocessResult has timed_out field that defaults to False."""
+        result = _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=0)
+        assert result.timed_out is False
+
+
 @pytest.mark.asyncio
 class TestAccountNameThreading:
 
