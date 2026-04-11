@@ -275,6 +275,18 @@ class UsageGate:
                     reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
                     self._handle_near_cap_warning(reason, oauth_token)
                     return True
+        else:
+            # No confirm keyword — the prefix guard above would have blocked
+            # detection anyway, but if a cap-like prefix IS present, emit a
+            # debug breadcrumb so silent false-negatives leave a trace
+            # (e.g. stderr truncation or Claude changes its message format).
+            for prefix in (*CAP_HIT_PREFIXES, *NEAR_CAP_PREFIXES):
+                if prefix.lower() in combined_lower:
+                    logger.debug(
+                        'Cap-like prefix %r seen but no confirm keyword; ignoring',
+                        prefix,
+                    )
+                    break  # first match is sufficient; avoid log spam
 
         return False
 
