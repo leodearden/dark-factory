@@ -257,8 +257,8 @@ class TestCollectSnapshot:
         # concurrently, so an ordered side_effect list can race. Look up by path.
         _tasks_map = {
             config.tasks_json: main_tasks,
-            reify_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': reify_tasks,
-            autopilot_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': autopilot_tasks,
+            reify_root / '.taskmaster' / 'tasks' / 'tasks.json': reify_tasks,
+            autopilot_root / '.taskmaster' / 'tasks' / 'tasks.json': autopilot_tasks,
         }
 
         with (
@@ -273,19 +273,19 @@ class TestCollectSnapshot:
         assert len(rows) == 3
         by_project = {row['project_id']: row for row in rows}
         assert str(base_config.project_root) in by_project
-        assert str(reify_root.resolve()) in by_project
-        assert str(autopilot_root.resolve()) in by_project
+        assert str(reify_root) in by_project
+        assert str(autopilot_root) in by_project
 
         # main project: 1 pending task
         main_row = by_project[str(base_config.project_root)]
         _assert_snapshot_counts(main_row, pending=1)
 
         # reify: 2 done tasks
-        reify_row = by_project[str(reify_root.resolve())]
+        reify_row = by_project[str(reify_root)]
         _assert_snapshot_counts(reify_row, done=2)
 
         # autopilot: 1 in-progress task
-        autopilot_row = by_project[str(autopilot_root.resolve())]
+        autopilot_row = by_project[str(autopilot_root)]
         _assert_snapshot_counts(autopilot_row, in_progress=1)
 
     @pytest.mark.asyncio
