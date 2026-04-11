@@ -892,3 +892,11 @@ class TestMakeStaleListFixture:
             {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
             {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
         ]
+
+    def test_custom_summaries(self, make_stale_list):
+        """make_stale_list(alice_summary=..., bob_summary=...) returns overridden summary values."""
+        result = make_stale_list(alice_summary='old A', bob_summary='old B')
+        assert result == [
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'old A'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'old B'},
+        ]
