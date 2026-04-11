@@ -1239,7 +1239,7 @@ class TestConfirmAccountOk:
         gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 4h.")
         assert gate._accounts[0].near_cap is True
 
-    def test_confirm_account_ok_on_capped_account(self):
+    def test_confirm_account_ok_on_capped_account_behavior(self):
         """confirm_account_ok clears near_cap even when the account is capped.
 
         Regression guard: a successful invocation proves the account is healthy, so
