@@ -304,3 +304,11 @@ class TestHooksIntegration:
             "hooks/project-checks must contain a 'stdlib-only' rationale comment "
             'explaining why the asyncmock check bypasses uv'
         )
+
+    def test_script_docstring_notes_stdlib_only(self):
+        """check_asyncmock_assertion_style.py module docstring must mention it is stdlib-only."""
+        source = SCRIPT_PATH.read_text(encoding='utf-8')
+        assert 'stdlib-only' in source.lower(), (
+            "check_asyncmock_assertion_style.py docstring must note that the script is "
+            "'stdlib-only' so maintainers know adding a dependency would break the pre-commit fast path"
+        )
