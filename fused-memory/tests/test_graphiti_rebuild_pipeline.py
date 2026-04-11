@@ -20,6 +20,39 @@ from fused_memory.backends.graphiti_client import (
     StaleSummaryResult,
 )
 
+
+# ---------------------------------------------------------------------------
+# task-507: make_stale_list factory fixture
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def make_stale_list():
+    """Factory fixture for the standard Alice/Bob two-entity stale-list shape.
+
+    Follows the factory-fixture convention used throughout this project
+    (make_backend, make_graph_mock, …): returns a callable that produces the
+    test object, allowing keyword overrides at call time.
+
+    Entity conventions:
+      - Alice: uuid='u1', name='Alice'
+      - Bob:   uuid='u2', name='Bob'
+
+    Summary defaults ('summary A' / 'summary B') match the most common values
+    used across the six consumer tests.  Pass keyword arguments to override:
+
+        make_stale_list(alice_summary='old A', bob_summary='old B')
+    """
+
+    def _factory(alice_summary: str = 'summary A', bob_summary: str = 'summary B'):
+        return [
+            {'uuid': 'u1', 'name': 'Alice', 'summary': alice_summary},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': bob_summary},
+        ]
+
+    return _factory
+
+
 # ---------------------------------------------------------------------------
 # step-1: StaleSummaryResult named tuple with backward-compat tuple unpacking
 # ---------------------------------------------------------------------------
