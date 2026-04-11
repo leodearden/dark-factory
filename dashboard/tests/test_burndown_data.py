@@ -414,6 +414,7 @@ class TestCollectSnapshot:
         config = DashboardConfig(project_root=link)
 
         async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
             with (
                 patch('dashboard.data.burndown.load_task_tree', return_value=[]),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
