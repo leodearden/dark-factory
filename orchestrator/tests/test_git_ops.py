@@ -1,6 +1,7 @@
 """Tests for git operations — worktree lifecycle."""
 
 import asyncio
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,6 +27,43 @@ async def _setup_repo(repo: Path):
     (repo / 'README.md').write_text('# Test\n')
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+async def _inject_uu_state(cwd: Path, path: str, tag: str = '') -> None:
+    """Inject unmerged (stage 1/2/3) index entries for *path* via index surgery.
+
+    Uses ``git hash-object -w --stdin`` to write three blob objects and
+    ``git update-index --index-info`` to register them at stages 1, 2, 3.
+    The resulting UU entry is detectable by ``_detect_unmerged_paths`` without
+    creating an actual conflicting merge commit or setting MERGE_HEAD.
+
+    *tag* is interpolated into the blob content so that multiple calls in the
+    same repository produce distinct shas even for different paths.
+    """
+    def _run_sync(cmd, **kwargs):
+        return subprocess.run(
+            cmd, cwd=str(cwd), capture_output=True, check=True, **kwargs,
+        )
+
+    h1 = _run_sync(
+        ['git', 'hash-object', '-w', '--stdin'],
+        input=f'version base{tag}\n'.encode(),
+    ).stdout.decode().strip()
+    h2 = _run_sync(
+        ['git', 'hash-object', '-w', '--stdin'],
+        input=f'version ours{tag}\n'.encode(),
+    ).stdout.decode().strip()
+    h3 = _run_sync(
+        ['git', 'hash-object', '-w', '--stdin'],
+        input=f'version theirs{tag}\n'.encode(),
+    ).stdout.decode().strip()
+
+    index_info = (
+        f'100644 {h1} 1\t{path}\n'
+        f'100644 {h2} 2\t{path}\n'
+        f'100644 {h3} 3\t{path}\n'
+    )
+    _run_sync(['git', 'update-index', '--index-info'], input=index_info.encode())
 
 
 @pytest.fixture
@@ -504,6 +542,7 @@ class TestWorkingTreeSync:
         # Recovery branch should be recorded
         assert hasattr(git_ops, '_last_recovery_branch')
         recovery = git_ops._last_recovery_branch
+        assert recovery is not None
         assert recovery.startswith('wip/recovery-')
 
     async def test_consecutive_advance_after_pop_conflict(self, git_ops: GitOps):
@@ -710,3 +749,493 @@ class TestWorkingTreeSync:
             ['git', 'stash', 'list'], cwd=git_ops.project_root,
         )
         assert stash_list.strip() == ''
+
+    async def test_sync_path_pop_conflict_still_uses_safe_helper(
+        self, git_ops: GitOps,
+    ):
+        """After refactor, sync-path pop still returns 'pop_conflict' and leaves tree clean.
+
+        This is a regression guard: the result code must remain 'pop_conflict'
+        (merge DID advance), and _detect_unmerged_paths must return [] after
+        recovery (proving the helper cleaned the tree).
+        """
+        # Create a merge commit
+        wt = await git_ops.create_worktree('sync-safe-helper')
+        (wt.path / 'sync_file.py').write_text('x = 1\n')
+        await git_ops.commit(wt.path, 'Add sync_file')
+        merge_result = await git_ops.merge_to_main(wt.path, 'sync-safe-helper')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Dirty tracked file so stash is created
+        (git_ops.project_root / 'README.md').write_text('# WIP sync guard\n')
+
+        # Mock: stash pop returns failure (simulates sync-path pop conflict)
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None):
+            if cmd[:3] == ['git', 'stash', 'pop']:
+                return (1, '', 'CONFLICT: merge conflict in README.md')
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        # Sync path: merge DID advance, WIP conflicted — must still be 'pop_conflict'
+        assert result == 'pop_conflict'
+
+        # Tree must be fully clean (recovery helper ran read-tree reset)
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert unmerged == [], f'Expected clean tree after recovery, got: {unmerged}'
+
+    async def test_cas_failure_pop_conflict_returns_pop_conflict_no_advance(
+        self, git_ops: GitOps,
+    ):
+        """When CAS fails AND stash pop conflicts, advance_main returns 'pop_conflict_no_advance'.
+
+        Main ref must not move, _last_recovery_branch must be set, and no
+        unmerged paths may remain in project_root after the call.
+        """
+        # Create a merge commit (adds cas_pop.py — no overlap with README.md)
+        wt = await git_ops.create_worktree('cas-pop-conflict')
+        (wt.path / 'cas_pop.py').write_text('x = 1\n')
+        await git_ops.commit(wt.path, 'Add cas_pop')
+        merge_result = await git_ops.merge_to_main(wt.path, 'cas-pop-conflict')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Dirty tracked file (no overlap with merge diff) so stash is created
+        (git_ops.project_root / 'README.md').write_text('# WIP for CAS pop conflict\n')
+
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
+        # Mock: stash pop returns failure (simulates pop conflict after CAS failure)
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None):
+            if cmd[:3] == ['git', 'stash', 'pop']:
+                return (1, '', 'CONFLICT: merge conflict in README.md')
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await git_ops.advance_main(
+                merge_result.merge_commit,
+                merge_result.merge_worktree,
+                branch='cas-pop-conflict',
+                expected_main='0' * 40,  # force CAS failure
+            )
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result == 'pop_conflict_no_advance'
+
+        # Recovery branch must have been created and recorded
+        assert hasattr(git_ops, '_last_recovery_branch')
+        recovery = git_ops._last_recovery_branch
+        assert recovery is not None and recovery.startswith('wip/recovery-')
+
+        # Main ref must NOT have moved
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip()
+
+        # No leftover unmerged paths
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert unmerged == []
+
+    async def test_advance_main_halts_on_preexisting_unmerged_state(
+        self, git_ops: GitOps,
+    ):
+        """advance_main returns 'unmerged_state' immediately when project_root has UU markers.
+
+        No stash must be created and main ref must not advance.
+        """
+        # Step 1: prepare a valid merge commit via a clean worktree
+        wt = await git_ops.create_worktree('uu-guard-advance')
+        (wt.path / 'new_feature.py').write_text('feature = True\n')
+        await git_ops.commit(wt.path, 'Add new_feature')
+        merge_result = await git_ops.merge_to_main(wt.path, 'uu-guard-advance')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Record state before injecting UU markers
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        _, stash_before, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+
+        # Step 2: inject unmerged (stage 1/2/3) entries into the index without
+        # doing an actual merge commit or setting MERGE_HEAD.
+        await _inject_uu_state(git_ops.project_root, 'uu_conflict_test.py')
+
+        # Verify the UU state is detectable
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert len(unmerged) >= 1, f'Expected unmerged paths after index surgery, got: {unmerged}'
+
+        # Step 3: advance_main must detect UU state and halt without touching main
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+        assert result == 'unmerged_state'
+
+        # Main ref must NOT have moved
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip()
+
+        # No stash was created during the halted advance attempt
+        _, stash_after, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_before.strip() == stash_after.strip()
+
+    async def test_advance_main_halts_on_preexisting_unmerged_state_speculative_shape(
+        self, git_ops: GitOps,
+    ):
+        """advance_main with full speculative-worker call shape returns 'unmerged_state' without stash.
+
+        Uses the full merge_queue.py call shape (branch, expected_main) and dirties
+        README.md so the working-tree protection block is armed.  Without the
+        unmerged-state guard, advance_main would reach the stash block and return
+        'stash_failed' (git stash push fails on a UU index with 'you have unmerged
+        paths') -- the guard must fire first so we see 'unmerged_state' instead,
+        and no stash entry is ever attempted.
+
+        Mirrors the real caller in merge_queue.py:265-270:
+            result = await self._git_ops.advance_main(
+                merge_result.merge_commit, merge_wt,
+                branch=req.branch, max_attempts=..., expected_main=main_sha,
+            )
+        """
+        # Step 1: prepare a valid merge commit via a clean worktree
+        wt = await git_ops.create_worktree('uu-guard-spec')
+        (wt.path / 'new_spec_feature.py').write_text('spec_feature = True\n')
+        await git_ops.commit(wt.path, 'Add new_spec_feature')
+        merge_result = await git_ops.merge_to_main(wt.path, 'uu-guard-spec')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Record state before injecting UU markers and dirtying the tree
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        _, stash_before, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+
+        # Step 2: dirty a tracked file so the working-tree protection block
+        # would attempt a stash if the unmerged guard were not present.
+        # Uses a DIFFERENT path (README.md) from the UU injection below so
+        # 'dirty file' and 'unmerged index entry' are independent states.
+        (git_ops.project_root / 'README.md').write_text('# WIP speculative guard test\n')
+
+        # Step 3: inject unmerged (stage 1/2/3) entries on 'uu_conflict_spec.py'
+        # via index surgery -- no real conflicting merge needed.
+        await _inject_uu_state(git_ops.project_root, 'uu_conflict_spec.py', tag=' spec')
+
+        # Precondition: confirm injected UU state is detectable
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert len(unmerged) >= 1, f'Expected unmerged paths after index surgery, got: {unmerged}'
+
+        # Step 4: call advance_main with the full speculative-worker call shape.
+        # expected_main is the REAL current main SHA -- without the guard the CAS
+        # would succeed and the ref would advance.  A passing test therefore certifies
+        # the guard fires BEFORE the entire happy path, not just before CAS.
+        #
+        # Orthogonal probe: record every _run invocation during advance_main to
+        # assert that git stash push was never attempted (decisive narrowing that
+        # the unmerged-state guard short-circuited the working-tree protection block).
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None, **kwargs):
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await git_ops.advance_main(
+                merge_result.merge_commit,
+                merge_result.merge_worktree,
+                branch='uu-guard-spec',
+                expected_main=main_before.strip(),
+            )
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result == 'unmerged_state'
+
+        # Decisive narrowing: the guard returned before the working-tree protection
+        # block had any chance to invoke git stash push.
+        assert not any(c[:3] == ['git', 'stash', 'push'] for c in recorded), (
+            f'guard should fire before stash push; recorded stash cmds: '
+            f'{[c for c in recorded if c[:2] == ["git", "stash"]]}'
+        )
+
+        # Positive-path: confirm the unmerged-state guard was actually entered.
+        # _detect_unmerged_paths calls ['git', 'status', '--porcelain']; this
+        # command does not appear in the pre-guard path (ls-tree / merge-base),
+        # so its presence uniquely certifies that the guard ran rather than
+        # short-circuiting for an unrelated reason.
+        assert any(c[:2] == ['git', 'status'] and '--porcelain' in c for c in recorded), (
+            f'expected _detect_unmerged_paths to invoke git status --porcelain '
+            f'(guard path marker); recorded commands: {recorded}'
+        )
+
+        # Main ref must NOT have moved
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip()
+
+        # Corroborating: stash list is unchanged (the guard returned before the stash
+        # block, and even if the stash block had been entered it would have failed to
+        # create an entry -- the decisive narrowing is the recording-_run probe above).
+        _, stash_after, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_before.strip() == stash_after.strip()
+
+    async def test_cas_failure_pop_conflict_does_not_cascade_to_stash_failed(
+        self, git_ops: GitOps,
+    ):
+        """Full cascade regression guard: after pop_conflict_no_advance the tree is clean.
+
+        Simulates the exact cascade the bug report describes:
+        1. CAS failure → stash pop conflicts → pop_conflict_no_advance returned.
+        2. Second advance_main call (no mocks, no dirty WIP) must NOT return
+           'stash_failed' or 'unmerged_state' — it must succeed normally.
+        This proves _safe_stash_pop_with_recovery fully cleans the tree.
+        """
+        # Setup: create a merge commit
+        wt = await git_ops.create_worktree('cascade-regr')
+        (wt.path / 'cascade.py').write_text('x = 1\n')
+        await git_ops.commit(wt.path, 'Add cascade file')
+        merge_result = await git_ops.merge_to_main(wt.path, 'cascade-regr')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Dirty a tracked file so advance_main creates a stash
+        (git_ops.project_root / 'README.md').write_text('# WIP cascade regression\n')
+
+        # First call: force CAS failure AND mock stash pop to conflict
+        original_run = _run
+
+        async def mock_run_conflict(cmd, cwd=None):
+            if cmd[:3] == ['git', 'stash', 'pop']:
+                return (1, '', 'CONFLICT: merge conflict in README.md')
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run_conflict):
+            result1 = await git_ops.advance_main(
+                merge_result.merge_commit,
+                merge_result.merge_worktree,
+                branch='cascade-regr',
+                expected_main='0' * 40,  # force CAS failure
+            )
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result1 == 'pop_conflict_no_advance', f'Expected pop_conflict_no_advance, got {result1}'
+
+        # Tree must be fully clean now (recovery helper ran read-tree reset)
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert unmerged == [], f'Tree not clean after first advance: {unmerged}'
+
+        # Second call: create a fresh merge commit, no patching, no dirty WIP
+        wt2 = await git_ops.create_worktree('cascade-regr-2')
+        (wt2.path / 'cascade2.py').write_text('y = 2\n')
+        await git_ops.commit(wt2.path, 'Add cascade2')
+        merge_result2 = await git_ops.merge_to_main(wt2.path, 'cascade-regr-2')
+        assert merge_result2.success
+
+        assert merge_result2.merge_commit is not None
+        result2 = await git_ops.advance_main(merge_result2.merge_commit)
+        if merge_result2.merge_worktree:
+            await git_ops.cleanup_merge_worktree(merge_result2.merge_worktree)
+
+        # Must NOT cascade to stash_failed or unmerged_state
+        assert result2 not in ('stash_failed', 'unmerged_state'), (
+            f'Cascade failure: second advance returned {result2!r} '
+            f'(tree was not cleaned by recovery helper)'
+        )
+        assert result2 == 'advanced', (
+            f'Unexpected result: {result2!r} (fully controlled path: no CAS injection, '
+            f'no mocks, no dirty WIP \u2014 cas_failed indicates an environmental regression)'
+        )
+
+
+@pytest.mark.asyncio
+class TestUnmergedDetection:
+    """Tests for the _detect_unmerged_paths helper."""
+
+    async def test_detect_unmerged_paths_empty_on_clean_tree(self, git_ops: GitOps):
+        """On a freshly-initialized repo with no conflicts, helper returns []."""
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert unmerged == []
+
+    async def test_detect_unmerged_paths_returns_uu_files(self, git_ops: GitOps):
+        """After a conflicting merge, helper returns paths containing the conflicted file."""
+        # Create a divergent branch with a conflicting change to README.md
+        await _run(
+            ['git', 'checkout', '-b', 'conflict-b'],
+            cwd=git_ops.project_root,
+        )
+        (git_ops.project_root / 'README.md').write_text('# From B\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'change README on B'],
+            cwd=git_ops.project_root,
+        )
+
+        # Go back to main and make a divergent change
+        await _run(['git', 'checkout', 'main'], cwd=git_ops.project_root)
+        (git_ops.project_root / 'README.md').write_text('# From Main\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'change README on main'],
+            cwd=git_ops.project_root,
+        )
+
+        # Trigger a conflicting merge — leaves UU markers in index/worktree
+        rc, _, _ = await _run(
+            ['git', 'merge', 'conflict-b'],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0  # Must have conflicted
+
+        # Now test the helper
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert 'README.md' in unmerged
+        assert len(unmerged) >= 1
+
+    async def test_inject_uu_state_helper_creates_unmerged_entries(
+        self, git_ops: GitOps,
+    ):
+        """_inject_uu_state creates detectable UU index entries for the given path."""
+        await _inject_uu_state(git_ops.project_root, 'helper_probe.py')
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert 'helper_probe.py' in unmerged, (
+            f'Expected helper_probe.py in unmerged paths, got: {unmerged}'
+        )
+
+    async def test_inject_uu_state_raises_on_non_git_cwd(
+        self, tmp_path: Path,
+    ):
+        """_inject_uu_state raises CalledProcessError when cwd is not a git repo.
+
+        git hash-object exits with rc != 0 in a non-git directory; without
+        check=True the helper silently builds an invalid payload.  With
+        check=True it raises immediately, turning silent corruption into an
+        actionable CalledProcessError that includes stderr.
+        """
+        with pytest.raises(subprocess.CalledProcessError):
+            await _inject_uu_state(tmp_path, 'foo.py')
+
+
+@pytest.mark.asyncio
+class TestSafeStashPopWithRecovery:
+    """Tests for the _safe_stash_pop_with_recovery helper."""
+
+    async def test_safe_stash_pop_success_returns_ok(self, git_ops: GitOps):
+        """_safe_stash_pop_with_recovery returns (True, None) on a clean pop.
+
+        Dirty file content is restored, stash list is empty, no recovery
+        branch is created.
+        """
+        # Stash a dirty tracked file
+        (git_ops.project_root / 'README.md').write_text('# WIP content\n')
+        await _run(
+            ['git', 'stash', 'push', '-m', 'test stash'], cwd=git_ops.project_root,
+        )
+
+        # Verify stash was created
+        _, stash_list, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_list.strip(), 'Stash should have an entry before pop'
+
+        # Call the helper — no conflict exists, should succeed
+        ok, recovery = await git_ops._safe_stash_pop_with_recovery('label-1')
+
+        assert ok is True
+        assert recovery is None
+
+        # Dirty file content must be restored
+        assert '# WIP content' in (git_ops.project_root / 'README.md').read_text()
+
+        # No recovery branch was created
+        _, branches, _ = await _run(['git', 'branch'], cwd=git_ops.project_root)
+        assert 'wip/recovery' not in branches
+
+        # Stash list is now empty
+        _, stash_after, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_after.strip() == ''
+
+    async def test_safe_stash_pop_conflict_creates_recovery_branch(
+        self, git_ops: GitOps,
+    ):
+        """_safe_stash_pop_with_recovery returns (False, branch) and cleans up on conflict.
+
+        The recovery branch points at the original stash tree, stash list is
+        empty, and project_root has no leftover unmerged paths afterward.
+        """
+        # Write WIP content to README.md and stash it
+        (git_ops.project_root / 'README.md').write_text('# WIP content for conflict\n')
+        await _run(
+            ['git', 'stash', 'push', '-m', 'wip-for-conflict'],
+            cwd=git_ops.project_root,
+        )
+
+        # Capture stash tree before pop attempt (to verify recovery branch later)
+        _, stash_tree, _ = await _run(
+            ['git', 'rev-parse', 'stash@{0}^{tree}'], cwd=git_ops.project_root,
+        )
+
+        # Commit a DIFFERENT version of README.md on main so stash pop will conflict.
+        # Three-way merge scenario:
+        #   base (stash parent) : '# Test\n'
+        #   ours (HEAD)         : '# Main version…\n'
+        #   theirs (stash)      : '# WIP content for conflict\n'
+        (git_ops.project_root / 'README.md').write_text('# Main version — conflicts with WIP\n')
+        await _run(['git', 'add', 'README.md'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Commit conflicting README'],
+            cwd=git_ops.project_root,
+        )
+
+        # Call the helper — git stash pop will conflict (real git conflict)
+        ok, recovery = await git_ops._safe_stash_pop_with_recovery('label-2')
+
+        assert ok is False
+        assert recovery is not None
+        assert recovery.startswith('wip/recovery-label-2-'), (
+            f'Recovery branch name should start with wip/recovery-label-2-, got {recovery!r}'
+        )
+
+        # Recovery branch tree must match the original stash tree
+        _, branch_tree, _ = await _run(
+            ['git', 'rev-parse', f'{recovery}^{{tree}}'], cwd=git_ops.project_root,
+        )
+        assert stash_tree.strip() == branch_tree.strip(), (
+            'Recovery branch tree must equal original stash tree'
+        )
+
+        # Stash list must be empty (stash was dropped after branch creation)
+        _, stash_after, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_after.strip() == ''
+
+        # No unmerged paths remain in project_root
+        unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
+        assert unmerged == [], f'Expected no unmerged paths after recovery, got: {unmerged}'

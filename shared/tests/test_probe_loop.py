@@ -578,11 +578,8 @@ class TestProbeLoopCostEvents:
         assert mock_write.await_count == 1
         assert mock_write.call_args[0][1] == 'resumed'
 
-    async def test_probe_count_is_zero_in_event_label(self):
-        """After successful probe, probe_count is reset to 0 BEFORE the cost event.
-
-        So the event label says 'probe #0 confirmed'.
-        """
+    async def test_label_reflects_probe_count_on_first_try(self):
+        """After a successful first-try probe, the label should reflect the probe number that confirmed (1, not 0)."""
         store = make_mock_cost_store()
         gate = make_gate(
             ['a'],
@@ -606,8 +603,38 @@ class TestProbeLoopCostEvents:
             )
 
         details = json.loads(mock_write.call_args[0][2])
-        # probe_count was reset to 0 before json.dumps, so label = 'probe #0 confirmed'
-        assert details['label'] == 'probe #0 confirmed'
+        assert details['label'] == 'probe #1 confirmed'
+
+    async def test_label_reflects_actual_probe_count_after_multiple_failures(self):
+        """With probe_count=0 and [False, False, True] side_effect: iteration 1 increments to 1
+        then fails, iteration 2 increments to 2 then fails, iteration 3 increments to 3 then
+        succeeds — label should read 'probe #3 confirmed'."""
+        store = make_mock_cost_store()
+        gate = make_gate(
+            ['a'],
+            cost_store=store,
+            probe_interval_secs=0,
+            max_probe_interval_secs=0,
+        )
+        acct = _capped_account(
+            gate,
+            resets_at=datetime.now(UTC) - timedelta(minutes=1),
+            probe_count=0,
+        )
+
+        gate._run_probe = AsyncMock(side_effect=[False, False, True])
+
+        with patch.object(
+            gate, '_write_cost_event', new_callable=AsyncMock,
+        ) as mock_write:
+            await asyncio.wait_for(
+                gate._account_resume_probe_loop(acct), timeout=5,
+            )
+
+        assert mock_write.await_count == 1
+        details = json.loads(mock_write.call_args[0][2])
+        assert details['label'] == 'probe #3 confirmed'
+        assert gate._run_probe.await_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -710,17 +737,23 @@ class TestRunProbe:
 
         assert result is False
 
-    async def test_cancelled_error_returns_false(self):
-        """CancelledError -> returns False."""
+    async def test_cancelled_error_propagates(self):
+        """CancelledError must propagate so shutdown() can drain the probe task.
+
+        Previously _run_probe swallowed the cancel and returned False, which
+        left ``_account_resume_probe_loop`` looping forever and made
+        ``UsageGate.shutdown()`` hang waiting for the task to finish.
+        """
         gate, acct = await self._make_probing_gate()
 
         async def cancel_exec(*args, **kwargs):
             raise asyncio.CancelledError()
 
-        with patch('asyncio.create_subprocess_exec', side_effect=cancel_exec):
-            result = await gate._run_probe(acct)
-
-        assert result is False
+        with (
+            patch('asyncio.create_subprocess_exec', side_effect=cancel_exec),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await gate._run_probe(acct)
 
     async def test_general_exception_returns_false(self):
         """General exception (e.g., FileNotFoundError) -> returns False."""
@@ -894,6 +927,37 @@ class TestRunProbe:
             result = await gate._run_probe(acct)
 
         assert result is False
+
+    async def test_probe_prefix_only_without_confirm_keyword_still_returns_false(self):
+        """Probe returns False on a bare CAP_HIT prefix with no CAP_CONFIRM_KEYWORDS keyword.
+
+        Deliberate asymmetry with detect_cap_hit:
+        - detect_cap_hit requires BOTH a prefix AND a confirm keyword ('resets', 'usage
+          limit', 'upgrade') to avoid false positives on generic phrases.
+        - _run_probe intentionally does NOT apply the confirm-keyword guard.  The probe
+          runs only while an account is already capped; any whiff of a cap prefix in the
+          probe output means the account is still capped and we must NOT unpause it.
+          Being conservative here avoids the far worse outcome of unpausing a capped
+          account and burning quota.
+
+        DO NOT 'fix' this asymmetry by adding the confirm-keyword guard to _run_probe.
+        If you think the asymmetry is a bug, read the inline comment above the prefix
+        loop in _run_probe and this docstring — then escalate rather than silently change
+        the behavior.
+        """
+        gate, acct = await self._make_probing_gate()
+        prefix = CAP_HIT_PREFIXES[0]  # e.g. "You've hit your"
+        # Deliberately no 'resets', 'usage limit', or 'upgrade' in the string.
+        stderr_content = f'{prefix} quota'.encode()
+        proc = _make_mock_proc(returncode=0, stderr=stderr_content)
+
+        with patch('asyncio.create_subprocess_exec', return_value=proc):
+            result = await gate._run_probe(acct)
+
+        assert result is False, (
+            '_run_probe must return False on a bare cap prefix even without a confirm keyword; '
+            'see docstring for the deliberate asymmetry with detect_cap_hit'
+        )
 
 
 # ---------------------------------------------------------------------------

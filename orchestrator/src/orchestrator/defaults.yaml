@@ -13,6 +13,7 @@ max_verify_attempts: 5
 max_review_cycles: 2
 reviewer_stagger_secs: 2.0
 max_reviewer_retries: 4
+max_amendment_rounds: 1
 
 # Merge conflict reduction
 max_advance_attempts: 3
@@ -33,7 +34,7 @@ scope_cargo: true
 
 # Steward lifecycle
 steward_lifetime_budget: 12.0
-steward_max_retries: 3
+steward_max_attempts: 1
 steward_completion_timeout: 900.0
 
 # Pre-triage threshold for review suggestions (count)
@@ -50,7 +51,7 @@ timeouts:
   debugger: 1200
   reviewer: 1200
   merger: 600
-  steward: 900
+  steward: 1800
   triage: 300
   module_tagger: 300
   deep_reviewer: 2400
@@ -128,6 +129,16 @@ review:
   full_review_on_complete: true
   briefing_path: "review/briefing.yaml"
   reports_dir: "data/review-checkpoints"
+
+# Scheduler fairness — anti-starvation for broad-footprint tasks.
+# Install a short-lived module reservation once a top-ranked candidate has
+# been skipped N times in a row; lease scales with observed task duration.
+fairness:
+  skip_threshold: 4
+  lease_multiplier: 5.0
+  lease_min_secs: 60.0
+  lease_max_secs: 3600.0
+  median_window: 50
 
 # Sandbox
 sandbox:

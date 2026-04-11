@@ -4,8 +4,9 @@ import asyncio
 import contextlib
 import logging
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any, NamedTuple, cast
+from typing import Any, NamedTuple, TypedDict, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
@@ -24,16 +25,34 @@ from fused_memory.config.schema import FusedMemoryConfig
 logger = logging.getLogger(__name__)
 
 
+class EdgeDict(TypedDict):
+    """Normalised edge dict returned by GraphitiBackend._edge_dict.
+
+    Consumed by get_valid_edges_for_node, get_all_valid_edges,
+    _canonical_facts, and _rebuild_entity_from_edges.
+    """
+
+    uuid: str
+    fact: str
+    name: str
+
+
 class StaleSummaryResult(NamedTuple):
     """Structured return type for _detect_stale_summaries_with_edges.
 
-    Inherits from tuple for full backward-compatibility: callers using
-    ``stale, all_edges, total = await self._detect_stale_summaries_with_edges(...)``
-    continue to work unchanged.
+    Use named attribute access — the canonical idiom after Task 438/465:
+
+    - ``result.stale`` — list of stale entity dicts (each has uuid, name, summary, etc.)
+    - ``result.all_edges`` — dict[uuid, list[EdgeDict]] of valid edges for every scanned entity
+    - ``result.total_count`` — total number of entity nodes scanned
+
+    Because StaleSummaryResult is a NamedTuple (a tuple subclass), positional
+    unpacking still works at runtime, but named access is the preferred idiom
+    across the codebase.
     """
 
     stale: list[dict]
-    all_edges: dict[str, list[dict]]
+    all_edges: dict[str, list[EdgeDict]]
     total_count: int
 
 
@@ -433,7 +452,7 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
-    async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[dict]:
+    async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[EdgeDict]:
         """Return all currently-valid RELATES_TO edges for an Entity node.
 
         Matches the node as either source or target (undirected) and filters
@@ -458,7 +477,7 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
-    async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[dict]]:
+    async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[EdgeDict]]:
         """Return all currently-valid RELATES_TO edges grouped by entity UUID.
 
         Bulk variant of get_valid_edges_for_node that issues a single Cypher query
@@ -491,7 +510,7 @@ class GraphitiBackend:
             'RETURN DISTINCT n.uuid, e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher)
-        grouped: dict[str, list[dict]] = {}
+        grouped: dict[str, list[EdgeDict]] = {}
         for row in (result.result_set or []):
             entity_uuid = row[0]
             grouped.setdefault(entity_uuid, []).append(self._edge_dict(row[1], row[2], row[3]))
@@ -777,21 +796,32 @@ class GraphitiBackend:
         return rows[0][0]
 
     @staticmethod
-    def _edge_dict(uuid: str, fact: str | None, name: str | None) -> dict:
+    def _edge_dict(uuid: str, fact: str | None, name: str | None) -> EdgeDict:
         """Build a normalised edge dict, coercing NULL fact/name to empty string.
 
         Args:
-            uuid: Edge UUID.
+            uuid: Edge UUID. Must not be None — a NULL uuid from the graph would
+                propagate silently through downstream callers and is treated as
+                a hard error.
             fact: Edge fact text, or None when the property is NULL in the graph.
             name: Edge name, or None when the property is NULL in the graph.
 
         Returns:
-            Dict with keys: uuid, fact, name. fact and name default to '' when None.
+            EdgeDict with keys: uuid, fact, name. fact and name default to '' when None.
+
+        Raises:
+            ValueError: If uuid is None.
         """
-        return {'uuid': uuid, 'fact': fact or '', 'name': name or ''}
+        if uuid is None:
+            raise ValueError('edge uuid must not be None')
+        return {
+            'uuid': uuid,
+            'fact': fact if fact is not None else '',
+            'name': name if name is not None else '',
+        }
 
     @staticmethod
-    def _canonical_facts(edges: list[dict]) -> list[str]:
+    def _canonical_facts(edges: Sequence[Mapping[str, Any]]) -> list[str]:
         """Deduplicate edge facts preserving insertion order, skipping missing/falsy values.
 
         Args:
@@ -819,6 +849,14 @@ class GraphitiBackend:
 
         Summary regeneration uses simple fact concatenation (deduped), consistent
         with Graphiti's own _extract_entity_summaries_batch pattern — no LLM call.
+
+        For bulk use see ``_rebuild_entity_from_edges``, which accepts
+        caller-supplied edges, name, and old_summary to avoid per-entity
+        ``get_node_text`` and ``get_valid_edges_for_node`` round-trips when
+        rebuilding many entities at once.  The two methods are an intentional
+        fork: ``refresh_entity_summary`` is self-contained for single-entity
+        callers; ``_rebuild_entity_from_edges`` is batch-internal and consumes
+        pre-fetched data from the ``rebuild_entity_summaries`` pipeline.
 
         Args:
             node_uuid: UUID of the Entity node to refresh.
@@ -894,7 +932,7 @@ class GraphitiBackend:
         Returns:
             StaleSummaryResult with fields:
               .stale       - list of stale entity dicts
-              .all_edges   - dict[uuid, list[dict]] of valid edges for all entities
+              .all_edges   - dict[uuid, list[EdgeDict]] of valid edges for all entities
               .total_count - total number of entity nodes scanned
         """
         entities = await self.list_entity_nodes(group_id=group_id)
@@ -1012,21 +1050,30 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            List of dicts (one per stale entity) with keys: uuid, name,
+            List of dicts (one per stale entity) with keys: uuid, name, summary,
             duplicate_count, stale_line_count, valid_fact_count,
-            summary_line_count.
+            summary_line_count. The ``summary`` key holds the current
+            (pre-rebuild) entity summary text so callers can diff it against
+            the canonical fact set without a second DB query.
         """
         result = await self._detect_stale_summaries_with_edges(group_id=group_id)
         return result.stale
 
     async def _rebuild_entity_from_edges(
-        self, uuid: str, name: str, edges: list[dict], *, group_id: str,
+        self, uuid: str, name: str, edges: list[EdgeDict], *, group_id: str,
         old_summary: str,
     ) -> dict[str, Any]:
         """Rebuild one Entity node's summary from pre-fetched edges.
 
         Accepts the edges already fetched by the bulk call, avoiding a
         per-entity get_valid_edges_for_node round-trip.
+
+        For single-entity use (not bulk) see ``refresh_entity_summary``, which
+        fetches its own name/old_summary via ``get_node_text`` and its own valid
+        edges via ``get_valid_edges_for_node``.  This method exists as the
+        bulk-optimised counterpart: it accepts caller-supplied edges and
+        old_summary to eliminate per-entity DB round-trips when rebuilding many
+        entities at once.
 
         .. note:: TOCTOU / eventual-consistency risk:
             The ``edges`` argument is pre-fetched by the caller in a single
@@ -1097,7 +1144,7 @@ class GraphitiBackend:
         """
         # Declare before if/else for explicit scoping — all branches assign these.
         targets: list[dict] = []
-        all_edges: dict[str, list[dict]] = {}
+        all_edges: dict[str, list[EdgeDict]] = {}
         total_entities: int = 0
 
         if force:
@@ -1264,8 +1311,25 @@ class GraphitiBackend:
         Uses ro_query since no writes are performed.
 
         Each record is a dict with keys: label, field, type, entity_type.
+
+        Note on the CALL db.indexes() procedure and the read-only path:
+        ``CALL db.indexes()`` is the *only* stored-procedure call sent on the
+        read-only path in this file — all other ``ro_query`` callers use plain
+        MATCH queries.  Stored procedures are sometimes classified as
+        write-capable by graph databases, so this usage was validated
+        empirically against FalkorDB module v41800 (4.18.0): the call is
+        accepted via ``GRAPH.RO_QUERY`` without error.
+
+        The live verification is pinned in
+        ``fused-memory/tests/test_list_indices_integration.py``
+        (Task 530 / esc-486-49).  If a future FalkorDB upgrade rejects
+        ``CALL`` on the RO path, revert this call to ``graph.query(...)``
+        (the write-capable command) and update the integration test to pin
+        the new behavior.
         """
         graph = self._graph_for(group_id)
+        # CALL db.indexes() is a read-only procedure; FalkorDB accepts it via
+        # GRAPH.RO_QUERY (verified via test_list_indices_integration.py).
         result = await graph.ro_query('CALL db.indexes()')
         indices = []
         for row in (result.result_set or []):
@@ -1310,8 +1374,8 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
         """
-        client = self._require_client()
-        graph = cast(Any, client.driver)._get_graph(graph_name)
+        driver = self._require_driver()
+        graph: Any = driver._get_graph(graph_name)
         result = await graph.ro_query('MATCH (n) RETURN count(n) as count')
         return result.result_set[0][0] if result.result_set else 0
 

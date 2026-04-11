@@ -58,18 +58,41 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
     except ConfigRequiredError as e:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
-    # Convert SIGTERM to KeyboardInterrupt so the finally block in
-    # harness.run() executes (persists metrics, stops subprocesses).
-    def _sigterm(signum, frame):
-        raise KeyboardInterrupt('SIGTERM received')
-    signal.signal(signal.SIGTERM, _sigterm)
-
     harness = Harness(config)
-    report = asyncio.run(harness.run(
-        prd, dry_run=dry_run, delay_secs=delay_secs,
-        force_dirty_start=force_dirty_start,
-        retag_modules=retag_modules,
-    ))
+    logger = logging.getLogger(__name__)
+
+    async def _main():
+        # Route SIGTERM/SIGINT through asyncio so CancelledError flows into
+        # harness.run() between scheduling steps rather than raising at an
+        # arbitrary bytecode inside the loop machinery. This guarantees the
+        # finally block in harness.run() runs to completion.
+        loop = asyncio.get_running_loop()
+        main_task = asyncio.current_task()
+        assert main_task is not None
+
+        def _cancel(sig_name: str) -> None:
+            logger.warning(f'{sig_name} received — cancelling main task')
+            main_task.cancel()
+
+        for sig_name in ('SIGTERM', 'SIGINT'):
+            sig = getattr(signal, sig_name)
+            try:
+                loop.add_signal_handler(sig, _cancel, sig_name)
+            except (NotImplementedError, RuntimeError):
+                # Fallback for platforms where add_signal_handler is unsupported
+                signal.signal(sig, lambda *_: main_task.cancel())
+
+        return await harness.run(
+            prd, dry_run=dry_run, delay_secs=delay_secs,
+            force_dirty_start=force_dirty_start,
+            retag_modules=retag_modules,
+        )
+
+    try:
+        report = asyncio.run(_main())
+    except asyncio.CancelledError:
+        click.echo('Orchestrator cancelled', err=True)
+        sys.exit(130)
 
     click.echo(report.summary())
 

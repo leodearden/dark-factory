@@ -325,20 +325,37 @@ class TestPostInit:
         new_cfg = dataclasses.replace(base_cfg, known_project_roots=[link])
         assert new_cfg.known_project_roots == [real_resolved]
 
-    def test_post_init_docstring_documents_nonexistent_path_limitation(self):
-        """__post_init__ docstring must document the non-existent path caveat."""
-        doc = DashboardConfig.__post_init__.__doc__ or ''
-        assert 'canonical (symlink-resolved) forms' in doc, (
-            f"Expected original invariant language 'canonical (symlink-resolved) forms' "
-            f'in docstring, got: {doc!r}'
+    def test_post_init_resolves_symlink_and_preserves_nonexistent_tail(self, symlinked_dir):
+        """Behavioral regression guard for the __post_init__ Path.resolve() semantics.
+
+        Verifies three observable behaviors of Path.resolve() when the path has an
+        existing symlink segment followed by a non-existent tail component:
+
+          (a) The result is absolute.
+          (b) The existing symlink segment is followed to its real target.
+          (c) The non-existent tail component is appended verbatim (not stripped).
+
+        This test will catch the day Python's Path.resolve() semantics change (e.g.,
+        if a future CPython version strips non-existent tail components instead of
+        appending them verbatim).  It does not depend on any docstring wording.
+        """
+        link, real_resolved = symlinked_dir
+        # 'not_yet' does not exist on disk — it is a non-existent trailing component.
+        cfg = DashboardConfig(project_root=link / 'not_yet')
+
+        # (a) The result must be absolute.
+        assert cfg.project_root.is_absolute(), (
+            f'Expected an absolute path, got: {cfg.project_root!r}'
         )
-        assert (
-            'Note: resolution is canonical only for paths that exist at construction time' in doc
-        ), (
-            f"Expected caveat 'Note: resolution is canonical only for paths that exist at "
-            f"construction time' in docstring, got: {doc!r}"
+        # (b) The existing symlink segment must be resolved to the real target.
+        assert cfg.project_root.parent == real_resolved, (
+            f'Expected parent {real_resolved!r}, got: {cfg.project_root.parent!r}'
         )
-        assert 'cannot follow symlink segments that do not yet exist on disk' in doc, (
-            f"Expected warning 'cannot follow symlink segments that do not yet exist on disk' "
-            f'in docstring, got: {doc!r}'
+        # (c) The non-existent tail must be preserved verbatim.
+        assert cfg.project_root.name == 'not_yet', (
+            f"Expected name 'not_yet', got: {cfg.project_root.name!r}"
+        )
+        # Full-equality sanity check: catches unexpected extra components.
+        assert cfg.project_root == real_resolved / 'not_yet', (
+            f'Expected {real_resolved / "not_yet"!r}, got: {cfg.project_root!r}'
         )

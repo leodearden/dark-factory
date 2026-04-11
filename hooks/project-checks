@@ -21,6 +21,14 @@ if ! uv run ruff check --quiet "${DIRS[@]}"; then
     exit 1
 fi
 
+# asyncmock assertion-style check (fused-memory/tests only)
+# Script is stdlib-only (ast/argparse/pathlib/sys) — invoked via plain python3 to skip uv env-resolution overhead.
+echo "pre-commit: asyncmock assertion-style check..."
+if ! (cd "$ROOT" && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests); then
+    echo "pre-commit: asyncmock style check failed. Use assert_not_awaited() instead of assert_not_called() on AsyncMocks."
+    exit 1
+fi
+
 # pyright (must run from each package directory to pick up [tool.pyright] config)
 for pkg in "${PYRIGHT_PACKAGES[@]}"; do
     dir="$ROOT/$pkg"

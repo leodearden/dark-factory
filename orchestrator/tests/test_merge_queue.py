@@ -1503,7 +1503,7 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
-    @pytest.mark.parametrize('failure_code', ['not_descendant', 'contaminated', 'stash_failed'])
+    @pytest.mark.parametrize('failure_code', ['not_descendant', 'contaminated', 'stash_failed', 'unmerged_state'])
     async def test_speculative_permanent_failure_returns_blocked(
         self, git_ops: GitOps, config: OrchestratorConfig, failure_code: str,
     ):
@@ -1851,6 +1851,72 @@ class TestWipHaltMergeWorker:
         with pytest.raises(asyncio.CancelledError):
             await worker_task
 
+    async def test_unmerged_state_returns_blocked_and_halts(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """unmerged_state: MergeWorker returns blocked and halts the queue."""
+        wt = await _make_branch_with_file(
+            git_ops, 'uu-mw-1', 'file_uu_mw.py', 'uu_mw = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        async def _unmerged_state(*args: Any, **kwargs: Any):
+            return 'unmerged_state'
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_unmerged_state),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('uu-mw-1', 'uu-mw-1', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked'
+        assert 'unmerged' in outcome.reason.lower()
+        assert worker.is_wip_halted
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_pop_conflict_no_advance_returns_wip_recovery_no_advance_and_halts(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """pop_conflict_no_advance: MergeWorker returns wip_recovery_no_advance and halts."""
+        wt = await _make_branch_with_file(
+            git_ops, 'pcna-mw-1', 'file_pcna_mw.py', 'pcna_mw = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        async def _pop_conflict_no_advance(*args: Any, **kwargs: Any):
+            git_ops._last_recovery_branch = 'wip/recovery-x-y'
+            return 'pop_conflict_no_advance'
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_pop_conflict_no_advance),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('pcna-mw-1', 'pcna-mw-1', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'wip_recovery_no_advance'
+        assert outcome.recovery_branch == 'wip/recovery-x-y'
+        assert 'did not advance' in outcome.reason.lower()
+        assert worker.is_wip_halted
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
 
 @pytest.mark.asyncio
 class TestWipHaltSpeculativeMergeWorker:
@@ -1938,6 +2004,68 @@ class TestWipHaltSpeculativeMergeWorker:
 
         assert outcome.status == 'done_wip_recovery'
         assert outcome.recovery_branch == 'wip/recovery-srecov-1-20260407T120000'
+        assert worker.is_wip_halted
+
+        await worker.stop()
+        await worker_task
+
+    async def test_speculative_unmerged_state_returns_blocked_and_halts(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """unmerged_state in SpeculativeMergeWorker returns blocked and halts."""
+        wt = await _make_branch_with_file(
+            git_ops, 'uu-sw-1', 'file_uu_sw.py', 'uu_sw = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        async def _unmerged_state(*args: Any, **kwargs: Any):
+            return 'unmerged_state'
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_unmerged_state),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('uu-sw-1', 'uu-sw-1', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked'
+        assert 'unmerged' in outcome.reason.lower()
+        assert worker.is_wip_halted
+
+        await worker.stop()
+        await worker_task
+
+    async def test_speculative_pop_conflict_no_advance_outcome(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """pop_conflict_no_advance in SpeculativeMergeWorker returns wip_recovery_no_advance."""
+        wt = await _make_branch_with_file(
+            git_ops, 'pcna-sw-1', 'file_pcna_sw.py', 'pcna_sw = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        async def _pop_conflict_no_advance(*args: Any, **kwargs: Any):
+            git_ops._last_recovery_branch = 'wip/recovery-x-y'
+            return 'pop_conflict_no_advance'
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_pop_conflict_no_advance),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('pcna-sw-1', 'pcna-sw-1', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'wip_recovery_no_advance'
+        assert outcome.recovery_branch == 'wip/recovery-x-y'
+        assert 'did not advance' in outcome.reason.lower()
         assert worker.is_wip_halted
 
         await worker.stop()

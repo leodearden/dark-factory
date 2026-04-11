@@ -202,6 +202,27 @@ def make_fake_maintenance_service():
 
 
 @pytest.fixture
+def make_edge_backend():
+    """Factory fixture: returns a callable(backend, *, nodes, edges) -> backend.
+
+    Takes a pre-built backend, wires list_entity_nodes and get_all_valid_edges
+    as AsyncMocks, and returns the same backend for one-line composition.
+
+    Usage::
+
+        def test_foo(self, mock_config, make_backend, make_edge_backend):
+            backend = make_edge_backend(make_backend(mock_config), nodes=[...], edges={...})
+            result = await backend.detect_stale_summaries(group_id='test')
+    """
+    def _factory(backend, *, nodes, edges):
+        backend.list_entity_nodes = AsyncMock(return_value=nodes)
+        backend.get_all_valid_edges = AsyncMock(return_value=edges)
+        return backend
+
+    return _factory
+
+
+@pytest.fixture
 def mock_config(tmp_path) -> FusedMemoryConfig:
     """A FusedMemoryConfig that doesn't require real API keys or services."""
     return FusedMemoryConfig(

@@ -4,7 +4,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from conftest import assert_ro_query_only
+from conftest import assert_ro_query_only, extract_cypher
 
 from fused_memory.backends.graphiti_client import (
     EdgeNotFoundError,
@@ -269,7 +269,14 @@ class TestUpdateEdgeEmbedding:
 # ---------------------------------------------------------------------------
 
 class TestListIndices:
-    """GraphitiBackend.list_indices() returns parsed index records."""
+    """GraphitiBackend.list_indices() returns parsed index records.
+
+    These unit tests pin the Cypher string and ro_query usage with a mocked
+    FalkorDB graph.  The empirical verification that FalkorDB actually accepts
+    ``CALL db.indexes()`` on the ``GRAPH.RO_QUERY`` path lives in
+    ``fused-memory/tests/test_list_indices_integration.py``
+    (Task 530 / esc-486-49).
+    """
 
     @pytest.mark.asyncio
     async def test_returns_index_list(self, mock_config, make_backend, make_graph_mock):
@@ -307,8 +314,7 @@ class TestListIndices:
         """list_indices uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
         graph = await assert_ro_query_only(backend, make_graph_mock, [], 'list_indices', group_id='test')
-        args, kwargs = graph.ro_query.call_args
-        cypher = args[0] if args else next(iter(kwargs.values()), '')
+        cypher = extract_cypher(graph.ro_query.call_args)
         assert 'db.indexes' in cypher
 
 
@@ -946,7 +952,7 @@ class TestNodeCount:
         """Returns the integer count from result_set[0][0]."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([[42]])
-        backend.client.driver._get_graph = MagicMock(return_value=graph)
+        backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.node_count('my_graph')
         assert result == 42
 
@@ -955,7 +961,7 @@ class TestNodeCount:
         """Returns 0 when result_set is empty."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        backend.client.driver._get_graph = MagicMock(return_value=graph)
+        backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.node_count('empty_graph')
         assert result == 0
 
@@ -971,7 +977,7 @@ class TestNodeCount:
         """node_count uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([[7]])
-        backend.client.driver._get_graph = MagicMock(return_value=graph)
+        backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.node_count('test_graph')
         graph.ro_query.assert_awaited_once()
         graph.query.assert_not_awaited()

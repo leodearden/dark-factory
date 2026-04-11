@@ -18,6 +18,7 @@ from conftest import assert_ro_query_only, extract_cypher, extract_params
 
 from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
+    EdgeDict,
     GraphitiBackend,
     NodeNotFoundError,
 )
@@ -190,6 +191,134 @@ class TestGetValidEdgesForNode:
 
 
 # ---------------------------------------------------------------------------
+# GraphitiBackend.get_all_valid_edges (bulk fetch)
+# ---------------------------------------------------------------------------
+
+class TestGetAllValidEdges:
+    """GraphitiBackend.get_all_valid_edges() bulk-fetches all valid edges, grouped by entity."""
+
+    @pytest.mark.asyncio
+    async def test_groups_edges_by_entity_uuid(self, mock_config, make_backend, make_graph_mock):
+        """Returns dict keyed by entity uuid; each value is a list of edge dicts."""
+        backend = make_backend(mock_config)
+        rows = [
+            ['node-1', 'e1', 'factA', 'edge1'],
+            ['node-1', 'e2', 'factB', 'edge2'],
+            ['node-2', 'e3', 'factC', 'edge3'],
+        ]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert set(result.keys()) == {'node-1', 'node-2'}
+        assert len(result['node-1']) == 2
+        assert {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'} in result['node-1']
+        assert {'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'} in result['node-1']
+        assert result['node-2'] == [{'uuid': 'e3', 'fact': 'factC', 'name': 'edge3'}]
+
+    @pytest.mark.asyncio
+    async def test_cypher_uses_return_distinct(self, mock_config, make_backend, make_graph_mock):
+        """Cypher query passed to ro_query contains 'RETURN DISTINCT'."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_all_valid_edges(group_id='test')
+        cypher = graph.ro_query.call_args.args[0]
+        assert 'RETURN DISTINCT' in cypher
+
+    @pytest.mark.asyncio
+    async def test_empty_graph_returns_empty_dict(self, mock_config, make_backend, make_graph_mock):
+        """Returns empty dict when no valid edges exist."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """Uses ro_query (read-only) — graph.query must NOT be called."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_all_valid_edges(group_id='test')
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_null_fact_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
+        """Row with None fact returns fact=''."""
+        backend = make_backend(mock_config)
+        rows = [['node-1', 'e1', None, 'edge1']]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result['node-1'][0]['fact'] == ''
+
+    @pytest.mark.asyncio
+    async def test_null_name_defaults_to_empty_string(self, mock_config, make_backend, make_graph_mock):
+        """Row with None name returns name=''."""
+        backend = make_backend(mock_config)
+        rows = [['node-1', 'e1', 'factA', None]]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result['node-1'][0]['name'] == ''
+
+    @pytest.mark.asyncio
+    async def test_cypher_filters_invalid_at_is_null(self, mock_config, make_backend, make_graph_mock):
+        """Cypher query includes 'invalid_at IS NULL' to exclude invalidated edges."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_all_valid_edges(group_id='test')
+        call_args = graph.ro_query.call_args
+        cypher = call_args[0][0] if call_args[0] else call_args[1].get('q', '')
+        assert 'invalid_at IS NULL' in cypher
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        """Raises RuntimeError when backend not initialized."""
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.get_all_valid_edges(group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_none_result_set_returns_empty_dict(self, mock_config, make_backend, make_graph_mock):
+        """result_set=None from the driver is treated as empty — returns {}."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        # Override the awaited return value to have result_set=None, simulating
+        # a driver that returns None instead of an empty list.
+        graph.ro_query.return_value.result_set = None
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_identical_rows_produce_duplicate_entries(self, mock_config, make_backend, make_graph_mock):
+        """Python grouping loop does no dedup — identical rows produce duplicate list entries.
+
+        RETURN DISTINCT in the Cypher query is the sole guard against duplicate
+        rows (it guards specifically against self-loop duplicates where A→A edges
+        yield two identical rows under the undirected MATCH).  If the database
+        ever returns identical rows the Python layer faithfully appends both,
+        producing duplicate entries in the result list.  This test documents and
+        locks in that contract so it is never accidentally 'fixed' at the Python
+        layer (which would silently change behaviour for the legitimate self-loop
+        case that RETURN DISTINCT already handles).
+        """
+        backend = make_backend(mock_config)
+        rows = [
+            ['node-1', 'e1', 'factA', 'edge1'],
+            ['node-1', 'e1', 'factA', 'edge1'],  # identical duplicate
+        ]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert len(result['node-1']) == 2  # both rows appended, no dedup
+
+
+# ---------------------------------------------------------------------------
 # GraphitiBackend._edge_dict: edge dict normalisation helper
 # ---------------------------------------------------------------------------
 
@@ -215,6 +344,33 @@ class TestEdgeDict:
         """Both fact and name None are coerced to empty strings."""
         result = GraphitiBackend._edge_dict('e-null', None, None)
         assert result == {'uuid': 'e-null', 'fact': '', 'name': ''}
+
+    def test_edge_dict_typeddict_has_expected_annotations(self):
+        """EdgeDict TypedDict declares uuid/fact/name as str — pins the schema."""
+        assert set(EdgeDict.__annotations__.keys()) == {'uuid', 'fact', 'name'}
+        assert EdgeDict.__annotations__['uuid'] is str
+        assert EdgeDict.__annotations__['fact'] is str
+        assert EdgeDict.__annotations__['name'] is str
+
+    def test_returned_dict_has_exactly_edge_dict_keys(self):
+        """Returned dict exposes only the EdgeDict keys — no extras."""
+        result = GraphitiBackend._edge_dict('e-1', 'fact', 'name')
+        assert set(result.keys()) == {'uuid', 'fact', 'name'}
+
+    def test_raises_value_error_when_uuid_is_none(self):
+        """None uuid raises ValueError rather than propagating silently."""
+        with pytest.raises(ValueError, match='uuid'):
+            GraphitiBackend._edge_dict(None, 'fact', 'name')  # type: ignore[arg-type]
+
+    def test_empty_string_fact_preserved_as_empty_string(self):
+        """Empty string fact is preserved as '' (contract pin for explicit-None refactor)."""
+        result = GraphitiBackend._edge_dict('e-1', '', 'knows')
+        assert result == {'uuid': 'e-1', 'fact': '', 'name': 'knows'}
+
+    def test_empty_string_name_preserved_as_empty_string(self):
+        """Empty string name is preserved as '' (contract pin for explicit-None refactor)."""
+        result = GraphitiBackend._edge_dict('e-1', 'Alice knows Bob', '')
+        assert result == {'uuid': 'e-1', 'fact': 'Alice knows Bob', 'name': ''}
 
 
 # ---------------------------------------------------------------------------

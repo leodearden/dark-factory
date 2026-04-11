@@ -13,12 +13,14 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import yaml
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import AccountState, UsageGate
+from shared.usage_gate import UsageGate
+
+from tests.conftest import build_usage_gate
 
 # ---------------------------------------------------------------------------
 # Constants — expected reify automation account pool (F→E→C→B→D)
@@ -50,31 +52,11 @@ def _make_reify_gate(wait_for_reset: bool = False) -> UsageGate:
     """Create a UsageGate with reify's 5 automation accounts.
 
     Tokens are injected directly (no env var lookup) for test isolation.
-    Mirrors the _make_gate() pattern in test_usage_gate.py.
+    Delegates to the shared build_usage_gate() helper in conftest.py.
     """
     acct_cfgs = [AccountConfig(**d) for d in REIFY_ACCOUNT_DEFS]
-    config = UsageCapConfig(accounts=acct_cfgs, wait_for_reset=wait_for_reset)
-    gate = UsageGate.__new__(UsageGate)
-    gate._config = config
-    gate._open = asyncio.Event()
-    gate._open.set()
-    gate._lock = asyncio.Lock()
-    gate._cumulative_cost = 0.0
-    gate._paused_reason = ''
-    gate._pause_started_at = None
-    gate._total_pause_secs = 0.0
-    gate._cost_store = None
-    gate._project_id = None
-    gate._run_id = None
-    gate._last_account_name = None
-    gate._background_tasks = set()
-    gate._probe_config_dir = MagicMock()
-    gate._run_probe = AsyncMock(return_value=True)
-    gate._accounts = [
-        AccountState(name=d['name'], token=f'token-{d["name"]}')
-        for d in REIFY_ACCOUNT_DEFS
-    ]
-    return gate
+    tokens = [f'token-{d["name"]}' for d in REIFY_ACCOUNT_DEFS]
+    return build_usage_gate(acct_cfgs, tokens, wait_for_reset=wait_for_reset)
 
 
 # ---------------------------------------------------------------------------
@@ -230,27 +212,28 @@ class TestGateFromReifyConfig:
         assert len(gate._accounts) == 5, (
             f"Expected 5 AccountState entries, got {len(gate._accounts)}"
         )
-        for state, defn in zip(gate._accounts, REIFY_ACCOUNT_DEFS, strict=False):
+        for state, defn in zip(gate._accounts, REIFY_ACCOUNT_DEFS, strict=True):
             assert state.name == defn['name']
             assert state.token is not None, (
                 f"Account {state.name!r} has None token — env var not resolved"
             )
             assert state.token == f'token-{defn["name"]}'
 
-    def test_gate_skips_account_when_token_missing(self):
+    def test_gate_skips_account_when_token_missing(self, monkeypatch):
         """UsageGate skips accounts whose env var is not set."""
         acct_cfgs = [AccountConfig(**d) for d in REIFY_ACCOUNT_DEFS]
         config = UsageCapConfig(accounts=acct_cfgs)
 
-        # Set only 3 of the 5 tokens
-        partial_env = {
-            'CLAUDE_OAUTH_TOKEN_F': 'token-f',
-            'CLAUDE_OAUTH_TOKEN_E': 'token-e',
-            'CLAUDE_OAUTH_TOKEN_C': 'token-c',
-        }
+        # Set only the 3 present tokens; explicitly delete the 2 missing ones so
+        # ambient environment values (if any) don't accidentally satisfy the lookup.
+        # monkeypatch restores the original env on test teardown automatically.
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_F', 'token-f')
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_E', 'token-e')
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_C', 'token-c')
+        monkeypatch.delenv('CLAUDE_OAUTH_TOKEN_B', raising=False)
+        monkeypatch.delenv('CLAUDE_OAUTH_TOKEN_D', raising=False)
 
-        with patch.dict(os.environ, partial_env, clear=True):
-            gate = UsageGate(config)
+        gate = UsageGate(config)
 
         # Should have exactly 3 accounts (skipped B and D)
         assert len(gate._accounts) == 3
