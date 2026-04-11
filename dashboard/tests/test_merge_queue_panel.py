@@ -385,6 +385,40 @@ class TestMergeQueueWindowAll:
         N = (87600 * 60 // bm) + 1
         assert N < 10_000, f"_bucket_minutes_for_window(87600) yields {N} points — regression!"
 
+
+# ---------------------------------------------------------------------------
+# TestExtractInlineScript
+# ---------------------------------------------------------------------------
+
+class TestExtractInlineScript:
+    """Unit tests for the _extract_inline_script helper."""
+
+    def test_skips_foreign_script_before_partial(self):
+        """Marker-based selection returns the partial's own script, not a foreign one.
+
+        This is the primary regression guard for the refactor: a foreign layout
+        script (e.g. alpine:init) appearing BEFORE the partial's own <script>
+        block must be skipped.  The old position-based re.search returns the
+        first script (the alpine:init one), causing the sentinel assertion to
+        fail — this test drives the refactor.
+        """
+        html = (
+            '<html><head>\n'
+            '<script>\n'
+            "document.addEventListener('alpine:init', () => { console.log('init'); });\n"
+            '</script>\n'
+            '</head><body>\n'
+            '<script>\n'
+            "var el = getOrDestroyChart('mergeQueueDepthChart');\n"
+            'function renderAll() { el.render(); }\n'
+            'renderAll();\n'
+            '</script>\n'
+            '</body></html>'
+        )
+        body = _extract_inline_script(html)
+        assert 'mergeQueueDepthChart' in body
+        assert 'alpine:init' not in body
+
     def test_window_all_real_aggregator_bounded_response(self, client, tmp_path):
         """Integration: real aggregate_queue_depth_timeseries with a real empty DB.
 
