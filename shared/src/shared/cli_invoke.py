@@ -640,6 +640,7 @@ async def _run_subprocess(
                 stderr=stderr_text,
                 returncode=proc.returncode if proc.returncode is not None else 1,
                 duration_ms=duration_ms,
+                timed_out=True,
             )
     except asyncio.CancelledError:
         # Orchestrator shutdown path: the awaiting task was cancelled. The
