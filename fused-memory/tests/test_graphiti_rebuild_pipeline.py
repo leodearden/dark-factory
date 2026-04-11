@@ -728,6 +728,11 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['uuid'] == 'u2'
         assert ok_detail['name'] == 'Bob'
         assert ok_detail['new_summary'] == 'rebuilt B'
+        assert ok_detail['old_summary'] == 'old B'
+        assert ok_detail['edge_count'] == 0
+
+        backend._detect_stale_summaries_with_edges.assert_awaited_once_with(group_id='test')
+        assert backend._rebuild_entity_from_edges.await_count == 2
 
 
 # ---------------------------------------------------------------------------
