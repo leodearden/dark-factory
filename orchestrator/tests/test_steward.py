@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -708,9 +709,13 @@ class TestStewardTimeoutCap:
         assert steward._timeout_counts == {}
 
     async def test_timeout_kill_increments_timeout_count(
-        self, steward, mock_config,
+        self, steward, mock_config, caplog,
     ):
-        """A SIGTERM+SIGKILL timeout must increment _timeout_counts but NOT _retry_counts."""
+        """A SIGTERM+SIGKILL timeout must increment _timeout_counts but NOT _retry_counts.
+
+        Also verifies the log message includes the 'timeout_count: N/M' suffix so
+        operators can see the cap approaching.
+        """
         mock_config.steward_max_timeouts_per_escalation = 3
         mock_config.steward_max_attempts = 2
         mock_config.timeouts.steward = 900.0
@@ -727,10 +732,12 @@ class TestStewardTimeoutCap:
                 session_id='sess-killed',
                 stderr='Process killed after 900.0s timeout (SIGTERM+SIGKILL)',
             )
-            await steward._handle_escalation(esc)
+            with caplog.at_level(logging.WARNING):
+                await steward._handle_escalation(esc)
 
         assert steward._timeout_counts.get('esc-42-1') == 1
         assert steward._retry_counts.get('esc-42-1', 0) == 0
+        assert 'timeout_count: 1/3' in caplog.text
 
     async def test_non_timeout_failure_does_not_increment_timeout_count(
         self, steward, mock_config,
@@ -776,10 +783,14 @@ class TestStewardTimeoutCap:
         submitted_esc = steward.escalation_queue.submit.call_args[0][0]
         assert submitted_esc.level == 1
         assert 'repeatedly timed out' in submitted_esc.summary.lower()
-        # Original escalation was dismissed
+        # Detail carries the timed-out reason so reviewers can diagnose downstream
+        assert 'timed out' in submitted_esc.detail.lower()
+        # Metrics counter was incremented by _auto_escalate_to_human
+        assert steward.metrics.escalations_reescalated == 1
+        # Original escalation was dismissed; reason includes count/cap for observability
         steward.escalation_queue.resolve.assert_called_once_with(
             esc.id,
-            'Auto-dismissed: re-escalated to level 1 — Invocation repeatedly timed out',
+            'Auto-dismissed: re-escalated to level 1 — Invocation repeatedly timed out (2/2)',
             dismiss=True,
             resolved_by='steward',
         )

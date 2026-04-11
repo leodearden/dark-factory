@@ -231,7 +231,8 @@ class TaskSteward:
         timeout_count = self._timeout_counts.get(escalation.id, 0)
         if timeout_count >= self.config.steward_max_timeouts_per_escalation:
             self._auto_escalate_to_human(
-                escalation, 'Invocation repeatedly timed out',
+                escalation,
+                f'Invocation repeatedly timed out ({timeout_count}/{self.config.steward_max_timeouts_per_escalation})',
             )
             return
 
@@ -345,6 +346,10 @@ class TaskSteward:
             )
         else:
             self.metrics.escalations_handled += 1
+            # Clean up per-escalation counters on successful resolution so the
+            # steward dict does not accumulate stale entries indefinitely.
+            self._retry_counts.pop(escalation.id, None)
+            self._timeout_counts.pop(escalation.id, None)
 
     # ------------------------------------------------------------------
     # Session-aware invocation with cap-hit recovery
