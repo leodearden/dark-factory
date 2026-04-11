@@ -393,6 +393,7 @@ class TestRebuildEntitySummariesForceDryRun:
 
         assert result['total_entities'] == 3
         assert result['stale_entities'] == 3  # force=True targets all
+        assert result['stale_entities'] == result['total_entities']  # force=True treats every entity as stale
         assert result['skipped'] == 3  # dry_run=True skips all
         assert result['rebuilt'] == 0
         assert result['errors'] == 0
