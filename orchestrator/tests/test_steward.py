@@ -43,6 +43,7 @@ def mock_config():
     config.steward_lifetime_budget = 12.0
     config.steward_max_retries = 3
     config.steward_completion_timeout = 300.0
+    config.timeouts.steward = 900.0
     config.suggestion_triage_threshold = 10
     return config
 
@@ -482,6 +483,31 @@ class TestStewardLifetimeBudget:
             mock_invoke.return_value = _make_result(cost=1.5)
             await steward._handle_escalation(esc)
             assert mock_invoke.call_args.kwargs['max_budget_usd'] == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
+# Timeout Passthrough
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardTimeoutPassthrough:
+
+    async def test_invoke_with_session_passes_timeout_seconds(self, steward, mock_config):
+        """_invoke_with_session must forward config.timeouts.steward as timeout_seconds."""
+        mock_config.timeouts.steward = 900.0
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(session_id='sess-t')
+            await steward._invoke_with_session(
+                prompt='do work',
+                cwd=steward.worktree,
+                mcp_config={},
+                per_invocation_budget=5.0,
+                escalation=_make_escalation(),
+            )
+
+        assert mock_invoke.call_args.kwargs['timeout_seconds'] == pytest.approx(900.0)
 
 
 # ---------------------------------------------------------------------------
