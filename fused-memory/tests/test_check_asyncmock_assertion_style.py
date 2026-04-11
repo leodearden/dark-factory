@@ -6,6 +6,8 @@ also contains assert_not_awaited(). See task 673 (lint guard replacing task-571 
 from __future__ import annotations
 
 import importlib.util
+import subprocess
+import sys
 import types
 from pathlib import Path
 
@@ -165,3 +167,43 @@ async def test_three_not_called():
         for v in violations:
             assert v.filename == 'test_multi.py'
             assert 'assert_not_awaited' in v.message
+
+
+# ---------------------------------------------------------------------------
+# CLI integration tests (steps 11-16)
+# ---------------------------------------------------------------------------
+
+_MIXED_STYLE_SOURCE = '''\
+async def test_mixed():
+    backend.get_all_valid_edges.assert_not_awaited()
+    backend.foo.assert_not_called()
+'''
+
+_CLEAN_SOURCE_DIFFERENT_FUNCS = '''\
+def func_a():
+    mock.a.assert_not_awaited()
+
+def func_b():
+    mock.b.assert_not_called()
+'''
+
+
+class TestCliExitCodes:
+    """CLI exit-code contract: 1 on violations, 0 on clean input."""
+
+    def test_cli_main_exits_nonzero_and_prints_violations_on_bad_file(self, tmp_path: Path):
+        """Violations file → returncode 1, stdout contains path/lineno/keywords."""
+        bad_file = tmp_path / 'test_bad.py'
+        bad_file.write_text(_MIXED_STYLE_SOURCE)
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), str(bad_file)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1
+        output = result.stdout
+        assert str(bad_file) in output
+        # assert_not_called is on line 3 of _MIXED_STYLE_SOURCE
+        assert ':3:' in output
+        assert 'assert_not_awaited' in output
+        assert 'assert_not_called' in output
