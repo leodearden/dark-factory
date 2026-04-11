@@ -817,6 +817,42 @@ class TestStewardTimeoutCap:
 
         assert steward._timeout_counts == {'esc-42-1': 1, 'esc-42-2': 1}
 
+    async def test_repeated_timeout_kills_eventually_terminate(
+        self, steward, mock_config,
+    ):
+        """Headline acceptance test: after cap timeouts the steward stops invoking."""
+        mock_config.steward_max_timeouts_per_escalation = 3
+        mock_config.steward_max_attempts = 10  # retry guard must not fire first
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-inf')
+        # Queue always returns pending (never resolved)
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-inf', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False,
+                cost=0.0,           # realistic: streaming cut off mid-turn
+                turns=0,
+                duration_ms=900000,
+                session_id='sess-inf',
+                stderr='Process killed after 900.0s timeout (SIGTERM+SIGKILL)',
+            )
+            for _ in range(5):
+                await steward._handle_escalation(esc)
+
+        # invoke_agent called exactly 3 times (cap=3); calls 4 and 5 are blocked
+        assert mock_invoke.call_count == 3
+        # Level-1 re-escalation was submitted at least once
+        steward.escalation_queue.submit.assert_called()
+        first_submit = steward.escalation_queue.submit.call_args_list[0][0][0]
+        assert first_submit.level == 1
+        assert 'repeatedly timed out' in first_submit.summary.lower()
+        # Timeout metric reflects the 3 actual invocations
+        assert steward.metrics.timeouts_recovered == 3
+        assert steward._timeout_counts['esc-42-inf'] == 3
+
 
 # ---------------------------------------------------------------------------
 # Unified Role
