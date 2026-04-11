@@ -34,13 +34,20 @@ HARDCODED_EXPECTED_ENV_LINE = (
     "/home/leo/src/autopilot-video"
 )
 
-# Canonical substitution values for rendering the template.
-# Source of truth: setup-host.sh lines 325-329 which run:
+# These are the literal paths baked into the committed hardcoded service file;
+# the render test verifies the template expands to exactly those values.
+# setup-host.sh computes REPO_ROOT and UV_PATH at runtime (from $(dirname $0)/..
+# and $(command -v uv) respectively), so what it installs on a worktree or
+# alternate machine may legitimately differ — the test is not asserting anything
+# about the runtime install environment.
+#
+# Substitution semantics (setup-host.sh lines 325-329):
 #   sed 's|__REPO_ROOT__|$REPO_ROOT|g'   (global, unanchored, literal substitution)
 #   sed 's|__UV_PATH__|$UV_PATH|g'       (global, unanchored, literal substitution)
-# These must match the values in the committed dashboard/dark-factory-dashboard.service.
-EXPECTED_REPO_ROOT = "/home/leo/src/dark-factory"
-EXPECTED_UV_PATH = "/home/leo/.local/bin/uv"
+# Both sentinels contain no regex metacharacters and no '|', so str.replace is
+# semantically identical to the sed command.
+HARDCODED_REPO_ROOT = "/home/leo/src/dark-factory"
+HARDCODED_UV_PATH = "/home/leo/.local/bin/uv"
 
 
 def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
@@ -246,8 +253,8 @@ def test_template_renders_to_hardcoded_file() -> None:
     byte-for-byte.
 
     Substitution semantics (mirroring setup-host.sh):
-        sed 's|__REPO_ROOT__|$REPO_ROOT|g'  →  str.replace('__REPO_ROOT__', EXPECTED_REPO_ROOT)
-        sed 's|__UV_PATH__|$UV_PATH|g'      →  str.replace('__UV_PATH__', EXPECTED_UV_PATH)
+        sed 's|__REPO_ROOT__|$REPO_ROOT|g'  →  str.replace('__REPO_ROOT__', HARDCODED_REPO_ROOT)
+        sed 's|__UV_PATH__|$UV_PATH|g'      →  str.replace('__UV_PATH__', HARDCODED_UV_PATH)
 
     Both sentinels contain no regex metacharacters and no '|', so str.replace is
     semantically identical to the sed command (global, unanchored, literal substitution).
@@ -258,8 +265,8 @@ def test_template_renders_to_hardcoded_file() -> None:
     """
     rendered = (
         TEMPLATE.read_text(encoding="utf-8")
-        .replace("__REPO_ROOT__", EXPECTED_REPO_ROOT)
-        .replace("__UV_PATH__", EXPECTED_UV_PATH)
+        .replace("__REPO_ROOT__", HARDCODED_REPO_ROOT)
+        .replace("__UV_PATH__", HARDCODED_UV_PATH)
     )
     hardcoded = HARDCODED.read_text(encoding="utf-8")
     assert rendered == hardcoded, (
