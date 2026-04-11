@@ -323,6 +323,15 @@ class TestFormatFilteredTaskTree:
         assert match is not None, f'Expected truncation notice in output: {output!r}'
         trimmed_count = int(match.group(1))
 
+        # Lower bound: at least one task was dropped by the char-budget clamp, confirming
+        # the lazy pop loop genuinely fired (not just the initial accumulator cycle).
+        # If trimmed_count=0, the budget arithmetic has drifted and the pop regime is
+        # no longer being exercised.
+        assert trimmed_count >= 1, (
+            f'trimmed_count={trimmed_count} should be >= 1; '
+            f'the lazy pop loop did not fire — budget may be too loose or derivation drifted'
+        )
+
         # At least one task line must survive the lazy pop loop — guards against the
         # regression where the notice fires but kept_lines ends up empty.
         assert '- [1]' in output, (
@@ -330,11 +339,13 @@ class TestFormatFilteredTaskTree:
             'if missing, the budget accounting has regressed'
         )
 
-        # trimmed_count must be bounded by the post-cap survivor count (5), not by
-        # total_active (10).  Bug mode: trimmed_count = total_active - len(kept_lines)
-        # = 10 - 1 = 9, which exceeds 5 and would fail this assertion.
-        assert trimmed_count <= 5, (
-            f'trimmed_count={trimmed_count} exceeds post-cap survivor count (5); '
+        # trimmed_count must be exactly 4 (5 post-cap survivors minus 1 kept line after
+        # the lazy pop loop).  Exact equality catches: (a) the total_active bug where
+        # buggy trimmed_count = 10 - 1 = 9, which fails 9 != 4; (b) subtler off-by-one
+        # errors in truncation accounting that the upper bound alone would not catch.
+        assert trimmed_count == 4, (
+            f'trimmed_count={trimmed_count} should be exactly 4 '
+            f'(5 post-cap survivors minus 1 kept line); '
             f'bug: trimmed_count tracks total_active instead of len(active[:max_tasks])'
         )
 
