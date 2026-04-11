@@ -759,7 +759,7 @@ class TestCollectSnapshot:
 
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
-        project_ids = {row[0] for row in rows}
+        project_ids = {row['project_id'] for row in rows}
 
         if raised_oserror:
             # Pre-fix behavior (task 519 not yet landed): asyncio.gather re-raises
