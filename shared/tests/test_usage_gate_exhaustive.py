@@ -552,11 +552,15 @@ class TestCapHitNowUsingExtraSemantics:
 class TestCapConfirmKeywordEnforcement:
     """Asserts that detect_cap_hit requires BOTH a matching prefix AND at least one CAP_CONFIRM_KEYWORDS entry.
 
-    The secondary keyword guard ('resets', 'usage limit', 'upgrade') must be
-    present in the combined text before routing to _handle_cap_detected or
-    _handle_near_cap_warning. This is the defense-in-depth guard against false
-    positives on ambiguous generic prefixes like 'You've used' or 'You're close
-    to'.
+    The secondary keyword guard ('resets', 'usage limit', 'upgrade your plan')
+    must be present in the combined text before routing to _handle_cap_detected
+    or _handle_near_cap_warning. This is the defense-in-depth guard against
+    false positives on ambiguous generic prefixes like 'You've used' or
+    'You're close to'.
+
+    Note: 'upgrade' was narrowed to 'upgrade your plan' (task 662) because the
+    bare verb is too common in unrelated CLI messaging and would reduce the guard
+    to near-prefix-only behaviour in false-positive scenarios.
     """
 
     def test_cap_hit_prefix_without_confirm_keyword_returns_false(self):
