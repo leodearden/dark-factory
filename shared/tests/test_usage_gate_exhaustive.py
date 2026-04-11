@@ -1217,6 +1217,28 @@ class TestConfirmAccountOk:
         gate.confirm_account_ok('completely-unknown-token')
         assert gate._accounts[0].near_cap is True
 
+    def test_near_cap_resets_after_confirm_then_warning(self):
+        """Locks in the clear/re-detect contract for near_cap.
+
+        Sequence: NEAR_CAP warning → confirm_account_ok → NEAR_CAP warning again.
+        After the first warning near_cap is True; after confirm_account_ok it is
+        False; after the second warning it must flip back to True.  This guards
+        against a future change that accidentally latches near_cap (i.e. stops
+        re-detection after a clear) or that makes the clear irreversible.
+        """
+        gate = make_gate(['a'])
+        # Step 1: trigger a NEAR_CAP warning — near_cap should become True
+        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 4h.")
+        assert gate._accounts[0].near_cap is True
+
+        # Step 2: a successful invocation clears near_cap
+        gate.confirm_account_ok(gate._accounts[0].token)
+        assert gate._accounts[0].near_cap is False
+
+        # Step 3: the same NEAR_CAP warning fires again — near_cap must be re-set to True
+        gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 4h.")
+        assert gate._accounts[0].near_cap is True
+
     def test_confirm_account_ok_on_capped_account(self):
         """confirm_account_ok clears near_cap even when the account is capped.
 
