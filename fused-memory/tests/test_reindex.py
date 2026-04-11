@@ -952,7 +952,7 @@ class TestNodeCount:
         """Returns the integer count from result_set[0][0]."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([[42]])
-        backend.client.driver._get_graph = MagicMock(return_value=graph)
+        backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.node_count('my_graph')
         assert result == 42
 
@@ -961,7 +961,7 @@ class TestNodeCount:
         """Returns 0 when result_set is empty."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        backend.client.driver._get_graph = MagicMock(return_value=graph)
+        backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.node_count('empty_graph')
         assert result == 0
 
@@ -977,7 +977,7 @@ class TestNodeCount:
         """node_count uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([[7]])
-        backend.client.driver._get_graph = MagicMock(return_value=graph)
+        backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.node_count('test_graph')
         graph.ro_query.assert_awaited_once()
         graph.query.assert_not_awaited()
