@@ -187,6 +187,23 @@ class TestCanonicalFacts:
         result = GraphitiBackend._canonical_facts(edges)
         assert result == ['  hello  ', 'A knows B']
 
+    def test_all_whitespace_edges_returns_empty_list(self):
+        """All-whitespace input returns an empty list — the boundary case.
+
+        All-whitespace input is the boundary case — if every edge is
+        whitespace-only, _canonical_facts must return an empty list (no
+        spurious empty string, no pre-strip value leakage).
+
+        This is distinct from test_whitespace_only_fact_is_filtered (which
+        mixes whitespace-only and valid edges) and from
+        test_whitespace_variants_all_filtered (which also mixes).  This test
+        covers the pure all-whitespace case where no valid fact is present,
+        ensuring the result is [] rather than ['', '  ', etc.].
+        """
+        edges = [{'fact': '   '}, {'fact': '\t'}]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == []
+
 
 # ---------------------------------------------------------------------------
 # step-5: refresh_entity_summary optional name/old_summary params
