@@ -6,6 +6,7 @@ also contains assert_not_awaited(). See task 673 (lint guard replacing task-571 
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 import types
