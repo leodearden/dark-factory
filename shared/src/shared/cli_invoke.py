@@ -81,6 +81,7 @@ class AgentResult:
     - ``subtype``: provider-specific result subtype (e.g. ``"success"``, ``"error"``)
     - ``stderr``: captured stderr from the CLI process
     - ``account_name``: the OAuth account used for this invocation
+    - ``timed_out``: True when the subprocess was killed by a wall-clock timeout
     """
 
     success: bool
@@ -97,6 +98,7 @@ class AgentResult:
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
     cache_create_tokens: int | None = None
+    timed_out: bool = False
 
 
 def _to_token_count(v: int | None) -> int | None:
