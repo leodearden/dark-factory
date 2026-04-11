@@ -783,6 +783,40 @@ class TestStewardTimeoutCap:
             resolved_by='steward',
         )
 
+    async def test_different_escalations_have_independent_timeout_counts(
+        self, steward, mock_config,
+    ):
+        """Timeout counts for distinct escalation ids must not bleed across."""
+        mock_config.steward_max_timeouts_per_escalation = 3
+        mock_config.steward_max_attempts = 5
+        mock_config.timeouts.steward = 900.0
+
+        timeout_stderr = 'Process killed after 900.0s timeout (SIGTERM+SIGKILL)'
+
+        esc1 = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False, cost=0.0, turns=0, session_id='sess-k1',
+                stderr=timeout_stderr,
+            )
+            await steward._handle_escalation(esc1)
+
+        esc2 = _make_escalation(id='esc-42-2')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-2', status='pending',
+        )
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False, cost=0.0, turns=0, session_id='sess-k2',
+                stderr=timeout_stderr,
+            )
+            await steward._handle_escalation(esc2)
+
+        assert steward._timeout_counts == {'esc-42-1': 1, 'esc-42-2': 1}
+
 
 # ---------------------------------------------------------------------------
 # Unified Role
