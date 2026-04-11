@@ -289,6 +289,125 @@ class TestRunEvalMatrixCancellation:
         )
 
 
+    async def test_all_collected_cancels_logged_in_caller_loop(
+        self,
+        single_task_matrix_case,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Each CancelledError returned by _collect_cancel_errors must be logged.
+
+        REGRESSION GUARD (Task 586 / Task 714):
+        runner.py:412-420 contains a ``for ce in cancel_errors:`` loop that calls
+        ``logger.error('Eval cancelled', exc_info=ce)`` once per item.  If that loop
+        were collapsed to a single-element call such as::
+
+            logger.error('Eval cancelled', exc_info=cancel_errors[0])
+
+        the second (and any further) CancelledError in a batch would be silently
+        dropped, reintroducing the original Task 586 bug.
+
+        This test monkeypatches ``_collect_cancel_errors`` to return a fixed
+        2-element list of distinct CancelledError instances, then drives
+        ``run_eval_matrix`` end-to-end.  The fake_run_eval returns a valid
+        EvalResult; its return value is never inspected because the hijacked
+        helper fires on the first asyncio.wait iteration and causes the loop
+        to raise.
+
+        HOW TO VERIFY THIS TEST CATCHES THE REGRESSION:
+        Temporarily replace the loop in runner.py with::
+
+            logger.error('Eval cancelled', exc_info=cancel_errors[0])
+
+        and re-run.  The assertion '2 caplog records' will fail with
+        'Expected 2 records, got 1'.
+
+        PASS/FAIL CONDITION (current correct code):
+          (a) pytest.raises(CancelledError) — the loop raises cancel_errors[0]
+          (b) Exactly 2 caplog records with message == 'Eval cancelled'
+          (c) Each record carries a 3-tuple exc_info whose exc_type is CancelledError
+          (d) The set of exc_info[1] identities == {ce_a, ce_b} — both instances
+              were logged, not the same one twice
+        """
+        _task_path, run_matrix = single_task_matrix_case
+
+        ce_a = asyncio.CancelledError('first-cancel')
+        ce_b = asyncio.CancelledError('second-cancel')
+
+        # Monkeypatch _collect_cancel_errors to return a deterministic 2-element
+        # list.  Because the first non-empty return causes the monitor loop to
+        # raise immediately, we never reach a second iteration.
+        #
+        # The wrapper also counts invocations: if _collect_cancel_errors is
+        # renamed or inlined in the future, the monkeypatch becomes a no-op and
+        # the counter assertion below surfaces the decoupling as a test failure
+        # rather than a silent regression guard.
+        _collect_cancel_calls: list[None] = []
+
+        def _fake_collect_cancel_errors(_done: set) -> list[asyncio.CancelledError]:
+            _collect_cancel_calls.append(None)
+            return [ce_a, ce_b]
+
+        monkeypatch.setattr(runner_mod, '_collect_cancel_errors', _fake_collect_cancel_errors)
+
+        async def fake_run_eval(*args, **kwargs) -> EvalResult:
+            return EvalResult(
+                task_id='task_a',
+                config_name=_CFG.name,
+                outcome='success',
+                metrics={},
+                worktree_path='/tmp/stub',
+            )
+
+        with (
+            caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await run_matrix(fake_run_eval)
+
+        cancel_records = [r for r in caplog.records if r.message == 'Eval cancelled']
+
+        # (b) Exactly 2 records — one per cancel error
+        assert len(cancel_records) == 2, (
+            f'Expected 2 "Eval cancelled" log records (one per CancelledError in the '
+            f'batch), got {len(cancel_records)}.  '
+            f'A regression that collapses the for-loop to a single logger.error call '
+            f'would produce 1 record here.'
+        )
+
+        # (c) Each record must carry a proper exc_info 3-tuple
+        for i, record in enumerate(cancel_records):
+            assert isinstance(record.exc_info, tuple) and len(record.exc_info) == 3, (
+                f'Record {i}: expected exc_info to be a 3-tuple, got {record.exc_info!r}'
+            )
+            exc_type, _exc_val, _exc_tb = record.exc_info
+            assert exc_type is asyncio.CancelledError, (
+                f'Record {i}: expected exc_type CancelledError, got {exc_type!r}'
+            )
+
+        # (d) Identity check: BOTH distinct instances must appear — not the same one twice.
+        # CancelledError (a BaseException subclass) uses object identity for __hash__
+        # and __eq__, so set-membership here is an identity check, NOT a value/message
+        # comparison.  Do not replace with string equality — that would miss the
+        # 'same exception logged twice' regression.
+        logged_exc_vals = {record.exc_info[1] for record in cancel_records if record.exc_info is not None}
+        assert logged_exc_vals == {ce_a, ce_b}, (
+            f'Expected both CancelledError instances to be logged (identity check). '
+            f'Logged exc_val set: {logged_exc_vals!r}  '
+            f'Expected: {{{ce_a!r}, {ce_b!r}}}.  '
+            f'A regression that logs cancel_errors[0] twice would produce '
+            f'{{{ce_a!r}}} here.'
+        )
+
+        # Call-count guard: if _collect_cancel_errors was renamed or inlined, the
+        # monkeypatch above would be a no-op and this assertion fails loudly.
+        assert len(_collect_cancel_calls) == 1, (
+            f'Expected _collect_cancel_errors to be called exactly once; '
+            f'got {len(_collect_cancel_calls)}.  '
+            f'If the count is 0, the monkeypatch is decoupled from the real '
+            f'call site (the helper was renamed or inlined).'
+        )
+
     async def test_cancelled_error_log_carries_exc_info(
         self, single_task_matrix_case, caplog: pytest.LogCaptureFixture
     ):
@@ -606,3 +725,48 @@ class TestCollectCancelErrors:
             assert isinstance(err, asyncio.CancelledError), (
                 f'Element {i}: expected CancelledError, got {err!r}'
             )
+
+
+def test_docstring_has_no_comment_prefixed_lines():
+    """The _collect_cancel_errors docstring must not contain lines starting with '# '.
+
+    TEST INTENT: The 'Belt-and-suspenders' paragraph in the docstring was
+    originally written as a block of ``#`` comments and pulled into the
+    docstring without stripping the prefixes.  Inside a docstring ``#`` is
+    not a comment marker — Sphinx and help() render it as a literal hash.
+    This test ensures all six offending lines are fixed.
+
+    PASS/FAIL CONDITION: Fails if any line in the docstring, after stripping
+    leading whitespace, starts with ``# `` (hash + space).  Passes once the
+    '# ' prefixes are removed while the prose is preserved verbatim.
+
+    NOTE: The assertion targets ``# `` (hash + space) rather than a bare
+    ``#`` to avoid false positives on legitimate inline hash references such
+    as 'issue #42' or '#3 in the list'.
+
+    NOTE: Kept at module level (not inside TestCollectCancelErrors) to avoid
+    any interaction with pytest-asyncio strict-mode handling of synchronous
+    methods inside an ``@pytest.mark.asyncio``-decorated test class.
+    """
+    doc = runner_mod._collect_cancel_errors.__doc__
+    assert doc is not None, '_collect_cancel_errors must have a docstring'
+    assert doc.strip(), '_collect_cancel_errors docstring must not be empty'
+
+    # Content-preservation guard: the prose must still be present after
+    # the prefix fix so we know the lines were not simply deleted.
+    assert 'Belt-and-suspenders' in doc, (
+        "Expected 'Belt-and-suspenders' paragraph to be present in docstring "
+        '(content must be preserved, only the # prefixes removed)'
+    )
+
+    offending = [
+        line
+        for line in doc.splitlines()
+        if line.lstrip().startswith('# ')
+    ]
+    assert not offending, (
+        f'Found {len(offending)} line(s) in _collect_cancel_errors.__doc__ '
+        f'that start with "# " after stripping whitespace — these are '
+        f'comment-style prefixes inside a docstring and must be removed:\n'
+        + '\n'.join(f'  {line!r}' for line in offending)
+    )
