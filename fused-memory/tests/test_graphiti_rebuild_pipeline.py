@@ -750,6 +750,12 @@ class TestCanonicalFactsStalenessRegression:
         After the fix, _canonical_facts filters out '   ', returns ['A knows B'],
         and the joined canonical string 'A knows B' matches the stored summary —
         so the entity is NOT stale.
+
+        The total_count assertion (added in task-492) strengthens this regression
+        guard: stale==[] alone could pass trivially if the entity loop never ran
+        (e.g. if list_entity_nodes returned zero entities).  total_count=1 pins
+        that exactly one entity was scanned and _canonical_facts was actually
+        exercised on its edges.
         """
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(
@@ -768,4 +774,8 @@ class TestCanonicalFactsStalenessRegression:
         assert result.stale == [], (
             'Entity should NOT be flagged stale when its only non-whitespace '
             'fact matches the stored summary.'
+        )
+        assert result.total_count == 1, (
+            'total_count must confirm the entity was actually scanned; '
+            'stale==[] alone could pass if the loop never ran.'
         )
