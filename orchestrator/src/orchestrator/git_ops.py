@@ -87,7 +87,10 @@ async def _scrub_task_dir_from_tree(cwd: Path, context: str, *, amend: bool = Tr
     )
 
     # Remove from index (not filesystem — .task/ may still be needed as scratch)
-    await _run(['git', 'rm', '-r', '--cached', '--', '.task/'], cwd=cwd)
+    rc, _, err = await _run(['git', 'rm', '-r', '--cached', '--', '.task/'], cwd=cwd)
+    if rc != 0:
+        logger.error('.task/ scrub failed during %s: git rm --cached failed: %s', context, err)
+        return False
 
     # Also remove from filesystem if present (cleanup inherited contamination)
     task_dir = cwd / '.task'
