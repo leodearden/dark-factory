@@ -261,6 +261,13 @@ class TestCapDetectionPatterns:
                 "You're close to reaching your plan limit. Your plan resets in 5h.",
                 True,
             ),
+            # Negative case: bare 'upgrade' no longer satisfies the confirm-keyword
+            # guard after task-662 narrowing to 'upgrade your plan' / 'upgrade your
+            # subscription'.  This was previously a True row before narrowing.
+            (
+                "You've used all available credits. Upgrade for more capacity.",
+                False,
+            ),
         ],
         ids=[
             'cap_hit_prefix_hit_your',
@@ -268,6 +275,7 @@ class TestCapDetectionPatterns:
             'cap_hit_prefix_out_of_extra',
             'cap_hit_prefix_now_using_extra',
             'near_cap_prefix_close_to',
+            'cap_hit_prefix_used_bare_upgrade_negative',
         ],
     )
     def test_realistic_cap_messages(self, message, expected):
@@ -552,13 +560,13 @@ class TestCapHitNowUsingExtraSemantics:
 class TestCapConfirmKeywordEnforcement:
     """Asserts that detect_cap_hit requires BOTH a matching prefix AND at least one CAP_CONFIRM_KEYWORDS entry.
 
-    The secondary keyword guard ('resets', 'usage limit', 'upgrade your plan')
-    must be present in the combined text before routing to _handle_cap_detected
-    or _handle_near_cap_warning. This is the defense-in-depth guard against
-    false positives on ambiguous generic prefixes like 'You've used' or
-    'You're close to'.
+    The secondary keyword guard ('resets', 'usage limit', 'upgrade your plan',
+    'upgrade your subscription') must be present in the combined text before
+    routing to _handle_cap_detected or _handle_near_cap_warning. This is the
+    defense-in-depth guard against false positives on ambiguous generic prefixes
+    like 'You've used' or 'You're close to'.
 
-    Note: 'upgrade' was narrowed to 'upgrade your plan' (task 662) because the
+    Note: 'upgrade' was narrowed to multi-word phrases (task 662) because the
     bare verb is too common in unrelated CLI messaging and would reduce the guard
     to near-prefix-only behaviour in false-positive scenarios.
     """
@@ -602,6 +610,16 @@ class TestCapConfirmKeywordEnforcement:
         """Prefix + 'upgrade your plan' secondary keyword must trigger CAP_HIT detection."""
         gate = make_gate(['a'])
         result = gate.detect_cap_hit('', "You've used all credits. Upgrade your plan for more.")
+        acct = gate._accounts[0]
+        assert result is True
+        assert acct.capped is True
+
+    def test_cap_hit_prefix_with_upgrade_your_subscription_keyword_returns_true(self):
+        """Prefix + 'upgrade your subscription' secondary keyword must trigger CAP_HIT detection."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit(
+            '', "You've used all credits. Upgrade your subscription for more."
+        )
         acct = gate._accounts[0]
         assert result is True
         assert acct.capped is True
