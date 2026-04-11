@@ -1116,6 +1116,19 @@ class TestUnmergedDetection:
             f'Expected helper_probe.py in unmerged paths, got: {unmerged}'
         )
 
+    async def test_inject_uu_state_raises_on_non_git_cwd(
+        self, tmp_path: Path,
+    ):
+        """_inject_uu_state raises CalledProcessError when cwd is not a git repo.
+
+        git hash-object exits with rc != 0 in a non-git directory; without
+        check=True the helper silently builds an invalid payload.  With
+        check=True it raises immediately, turning silent corruption into an
+        actionable CalledProcessError that includes stderr.
+        """
+        with pytest.raises(subprocess.CalledProcessError):
+            await _inject_uu_state(tmp_path, 'foo.py')
+
 
 @pytest.mark.asyncio
 class TestSafeStashPopWithRecovery:
