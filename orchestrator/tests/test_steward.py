@@ -713,6 +713,10 @@ class TestStewardMetrics:
         assert m.total_cost_usd == 0.0
         assert m.escalations_reescalated == 0
 
+    def test_timeouts_recovered_initial_value(self):
+        m = StewardMetrics()
+        assert m.timeouts_recovered == 0
+
 
 # ---------------------------------------------------------------------------
 # Next Escalation
