@@ -8,7 +8,7 @@ inherits it, agents treat it as state, and cross-task contamination follows.
 
 This module contains multiple redundant safeguards ("belts and braces"):
 
-1. _scrub_task_dir_from_tree() — removes .task/ from the git index in any
+1. scrub_task_dir_from_tree() — removes .task/ from the git index in any
    worktree, amending the current commit.  Called after merges and during
    worktree creation.
 2. _assert_no_task_dir() — hard assertion that a given commit SHA contains
@@ -46,7 +46,7 @@ AdvanceResult = Literal[
 
 
 class ScrubResult(Enum):
-    """Result of a ``_scrub_task_dir_from_tree`` call.
+    """Result of a ``scrub_task_dir_from_tree`` call.
 
     Distinguishes three outcomes so callers can react precisely:
 
@@ -65,7 +65,7 @@ class ScrubResult(Enum):
 # .task/ contamination helpers
 # ---------------------------------------------------------------------------
 
-async def _scrub_task_dir_from_tree(
+async def scrub_task_dir_from_tree(
     cwd: Path, context: str, *, amend: bool = True,
 ) -> ScrubResult:
     """Remove .task/ from the git index if present.
@@ -327,7 +327,7 @@ class GitOps:
         # been committed yet.
         # amend=False: HEAD is shared with main — must NOT amend the shared commit.
         # Instead, create a new commit on the branch to remove .task/.
-        scrub_result = await _scrub_task_dir_from_tree(
+        scrub_result = await scrub_task_dir_from_tree(
             worktree_path, 'worktree-creation', amend=False,
         )
         if scrub_result == ScrubResult.SCRUBBED:
@@ -530,10 +530,10 @@ class GitOps:
             # merge commit contains those files.  We MUST remove them
             # before this commit reaches main via advance_main().
             #
-            # _scrub_task_dir_from_tree() checks git ls-tree, runs
+            # scrub_task_dir_from_tree() checks git ls-tree, runs
             # git rm --cached, and amends the merge commit in-place.
             # This is the single most important .task/ defense.
-            scrub_result = await _scrub_task_dir_from_tree(merge_wt, f'post-merge({full_branch})')
+            scrub_result = await scrub_task_dir_from_tree(merge_wt, f'post-merge({full_branch})')
             if scrub_result == ScrubResult.FAILED:
                 logger.error(
                     '.task/ scrub FAILED post-merge for %s — index may still be '
@@ -787,7 +787,7 @@ class GitOps:
                 )
                 return 'not_descendant'
 
-            scrub_result = await _scrub_task_dir_from_tree(
+            scrub_result = await scrub_task_dir_from_tree(
                 merge_worktree, f'advance_main-retry({attempt + 1})',
             )
             if scrub_result == ScrubResult.FAILED:
