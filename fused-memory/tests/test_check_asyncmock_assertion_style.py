@@ -292,3 +292,15 @@ class TestHooksIntegration:
             assert 'uv run' not in line, (
                 f'Found uv run in asyncmock check invocation (should use plain python3): {line!r}'
             )
+
+    def test_hook_has_stdlib_only_rationale_comment(self):
+        """hooks/project-checks must contain a 'stdlib-only' rationale comment near the asyncmock check."""
+        hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
+        content = hooks_path.read_text(encoding='utf-8')
+        assert 'check_asyncmock_assertion_style.py' in content, (
+            'asyncmock check invocation not found in hooks/project-checks'
+        )
+        assert 'stdlib-only' in content.lower(), (
+            "hooks/project-checks must contain a 'stdlib-only' rationale comment "
+            'explaining why the asyncmock check bypasses uv'
+        )
