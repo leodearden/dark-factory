@@ -293,6 +293,29 @@ class TestGetAllValidEdges:
         result = await backend.get_all_valid_edges(group_id='test')
         assert result == {}
 
+    @pytest.mark.asyncio
+    async def test_identical_rows_produce_duplicate_entries(self, mock_config, make_backend, make_graph_mock):
+        """Python grouping loop does no dedup — identical rows produce duplicate list entries.
+
+        RETURN DISTINCT in the Cypher query is the sole guard against duplicate
+        rows (it guards specifically against self-loop duplicates where A→A edges
+        yield two identical rows under the undirected MATCH).  If the database
+        ever returns identical rows the Python layer faithfully appends both,
+        producing duplicate entries in the result list.  This test documents and
+        locks in that contract so it is never accidentally 'fixed' at the Python
+        layer (which would silently change behaviour for the legitimate self-loop
+        case that RETURN DISTINCT already handles).
+        """
+        backend = make_backend(mock_config)
+        rows = [
+            ['node-1', 'e1', 'factA', 'edge1'],
+            ['node-1', 'e1', 'factA', 'edge1'],  # identical duplicate
+        ]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert len(result['node-1']) == 2  # both rows appended, no dedup
+
 
 # ---------------------------------------------------------------------------
 # GraphitiBackend._edge_dict: edge dict normalisation helper
