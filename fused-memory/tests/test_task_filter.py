@@ -709,6 +709,90 @@ class TestFilterTaskTreeDoneAndCancelledLists:
         assert result.done_count == 0
         assert result.cancelled_count == 0
 
+    def test_done_and_cancelled_lists_sort_with_non_int_ids(self):
+        """Non-int ids fall back to _id_key=0 and sort last in descending order; stable sort preserves their mutual order."""
+        tasks_data = {
+            'tasks': [
+                # done: two non-int ids ('abc' then 'def') interleaved with ints;
+                # no literal id=0 to avoid sort-stability ambiguity with the fallback key.
+                {'id': 10, 'title': 'Done 10', 'status': 'done', 'dependencies': []},
+                {'id': 'abc', 'title': 'Done abc', 'status': 'done', 'dependencies': []},
+                {'id': 5, 'title': 'Done 5', 'status': 'done', 'dependencies': []},
+                {'id': 3, 'title': 'Done 3', 'status': 'done', 'dependencies': []},
+                {'id': 'def', 'title': 'Done def', 'status': 'done', 'dependencies': []},
+                # cancelled: mix of int and non-int ids
+                {'id': 7, 'title': 'Cancelled 7', 'status': 'cancelled', 'dependencies': []},
+                {'id': 'xyz', 'title': 'Cancelled xyz', 'status': 'cancelled', 'dependencies': []},
+                {'id': 2, 'title': 'Cancelled 2', 'status': 'cancelled', 'dependencies': []},
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        done_ids = [t['id'] for t in result.done_tasks]
+        cancelled_ids = [t['id'] for t in result.cancelled_tasks]
+
+        # 'abc' and 'def' both have _id_key=0 (int() fallback), so they sort last after
+        # all int ids (10 > 5 > 3 > 0). Stable sort preserves their input order: 'abc' before 'def'.
+        assert done_ids == [10, 5, 3, 'abc', 'def'], (
+            f"Expected done_tasks id order [10, 5, 3, 'abc', 'def'] — non-int ids 'abc' and 'def' "
+            f"both have _id_key=0 via the int() fallback, sort last (0 < 3 < 5 < 10 descending), "
+            f"and preserve input order relative to each other (stable sort). Got: {done_ids}"
+        )
+
+        # 'xyz' has _id_key=0 (int() fallback), so it sorts last after 7, 2 (both > 0)
+        assert cancelled_ids == [7, 2, 'xyz'], (
+            f"Expected cancelled_tasks id order [7, 2, 'xyz'] — non-int 'xyz' has _id_key=0 "
+            f"via the int() fallback and sorts last (0 < 2 < 7 descending). Got: {cancelled_ids}"
+        )
+
+    def test_active_done_cancelled_lists_are_disjoint(self):
+        """Every task is routed to exactly one bucket; active/done/cancelled are mutually exclusive."""
+        tasks_data = {
+            'tasks': [
+                # active statuses
+                _make_task(1, 'pending'),
+                _make_task(2, 'in-progress'),
+                _make_task(3, 'blocked'),
+                _make_task(4, 'deferred'),
+                _make_task(5, 'review'),
+                # done
+                _make_task(6, 'done'),
+                _make_task(7, 'done'),
+                # cancelled
+                _make_task(8, 'cancelled'),
+                _make_task(9, 'cancelled'),
+                # unknown/other — must NOT appear in any of the three lists
+                _make_task(10, 'stalled'),
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        active_ids = {t['id'] for t in result.active_tasks}
+        done_ids = {t['id'] for t in result.done_tasks}
+        cancelled_ids = {t['id'] for t in result.cancelled_tasks}
+
+        # Pairwise disjointness — the primary regression guard of this test
+        assert active_ids.isdisjoint(done_ids), (
+            f"active_tasks and done_tasks overlap: {active_ids & done_ids}"
+        )
+        assert active_ids.isdisjoint(cancelled_ids), (
+            f"active_tasks and cancelled_tasks overlap: {active_ids & cancelled_ids}"
+        )
+        assert done_ids.isdisjoint(cancelled_ids), (
+            f"done_tasks and cancelled_tasks overlap: {done_ids & cancelled_ids}"
+        )
+
+        # id=10 (status='stalled') must NOT appear in any list — it goes to other_count
+        # (bucket-content checks are already covered by test_partitions_active_done_cancelled_and_other)
+        all_listed_ids = active_ids | done_ids | cancelled_ids
+        assert 10 not in all_listed_ids, (
+            f"Task id=10 (status='stalled') should route to other_count only, "
+            f"not appear in active/done/cancelled. Found in: {all_listed_ids}"
+        )
+        assert result.other_count >= 1, (
+            f"Expected other_count >= 1 for the 'stalled' task, got {result.other_count}"
+        )
+
 
 class TestStatusPriorityIncludesDone:
     """Tests that _STATUS_PRIORITY includes 'done' and all expected keys."""
