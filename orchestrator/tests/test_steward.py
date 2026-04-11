@@ -583,6 +583,115 @@ class TestStewardTimeoutKillRecovery:
         assert steward._retry_counts.get('esc-42-1', 0) == 0
         steward.escalation_queue.submit.assert_not_called()
 
+    async def test_timeout_kill_increments_timeouts_recovered_metric(
+        self, steward, mock_config,
+    ):
+        """timeouts_recovered counter must tick; invocations==1, handled==0."""
+        mock_config.steward_max_retries = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False, cost=1.5, turns=3, session_id='sess-killed',
+                stderr='Process killed after 900.0s timeout (SIGTERM+SIGKILL)',
+            )
+            await steward._handle_escalation(esc)
+
+        assert steward.metrics.timeouts_recovered == 1
+        assert steward.metrics.invocations == 1
+        assert steward.metrics.escalations_handled == 0
+
+    async def test_timeout_kill_matches_terminated_stderr_pattern(
+        self, steward, mock_config,
+    ):
+        """'Process terminated after …' pattern (SIGTERM; stream closed) must match."""
+        mock_config.steward_max_retries = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False, cost=1.5, turns=3, session_id='sess-term',
+                stderr='Process terminated after 900.0s timeout (SIGTERM); stream closed',
+            )
+            await steward._handle_escalation(esc)
+
+        assert steward._retry_counts.get('esc-42-1', 0) == 0
+        assert steward.metrics.timeouts_recovered == 1
+
+    async def test_non_timeout_failure_still_increments_retry_count(
+        self, steward, mock_config,
+    ):
+        """Non-timeout failures must still consume retry budget (regression guard)."""
+        mock_config.steward_max_retries = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False, cost=0.5,
+                stderr='Some other CLI error (not a timeout)',
+            )
+            await steward._handle_escalation(esc)
+
+        assert steward._retry_counts.get('esc-42-1') == 1
+        assert steward.metrics.timeouts_recovered == 0
+
+    async def test_timeout_kill_still_tracks_cost_and_duration(
+        self, steward, mock_config,
+    ):
+        """Cost and duration from killed invocation must flow into lifetime metrics."""
+        mock_config.steward_max_retries = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False, cost=2.25, turns=7, duration_ms=900000,
+                stderr='Process killed after 900.0s timeout (SIGTERM+SIGKILL)',
+            )
+            await steward._handle_escalation(esc)
+
+        assert steward.metrics.total_cost_usd == pytest.approx(2.25)
+        assert steward.metrics.total_duration_ms == 900000
+        assert steward.metrics.invocations == 1
+
+    async def test_timeout_kill_does_not_auto_escalate_even_at_retry_cap(
+        self, steward, mock_config,
+    ):
+        """Timeout-kill on first attempt must NOT auto-escalate, even with max_retries=1."""
+        mock_config.steward_max_retries = 1
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-77')
+        # Fresh escalation — retry count starts at 0
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-77', status='pending',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False, cost=1.0, turns=5,
+                stderr='Process killed after 900.0s timeout (SIGTERM+SIGKILL)',
+            )
+            await steward._handle_escalation(esc)
+
+        steward.escalation_queue.submit.assert_not_called()
+        assert steward._retry_counts.get('esc-42-77', 0) == 0
+        assert steward.metrics.timeouts_recovered == 1
+
 
 # ---------------------------------------------------------------------------
 # Unified Role
