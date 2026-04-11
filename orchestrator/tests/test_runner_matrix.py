@@ -336,9 +336,19 @@ class TestRunEvalMatrixCancellation:
 
         # Monkeypatch _collect_cancel_errors to return a deterministic 2-element
         # list.  Because the first non-empty return causes the monitor loop to
-        # raise immediately, we never reach a second iteration — a simple lambda
-        # that always returns the same list is sufficient.
-        monkeypatch.setattr(runner_mod, '_collect_cancel_errors', lambda _done: [ce_a, ce_b])
+        # raise immediately, we never reach a second iteration.
+        #
+        # The wrapper also counts invocations: if _collect_cancel_errors is
+        # renamed or inlined in the future, the monkeypatch becomes a no-op and
+        # the counter assertion below surfaces the decoupling as a test failure
+        # rather than a silent regression guard.
+        _collect_cancel_calls: list[None] = []
+
+        def _fake_collect_cancel_errors(_done: set) -> list[asyncio.CancelledError]:
+            _collect_cancel_calls.append(None)
+            return [ce_a, ce_b]
+
+        monkeypatch.setattr(runner_mod, '_collect_cancel_errors', _fake_collect_cancel_errors)
 
         async def fake_run_eval(*args, **kwargs) -> EvalResult:
             return EvalResult(
@@ -375,7 +385,11 @@ class TestRunEvalMatrixCancellation:
                 f'Record {i}: expected exc_type CancelledError, got {exc_type!r}'
             )
 
-        # (d) Identity check: BOTH distinct instances must appear — not the same one twice
+        # (d) Identity check: BOTH distinct instances must appear — not the same one twice.
+        # CancelledError (a BaseException subclass) uses object identity for __hash__
+        # and __eq__, so set-membership here is an identity check, NOT a value/message
+        # comparison.  Do not replace with string equality — that would miss the
+        # 'same exception logged twice' regression.
         logged_exc_vals = {record.exc_info[1] for record in cancel_records if record.exc_info is not None}
         assert logged_exc_vals == {ce_a, ce_b}, (
             f'Expected both CancelledError instances to be logged (identity check). '
@@ -383,6 +397,15 @@ class TestRunEvalMatrixCancellation:
             f'Expected: {{{ce_a!r}, {ce_b!r}}}.  '
             f'A regression that logs cancel_errors[0] twice would produce '
             f'{{{ce_a!r}}} here.'
+        )
+
+        # Call-count guard: if _collect_cancel_errors was renamed or inlined, the
+        # monkeypatch above would be a no-op and this assertion fails loudly.
+        assert len(_collect_cancel_calls) == 1, (
+            f'Expected _collect_cancel_errors to be called exactly once; '
+            f'got {len(_collect_cancel_calls)}.  '
+            f'If the count is 0, the monkeypatch is decoupled from the real '
+            f'call site (the helper was renamed or inlined).'
         )
 
     async def test_cancelled_error_log_carries_exc_info(
@@ -703,42 +726,47 @@ class TestCollectCancelErrors:
                 f'Element {i}: expected CancelledError, got {err!r}'
             )
 
-    def test_docstring_has_no_comment_prefixed_lines(self):
-        """The _collect_cancel_errors docstring must not contain lines starting with '# '.
 
-        TEST INTENT: The 'Belt-and-suspenders' paragraph in the docstring was
-        originally written as a block of ``#`` comments and pulled into the
-        docstring without stripping the prefixes.  Inside a docstring ``#`` is
-        not a comment marker — Sphinx and help() render it as a literal hash.
-        This test ensures all six offending lines are fixed.
+def test_docstring_has_no_comment_prefixed_lines():
+    """The _collect_cancel_errors docstring must not contain lines starting with '# '.
 
-        PASS/FAIL CONDITION: Fails if any line in the docstring, after stripping
-        leading whitespace, starts with ``# `` (hash + space).  Passes once the
-        '# ' prefixes are removed while the prose is preserved verbatim.
+    TEST INTENT: The 'Belt-and-suspenders' paragraph in the docstring was
+    originally written as a block of ``#`` comments and pulled into the
+    docstring without stripping the prefixes.  Inside a docstring ``#`` is
+    not a comment marker — Sphinx and help() render it as a literal hash.
+    This test ensures all six offending lines are fixed.
 
-        NOTE: The assertion targets ``# `` (hash + space) rather than a bare
-        ``#`` to avoid false positives on legitimate inline hash references such
-        as 'issue #42' or '#3 in the list'.
-        """
-        doc = runner_mod._collect_cancel_errors.__doc__
-        assert doc is not None, '_collect_cancel_errors must have a docstring'
-        assert doc.strip(), '_collect_cancel_errors docstring must not be empty'
+    PASS/FAIL CONDITION: Fails if any line in the docstring, after stripping
+    leading whitespace, starts with ``# `` (hash + space).  Passes once the
+    '# ' prefixes are removed while the prose is preserved verbatim.
 
-        # Content-preservation guard: the prose must still be present after
-        # the prefix fix so we know the lines were not simply deleted.
-        assert 'Belt-and-suspenders' in doc, (
-            "Expected 'Belt-and-suspenders' paragraph to be present in docstring "
-            '(content must be preserved, only the # prefixes removed)'
-        )
+    NOTE: The assertion targets ``# `` (hash + space) rather than a bare
+    ``#`` to avoid false positives on legitimate inline hash references such
+    as 'issue #42' or '#3 in the list'.
 
-        offending = [
-            line
-            for line in doc.splitlines()
-            if line.lstrip().startswith('# ')
-        ]
-        assert not offending, (
-            f'Found {len(offending)} line(s) in _collect_cancel_errors.__doc__ '
-            f'that start with "# " after stripping whitespace — these are '
-            f'comment-style prefixes inside a docstring and must be removed:\n'
-            + '\n'.join(f'  {line!r}' for line in offending)
-        )
+    NOTE: Kept at module level (not inside TestCollectCancelErrors) to avoid
+    any interaction with pytest-asyncio strict-mode handling of synchronous
+    methods inside an ``@pytest.mark.asyncio``-decorated test class.
+    """
+    doc = runner_mod._collect_cancel_errors.__doc__
+    assert doc is not None, '_collect_cancel_errors must have a docstring'
+    assert doc.strip(), '_collect_cancel_errors docstring must not be empty'
+
+    # Content-preservation guard: the prose must still be present after
+    # the prefix fix so we know the lines were not simply deleted.
+    assert 'Belt-and-suspenders' in doc, (
+        "Expected 'Belt-and-suspenders' paragraph to be present in docstring "
+        '(content must be preserved, only the # prefixes removed)'
+    )
+
+    offending = [
+        line
+        for line in doc.splitlines()
+        if line.lstrip().startswith('# ')
+    ]
+    assert not offending, (
+        f'Found {len(offending)} line(s) in _collect_cancel_errors.__doc__ '
+        f'that start with "# " after stripping whitespace — these are '
+        f'comment-style prefixes inside a docstring and must be removed:\n'
+        + '\n'.join(f'  {line!r}' for line in offending)
+    )
