@@ -298,23 +298,22 @@ class TestFormatFilteredTaskTree:
         assert re.search(r'450\s+more active.*max_tasks', output)
 
     def test_char_budget_clamps_below_max_tasks(self):
-        """With few active tasks, max_chars=200 forces the char-budget clamp branch.
+        """When max_chars forces truncation below the max_tasks cap, the truncation notice
+        reflects post-cap survivors, not total active.
 
-        trimmed_count in the truncation notice must reflect only tasks surviving the
-        max_tasks cap (here: all 10), not the full active_tasks list.  With max_tasks=50
-        and 10 active tasks, every task survives the cap, so trimmed_count <= 10.
+        Regression guard for task 480 (esc-480-107).
         """
-        active = [_make_task(i, 'pending', f'Task title {i}') for i in range(1, 11)]
-        tree = FilteredTaskTree(
-            active_tasks=active,
-            done_count=0,
-            cancelled_count=0,
-            other_count=0,
-            total_count=10,
-        )
+        tree = self._make_tree(active_count=10, done_count=0, cancelled_count=0, other_count=0)
 
-        max_chars = 200
-        output = format_filtered_task_tree(tree, max_tasks=50, max_chars=max_chars)
+        # max_chars=240 is chosen so that three regimes all exercise in one pass:
+        #   (1) max_tasks=5 caps 10 active tasks to 5 post-cap survivors,
+        #   (2) budget = 240 - 118 (header) - 29 (summary) = 93 admits 2 task lines
+        #       at 37 chars each (36-char line + 1-char newline separator) before
+        #       the accumulator overflows,
+        #   (3) the lazy pop loop fires: first-pass result = 266 > 240, so one line
+        #       is popped, leaving kept_lines=[line1], trimmed_count=4, result=229 <= 240.
+        max_chars = 240
+        output = format_filtered_task_tree(tree, max_tasks=5, max_chars=max_chars)
 
         # Output must honour the char budget
         assert len(output) <= max_chars
@@ -324,11 +323,19 @@ class TestFormatFilteredTaskTree:
         assert match is not None, f'Expected truncation notice in output: {output!r}'
         trimmed_count = int(match.group(1))
 
-        # trimmed_count must reflect tasks surviving the max_tasks cap (= 10 here),
-        # not some inflated value tied to the full list.
-        assert trimmed_count <= 10, (
-            f'trimmed_count={trimmed_count} exceeds surviving task count (10); '
-            f'bug: trimmed_count tracks full list instead of post-cap survivors'
+        # At least one task line must survive the lazy pop loop — guards against the
+        # regression where the notice fires but kept_lines ends up empty.
+        assert '- [1]' in output, (
+            'Task 1 line should survive the lazy pop loop; '
+            'if missing, the budget accounting has regressed'
+        )
+
+        # trimmed_count must be bounded by the post-cap survivor count (5), not by
+        # total_active (10).  Bug mode: trimmed_count = total_active - len(kept_lines)
+        # = 10 - 1 = 9, which exceeds 5 and would fail this assertion.
+        assert trimmed_count <= 5, (
+            f'trimmed_count={trimmed_count} exceeds post-cap survivor count (5); '
+            f'bug: trimmed_count tracks total_active instead of len(active[:max_tasks])'
         )
 
     def test_empty_active_and_empty_tree(self):
