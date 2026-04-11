@@ -14,6 +14,21 @@ import re
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
 
+
+def _keywords_in_proximity(doc: str, kw1: str, kw2: str, max_distance: int = 200) -> bool:
+    """Return True iff kw1 and kw2 appear within max_distance chars of each other in doc.
+
+    Uses re.finditer to locate all occurrences of each keyword; returns True iff
+    the minimum pairwise character distance is strictly less than max_distance.
+    Immune to sentence-tokenisation artefacts like 'e.g.' or 'i.e.'.
+    """
+    pos1 = [m.start() for m in re.finditer(re.escape(kw1), doc)]
+    pos2 = [m.start() for m in re.finditer(re.escape(kw2), doc)]
+    if not pos1 or not pos2:
+        return False
+    return min(abs(p1 - p2) for p1 in pos1 for p2 in pos2) < max_distance
+
+
 # ---------------------------------------------------------------------------
 # Helper: _keywords_in_proximity
 # ---------------------------------------------------------------------------
