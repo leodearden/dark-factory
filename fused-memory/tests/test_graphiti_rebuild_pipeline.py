@@ -842,3 +842,20 @@ class TestCanonicalFactsCallerCoverage:
             'edge_count must reflect the raw number of edges supplied, '
             'not the filtered count.'
         )
+
+
+# ---------------------------------------------------------------------------
+# task-507: make_stale_list fixture contract tests
+# ---------------------------------------------------------------------------
+
+
+class TestMakeStaleListFixture:
+    """Direct contract tests for the make_stale_list factory fixture."""
+
+    def test_default_shape(self, make_stale_list):
+        """make_stale_list() with no args returns the standard Alice/Bob two-entity list."""
+        result = make_stale_list()
+        assert result == [
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
+        ]
