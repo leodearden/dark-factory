@@ -279,25 +279,34 @@ class TestHooksIntegration:
         Word-boundary regex r'\\bpython3(?:\\.\\d+)?\\b' accepts plain `python3`, versioned
         `python3.11`, and absolute paths like `/usr/bin/python3` or `/usr/bin/env python3`,
         while rejecting bare `python` (Python 2) or `mypython3` (word-boundary failure).
-        The `fused-memory/tests` assertion verifies the scan target is present on the same
-        invocation line, absorbing the purpose of the former existence-check test.
+
+        The `not line.lstrip().startswith('#')` filter excludes bash-style comment lines that
+        happen to mention the script name (e.g. `# See check_asyncmock_assertion_style.py`).
+        Without it, such a comment line would be included in invocation_lines and then fail
+        the python3/no-uv-run assertions, producing a spurious test failure on a benign edit.
+
+        The `fused-memory/tests` scan-target assertion is applied at file level (not per line)
+        so a future shell-variable refactor like `TESTS_DIR=fused-memory/tests; python3 .../check.py
+        "$TESTS_DIR"` does not break the test — the literal still appears in the hook file, just
+        not necessarily on the same line as the python3 invocation.
         """
         hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
         content = hooks_path.read_text(encoding='utf-8')
         invocation_lines = [
             line for line in content.splitlines()
             if 'check_asyncmock_assertion_style.py' in line
+            and not line.lstrip().startswith('#')
         ]
         assert invocation_lines, 'No invocation of check_asyncmock_assertion_style.py found in hooks/project-checks'
+        assert 'fused-memory/tests' in content, (
+            'Expected fused-memory/tests scan target to appear somewhere in hooks/project-checks'
+        )
         for line in invocation_lines:
             assert re.search(r'\bpython3(?:\.\d+)?\b', line), (
                 f'Expected a python3 token (plain, versioned, or absolute path), got: {line!r}'
             )
             assert 'uv run' not in line, (
                 f'Found uv run in asyncmock check invocation (should use plain python3): {line!r}'
-            )
-            assert 'fused-memory/tests' in line, (
-                f'Expected fused-memory/tests scan target on invocation line, got: {line!r}'
             )
 
     def test_script_runs_under_isolated_python3_proves_stdlib_only(self, tmp_path: Path):
