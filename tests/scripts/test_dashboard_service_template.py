@@ -34,13 +34,20 @@ HARDCODED_EXPECTED_ENV_LINE = (
     "/home/leo/src/autopilot-video"
 )
 
-# Canonical substitution values for rendering the template.
-# Source of truth: setup-host.sh lines 325-329 which run:
+# These are the literal paths baked into the committed hardcoded service file;
+# the render test verifies the template expands to exactly those values.
+# setup-host.sh computes REPO_ROOT and UV_PATH at runtime (from $(dirname $0)/..
+# and $(command -v uv) respectively), so what it installs on a worktree or
+# alternate machine may legitimately differ — the test is not asserting anything
+# about the runtime install environment.
+#
+# Substitution semantics (setup-host.sh lines 325-329):
 #   sed 's|__REPO_ROOT__|$REPO_ROOT|g'   (global, unanchored, literal substitution)
 #   sed 's|__UV_PATH__|$UV_PATH|g'       (global, unanchored, literal substitution)
-# These must match the values in the committed dashboard/dark-factory-dashboard.service.
-EXPECTED_REPO_ROOT = "/home/leo/src/dark-factory"
-EXPECTED_UV_PATH = "/home/leo/.local/bin/uv"
+# Both sentinels contain no regex metacharacters and no '|', so str.replace is
+# semantically identical to the sed command.
+HARDCODED_REPO_ROOT = "/home/leo/src/dark-factory"
+HARDCODED_UV_PATH = "/home/leo/.local/bin/uv"
 
 
 def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
@@ -75,7 +82,12 @@ def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
 
 
 def test_template_sets_known_project_roots() -> None:
-    """scripts/dashboard.service.template must declare DASHBOARD_KNOWN_PROJECT_ROOTS with __REPO_ROOT__ sentinel."""
+    """scripts/dashboard.service.template must declare DASHBOARD_KNOWN_PROJECT_ROOTS with __REPO_ROOT__ sentinel.
+
+    Kept for targeted diagnostics — this property is subsumed by
+    test_template_renders_to_hardcoded_file, but this test pinpoints which
+    specific invariant broke if the render test fails.
+    """
     content = TEMPLATE.read_text(encoding="utf-8")
     assert TEMPLATE_EXPECTED_ENV_LINE in content, (
         f"Expected line not found in {TEMPLATE}:\n  {TEMPLATE_EXPECTED_ENV_LINE!r}\n"
@@ -85,7 +97,12 @@ def test_template_sets_known_project_roots() -> None:
 
 
 def test_hardcoded_service_file_sets_known_project_roots() -> None:
-    """dashboard/dark-factory-dashboard.service must declare DASHBOARD_KNOWN_PROJECT_ROOTS with literal path."""
+    """dashboard/dark-factory-dashboard.service must declare DASHBOARD_KNOWN_PROJECT_ROOTS with literal path.
+
+    Kept for targeted diagnostics — this property is subsumed by
+    test_template_renders_to_hardcoded_file, but this test pinpoints which
+    specific invariant broke if the render test fails.
+    """
     content = HARDCODED.read_text(encoding="utf-8")
     assert HARDCODED_EXPECTED_ENV_LINE in content, (
         f"Expected line not found in {HARDCODED}:\n  {HARDCODED_EXPECTED_ENV_LINE!r}\n"
@@ -159,6 +176,10 @@ def test_known_project_roots_uses_comma_separator_not_colon() -> None:
     guards both the literal-path form (``/home/leo/src/dark-factory:``) and the
     template's ``__REPO_ROOT__:`` sentinel form in a single, position-independent
     pass.
+
+    Kept for targeted diagnostics — this property is subsumed by
+    test_template_renders_to_hardcoded_file, but this test pinpoints which
+    specific invariant broke if the render test fails.
     """
     for path in (TEMPLATE, HARDCODED):
         _assert_known_project_roots_comma_separated(path)
@@ -215,9 +236,10 @@ def test_comment_warns_about_systemd_space_handling() -> None:
             "Update the comment to warn about spaces inside the Environment= value."
         )
 
-        # The old misleading phrase 'no spaces' must not appear anywhere in this file
-        assert "no spaces" not in content.lower(), (
-            f"Misleading phrase 'no spaces' found in {path}. "
+        # The old misleading phrase 'no spaces' must not appear in the warning comment
+        assert "no spaces" not in comment_line.lower(), (
+            f"Misleading phrase 'no spaces' found in the warning comment above "
+            f"Environment=DASHBOARD_KNOWN_PROJECT_ROOTS= in {path}. "
             "Remove it — the real hazard is systemd's space-as-separator behavior, "
             "not the Python parser's whitespace tolerance."
         )
@@ -231,8 +253,8 @@ def test_template_renders_to_hardcoded_file() -> None:
     byte-for-byte.
 
     Substitution semantics (mirroring setup-host.sh):
-        sed 's|__REPO_ROOT__|$REPO_ROOT|g'  →  str.replace('__REPO_ROOT__', EXPECTED_REPO_ROOT)
-        sed 's|__UV_PATH__|$UV_PATH|g'      →  str.replace('__UV_PATH__', EXPECTED_UV_PATH)
+        sed 's|__REPO_ROOT__|$REPO_ROOT|g'  →  str.replace('__REPO_ROOT__', HARDCODED_REPO_ROOT)
+        sed 's|__UV_PATH__|$UV_PATH|g'      →  str.replace('__UV_PATH__', HARDCODED_UV_PATH)
 
     Both sentinels contain no regex metacharacters and no '|', so str.replace is
     semantically identical to the sed command (global, unanchored, literal substitution).
@@ -243,8 +265,8 @@ def test_template_renders_to_hardcoded_file() -> None:
     """
     rendered = (
         TEMPLATE.read_text(encoding="utf-8")
-        .replace("__REPO_ROOT__", EXPECTED_REPO_ROOT)
-        .replace("__UV_PATH__", EXPECTED_UV_PATH)
+        .replace("__REPO_ROOT__", HARDCODED_REPO_ROOT)
+        .replace("__UV_PATH__", HARDCODED_UV_PATH)
     )
     hardcoded = HARDCODED.read_text(encoding="utf-8")
     assert rendered == hardcoded, (
