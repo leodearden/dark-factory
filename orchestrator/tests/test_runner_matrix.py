@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -344,7 +346,7 @@ class TestRunEvalMatrixCancellation:
         # rather than a silent regression guard.
         _collect_cancel_calls: list[None] = []
 
-        def _fake_collect_cancel_errors(_done: set) -> list[asyncio.CancelledError]:
+        def _fake_collect_cancel_errors(_done: Iterable[asyncio.Task[Any]]) -> list[asyncio.CancelledError]:
             _collect_cancel_calls.append(None)
             return [ce_a, ce_b]
 
