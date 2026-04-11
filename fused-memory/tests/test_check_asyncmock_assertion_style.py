@@ -207,3 +207,15 @@ class TestCliExitCodes:
         assert ':3:' in output
         assert 'assert_not_awaited' in output
         assert 'assert_not_called' in output
+
+    def test_cli_main_exits_zero_on_clean_file(self, tmp_path: Path):
+        """Clean file (styles in different functions) → returncode 0, stdout empty."""
+        clean_file = tmp_path / 'test_clean.py'
+        clean_file.write_text(_CLEAN_SOURCE_DIFFERENT_FUNCS)
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), str(clean_file)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert result.stdout == ''
