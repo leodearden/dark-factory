@@ -170,7 +170,8 @@ class TimeoutsConfig(BaseModel):
     grace period that controls how long the workflow waits for the steward to
     drain the escalation queue after task completion.  Keep ``steward`` ≥
     ``steward_completion_timeout`` so individual invocations are not silently
-    cut short inside the grace window.
+    cut short inside the grace window.  This invariant is enforced at
+    construction time by a ``model_validator`` on ``OrchestratorConfig``.
     """
 
     architect: float = Field(default=2400.0)
@@ -437,6 +438,17 @@ class OrchestratorConfig(BaseSettings):
     @model_validator(mode='after')
     def _resolve_project_root(self) -> 'OrchestratorConfig':
         self.project_root = self.project_root.resolve()
+        return self
+
+    @model_validator(mode='after')
+    def _validate_steward_timeout_invariant(self) -> 'OrchestratorConfig':
+        if self.timeouts.steward < self.steward_completion_timeout:
+            raise ValueError(
+                f'timeouts.steward ({self.timeouts.steward}) must be >= '
+                f'steward_completion_timeout ({self.steward_completion_timeout}); '
+                'a smaller per-invocation wall-clock would silently cut the steward '
+                'short inside the grace window.'
+            )
         return self
 
     def for_module(self, module_path: str) -> ModuleConfig | None:
