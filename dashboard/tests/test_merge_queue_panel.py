@@ -59,10 +59,15 @@ def _extract_inline_script(html: str) -> str:
     """Extract the body of the first inline <script> block from rendered HTML.
 
     Used by TestMergeQueueListenerLifecycle to scope assertions against the
-    partial's own <script> block rather than the full response text.  This
-    prevents spurious failures if the route ever wraps the partial in a
-    base layout that itself contains document.addEventListener calls (e.g.
-    the alpine:init listener in base.html / burndown.html / costs.html).
+    partial's own <script> block rather than the full response text.
+
+    Note: this returns the *first* <script> block by position in the document.
+    Today /partials/merge-queue returns only the partial with no layout wrapper,
+    so the first <script> is the partial's own.  If the route ever gains a
+    layout wrapper whose <script> appears earlier in the document (e.g. the
+    alpine:init listener in base.html / burndown.html / costs.html), this helper
+    would need to be updated to select by a partial-specific marker (e.g.
+    ``'mergeQueueDepthChart'``) rather than by position.
     """
     match = re.search(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
     assert match is not None, 'No inline <script> block found in response HTML'
@@ -298,26 +303,35 @@ class TestMergeQueueListenerLifecycle:
         """renderAll() must be called directly within the IIFE so charts render
         after an htmx swap (when DOMContentLoaded has already fired).
 
-        The old assertion ``assert 'renderAll()' in resp.text`` was tautological:
-        the substring 'renderAll()' also appears inside the function definition
-        ``function renderAll() {``, so deleting the direct-invocation line would
-        not have caused it to fail.
+        The old assertion used ``'renderAll()' in resp.text`` (no semicolon),
+        which was tautological: the substring ``renderAll()`` also appears inside
+        the function definition line ``function renderAll() {``, so deleting the
+        direct-invocation line would not have caused it to fail.  A previous
+        belt-and-suspenders ``resp.text.count('renderAll()') >= 2`` counted both
+        the definition and the call (both contain the no-semicolon form), but was
+        fragile to drift from HTML comments or documentation text that happened to
+        mention ``renderAll()``.
 
-        The trailing-semicolon form ``renderAll();`` is the disambiguator: the
-        definition line ends with `` {``, not ``;``, so only the actual call site
-        contains the semicoloned form.  ``count == 1`` is strictly tighter than
-        ``>= 2``: it catches the original regression (no direct invocation →
-        count becomes 0) AND prevents accidental double-invocation, AND is immune
-        to drift from HTML comments or documentation text that happens to mention
-        ``renderAll()``.
+        The new assertions use two distinct substrings — note the substring
+        changed, not just the bound:
 
-        Both assertions are scoped to the partial's own inline <script> block via
+        * ``'function renderAll()'`` — matches only the definition line (ends
+          with `` {``), confirming the function is actually declared in the script.
+        * ``'renderAll();'`` — the trailing semicolon form matches only the direct
+          call site (the definition line ends with `` {``, not ``;``).
+          ``count == 1`` asserts exactly one direct invocation, catching the
+          original regression (no call → count becomes 0) and preventing
+          accidental double-invocation.
+
+        Both checks are scoped to the partial's own inline <script> block via
         _extract_inline_script to avoid false failures from any outer layout.
         """
         with _patch_merge_queue_data():
             resp = client.get('/partials/merge-queue')
         assert resp.status_code == 200
         script_body = _extract_inline_script(resp.text)
-        # Exactly one direct invocation of renderAll() must appear in the script.
-        # Trailing semicolon uniquely identifies the call site vs. the definition.
+        # The function must be defined (not just imported or referenced externally).
+        assert 'function renderAll()' in script_body
+        # Exactly one direct invocation must appear; trailing semicolon is the
+        # disambiguator that excludes the definition line.
         assert script_body.count('renderAll();') == 1
