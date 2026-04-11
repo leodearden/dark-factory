@@ -254,6 +254,38 @@ def test_parse_pyright_packages_returns_empty_list_when_declared_empty() -> None
     )
 
 
+def test_parse_pyright_packages_handles_line_continuations() -> None:
+    """_parse_pyright_packages correctly parses a Bash array written with line continuations.
+
+    A multi-line PYRIGHT_PACKAGES declaration using ``\\`` continuation tokens:
+
+        PYRIGHT_PACKAGES=( \\
+            fused-memory \\
+            orchestrator \\
+            dashboard \\
+        )
+
+    must return ['fused-memory', 'orchestrator', 'dashboard'] without stray
+    '\\\\' tokens in the result.  Without normalization, .split() on the captured
+    body leaves stray '\\\\' tokens and the result would be
+    ['\\\\', 'fused-memory', '\\\\', 'orchestrator', '\\\\', 'dashboard', '\\\\'],
+    which would hide a real regression because 'orchestrator' happens to survive
+    the split even with the stray tokens.
+    """
+    content = (
+        "PYRIGHT_PACKAGES=( \\\n"
+        "    fused-memory \\\n"
+        "    orchestrator \\\n"
+        "    dashboard \\\n"
+        ")\n"
+    )
+    result = _parse_pyright_packages(content)
+    assert result == ["fused-memory", "orchestrator", "dashboard"], (
+        f"Expected ['fused-memory', 'orchestrator', 'dashboard'], got {result!r}. "
+        "Line-continuation tokens ('\\\\') must be stripped from the result."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unit tests for _hook_invokes_pyright_in_loop helper
 # ---------------------------------------------------------------------------
