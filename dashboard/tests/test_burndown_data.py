@@ -1269,3 +1269,195 @@ class TestAssertSnapshotCounts:
 
         result = _assert_snapshot_counts(row)  # all defaults are 0
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator-discovery failure isolation (#12)
+# ---------------------------------------------------------------------------
+
+
+class TestCollectSnapshotOrchestratorDiscoveryFailure:
+    """Verify that orchestrator-discovery failures degrade gracefully.
+
+    These tests are written in TDD red-phase for step-2 of task 539.  They
+    fail before the try/except is added around the orchestrator-discovery block
+    because the current code lets exceptions propagate out of that block,
+    aborting the entire snapshot — including the main project and
+    known_project_roots rows that were not responsible for the failure.
+    """
+
+    @pytest.mark.asyncio
+    async def test_find_running_orchestrators_raises_preserves_main_and_known_roots(
+        self, burndown_env, caplog
+    ):
+        """RuntimeError from find_running_orchestrators must not abort the snapshot.
+
+        After the fix, collect_snapshot must: not raise; commit the main
+        project row; commit the known_project_roots row; and emit a WARNING
+        naming orchestrator discovery (with exc_info).
+        """
+        import logging
+
+        db_path, base_config, conn = burndown_env
+        known_root = Path('/fake/project/orch_disc_test_a')
+        config = DashboardConfig(
+            project_root=base_config.project_root,
+            known_project_roots=[known_root],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        known_tasks = [{'status': 'done'}]
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            known_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': known_tasks,
+        }
+
+        with (
+            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+            patch(
+                'dashboard.data.burndown.find_running_orchestrators',
+                side_effect=RuntimeError('subprocess exploded'),
+            ),
+            caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+        ):
+            # Must NOT raise despite find_running_orchestrators raising
+            await collect_snapshot(conn, config)
+
+        async with conn.execute('SELECT project_id FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
+
+        project_ids = {row['project_id'] for row in rows}
+        assert len(rows) == 2, f'Expected 2 rows, got {len(rows)}: {project_ids}'
+        assert str(base_config.project_root) in project_ids
+        assert str(known_root.resolve()) in project_ids
+
+        # A WARNING naming orchestrator discovery must be logged with exc_info
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'Expected at least one WARNING for orchestrator discovery failure'
+        combined = ' '.join(r.getMessage() for r in warning_records)
+        assert 'orchestrator' in combined.lower(), (
+            f'Expected "orchestrator" in warning message, got: {combined!r}'
+        )
+        assert any(r.exc_info for r in warning_records)
+
+    @pytest.mark.asyncio
+    async def test_resolve_project_root_raises_preserves_main_and_known_roots(
+        self, burndown_env, caplog
+    ):
+        """OSError from _resolve_project_root inside the orchestrator loop must not abort the snapshot.
+
+        A PRD-based orchestrator entry whose _resolve_project_root raises must be
+        skipped; the main project and known_project_roots rows must still be
+        committed, and a WARNING must be logged naming orchestrator discovery.
+        """
+        import logging
+
+        db_path, base_config, conn = burndown_env
+        known_root = Path('/fake/project/orch_disc_test_b')
+        config = DashboardConfig(
+            project_root=base_config.project_root,
+            known_project_roots=[known_root],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        known_tasks = [{'status': 'done'}]
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            known_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': known_tasks,
+        }
+
+        # Orchestrator has a prd entry; _resolve_project_root will raise
+        fake_orchestrators = [{'prd': 'fake_prd.md', 'config_path': None}]
+
+        with (
+            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+            patch(
+                'dashboard.data.burndown.find_running_orchestrators',
+                return_value=fake_orchestrators,
+            ),
+            patch(
+                'dashboard.data.burndown._resolve_project_root',
+                side_effect=OSError('prd path not found'),
+            ),
+            caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+        ):
+            # Must NOT raise despite _resolve_project_root raising inside the loop
+            await collect_snapshot(conn, config)
+
+        async with conn.execute('SELECT project_id FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
+
+        project_ids = {row['project_id'] for row in rows}
+        assert len(rows) == 2, f'Expected 2 rows, got {len(rows)}: {project_ids}'
+        assert str(base_config.project_root) in project_ids
+        assert str(known_root.resolve()) in project_ids
+
+        # A WARNING naming orchestrator discovery must be logged with exc_info
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'Expected at least one WARNING for orchestrator discovery failure'
+        combined = ' '.join(r.getMessage() for r in warning_records)
+        assert 'orchestrator' in combined.lower(), (
+            f'Expected "orchestrator" in warning message, got: {combined!r}'
+        )
+        assert any(r.exc_info for r in warning_records)
+
+    @pytest.mark.asyncio
+    async def test_read_project_root_from_config_raises_preserves_main_and_known_roots(
+        self, burndown_env, caplog
+    ):
+        """OSError from _read_project_root_from_config inside the orchestrator loop must not abort the snapshot.
+
+        A config_path-based orchestrator entry whose _read_project_root_from_config
+        raises must be skipped; the main project and known_project_roots rows must
+        still be committed, and a WARNING must be logged naming orchestrator discovery.
+        """
+        import logging
+
+        db_path, base_config, conn = burndown_env
+        known_root = Path('/fake/project/orch_disc_test_c')
+        config = DashboardConfig(
+            project_root=base_config.project_root,
+            known_project_roots=[known_root],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        known_tasks = [{'status': 'done'}]
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            known_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': known_tasks,
+        }
+
+        # Orchestrator has a config_path entry; _read_project_root_from_config will raise
+        fake_orchestrators = [{'prd': None, 'config_path': '/fake/orchestrator.yaml'}]
+
+        with (
+            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+            patch(
+                'dashboard.data.burndown.find_running_orchestrators',
+                return_value=fake_orchestrators,
+            ),
+            patch(
+                'dashboard.data.burndown._read_project_root_from_config',
+                side_effect=OSError('YAML parse error'),
+            ),
+            caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+        ):
+            # Must NOT raise despite _read_project_root_from_config raising inside the loop
+            await collect_snapshot(conn, config)
+
+        async with conn.execute('SELECT project_id FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
+
+        project_ids = {row['project_id'] for row in rows}
+        assert len(rows) == 2, f'Expected 2 rows, got {len(rows)}: {project_ids}'
+        assert str(base_config.project_root) in project_ids
+        assert str(known_root.resolve()) in project_ids
+
+        # A WARNING naming orchestrator discovery must be logged with exc_info
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'Expected at least one WARNING for orchestrator discovery failure'
+        combined = ' '.join(r.getMessage() for r in warning_records)
+        assert 'orchestrator' in combined.lower(), (
+            f'Expected "orchestrator" in warning message, got: {combined!r}'
+        )
+        assert any(r.exc_info for r in warning_records)
