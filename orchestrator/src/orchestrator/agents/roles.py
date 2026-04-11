@@ -477,17 +477,22 @@ Post-merge improvement suggestions from automated code reviewers.
 **Pre-triaged format:** When the escalation detail starts with `## Pre-Triaged Results`,
 classification has already been done by a triage agent. Do NOT re-classify. Instead:
 1. For each entry in `proposed_task_groups`: create a task via `add_task` with the
-   group's title, description, and `metadata={"source": "steward-triage", "modules": [...]}`
-   using the file paths listed in the group.
+   group's title, description, and `metadata={"source": "steward-triage",
+   "spawn_context": "steward-triage", "spawned_from": "<task_id under review>",
+   "modules": [...]}` using the file paths listed in the group. Populate `spawned_from`
+   with the id of the task that produced the escalation (it is in the escalation detail
+   under `task_id`).
 2. For notable conventions among accepted items: write via `add_memory`
    with category `preferences_and_norms`.
 3. Call `resolve_issue` summarizing: N tasks created, M conventions written, K skipped.
 
 **Raw format (fallback):** When the detail is a raw JSON array, triage each suggestion as:
 - **create_task** — Substantial improvement worth a follow-up task. Create via `add_task`
-  with `metadata={"source": "steward-triage", "modules": ["path/to/module", ...]}`.
+  with `metadata={"source": "steward-triage", "spawn_context": "steward-triage",
+  "spawned_from": "<task_id under review>", "modules": ["path/to/module", ...]}`.
   Include the code modules (directory paths relative to project root) that this task will
-  need to modify — these are used for concurrency locking.
+  need to modify — these are used for concurrency locking. `spawned_from` lets the task
+  curator spot duplicates against the original task's details.
 - **convention** — Pattern-level insight for future agents. Write via `add_memory`
   with category `preferences_and_norms`.
 - **dismiss** — Not actionable, already covered, or noise.
@@ -617,9 +622,11 @@ Use the `add_task` MCP tool. Always include:
 - `title`: concise description of the fix
 - `description`: what's wrong, where, and the suggested approach
 - `priority`: "high" for broken wiring/stubs, "medium" for consistency issues
-- `metadata`: `{"source": "review-cycle", "review_id": "<from your prompt>", "modules": ["path/to/module", ...]}`
+- `metadata`: `{"source": "review-cycle", "spawn_context": "review",
+  "review_id": "<from your prompt>", "modules": ["path/to/module", ...]}`
   Include the code modules (directory paths relative to project root) that this task will need to modify.
   These are used for concurrency locking — be specific and include both source and test directories.
+  `spawn_context` tells the task curator how to treat duplicates against the existing backlog.
 - `project_root`: use the value from your Agent Identity section
 
 ### Escalating ambiguous findings
