@@ -57,24 +57,38 @@ MOCK_SPEC = {
 
 _UNSET = object()
 
+# Sentinel used by _extract_inline_script to locate the merge-queue partial's
+# own <script> block.  This is the canvas id referenced inside the partial's
+# inline script (merge_queue.html: getOrDestroyChart('mergeQueueDepthChart')).
+# It is unique to this partial and does not appear in any other template's
+# script body, making it a reliable discriminator even if the route is later
+# wrapped in a layout that prepends additional <script> blocks.
+_PARTIAL_SCRIPT_SENTINEL = 'mergeQueueDepthChart'
+
 
 def _extract_inline_script(html: str) -> str:
-    """Extract the body of the first inline <script> block from rendered HTML.
+    """Extract the body of the merge-queue partial's inline <script> block.
 
-    Used by TestMergeQueueListenerLifecycle to scope assertions against the
-    partial's own <script> block rather than the full response text.
+    Uses marker-based selection: iterates all ``<script>`` blocks in the HTML
+    and returns the first whose body contains ``_PARTIAL_SCRIPT_SENTINEL``
+    (``'mergeQueueDepthChart'`` — the canvas id unique to this partial).
 
-    Note: this returns the *first* <script> block by position in the document.
-    Today /partials/merge-queue returns only the partial with no layout wrapper,
-    so the first <script> is the partial's own.  If the route ever gains a
-    layout wrapper whose <script> appears earlier in the document (e.g. the
-    alpine:init listener in base.html / burndown.html / costs.html), this helper
-    would need to be updated to select by a partial-specific marker (e.g.
-    ``'mergeQueueDepthChart'``) rather than by position.
+    This approach is immune to future layout-wrapper changes that prepend other
+    script blocks (e.g. the alpine:init listener in base.html / burndown.html /
+    costs.html): those scripts will not contain the sentinel and are skipped.
+    As a side benefit, ``<script>`` tags embedded inside HTML comments are also
+    naturally skipped because their bodies typically do not carry the sentinel.
+
+    Raises ``AssertionError`` if no sentinel-bearing script block is found, so
+    failures surface a clear message rather than a downstream ``AttributeError``.
     """
-    match = re.search(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
-    assert match is not None, 'No inline <script> block found in response HTML'
-    return match.group(1)
+    for m in re.finditer(r'<script[^>]*>(.*?)</script>', html, re.DOTALL):
+        if _PARTIAL_SCRIPT_SENTINEL in m.group(1):
+            return m.group(1)
+    raise AssertionError(
+        f'No inline <script> block containing sentinel {_PARTIAL_SCRIPT_SENTINEL!r}'
+        ' found in response HTML'
+    )
 
 
 def _patch_merge_queue_data(
