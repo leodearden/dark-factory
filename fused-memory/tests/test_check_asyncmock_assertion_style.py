@@ -219,3 +219,31 @@ class TestCliExitCodes:
         )
         assert result.returncode == 0
         assert result.stdout == ''
+
+
+class TestCliDirectoryScan:
+    """Directory-mode scans test_*.py and conftest.py recursively, ignores other .py files."""
+
+    def test_cli_main_recursively_scans_directory_for_test_files_and_conftest(
+        self, tmp_path: Path
+    ):
+        """Dir scan: test_example.py + conftest.py flagged; other_file.py ignored."""
+        subdir = tmp_path / 'sub'
+        subdir.mkdir()
+
+        # Should be scanned and violate
+        (subdir / 'test_example.py').write_text(_MIXED_STYLE_SOURCE)
+        (subdir / 'conftest.py').write_text(_MIXED_STYLE_SOURCE)
+        # Should NOT be scanned (not a test_*.py or conftest.py)
+        (subdir / 'other_file.py').write_text(_MIXED_STYLE_SOURCE)
+
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1
+        output = result.stdout
+        assert 'test_example.py' in output
+        assert 'conftest.py' in output
+        assert 'other_file.py' not in output
