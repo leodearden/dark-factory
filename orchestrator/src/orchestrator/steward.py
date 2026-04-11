@@ -49,6 +49,7 @@ class StewardMetrics:
     total_duration_ms: int = 0
     escalations_handled: int = 0
     escalations_reescalated: int = 0
+    timeouts_recovered: int = 0
 
 
 class TaskSteward:
@@ -303,6 +304,18 @@ class TaskSteward:
                     'account_name': result.account_name,
                 },
             )
+
+        # Timeout-kill: treat as recoverable — do NOT consume retry budget.
+        # The escalation remains pending so the run loop re-queues it naturally.
+        if _is_timeout_kill(result):
+            self.metrics.timeouts_recovered += 1
+            logger.warning(
+                f'Steward for task {self.task_id}: invocation timed out after '
+                f'{self.config.timeouts.steward:.0f}s — treating as recoverable, '
+                f'retry_count NOT incremented (escalation remains pending: '
+                f'{escalation.id})'
+            )
+            return
 
         # Patch resolution metadata
         self._patch_resolution_metadata(escalation.id, result)
@@ -564,3 +577,26 @@ def _strip_hash_prefix(detail: str) -> str:
     if detail.startswith('#hash:') and '#' in detail[6:]:
         return detail[detail.index('#', 6) + 1:]
     return detail
+
+
+def _is_timeout_kill(result) -> bool:
+    """Return True when *result* represents a process killed by a wall-clock timeout.
+
+    Matches stderr patterns emitted by both subprocess paths:
+    - ``shared/src/shared/cli_invoke.py`` (SIGTERM+SIGKILL / SIGTERM)
+    - ``orchestrator/src/orchestrator/agents/invoke.py`` (codex/gemini local)
+
+    Examples::
+
+        'Process killed after 900.0s timeout (SIGTERM+SIGKILL)'
+        'Process terminated after 900.0s timeout (SIGTERM); stream closed'
+        'Process killed after 900.0s timeout'
+    """
+    if result.success:
+        return False
+    stderr = result.stderr or ''
+    has_marker = (
+        'Process killed after' in stderr
+        or 'Process terminated after' in stderr
+    )
+    return has_marker and 'timeout' in stderr
