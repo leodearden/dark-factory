@@ -11,6 +11,7 @@ from orchestrator.config import (
     ConfigRequiredError,
     ModuleConfig,
     OrchestratorConfig,
+    TimeoutsConfig,
     _deep_merge,
     _discover_module_configs,
     load_config,
@@ -284,7 +285,7 @@ class TestStewardTimeoutInvariant:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError, match='steward'):
-            OrchestratorConfig(steward_completion_timeout=900.0, timeouts={'steward': 600.0})
+            OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=600.0))
 
     def test_yaml_load_violation_raises_validation_error(self, tmp_path, monkeypatch):
         """Loading a YAML config with timeouts.steward < steward_completion_timeout raises ValidationError."""
@@ -302,12 +303,12 @@ class TestStewardTimeoutInvariant:
         """timeouts.steward == steward_completion_timeout is valid (invariant is >=, not strict >)."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        config = OrchestratorConfig(steward_completion_timeout=900.0, timeouts={'steward': 900.0})
+        config = OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=900.0))
         assert config.timeouts.steward == config.steward_completion_timeout
 
     def test_greater_value_allowed(self, monkeypatch, tmp_path):
         """timeouts.steward > steward_completion_timeout is valid."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        config = OrchestratorConfig(steward_completion_timeout=900.0, timeouts={'steward': 1800.0})
+        config = OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=1800.0))
         assert config.timeouts.steward > config.steward_completion_timeout
