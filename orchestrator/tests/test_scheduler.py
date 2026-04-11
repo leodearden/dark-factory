@@ -1322,3 +1322,27 @@ class TestSchedulerInternalRouting:
         with patch.object(scheduler, 'get_cached_status', wraps=scheduler.get_cached_status) as spy:
             await scheduler.set_task_status('42', 'done')
             spy.assert_called_with('42')
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_reads_via_get_cached_status(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """get_tasks() must read the cached value via get_cached_status() for reinstatement detection."""
+        import json
+        scheduler._status_cache['42'] = 'cancelled'
+
+        tasks_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': json.dumps({'tasks': [{'id': '42', 'status': 'pending', 'title': 'T'}]}),
+                    }
+                ]
+            }
+        }
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value=tasks_response))
+
+        with patch.object(scheduler, 'get_cached_status', wraps=scheduler.get_cached_status) as spy:
+            await scheduler.get_tasks()
+            spy.assert_any_call('42')
