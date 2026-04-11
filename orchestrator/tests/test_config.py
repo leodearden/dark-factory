@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from orchestrator.config import (
     ConfigRequiredError,
@@ -272,3 +273,40 @@ class TestPathResolution:
         resolved = (config.project_root / config.fused_memory.config_path).resolve()
         assert str(resolved).startswith(str(tmp_path))
         assert '..' not in resolved.parts
+
+
+class TestStewardTimeoutInvariant:
+    """OrchestratorConfig must reject configs where timeouts.steward < steward_completion_timeout."""
+
+    def test_direct_init_violation_raises_validation_error(self, monkeypatch, tmp_path):
+        """Directly instantiating OrchestratorConfig with a violating config raises ValidationError."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        with pytest.raises(ValidationError, match='steward'):
+            OrchestratorConfig(steward_completion_timeout=900.0, timeouts={'steward': 600.0})
+
+    def test_yaml_load_violation_raises_validation_error(self, tmp_path, monkeypatch):
+        """Loading a YAML config with timeouts.steward < steward_completion_timeout raises ValidationError."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        bad_yaml = tmp_path / 'bad.yaml'
+        bad_yaml.write_text(yaml.dump({
+            'timeouts': {'steward': 600.0},
+            'steward_completion_timeout': 900.0,
+        }))
+        with pytest.raises(ValidationError, match='steward'):
+            load_config(bad_yaml)
+
+    def test_equal_values_allowed(self, monkeypatch, tmp_path):
+        """timeouts.steward == steward_completion_timeout is valid (invariant is >=, not strict >)."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig(steward_completion_timeout=900.0, timeouts={'steward': 900.0})
+        assert config.timeouts.steward == config.steward_completion_timeout
+
+    def test_greater_value_allowed(self, monkeypatch, tmp_path):
+        """timeouts.steward > steward_completion_timeout is valid."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig(steward_completion_timeout=900.0, timeouts={'steward': 1800.0})
+        assert config.timeouts.steward > config.steward_completion_timeout
