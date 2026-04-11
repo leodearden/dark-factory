@@ -17,6 +17,8 @@ from shared.cli_invoke import (
     CAP_HIT_RESUME_PROMPT,
     AgentResult,
     _SubprocessResult,
+    _parse_claude_output,
+    _run_subprocess,
     _to_token_count,
     invoke_claude_agent,
     invoke_with_cap_retry,
@@ -1142,3 +1144,115 @@ class TestVllmBridgeActivation:
         mock_instance.stop.assert_awaited_once()
         # subprocess was never reached (start raised before _run_subprocess)
         assert not captured_kwargs
+
+
+# ── _run_subprocess timed_out flag ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestRunSubprocessTimedOut:
+
+    async def test_run_subprocess_sets_timed_out_on_sigkill_branch(self, tmp_path):
+        """_run_subprocess sets timed_out=True on the SIGTERM+SIGKILL branch."""
+        proc = MagicMock()
+        # Both communicate() calls raise TimeoutError → SIGTERM+SIGKILL path
+        proc.communicate = AsyncMock(side_effect=TimeoutError)
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = None
+        proc.pid = 12345
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
+            )
+
+        assert result.timed_out is True
+        assert result.returncode != 0
+        assert 'SIGTERM+SIGKILL' in result.stderr
+
+    async def test_run_subprocess_sets_timed_out_on_sigterm_grace_branch(self, tmp_path):
+        """_run_subprocess sets timed_out=True on the SIGTERM-grace branch."""
+        valid_json = json.dumps({
+            'result': 'ok',
+            'subtype': 'success',
+            'cost_usd': 0.01,
+            'duration_ms': 100,
+            'num_turns': 1,
+            'session_id': 'sess-grace',
+        }).encode()
+
+        call_count = 0
+
+        async def communicate_side_effect(input=None):  # noqa: A002
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise TimeoutError
+            # Second call (post-SIGTERM grace) returns normally
+            return (valid_json, b'')
+
+        proc = MagicMock()
+        proc.communicate = AsyncMock(side_effect=communicate_side_effect)
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = 0
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
+            )
+
+        assert result.timed_out is True
+        assert 'Process terminated after' in result.stderr
+        assert result.returncode == 0  # grace path preserves returncode
+
+
+# ── _parse_claude_output threads timed_out ────────────────────────────────
+
+
+class TestParseClaudeOutputThreadsTimedOut:
+
+    def test_timed_out_threads_through_empty_stdout_path(self):
+        """_parse_claude_output propagates timed_out=True for empty-stdout result."""
+        sub = _SubprocessResult(stdout='', stderr='timeout stderr', returncode=1,
+                                duration_ms=100, timed_out=True)
+        agent = _parse_claude_output(sub)
+        assert agent.timed_out is True
+
+    def test_timed_out_threads_through_json_decode_error_path(self):
+        """_parse_claude_output propagates timed_out=True for non-JSON stdout."""
+        sub = _SubprocessResult(stdout='not valid json', stderr='', returncode=1,
+                                duration_ms=100, timed_out=True)
+        agent = _parse_claude_output(sub)
+        assert agent.timed_out is True
+
+    def test_timed_out_threads_through_normal_parse_path(self):
+        """_parse_claude_output propagates timed_out=True for valid JSON result."""
+        valid_json = json.dumps({
+            'result': 'ok',
+            'subtype': 'success',
+            'cost_usd': 0.01,
+            'duration_ms': 100,
+            'num_turns': 1,
+            'session_id': 'sess-test',
+        })
+        sub = _SubprocessResult(stdout=valid_json, stderr='', returncode=0,
+                                duration_ms=100, timed_out=True)
+        agent = _parse_claude_output(sub)
+        assert agent.timed_out is True
+
+    def test_timed_out_false_passes_through(self):
+        """_parse_claude_output propagates timed_out=False (negative case)."""
+        sub = _SubprocessResult(stdout='', stderr='some error', returncode=1,
+                                duration_ms=100, timed_out=False)
+        agent = _parse_claude_output(sub)
+        assert agent.timed_out is False
