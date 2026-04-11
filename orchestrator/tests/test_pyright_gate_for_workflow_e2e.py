@@ -45,6 +45,23 @@ def _parse_pyright_packages(content: str) -> list[str] | None:
     return match.group(1).split() if match else None
 
 
+def _hook_invokes_pyright_in_loop(content: str) -> bool:
+    """Return True iff ``uv run pyright`` appears inside a PYRIGHT_PACKAGES for-loop.
+
+    Captures the body of the ``for pkg in "${PYRIGHT_PACKAGES[@]}"; do ... done``
+    block using ``re.DOTALL`` and checks that ``uv run pyright`` is present
+    *inside* the captured body.  A stray ``uv run pyright`` elsewhere in the
+    file (e.g. in a comment) does not falsely pass, and a loop that iterates
+    PYRIGHT_PACKAGES but calls some other command inside fails correctly.
+    """
+    _LOOP_PATTERN = re.compile(
+        r'for\s+\w+\s+in\s+"\$\{PYRIGHT_PACKAGES\[@\]\}"\s*;\s*do(.*?)done',
+        re.DOTALL,
+    )
+    match = _LOOP_PATTERN.search(content)
+    return bool(match and "uv run pyright" in match.group(1))
+
+
 # ---------------------------------------------------------------------------
 # (a) Sanity: [tool.pyright] section exists in orchestrator/pyproject.toml
 # ---------------------------------------------------------------------------
