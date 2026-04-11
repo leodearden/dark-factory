@@ -820,6 +820,14 @@ class GraphitiBackend:
         Summary regeneration uses simple fact concatenation (deduped), consistent
         with Graphiti's own _extract_entity_summaries_batch pattern — no LLM call.
 
+        For bulk use see ``_rebuild_entity_from_edges``, which accepts
+        caller-supplied edges, name, and old_summary to avoid per-entity
+        ``get_node_text`` and ``get_valid_edges_for_node`` round-trips when
+        rebuilding many entities at once.  The two methods are an intentional
+        fork: ``refresh_entity_summary`` is self-contained for single-entity
+        callers; ``_rebuild_entity_from_edges`` is batch-internal and consumes
+        pre-fetched data from the ``rebuild_entity_summaries`` pipeline.
+
         Args:
             node_uuid: UUID of the Entity node to refresh.
             group_id: Project graph to target.
@@ -1012,9 +1020,11 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            List of dicts (one per stale entity) with keys: uuid, name,
+            List of dicts (one per stale entity) with keys: uuid, name, summary,
             duplicate_count, stale_line_count, valid_fact_count,
-            summary_line_count.
+            summary_line_count. The ``summary`` key holds the current
+            (pre-rebuild) entity summary text so callers can diff it against
+            the canonical fact set without a second DB query.
         """
         result = await self._detect_stale_summaries_with_edges(group_id=group_id)
         return result.stale
@@ -1027,6 +1037,13 @@ class GraphitiBackend:
 
         Accepts the edges already fetched by the bulk call, avoiding a
         per-entity get_valid_edges_for_node round-trip.
+
+        For single-entity use (not bulk) see ``refresh_entity_summary``, which
+        fetches its own name/old_summary via ``get_node_text`` and its own valid
+        edges via ``get_valid_edges_for_node``.  This method exists as the
+        bulk-optimised counterpart: it accepts caller-supplied edges and
+        old_summary to eliminate per-entity DB round-trips when rebuilding many
+        entities at once.
 
         .. note:: TOCTOU / eventual-consistency risk:
             The ``edges`` argument is pre-fetched by the caller in a single
