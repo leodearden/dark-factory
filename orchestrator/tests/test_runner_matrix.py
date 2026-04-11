@@ -578,3 +578,46 @@ class TestRunEvalMatrixNonCancelPath:
         # (e) exc_tb must be present — the whole point of exc_info is to preserve
         #     the traceback for post-mortem debugging
         assert exc_tb is not None, 'Expected traceback to be attached to the RuntimeError'
+
+
+@pytest.mark.asyncio
+class TestCollectCancelErrors:
+    """Unit tests for the _collect_cancel_errors helper.
+
+    These tests exercise the classification logic in isolation by constructing
+    known done sets and asserting the helper's output — no scheduling or
+    asyncio.wait semantics involved.
+    """
+
+    async def test_collects_all_cancels_from_real_tasks(self):
+        """_collect_cancel_errors returns one CancelledError per cancelled task.
+
+        TEST INTENT: Verify that when two real asyncio.Task objects have been
+        .cancel()'d and awaited, _collect_cancel_errors returns a list with
+        exactly two CancelledError instances.
+
+        PASS/FAIL CONDITION: Fails with AttributeError if _collect_cancel_errors
+        does not exist on runner_mod. Fails with assertion error if the returned
+        list length != 2 or elements are not CancelledError instances.
+        """
+
+        async def long_sleep():
+            await asyncio.sleep(3600)
+
+        task_a = asyncio.create_task(long_sleep())
+        task_b = asyncio.create_task(long_sleep())
+        task_a.cancel()
+        task_b.cancel()
+        for t in (task_a, task_b):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+        result = runner_mod._collect_cancel_errors({task_a, task_b})
+
+        assert len(result) == 2, f'Expected 2 CancelledErrors, got {len(result)}: {result}'
+        for i, err in enumerate(result):
+            assert isinstance(err, asyncio.CancelledError), (
+                f'Element {i}: expected CancelledError, got {err!r}'
+            )
