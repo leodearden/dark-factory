@@ -853,6 +853,55 @@ class TestCollectSnapshot:
         assert any(r.exc_info for r in warning_records)
 
     @pytest.mark.asyncio
+    async def test_main_project_failure_skips_all_inserts(self, burndown_env, caplog):
+        """PermissionError on the main project's load_task_tree is isolated via return_exceptions=True.
+
+        The main project is always the first entry in roots_to_snapshot. With no orchestrators
+        and no known_project_roots, a failing load_task_tree for the main project must:
+
+        (a) NOT propagate out of collect_snapshot — return_exceptions=True in Phase 2 absorbs it,
+            and Phase 3's isinstance(tasks, BaseException) guard logs-and-continues.
+        (b) Commit zero rows to the snapshots table — the only root failed, so nothing to insert.
+        (c) Emit a WARNING log record naming the main project with exc_info populated.
+
+        Sibling test to test_continues_when_known_root_unreadable and
+        test_gather_return_exceptions_preserves_healthy_snapshots, covering the
+        previously-untested main-project failure path. Uses path-keyed dispatch so
+        the test does not depend on load_task_tree call ordering.
+        """
+        import logging
+
+        db_path, config, conn = burndown_env
+
+        bad_path = config.tasks_json  # the main project's tasks.json path
+
+        def fake_load(path):
+            if path == bad_path:
+                raise PermissionError('Permission denied')
+            pytest.fail(f'Unexpected load_task_tree call for {path}')
+
+        with (
+            patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+        ):
+            # Must NOT raise — return_exceptions=True absorbs the PermissionError.
+            await collect_snapshot(conn, config)
+
+        # (b) zero rows committed — the only root failed, so snapshots is empty.
+        async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == 0
+
+        # (c) at least one WARNING record must name the main project and carry exc_info.
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'Expected at least one WARNING log record'
+        combined = ' '.join(r.getMessage() for r in warning_records)
+        assert str(config.project_root) in combined
+        assert any(r.exc_info for r in warning_records)
+
+    @pytest.mark.asyncio
     async def test_skips_known_root_on_resolve_error(self, tmp_path, caplog):
         """OSError raised from Path.resolve for one known_project_roots entry is
         absorbed by Phase 2's return_exceptions=True: a warning is logged naming
