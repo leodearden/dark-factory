@@ -756,6 +756,30 @@ class TestStewardTimeoutCap:
         assert steward._timeout_counts.get('esc-42-1', 0) == 0
         assert steward._retry_counts.get('esc-42-1') == 1
 
+    async def test_auto_escalates_when_timeout_count_at_cap(
+        self, steward, mock_config,
+    ):
+        """When _timeout_counts[id] >= cap, guard must fire BEFORE invoke_agent."""
+        mock_config.steward_max_timeouts_per_escalation = 2
+        esc = _make_escalation(id='esc-42-1')
+        # Pre-seed timeout count at cap
+        steward._timeout_counts['esc-42-1'] = 2
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        # Guard fires before any invocation
+        mock_invoke.assert_not_called()
+        # Level-1 re-escalation was submitted
+        steward.escalation_queue.submit.assert_called_once()
+        submitted_esc = steward.escalation_queue.submit.call_args[0][0]
+        assert submitted_esc.level == 1
+        assert 'repeatedly timed out' in submitted_esc.summary.lower()
+        # Original escalation was dismissed
+        steward.escalation_queue.resolve.assert_called_once_with(
+            esc.id, resolution='dismissed', dismiss=True,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Unified Role
