@@ -320,6 +320,20 @@ class TestNearCapStateDistinction:
         gate.detect_cap_hit('', "You're close to reaching your usage limit. Your plan resets in 1h.")
         assert gate._open.is_set() is True
 
+    def test_near_cap_marks_correct_account_by_token(self):
+        """NEAR_CAP message with oauth_token=token_b must set near_cap only on account b."""
+        gate = make_gate(['a', 'b'])
+        token_b = gate._accounts[1].token
+        result = gate.detect_cap_hit(
+            '', "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token=token_b,
+        )
+        assert result is True
+        assert gate._accounts[0].near_cap is False
+        assert gate._accounts[1].near_cap is True
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[1].capped is False
+
     def test_near_cap_does_not_start_resume_probe(self):
         """NEAR_CAP must NOT launch a resume probe task."""
         gate = make_gate(['a'], wait_for_reset=True)
