@@ -24,7 +24,6 @@ from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
