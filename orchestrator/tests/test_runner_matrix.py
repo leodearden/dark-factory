@@ -13,7 +13,7 @@ import contextlib
 import logging
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -392,7 +392,7 @@ class TestRunEvalMatrixCancellation:
         # and __eq__, so set-membership here is an identity check, NOT a value/message
         # comparison.  Do not replace with string equality — that would miss the
         # 'same exception logged twice' regression.
-        logged_exc_vals = {record.exc_info[1] for record in cancel_records if record.exc_info is not None}
+        logged_exc_vals = {cast(tuple, record.exc_info)[1] for record in cancel_records}
         assert logged_exc_vals == {ce_a, ce_b}, (
             f'Expected both CancelledError instances to be logged (identity check). '
             f'Logged exc_val set: {logged_exc_vals!r}  '
