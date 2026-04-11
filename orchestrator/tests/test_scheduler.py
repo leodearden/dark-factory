@@ -1683,8 +1683,7 @@ class TestSchedulerInternalRouting:
     ):
         """get_tasks() must write the cached status via _set_cached_status().
 
-        Fails (AttributeError on recorder install or missed assertion) until
-        step 5 routes the get_tasks write through the helper.
+        Verifies get_tasks() writes via the _set_cached_status chokepoint.
         """
         import json
 
@@ -1700,14 +1699,7 @@ class TestSchedulerInternalRouting:
         }
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value=tasks_response))
 
-        recorded: list[tuple[str, str]] = []
-        original = scheduler._set_cached_status  # AttributeError until step 3
-
-        def recorder(task_id: str, status: str) -> None:
-            recorded.append((task_id, status))
-            original(task_id, status)
-
-        scheduler._set_cached_status = recorder  # type: ignore[method-assign]
+        recorded = _spy_set_cached_status(scheduler)
 
         await scheduler.get_tasks()
         assert ('42', 'pending') in recorded
