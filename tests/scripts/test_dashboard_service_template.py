@@ -68,7 +68,7 @@ def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
     assert ":" not in value, (
         f"Colon-separated DASHBOARD_KNOWN_PROJECT_ROOTS found in {path}. "
         "Use commas — the parser at "
-        "dashboard/src/dashboard/config.py \u2014 "
+        "dashboard/src/dashboard/config.py — "
         "DashboardConfig.from_env handling of DASHBOARD_KNOWN_PROJECT_ROOTS "
         "calls roots.split(',')."
     )
