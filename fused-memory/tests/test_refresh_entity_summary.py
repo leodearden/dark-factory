@@ -18,6 +18,7 @@ from conftest import assert_ro_query_only, extract_cypher, extract_params
 
 from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
+    EdgeDict,
     GraphitiBackend,
     NodeNotFoundError,
 )
@@ -343,6 +344,33 @@ class TestEdgeDict:
         """Both fact and name None are coerced to empty strings."""
         result = GraphitiBackend._edge_dict('e-null', None, None)
         assert result == {'uuid': 'e-null', 'fact': '', 'name': ''}
+
+    def test_edge_dict_typeddict_has_expected_annotations(self):
+        """EdgeDict TypedDict declares uuid/fact/name as str — pins the schema."""
+        assert set(EdgeDict.__annotations__.keys()) == {'uuid', 'fact', 'name'}
+        assert EdgeDict.__annotations__['uuid'] is str
+        assert EdgeDict.__annotations__['fact'] is str
+        assert EdgeDict.__annotations__['name'] is str
+
+    def test_returned_dict_has_exactly_edge_dict_keys(self):
+        """Returned dict exposes only the EdgeDict keys — no extras."""
+        result = GraphitiBackend._edge_dict('e-1', 'fact', 'name')
+        assert set(result.keys()) == {'uuid', 'fact', 'name'}
+
+    def test_raises_value_error_when_uuid_is_none(self):
+        """None uuid raises ValueError rather than propagating silently."""
+        with pytest.raises(ValueError, match='uuid'):
+            GraphitiBackend._edge_dict(None, 'fact', 'name')  # type: ignore[arg-type]
+
+    def test_empty_string_fact_preserved_as_empty_string(self):
+        """Empty string fact is preserved as '' (contract pin for explicit-None refactor)."""
+        result = GraphitiBackend._edge_dict('e-1', '', 'knows')
+        assert result == {'uuid': 'e-1', 'fact': '', 'name': 'knows'}
+
+    def test_empty_string_name_preserved_as_empty_string(self):
+        """Empty string name is preserved as '' (contract pin for explicit-None refactor)."""
+        result = GraphitiBackend._edge_dict('e-1', 'Alice knows Bob', '')
+        assert result == {'uuid': 'e-1', 'fact': 'Alice knows Bob', 'name': ''}
 
 
 # ---------------------------------------------------------------------------
