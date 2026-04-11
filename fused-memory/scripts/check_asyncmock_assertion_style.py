@@ -121,7 +121,14 @@ def main(argv: list[str] | None = None) -> int:
 
     For directories, recursively scans for test_*.py and conftest.py files only.
     Prints violations to stdout in 'path:lineno:col: message' format (ruff-style).
-    Returns 1 if any violations were found, 0 if clean, 2 on fatal errors.
+
+    Explicit file paths are validated up front; a missing explicit path fails
+    fast with exit code 2 before any scan work. Mid-scan OSErrors (e.g. a file
+    yanked between rglob discovery and read) are accumulated and reported on
+    stderr without discarding violations already collected.
+
+    Returns 0 if clean, 1 if only violations were found, 2 on any fatal error
+    (missing explicit path or transient read failure).
     """
     parser = argparse.ArgumentParser(
         description='Check for assert_not_called/assert_not_awaited style mixing in test files.'
@@ -129,34 +136,46 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('paths', nargs='+', help='Files or directories to check')
     args = parser.parse_args(argv)
 
-    all_violations: list[Violation] = []
-
+    # Phase 1: discovery + upfront validation of explicit paths.
+    # rglob results are guaranteed to exist at discovery time, so only
+    # non-directory (explicit) paths need the existence check.
+    files_to_scan: list[Path] = []
     for path_str in args.paths:
         p = Path(path_str)
         if p.is_dir():
             # Only scan test files and conftest; runtime code does not use AsyncMock.
-            files: list[Path] = sorted(
-                set(p.rglob('test_*.py')) | set(p.rglob('conftest.py'))
+            files_to_scan.extend(
+                sorted(set(p.rglob('test_*.py')) | set(p.rglob('conftest.py')))
             )
         else:
-            files = [p]
-
-        for file_path in files:
-            try:
-                source = file_path.read_text(encoding='utf-8')
-            except FileNotFoundError as exc:
-                print(f'error: {exc}', file=sys.stderr)
+            if not p.exists():
+                print(f'error: {p}: No such file or directory', file=sys.stderr)
                 return 2
-            except OSError as exc:
-                print(f'error reading {file_path}: {exc}', file=sys.stderr)
-                return 2
+            files_to_scan.append(p)
 
-            violations = find_violations(source, str(file_path))
-            all_violations.extend(violations)
+    # Phase 2: scan. Accumulate per-file read errors without returning early,
+    # so a transient OSError on one file never discards violations already
+    # collected from earlier files.
+    all_violations: list[Violation] = []
+    read_errors: list[tuple[Path, OSError]] = []
+    for file_path in files_to_scan:
+        try:
+            source = file_path.read_text(encoding='utf-8')
+        except OSError as exc:
+            read_errors.append((file_path, exc))
+            continue
 
+        violations = find_violations(source, str(file_path))
+        all_violations.extend(violations)
+
+    # Phase 3: reporting.
     for v in all_violations:
         print(f'{v.filename}:{v.lineno}:{v.col_offset}: {v.message}')
+    for file_path, exc in read_errors:
+        print(f'error reading {file_path}: {exc}', file=sys.stderr)
 
+    if read_errors:
+        return 2
     return 1 if all_violations else 0
 
 

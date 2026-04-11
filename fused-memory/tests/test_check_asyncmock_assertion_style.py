@@ -312,3 +312,82 @@ class TestHooksIntegration:
             "check_asyncmock_assertion_style.py docstring must note that the script is "
             "'stdlib-only' so maintainers know adding a dependency would break the pre-commit fast path"
         )
+
+
+class TestCliErrorHandling:
+    """main() path/read-error handling: fail fast on missing explicit paths,
+    accumulate mid-scan OSErrors without dropping already-collected violations.
+    """
+
+    def test_missing_explicit_file_path_fails_fast_with_exit_2(
+        self, tmp_path: Path, monkeypatch, capsys
+    ):
+        """A missing explicit path → exit 2, no scan work done (no read_text calls).
+
+        bad_file is listed FIRST to prove Phase 1 validation runs across ALL
+        paths before Phase 2 starts — even a valid-first ordering must skip
+        the scan when a later explicit path is missing. The strongest
+        "no scan work done" guarantee is that ``Path.read_text`` is NEVER
+        invoked during a failed Phase 1, which we verify via a spy.
+        """
+        bad_file = tmp_path / 'test_bad.py'
+        bad_file.write_text(_MIXED_STYLE_SOURCE)
+        missing = tmp_path / 'nonexistent.py'  # deliberately NOT created
+
+        real_read_text = Path.read_text
+        read_text_calls: list[str] = []
+
+        def spy_read_text(self, *args, **kwargs):
+            read_text_calls.append(self.name)
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'read_text', spy_read_text)
+
+        exit_code = _checker.main([str(bad_file), str(missing)])
+
+        captured = capsys.readouterr()
+        assert exit_code == 2
+        assert 'nonexistent.py' in captured.err
+        # No violations printed — Phase 2 never ran.
+        assert captured.out == ''
+        # Hard "no scan work done" guarantee: read_text was never called on
+        # any scan target. Current broken main() fails this because it reads
+        # bad_file before hitting the FileNotFoundError on the missing path.
+        assert read_text_calls == [], (
+            f'Phase 1 should fail fast before any read_text call, '
+            f'but read_text was invoked on: {read_text_calls}'
+        )
+
+    def test_transient_os_error_does_not_hide_violations_from_other_files(
+        self, tmp_path: Path, monkeypatch, capsys
+    ):
+        """A mid-scan OSError on one file must not discard violations from other files.
+
+        Both files are discovered via directory mode (rglob) so the failure
+        routes through Phase 2, not Phase 1's explicit-path check.
+        """
+        good_file = tmp_path / 'test_good.py'
+        good_file.write_text(_MIXED_STYLE_SOURCE)
+        broken_file = tmp_path / 'test_broken.py'
+        broken_file.write_text('# placeholder — read_text will be monkeypatched to raise')
+
+        real_read_text = Path.read_text
+
+        def fake_read_text(self, *args, **kwargs):
+            if self.name == 'test_broken.py':
+                raise OSError('simulated transient read error')
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'read_text', fake_read_text)
+
+        exit_code = _checker.main([str(tmp_path)])
+
+        captured = capsys.readouterr()
+        # Read error → fatal exit precedence over plain violations exit (1).
+        assert exit_code == 2
+        # Violation from the readable file IS still reported.
+        assert 'test_good.py' in captured.out
+        assert 'assert_not_awaited' in captured.out
+        # Read failure from the broken file is reported on stderr.
+        assert 'test_broken.py' in captured.err
+        assert 'simulated transient read error' in captured.err
