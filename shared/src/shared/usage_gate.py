@@ -49,7 +49,13 @@ CAP_HIT_PREFIXES = [
 # Secondary confirmation — at least one of these keywords must also appear in
 # the same text for a CAP_HIT or NEAR_CAP prefix match to be accepted
 # (defense-in-depth against ambiguous prefix false positives).
-CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade"]
+# NOTE: 'upgrade' was narrowed to 'upgrade your plan' because the bare verb is
+# too common in unrelated CLI messaging (e.g. 'Upgrade to v2 for more features')
+# and would effectively reduce the guard to a near-prefix-only match in those
+# cases.  'upgrade your plan' is the natural SaaS cap-message phrase and is
+# unlikely to appear in non-cap contexts.  The primary defense remains the
+# CAP_HIT_PREFIXES / NEAR_CAP_PREFIXES prefix match.
+CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade your plan"]
 
 # Patterns for near-cap warnings (pause proactively)
 NEAR_CAP_PREFIXES = [
@@ -597,6 +603,7 @@ class UsageGate:
         # account is still capped and we must NOT unpause it.  Being
         # conservative here avoids the far worse outcome of unpausing a
         # capped account and burning quota on a still-limited account.
+        # CAP_CONFIRM_KEYWORDS currently: ['resets', 'usage limit', 'upgrade your plan'].
         # Do not 'fix' this asymmetry without understanding the safety-margin
         # implications — see test_probe_prefix_only_without_confirm_keyword_still_returns_false.
         for prefixes in (CAP_HIT_PREFIXES, NEAR_CAP_PREFIXES):
