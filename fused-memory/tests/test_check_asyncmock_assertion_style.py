@@ -142,3 +142,26 @@ def outer():
         # inner() mixes both styles; outer() only has assert_not_awaited — outer is clean
         assert len(violations) == 1
         assert violations[0].lineno == 5  # assert_not_called in inner()
+
+
+class TestFindViolationsMultipleCallsPerFunction:
+    """Every assert_not_called in a mixed function is flagged, not just the first."""
+
+    def test_reports_multiple_assert_not_called_violations_in_same_function(self):
+        """Three assert_not_called calls in one function with assert_not_awaited → 3 violations."""
+        source = '''\
+async def test_three_not_called():
+    backend.get_all_valid_edges.assert_not_awaited()
+    backend.a.assert_not_called()
+    backend.b.assert_not_called()
+    backend.c.assert_not_called()
+'''
+        violations = find_violations(source, 'test_multi.py')
+        assert len(violations) == 3
+        line_numbers = [v.lineno for v in violations]
+        assert 3 in line_numbers  # backend.a.assert_not_called()
+        assert 4 in line_numbers  # backend.b.assert_not_called()
+        assert 5 in line_numbers  # backend.c.assert_not_called()
+        for v in violations:
+            assert v.filename == 'test_multi.py'
+            assert 'assert_not_awaited' in v.message
