@@ -46,3 +46,27 @@ class TestMyClass:
         assert v.filename == 'test_example.py'
         assert v.lineno == 4  # line of assert_not_called
         assert 'assert_not_awaited' in v.message
+
+
+class TestFindViolationsNegativeCases:
+    """Precision tests: no violations when both styles do NOT coexist in the same function."""
+
+    def test_ignores_assert_not_called_when_function_has_no_assert_not_awaited(self):
+        """Function with only assert_not_called — no violation."""
+        source = '''\
+def test_only_not_called():
+    mock_a.method.assert_not_called()
+    mock_b.other.assert_not_called()
+'''
+        violations = find_violations(source, 'test_only_not_called.py')
+        assert violations == []
+
+    def test_ignores_assert_not_awaited_when_function_has_no_assert_not_called(self):
+        """Function with only assert_not_awaited — no violation."""
+        source = '''\
+async def test_only_not_awaited():
+    backend.get_all_valid_edges.assert_not_awaited()
+    backend.search.assert_not_awaited()
+'''
+        violations = find_violations(source, 'test_only_not_awaited.py')
+        assert violations == []
