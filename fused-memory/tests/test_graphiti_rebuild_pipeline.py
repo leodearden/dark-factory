@@ -20,7 +20,6 @@ from fused_memory.backends.graphiti_client import (
     StaleSummaryResult,
 )
 
-
 # ---------------------------------------------------------------------------
 # task-507: make_stale_list factory fixture
 # ---------------------------------------------------------------------------
