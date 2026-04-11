@@ -460,13 +460,17 @@ class _EvalScheduler:
 
     def __init__(self, config: OrchestratorConfig):
         self.config = config
-        self._status_cache: dict[str, str] = {}
+        self._cache: dict[str, str] = {}
 
     async def get_tasks(self):
         return []
 
     async def set_task_status(self, task_id: str, status: str):
         logger.info(f'[eval] Task {task_id} → {status}')
+        self._cache[task_id] = status
+
+    def get_cached_status(self, task_id: str) -> str | None:
+        return self._cache.get(task_id)
 
     async def handle_blast_radius_expansion(self, task_id: str, current: list[str], needed: list[str]) -> bool:
         return True  # always allow in eval mode

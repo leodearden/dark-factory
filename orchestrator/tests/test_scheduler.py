@@ -378,7 +378,10 @@ class TestStatusTransitionGuard:
 
 
 class TestGetTasksSeedsCache:
-    """get_tasks() should populate the _status_cache so pre-existing terminal tasks are guarded."""
+    """get_tasks() should populate the status cache so pre-existing terminal tasks are guarded.
+
+    Uses get_cached_status() to verify cache contents.
+    """
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
@@ -426,7 +429,7 @@ class TestGetTasksSeedsCache:
         set_mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', set_mock)
         await scheduler.set_task_status('42', 'cancelled')
-        assert scheduler._status_cache.get('42') == 'cancelled'
+        assert scheduler.get_cached_status('42') == 'cancelled'
 
         # Step 2: Simulate store reinstatement — task 42 is now 'pending'
         reinstated_response = {
@@ -444,7 +447,7 @@ class TestGetTasksSeedsCache:
 
         # Step 3: get_tasks() must resync cache to match store
         await scheduler.get_tasks()
-        assert scheduler._status_cache.get('42') == 'pending', (
+        assert scheduler.get_cached_status('42') == 'pending', (
             'get_tasks() must trust store reinstatement of cancelled -> pending'
         )
 
@@ -464,7 +467,7 @@ class TestGetTasksSeedsCache:
         set_mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', set_mock)
         await scheduler.set_task_status('42', 'in-progress')
-        assert scheduler._status_cache.get('42') == 'in-progress'
+        assert scheduler.get_cached_status('42') == 'in-progress'
 
         # Simulate taskmaster reporting a different non-terminal status ('blocked')
         update_response = {
@@ -483,7 +486,7 @@ class TestGetTasksSeedsCache:
         await scheduler.get_tasks()
 
         # Non-terminal cache entry SHOULD be updated
-        assert scheduler._status_cache.get('42') == 'blocked', (
+        assert scheduler.get_cached_status('42') == 'blocked', (
             'get_tasks() should update non-terminal cache entries'
         )
 
@@ -1070,10 +1073,12 @@ class TestCancelledTaskResync:
     """Regression: externally reinstated cancelled tasks must not spin-loop.
 
     Reproduces the bug where 15 cancelled tasks were reinstated to pending in
-    the store, but the scheduler's _status_cache still held 'cancelled'.  The
+    the store, but the scheduler's status cache still held 'cancelled'.  The
     terminal guard rejected every cancelled->in-progress transition, and the
     task was immediately reacquired — an infinite spin that starved pending
     tasks (156k+ rejections for a single task).
+
+    Uses get_cached_status() to verify cache contents.
     """
 
     @pytest.fixture
@@ -1091,7 +1096,7 @@ class TestCancelledTaskResync:
 
         # 1. Orchestrator cancels the task — cache records 'cancelled'
         await scheduler.set_task_status('64', 'cancelled')
-        assert scheduler._status_cache['64'] == 'cancelled'
+        assert scheduler.get_cached_status('64') == 'cancelled'
 
         # 2. External process reinstates to pending (store returns pending)
         reinstated_task = {
@@ -1125,7 +1130,7 @@ class TestCancelledTaskResync:
 
         # 4. Cache must now show 'pending' (resynced from store)
         #    so that set_task_status('in-progress') is NOT rejected
-        assert scheduler._status_cache['64'] == 'pending'
+        assert scheduler.get_cached_status('64') == 'pending'
 
         # 5. Transition to in-progress must succeed (not be silently dropped)
         ip_mock = AsyncMock(return_value={})
@@ -1136,7 +1141,7 @@ class TestCancelledTaskResync:
             'set_task_status(in-progress) must issue MCP call after reinstatement — '
             'was silently rejected by stale terminal guard before fix'
         )
-        assert scheduler._status_cache['64'] == 'in-progress'
+        assert scheduler.get_cached_status('64') == 'in-progress'
 
     @pytest.mark.asyncio
     async def test_spin_loop_does_not_occur(
@@ -1274,3 +1279,25 @@ class TestRequeueCooldown:
 
         a2 = await scheduler.acquire_next()
         assert a2 is not None and a2.task_id == '99'
+
+
+class TestGetCachedStatus:
+    """get_cached_status() exposes the internal status cache via a public method."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def test_get_cached_status_returns_none_for_unknown_task(self, scheduler: Scheduler):
+        """get_cached_status returns None when the task has never been seen."""
+        assert scheduler.get_cached_status('unknown') is None
+
+    @pytest.mark.asyncio
+    async def test_get_cached_status_returns_status_after_set_task_status(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """get_cached_status returns the last status written via set_task_status."""
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value={}))
+        await scheduler.set_task_status('42', 'in-progress')
+        assert scheduler.get_cached_status('42') == 'in-progress'
