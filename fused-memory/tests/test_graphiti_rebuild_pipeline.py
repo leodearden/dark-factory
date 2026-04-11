@@ -68,9 +68,8 @@ class TestStaleSummaryResult:
     def test_no_legacy_edges_attribute(self):
         """StaleSummaryResult must NOT expose the old 'edges' field name.
 
-        The rename edges → all_edges was applied in task 438. This test locks
-        in that the old alias is truly absent, so any accidental re-exposure
-        would be caught immediately.
+        StaleSummaryResult uses all_edges (not edges) as the field name; this test
+        prevents silent re-aliasing.
         """
         result = StaleSummaryResult(stale=[], all_edges={}, total_count=0)
         assert not hasattr(result, 'edges')

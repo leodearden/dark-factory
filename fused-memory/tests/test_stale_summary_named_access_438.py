@@ -1,15 +1,15 @@
-"""Regression tests for StaleSummaryResult.all_edges field rename and named-access refactor.
+"""Regression tests for detect_stale_summaries and rebuild_entity_summaries named-attribute access.
 
 Task 438: Fix StaleSummaryResult positional unpacking at both call sites.
 
 Locks in:
-  (a) The renamed field ``all_edges`` exists on StaleSummaryResult.
-  (b) ``detect_stale_summaries`` uses named attribute access (``result.stale``).
-  (c) ``rebuild_entity_summaries`` uses named attribute access and routes the
-      per-entity edge list correctly from the renamed ``all_edges`` field.
+  (a) ``detect_stale_summaries`` uses named attribute access (``result.stale``).
+  (b) ``rebuild_entity_summaries`` uses named attribute access and routes the
+      per-entity edge list correctly from the ``all_edges`` field.
 
-Any accidental reversion of the ``edges`` → ``all_edges`` rename would break tests
-(a) and (b) at NamedTuple construction time (unexpected keyword argument).
+Structural field contract (all_edges, tuple unpacking) is covered in
+test_graphiti_rebuild_pipeline.py::TestStaleSummaryResult. This file focuses on
+integration behaviour of detect_stale_summaries and rebuild_entity_summaries.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ class TestDetectStaleSummariesNamedAccess:
     async def test_detect_stale_summaries_named_access(self, mock_config, make_backend):
         """detect_stale_summaries returns the stale list from a StaleSummaryResult."""
         backend = make_backend(mock_config)
-        stale_list = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'old'}]
+        stale_list = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'old', 'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 1, 'summary_line_count': 1}]
         detect_result = StaleSummaryResult(
             stale=stale_list,
             all_edges={},
@@ -56,7 +56,7 @@ class TestDetectStaleSummariesNamedAccess:
 
         returned = await backend.detect_stale_summaries(group_id='t')
 
-        assert returned == []
+        assert returned is detect_result.stale
         backend._detect_stale_summaries_with_edges.assert_awaited_once_with(group_id='t')
 
     @pytest.mark.asyncio
