@@ -683,9 +683,10 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['new_summary'] == 'Bob summary v2'
         assert ok_detail['edge_count'] == 3
 
-        # Verify the implementation forwards the entity's summary as old_summary
-        # into _rebuild_entity_from_edges (not just trusting the mock return value).
-        # This pins down the entity→target→helper data-forwarding path.
+        # Verify the implementation reads old_summary from the entity dict and forwards
+        # it as the old_summary kwarg to _rebuild_entity_from_edges. The ok_detail['old_summary']
+        # assertion above reflects the mock return value; this assertion independently pins
+        # the input forwarding path.
         backend._rebuild_entity_from_edges.assert_any_call(
             'u2', 'Bob', [], group_id='test', old_summary='stale summary 2'
         )
