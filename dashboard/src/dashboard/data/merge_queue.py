@@ -370,7 +370,8 @@ async def aggregate_queue_depth_timeseries(
 ) -> ChartData:
     """Aggregate queue depth timeseries across multiple project DBs.
 
-    Counts per bucket are summed across all DBs.
+    Counts per bucket are summed across all DBs.  Bucket width is adaptive
+    to ``hours`` (see ``_bucket_minutes_for_window``).
 
     Args:
         dbs: List of aiosqlite connections (None entries are tolerated).
@@ -381,7 +382,7 @@ async def aggregate_queue_depth_timeseries(
             here so that all concurrent per-DB coroutines share the same
             alignment — eliminating the race where concurrent calls to
             ``datetime.now(UTC)`` inside each per-DB ``_query`` could straddle
-            a 15-min boundary and produce divergent label sets.  Pass an
+            a bucket boundary and produce divergent label sets.  Pass an
             explicit value in tests for full determinism.
     """
     effective_now = now if now is not None else datetime.now(UTC)
