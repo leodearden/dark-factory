@@ -601,6 +601,7 @@ class TestCollectSnapshot:
             return _tasks_map[path]
 
         async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
             with (
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
