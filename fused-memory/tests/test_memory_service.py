@@ -1210,6 +1210,39 @@ class TestGetEntity:
         # CancelledError is BaseException, NOT Exception — logging guard must not fire.
         assert mock_logger.warning.call_count == 0
 
+    @pytest.mark.asyncio
+    async def test_cancelled_error_takes_precedence_over_exception(self, service):
+        """CancelledError takes precedence over RuntimeError even when RuntimeError comes first.
+
+        Scenario: search_nodes() raises RuntimeError('boom') — it is at results[0].
+                  search() raises CancelledError — it is at results[1].
+
+        Under the OLD code, `next((r for r in results if isinstance(r, BaseException)), None)`
+        picks the first match by position: RuntimeError IS a BaseException subclass, so it
+        wins and RuntimeError is raised.
+
+        Under the NEW code (propagate_cancellations called first), the helper scans the
+        full sequence for bare-BaseException (BaseException but NOT Exception). RuntimeError
+        IS an Exception so it is skipped; CancelledError is not an Exception, so it is raised.
+
+        This aligns get_entity with the convention in graphiti_client.rebuild_entity_summaries
+        and context_assembler.assemble where cancellation signals always take precedence over
+        per-call application errors — structured concurrency semantics.
+        """
+        service.graphiti.search_nodes = AsyncMock(
+            side_effect=RuntimeError('boom')
+        )
+        service.graphiti.search = AsyncMock(
+            side_effect=asyncio.CancelledError()
+        )
+
+        with patch('fused_memory.services.memory_service.logger') as mock_logger, \
+             pytest.raises(asyncio.CancelledError):
+            await service.get_entity('entity', project_id='test')
+
+        # Cancellation propagates before the per-call warning loop executes.
+        assert mock_logger.warning.call_count == 0
+
     # ------------------------------------------------------------------
     # temporal serialization in edge_data
     # ------------------------------------------------------------------
