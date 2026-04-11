@@ -9,7 +9,7 @@ Lifecycle:
 - Started lazily on first escalation (not at workflow start).
 - Each escalation either resumes the existing session or creates a fresh one.
 - Budget-capped at $12 lifetime; auto-re-escalates to level-1 on exhaustion.
-- Retries each escalation up to 3 times before re-escalating to level-1.
+- Retries each escalation up to 1 attempt before re-escalating to level-1.
 - Stopped by the workflow after task completion + grace period.
 """
 
