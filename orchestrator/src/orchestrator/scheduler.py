@@ -213,7 +213,7 @@ class Scheduler:
 
     async def set_task_status(self, task_id: str, status: str) -> None:
         """Update task status via fused-memory."""
-        cached = self._status_cache.get(task_id)
+        cached = self.get_cached_status(task_id)
         if not is_valid_transition(cached, status):
             logger.warning(
                 'Task %s: rejecting %s->%s (terminal state guard)', task_id, cached, status
