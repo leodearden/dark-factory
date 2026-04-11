@@ -13,7 +13,7 @@ import contextlib
 import logging
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -377,22 +377,29 @@ class TestRunEvalMatrixCancellation:
             f'would produce 1 record here.'
         )
 
-        # (c) Each record must carry a proper exc_info 3-tuple
+        # (c) Each record must carry a proper exc_info 3-tuple; collect exc_val
+        # here where isinstance already narrows record.exc_info to tuple — no
+        # cast needed downstream.
+        exc_vals: list[BaseException] = []
         for i, record in enumerate(cancel_records):
             assert isinstance(record.exc_info, tuple) and len(record.exc_info) == 3, (
                 f'Record {i}: expected exc_info to be a 3-tuple, got {record.exc_info!r}'
             )
-            exc_type, _exc_val, _exc_tb = record.exc_info
+            exc_type, exc_val, _exc_tb = record.exc_info
             assert exc_type is asyncio.CancelledError, (
                 f'Record {i}: expected exc_type CancelledError, got {exc_type!r}'
             )
+            assert isinstance(exc_val, BaseException), (
+                f'Record {i}: expected exc_val to be a BaseException, got {exc_val!r}'
+            )
+            exc_vals.append(exc_val)
 
         # (d) Identity check: BOTH distinct instances must appear — not the same one twice.
         # CancelledError (a BaseException subclass) uses object identity for __hash__
         # and __eq__, so set-membership here is an identity check, NOT a value/message
         # comparison.  Do not replace with string equality — that would miss the
         # 'same exception logged twice' regression.
-        logged_exc_vals = {cast(tuple, record.exc_info)[1] for record in cancel_records}
+        logged_exc_vals = set(exc_vals)
         assert logged_exc_vals == {ce_a, ce_b}, (
             f'Expected both CancelledError instances to be logged (identity check). '
             f'Logged exc_val set: {logged_exc_vals!r}  '
