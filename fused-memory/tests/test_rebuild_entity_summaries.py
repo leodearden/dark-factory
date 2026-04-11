@@ -267,7 +267,7 @@ class TestDetectStaleSummariesDryRun:
 
     These tests live in test_rebuild_entity_summaries.py (the canonical file
     for rebuild_entity_summaries coverage) rather than in
-    test_graphiti_quality_433.py (task-433 quality improvements) per the
+    test_graphiti_rebuild_pipeline.py (rebuild/refresh pipeline quality improvements) per the
     established layout where each backend method gets a dedicated test class.
     See task 526 for the full design rationale.
     """
@@ -380,7 +380,7 @@ class TestDetectStaleSummariesDryRun:
         per-entity via get_valid_edges_for_node rather than materialising the
         O(E) bulk all-edges dict.  The assertion style follows the project's
         AsyncMock convention (assert_not_awaited, not assert_not_called) as
-        enforced by TestEdgeFetchGuardAssertionStyle in test_graphiti_quality_433.py.
+        enforced in test_graphiti_rebuild_pipeline.py.
         """
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(return_value=[
