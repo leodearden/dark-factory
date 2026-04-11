@@ -41,8 +41,20 @@ def _parse_pyright_packages(content: str) -> list[str] | None:
     Uses ``re.MULTILINE`` with a ``^`` anchor so only a real array declaration
     at the start of a line is matched, not a PYRIGHT_PACKAGES substring that
     appears inside a comment or an unrelated string.
+
+    Bash line continuations (a ``\\`` backslash followed by a newline) are
+    normalized to a single space before matching, so a multi-line declaration
+    such as::
+
+        PYRIGHT_PACKAGES=( \\
+            fused-memory \\
+            orchestrator \\
+        )
+
+    is parsed correctly without stray ``\\`` tokens in the result.
     """
-    match = re.search(r"^PYRIGHT_PACKAGES=\(([^)]*)\)", content, re.MULTILINE)
+    normalized = content.replace("\\\n", " ")
+    match = re.search(r"^PYRIGHT_PACKAGES=\(([^)]*)\)", normalized, re.MULTILINE)
     return match.group(1).split() if match else None
 
 
