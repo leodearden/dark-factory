@@ -113,8 +113,8 @@ from dashboard.data.merge_queue import (  # noqa: E402
 class TestQueueDepthTimeseries:
     @pytest.mark.asyncio
     async def test_buckets_15min_over_24h(self, merge_events_db):
-        """24h window produces 96 buckets; events fall in correct buckets."""
-        now = datetime.now(UTC)
+        """24h window produces 97 buckets; events fall in correct buckets."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
         cutoff = now - timedelta(hours=24)
         cutoff_aligned = _bucket_start(cutoff)
 
@@ -136,13 +136,13 @@ class TestQueueDepthTimeseries:
 
         async with aiosqlite.connect(str(merge_events_db)) as db:
             db.row_factory = aiosqlite.Row
-            result = await queue_depth_timeseries(db, hours=24)
+            result = await queue_depth_timeseries(db, hours=24, now=now)
 
         labels = result['labels']
         values = result['values']
 
-        assert len(labels) == 96
-        assert len(values) == 96
+        assert len(labels) == 97
+        assert len(values) == 97
         assert all(v >= 0 for v in values)
         assert sum(values) == 5
         assert sum(1 for v in values if v > 0) == 2
@@ -155,6 +155,27 @@ class TestQueueDepthTimeseries:
         assert values[labels.index(label_b)] == 2
 
     @pytest.mark.asyncio
+    async def test_current_bucket_event_included(self, merge_events_db):
+        """An event in the current 15-min bucket must appear in the output."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        event_ts = datetime(2026, 4, 11, 12, 6, 0, tzinfo=UTC)
+        expected_label = _bucket_start(now).isoformat()  # "2026-04-11T12:00:00+00:00"
+
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        _insert_event(conn_sync, event_type='merge_attempt', timestamp=event_ts,
+                      data={'outcome': 'done'})
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await queue_depth_timeseries(db, hours=24, now=now)
+
+        assert expected_label in result['labels']
+        idx = result['labels'].index(expected_label)
+        assert result['values'][idx] == 1
+
+    @pytest.mark.asyncio
     async def test_none_db(self):
         """None DB returns empty ChartData."""
         result = await queue_depth_timeseries(None, hours=24)
@@ -162,10 +183,11 @@ class TestQueueDepthTimeseries:
 
     @pytest.mark.asyncio
     async def test_empty_db(self, empty_merge_events_conn):
-        """No events → 96 buckets all with count 0."""
-        result = await queue_depth_timeseries(empty_merge_events_conn, hours=24)
-        assert len(result['labels']) == 96
-        assert len(result['values']) == 96
+        """No events → 97 buckets all with count 0."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        result = await queue_depth_timeseries(empty_merge_events_conn, hours=24, now=now)
+        assert len(result['labels']) == 97
+        assert len(result['values']) == 97
         assert all(v == 0 for v in result['values'])
 
 
@@ -469,7 +491,7 @@ class TestMultiDbAggregation:
     @pytest.mark.asyncio
     async def test_aggregate_queue_depth_timeseries(self, tmp_path):
         """Counts per bucket sum across two DBs."""
-        now = datetime.now(UTC)
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
         cutoff = now - timedelta(hours=24)
         bucket = _bucket_start(cutoff) + timedelta(hours=22)
 
@@ -490,13 +512,60 @@ class TestMultiDbAggregation:
         ):
             conn1.row_factory = aiosqlite.Row
             conn2.row_factory = aiosqlite.Row
-            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=24)
+            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=24, now=now)
 
-        assert len(result['labels']) == 96
+        assert len(result['labels']) == 97
         bucket_label = bucket.isoformat()
         assert bucket_label in result['labels']
         idx = result['labels'].index(bucket_label)
         assert result['values'][idx] == 3  # 2 + 1
+
+    @pytest.mark.asyncio
+    async def test_aggregator_uses_consistent_now_across_dbs(self, tmp_path):
+        """Aggregator with explicit now threads same timestamp to all per-DB calls."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        current_bucket_label = _bucket_start(now).isoformat()  # "2026-04-11T12:00:00+00:00"
+
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': now - timedelta(seconds=30),
+             'data': {'outcome': 'done'}},
+        ])
+        db2 = self._make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': now - timedelta(seconds=45),
+             'data': {'outcome': 'done'}},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=24, now=now)
+
+        assert current_bucket_label in result['labels']
+        idx = result['labels'].index(current_bucket_label)
+        assert result['values'][idx] == 2  # 1 from each DB
+
+    @pytest.mark.asyncio
+    async def test_aggregator_labels_stable_skewed_now(self, tmp_path):
+        """Two calls with skewed now values in the same 15-min bucket yield identical labels."""
+        now1 = datetime(2026, 4, 11, 12, 7, 0, tzinfo=UTC)
+        now2 = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+
+        db1 = self._make_db(tmp_path, 'runs1.db', [])
+
+        async with aiosqlite.connect(str(db1)) as conn1:
+            conn1.row_factory = aiosqlite.Row
+            result1 = await aggregate_queue_depth_timeseries([conn1], hours=24, now=now1)
+
+        async with aiosqlite.connect(str(db1)) as conn2:
+            conn2.row_factory = aiosqlite.Row
+            result2 = await aggregate_queue_depth_timeseries([conn2], hours=24, now=now2)
+
+        assert result1['labels'] == result2['labels']
 
     @pytest.mark.asyncio
     async def test_aggregate_outcome_distribution(self, tmp_path):
