@@ -13,6 +13,10 @@ hooks/project-checks.
 The rule is narrow by design: it only flags the exact regression pattern (mixing both styles
 in the same function body) and produces zero false positives against the current
 fused-memory/tests/ codebase, where no single function mixes the two styles.
+
+This script is intentionally stdlib-only (ast, argparse, pathlib, sys) so hooks/project-checks
+can invoke it via plain python3 without uv env-resolution overhead. Adding a third-party
+dependency here would break that fast path.
 """
 from __future__ import annotations
 
