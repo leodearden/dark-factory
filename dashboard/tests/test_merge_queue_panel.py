@@ -272,9 +272,26 @@ class TestMergeQueueListenerLifecycle:
         assert 'DOMContentLoaded' in resp.text
 
     def test_render_all_invoked_directly_in_iife(self, client):
-        """renderAll() must be called directly within the IIFE (not only inside
-        a document.addEventListener callback) so charts render after htmx swap."""
+        """renderAll() must be called directly within the IIFE so charts render
+        after an htmx swap (when DOMContentLoaded has already fired).
+
+        The old assertion ``assert 'renderAll()' in resp.text`` was tautological:
+        the substring 'renderAll()' also appears inside the function definition
+        ``function renderAll() {``, so deleting the direct-invocation line would
+        not have caused it to fail.
+
+        The trailing-semicolon check ``'renderAll();'`` is the disambiguator:
+        the definition line ends with `` {``, not ``;``, so the semicoloned form
+        only appears on the actual call site.  The count check is a belt-and-
+        suspenders guard ensuring both the definition and the direct invocation
+        are present (neither was accidentally deleted).
+        """
         with _patch_merge_queue_data():
             resp = client.get('/partials/merge-queue')
         assert resp.status_code == 200
-        assert 'renderAll()' in resp.text
+        # Trailing semicolon uniquely identifies the direct invocation (not the
+        # function definition line, which ends with ' {').
+        assert 'renderAll();' in resp.text
+        # Both the definition and the direct invocation contain 'renderAll()',
+        # so the count must be at least 2.
+        assert resp.text.count('renderAll()') >= 2
