@@ -1625,6 +1625,11 @@ class TestHarnessFilteredTaskTreeWiring:
         remediation reuses the pre-fetched tree rather than re-fetching), not stage-internal
         bypasses.
         """
+        # NOTE: All stage .run methods are mocked below, so this test only verifies
+        # the harness-level orchestration path (run_full_cycle and remediation share
+        # the pre-fetched tree). It does NOT catch a stage that bypasses the helper
+        # by calling taskmaster.get_tasks directly — that would require an
+        # integration test with real stage implementations.
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
         # Set up taskmaster.get_tasks to return a valid task list so the real
