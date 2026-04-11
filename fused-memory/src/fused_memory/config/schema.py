@@ -261,6 +261,40 @@ class ReconciliationConfig(BaseModel):
     usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)
 
 
+class CuratorConfig(BaseModel):
+    """Task curator gate — LLM-judged drop/combine/create decision on task creation.
+
+    Replaces the title-only threshold dedup with a richer corpus + LLM call so
+    reviewer-spawned tasks can be combined into existing pending work instead of
+    fragmenting the backlog. See docs/reify-task-fragmentation-report-2026-04-11.txt
+    for the motivating analysis.
+    """
+
+    enabled: bool = Field(default=True)
+    model: str = Field(default='sonnet')
+    timeout_seconds: float = Field(default=60.0)
+    max_budget_usd: float = Field(default=0.30)
+
+    # Corpus caps — see design notes in shared/docs (the four-stream pool).
+    pool_module_cap: int = Field(default=15)
+    pool_embedding_cap: int = Field(default=10)
+    pool_dependency_cap: int = Field(default=3)
+    pool_total_cap: int = Field(default=30)
+
+    # Lock-key depth must match the scheduler's lock_depth to make module-pool
+    # matching scheduler-consistent. Default 2 matches shared.locking defaults.
+    lock_depth: int = Field(default=2)
+
+    # Idempotency cache: skip re-invoking the LLM for the same candidate payload
+    # if a decision was already rendered within this window.
+    idempotency_ttl_seconds: float = Field(default=600.0)
+
+    # Entry payload limits (applied per pool entry; whole entries trimmed, not
+    # truncated — see design notes on preserving concrete code references).
+    entry_description_chars: int = Field(default=500)
+    entry_details_chars: int = Field(default=1500)
+
+
 # --- Top-level ---
 
 class FusedMemoryConfig(BaseSettings):
@@ -275,6 +309,7 @@ class FusedMemoryConfig(BaseSettings):
     queue: QueueConfig = Field(default_factory=QueueConfig)
     taskmaster: TaskmasterConfig | None = Field(default=None)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
+    curator: CuratorConfig = Field(default_factory=CuratorConfig)
 
     model_config = SettingsConfigDict(
         env_prefix='',
