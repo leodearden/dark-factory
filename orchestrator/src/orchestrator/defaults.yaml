@@ -50,7 +50,7 @@ timeouts:
   debugger: 1200
   reviewer: 1200
   merger: 600
-  steward: 900
+  steward: 1800
   triage: 300
   module_tagger: 300
   deep_reviewer: 2400
