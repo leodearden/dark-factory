@@ -1,11 +1,17 @@
 """Tests for task interceptor middleware."""
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 
+from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
+from fused_memory.middleware.task_curator import (
+    CandidateTask,
+    CuratorDecision,
+    RewrittenTask,
+)
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
@@ -126,6 +132,188 @@ async def test_add_task_without_metadata_skips_update(interceptor, taskmaster):
     """add_task without metadata does not call update_task."""
     await interceptor.add_task('/project', prompt='Test')
     taskmaster.update_task.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Curator gate integration
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def curator_enabled_config():
+    cfg = FusedMemoryConfig()
+    cfg.curator = CuratorConfig(enabled=True)
+    return cfg
+
+
+@pytest.fixture
+def curator_interceptor(taskmaster, reconciler, event_buffer, curator_enabled_config):
+    return TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+    )
+
+
+def _mock_curator(decision: CuratorDecision) -> MagicMock:
+    """Mock TaskCurator returning a fixed decision."""
+    curator = MagicMock()
+    curator.curate = AsyncMock(return_value=decision)
+    curator.record_task = AsyncMock()
+    curator.reembed_task = AsyncMock()
+    return curator
+
+
+@pytest.mark.asyncio
+async def test_curator_drop_short_circuits_add_task(
+    curator_interceptor, taskmaster,
+):
+    """A drop decision returns the target_id without calling tm.add_task."""
+    decision = CuratorDecision(
+        action='drop', target_id='99',
+        justification='already covered by task 99',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await curator_interceptor.add_task(
+        '/project',
+        title='Fix parser bug',
+        description='The parser explodes on empty input',
+    )
+
+    assert result['id'] == '99'
+    assert result['deduplicated'] is True
+    assert result['action'] == 'drop'
+    taskmaster.add_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_updates_target_and_returns_id(
+    curator_interceptor, taskmaster,
+):
+    """A combine decision updates the target via update_task and returns its id."""
+    rewritten = RewrittenTask(
+        title='Harden parser',
+        description='Combined parser hardening',
+        details='Fix line 42; add test for empty input at tests/test_parser.py:88',
+        files_to_modify=['src/parser.py', 'tests/test_parser.py'],
+        priority='high',
+    )
+    decision = CuratorDecision(
+        action='combine',
+        target_id='50',
+        rewritten_task=rewritten,
+        justification='same root cause as task 50',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await curator_interceptor.add_task(
+        '/project',
+        title='Fix parser on empty input',
+        description='Parser panics on empty string',
+    )
+
+    assert result['id'] == '50'
+    assert result['action'] == 'combine'
+    # Combine calls update_task with a prompt instructing the rewrite.
+    taskmaster.update_task.assert_called_once()
+    call = taskmaster.update_task.call_args
+    assert call.kwargs['task_id'] == '50'
+    assert 'Harden parser' in call.kwargs['prompt']
+    assert 'line 42' in call.kwargs['prompt']  # specifics preserved verbatim
+    taskmaster.add_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_curator_create_proceeds_with_add_task(
+    curator_interceptor, taskmaster,
+):
+    """A create decision forwards to tm.add_task normally."""
+    decision = CuratorDecision(action='create', justification='genuinely new')
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await curator_interceptor.add_task(
+        '/project', title='Novel unrelated work',
+    )
+
+    assert result == {'id': '2', 'title': 'New Task'}
+    taskmaster.add_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_failure_falls_through_to_create(
+    curator_interceptor, taskmaster,
+):
+    """If tm.update_task raises during combine, fall back to creating the task."""
+    rewritten = RewrittenTask(
+        title='x', description='', details='d',
+        files_to_modify=[], priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine', target_id='50', rewritten_task=rewritten,
+        justification='...',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+    taskmaster.update_task.side_effect = RuntimeError('taskmaster failed')
+
+    result = await curator_interceptor.add_task(
+        '/project', title='Fix x',
+    )
+
+    # Fell through to create path
+    assert result == {'id': '2', 'title': 'New Task'}
+    taskmaster.add_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_curator_drop_short_circuits_add_subtask(
+    curator_interceptor, taskmaster,
+):
+    """add_subtask also runs the curator gate — previously bypassed."""
+    decision = CuratorDecision(
+        action='drop', target_id='88', justification='duplicate of sibling',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await curator_interceptor.add_subtask(
+        '1', '/project', title='Duplicate subtask work',
+    )
+
+    assert result['id'] == '88'
+    assert result['action'] == 'drop'
+    taskmaster.add_subtask.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_curator_disabled_still_proxies(taskmaster, reconciler, event_buffer):
+    """With curator.enabled=False, add_task proxies straight to Taskmaster."""
+    cfg = FusedMemoryConfig()
+    cfg.curator = CuratorConfig(enabled=False)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg)
+
+    result = await interceptor.add_task('/project', title='T')
+
+    assert result == {'id': '2', 'title': 'New Task'}
+    taskmaster.add_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_update_task_reembeds_on_title_change(
+    curator_interceptor, taskmaster,
+):
+    """update_task triggers fire-and-forget reembed when title/details change."""
+    curator_mock = _mock_curator(CuratorDecision(action='create'))
+    curator_interceptor._curator = curator_mock
+    taskmaster.get_task.return_value = {
+        'id': '7', 'status': 'pending', 'title': 'Updated title',
+        'description': 'desc', 'details': 'details',
+    }
+
+    await curator_interceptor.update_task(
+        '7', '/project', prompt='rename title to updated',
+    )
+    await asyncio.sleep(0)  # let fire-and-forget run
+    await curator_interceptor.drain()
+
+    curator_mock.reembed_task.assert_called_once()
 
 
 @pytest.mark.asyncio
