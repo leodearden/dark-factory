@@ -1711,7 +1711,7 @@ class TestCollectSnapshotExplicitRollback:
         (a) RuntimeError propagates out of collect_snapshot.
         (b) conn.rollback was called at least once before the re-raise.
         """
-        from unittest.mock import AsyncMock, patch as _patch
+        from unittest.mock import patch as _patch
 
         db_path, config, conn = burndown_env
 
