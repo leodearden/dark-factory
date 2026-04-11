@@ -979,6 +979,16 @@ class TestWorkingTreeSync:
             f'{[c for c in recorded if c[:2] == ["git", "stash"]]}'
         )
 
+        # Positive-path: confirm the unmerged-state guard was actually entered.
+        # _detect_unmerged_paths calls ['git', 'status', '--porcelain']; this
+        # command does not appear in the pre-guard path (ls-tree / merge-base),
+        # so its presence uniquely certifies that the guard ran rather than
+        # short-circuiting for an unrelated reason.
+        assert any(c[:2] == ['git', 'status'] and '--porcelain' in c for c in recorded), (
+            f'expected _detect_unmerged_paths to invoke git status --porcelain '
+            f'(guard path marker); recorded commands: {recorded}'
+        )
+
         # Main ref must NOT have moved
         _, main_after, _ = await _run(
             ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
