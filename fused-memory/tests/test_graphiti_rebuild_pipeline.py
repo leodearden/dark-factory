@@ -692,7 +692,9 @@ class TestRebuildEntitySummariesErrorHandling:
         )
 
     @pytest.mark.asyncio
-    async def test_force_false_partial_error_uses_detect_total(self, mock_config, make_backend):
+    async def test_force_false_partial_error_uses_detect_total(
+        self, mock_config, make_backend, make_stale_list
+    ):
         """force=False error path: total_entities flows from StaleSummaryResult.total_count.
 
         This exercises the force=False bookkeeping path where total_entities comes
@@ -705,10 +707,7 @@ class TestRebuildEntitySummariesErrorHandling:
         errors=1 and rebuilt=1, with details in target order (u1 first, u2 second).
         """
         backend = make_backend(mock_config)
-        stale_list = [
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'old A'},
-            {'uuid': 'u2', 'name': 'Bob', 'summary': 'old B'},
-        ]
+        stale_list = make_stale_list(alice_summary='old A', bob_summary='old B')
         detect_result = StaleSummaryResult(
             stale=stale_list,
             all_edges={'u1': [], 'u2': []},
