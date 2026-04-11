@@ -129,6 +129,16 @@ review:
   briefing_path: "review/briefing.yaml"
   reports_dir: "data/review-checkpoints"
 
+# Scheduler fairness — anti-starvation for broad-footprint tasks.
+# Install a short-lived module reservation once a top-ranked candidate has
+# been skipped N times in a row; lease scales with observed task duration.
+fairness:
+  skip_threshold: 4
+  lease_multiplier: 5.0
+  lease_min_secs: 60.0
+  lease_max_secs: 3600.0
+  median_window: 50
+
 # Sandbox
 sandbox:
   enabled: false
