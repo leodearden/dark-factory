@@ -1411,9 +1411,9 @@ class TestMergeToMainScrubFailure:
     async def test_merge_to_main_fails_when_scrub_fails(
         self, git_ops: GitOps,
     ):
-        """merge_to_main must return MergeResult(success=False) when _scrub fails.
+        """merge_to_main must return MergeResult(success=False) when scrub fails.
 
-        When _scrub_task_dir_from_tree returns _ScrubResult.FAILED, merge_to_main
+        When scrub_task_dir_from_tree returns ScrubResult.FAILED, merge_to_main
         should fail fast: clean up the merge worktree and return
         MergeResult(success=False, conflicts=False, ...) rather than returning
         MergeResult(success=True) with a contaminated commit.
@@ -1490,7 +1490,42 @@ class TestMergeToMainScrubFailure:
                 f'Leaked merge worktree directories on disk: {leak_dirs}'
             )
 
-    # Happy-path coverage: TestWorktreeLifecycle::test_merge_to_main (line 198)
-    # exercises merge_to_main with the real _scrub_task_dir_from_tree on a branch
-    # that has no .task/ content, verifying result.success is True and advance_main
-    # proceeds normally.  No additional happy-path test is needed here.
+    async def test_merge_to_main_succeeds_when_scrub_cleans_task_dir(
+        self, git_ops: GitOps,
+    ):
+        """merge_to_main must return success=True when scrub_task_dir_from_tree
+        returns ScrubResult.SCRUBBED (i.e. .task/ was found and removed cleanly).
+
+        Guards against regressions where a future change accidentally treats
+        SCRUBBED the same as FAILED.
+        """
+        worktree_info = await git_ops.create_worktree('scrub-ok-branch')
+        (worktree_info.path / 'scrub_ok.py').write_text('y = 2\n')
+        await git_ops.commit(worktree_info.path, 'Add scrub-ok file')
+
+        async def fake_scrub_ok(*args, **kwargs):
+            return ScrubResult.SCRUBBED
+
+        with patch(
+            'orchestrator.git_ops.scrub_task_dir_from_tree',
+            new=fake_scrub_ok,
+        ):
+            result = await git_ops.merge_to_main(worktree_info.path, 'scrub-ok-branch')
+
+        # SCRUBBED must not trigger the failure path — merge should succeed.
+        assert result.success is True, (
+            f'Expected success=True when scrub returns SCRUBBED, got {result.success!r}'
+        )
+        assert result.merge_commit is not None, (
+            'Expected a valid merge_commit SHA when scrub returns SCRUBBED'
+        )
+        assert len(result.merge_commit.strip()) == 40, (
+            f'Expected 40-char merge_commit SHA, got: {result.merge_commit!r}'
+        )
+        assert result.conflicts is False, (
+            f'Expected conflicts=False on SCRUBBED result, got {result.conflicts!r}'
+        )
+
+        # Clean up the merge worktree to avoid polluting other tests.
+        if result.merge_worktree is not None:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
