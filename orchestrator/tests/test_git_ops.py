@@ -1426,10 +1426,10 @@ class TestMergeToMainScrubFailure:
         # Patch _scrub_task_dir_from_tree to return FAILED, simulating a scrub
         # failure after the merge commit has been created.
         async def fake_scrub(*args, **kwargs):
-            return _ScrubResult.FAILED
+            return ScrubResult.FAILED
 
         with patch(
-            'orchestrator.git_ops._scrub_task_dir_from_tree',
+            'orchestrator.git_ops.scrub_task_dir_from_tree',
             new=fake_scrub,
         ):
             result = await git_ops.merge_to_main(worktree_info.path, 'scrub-fail-branch')
