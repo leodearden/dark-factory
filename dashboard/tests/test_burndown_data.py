@@ -210,10 +210,7 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        # Only 1 row — symlink and real path should deduplicate
-        assert count == 1
+                assert row[0] == 1  # Only 1 row — symlink and real path should deduplicate
 
     @pytest.mark.asyncio
     async def test_deduplicates_main_project_from_orchestrators(self, burndown_env):
