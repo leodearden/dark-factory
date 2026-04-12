@@ -96,6 +96,7 @@ async def empty_merge_events_conn(empty_merge_events_db):
 from dashboard.data.merge_queue import (  # noqa: E402
     _align_bucket,
     _bucket_minutes_for_window,
+    _get_durations,
     aggregate_latency_stats,
     aggregate_outcome_distribution,
     aggregate_queue_depth_timeseries,
@@ -502,6 +503,29 @@ class TestLatencyStats:
             result = await latency_stats(db, hours=24)
 
         assert result == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
+
+    @pytest.mark.asyncio
+    async def test_get_durations_returns_sorted(self, merge_events_db):
+        """_get_durations returns a sorted list even when inserted in non-sorted order.
+
+        Establishes the sorted-output invariant of _get_durations, which latency_stats
+        relies on to avoid a redundant sorted() call.
+        """
+        now = datetime.now(UTC)
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        for ms in [500, 100, 300, 200, 400]:
+            _insert_event(conn_sync, event_type='merge_attempt',
+                          timestamp=now - timedelta(minutes=10),
+                          data={'outcome': 'done'},
+                          duration_ms=ms)
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await _get_durations(db, hours=24)
+
+        assert result == sorted([500.0, 100.0, 300.0, 200.0, 400.0])
 
 
 # ---------------------------------------------------------------------------
