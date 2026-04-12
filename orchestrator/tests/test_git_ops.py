@@ -1402,3 +1402,130 @@ class TestScrubTaskDirFromTree:
         assert not sentinel.exists(), (
             'sentinel.txt still exists — rmtree must run before git commit attempt'
         )
+
+
+@pytest.mark.asyncio
+class TestMergeToMainScrubFailure:
+    """Tests for merge_to_main returning success=False when scrub fails."""
+
+    async def test_merge_to_main_fails_when_scrub_fails(
+        self, git_ops: GitOps,
+    ):
+        """merge_to_main must return MergeResult(success=False) when scrub fails.
+
+        When scrub_task_dir_from_tree returns ScrubResult.FAILED, merge_to_main
+        should fail fast: clean up the merge worktree and return
+        MergeResult(success=False, conflicts=False, ...) rather than returning
+        MergeResult(success=True) with a contaminated commit.
+        """
+        # Set up a feature branch with a committed file.
+        worktree_info = await git_ops.create_worktree('scrub-fail-branch')
+        (worktree_info.path / 'scrub_test.py').write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, 'Add scrub test file')
+
+        # Patch _scrub_task_dir_from_tree to return FAILED, simulating a scrub
+        # failure after the merge commit has been created.
+        async def fake_scrub(*args, **kwargs):
+            return ScrubResult.FAILED
+
+        with patch(
+            'orchestrator.git_ops.scrub_task_dir_from_tree',
+            new=fake_scrub,
+        ):
+            result = await git_ops.merge_to_main(worktree_info.path, 'scrub-fail-branch')
+
+        # (1) success must be False — scrub failure is a hard stop
+        assert result.success is False, (
+            f'Expected success=False on scrub failure, got success={result.success!r}'
+        )
+
+        # (2) conflicts must be False — this is NOT a merge conflict
+        assert result.conflicts is False, (
+            f'Expected conflicts=False on scrub failure, got conflicts={result.conflicts!r}'
+        )
+
+        # (3) details must mention 'scrub' and the branch name
+        assert 'scrub' in result.details.lower(), (
+            f'Expected "scrub" in details, got: {result.details!r}'
+        )
+        assert (
+            'scrub-fail-branch' in result.details
+            or 'task/scrub-fail-branch' in result.details
+        ), f'Expected branch name in details, got: {result.details!r}'
+
+        # (4) pre_merge_sha must be a valid 40-char SHA
+        assert result.pre_merge_sha is not None, 'Expected pre_merge_sha to be set'
+        assert len(result.pre_merge_sha.strip()) == 40, (
+            f'Expected 40-char SHA, got: {result.pre_merge_sha!r}'
+        )
+
+        # (5) merge_commit must be None — no committed merge SHA on failure
+        assert result.merge_commit is None, (
+            f'Expected merge_commit=None on scrub failure, got: {result.merge_commit!r}'
+        )
+
+        # (6) merge_worktree must be None — mirrors the non-conflict failure path
+        assert result.merge_worktree is None, (
+            f'Expected merge_worktree=None on scrub failure, got: {result.merge_worktree!r}'
+        )
+
+        # (7) No _merge-* worktrees should remain registered.
+        _, worktree_list, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        leak_lines = [
+            line for line in worktree_list.splitlines()
+            if '_merge-' in line
+        ]
+        assert not leak_lines, (
+            f'Leaked merge worktrees still registered: {leak_lines}'
+        )
+
+        # (8) No _merge-* directories should remain on disk.
+        worktree_base = git_ops.worktree_base
+        if worktree_base.exists():
+            leak_dirs = list(worktree_base.glob('_merge-*'))
+            assert not leak_dirs, (
+                f'Leaked merge worktree directories on disk: {leak_dirs}'
+            )
+
+    async def test_merge_to_main_succeeds_when_scrub_cleans_task_dir(
+        self, git_ops: GitOps,
+    ):
+        """merge_to_main must return success=True when scrub_task_dir_from_tree
+        returns ScrubResult.SCRUBBED (i.e. .task/ was found and removed cleanly).
+
+        Guards against regressions where a future change accidentally treats
+        SCRUBBED the same as FAILED.
+        """
+        worktree_info = await git_ops.create_worktree('scrub-ok-branch')
+        (worktree_info.path / 'scrub_ok.py').write_text('y = 2\n')
+        await git_ops.commit(worktree_info.path, 'Add scrub-ok file')
+
+        async def fake_scrub_ok(*args, **kwargs):
+            return ScrubResult.SCRUBBED
+
+        with patch(
+            'orchestrator.git_ops.scrub_task_dir_from_tree',
+            new=fake_scrub_ok,
+        ):
+            result = await git_ops.merge_to_main(worktree_info.path, 'scrub-ok-branch')
+
+        # SCRUBBED must not trigger the failure path — merge should succeed.
+        assert result.success is True, (
+            f'Expected success=True when scrub returns SCRUBBED, got {result.success!r}'
+        )
+        assert result.merge_commit is not None, (
+            'Expected a valid merge_commit SHA when scrub returns SCRUBBED'
+        )
+        assert len(result.merge_commit.strip()) == 40, (
+            f'Expected 40-char merge_commit SHA, got: {result.merge_commit!r}'
+        )
+        assert result.conflicts is False, (
+            f'Expected conflicts=False on SCRUBBED result, got {result.conflicts!r}'
+        )
+
+        # Clean up the merge worktree to avoid polluting other tests.
+        if result.merge_worktree is not None:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)

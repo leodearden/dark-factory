@@ -402,13 +402,13 @@ class TestRebuildEntitySummariesForceDryRun:
 
         assert result['total_entities'] == len(entities)
         assert result['stale_entities'] == result['total_entities']  # force=True treats every entity as stale
-        assert result['skipped'] == 3  # dry_run=True skips all
+        assert result['skipped'] == len(entities)  # dry_run=True skips all
         assert result['rebuilt'] == 0
         assert result['errors'] == 0
         expected_details = [
             {'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities
         ]
-        assert len(result['details']) == 3  # explicit length guard for clearer failure diagnostics
+        assert len(result['details']) == len(entities)  # explicit length guard for clearer failure diagnostics
         # dry_run path appends details sequentially via 'for t in targets', so order is stable
         assert [{k: d[k] for k in ('uuid', 'name', 'status')} for d in result['details']] == expected_details
         assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']

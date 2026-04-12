@@ -337,3 +337,58 @@ class TestStewardTimeoutInvariant:
         # env override: timeouts.steward=300 → 300 < 900 → validator must fire
         with pytest.raises(ValidationError, match='steward'):
             OrchestratorConfig()
+
+
+class TestValidateAssignment:
+    """validate_assignment=True must re-run model validators on top-level field mutations."""
+
+    def test_validate_assignment_rejects_steward_completion_timeout_mutation(
+        self, monkeypatch, tmp_path
+    ):
+        """Setting steward_completion_timeout above timeouts.steward must raise ValidationError.
+
+        With validate_assignment=True, this assignment fires _validate_steward_timeout_invariant
+        and raises ValidationError.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        # Construct a valid config: defaults give timeouts.steward=1800, sct=900
+        cfg = OrchestratorConfig()
+        assert cfg.timeouts.steward == 1800.0
+        assert cfg.steward_completion_timeout == 900.0
+        # Mutate steward_completion_timeout to 2000.0 — now above timeouts.steward=1800.
+        # validate_assignment=True fires _validate_steward_timeout_invariant, raising ValidationError.
+        with pytest.raises(ValidationError, match='steward'):
+            cfg.steward_completion_timeout = 2000.0
+
+    def test_validate_assignment_rejects_timeouts_replacement(
+        self, monkeypatch, tmp_path
+    ):
+        """Replacing cfg.timeouts with a TimeoutsConfig that violates the invariant must raise.
+
+        With validate_assignment=True, assigning cfg.timeouts fires _validate_steward_timeout_invariant
+        and raises ValidationError.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        # steward_completion_timeout=900 is valid against default timeouts.steward=1800
+        cfg = OrchestratorConfig(steward_completion_timeout=900.0)
+        assert cfg.steward_completion_timeout == 900.0
+        # Replace timeouts with steward=300 — now 300 < 900, violating the invariant.
+        # validate_assignment=True fires _validate_steward_timeout_invariant, raising ValidationError.
+        with pytest.raises(ValidationError, match='steward'):
+            cfg.timeouts = TimeoutsConfig(steward=300.0)
+
+    def test_validate_assignment_allows_valid_mutation(self, monkeypatch, tmp_path):
+        """A valid mutation of steward_completion_timeout must succeed without errors.
+
+        Regression guard: confirms that validate_assignment does not block
+        mutations that satisfy the invariant. Passes before and after step-4.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        cfg = OrchestratorConfig()
+        # default timeouts.steward=1800, steward_completion_timeout=900
+        # Setting sct=500 is valid (500 <= 1800).
+        cfg.steward_completion_timeout = 500.0
+        assert cfg.steward_completion_timeout == 500.0

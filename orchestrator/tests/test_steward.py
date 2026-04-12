@@ -120,6 +120,20 @@ def _make_escalation(**overrides):  # type: ignore[no-untyped-def]
     return Escalation(**defaults)  # type: ignore[arg-type]
 
 
+def _assert_cap_fire_pops_counters(steward, esc_id, mock_invoke):  # type: ignore[no-untyped-def]
+    """Assert standard cap-fire outcomes: no invocation, level-1 auto-escalation, counters popped.
+
+    Returns the submitted escalation object for guard-specific extra assertions.
+    """
+    mock_invoke.assert_not_called()
+    steward.escalation_queue.submit.assert_called_once()
+    submitted = steward.escalation_queue.submit.call_args[0][0]
+    assert submitted.level == 1
+    assert esc_id not in steward._retry_counts
+    assert esc_id not in steward._timeout_counts
+    return submitted
+
+
 # ---------------------------------------------------------------------------
 # Session Persistence
 # ---------------------------------------------------------------------------
@@ -444,6 +458,23 @@ class TestStewardRetryLogic:
 
         assert steward._retry_counts == {'esc-42-1': 1, 'esc-42-2': 1}
 
+    async def test_retry_cap_pops_counters(self, steward, mock_config):
+        """When the retry cap fires via _handle_escalation both counters are popped.
+
+        Integration test through the per-escalation retry-limit guard in _handle_escalation.
+        After cap-fire the dicts must not retain stale entries for the escalation id.
+        """
+        mock_config.steward_max_attempts = 2
+        esc = _make_escalation(id='esc-42-1')
+        # Pre-seed at retry cap so the guard fires immediately
+        steward._retry_counts['esc-42-1'] = 2
+        steward._timeout_counts['esc-42-1'] = 1
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
+
 
 # ---------------------------------------------------------------------------
 # Lifetime Budget
@@ -490,6 +521,25 @@ class TestStewardLifetimeBudget:
             mock_invoke.return_value = _make_result(cost=1.5)
             await steward._handle_escalation(esc)
             assert mock_invoke.call_args.kwargs['max_budget_usd'] == pytest.approx(2.0)
+
+    async def test_budget_exhaustion_pops_counters(self, steward, mock_config):
+        """When the lifetime budget guard fires both counters are popped.
+
+        Integration test through the lifetime-budget-exhaustion guard in _handle_escalation.
+        After cap-fire the dicts must not retain stale entries.
+        """
+        mock_config.steward_lifetime_budget = 5.0
+        steward.metrics.total_cost_usd = 6.0  # over budget
+
+        esc = _make_escalation(id='esc-42-1')
+        steward._retry_counts['esc-42-1'] = 1
+        steward._timeout_counts['esc-42-1'] = 1
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        submitted = _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
+        assert 'budget exhausted' in submitted.summary.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -886,6 +936,23 @@ class TestStewardTimeoutCap:
             resolved_by='steward',
         )
 
+    async def test_timeout_cap_pops_counters(self, steward, mock_config):
+        """When the timeout cap fires via _handle_escalation both counters are popped.
+
+        Integration test through the per-escalation timeout-limit guard in _handle_escalation.
+        After cap-fire the dicts must not retain stale entries for the escalation id.
+        """
+        mock_config.steward_max_timeouts_per_escalation = 2
+        esc = _make_escalation(id='esc-42-1')
+        # Pre-seed at cap so the guard fires immediately
+        steward._timeout_counts['esc-42-1'] = 2
+        steward._retry_counts['esc-42-1'] = 1
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
+
     async def test_different_escalations_have_independent_timeout_counts(
         self, steward, mock_config,
     ):
@@ -923,7 +990,12 @@ class TestStewardTimeoutCap:
     async def test_repeated_timeout_kills_eventually_terminate(
         self, steward, mock_config,
     ):
-        """Headline acceptance test: after cap timeouts the steward stops invoking."""
+        """Headline acceptance test: after cap timeouts the steward auto-escalates.
+
+        Loop runs 4 iterations: 3 real invocations (all timeout) + 1 cap-fire call
+        that triggers auto-escalation.  After cap-fire the counter is popped so
+        the dicts do not accumulate stale entries.
+        """
         mock_config.steward_max_timeouts_per_escalation = 3
         mock_config.steward_max_attempts = 10  # retry guard must not fire first
         mock_config.timeouts.steward = 900.0
@@ -942,10 +1014,10 @@ class TestStewardTimeoutCap:
                 session_id='sess-inf',
                 stderr='Process killed after 900.0s timeout (SIGTERM+SIGKILL)',
             )
-            for _ in range(5):
+            for _ in range(4):
                 await steward._handle_escalation(esc)
 
-        # invoke_agent called exactly 3 times (cap=3); calls 4 and 5 are blocked
+        # invoke_agent called exactly 3 times (cap=3); call 4 is blocked by the cap
         assert mock_invoke.call_count == 3
         # Level-1 re-escalation was submitted at least once
         steward.escalation_queue.submit.assert_called()
@@ -954,7 +1026,8 @@ class TestStewardTimeoutCap:
         assert 'repeatedly timed out' in first_submit.summary.lower()
         # Timeout metric reflects the 3 actual invocations
         assert steward.metrics.timeouts_recovered == 3
-        assert steward._timeout_counts['esc-42-inf'] == 3
+        # Counter popped on cap-fire — no stale entry retained
+        assert 'esc-42-inf' not in steward._timeout_counts
 
 
 # ---------------------------------------------------------------------------
@@ -1027,6 +1100,21 @@ class TestStewardAutoEscalation:
         esc = _make_escalation()
         steward._auto_escalate_to_human(esc, 'test reason')
         assert steward.metrics.escalations_reescalated == 1
+
+    def test_pops_per_escalation_counters(self, steward):
+        """_auto_escalate_to_human must pop _retry_counts and _timeout_counts for the id.
+
+        Prevents slow memory leak: counters accumulate forever if not cleaned up
+        on cap-fire paths (the success path already pops at L351-352).
+        """
+        esc = _make_escalation(id='esc-42-1')
+        steward._retry_counts['esc-42-1'] = 2
+        steward._timeout_counts['esc-42-1'] = 1
+
+        steward._auto_escalate_to_human(esc, 'cap fired')
+
+        assert 'esc-42-1' not in steward._retry_counts
+        assert 'esc-42-1' not in steward._timeout_counts
 
 
 # ---------------------------------------------------------------------------

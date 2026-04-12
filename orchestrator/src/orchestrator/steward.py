@@ -563,6 +563,11 @@ class TaskSteward:
             resolved_by='steward',
         )
 
+        # Clean up per-escalation counters so the dicts do not accumulate
+        # stale entries when cap-fire paths skip the success-path cleanup.
+        self._retry_counts.pop(escalation.id, None)
+        self._timeout_counts.pop(escalation.id, None)
+
         self.metrics.escalations_reescalated += 1
         logger.warning(
             f'Steward for task {self.task_id}: re-escalated {escalation.id} '
