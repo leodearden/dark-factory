@@ -1438,6 +1438,77 @@ class TestScrubTaskDirFromTree:
             'sentinel.txt still exists — rmtree must run before git commit attempt'
         )
 
+    async def test_scrub_failed_result_carries_error(
+        self, git_ops: GitOps,
+    ):
+        """When git rm fails, the returned ScrubResult must carry the git stderr.
+
+        After the ScrubResult → dataclass conversion, the failure path sets
+        outcome=ScrubOutcome.FAILED and error=<stderr>.strip().  This test drives
+        that conversion by asserting .outcome and .error on the return value.
+        """
+        worktree_info = await git_ops.create_worktree('scrub-carries-err')
+
+        async def mock_run(cmd, cwd=None):
+            if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
+                return (0, '.task/tracked.txt', '')
+            if cmd[:5] == ['git', 'rm', '-r', '--cached', '--']:
+                return (1, '', 'fatal: pathspec error from git rm')
+            pytest.fail(f'unexpected _run call: {cmd}')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await scrub_task_dir_from_tree(worktree_info.path, 'carries-err')
+
+        assert result.outcome == ScrubOutcome.FAILED, (  # type: ignore[name-defined]  # noqa: F821
+            f'Expected outcome=FAILED on git rm failure, got {result!r}'
+        )
+        assert result.error is not None, 'Expected error to be set on git rm failure'
+        assert 'pathspec' in result.error, (
+            f'Expected git rm stderr in .error, got: {result.error!r}'
+        )
+
+    async def test_scrub_scrubbed_result_has_no_error(
+        self, git_ops: GitOps,
+    ):
+        """When scrub succeeds, ScrubResult must have outcome=SCRUBBED and error=None."""
+        worktree_info = await git_ops.create_worktree('scrub-no-err-ok')
+
+        async def mock_run(cmd, cwd=None):
+            if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
+                return (0, '.task/tracked.txt', '')
+            if cmd[:5] == ['git', 'rm', '-r', '--cached', '--']:
+                return (0, '', '')
+            if len(cmd) >= 2 and cmd[1] == 'commit':
+                return (0, '', '')
+            pytest.fail(f'unexpected _run call: {cmd}')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await scrub_task_dir_from_tree(worktree_info.path, 'no-err-ok')
+
+        assert result.outcome == ScrubOutcome.SCRUBBED, (  # type: ignore[name-defined]  # noqa: F821
+            f'Expected outcome=SCRUBBED on success, got {result!r}'
+        )
+        assert result.error is None, f'Expected error=None on success, got {result.error!r}'
+
+    async def test_scrub_clean_result_has_no_error(
+        self, git_ops: GitOps,
+    ):
+        """When no .task/ files are present, ScrubResult must have outcome=CLEAN and error=None."""
+        worktree_info = await git_ops.create_worktree('scrub-clean-no-err')
+
+        async def mock_run(cmd, cwd=None):
+            if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
+                return (0, '', '')  # empty — no .task/ tracked
+            pytest.fail(f'unexpected _run call on clean path: {cmd}')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await scrub_task_dir_from_tree(worktree_info.path, 'clean-no-err')
+
+        assert result.outcome == ScrubOutcome.CLEAN, (  # type: ignore[name-defined]  # noqa: F821
+            f'Expected outcome=CLEAN on empty tree, got {result!r}'
+        )
+        assert result.error is None, f'Expected error=None on clean, got {result.error!r}'
+
 
 @pytest.mark.asyncio
 class TestMergeToMainScrubFailure:
