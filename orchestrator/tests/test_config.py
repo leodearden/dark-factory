@@ -2,7 +2,6 @@
 
 from importlib import resources as pkg_resources
 from pathlib import Path
-
 import pytest
 import yaml
 from pydantic import ValidationError
@@ -407,3 +406,36 @@ class TestValidateAssignment:
         # Assign a relative path post-construction; the field validator must resolve it
         cfg.project_root = Path('relative/subdir')
         assert cfg.project_root.is_absolute() is True
+
+    def test_project_root_field_validator_does_not_double_trigger_model_validator(
+        self, monkeypatch, tmp_path
+    ):
+        """@field_validator must not cause model validators to fire twice during construction.
+
+        With the old model_post_init: assigning self.project_root under validate_assignment=True
+        would trigger a second full model-validation pass (including _validate_steward_timeout_invariant),
+        so model validators fired 2× during construction.
+        With @field_validator('project_root', mode='after'): field-level validation resolves the
+        path without triggering a second model-validation pass, so model validators fire exactly 1×.
+
+        Strategy: subclass OrchestratorConfig with a counting model_validator; assert count == 1.
+        """
+        from pydantic import model_validator as _mv
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        call_count: list[int] = []
+
+        class TrackingConfig(OrchestratorConfig):
+            @_mv(mode='after')
+            def _count_model_validation_pass(self) -> 'TrackingConfig':
+                call_count.append(1)
+                return self
+
+        TrackingConfig()
+
+        assert len(call_count) == 1, (
+            f'Model validators were triggered {len(call_count)} times during construction; '
+            'expected exactly 1. With field_validator, the field-level resolver must not '
+            'cause a second full model-validation pass.'
+        )
