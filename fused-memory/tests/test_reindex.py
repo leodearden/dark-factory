@@ -982,6 +982,16 @@ class TestNodeCount:
         graph.ro_query.assert_awaited_once()
         graph.query.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_delegates_to_graph_for(self, mock_config, make_backend, make_graph_mock):
+        """node_count delegates graph resolution to _graph_for, not _require_driver._get_graph."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([[42]])
+        with patch.object(backend, '_graph_for', return_value=graph) as mock_graph_for:
+            result = await backend.node_count('my_graph')
+        mock_graph_for.assert_called_once_with('my_graph')
+        assert result == 42
+
 
 class TestListGraphs:
     """GraphitiBackend.list_graphs() returns non-system FalkorDB graph names."""
