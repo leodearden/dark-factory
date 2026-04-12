@@ -942,6 +942,57 @@ class TestHandleCapDetected:
 
 
 # =========================================================================
+# TestHandleNearCapWarning
+# =========================================================================
+
+
+class TestHandleNearCapWarning:
+    """_handle_near_cap_warning: account marking, logging, and cost events."""
+
+    def test_marks_correct_account_by_token(self):
+        gate = make_gate(['a', 'b'])
+        token_b = gate._accounts[1].token
+        gate._handle_near_cap_warning('reason', token_b)
+        assert gate._accounts[1].near_cap is True
+        assert gate._accounts[0].near_cap is False
+        # Neither account should be capped — near-cap only
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[1].capped is False
+
+    def test_unknown_token_marks_first_uncapped(self):
+        gate = make_gate(['a', 'b'])
+        gate._handle_near_cap_warning('reason', 'unknown-token')
+        assert gate._accounts[0].near_cap is True
+
+    def test_none_token_marks_first_uncapped(self):
+        gate = make_gate(['a', 'b'])
+        gate._handle_near_cap_warning('reason', None)
+        assert gate._accounts[0].near_cap is True
+
+    def test_all_capped_unknown_token_logs_warning(self, caplog):
+        gate = make_gate(['a'])
+        gate._accounts[0].capped = True
+        with caplog.at_level(logging.WARNING, logger='shared.usage_gate'):
+            gate._handle_near_cap_warning('reason', 'unknown-token')
+        assert any('no matching account' in r.message.lower() for r in caplog.records)
+
+    def test_fires_cost_event_with_cost_store(self):
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['a'], cost_store=cost_store)
+        token = gate._accounts[0].token
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._handle_near_cap_warning('reason', token)
+        mock_fire.assert_called_once()
+
+    def test_no_cost_event_without_cost_store(self):
+        gate = make_gate(['a'], cost_store=None)
+        token = gate._accounts[0].token
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._handle_near_cap_warning('reason', token)
+        mock_fire.assert_not_called()
+
+
+# =========================================================================
 # TestResolveAccount
 # =========================================================================
 
