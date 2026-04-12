@@ -1483,10 +1483,9 @@ class TestMergeToMainScrubFailure:
         assert 'scrub' in result.details.lower(), (
             f'Expected "scrub" in details, got: {result.details!r}'
         )
-        assert (
-            'scrub-fail-branch' in result.details
-            or 'task/scrub-fail-branch' in result.details
-        ), f'Expected branch name in details, got: {result.details!r}'
+        assert 'task/scrub-fail-branch' in result.details, (
+            f'Expected full prefixed branch name in details, got: {result.details!r}'
+        )
 
         # (4) pre_merge_sha must be a valid 40-char SHA
         assert result.pre_merge_sha is not None, 'Expected pre_merge_sha to be set'
