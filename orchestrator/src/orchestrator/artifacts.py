@@ -13,6 +13,122 @@ logger = logging.getLogger(__name__)
 
 PLAN_SCHEMA_VERSION = 1
 
+# Keys the architect LLM sometimes uses instead of the required "steps".
+_STEPS_ALIASES = ('tdd_steps', 'tdd_plan', 'implementation_steps')
+
+# Key for deeply-nested phase structures (tdd_implementation_plan.phase_1_red, …).
+_NESTED_PLAN_KEY = 'tdd_implementation_plan'
+
+
+def _wrap_string_items(items: list, prefix: str) -> tuple[list, bool]:
+    """Wrap any plain-string items in a list into canonical step dicts.
+
+    Returns (new_list, was_modified).
+    """
+    modified = False
+    out: list = []
+    for i, item in enumerate(items):
+        if isinstance(item, str):
+            out.append({
+                'id': f'{prefix}-{i + 1}',
+                'description': item,
+                'status': 'pending',
+                'commit': None,
+            })
+            modified = True
+        else:
+            out.append(item)
+    return out, modified
+
+
+def _flatten_phases(phases: dict) -> list[dict]:
+    """Flatten a nested tdd_implementation_plan dict into a flat step list."""
+    steps: list[dict] = []
+    step_counter = 0
+    for _phase_key in sorted(phases):
+        value = phases[_phase_key]
+        if isinstance(value, list):
+            items = value
+        elif isinstance(value, (dict, str)):
+            items = [value]
+        else:
+            logger.warning('Skipping unrecognisable phase value type %s in %s',
+                           type(value).__name__, _phase_key)
+            continue
+        for item in items:
+            step_counter += 1
+            if isinstance(item, dict):
+                # Ensure it has an id
+                if 'id' not in item:
+                    item['id'] = f'step-{step_counter}'
+                if 'status' not in item:
+                    item['status'] = 'pending'
+                if 'commit' not in item:
+                    item['commit'] = None
+                steps.append(item)
+            elif isinstance(item, str):
+                steps.append({
+                    'id': f'step-{step_counter}',
+                    'description': item,
+                    'status': 'pending',
+                    'commit': None,
+                })
+            else:
+                logger.warning('Skipping non-dict/str item in phase %s', _phase_key)
+    return steps
+
+
+def _normalize_plan(plan: dict) -> tuple[dict, bool]:
+    """Detect and fix common malformed plan shapes.
+
+    Returns (plan, was_modified).  The caller should write back to disk
+    when *was_modified* is True.
+    """
+    modified = False
+
+    # Rule 1-2: rename known step-key aliases → steps
+    if 'steps' not in plan:
+        for alias in _STEPS_ALIASES:
+            if alias in plan and isinstance(plan[alias], list):
+                logger.warning('Normalizing plan: renaming %r → "steps"', alias)
+                plan['steps'] = plan.pop(alias)
+                modified = True
+                break
+
+    # Rule 3: flatten nested tdd_implementation_plan phases
+    if 'steps' not in plan and _NESTED_PLAN_KEY in plan:
+        nested = plan[_NESTED_PLAN_KEY]
+        if isinstance(nested, dict):
+            logger.warning(
+                'Normalizing plan: flattening %s phases from %r',
+                len(nested), _NESTED_PLAN_KEY,
+            )
+            plan['steps'] = _flatten_phases(nested)
+            plan.pop(_NESTED_PLAN_KEY)
+            modified = True
+
+    # Rule 4: wrap string prerequisites
+    prereqs = plan.get('prerequisites')
+    if isinstance(prereqs, list):
+        new_prereqs, changed = _wrap_string_items(prereqs, 'pre')
+        if changed:
+            logger.warning('Normalizing plan: wrapping %d string prerequisites as dicts',
+                           sum(1 for p in prereqs if isinstance(p, str)))
+            plan['prerequisites'] = new_prereqs
+            modified = True
+
+    # Rule 5: wrap string steps
+    steps = plan.get('steps')
+    if isinstance(steps, list):
+        new_steps, changed = _wrap_string_items(steps, 'step')
+        if changed:
+            logger.warning('Normalizing plan: wrapping %d string steps as dicts',
+                           sum(1 for s in steps if isinstance(s, str)))
+            plan['steps'] = new_steps
+            modified = True
+
+    return plan, modified
+
 
 @dataclass
 class ReviewAggregation:
@@ -123,11 +239,19 @@ class TaskArtifacts:
         self._write_json(self.root / 'plan.json', plan)
 
     def read_plan(self) -> dict:
-        """Read current plan state."""
+        """Read current plan state, auto-normalizing malformed shapes."""
         plan_path = self.root / 'plan.json'
         if not plan_path.exists():
             return {}
-        return json.loads(plan_path.read_text())
+        plan = json.loads(plan_path.read_text())
+        plan, modified = _normalize_plan(plan)
+        if modified:
+            logger.warning(
+                'Plan normalization applied — writing corrected plan to %s',
+                plan_path,
+            )
+            self._write_json(plan_path, plan)
+        return plan
 
     def update_step_status(
         self, step_id: str, status: str, commit: str | None = None
@@ -137,6 +261,8 @@ class TaskArtifacts:
 
         for collection in ('prerequisites', 'steps'):
             for item in plan.get(collection, []):
+                if not isinstance(item, dict):
+                    continue
                 if item.get('id') == step_id:
                     item['status'] = status
                     if commit is not None:
@@ -152,7 +278,7 @@ class TaskArtifacts:
         pending = []
         for collection in ('prerequisites', 'steps'):
             for item in plan.get(collection, []):
-                if item.get('status') == 'pending':
+                if isinstance(item, dict) and item.get('status') == 'pending':
                     pending.append(item)
         return pending
 
@@ -162,7 +288,7 @@ class TaskArtifacts:
         completed = []
         for collection in ('prerequisites', 'steps'):
             for item in plan.get(collection, []):
-                if item.get('status') == 'done':
+                if isinstance(item, dict) and item.get('status') == 'done':
                     completed.append(item)
         return completed
 
