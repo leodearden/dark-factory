@@ -55,6 +55,21 @@ CAP_HIT_PREFIXES = [
 # cases.  'upgrade your plan' and 'upgrade your subscription' are natural SaaS
 # cap-message phrases unlikely to appear in non-cap contexts.  The primary
 # defense remains the CAP_HIT_PREFIXES / NEAR_CAP_PREFIXES prefix match.
+#
+# Known verbatim Claude CLI cap-hit messages that motivated this list
+# (update if Claude changes its wording):
+#   "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours."
+#       → 'usage limit', 'resets'
+#   "You've used all available credits. Upgrade your plan for more capacity."
+#       → 'upgrade your plan'
+#   "You're out of extra usage for this billing period. Your plan resets in 2h."
+#       → 'resets'
+#   "You're now using extra compute credits. Your plan resets in 1h."
+#       → 'resets'
+#   "You're close to reaching your usage limit. Your plan resets in 1h."  (near-cap)
+#       → 'usage limit', 'resets'
+# See also: TestCapDetectionPatterns.test_realistic_cap_messages in
+# test_usage_gate_exhaustive.py for the full parametrized fixture set.
 CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade your plan", "upgrade your subscription"]
 
 # Patterns for near-cap warnings (pause proactively)
