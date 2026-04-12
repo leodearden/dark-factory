@@ -1372,7 +1372,7 @@ class TestRebuildEntitySummariesCancellation:
 
     @pytest.mark.asyncio
     async def test_cancelled_error_propagates_alongside_other_errors(
-        self, two_entity_backend
+        self, two_entity_backend, caplog
     ):
         """CancelledError must take precedence over per-entity RuntimeErrors in the same batch.
 
@@ -1386,6 +1386,9 @@ class TestRebuildEntitySummariesCancellation:
         The propagation pass scans *all* results before any per-entity bookkeeping, so
         even if RuntimeError occupies the first slot, CancelledError in the second slot
         is still detected and re-raised.
+
+        The WARNING log must also be emitted on this mixed-error path — a regression
+        dropping the warning from this branch would otherwise go undetected.
         """
         backend = two_entity_backend
         # First entity raises a normal RuntimeError; second raises CancelledError
@@ -1393,7 +1396,7 @@ class TestRebuildEntitySummariesCancellation:
             side_effect=[RuntimeError('per-entity failure'), asyncio.CancelledError()]
         )
 
-        with pytest.raises(asyncio.CancelledError):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'), pytest.raises(asyncio.CancelledError):
             await backend.rebuild_entity_summaries(group_id='test', force=True)
 
         # After CancelledError propagated, verify both update_node_summary calls were
@@ -1405,6 +1408,19 @@ class TestRebuildEntitySummariesCancellation:
         # proves gather scheduled both coroutines and that we are testing the
         # post-gather propagation path, not a pre-gather short-circuit.
         assert backend.update_node_summary.await_count == 2
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.backends.graphiti_client'
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected 1 WARNING from graphiti_client, got {len(warning_records)}: {warning_records}'
+        )
+        msg = warning_records[0].getMessage()
+        assert 'rebuild_entity_summaries' in msg
+        assert 'cancellation' in msg
+        assert 'group=test' in msg
 
     @pytest.mark.asyncio
     async def test_cancelled_error_logs_warning_before_propagating(
