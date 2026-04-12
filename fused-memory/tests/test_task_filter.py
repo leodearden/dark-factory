@@ -293,9 +293,9 @@ class TestFormatFilteredTaskTree:
         # Task 51 is beyond the max_tasks=50 cap — must not appear in body
         assert 'Task title 51' not in output
 
-        # Header must contain the max_tasks-cap omission phrase: pins count + intent,
+        # Header must contain the max_tasks-cap omission phrase: pins count + verb + intent,
         # tolerates preposition rewording (e.g. 'omitted by' vs 'omitted due to')
-        assert re.search(r'450\s+more active.*max_tasks', output)
+        assert re.search(r'450\s+more active omitted (by|due to) max_tasks cap', output)
 
     def test_char_budget_clamps_below_max_tasks(self):
         """When max_chars forces truncation below the max_tasks cap, the truncation notice
