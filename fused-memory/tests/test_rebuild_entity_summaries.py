@@ -1458,6 +1458,48 @@ class TestRebuildEntitySummariesCancellation:
         assert 'errors_so_far=0' in msg
 
     @pytest.mark.asyncio
+    async def test_cancelled_error_in_second_slot_still_logs_warning(
+        self, two_entity_backend, caplog
+    ):
+        """CancelledError in the second slot is detected by propagate_cancellations scan.
+
+        All prior CancelledError tests place the error in slot 0 (side_effect=[CancelledError(),
+        None]).  This test exercises slot 1 (side_effect=[None, CancelledError()]) where the
+        first entity succeeds and CancelledError appears only in the second position.
+
+        propagate_cancellations scans *all* results before any per-entity bookkeeping, so
+        CancelledError in any slot must still be detected and re-raised.  Explicit coverage
+        here guards against a regression where the scan is shortened to check only the first
+        result.
+
+        rebuilt_so_far=0 and errors_so_far=0 because counters are only incremented in Pass 2,
+        which never executes when CancelledError is found in Pass 1.
+        """
+        backend = two_entity_backend
+        # First entity's rebuild succeeds; second raises CancelledError
+        backend.update_node_summary = AsyncMock(
+            side_effect=[None, asyncio.CancelledError()]
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'), pytest.raises(asyncio.CancelledError):
+            await backend.rebuild_entity_summaries(group_id='test', force=True)
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.backends.graphiti_client'
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected 1 WARNING from graphiti_client, got {len(warning_records)}: {warning_records}'
+        )
+        msg = warning_records[0].getMessage()
+        assert 'rebuild_entity_summaries' in msg
+        assert 'cancellation' in msg
+        assert 'group=test' in msg
+        assert 'rebuilt_so_far=0' in msg
+        assert 'errors_so_far=0' in msg
+
+    @pytest.mark.asyncio
     async def test_cancelled_error_propagates_force_false(self, two_entity_backend):
         """CancelledError must propagate through the force=False code path.
 
