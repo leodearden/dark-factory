@@ -2137,6 +2137,78 @@ class TestEvalSchedulerCachedStatus:
 # signature drift, not behavioural regressions.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Tests: Prerequisites format validation
+# ---------------------------------------------------------------------------
+
+
+class StringPrereqsArchitectStub(AgentStub):
+    """AgentStub subclass that writes a plan with plain-string prerequisites."""
+
+    async def _architect(self, cwd: Path) -> AgentResult:
+        task_dir = cwd / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        bad_plan = {
+            'task_id': '42',
+            'title': 'Add farewell function',
+            'modules': ['lib'],
+            'analysis': 'Simple function addition with TDD',
+            'prerequisites': ['install deps', 'set up config'],  # plain strings — invalid
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'type': 'test',
+                    'description': 'Write failing test for farewell()',
+                    'status': 'pending',
+                    'commit': None,
+                },
+            ],
+            '_schema_version': 1,
+        }
+        (task_dir / 'plan.json').write_text(json.dumps(bad_plan, indent=2) + '\n')
+        return AgentResult(success=True, output='Plan created', cost_usd=0.50)
+
+
+@pytest.mark.asyncio
+class TestPrerequisitesValidation:
+    """Workflow blocks with descriptive error when architect writes string prerequisites."""
+
+    async def test_string_prerequisites_block_workflow(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """Architect plan with ['string prereq'] prerequisites causes BLOCKED outcome.
+
+        The escalation message must mention 'prerequisites' (descriptive error),
+        not a generic AttributeError crash.  This verifies that validate_plan_prerequisites()
+        is called at the plan checkpoint rather than failing silently later.
+        """
+        stub = StringPrereqsArchitectStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.statuses['42'][-1] == 'blocked'
+
+        # The escalation must describe the prerequisites problem, not a generic crash
+        escalations = queue.get_by_task('42')
+        assert len(escalations) == 1
+        esc = escalations[0]
+        # summary or detail must mention 'prerequisites' to confirm the validation ran
+        assert 'prerequisites' in esc.summary.lower() or 'prerequisites' in (esc.detail or '').lower()
+
+
 if TYPE_CHECKING:
     from orchestrator.evals.runner import _EvalScheduler as _EvalSchedulerStatic
     from orchestrator.workflow import _SchedulerLike
