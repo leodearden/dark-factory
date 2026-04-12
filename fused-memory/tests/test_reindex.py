@@ -981,3 +981,24 @@ class TestNodeCount:
         await backend.node_count('test_graph')
         graph.ro_query.assert_awaited_once()
         graph.query.assert_not_awaited()
+
+
+class TestListGraphs:
+    """GraphitiBackend.list_graphs() returns non-system FalkorDB graph names."""
+
+    @pytest.mark.asyncio
+    async def test_returns_filtered(self, mock_config, make_backend):
+        """Filters out 'default_db' and names ending in '_db' via _driver.client.list_graphs."""
+        backend = make_backend(mock_config)
+        backend._driver.client.list_graphs = AsyncMock(
+            return_value=['proj_a', 'default_db', 'proj_b', 'internal_db']
+        )
+        result = await backend.list_graphs()
+        assert result == ['proj_a', 'proj_b']
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        """Raises RuntimeError when backend is not initialized (_driver is None)."""
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.list_graphs()
