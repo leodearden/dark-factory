@@ -1028,6 +1028,21 @@ class TestStewardAutoEscalation:
         steward._auto_escalate_to_human(esc, 'test reason')
         assert steward.metrics.escalations_reescalated == 1
 
+    def test_pops_per_escalation_counters(self, steward):
+        """_auto_escalate_to_human must pop _retry_counts and _timeout_counts for the id.
+
+        Prevents slow memory leak: counters accumulate forever if not cleaned up
+        on cap-fire paths (the success path already pops at L351-352).
+        """
+        esc = _make_escalation(id='esc-42-1')
+        steward._retry_counts['esc-42-1'] = 2
+        steward._timeout_counts['esc-42-1'] = 1
+
+        steward._auto_escalate_to_human(esc, 'cap fired')
+
+        assert 'esc-42-1' not in steward._retry_counts
+        assert 'esc-42-1' not in steward._timeout_counts
+
 
 # ---------------------------------------------------------------------------
 # Run Loop
