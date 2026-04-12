@@ -320,7 +320,8 @@ class TestHooksIntegration:
             if 'check_asyncmock_assertion_style.py' in line.split('#')[0]
         ]
         assert invocation_lines, 'No invocation of check_asyncmock_assertion_style.py found in hooks/project-checks'
-        assert any('fused-memory/tests' in line.split('#')[0] for line in content.splitlines()), (
+        assert any('fused-memory/tests' in line.split('#')[0]  # Naive comment strip — safe for this literal
+                   for line in content.splitlines()), (
             'Expected fused-memory/tests scan target in non-comment code in hooks/project-checks'
         )
         for line in invocation_lines:
