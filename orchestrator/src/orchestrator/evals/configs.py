@@ -77,6 +77,7 @@ def _vllm_config(
 
 RTX_PRO_6000 = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
 H200 = "NVIDIA H200"
+B200 = "NVIDIA B200"
 
 
 VLLM_EVAL_CONFIGS = [
@@ -293,55 +294,82 @@ EVAL_CONFIGS = [
 # or are architecturally sound on SM90/SM121a.  Run with:
 #   --task-timeout-min 180 --orch-timeout-min 150
 FINAL_RUN_CONFIGS = [
-    # --- REAP-139B AWQ (best REAP-139B variant so far) ---
-    # AWQ 4-bit: ~78 GB VRAM. On H200 (141 GB) that leaves 56 GB KV cache
-    # = ~239k tokens.  Bumped to 131k context (model's native max).
+    # ===== GPU compatibility (SM120 = RTX PRO 6000 Blackwell) =====
+    # ✅ SM120 works: FP8 quant + any TP (confirmed TP=2, TP=4)
+    # ❌ SM120 broken: NVFP4 MoE kernels (vLLM #35566), AWQ TP=2 NCCL hang
+    # ✅ SM90 (H200) works: everything — FP8, NVFP4, AWQ
+    # ✅ SM102 (B200) works: assumed same as SM90 (Blackwell data-center)
+    #
+    # Launch with: --task-timeout-min 180 --orch-timeout-min 150 --all-tasks
+    # Baked images: leosiriusdawn/runpod-vllm:final-<model-slug>
+
+    # --- REAP-139B AWQ 4-bit (~78 GB VRAM) ---
+    # ❌ RTX PRO: AWQ TP=2 hangs at NCCL init; TP=1 can't fit 131k context
+    # ✅ H200 (141 GB): 56 GB KV = full 131k context
     _vllm_config('final-reap-139b-awq',
         hf_model='cyankiwi/MiniMax-M2.5-REAP-139B-A10B-AWQ-4bit',
-        image='leosiriusdawn/runpod-vllm:latest',
+        image='leosiriusdawn/runpod-vllm:final-reap-139b-awq',
         gpu_type=H200, gpu_count=1, container_disk_gb=100,
         max_model_len=131072, gpu_memory_util=0.95,
         tool_call_parser='minimax_m2'),
-    # --- REAP-172B NVFP4 GB10 (larger REAP, strongest self-hosted so far) ---
-    # 93 GB NVFP4. On H200 (141 GB) = ~40 GB KV. 131k may be too tight;
-    # use 100k as a compromise — leaves ~25k tokens KV headroom.
+
+    # --- REAP-139B FP8 (~131 GB VRAM) ---
+    # ✅ RTX PRO: 2× RTX PRO (192 GB), TP=2, FP8 works on SM120
+    # Canonical source model — validates REAP-139B quality without quant issues.
+    _vllm_config('final-reap-139b-fp8',
+        hf_model='cerebras/MiniMax-M2.5-REAP-139B-A10B',
+        image='leosiriusdawn/runpod-vllm:final-reap-139b-fp8',
+        gpu_type=RTX_PRO_6000, gpu_count=2, container_disk_gb=350,
+        max_model_len=131072, gpu_memory_util=0.95,
+        quantization='fp8',
+        tool_call_parser='minimax_m2'),
+
+    # --- REAP-172B NVFP4 GB10 (~93 GB VRAM) ---
+    # ❌ RTX PRO: NVFP4 MoE broken on SM120
+    # ✅ B200 (180 GB): 80+ GB KV = full 131k context
+    # Falls back to 2× H200 (282 GB) if B200 unavailable.
     _vllm_config('final-reap-172b-nvfp4-gb10',
         hf_model='saricles/MiniMax-M2.5-REAP-172B-A10B-NVFP4-GB10',
-        image='leosiriusdawn/runpod-vllm:latest',
-        gpu_type=H200, gpu_count=1, container_disk_gb=250,
-        max_model_len=100000, gpu_memory_util=0.95,
+        image='leosiriusdawn/runpod-vllm:final-reap-172b-nvfp4-gb10',
+        gpu_type=B200, gpu_count=1, container_disk_gb=250,
+        max_model_len=131072, gpu_memory_util=0.95,
         tool_call_parser='minimax_m2',
         override_generation_config='{"eos_token_id": 200020}'),
-    # --- MiniMax-M2.5 FP8 (full 215 GB, 4× RTX PRO / 2× H200) ---
-    # Best self-hosted model in trials (solved reify_task_12). 215 GB FP8.
-    # 4× RTX PRO (384 GB) or 2× H200 (282 GB). Full 131k context.
+
+    # --- MiniMax-M2.5 FP8 (~215 GB VRAM) ---
+    # ✅ RTX PRO: 4× RTX PRO (384 GB), TP=4 — best self-hosted in trials
+    # Solved reify_task_12 (1531 lines). High availability GPU.
     _vllm_config('final-minimax-m25-fp8',
         hf_model='MiniMaxAI/MiniMax-M2.5',
-        image='leosiriusdawn/runpod-vllm:minimax-m25-fp8-baked',
-        gpu_type=RTX_PRO_6000, gpu_count=4, container_disk_gb=320,
+        image='leosiriusdawn/runpod-vllm:final-minimax-m25-fp8',
+        gpu_type=RTX_PRO_6000, gpu_count=4, container_disk_gb=600,
         max_model_len=131072,
         quantization='fp8',
         tool_call_parser='minimax_m2',
         extra_env={'MAX_NUM_SEQS': '5'}),
-    # --- MiniMax-M2.5 NVFP4 (nvidia, 131 GB, 1× H200) ---
-    # Same architecture as FP8 but quantized to NVFP4. Tighter on KV cache
-    # so keep 80k context (matches earlier successful run).
+
+    # --- MiniMax-M2.5 NVFP4 (~131 GB VRAM) ---
+    # ❌ RTX PRO: NVFP4 MoE broken on SM120
+    # ✅ B200 (180 GB): 40+ GB KV = full 131k context
     _vllm_config('final-minimax-m25-nvfp4',
         hf_model='nvidia/MiniMax-M2.5-NVFP4',
-        image='leosiriusdawn/runpod-vllm:minimax-m25-nvfp4-baked',
-        gpu_type=H200, gpu_count=1, container_disk_gb=240,
-        max_model_len=80000, gpu_memory_util=0.97,
+        image='leosiriusdawn/runpod-vllm:final-minimax-m25-nvfp4',
+        gpu_type=B200, gpu_count=1, container_disk_gb=240,
+        max_model_len=131072, gpu_memory_util=0.95,
         tool_call_parser='minimax_m2',
         extra_env={'MAX_NUM_SEQS': '5'}),
-    # --- Qwen3-Coder-Next FP8 (75 GB, 1× H200) ---
-    # Code-specialized model. Full 131k context on H200 with 56+ GB KV.
+
+    # --- Qwen3-Coder-Next FP8 (~75 GB VRAM) ---
+    # ❌ RTX PRO: TP=2 hangs at NCCL init (model-specific, not just quant)
+    # ✅ H200 (141 GB): 56+ GB KV = full 131k context
     _vllm_config('final-qwen3-coder-next-fp8',
         hf_model='Qwen/Qwen3-Coder-Next-FP8',
-        image='leosiriusdawn/runpod-vllm:latest',
+        image='leosiriusdawn/runpod-vllm:final-qwen3-coder-next-fp8',
         gpu_type=H200, gpu_count=1, container_disk_gb=200,
         max_model_len=131072,
         tool_call_parser='qwen3_coder',
         enforce_eager=True),
+
     # --- Cloud baselines (re-run with higher timeout) ---
     EvalConfig('final-claude-sonnet-max', 'claude', 'sonnet', 'max'),
     EvalConfig('final-claude-opus-max', 'claude', 'opus', 'max'),

@@ -90,6 +90,17 @@ H200_VARIANTS = [
     "NVIDIA H200 NVL",  # H200 NVL (143 GB)
 ]
 
+# B200 variants (180 GB single GPU).
+B200_VARIANTS = [
+    "NVIDIA B200",
+]
+
+# GPU type expansion: single type → fallback list for availability.
+GPU_TYPE_FALLBACKS = {
+    "NVIDIA H200": H200_VARIANTS,
+    "NVIDIA B200": B200_VARIANTS,
+}
+
 # Fallback GPU types when neither the config nor --gpu-type provides one.
 GPU_TYPES = [
     "NVIDIA RTX PRO 6000 Blackwell Server Edition",
@@ -594,7 +605,7 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
     if args.gpu_type:
         gpu_types_to_try = [args.gpu_type]
     elif cfg.gpu_type:
-        gpu_types_to_try = H200_VARIANTS if cfg.gpu_type == "NVIDIA H200" else [cfg.gpu_type]
+        gpu_types_to_try = GPU_TYPE_FALLBACKS.get(cfg.gpu_type, [cfg.gpu_type])
     else:
         gpu_types_to_try = GPU_TYPES
 
