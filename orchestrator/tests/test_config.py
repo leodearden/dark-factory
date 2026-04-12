@@ -393,3 +393,17 @@ class TestValidateAssignment:
         # Setting sct=500 is valid (500 <= 1800).
         cfg.steward_completion_timeout = 500.0
         assert cfg.steward_completion_timeout == 500.0
+
+    def test_project_root_resolved_on_assignment(self, monkeypatch, tmp_path):
+        """Assigning a relative path to project_root after construction must resolve it to absolute.
+
+        With a @field_validator('project_root', mode='after') and validate_assignment=True,
+        post-construction assignment fires the field validator, resolving the path.
+        This test fails when model_post_init is used (which only fires at construction).
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        cfg = OrchestratorConfig()
+        # Assign a relative path post-construction; the field validator must resolve it
+        cfg.project_root = Path('relative/subdir')
+        assert cfg.project_root.is_absolute() is True
