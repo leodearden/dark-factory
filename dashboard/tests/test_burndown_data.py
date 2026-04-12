@@ -1203,8 +1203,8 @@ class TestBurndownEnvFixture:
         # (c) conn is a usable aiosqlite connection
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
             row = await cur.fetchone()
-        assert row is not None
-        assert row[0] == 0
+            assert row is not None
+            assert row[0] == 0
 
 
 # ---------------------------------------------------------------------------
