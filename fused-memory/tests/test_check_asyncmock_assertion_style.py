@@ -195,7 +195,7 @@ def func_b():
 def _assert_violation_output(stdout: str, bad_file: Path) -> None:
     """Assert that checker stdout matches the violation-report contract.
 
-    Checks: full bad_file path present, line-3 reference present,
+    Checks: full bad_file path present, anchored line-3 reference present,
     assert_not_awaited keyword present, assert_not_called keyword present.
 
     Shared by TestCliExitCodes (sys.executable) and TestHooksIntegration
@@ -205,8 +205,8 @@ def _assert_violation_output(stdout: str, bad_file: Path) -> None:
     assert str(bad_file) in stdout, (
         f'Expected bad_file path in violation output, got: {stdout!r}'
     )
-    assert ':3:' in stdout, (
-        f'Expected line-3 reference in violation output, got: {stdout!r}'
+    assert f'{bad_file}:3:' in stdout, (
+        f'Expected anchored line-3 reference in violation output, got: {stdout!r}'
     )
     assert 'assert_not_awaited' in stdout, (
         f'Expected assert_not_awaited in violation output, got: {stdout!r}'
