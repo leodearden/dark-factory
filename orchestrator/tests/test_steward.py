@@ -1025,15 +1025,30 @@ class TestStewardTimeoutCap:
         Loop runs 4 iterations: 3 real invocations (all timeout) + 1 cap-fire call
         that triggers auto-escalation.  After cap-fire the counter is popped so
         the dicts do not accumulate stale entries.
+
+        The stateful queue mock ensures that once resolve() dismisses the escalation,
+        subsequent queue.get() calls return dismissed status — reflecting production
+        behaviour where the run-loop would not re-dispatch a dismissed escalation.
+        Assertions are exact counts (not just assert_called) to catch double-fire bugs.
         """
         mock_config.steward_max_timeouts_per_escalation = 3
         mock_config.steward_max_attempts = 10  # retry guard must not fire first
         mock_config.timeouts.steward = 900.0
         esc = _make_escalation(id='esc-42-inf')
-        # Queue always returns pending (never resolved)
-        steward.escalation_queue.get.return_value = _make_escalation(
-            id='esc-42-inf', status='pending',
-        )
+
+        # Stateful mock: get() returns pending until resolve() is called, then dismissed
+        _dismissed_ids: set[str] = set()
+
+        def _track_resolve(esc_id, *args, **kwargs):  # type: ignore[no-untyped-def]
+            _dismissed_ids.add(esc_id)
+
+        def _get_by_state(esc_id):  # type: ignore[no-untyped-def]
+            if esc_id in _dismissed_ids:
+                return _make_escalation(id=esc_id, status='dismissed')
+            return _make_escalation(id='esc-42-inf', status='pending')
+
+        steward.escalation_queue.resolve.side_effect = _track_resolve
+        steward.escalation_queue.get.side_effect = _get_by_state
 
         with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
             mock_invoke.return_value = _make_result(
@@ -1049,11 +1064,13 @@ class TestStewardTimeoutCap:
 
         # invoke_agent called exactly 3 times (cap=3); call 4 is blocked by the cap
         assert mock_invoke.call_count == 3
-        # Level-1 re-escalation was submitted at least once
-        steward.escalation_queue.submit.assert_called()
+        # Level-1 re-escalation submitted exactly once — not double-counted
+        assert steward.escalation_queue.submit.call_count == 1
         first_submit = steward.escalation_queue.submit.call_args_list[0][0][0]
         assert first_submit.level == 1
         assert 'repeatedly timed out' in first_submit.summary.lower()
+        # Re-escalation metric is exactly 1 — not double-counted
+        assert steward.metrics.escalations_reescalated == 1
         # Timeout metric reflects the 3 actual invocations
         assert steward.metrics.timeouts_recovered == 3
         # Counter popped on cap-fire — no stale entry retained
