@@ -409,7 +409,12 @@ class TestRebuildEntitySummariesForceDryRun:
             {'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities
         ]
         assert len(result['details']) == len(entities)  # explicit length guard for clearer failure diagnostics
-        # dry_run path appends details sequentially via 'for t in targets', so order is stable
+        # Schema pinning: assert the exact key set on [0] to catch accidental schema leaks (e.g. extra fields
+        # added to the dry_run dict in graphiti_client.py).  All detail dicts are built by the same code path
+        # so checking [0] is sufficient.
+        assert set(result['details'][0].keys()) == {'uuid', 'name', 'status'}
+        # Value + order check: projection tolerates nothing extra (guarded above) and verifies sequential order
+        # from the 'for t in targets' loop.
         assert [{k: d[k] for k in ('uuid', 'name', 'status')} for d in result['details']] == expected_details
         assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
         backend._rebuild_entity_from_edges.assert_not_awaited()
