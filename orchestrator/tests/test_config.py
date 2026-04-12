@@ -378,3 +378,17 @@ class TestValidateAssignment:
         # With validate_assignment=True this should raise; currently it silently succeeds.
         with pytest.raises(ValidationError, match='steward'):
             cfg.timeouts = TimeoutsConfig(steward=300.0)
+
+    def test_validate_assignment_allows_valid_mutation(self, monkeypatch, tmp_path):
+        """A valid mutation of steward_completion_timeout must succeed without errors.
+
+        Regression guard: confirms that validate_assignment does not block
+        mutations that satisfy the invariant. Passes before and after step-4.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        cfg = OrchestratorConfig()
+        # default timeouts.steward=1800, steward_completion_timeout=900
+        # Setting sct=500 is valid (500 <= 1800).
+        cfg.steward_completion_timeout = 500.0
+        assert cfg.steward_completion_timeout == 500.0
