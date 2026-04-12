@@ -1,7 +1,92 @@
 # vLLM Local Model Evaluation — Status Report
 
-**Last updated:** 2026-04-09 ~13:30 BST
-**Status:** Alternative REAP-139B quantizations researched and tested. AWQ confirmed working (coherent output, tool calls parse). SM120 (RTX PRO 6000 Blackwell) is broadly broken for NVFP4 MoE models — moving affected configs to H200 (SM90). Bridge max_tokens clamping, tunnel liveness detection, and concurrent task execution all fixed. minimax-m25-fp8-new and reap-139b-fp8-new running full eval sets. Workstation eval (qwen3-coder-30b-q4) had first successful tool-call turns after bridge max_tokens fix.
+**Last updated:** 2026-04-12
+**Status:** Final-run configs prepared for DGX Spark evaluation scenario. Bridge max_tokens clamping now dynamic (25% of max_model_len). B200 GPU support added. SM120 (RTX PRO 6000) compatibility fully mapped. Reify eval tasks unblocked (cargo symlinked). Ready for final-run execution in next session.
+
+## Update 2026-04-12: final-run configs, bridge fix, handoff prep
+
+### TL;DR
+
+- **Bridge max_tokens clamping made dynamic** (`5f7a2aab30`): was hard 8192, now 25% of max_model_len. On 131k context = 32k cap (no clamping vs Claude CLI default). On 80k = 20k (was 8k, caused 132 context overflow errors on AWQ H200 run). Root cause of all prior context-limit crashes.
+- **Final-run configs created** (`FINAL_RUN_CONFIGS` in configs.py): 7 configs tuned for DGX Spark scenario — full context (131k), 3-hour timeouts, all tasks including reify.
+- **B200 GPU support** (`5f7a2aab30`): 180 GB VRAM, `"NVIDIA B200"` added to RunPod GPU types. Context-constrained NVFP4 models (reap-172b, minimax-m25-nvfp4) moved from 1×H200 to 1×B200 for full 131k context.
+- **SM120 compatibility fully mapped**: FP8+TP works (any TP count), NVFP4 MoE broken, AWQ TP=2 NCCL hang, qwen3 TP=2 hang. See table below.
+- **Reify tasks unblocked**: cargo/clippy/rustc symlinked to `~/.local/bin`. Preflight passes.
+- **runpod-toolkit cloned** to `/home/leo/src/runpod-toolkit` with Python 3.13 venv.
+- **RunPod SSH key** copied from laptop to `~/.ssh/id_runpod`.
+
+### SM120 (RTX PRO 6000) compatibility
+
+| Model | Quant | RTX PRO? | Why |
+|-------|-------|----------|-----|
+| REAP-139B | FP8 | ✅ 2× TP=2 | FP8 works on SM120 |
+| REAP-139B | AWQ | ❌ | TP=2 NCCL init hang |
+| REAP-172B | NVFP4 | ❌ | NVFP4 MoE kernel crash (vLLM #35566) |
+| MiniMax-M2.5 | FP8 | ✅ 4× TP=4 | Best self-hosted; solved reify_task_12 |
+| MiniMax-M2.5 | NVFP4 | ❌ | NVFP4 MoE kernel crash |
+| Qwen3-Coder-Next | FP8 | ❌ | TP=2 NCCL init hang (model-specific) |
+
+### Final-run configs
+
+| Config | Model | GPU | Context | RTX PRO? |
+|--------|-------|-----|---------|----------|
+| `final-reap-139b-awq` | REAP-139B AWQ | 1×H200 | 131k | ❌ |
+| `final-reap-139b-fp8` | REAP-139B FP8 | 2×RTX PRO | 131k | ✅ |
+| `final-reap-172b-nvfp4-gb10` | REAP-172B NVFP4 | 1×B200 | 131k | ❌ |
+| `final-minimax-m25-fp8` | MiniMax-M2.5 FP8 | 4×RTX PRO | 131k | ✅ |
+| `final-minimax-m25-nvfp4` | MiniMax-M2.5 NVFP4 | 1×B200 | 131k | ❌ |
+| `final-qwen3-coder-next-fp8` | Qwen3-Coder-Next | 1×H200 | 131k | ❌ |
+| `final-claude-sonnet-max` | Claude Sonnet | Cloud | — | — |
+| `final-claude-opus-max` | Claude Opus | Cloud | — | — |
+
+### Results summary (all trials to date)
+
+**Tier 1 — completing tasks:**
+- claude-opus-high: df_12 ✅, df_13 ✅, df_18 timeout (5399L)
+- claude-sonnet-max: df_12 ✅, df_13 ✅, df_18 timeout (8695L)
+- minimax-m25-fp8-new: df_12 ✅, df_13 ✅, reify_12 ✅ (1531L), df_18 timeout
+
+**Tier 2 — partial success:**
+- reap-172b-nvfp4-gb10-new: df_12 ✅, df_13 ✅, df_18 timeout (6086L)
+- reap-139b-awq-new: df_12 ✅
+- reap-139b-fp8-new: df_12 ✅
+
+**Tier 3 — not working:**
+- Codex (both), Gemini (both), qwen3-coder-30b, devstral: all blocked/timeout
+
+### Baked images needed
+
+All final configs reference `leosiriusdawn/runpod-vllm:final-*` tags that don't exist yet. Fall back to `:latest` + HF download (5-30 min cold start) until baked. Models to bake:
+
+| Tag | HF model | Disk |
+|-----|----------|------|
+| `:final-reap-139b-awq` | cyankiwi/MiniMax-M2.5-REAP-139B-A10B-AWQ-4bit | ~23 GB |
+| `:final-reap-139b-fp8` | cerebras/MiniMax-M2.5-REAP-139B-A10B | ~131 GB |
+| `:final-reap-172b-nvfp4-gb10` | saricles/MiniMax-M2.5-REAP-172B-A10B-NVFP4-GB10 | ~93 GB |
+| `:final-minimax-m25-fp8` | MiniMaxAI/MiniMax-M2.5 | ~215 GB |
+| `:final-minimax-m25-nvfp4` | nvidia/MiniMax-M2.5-NVFP4 | ~131 GB |
+| `:final-qwen3-coder-next-fp8` | Qwen/Qwen3-Coder-Next-FP8 | ~75 GB |
+
+Use `runpod-toolkit/scripts/bake_model_image.py` to build. None of these models are cached locally — need to download first (~668 GB total). Consider baking on a RunPod pod with fast storage, or downloading and baking concurrently during the eval session.
+
+### Next-session plan
+
+1. **Start baking images** in background (or accept cold-start penalty and launch with `:latest`)
+2. **Launch RTX PRO configs first** (high availability): `final-reap-139b-fp8`, `final-minimax-m25-fp8`
+3. **Claim H200/B200 pods** for remaining configs as available
+4. **Run all tasks** including reify: `--all-tasks --task-timeout-min 180 --orch-timeout-min 150`
+5. **Retry strategy**: if a GPU type is unavailable, try next in fallback list; retry every 5 min
+6. **Elo tournament** once ≥3 configs have clean full-set results
+
+### Infrastructure on this machine
+
+- `runpod-toolkit`: `/home/leo/src/runpod-toolkit` (Python 3.13 venv, `.python-version` pinned)
+- SSH key: `~/.ssh/id_runpod` (copied from laptop)
+- Cargo: `~/.local/bin/cargo` → `~/.cargo/bin/cargo` (symlinked)
+- Eval logs: `/var/tmp/dark-factory-evals/`
+- RunPod SDK patch: `pods.py` line 119 needs re-patching after `uv sync` (escapes `"` in env var values for GraphQL)
+
+---
 
 ## Update 2026-04-09 afternoon: alternative quantizations, H200 pivot, infra fixes
 
