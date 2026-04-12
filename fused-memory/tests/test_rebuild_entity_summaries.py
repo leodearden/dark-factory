@@ -1413,9 +1413,9 @@ class TestRebuildEntitySummariesCancellation:
         """A WARNING is emitted with group_id and progress counters before CancelledError propagates.
 
         The warning must contain 'rebuild_entity_summaries', 'cancellation', and the group_id
-        so operators can identify mid-flight cancellations in logs. At the moment of the
-        warning, Pass 2 has not yet executed for this batch so rebuilt_so_far=0 and
-        errors_so_far=0.
+        so operators can identify mid-flight cancellations in logs. rebuilt_so_far=0 and
+        errors_so_far=0 because counters are only incremented in Pass 2, which never executes
+        when CancelledError is found in Pass 1.
         """
         backend = two_entity_backend
         # First entity's rebuild raises CancelledError; second would succeed
