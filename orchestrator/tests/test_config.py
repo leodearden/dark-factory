@@ -320,7 +320,7 @@ class TestStewardTimeoutInvariant:
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        with pytest.raises(ValidationError, match=r'Raise timeouts\.steward to >= steward_completion_timeout'):
+        with pytest.raises(ValidationError, match=r'(?i)raise.*timeouts\.steward.*or lower.*steward_completion_timeout'):
             OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=600.0))
 
     def test_env_var_override_triggers_invariant(self, monkeypatch, tmp_path):
@@ -332,8 +332,9 @@ class TestStewardTimeoutInvariant:
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_TIMEOUTS__STEWARD', '300')
+        monkeypatch.setenv('ORCH_STEWARD_COMPLETION_TIMEOUT', '900')
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        # defaults.yaml: steward_completion_timeout=900.0, timeouts.steward=1800
+        # Both sides are test-pinned: timeouts.steward=300, steward_completion_timeout=900
         # env override: timeouts.steward=300 → 300 < 900 → validator must fire
         with pytest.raises(ValidationError, match='steward'):
             OrchestratorConfig()
