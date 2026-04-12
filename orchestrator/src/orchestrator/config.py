@@ -435,10 +435,8 @@ class OrchestratorConfig(BaseSettings):
     # Per-module overrides (populated by load_config via _discover_module_configs)
     _module_configs: dict[str, ModuleConfig] = PrivateAttr(default_factory=dict)
 
-    @model_validator(mode='after')
-    def _resolve_project_root(self) -> 'OrchestratorConfig':
+    def model_post_init(self, __context: Any) -> None:
         self.project_root = self.project_root.resolve()
-        return self
 
     @model_validator(mode='after')
     def _validate_steward_timeout_invariant(self) -> 'OrchestratorConfig':
@@ -465,6 +463,7 @@ class OrchestratorConfig(BaseSettings):
         env_nested_delimiter='__',
         case_sensitive=False,
         extra='ignore',
+        validate_assignment=True,
     )
 
     @classmethod
