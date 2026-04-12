@@ -1410,20 +1410,24 @@ class TestCollectSnapshotInsertFailureIsolation:
         ``wrapper.trigger_count`` after the run to guard against silent
         pass-through if the SQL text is ever reformatted.
         """
-        trigger_count: list[int] = []
 
-        async def execute_wrapper(sql, params=()):
-            if (
-                'INSERT INTO snapshots' in sql
-                and params
-                and params[0] in failing_project_ids
-            ):
-                trigger_count.append(1)
-                raise aiosqlite.OperationalError('mock disk full')
-            return await original_execute(sql, params)
+        class ExecuteWrapper:
+            trigger_count: list[int]
 
-        execute_wrapper.trigger_count = trigger_count  # type: ignore[attr-defined]
-        return execute_wrapper
+            def __init__(self) -> None:
+                self.trigger_count = []
+
+            async def __call__(self, sql: str, params: tuple = ()) -> object:
+                if (
+                    'INSERT INTO snapshots' in sql
+                    and params
+                    and params[0] in failing_project_ids
+                ):
+                    self.trigger_count.append(1)
+                    raise aiosqlite.OperationalError('mock disk full')
+                return await original_execute(sql, params)
+
+        return ExecuteWrapper()
 
     @pytest.mark.asyncio
     async def test_db_error_on_extra_insert_preserves_main_snapshot(
