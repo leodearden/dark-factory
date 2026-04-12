@@ -576,3 +576,12 @@ class TestExtractInlineScript:
         assert 'mergeQueueDepthChart' in body
         assert 'function renderAll()' in body
         assert 'var x = 1' not in body
+
+    def test_raises_on_no_script_blocks(self):
+        """AssertionError is raised when the HTML has no <script> blocks at all.
+
+        Documents the degenerate edge case: the for-loop in _extract_inline_script
+        does not iterate on empty HTML, falling through to the AssertionError raise.
+        """
+        with pytest.raises(AssertionError):
+            _extract_inline_script('<html><body></body></html>')
