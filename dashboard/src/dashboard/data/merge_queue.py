@@ -285,7 +285,7 @@ async def latency_stats(
     When no rows have non-null duration_ms, returns all zeros with count=0.
     """
     durations = await _get_durations(db, hours=hours)
-    return _compute_latency_stats(sorted(durations))
+    return _compute_latency_stats(durations)
 
 
 # ---------------------------------------------------------------------------
