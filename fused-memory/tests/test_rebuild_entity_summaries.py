@@ -1437,7 +1437,7 @@ class TestRebuildEntitySummariesCancellation:
         msg = warning_records[0].getMessage()
         assert 'rebuild_entity_summaries' in msg
         assert 'cancellation' in msg
-        assert 'test' in msg
+        assert 'group=test' in msg
         assert 'rebuilt_so_far=0' in msg
         assert 'errors_so_far=0' in msg
 
