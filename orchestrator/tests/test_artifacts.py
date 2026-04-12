@@ -499,3 +499,120 @@ class TestReviews:
         assert agg.has_blocking_issues
         assert agg.reviewer_errors == ['reviewer1']
         assert len(agg.blocking_issues) == 1
+
+
+# --- Prerequisites plans for validate_plan_prerequisites tests ---
+
+VALID_PREREQS = [
+    {'id': 'pre-1', 'description': 'Install deps', 'status': 'pending', 'commit': None, 'tests': []},
+    {'id': 'pre-2', 'description': 'Set up config', 'status': 'done', 'commit': 'abc123', 'tests': []},
+]
+
+STRING_PREREQS_PLAN = {
+    'task_id': 'task-1',
+    'steps': [{'id': 'step-1', 'status': 'pending'}],
+    'prerequisites': ['install deps', 'set up config'],
+}
+
+MIXED_PREREQS_PLAN = {
+    'task_id': 'task-1',
+    'steps': [{'id': 'step-1', 'status': 'pending'}],
+    'prerequisites': [
+        {'id': 'pre-1', 'description': 'Install deps', 'status': 'pending'},
+        'set up config',
+    ],
+}
+
+MISSING_KEYS_PREREQS_PLAN = {
+    'task_id': 'task-1',
+    'steps': [{'id': 'step-1', 'status': 'pending'}],
+    'prerequisites': [
+        {'id': 'pre-1', 'description': 'Install deps'},  # missing 'status'
+    ],
+}
+
+VALID_PREREQS_PLAN = {
+    'task_id': 'task-1',
+    'steps': [{'id': 'step-1', 'status': 'pending'}],
+    'prerequisites': VALID_PREREQS,
+}
+
+NO_PREREQS_PLAN = {
+    'task_id': 'task-1',
+    'steps': [{'id': 'step-1', 'status': 'pending'}],
+}
+
+EMPTY_PREREQS_PLAN = {
+    'task_id': 'task-1',
+    'steps': [{'id': 'step-1', 'status': 'pending'}],
+    'prerequisites': [],
+}
+
+
+class TestValidatePlanPrerequisites:
+    """Tests for validate_plan_prerequisites() method on TaskArtifacts."""
+
+    # --- step-1: plain string list raises ValueError ---
+    def test_raises_for_plain_string_prerequisites(self, artifacts: TaskArtifacts):
+        """All plain-string prerequisites list must raise ValueError."""
+        artifacts.write_plan(STRING_PREREQS_PLAN)
+        with pytest.raises(ValueError, match='prerequisites'):
+            artifacts.validate_plan_prerequisites()
+
+    def test_error_message_includes_index_and_value(self, artifacts: TaskArtifacts):
+        """Error message must include the offending index and value."""
+        artifacts.write_plan(STRING_PREREQS_PLAN)
+        with pytest.raises(ValueError) as exc_info:
+            artifacts.validate_plan_prerequisites()
+        msg = str(exc_info.value)
+        assert '0' in msg  # first offending index
+        assert 'install deps' in msg.lower()
+
+    # --- step-2: mixed list (some strings, some dicts) raises ValueError ---
+    def test_raises_for_mixed_prerequisites(self, artifacts: TaskArtifacts):
+        """Mixed list with at least one non-dict must raise ValueError."""
+        artifacts.write_plan(MIXED_PREREQS_PLAN)
+        with pytest.raises(ValueError, match='prerequisites'):
+            artifacts.validate_plan_prerequisites()
+
+    def test_mixed_error_identifies_string_item_not_dict(self, artifacts: TaskArtifacts):
+        """Error message pinpoints the string item (index 1), not the valid dict."""
+        artifacts.write_plan(MIXED_PREREQS_PLAN)
+        with pytest.raises(ValueError) as exc_info:
+            artifacts.validate_plan_prerequisites()
+        msg = str(exc_info.value)
+        assert '1' in msg  # second item (index 1) is the string
+
+    # --- step-3: dicts missing required keys raise ValueError ---
+    def test_raises_for_dict_missing_required_keys(self, artifacts: TaskArtifacts):
+        """Dict prerequisite missing 'status' must raise ValueError."""
+        artifacts.write_plan(MISSING_KEYS_PREREQS_PLAN)
+        with pytest.raises(ValueError, match='prerequisites'):
+            artifacts.validate_plan_prerequisites()
+
+    def test_error_message_mentions_missing_key(self, artifacts: TaskArtifacts):
+        """Error message must identify which key is missing."""
+        artifacts.write_plan(MISSING_KEYS_PREREQS_PLAN)
+        with pytest.raises(ValueError) as exc_info:
+            artifacts.validate_plan_prerequisites()
+        msg = str(exc_info.value)
+        assert 'status' in msg
+
+    # --- step-4: valid / absent prerequisites pass silently ---
+    def test_passes_for_valid_dict_prerequisites(self, artifacts: TaskArtifacts):
+        """All required-key dicts must pass without raising."""
+        artifacts.write_plan(VALID_PREREQS_PLAN)
+        result = artifacts.validate_plan_prerequisites()
+        assert result is None
+
+    def test_passes_when_prerequisites_absent(self, artifacts: TaskArtifacts):
+        """Plan with no 'prerequisites' key must pass without raising."""
+        artifacts.write_plan(NO_PREREQS_PLAN)
+        result = artifacts.validate_plan_prerequisites()
+        assert result is None
+
+    def test_passes_for_empty_prerequisites_list(self, artifacts: TaskArtifacts):
+        """Empty prerequisites list must pass without raising."""
+        artifacts.write_plan(EMPTY_PREREQS_PLAN)
+        result = artifacts.validate_plan_prerequisites()
+        assert result is None
