@@ -360,3 +360,21 @@ class TestValidateAssignment:
         # With validate_assignment=True this should raise; currently it silently succeeds.
         with pytest.raises(ValidationError, match='steward'):
             cfg.steward_completion_timeout = 2000.0
+
+    def test_validate_assignment_rejects_timeouts_replacement(
+        self, monkeypatch, tmp_path
+    ):
+        """Replacing cfg.timeouts with a TimeoutsConfig that violates the invariant must raise.
+
+        Currently silently succeeds because validate_assignment is not enabled.
+        After impl (step-4), assigning cfg.timeouts fires _validate_steward_timeout_invariant.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        # steward_completion_timeout=900 is valid against default timeouts.steward=1800
+        cfg = OrchestratorConfig(steward_completion_timeout=900.0)
+        assert cfg.steward_completion_timeout == 900.0
+        # Replace timeouts with steward=300 — now 300 < 900, violating the invariant.
+        # With validate_assignment=True this should raise; currently it silently succeeds.
+        with pytest.raises(ValidationError, match='steward'):
+            cfg.timeouts = TimeoutsConfig(steward=300.0)
