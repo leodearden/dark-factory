@@ -2209,9 +2209,41 @@ class TestPrerequisitesValidation:
         assert 'prerequisites' in esc.summary.lower() or 'prerequisites' in (esc.detail or '').lower()
 
 
-if TYPE_CHECKING:
-    from orchestrator.evals.runner import _EvalScheduler as _EvalSchedulerStatic
-    from orchestrator.workflow import _SchedulerLike
+# ---------------------------------------------------------------------------
+# Tests: ARCHITECT prompt guidance
+# ---------------------------------------------------------------------------
 
-    _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()
-    _eval_scheduler_conforms: _SchedulerLike = _EvalSchedulerStatic(OrchestratorConfig())
+
+class TestArchitectPromptGuidance:
+    """ARCHITECT system_prompt must contain negative guidance about prerequisites format."""
+
+    def test_architect_prompt_prerequisites_must_not_say_plain_string(self):
+        """ARCHITECT prompt must contain 'NOT a plain string' guidance about prerequisites."""
+        from orchestrator.agents.roles import ARCHITECT
+
+        prompt = ARCHITECT.system_prompt
+        # The specific negative-guidance phrase modelled on the 'steps vs tdd_plan' warning
+        assert 'NOT a plain string' in prompt or 'not a plain string' in prompt.lower()
+
+    def test_architect_prompt_prerequisites_guidance_mentions_string_rejection(self):
+        """ARCHITECT prompt must explicitly state string prerequisites are rejected."""
+        from orchestrator.agents.roles import ARCHITECT
+
+        prompt = ARCHITECT.system_prompt
+        # Must say that prerequisites must be dicts with specific keys
+        assert ('prerequisites MUST be' in prompt or 'prerequisites must be' in prompt.lower())
+
+    def test_architect_prompt_prerequisites_guidance_is_near_steps_warning(self):
+        """Prerequisites guidance must appear in the ## Important section, near the steps warning."""
+        from orchestrator.agents.roles import ARCHITECT
+
+        prompt = ARCHITECT.system_prompt
+        # Find the steps-format warning (line 138 of roles.py)
+        steps_warning = 'top-level key for your plan steps MUST be'
+        assert steps_warning in prompt
+
+        # The prerequisites warning must be present near the steps warning
+        steps_idx = prompt.index(steps_warning)
+        # Look for 'prerequisites' in the Important section (within 600 chars of steps warning)
+        surrounding = prompt[max(0, steps_idx - 200):steps_idx + 600]
+        assert 'prerequisites' in surrounding.lower() and ('dict' in surrounding.lower() or 'NOT a plain string' in surrounding)
