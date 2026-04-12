@@ -843,7 +843,7 @@ class TestStewardTimeoutKillRecovery:
 
 @pytest.mark.asyncio
 class TestStewardTimeoutCap:
-    """_timeout_counts tracks consecutive timeout-kills; cap triggers auto-escalation."""
+    """_timeout_counts tracks cumulative per-escalation timeout-kills; cap triggers auto-escalation."""
 
     def test_timeout_counts_dict_initialized_empty(self, steward):
         """_timeout_counts must be an empty dict right after construction."""
