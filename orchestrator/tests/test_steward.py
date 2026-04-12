@@ -886,6 +886,31 @@ class TestStewardTimeoutCap:
             resolved_by='steward',
         )
 
+    async def test_timeout_cap_pops_counters(self, steward, mock_config):
+        """When the timeout cap fires via _handle_escalation both counters are popped.
+
+        Integration test through the timeout cap guard path (L231-236 in steward.py).
+        After cap-fire the dicts must not retain stale entries for the escalation id.
+        """
+        mock_config.steward_max_timeouts_per_escalation = 2
+        esc = _make_escalation(id='esc-42-1')
+        # Pre-seed at cap so the guard fires immediately
+        steward._timeout_counts['esc-42-1'] = 2
+        steward._retry_counts['esc-42-1'] = 1
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        # Guard fires before any invocation
+        mock_invoke.assert_not_called()
+        # Auto-escalation was issued (level-1 submitted)
+        steward.escalation_queue.submit.assert_called_once()
+        submitted = steward.escalation_queue.submit.call_args[0][0]
+        assert submitted.level == 1
+        # Both counters popped — no stale entries remain
+        assert 'esc-42-1' not in steward._timeout_counts
+        assert 'esc-42-1' not in steward._retry_counts
+
     async def test_different_escalations_have_independent_timeout_counts(
         self, steward, mock_config,
     ):
