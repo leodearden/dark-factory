@@ -952,8 +952,8 @@ class TestNodeCount:
         """Returns the integer count from result_set[0][0]."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([[42]])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        result = await backend.node_count('my_graph')
+        with patch.object(backend, '_graph_for', return_value=graph):
+            result = await backend.node_count('my_graph')
         assert result == 42
 
     @pytest.mark.asyncio
@@ -961,14 +961,22 @@ class TestNodeCount:
         """Returns 0 when result_set is empty."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        result = await backend.node_count('empty_graph')
+        with patch.object(backend, '_graph_for', return_value=graph):
+            result = await backend.node_count('empty_graph')
         assert result == 0
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
-        """Raises RuntimeError when client is None."""
+        """Raises RuntimeError when backend is not initialized (both client and _driver are None)."""
         backend = GraphitiBackend(mock_config)  # client is None
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.node_count('some_graph')
+
+    @pytest.mark.asyncio
+    async def test_raises_when_driver_explicitly_none(self, mock_config, make_backend):
+        """Raises RuntimeError when _driver is explicitly None (client is set but driver is not)."""
+        backend = make_backend(mock_config)  # client is set via make_backend
+        backend._driver = None
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.node_count('some_graph')
 
@@ -977,7 +985,38 @@ class TestNodeCount:
         """node_count uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([[7]])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.node_count('test_graph')
+        with patch.object(backend, '_graph_for', return_value=graph):
+            await backend.node_count('test_graph')
         graph.ro_query.assert_awaited_once()
         graph.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_graph_for(self, mock_config, make_backend, make_graph_mock):
+        """node_count delegates graph resolution to _graph_for, not _require_driver._get_graph."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([[42]])
+        with patch.object(backend, '_graph_for', return_value=graph) as mock_graph_for:
+            result = await backend.node_count('my_graph')
+        mock_graph_for.assert_called_once_with('my_graph')
+        assert result == 42
+
+
+class TestListGraphs:
+    """GraphitiBackend.list_graphs() returns non-system FalkorDB graph names."""
+
+    @pytest.mark.asyncio
+    async def test_returns_filtered(self, mock_config, make_backend):
+        """Filters out 'default_db' and names ending in '_db' via _driver.client.list_graphs."""
+        backend = make_backend(mock_config)
+        backend._driver.client.list_graphs = AsyncMock(
+            return_value=['proj_a', 'default_db', 'proj_b', 'internal_db']
+        )
+        result = await backend.list_graphs()
+        assert result == ['proj_a', 'proj_b']
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        """Raises RuntimeError when backend is not initialized (_driver is None)."""
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.list_graphs()

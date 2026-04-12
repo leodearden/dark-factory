@@ -1379,8 +1379,8 @@ class GraphitiBackend:
 
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
-        client = self._require_client()
-        all_graphs = await cast(Any, client.driver).client.list_graphs()
+        driver = self._require_driver()
+        all_graphs = await cast(Any, driver).client.list_graphs()
         return [g for g in all_graphs if g != 'default_db' and not g.endswith('_db')]
 
     async def node_count(self, graph_name: str) -> int:
@@ -1388,8 +1388,7 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
         """
-        driver = self._require_driver()
-        graph: Any = driver._get_graph(graph_name)
+        graph: Any = self._graph_for(graph_name)
         result = await graph.ro_query('MATCH (n) RETURN count(n) as count')
         return result.result_set[0][0] if result.result_set else 0
 
