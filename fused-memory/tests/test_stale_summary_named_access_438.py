@@ -64,12 +64,10 @@ class TestDetectStaleSummariesNamedAccess:
     async def test_detect_stale_summaries_includes_summary_field_named_access(
         self, mock_config, make_backend
     ):
-        """Stale entity dicts from _detect_stale_summaries_with_edges include a 'summary'
-        key, accessible via result.stale (named attribute access, not positional unpacking).
-
-        Regression lock: this test guards against reversion to positional unpacking
-        for the summary-field scenario originally at line 829 of
-        test_rebuild_entity_summaries.py.
+        """Confirms named attribute access on StaleSummaryResult fields works correctly
+        for the summary-field scenario. Verifies that result.stale contains summary data,
+        result.all_edges maps entity UUIDs to edge lists, and result.total_count reflects
+        the scanned entity count.
         """
         backend = make_backend(mock_config)
         original_summary = 'old stale fact'
