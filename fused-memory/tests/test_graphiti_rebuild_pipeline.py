@@ -376,13 +376,9 @@ class TestRebuildEntitySummariesForceDryRun:
         backend._rebuild_entity_from_edges.assert_not_awaited()
         backend.list_entity_nodes.assert_awaited_once()
 
-    async def _make_dry_run_result(self, mock_config, make_backend):
-        """Shared setup for force=True dry_run=True tests.
-
-        Returns (backend, entities, result) with a standard 3-entity fixture
-        and all relevant methods mocked.  Extracted to avoid duplicating
-        identical mock-wiring and production-call boilerplate across tests.
-        """
+    @pytest.mark.asyncio
+    async def test_force_dry_run_returns_correct_aggregate(self, mock_config, make_backend):
+        """When force=True and dry_run=True, result has correct structure."""
         backend = make_backend(mock_config)
         entities = [
             {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
@@ -393,12 +389,6 @@ class TestRebuildEntitySummariesForceDryRun:
         backend.get_all_valid_edges = AsyncMock(return_value={})
         backend._rebuild_entity_from_edges = AsyncMock()
         result = await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=True)
-        return backend, entities, result
-
-    @pytest.mark.asyncio
-    async def test_force_dry_run_returns_correct_aggregate(self, mock_config, make_backend):
-        """When force=True and dry_run=True, result has correct structure."""
-        backend, entities, result = await self._make_dry_run_result(mock_config, make_backend)
 
         assert result['total_entities'] == len(entities)
         assert result['stale_entities'] == result['total_entities']  # force=True treats every entity as stale
