@@ -1250,6 +1250,48 @@ class TestSafeStashPopWithRecovery:
 
 @pytest.mark.asyncio
 class TestScrubTaskDirFromTree:
+    async def test_scrub_returns_clean_when_no_contamination(
+        self, git_ops: GitOps, caplog,
+    ):
+        """scrub_task_dir_from_tree returns CLEAN when ls-tree shows no tracked .task/ files."""
+        # Create a real worktree for a realistic working directory (no mock yet)
+        worktree_info = await git_ops.create_worktree('scrub-clean')
+
+        # Create a .task/ directory with sentinel content on disk — canary for rmtree
+        task_dir = worktree_info.path / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        sentinel = task_dir / 'sentinel.txt'
+        sentinel.write_text('canary-no-rmtree\n')
+
+        async def mock_run(cmd, cwd=None):
+            # ls-tree returns empty stdout — no tracked .task/ files
+            if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
+                return (0, '', '')
+            # Strict — no other git commands should be reached on the CLEAN path
+            pytest.fail(f'unexpected _run call on CLEAN path: {cmd}')
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+            patch('orchestrator.git_ops._run', side_effect=mock_run),
+        ):
+            result = await scrub_task_dir_from_tree(worktree_info.path, 'test-clean')
+
+        # Return value must be CLEAN — no tracked .task/ files in tree
+        assert result == ScrubResult.CLEAN, (
+            f'Expected ScrubResult.CLEAN when ls-tree is empty, got {result!r}'
+        )
+
+        # Filesystem .task/ must still exist — rmtree must NOT have run
+        assert sentinel.exists(), (
+            'sentinel.txt was deleted — rmtree must not run on CLEAN path'
+        )
+
+        # No WARNING or ERROR should have been logged on the CLEAN path
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warnings, (
+            f'Unexpected log entries on CLEAN path: {[r.getMessage() for r in warnings]}'
+        )
+
     async def test_scrub_returns_failed_when_git_rm_fails(
         self, git_ops: GitOps, caplog,
     ):
