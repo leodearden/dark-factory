@@ -376,46 +376,12 @@ class TestRebuildEntitySummariesForceDryRun:
         backend._rebuild_entity_from_edges.assert_not_awaited()
         backend.list_entity_nodes.assert_awaited_once()
 
-    @pytest.mark.asyncio
-    async def test_force_dry_run_returns_correct_aggregate(self, mock_config, make_backend):
-        """When force=True and dry_run=True, result has correct structure."""
-        backend = make_backend(mock_config)
-        entities = [
-            {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
-            {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
-            {'uuid': 'u3', 'name': 'Carol', 'summary': 'summary C'},
-        ]
-        backend.list_entity_nodes = AsyncMock(return_value=entities)
-        backend.get_all_valid_edges = AsyncMock(return_value={})
-        backend._rebuild_entity_from_edges = AsyncMock()
+    async def _make_dry_run_result(self, mock_config, make_backend):
+        """Shared setup for force=True dry_run=True tests.
 
-        result = await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=True)
-
-        assert result['total_entities'] == len(entities)
-        assert result['stale_entities'] == result['total_entities']  # force=True treats every entity as stale
-        assert result['skipped'] == 3  # dry_run=True skips all
-        assert result['rebuilt'] == 0
-        assert result['errors'] == 0
-        expected_details = [
-            {'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities
-        ]
-        # dry_run path appends details sequentially via 'for t in targets', so order is stable
-        assert [{k: d[k] for k in ('uuid', 'name', 'status')} for d in result['details']] == expected_details
-        assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
-        backend._rebuild_entity_from_edges.assert_not_awaited()
-        backend.get_all_valid_edges.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_force_dry_run_detail_tolerates_extra_keys(self, mock_config, make_backend):
-        """Regression guard: projected-key comparison tolerates additive detail schema changes.
-
-        Simulates a future schema addition (e.g. 'group_id' field) in the detail
-        dicts returned by the dry_run path, and verifies that the projected-key
-        assertion pattern correctly validates uuid/name/status while ignoring
-        extra fields.
-
-        Also demonstrates that the old exact-dict equality would fail with extra
-        keys — confirming why the schema-tolerant projection pattern is needed.
+        Returns (backend, entities, result) with a standard 3-entity fixture
+        and all relevant methods mocked.  Extracted to avoid duplicating
+        identical mock-wiring and production-call boilerplate across tests.
         """
         backend = make_backend(mock_config)
         entities = [
@@ -426,8 +392,45 @@ class TestRebuildEntitySummariesForceDryRun:
         backend.list_entity_nodes = AsyncMock(return_value=entities)
         backend.get_all_valid_edges = AsyncMock(return_value={})
         backend._rebuild_entity_from_edges = AsyncMock()
-
         result = await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=True)
+        return backend, entities, result
+
+    @pytest.mark.asyncio
+    async def test_force_dry_run_returns_correct_aggregate(self, mock_config, make_backend):
+        """When force=True and dry_run=True, result has correct structure."""
+        backend, entities, result = await self._make_dry_run_result(mock_config, make_backend)
+
+        assert result['total_entities'] == len(entities)
+        assert result['stale_entities'] == result['total_entities']  # force=True treats every entity as stale
+        assert result['skipped'] == 3  # dry_run=True skips all
+        assert result['rebuilt'] == 0
+        assert result['errors'] == 0
+        expected_details = [
+            {'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities
+        ]
+        assert len(result['details']) == 3  # explicit length guard for clearer failure diagnostics
+        # dry_run path appends details sequentially via 'for t in targets', so order is stable
+        assert [{k: d[k] for k in ('uuid', 'name', 'status')} for d in result['details']] == expected_details
+        assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
+        backend._rebuild_entity_from_edges.assert_not_awaited()
+        backend.get_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_force_dry_run_detail_tolerates_extra_keys(self, mock_config, make_backend):
+        """Pattern-regression test: projected-key assertion tolerates additive detail schema changes.
+
+        This is a test-suite regression guard, not a production-behavior test. It
+        manually injects an extra field into the returned detail dicts (simulating a
+        future additive schema change) and verifies that:
+          1. The projected-key assertion ({k: d[k] for k in keys}) correctly validates
+             uuid/name/status while ignoring extra fields.
+          2. The old exact-dict equality would fail with extra keys — documenting why
+             the schema-tolerant projection pattern is needed.
+
+        For a production-behavior test covering the full rebuild aggregate, see
+        test_force_dry_run_returns_correct_aggregate.
+        """
+        _, entities, result = await self._make_dry_run_result(mock_config, make_backend)
 
         # Simulate an additive schema change: inject an extra field into each detail,
         # as if production had added 'group_id' to the skipped_dry_run record.
