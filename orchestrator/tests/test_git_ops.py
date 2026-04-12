@@ -1305,8 +1305,6 @@ class TestScrubTaskDirFromTree:
         sentinel = task_dir / 'sentinel.txt'
         sentinel.write_text('keep-me\n')
 
-        commit_calls: list = []
-
         async def mock_run(cmd, cwd=None):
             # (a) Fake .task/ contamination detected via ls-tree
             if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
@@ -1340,10 +1338,6 @@ class TestScrubTaskDirFromTree:
             'sentinel.txt was deleted — rmtree must be skipped on git rm failure'
         )
 
-        # No git commit should have been issued (early return before commit step)
-        assert not commit_calls, (
-            f'Expected no commit calls on git rm failure, got: {commit_calls}'
-        )
 
     async def test_scrub_returns_scrubbed_on_happy_path(
         self, git_ops: GitOps, caplog,
