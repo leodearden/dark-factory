@@ -132,7 +132,7 @@ class ContextAssembler:
             propagate_cancellations(batch_contexts)
 
             for event, ctx_result in zip(batch, batch_contexts, strict=True):
-                if isinstance(ctx_result, BaseException):
+                if isinstance(ctx_result, Exception):
                     logger.warning(
                         f'Context fetch failed for event {event.id}: {ctx_result}'
                     )
