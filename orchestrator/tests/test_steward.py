@@ -120,6 +120,20 @@ def _make_escalation(**overrides):  # type: ignore[no-untyped-def]
     return Escalation(**defaults)  # type: ignore[arg-type]
 
 
+def _assert_cap_fire_pops_counters(steward, esc_id, mock_invoke):  # type: ignore[no-untyped-def]
+    """Assert standard cap-fire outcomes: no invocation, level-1 auto-escalation, counters popped.
+
+    Returns the submitted escalation object for guard-specific extra assertions.
+    """
+    mock_invoke.assert_not_called()
+    steward.escalation_queue.submit.assert_called_once()
+    submitted = steward.escalation_queue.submit.call_args[0][0]
+    assert submitted.level == 1
+    assert esc_id not in steward._retry_counts
+    assert esc_id not in steward._timeout_counts
+    return submitted
+
+
 # ---------------------------------------------------------------------------
 # Session Persistence
 # ---------------------------------------------------------------------------
@@ -447,7 +461,7 @@ class TestStewardRetryLogic:
     async def test_retry_cap_pops_counters(self, steward, mock_config):
         """When the retry cap fires via _handle_escalation both counters are popped.
 
-        Integration test through the retry-cap guard path (L222-227 in steward.py).
+        Integration test through the per-escalation retry-limit guard in _handle_escalation.
         After cap-fire the dicts must not retain stale entries for the escalation id.
         """
         mock_config.steward_max_attempts = 2
@@ -459,15 +473,7 @@ class TestStewardRetryLogic:
         with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
             await steward._handle_escalation(esc)
 
-        # Guard fires before any invocation
-        mock_invoke.assert_not_called()
-        # Auto-escalation was issued (level-1 submitted)
-        steward.escalation_queue.submit.assert_called_once()
-        submitted = steward.escalation_queue.submit.call_args[0][0]
-        assert submitted.level == 1
-        # Both counters popped — no stale entries remain
-        assert 'esc-42-1' not in steward._retry_counts
-        assert 'esc-42-1' not in steward._timeout_counts
+        _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
 
 
 # ---------------------------------------------------------------------------
@@ -519,8 +525,8 @@ class TestStewardLifetimeBudget:
     async def test_budget_exhaustion_pops_counters(self, steward, mock_config):
         """When the lifetime budget guard fires both counters are popped.
 
-        Integration test through the budget-exhaustion guard path (L213-218 in
-        steward.py).  After cap-fire the dicts must not retain stale entries.
+        Integration test through the lifetime-budget-exhaustion guard in _handle_escalation.
+        After cap-fire the dicts must not retain stale entries.
         """
         mock_config.steward_lifetime_budget = 5.0
         steward.metrics.total_cost_usd = 6.0  # over budget
@@ -532,16 +538,8 @@ class TestStewardLifetimeBudget:
         with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
             await steward._handle_escalation(esc)
 
-        # Guard fires before any invocation
-        mock_invoke.assert_not_called()
-        # Auto-escalation was issued
-        steward.escalation_queue.submit.assert_called_once()
-        submitted = steward.escalation_queue.submit.call_args[0][0]
-        assert submitted.level == 1
+        submitted = _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
         assert 'budget exhausted' in submitted.summary.lower()
-        # Both counters popped — no stale entries remain
-        assert 'esc-42-1' not in steward._retry_counts
-        assert 'esc-42-1' not in steward._timeout_counts
 
 
 # ---------------------------------------------------------------------------
@@ -941,7 +939,7 @@ class TestStewardTimeoutCap:
     async def test_timeout_cap_pops_counters(self, steward, mock_config):
         """When the timeout cap fires via _handle_escalation both counters are popped.
 
-        Integration test through the timeout cap guard path (L231-236 in steward.py).
+        Integration test through the per-escalation timeout-limit guard in _handle_escalation.
         After cap-fire the dicts must not retain stale entries for the escalation id.
         """
         mock_config.steward_max_timeouts_per_escalation = 2
@@ -953,15 +951,7 @@ class TestStewardTimeoutCap:
         with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
             await steward._handle_escalation(esc)
 
-        # Guard fires before any invocation
-        mock_invoke.assert_not_called()
-        # Auto-escalation was issued (level-1 submitted)
-        steward.escalation_queue.submit.assert_called_once()
-        submitted = steward.escalation_queue.submit.call_args[0][0]
-        assert submitted.level == 1
-        # Both counters popped — no stale entries remain
-        assert 'esc-42-1' not in steward._timeout_counts
-        assert 'esc-42-1' not in steward._retry_counts
+        _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
 
     async def test_different_escalations_have_independent_timeout_counts(
         self, steward, mock_config,
