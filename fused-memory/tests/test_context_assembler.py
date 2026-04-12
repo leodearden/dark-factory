@@ -480,7 +480,7 @@ class TestContextAssemblerCancellation:
     Two passes:
       - Pass 1 (propagate_cancellations): re-raise any value that is a BaseException
         but NOT an Exception (CancelledError, KeyboardInterrupt, SystemExit).
-      - Pass 2 (accumulation): the per-event zip loop uses ``isinstance(ctx_result, BaseException)``
+      - Pass 2 (accumulation): the per-event zip loop uses ``isinstance(ctx_result, Exception)``
         so only application-level failures degrade to empty context.
     """
 
