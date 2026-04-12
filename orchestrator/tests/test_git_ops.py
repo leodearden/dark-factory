@@ -1338,7 +1338,6 @@ class TestScrubTaskDirFromTree:
             'sentinel.txt was deleted — rmtree must be skipped on git rm failure'
         )
 
-
     async def test_scrub_returns_scrubbed_on_happy_path(
         self, git_ops: GitOps, caplog,
     ):
