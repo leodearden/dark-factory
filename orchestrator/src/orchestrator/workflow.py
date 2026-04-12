@@ -709,6 +709,19 @@ class TaskWorkflow:
                 detail=f'Plan content:\n{plan_dump[:4000]}',
             )
 
+        try:
+            self.artifacts.validate_plan_prerequisites()
+        except ValueError as exc:
+            plan_dump = json.dumps(self.plan, indent=2)
+            logger.error(
+                f'Task {self.task_id}: architect wrote plan.json with invalid prerequisites '
+                f'— {exc}'
+            )
+            return await self._mark_blocked(
+                f'Planning failed: invalid prerequisites format — {exc}',
+                detail=f'Plan content:\n{plan_dump[:4000]}',
+            )
+
         # Stamp provenance and acquire lock
         self.artifacts.stamp_plan_provenance(self.session_id)
         self.artifacts.lock_plan(self.session_id)
@@ -858,6 +871,18 @@ class TaskWorkflow:
                 )
                 return await self._mark_blocked(
                     'Architect replan produced no valid steps',
+                    detail=f'Replan content:\n{plan_dump[:4000]}',
+                )
+            try:
+                self.artifacts.validate_plan_prerequisites()
+            except ValueError as exc:
+                plan_dump = json.dumps(self.plan, indent=2)
+                logger.error(
+                    f'Task {self.task_id}: replan produced plan.json with invalid prerequisites '
+                    f'— {exc}'
+                )
+                return await self._mark_blocked(
+                    f'Architect replan produced invalid prerequisites format — {exc}',
                     detail=f'Replan content:\n{plan_dump[:4000]}',
                 )
             self.artifacts.stamp_plan_provenance(self.session_id)
