@@ -706,6 +706,13 @@ class TestFormatFilteredTaskTree:
             "'\\n- [51] ' must not appear in output"
         )
 
+        # (c) End-to-end header check: 600 active tasks minus 50 shown = 550 omitted.
+        #     Confirms the max_tasks cap logic fires correctly for this range of IDs.
+        assert re.search(r'550\s+more active omitted (by|due to) max_tasks cap', output), (
+            "Expected header phrase '550 more active omitted … max_tasks cap' "
+            "(600 tasks − 50 shown = 550 omitted); output was:\n" + output
+        )
+
     def test_many_deps_per_task_stays_under_budget(self):
         """Tasks with many deps (200) do not exhaust the char budget.
 
