@@ -516,6 +516,33 @@ class TestStewardLifetimeBudget:
             await steward._handle_escalation(esc)
             assert mock_invoke.call_args.kwargs['max_budget_usd'] == pytest.approx(2.0)
 
+    async def test_budget_exhaustion_pops_counters(self, steward, mock_config):
+        """When the lifetime budget guard fires both counters are popped.
+
+        Integration test through the budget-exhaustion guard path (L213-218 in
+        steward.py).  After cap-fire the dicts must not retain stale entries.
+        """
+        mock_config.steward_lifetime_budget = 5.0
+        steward.metrics.total_cost_usd = 6.0  # over budget
+
+        esc = _make_escalation(id='esc-42-1')
+        steward._retry_counts['esc-42-1'] = 1
+        steward._timeout_counts['esc-42-1'] = 1
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        # Guard fires before any invocation
+        mock_invoke.assert_not_called()
+        # Auto-escalation was issued
+        steward.escalation_queue.submit.assert_called_once()
+        submitted = steward.escalation_queue.submit.call_args[0][0]
+        assert submitted.level == 1
+        assert 'budget exhausted' in submitted.summary.lower()
+        # Both counters popped — no stale entries remain
+        assert 'esc-42-1' not in steward._retry_counts
+        assert 'esc-42-1' not in steward._timeout_counts
+
 
 # ---------------------------------------------------------------------------
 # Timeout Passthrough
