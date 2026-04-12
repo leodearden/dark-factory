@@ -39,6 +39,7 @@ from runpod_toolkit.compute import RunPodClient, PodStatus  # type: ignore[impor
 from orchestrator.evals.configs import (
     get_config_by_name,
     VLLM_EVAL_CONFIGS,
+    FINAL_RUN_CONFIGS,
     EvalConfig,
 )
 
@@ -95,14 +96,17 @@ GPU_TYPES = [
     "NVIDIA H200",
 ]
 
+# All vLLM-backed configs (original + final run).
+_ALL_VLLM_CONFIGS = [*VLLM_EVAL_CONFIGS, *[c for c in FINAL_RUN_CONFIGS if c.image]]
+
 # RunPod-targetable config names: those with an image set in configs.py.
-RUNPOD_CONFIG_NAMES = [c.name for c in VLLM_EVAL_CONFIGS if c.image is not None]
+RUNPOD_CONFIG_NAMES = [c.name for c in _ALL_VLLM_CONFIGS if c.image is not None]
 
 # Workstation config names: those WITHOUT an image (no RunPod pod; direct URL).
-WORKSTATION_CONFIG_NAMES = [c.name for c in VLLM_EVAL_CONFIGS if c.image is None]
+WORKSTATION_CONFIG_NAMES = [c.name for c in _ALL_VLLM_CONFIGS if c.image is None]
 
 # All vLLM config names (RunPod + workstation).
-ALL_VLLM_CONFIG_NAMES = [c.name for c in VLLM_EVAL_CONFIGS]
+ALL_VLLM_CONFIG_NAMES = [c.name for c in _ALL_VLLM_CONFIGS]
 
 
 # ---------------------------------------------------------------------------

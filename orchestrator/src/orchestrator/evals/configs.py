@@ -287,9 +287,72 @@ EVAL_CONFIGS = [
 ]
 
 
+# ===== Final-run configs: DGX Spark scenario (128 GB unified, SM121a) =====
+# Tuned for ideal circumstances: full context, generous timeouts, H200 as
+# proxy for DGX Spark.  Only configs that have demonstrated task completions
+# or are architecturally sound on SM90/SM121a.  Run with:
+#   --task-timeout-min 180 --orch-timeout-min 150
+FINAL_RUN_CONFIGS = [
+    # --- REAP-139B AWQ (best REAP-139B variant so far) ---
+    # AWQ 4-bit: ~78 GB VRAM. On H200 (141 GB) that leaves 56 GB KV cache
+    # = ~239k tokens.  Bumped to 131k context (model's native max).
+    _vllm_config('final-reap-139b-awq',
+        hf_model='cyankiwi/MiniMax-M2.5-REAP-139B-A10B-AWQ-4bit',
+        image='leosiriusdawn/runpod-vllm:latest',
+        gpu_type=H200, gpu_count=1, container_disk_gb=100,
+        max_model_len=131072, gpu_memory_util=0.95,
+        tool_call_parser='minimax_m2'),
+    # --- REAP-172B NVFP4 GB10 (larger REAP, strongest self-hosted so far) ---
+    # 93 GB NVFP4. On H200 (141 GB) = ~40 GB KV. 131k may be too tight;
+    # use 100k as a compromise — leaves ~25k tokens KV headroom.
+    _vllm_config('final-reap-172b-nvfp4-gb10',
+        hf_model='saricles/MiniMax-M2.5-REAP-172B-A10B-NVFP4-GB10',
+        image='leosiriusdawn/runpod-vllm:latest',
+        gpu_type=H200, gpu_count=1, container_disk_gb=250,
+        max_model_len=100000, gpu_memory_util=0.95,
+        tool_call_parser='minimax_m2',
+        override_generation_config='{"eos_token_id": 200020}'),
+    # --- MiniMax-M2.5 FP8 (full 215 GB, 4× RTX PRO / 2× H200) ---
+    # Best self-hosted model in trials (solved reify_task_12). 215 GB FP8.
+    # 4× RTX PRO (384 GB) or 2× H200 (282 GB). Full 131k context.
+    _vllm_config('final-minimax-m25-fp8',
+        hf_model='MiniMaxAI/MiniMax-M2.5',
+        image='leosiriusdawn/runpod-vllm:minimax-m25-fp8-baked',
+        gpu_type=RTX_PRO_6000, gpu_count=4, container_disk_gb=320,
+        max_model_len=131072,
+        quantization='fp8',
+        tool_call_parser='minimax_m2',
+        extra_env={'MAX_NUM_SEQS': '5'}),
+    # --- MiniMax-M2.5 NVFP4 (nvidia, 131 GB, 1× H200) ---
+    # Same architecture as FP8 but quantized to NVFP4. Tighter on KV cache
+    # so keep 80k context (matches earlier successful run).
+    _vllm_config('final-minimax-m25-nvfp4',
+        hf_model='nvidia/MiniMax-M2.5-NVFP4',
+        image='leosiriusdawn/runpod-vllm:minimax-m25-nvfp4-baked',
+        gpu_type=H200, gpu_count=1, container_disk_gb=240,
+        max_model_len=80000, gpu_memory_util=0.97,
+        tool_call_parser='minimax_m2',
+        extra_env={'MAX_NUM_SEQS': '5'}),
+    # --- Qwen3-Coder-Next FP8 (75 GB, 1× H200) ---
+    # Code-specialized model. Full 131k context on H200 with 56+ GB KV.
+    _vllm_config('final-qwen3-coder-next-fp8',
+        hf_model='Qwen/Qwen3-Coder-Next-FP8',
+        image='leosiriusdawn/runpod-vllm:latest',
+        gpu_type=H200, gpu_count=1, container_disk_gb=200,
+        max_model_len=131072,
+        tool_call_parser='qwen3_coder',
+        enforce_eager=True),
+    # --- Cloud baselines (re-run with higher timeout) ---
+    EvalConfig('final-claude-sonnet-max', 'claude', 'sonnet', 'max'),
+    EvalConfig('final-claude-opus-max', 'claude', 'opus', 'max'),
+]
+
+ALL_FINAL_CONFIG_NAMES = [c.name for c in FINAL_RUN_CONFIGS]
+
+
 def get_config_by_name(name: str) -> EvalConfig | None:
     """Look up an eval config by name."""
-    for cfg in EVAL_CONFIGS:
+    for cfg in [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS]:
         if cfg.name == name:
             return cfg
     return None

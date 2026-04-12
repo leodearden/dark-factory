@@ -284,26 +284,24 @@ class VllmBridge:
         except Exception as e:
             logger.warning('Bridge failed to discover max_model_len: %s', e)
 
-    # Default output token cap as a fraction of max_model_len.  Claude CLI
-    # defaults to max_tokens=32000 which assumes a 200k+ context.  For
-    # smaller models (63k context, 131k context), we need to leave most of
-    # the context for the prompt.  Eval prompts are ~31-39k tokens, so
-    # reserving 75% for input and 25% for output is a safe starting point.
-    # 8k output tokens is generous for tool calls + code generation while
-    # leaving the vast majority of the context window for the prompt.
-    _DEFAULT_OUTPUT_CAP = 8192
+    # Default output token cap — 25% of max_model_len, floored at 8192.
+    # Claude CLI defaults to max_tokens=32000 which assumes a 200k+ context.
+    # For smaller models we need to leave room for the prompt.  Using 25% of
+    # context as the cap is a safe starting point: on 80k context that's 20k,
+    # on 131k it's ~32k (no clamping needed), on 55k it's ~14k.
+    _FALLBACK_OUTPUT_CAP = 8192
 
     def _clamp_max_tokens(self, body: dict) -> None:
         """Clamp ``max_tokens`` to avoid context-length overflow.
 
-        We don't know the prompt token count at request time (vLLM
-        tokenizes server-side), so we can't compute the exact remaining
-        budget.  Instead, clamp to a safe fixed cap: 8192 tokens is
-        enough for any single tool-call response and leaves 46k+ tokens
-        for the prompt on a 55k context model (or 55k+ on a 63k model).
-        If ``max_output_tokens`` was provided at init, use that instead.
+        Priority: explicit max_output_tokens > 25% of max_model_len > 8192.
         """
-        cap = self._max_output_tokens or self._DEFAULT_OUTPUT_CAP
+        if self._max_output_tokens:
+            cap = self._max_output_tokens
+        elif self._max_model_len:
+            cap = max(self._FALLBACK_OUTPUT_CAP, self._max_model_len // 4)
+        else:
+            cap = self._FALLBACK_OUTPUT_CAP
 
         current = body.get('max_tokens')
         if isinstance(current, int) and current > cap:
