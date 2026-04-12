@@ -493,7 +493,7 @@ class TestExtractInlineScript:
             '</body></html>'
         )
         body = _extract_inline_script(html)
-        assert 'mergeQueueDepthChart' in body
+        assert _PARTIAL_SCRIPT_SENTINEL in body
         assert 'alpine:init' not in body
 
     def test_raises_assertion_when_no_script_contains_sentinel(self):
@@ -518,7 +518,7 @@ class TestExtractInlineScript:
         )
         with pytest.raises(AssertionError) as excinfo:
             _extract_inline_script(html)
-        assert 'mergeQueueDepthChart' in str(excinfo.value)
+        assert _PARTIAL_SCRIPT_SENTINEL in str(excinfo.value)
 
     def test_sentinel_in_commented_script_is_still_matched(self):
         """A commented-out <script> containing the sentinel IS returned first.
@@ -547,7 +547,7 @@ class TestExtractInlineScript:
         )
         # The commented-out block contains the sentinel and is matched first.
         body = _extract_inline_script(html)
-        assert 'mergeQueueDepthChart' in body
+        assert _PARTIAL_SCRIPT_SENTINEL in body
         # 'function renderAll()' only appears in the real (second) script —
         # its absence confirms the commented block was returned, not the real one.
         assert 'function renderAll()' not in body
@@ -573,7 +573,7 @@ class TestExtractInlineScript:
             '</body></html>'
         )
         body = _extract_inline_script(html)
-        assert 'mergeQueueDepthChart' in body
+        assert _PARTIAL_SCRIPT_SENTINEL in body
         assert 'function renderAll()' in body
         assert 'var x = 1' not in body
 
