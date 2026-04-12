@@ -290,8 +290,8 @@ class TestFormatFilteredTaskTree:
         # Output must not exceed max_chars budget (default 50,000)
         assert len(output) <= 50_000
 
-        # Task 51 is beyond the max_tasks=50 cap — must not appear in body
-        assert 'Task title 51' not in output
+        # Task 51 is beyond the max_tasks=50 cap — structural match immune to ID-range changes
+        assert '\n- [51] ' not in output
 
         # Header must contain the max_tasks-cap omission phrase: pins count + verb + intent,
         # tolerates preposition rewording (e.g. 'omitted by' vs 'omitted due to')
