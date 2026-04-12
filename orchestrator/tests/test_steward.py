@@ -987,6 +987,36 @@ class TestStewardTimeoutCap:
 
         assert steward._timeout_counts == {'esc-42-1': 1, 'esc-42-2': 1}
 
+    async def test_success_path_cleans_up_counters(self, steward, mock_config):
+        """Successful resolution must pop both counter dicts and increment escalations_handled.
+
+        steward.py lines 347-352: the else-branch of the status check pops _retry_counts
+        and _timeout_counts on successful resolution. Pre-seeding both counters verifies
+        that existing cumulative per-escalation counts are cleaned up so the steward
+        dict does not accumulate stale entries when an escalation is resolved successfully.
+        """
+        mock_config.steward_max_timeouts_per_escalation = 3
+        mock_config.steward_max_attempts = 3
+        esc = _make_escalation(id='esc-42-1')
+        # Pre-seed both counters to confirm they get cleaned up on success
+        steward._timeout_counts['esc-42-1'] = 1
+        steward._retry_counts['esc-42-1'] = 1
+        # Queue returns resolved after the agent handles it
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='resolved', resolution='fixed',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            # invoke_agent returns success — not a timeout kill
+            mock_invoke.return_value = _make_result(success=True)
+            await steward._handle_escalation(esc)
+
+        # Both counters must be absent — no stale entries
+        assert 'esc-42-1' not in steward._timeout_counts
+        assert 'esc-42-1' not in steward._retry_counts
+        # Metric confirms the success path was taken
+        assert steward.metrics.escalations_handled == 1
+
     async def test_repeated_timeout_kills_eventually_terminate(
         self, steward, mock_config,
     ):
