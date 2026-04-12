@@ -60,6 +60,11 @@ class TestDetectStaleSummariesNamedAccess:
         assert returned is detect_result.stale
         backend._detect_stale_summaries_with_edges.assert_awaited_once_with(group_id='t')
 
+
+
+class TestDetectStaleSummariesWithEdgesNamedAccess:
+    """_detect_stale_summaries_with_edges returns a fully-populated StaleSummaryResult with named access."""
+
     @pytest.mark.asyncio
     async def test_detect_stale_summaries_includes_summary_field_named_access(
         self, mock_config, make_backend
