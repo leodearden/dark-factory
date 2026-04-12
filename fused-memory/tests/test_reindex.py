@@ -967,8 +967,16 @@ class TestNodeCount:
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
-        """Raises RuntimeError when client is None."""
+        """Raises RuntimeError when backend is not initialized (both client and _driver are None)."""
         backend = GraphitiBackend(mock_config)  # client is None
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.node_count('some_graph')
+
+    @pytest.mark.asyncio
+    async def test_raises_when_driver_explicitly_none(self, mock_config, make_backend):
+        """Raises RuntimeError when _driver is explicitly None (client is set but driver is not)."""
+        backend = make_backend(mock_config)  # client is set via make_backend
+        backend._driver = None
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.node_count('some_graph')
 
