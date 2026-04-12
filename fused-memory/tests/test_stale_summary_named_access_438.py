@@ -85,6 +85,8 @@ class TestDetectStaleSummariesNamedAccess:
         assert len(result.stale) == 1
         assert 'summary' in result.stale[0]
         assert result.stale[0]['summary'] == original_summary
+        assert result.all_edges == {'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]}
+        assert result.total_count == 1
 
 
 class TestRebuildEntitySummariesNamedAccess:
