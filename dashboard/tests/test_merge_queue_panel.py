@@ -458,6 +458,31 @@ class TestExtractInlineScript:
             _extract_inline_script(html)
         assert 'mergeQueueDepthChart' in str(excinfo.value)
 
+    def test_ignores_script_tag_inside_html_comment(self):
+        """A <script> tag embedded inside an HTML comment is naturally skipped.
+
+        This documents the 'secondary concern sidestep' from the task details:
+        the marker-based approach ignores commented-out script blocks because
+        their bodies typically do not contain the sentinel.  The real partial
+        script that follows the comment is returned correctly.
+        """
+        html = (
+            '<html><body>\n'
+            '<!-- old layout script, kept for reference:\n'
+            '<script>var x = 1;</script>\n'
+            '-->\n'
+            '<script>\n'
+            "var el = getOrDestroyChart('mergeQueueDepthChart');\n"
+            'function renderAll() { el.render(); }\n'
+            'renderAll();\n'
+            '</script>\n'
+            '</body></html>'
+        )
+        body = _extract_inline_script(html)
+        assert 'mergeQueueDepthChart' in body
+        assert 'function renderAll()' in body
+        assert 'var x = 1' not in body
+
     def test_window_all_real_aggregator_bounded_response(self, client, tmp_path):
         """Integration: real aggregate_queue_depth_timeseries with a real empty DB.
 
