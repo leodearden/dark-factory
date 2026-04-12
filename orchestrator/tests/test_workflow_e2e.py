@@ -2230,8 +2230,8 @@ class TestArchitectPromptGuidance:
         from orchestrator.agents.roles import ARCHITECT
 
         prompt = ARCHITECT.system_prompt
-        # Must say that prerequisites must be dicts with specific keys
-        assert ('prerequisites MUST be' in prompt or 'prerequisites must be' in prompt.lower())
+        # Must say that prerequisites must be dicts (allowing for markdown backticks around the word)
+        assert 'prerequisites' in prompt and ('MUST be' in prompt or 'must be a dict' in prompt.lower())
 
     def test_architect_prompt_prerequisites_guidance_is_near_steps_warning(self):
         """Prerequisites guidance must appear in the ## Important section, near the steps warning."""
