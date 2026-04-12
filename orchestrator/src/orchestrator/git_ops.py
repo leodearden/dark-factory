@@ -536,9 +536,15 @@ class GitOps:
             scrub_result = await scrub_task_dir_from_tree(merge_wt, f'post-merge({full_branch})')
             if scrub_result == ScrubResult.FAILED:
                 logger.error(
-                    '.task/ scrub FAILED post-merge for %s — index may still be '
-                    'contaminated; _assert_no_task_dir will catch it at advance_main.',
+                    '.task/ scrub FAILED post-merge for %s — aborting merge; '
+                    'no advance_main will run.',
                     full_branch,
+                )
+                await self.cleanup_merge_worktree(merge_wt)
+                return MergeResult(
+                    success=False,
+                    details=f'.task/ scrub failed post-merge for {full_branch}',
+                    pre_merge_sha=pre_merge_sha,
                 )
 
             _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
