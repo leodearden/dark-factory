@@ -719,22 +719,66 @@ class TestMultiDbAggregation:
         assert result['values'][idx] == 2  # 1 from each DB
 
     @pytest.mark.asyncio
-    async def test_aggregator_labels_stable_skewed_now(self, tmp_path):
-        """Two calls with skewed now values in the same 15-min bucket yield identical labels."""
-        now1 = datetime(2026, 4, 11, 12, 7, 0, tzinfo=UTC)
-        now2 = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+    async def test_aggregator_labels_stable_skewed_now(self, tmp_path, monkeypatch):
+        """Aggregator captures datetime.now() once and threads it to all per-DB calls.
+
+        Without the effective_now capture at the top of aggregate_queue_depth_timeseries,
+        a stepping datetime.now() that straddles the 12:00→12:15 bucket boundary would
+        cause per-DB subcalls to receive different now values, diverging their label sets.
+        The strengthened test verifies: (a) both subcalls receive the same pre-boundary
+        now, (b) datetime.now was called exactly once (aggregator-level capture, not
+        per-DB), and (c) labels use the pre-boundary 15-min bucket alignment.
+        """
+        from dashboard.data import merge_queue
+
+        # Stepping clock: first call → 12:14:59 (pre-boundary),
+        # subsequent calls → 12:15:01 (post-boundary, should never be reached).
+        before = datetime(2026, 4, 11, 12, 14, 59, tzinfo=UTC)
+        after = datetime(2026, 4, 11, 12, 15, 1, tzinfo=UTC)
+
+        class _SteppingDT(datetime):
+            _call_count = 0
+
+            @classmethod
+            def now(cls, tz=None):
+                assert tz is UTC, f'Expected UTC, got {tz}'
+                val = before if cls._call_count == 0 else after
+                cls._call_count += 1
+                return val
+
+        monkeypatch.setattr(merge_queue, 'datetime', _SteppingDT)
+
+        # Async spy: record the `now` kwarg received by each per-DB subcall.
+        received_nows: list = []
+        _real = queue_depth_timeseries
+
+        async def _spy(db, *, hours, now=None):
+            received_nows.append(now)
+            return await _real(db, hours=hours, now=now)
+
+        monkeypatch.setattr(merge_queue, 'queue_depth_timeseries', _spy)
 
         db1 = self._make_db(tmp_path, 'runs1.db', [])
+        db2 = self._make_db(tmp_path, 'runs2.db', [])
 
-        async with aiosqlite.connect(str(db1)) as conn1:
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
             conn1.row_factory = aiosqlite.Row
-            result1 = await aggregate_queue_depth_timeseries([conn1], hours=24, now=now1)
-
-        async with aiosqlite.connect(str(db1)) as conn2:
             conn2.row_factory = aiosqlite.Row
-            result2 = await aggregate_queue_depth_timeseries([conn2], hours=24, now=now2)
+            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=24)
 
-        assert result1['labels'] == result2['labels']
+        # (a) Both per-DB subcalls received the same pre-boundary now.
+        assert len(received_nows) == 2
+        assert received_nows[0] == before
+        assert received_nows[1] == before
+
+        # (b) datetime.now was called exactly once: aggregator-level capture, not per-DB.
+        assert _SteppingDT._call_count == 1
+
+        # (c) Labels use the pre-boundary 15-min bucket: 12:14:59 → bucket 12:00:00.
+        assert result['labels'][-1] == '2026-04-11T12:00:00+00:00'
 
     @pytest.mark.asyncio
     async def test_aggregate_outcome_distribution(self, tmp_path):
