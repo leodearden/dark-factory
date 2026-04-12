@@ -1000,7 +1000,12 @@ class TestStewardTimeoutCap:
     async def test_repeated_timeout_kills_eventually_terminate(
         self, steward, mock_config,
     ):
-        """Headline acceptance test: after cap timeouts the steward stops invoking."""
+        """Headline acceptance test: after cap timeouts the steward auto-escalates.
+
+        Loop runs 4 iterations: 3 real invocations (all timeout) + 1 cap-fire call
+        that triggers auto-escalation.  After cap-fire the counter is popped so
+        the dicts do not accumulate stale entries.
+        """
         mock_config.steward_max_timeouts_per_escalation = 3
         mock_config.steward_max_attempts = 10  # retry guard must not fire first
         mock_config.timeouts.steward = 900.0
@@ -1019,10 +1024,10 @@ class TestStewardTimeoutCap:
                 session_id='sess-inf',
                 stderr='Process killed after 900.0s timeout (SIGTERM+SIGKILL)',
             )
-            for _ in range(5):
+            for _ in range(4):
                 await steward._handle_escalation(esc)
 
-        # invoke_agent called exactly 3 times (cap=3); calls 4 and 5 are blocked
+        # invoke_agent called exactly 3 times (cap=3); call 4 is blocked by the cap
         assert mock_invoke.call_count == 3
         # Level-1 re-escalation was submitted at least once
         steward.escalation_queue.submit.assert_called()
@@ -1031,7 +1036,8 @@ class TestStewardTimeoutCap:
         assert 'repeatedly timed out' in first_submit.summary.lower()
         # Timeout metric reflects the 3 actual invocations
         assert steward.metrics.timeouts_recovered == 3
-        assert steward._timeout_counts['esc-42-inf'] == 3
+        # Counter popped on cap-fire — no stale entry retained
+        assert 'esc-42-inf' not in steward._timeout_counts
 
 
 # ---------------------------------------------------------------------------
