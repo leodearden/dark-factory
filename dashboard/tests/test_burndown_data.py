@@ -232,9 +232,7 @@ class TestCollectSnapshot:
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
             row = await cur.fetchone()
             assert row is not None
-            count = row[0]
-
-        assert count == 1
+            assert row[0] == 1
 
     @pytest.mark.asyncio
     async def test_snapshots_known_project_roots_when_no_orchestrators(self, burndown_env):
