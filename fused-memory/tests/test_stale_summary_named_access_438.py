@@ -67,19 +67,17 @@ class TestDetectStaleSummariesWithEdgesNamedAccess:
 
     @pytest.mark.asyncio
     async def test_detect_stale_summaries_includes_summary_field_named_access(
-        self, mock_config, make_backend
+        self, mock_config, make_backend, make_edge_backend
     ):
         """Confirms named attribute access on StaleSummaryResult fields works correctly
         for the summary-field scenario. Verifies that result.stale contains summary data,
         result.all_edges maps entity UUIDs to edge lists, and result.total_count reflects
         the scanned entity count.
         """
-        backend = make_backend(mock_config)
         original_summary = 'old stale fact'
-        backend.list_entity_nodes = AsyncMock(return_value=[
+        backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': original_summary},
-        ])
-        backend.get_all_valid_edges = AsyncMock(return_value={
+        ], edges={
             'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
         })
 
