@@ -1563,3 +1563,67 @@ class TestMergeToMainScrubFailure:
         # Clean up the merge worktree to avoid polluting other tests.
         if result.merge_worktree is not None:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+    async def test_merge_to_main_scrubs_real_task_dir(
+        self, git_ops: GitOps,
+    ):
+        """merge_to_main strips .task/ from the merge commit via the real scrub.
+
+        Unlike test_merge_to_main_succeeds_when_scrub_cleans_task_dir, this test
+        uses NO mock — it commits a real .task/plan.json file on the feature branch
+        and verifies that merge_to_main produces a clean merge commit with no .task/
+        entries in the tree.  This exercises the real scrub_task_dir_from_tree with
+        amend=True on an actual contaminated merge commit.
+        """
+        # Create a worktree and commit a regular file so the branch has content.
+        worktree_info = await git_ops.create_worktree('scrub-real-branch')
+        (worktree_info.path / 'feature.py').write_text('def feature(): pass\n')
+        await git_ops.commit(worktree_info.path, 'Add feature file')
+
+        # Inject .task/ contamination directly via git commands, bypassing the
+        # safety guards in git_ops.commit (which would normally unstage .task/).
+        # Use -f to force-add past the .task/.gitignore ('*') that create_worktree
+        # places there as a defence-in-depth measure.
+        task_dir = worktree_info.path / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"contamination": true}\n')
+        await _run(['git', 'add', '-f', '.task/plan.json'], cwd=worktree_info.path)
+        await _run(
+            ['git', 'commit', '-m', 'Simulated .task/ contamination'],
+            cwd=worktree_info.path,
+        )
+
+        # Verify contamination is present on the branch before merge.
+        _, ls_before, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'HEAD', '--', '.task/'],
+            cwd=worktree_info.path,
+        )
+        assert '.task/plan.json' in ls_before, (
+            f'Pre-condition: expected .task/plan.json on branch, got: {ls_before!r}'
+        )
+
+        # Call merge_to_main with NO mock — uses real scrub_task_dir_from_tree.
+        result = await git_ops.merge_to_main(worktree_info.path, 'scrub-real-branch')
+
+        # (a) Merge must succeed.
+        assert result.success is True, (
+            f'Expected success=True when real scrub cleans .task/, got {result.success!r}'
+        )
+
+        # (b) A merge commit must have been created.
+        assert result.merge_commit is not None, (
+            'Expected a valid merge_commit SHA when scrub succeeds'
+        )
+
+        # (c) Verify .task/ is absent from the merge commit tree.
+        _, task_in_tree, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', result.merge_commit.strip(), '--', '.task/'],
+            cwd=git_ops.project_root,
+        )
+        assert not task_in_tree.strip(), (
+            f'.task/ must be absent from merge commit tree, but found: {task_in_tree!r}'
+        )
+
+        # Clean up the merge worktree.
+        if result.merge_worktree is not None:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
