@@ -529,7 +529,7 @@ class TestFormatFilteredTaskTree:
 
         N=1_100_000 ensures trimmed_count is always 7+ digits regardless of how many lines
         the lazy loop retains (1,100,000 - any_kept ≈ 1,099,500+). max_chars=500 provides
-        328 chars of headroom above the minimum viable output (header+notice+summary=172),
+        330 chars of headroom above the minimum viable output (header+notice+summary=170),
         making the test insensitive to header format changes while still exercising the
         lazy loop (initial result=551 > 500).
 
@@ -548,13 +548,13 @@ class TestFormatFilteredTaskTree:
 
         # Stub lines are 1 char each. With N=1_100_000, max_tasks=N, max_chars=500:
         # header = "### Active Task Tree\n(1100000 active shown, 0 done, 0 cancelled, 0 other, 1100000 total)\n"
-        #        = 91 chars.
+        #        = 89 chars.
         # summary_line = "0 done, 0 cancelled — omitted" = 29 chars.
-        # budget = 500 - 91 - 29 = 380. Each stub line costs 2 chars (1 char + newline sep).
-        # initial kept = floor(380/2) = 190. trimmed_count = 1_100_000 - 190 = 1_099_810 (7 digits).
-        # Notice = "... and 1099810 more active (truncated for budget)" = 52 chars.
-        # Initial result = 91 + 379 + 52 + 29 = 551 > 500. Lazy loop fires, pops ~26 lines.
-        # After ~26 pops: kept=164, trimmed=1_099_836 (still 7 digits), result=499 ≤ 500. ✓
+        # budget = 500 - 89 - 29 = 382. Each stub line costs 2 chars (1 char + newline sep).
+        # initial kept = floor(383/2) = 191. trimmed_count = 1_100_000 - 191 = 1_099_809 (7 digits).
+        # Notice = "... and 1099809 more active (truncated for budget)" = 52 chars.
+        # Initial result = 89 + 381 + 52 + 29 = 551 > 500. Lazy loop fires, pops ~26 lines.
+        # After ~26 pops: kept=165, trimmed=1_099_835 (still 7 digits), result=499 ≤ 500. ✓
 
         single_task = {'id': 1, 'title': 'T', 'status': 'pending', 'dependencies': []}
         n = 1_100_000
