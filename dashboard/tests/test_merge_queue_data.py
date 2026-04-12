@@ -585,6 +585,34 @@ class TestRecentMerges:
 
         assert len(result) == 5
 
+    @pytest.mark.asyncio
+    async def test_hours_window_excludes_old_events(self, merge_events_db):
+        """recent_merges with hours=1 excludes events older than 1 hour."""
+        now = datetime.now(UTC)
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        # 3 events at now-30min (within the 1-hour window)
+        for i in range(3):
+            _insert_event(conn_sync, event_type='merge_attempt',
+                          timestamp=now - timedelta(minutes=30 + i),
+                          task_id=f'recent-{i}', run_id=f'run-r{i}',
+                          data={'outcome': 'done'})
+        # 2 events at now-3hours (outside the 1-hour window)
+        for i in range(2):
+            _insert_event(conn_sync, event_type='merge_attempt',
+                          timestamp=now - timedelta(hours=3 + i),
+                          task_id=f'old-{i}', run_id=f'run-o{i}',
+                          data={'outcome': 'done'})
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await recent_merges(db, limit=20, hours=1)
+
+        assert len(result) == 3
+        task_ids = [r['task_id'] for r in result]
+        assert all(tid.startswith('recent-') for tid in task_ids)
+
 
 # ---------------------------------------------------------------------------
 # TestSpeculativeStats
