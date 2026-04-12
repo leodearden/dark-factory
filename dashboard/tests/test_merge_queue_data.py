@@ -741,6 +741,7 @@ class TestMultiDbAggregation:
 
             @classmethod
             def now(cls, tz=None):
+                assert tz is UTC, f'Expected UTC, got {tz}'
                 val = before if cls._call_count == 0 else after
                 cls._call_count += 1
                 return val
