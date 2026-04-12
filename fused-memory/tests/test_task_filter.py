@@ -513,37 +513,52 @@ class TestFormatFilteredTaskTree:
             f'the lazy verification loop must pop task lines until the output fits'
         )
 
-    def test_budget_lazy_loop_handles_7_digit_trimmed_count(self):
+    def test_budget_lazy_loop_handles_7_digit_trimmed_count(self, monkeypatch):
         """Regression: format_filtered_task_tree must enforce len(output) <= max_chars even
         when trimmed_count reaches 7+ digits, where a fixed-width reserve approach would
         have under-allocated space for the truncation notice.
 
         The implementation uses a lazy verification loop that re-measures the realized
         notice length after each pop iteration. This test exercises the 7+ digit path
-        (trimmed_count=1_000_000) where a fixed-width reserve keyed on 4-digit trimmed
-        counts would overflow.
+        where a fixed-width reserve keyed on 4-digit trimmed counts would overflow.
 
-        Uses repeated-reference trick ([same_dict]*N) to keep peak allocation under
-        ~100 MB (1M pointers + rendered lines) rather than creating 1M full task dicts.
+        Performance: _render_task_line is monkeypatched to return 'X' (1 char) instead of
+        the real ~25-char line. This collapses per-line cost from ~25 chars to 1 char,
+        reducing peak memory from ~100 MB to ~20 MB and wall time from seconds to
+        sub-second, while preserving lazy-loop + 7-digit-trimmed_count coverage.
+
+        N=1_100_000 ensures trimmed_count is always 7+ digits regardless of how many lines
+        the lazy loop retains (1,100,000 - any_kept ≈ 1,099,500+). max_chars=500 provides
+        328 chars of headroom above the minimum viable output (header+notice+summary=172),
+        making the test insensitive to header format changes while still exercising the
+        lazy loop (initial result=551 > 500).
 
         Failure mode guarded: if the implementation ever switches to a fixed-width reserve
         (e.g. reserving 49 chars for a notice with a 4-digit count), then a 7-digit
         trimmed_count would produce a notice 3 chars longer, causing output to exceed
         max_chars. This test fails loudly in that case.
         """
-        # Task line for title='T', id=1: "- [1] (pending) T deps=[]" = 25 chars.
-        # With N=1_000_001, max_tasks=N, max_chars=200:
-        # header = "### Active Task Tree\n(1000001 active shown, 0 done, 0 cancelled, 0 other, 1000001 total)\n"
-        #        = 89 chars.
+        # Monkeypatch _render_task_line to return 'X' (1 char) for all tasks.
+        # format_filtered_task_tree calls the function via the module-local reference,
+        # so we patch at the module level to ensure the stub is used during the call.
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.task_filter._render_task_line',
+            lambda task: 'X',
+        )
+
+        # Stub lines are 1 char each. With N=1_100_000, max_tasks=N, max_chars=500:
+        # header = "### Active Task Tree\n(1100000 active shown, 0 done, 0 cancelled, 0 other, 1100000 total)\n"
+        #        = 91 chars.
         # summary_line = "0 done, 0 cancelled — omitted" = 29 chars.
-        # budget = 200 - 89 - 29 = 82. Each line costs 26 chars (25 + newline).
-        # initial kept_lines = floor(82/26) = 3. trimmed_count starts at 999_998 (6 digits).
-        # After 2 pop iterations: kept_lines=1, trimmed_count=1_000_000 (7 digits).
-        # Result fits within 200 chars with a 5-char slack margin.
+        # budget = 500 - 91 - 29 = 380. Each stub line costs 2 chars (1 char + newline sep).
+        # initial kept = floor(380/2) = 190. trimmed_count = 1_100_000 - 190 = 1_099_810 (7 digits).
+        # Notice = "... and 1099810 more active (truncated for budget)" = 52 chars.
+        # Initial result = 91 + 379 + 52 + 29 = 551 > 500. Lazy loop fires, pops ~26 lines.
+        # After ~26 pops: kept=164, trimmed=1_099_836 (still 7 digits), result=499 ≤ 500. ✓
 
         single_task = {'id': 1, 'title': 'T', 'status': 'pending', 'dependencies': []}
-        n = 1_000_001
-        # Repeated-reference trick: list of n pointers to same dict — keeps memory < 1 MB.
+        n = 1_100_000
+        # Repeated-reference trick: list of n pointers to same dict — keeps memory < 2 MB.
         # Safe only because format_filtered_task_tree treats task dicts as read-only;
         # any future in-place mutation in the formatter (e.g. dep normalization) would
         # alias across all N entries and invalidate the trick.
@@ -556,7 +571,7 @@ class TestFormatFilteredTaskTree:
             total_count=n,
         )
 
-        max_chars = 200  # Tight budget: forces trimmed_count into the 7-digit range
+        max_chars = 500  # Wide enough to avoid header-format sensitivity; lazy loop still fires
         output = format_filtered_task_tree(tree_large, max_tasks=n, max_chars=max_chars)
 
         assert len(output) <= max_chars, (
@@ -570,8 +585,8 @@ class TestFormatFilteredTaskTree:
             f'Truncation notice not found in output; got: {output!r}'
         )
         trimmed_count = int(m.group(1))
-        assert trimmed_count >= 1_000_000, (
-            f'trimmed_count={trimmed_count} is under 1_000_000; '
+        assert len(str(trimmed_count)) >= 7, (
+            f'trimmed_count={trimmed_count} has fewer than 7 digits; '
             f'the 7+ digit path was not exercised (short-circuited?)'
         )
 
