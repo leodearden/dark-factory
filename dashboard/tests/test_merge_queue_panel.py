@@ -7,6 +7,8 @@ import sqlite3
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from dashboard.data.merge_queue import _bucket_minutes_for_window
 
 # ---------------------------------------------------------------------------
@@ -77,7 +79,12 @@ def _extract_inline_script(html: str) -> str:
     script blocks (e.g. the alpine:init listener in base.html / burndown.html /
     costs.html): those scripts will not contain the sentinel and are skipped.
     As a side benefit, ``<script>`` tags embedded inside HTML comments are also
-    naturally skipped because their bodies typically do not carry the sentinel.
+    typically skipped because their bodies do not carry the sentinel.
+
+    Note: the regex does not parse HTML comments; skipping relies entirely on
+    the sentinel not appearing in the commented block.  If a commented-out
+    ``<script>`` block happens to contain the sentinel, it will be returned
+    instead of the real partial script.
 
     Raises ``AssertionError`` if no sentinel-bearing script block is found, so
     failures surface a clear message rather than a downstream ``AttributeError``.
@@ -498,7 +505,6 @@ class TestExtractInlineScript:
         pointing at the missing sentinel is more actionable than a downstream
         AttributeError on a None return value.
         """
-        import pytest
         html = (
             '<html><head>\n'
             '<script>\n'
@@ -513,6 +519,38 @@ class TestExtractInlineScript:
         with pytest.raises(AssertionError) as excinfo:
             _extract_inline_script(html)
         assert 'mergeQueueDepthChart' in str(excinfo.value)
+
+    def test_sentinel_in_commented_script_is_still_matched(self):
+        """A commented-out <script> containing the sentinel IS returned first.
+
+        This documents the known limitation of the marker-based approach: the
+        regex does not parse HTML comments.  If a commented-out ``<script>``
+        block happens to contain the sentinel, it will be matched and returned
+        before the real partial script.  The 'skipping' seen in
+        ``test_ignores_script_tag_inside_html_comment`` relies entirely on the
+        commented block not containing the sentinel — not on structural parsing
+        of HTML comments.
+        """
+        html = (
+            '<html><body>\n'
+            '<!-- old partial, kept for reference:\n'
+            '<script>\n'
+            "var el = getOrDestroyChart('mergeQueueDepthChart');  // legacy\n"
+            '</script>\n'
+            '-->\n'
+            '<script>\n'
+            "var el = getOrDestroyChart('mergeQueueDepthChart');\n"
+            'function renderAll() { el.render(); }\n'
+            'renderAll();\n'
+            '</script>\n'
+            '</body></html>'
+        )
+        # The commented-out block contains the sentinel and is matched first.
+        body = _extract_inline_script(html)
+        assert 'mergeQueueDepthChart' in body
+        # 'function renderAll()' only appears in the real (second) script —
+        # its absence confirms the commented block was returned, not the real one.
+        assert 'function renderAll()' not in body
 
     def test_ignores_script_tag_inside_html_comment(self):
         """A <script> tag embedded inside an HTML comment is naturally skipped.
