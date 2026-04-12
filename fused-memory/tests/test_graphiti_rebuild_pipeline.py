@@ -393,10 +393,10 @@ class TestRebuildEntitySummariesForceDryRun:
 
         assert result['total_entities'] == len(entities)
         assert result['stale_entities'] == result['total_entities']  # force=True treats every entity as stale
-        assert result['skipped'] == 3  # dry_run=True skips all
+        assert result['skipped'] == len(entities)  # dry_run=True skips all
         assert result['rebuilt'] == 0
         assert result['errors'] == 0
-        assert len(result['details']) == 3
+        assert len(result['details']) == len(entities)
         expected_details = [
             {'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities
         ]
