@@ -305,10 +305,13 @@ class TestHooksIntegration:
         (`echo ok # run check_asyncmock_assertion_style.py`). Without this, either comment form
         would land in invocation_lines and fail the python3/no-uv-run assertions on a benign edit.
 
-        The `fused-memory/tests` scan-target assertion is applied at file level (not per line)
-        so a future shell-variable refactor like `TESTS_DIR=fused-memory/tests; python3 .../check.py
-        "$TESTS_DIR"` does not break the test — the literal still appears in the hook file, just
-        not necessarily on the same line as the python3 invocation.
+        The `fused-memory/tests` scan-target assertion checks each line's non-comment portion
+        (`line.split('#')[0]`) so that a comment-only occurrence like
+        `# asyncmock assertion-style check (fused-memory/tests only)` does not satisfy it.
+        The check is still at file level (not requiring the literal on the same line as the
+        python3 invocation), so a future shell-variable refactor like
+        `TESTS_DIR=fused-memory/tests; python3 .../check.py "$TESTS_DIR"` still passes —
+        the literal appears in the hook file's non-comment code, just not on the python3 line.
         """
         hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
         content = hooks_path.read_text(encoding='utf-8')
@@ -317,8 +320,8 @@ class TestHooksIntegration:
             if 'check_asyncmock_assertion_style.py' in line.split('#')[0]
         ]
         assert invocation_lines, 'No invocation of check_asyncmock_assertion_style.py found in hooks/project-checks'
-        assert 'fused-memory/tests' in content, (
-            'Expected fused-memory/tests scan target to appear somewhere in hooks/project-checks'
+        assert any('fused-memory/tests' in line.split('#')[0] for line in content.splitlines()), (
+            'Expected fused-memory/tests scan target in non-comment code in hooks/project-checks'
         )
         for line in invocation_lines:
             assert re.search(r'\bpython3(?:\.\d+)?\b', line), (
