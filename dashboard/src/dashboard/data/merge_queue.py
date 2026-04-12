@@ -296,8 +296,15 @@ async def recent_merges(
     db: aiosqlite.Connection | None,
     *,
     limit: int = 20,
+    hours: int = 168,
 ) -> list[dict]:
     """Most recent merge_attempt events, newest first.
+
+    Args:
+        db: Async SQLite connection, or None (returns []).
+        limit: Maximum number of rows to return.
+        hours: Look-back window in hours (default 168 = 7 days).  Only
+            events with ``timestamp >= now - hours`` are included.
 
     Returns list of {'task_id', 'run_id', 'outcome', 'duration_ms',
                      'timestamp'} dicts.
@@ -306,15 +313,17 @@ async def recent_merges(
         return []
 
     async def _query(conn: aiosqlite.Connection) -> list[dict]:
+        since = _cutoff_iso(hours)
         rows = await conn.execute_fetchall(
             "SELECT task_id, run_id, "
             "       json_extract(data, '$.outcome') AS outcome, "
             "       duration_ms, timestamp "
             "FROM events "
             "WHERE event_type = 'merge_attempt' "
+            "  AND timestamp >= ? "
             "ORDER BY timestamp DESC "
             "LIMIT ?",
-            (limit,),
+            (since, limit),
         )
         return [
             {
