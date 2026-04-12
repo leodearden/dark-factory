@@ -406,6 +406,50 @@ class TestRebuildEntitySummariesForceDryRun:
         backend.get_all_valid_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_force_dry_run_detail_tolerates_extra_keys(self, mock_config, make_backend):
+        """Regression guard: projected-key comparison tolerates additive detail schema changes.
+
+        Simulates a future schema addition (e.g. 'group_id' field) in the detail
+        dicts returned by the dry_run path, and verifies that the projected-key
+        assertion pattern correctly validates uuid/name/status while ignoring
+        extra fields.
+
+        Also demonstrates that the old exact-dict equality would fail with extra
+        keys — confirming why the schema-tolerant projection pattern is needed.
+        """
+        backend = make_backend(mock_config)
+        entities = [
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
+            {'uuid': 'u3', 'name': 'Carol', 'summary': 'summary C'},
+        ]
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        backend._rebuild_entity_from_edges = AsyncMock()
+
+        result = await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=True)
+
+        # Simulate an additive schema change: inject an extra field into each detail,
+        # as if production had added 'group_id' to the skipped_dry_run record.
+        for d in result['details']:
+            d['group_id'] = 'extra_key_test'
+
+        expected_details = [
+            {'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities
+        ]
+
+        # Confirm the extra key is present (simulation worked)
+        assert all('group_id' in d for d in result['details'])
+
+        # Old exact-dict comparison fails when extra keys are present
+        with pytest.raises(AssertionError):
+            assert result['details'] == expected_details
+
+        # dry_run path appends details sequentially via 'for t in targets', so order is stable
+        # Projected-key comparison tolerates extra keys while preserving order check
+        assert [{k: d[k] for k in ('uuid', 'name', 'status')} for d in result['details']] == expected_details
+
+    @pytest.mark.asyncio
     async def test_force_no_dry_run_calls_get_all_valid_edges(
         self, mock_config, make_backend, make_stale_list
     ):
