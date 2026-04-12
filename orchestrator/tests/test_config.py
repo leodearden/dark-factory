@@ -347,8 +347,8 @@ class TestValidateAssignment:
     ):
         """Setting steward_completion_timeout above timeouts.steward must raise ValidationError.
 
-        Currently silently succeeds because validate_assignment is not enabled.
-        After impl (step-4), this assignment fires _validate_steward_timeout_invariant.
+        With validate_assignment=True, this assignment fires _validate_steward_timeout_invariant
+        and raises ValidationError.
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
@@ -357,7 +357,7 @@ class TestValidateAssignment:
         assert cfg.timeouts.steward == 1800.0
         assert cfg.steward_completion_timeout == 900.0
         # Mutate steward_completion_timeout to 2000.0 — now above timeouts.steward=1800.
-        # With validate_assignment=True this should raise; currently it silently succeeds.
+        # validate_assignment=True fires _validate_steward_timeout_invariant, raising ValidationError.
         with pytest.raises(ValidationError, match='steward'):
             cfg.steward_completion_timeout = 2000.0
 
@@ -366,8 +366,8 @@ class TestValidateAssignment:
     ):
         """Replacing cfg.timeouts with a TimeoutsConfig that violates the invariant must raise.
 
-        Currently silently succeeds because validate_assignment is not enabled.
-        After impl (step-4), assigning cfg.timeouts fires _validate_steward_timeout_invariant.
+        With validate_assignment=True, assigning cfg.timeouts fires _validate_steward_timeout_invariant
+        and raises ValidationError.
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
@@ -375,7 +375,7 @@ class TestValidateAssignment:
         cfg = OrchestratorConfig(steward_completion_timeout=900.0)
         assert cfg.steward_completion_timeout == 900.0
         # Replace timeouts with steward=300 — now 300 < 900, violating the invariant.
-        # With validate_assignment=True this should raise; currently it silently succeeds.
+        # validate_assignment=True fires _validate_steward_timeout_invariant, raising ValidationError.
         with pytest.raises(ValidationError, match='steward'):
             cfg.timeouts = TimeoutsConfig(steward=300.0)
 

@@ -436,6 +436,8 @@ class OrchestratorConfig(BaseSettings):
     _module_configs: dict[str, ModuleConfig] = PrivateAttr(default_factory=dict)
 
     def model_post_init(self, __context: Any) -> None:
+        super().model_post_init(__context)
+        # triggers validate_assignment re-check of model validators; benign
         self.project_root = self.project_root.resolve()
 
     @model_validator(mode='after')
