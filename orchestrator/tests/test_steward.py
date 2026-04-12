@@ -1016,6 +1016,8 @@ class TestStewardTimeoutCap:
         assert 'esc-42-1' not in steward._retry_counts
         # Metric confirms the success path was taken
         assert steward.metrics.escalations_handled == 1
+        # Explicit invocation count — guards against metric being incremented elsewhere
+        assert mock_invoke.call_count == 1
 
     async def test_repeated_timeout_kills_eventually_terminate(
         self, steward, mock_config,
@@ -1026,9 +1028,10 @@ class TestStewardTimeoutCap:
         that triggers auto-escalation.  After cap-fire the counter is popped so
         the dicts do not accumulate stale entries.
 
-        The stateful queue mock ensures that once resolve() dismisses the escalation,
-        subsequent queue.get() calls return dismissed status — reflecting production
-        behaviour where the run-loop would not re-dispatch a dismissed escalation.
+        The stateful queue mock is wired so that if any code path later calls get()
+        after resolve(), it would see dismissed status — matching production semantics.
+        This is defensive: the current test does not exercise the get() path after
+        resolve(), but the mock is correct for future test variants.
         Assertions are exact counts (not just assert_called) to catch double-fire bugs.
         """
         mock_config.steward_max_timeouts_per_escalation = 3
@@ -1045,7 +1048,7 @@ class TestStewardTimeoutCap:
         def _get_by_state(esc_id):  # type: ignore[no-untyped-def]
             if esc_id in _dismissed_ids:
                 return _make_escalation(id=esc_id, status='dismissed')
-            return _make_escalation(id='esc-42-inf', status='pending')
+            return _make_escalation(id=esc_id, status='pending')
 
         steward.escalation_queue.resolve.side_effect = _track_resolve
         steward.escalation_queue.get.side_effect = _get_by_state
