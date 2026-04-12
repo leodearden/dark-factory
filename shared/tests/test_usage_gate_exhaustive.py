@@ -823,6 +823,12 @@ class TestHandleCapDetected:
         assert gate._accounts[0].capped is True
         assert gate._accounts[1].capped is False
 
+    def test_none_token_caps_first_uncapped(self):
+        gate = make_gate(['a', 'b'])
+        gate._handle_cap_detected('reason', None, None)
+        assert gate._accounts[0].capped is True
+        assert gate._accounts[1].capped is False
+
     def test_all_capped_unknown_token_logs_warning(self, caplog):
         gate = make_gate(['a'])
         gate._accounts[0].capped = True
