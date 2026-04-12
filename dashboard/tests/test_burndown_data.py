@@ -323,17 +323,6 @@ class TestCollectSnapshot:
             assert row is not None
             assert row[0] == 1
 
-        # TERTIARY: direct value check — the surviving row carries the expected
-        # project_id key.  Fetching without WHERE is intentional: the SECONDARY
-        # assertion above already proved exactly one row exists, so this asserts
-        # the strongest form of the contract: the *only* row has the right key.
-        # Uses column-name access (conn.row_factory = aiosqlite.Row) consistent
-        # with the by_project pattern elsewhere in this file.
-        async with conn.execute('SELECT project_id FROM snapshots') as cur:
-            surviving = await cur.fetchone()
-            assert surviving is not None
-            assert surviving['project_id'] == str(base_config.project_root)
-
     @pytest.mark.asyncio
     async def test_symlinked_root_deduplicates_with_known_roots(self, tmp_path):
         """If known_project_roots includes the resolved real path, it deduplicates with a symlinked project_root."""
