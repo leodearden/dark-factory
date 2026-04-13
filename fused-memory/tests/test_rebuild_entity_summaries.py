@@ -636,7 +636,7 @@ class TestMemoryServiceRebuildEntitySummaries:
         The full backend result includes a 'details' list (one entry per rebuilt
         entity with uuid, name, status, old_summary, new_summary, edge_count, error).
         Passing this verbatim bloats the journal for large graphs. The service must
-        condense result_summary to only the four aggregate fields.
+        condense result_summary to only the five aggregate fields.
         """
         from fused_memory.services.memory_service import MemoryService
         svc = MemoryService(mock_config)
@@ -672,7 +672,7 @@ class TestMemoryServiceRebuildEntitySummaries:
         call_kwargs = mock_journal.log_write_op.call_args[1]
         result_summary = call_kwargs.get('result_summary')
         assert result_summary is not None, 'result_summary must be set on success'
-        # Must contain the four aggregate fields
+        # Must contain the five aggregate fields
         assert 'total_entities' in result_summary
         assert 'stale_entities' in result_summary
         assert 'rebuilt' in result_summary
