@@ -291,7 +291,7 @@ class ContextAssembler:
             ContextItem(
                 id=f'task:{task_id}',
                 source='task',
-                formatted=_format_task(task),
+                formatted=_format_task(task, display_id=str(task_id)),
             ),
         ]
         # If task has memory hints with queries, search for each
