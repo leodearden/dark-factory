@@ -80,11 +80,16 @@ async def invoke_with_cap_retry(
         if config_dir and oauth_token:
             config_dir.write_credentials(oauth_token)
 
-        result = await invoke_agent(
-            **invoke_kwargs,
-            oauth_token=oauth_token,
-            config_dir=config_dir.path if config_dir else None,
-        )
+        try:
+            result = await invoke_agent(
+                **invoke_kwargs,
+                oauth_token=oauth_token,
+                config_dir=config_dir.path if config_dir else None,
+            )
+        except BaseException:
+            if usage_gate is not None:
+                usage_gate.release_probe_slot(oauth_token)
+            raise
 
         if usage_gate and usage_gate.detect_cap_hit(
             result.stderr, result.output, backend, oauth_token=oauth_token,
