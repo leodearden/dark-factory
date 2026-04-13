@@ -136,6 +136,11 @@ async def collect_snapshot(
                         continue
                     seen_roots.add(root_str)
                     roots_to_snapshot.append((root_str, project_root / '.taskmaster' / 'tasks' / 'tasks.json'))
+                except OSError:
+                    logger.warning(
+                        'Cannot resolve project root for orchestrator entry; skipping',
+                        exc_info=True,
+                    )
                 except Exception:
                     logger.warning(
                         'Orchestrator entry processing failed; skipping entry',
