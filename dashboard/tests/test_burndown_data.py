@@ -1269,3 +1269,41 @@ class TestAssertSnapshotCounts:
 
         result = _assert_snapshot_counts(row)  # all defaults are 0
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# burndown_conn_with_config factory fixture validation
+# ---------------------------------------------------------------------------
+
+
+class TestBurndownConnWithConfig:
+    @pytest.mark.asyncio
+    async def test_factory_yields_valid_triple(self, burndown_conn_with_config):
+        """Factory yields (db_path, config, conn) triple with a fresh burndown schema."""
+        async with burndown_conn_with_config() as (db_path, config, conn):
+            # (a) db_path is a Path and exists on disk
+            assert isinstance(db_path, Path)
+            assert db_path.exists()
+            # (b) config is a DashboardConfig
+            assert isinstance(config, DashboardConfig)
+            # (c) conn can query snapshots table (empty on creation)
+            async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+                row = await cur.fetchone()
+            assert row is not None
+            assert row[0] == 0
+
+    @pytest.mark.asyncio
+    async def test_factory_accepts_custom_known_project_roots(self, burndown_conn_with_config):
+        """kwargs pass through to DashboardConfig.known_project_roots."""
+        roots = [Path('/fake/project/root_a'), Path('/fake/project/root_b')]
+        async with burndown_conn_with_config(known_project_roots=roots) as (db_path, config, conn):
+            # DashboardConfig.__post_init__ resolves all paths
+            assert config.known_project_roots == [r.resolve() for r in roots]
+
+    @pytest.mark.asyncio
+    async def test_factory_accepts_custom_project_root(self, tmp_path, burndown_conn_with_config):
+        """project_root override is reflected in the yielded config."""
+        custom_root = tmp_path / 'custom'
+        custom_root.mkdir()
+        async with burndown_conn_with_config(project_root=custom_root) as (db_path, config, conn):
+            assert config.project_root == custom_root.resolve()
