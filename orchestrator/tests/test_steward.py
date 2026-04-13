@@ -414,34 +414,21 @@ class TestStewardRetryLogic:
 
         assert steward._retry_counts.get('esc-42-1') == 1
 
-    async def test_auto_escalates_after_max_attempts(self, steward, mock_config):
-        mock_config.steward_max_attempts = 2
-        esc = _make_escalation()
-        steward._retry_counts['esc-42-1'] = 2
-
-        await steward._handle_escalation(esc)
-
-        steward.escalation_queue.submit.assert_called_once()
-        submitted = steward.escalation_queue.submit.call_args[0][0]
-        assert submitted.level == 1
-        assert 'Failed after 2 attempts' in submitted.summary
-
-        steward.escalation_queue.resolve.assert_called_once()
-        assert steward.escalation_queue.resolve.call_args[1].get('dismiss') is True
-
-    async def test_auto_escalates_after_one_attempt_with_default_retries(
-        self, steward, mock_config,
+    @pytest.mark.parametrize('max_attempts', [1, 2, 3])
+    async def test_auto_escalates_after_max_attempts(
+        self, steward, mock_config, max_attempts,
     ):
-        mock_config.steward_max_attempts = 1
+        mock_config.steward_max_attempts = max_attempts
         esc = _make_escalation()
-        steward._retry_counts['esc-42-1'] = 1
+        steward._retry_counts['esc-42-1'] = max_attempts
 
         await steward._handle_escalation(esc)
 
         steward.escalation_queue.submit.assert_called_once()
         submitted = steward.escalation_queue.submit.call_args[0][0]
         assert submitted.level == 1
-        assert 'Failed after 1 attempt:' in submitted.summary
+        expected = f'Failed after {max_attempts} attempt{"s" if max_attempts != 1 else ""}:'
+        assert expected in submitted.summary
 
         steward.escalation_queue.resolve.assert_called_once()
         assert steward.escalation_queue.resolve.call_args[1].get('dismiss') is True
