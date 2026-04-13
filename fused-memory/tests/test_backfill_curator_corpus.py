@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -526,6 +527,32 @@ class TestBackfillPointIdConsistency:
 
 
 class TestRunBackfill:
+    @contextlib.contextmanager
+    def _run_backfill_context(self):
+        """Yield ``(mock_curator, mock_tm_cls)`` with the common patch stack applied.
+
+        Patches applied: ``maintenance_service``, ``TaskmasterBackend``, ``TaskCurator``.
+        ``TaskCurator`` is pre-wired to return ``mock_curator``; tests configure
+        ``mock_tm_cls.return_value`` themselves.
+        """
+        mock_config = _make_config()
+        mock_curator = AsyncMock()
+
+        @contextlib.asynccontextmanager
+        async def fake_maintenance_service(config_path):
+            yield mock_config, MagicMock()
+
+        with patch(
+            'fused_memory.maintenance.backfill_curator_corpus.maintenance_service',
+            new=fake_maintenance_service,
+        ), patch(
+            'fused_memory.maintenance.backfill_curator_corpus.TaskmasterBackend',
+        ) as mock_tm_cls, patch(
+            'fused_memory.maintenance.backfill_curator_corpus.TaskCurator',
+        ) as mock_curator_cls:
+            mock_curator_cls.return_value = mock_curator
+            yield mock_curator, mock_tm_cls
+
     @pytest.mark.asyncio
     async def test_run_backfill_orchestrates_correctly(self):
         """run_backfill() fetches tasks, flattens, then calls backfill_corpus()."""
@@ -548,36 +575,13 @@ class TestRunBackfill:
                 },
             ],
         }
-
         mock_backfill_result = BackfillResult(upserted=3, skipped=0, errors=0)
 
-        mock_taskmaster = AsyncMock()
-        mock_taskmaster.get_tasks = AsyncMock(return_value=canned_task_tree)
-
-        mock_curator = AsyncMock()
-        mock_curator.backfill_corpus = AsyncMock(return_value=mock_backfill_result)
-
-        mock_config = _make_config()
-
-        import contextlib
-
-        @contextlib.asynccontextmanager
-        async def fake_maintenance_service(config_path):
-            yield mock_config, MagicMock()
-
-        with patch(
-            'fused_memory.maintenance.backfill_curator_corpus.maintenance_service',
-            new=fake_maintenance_service,
-        ), patch(
-            'fused_memory.maintenance.backfill_curator_corpus.TaskmasterBackend',
-        ) as mock_tm_cls, patch(
-            'fused_memory.maintenance.backfill_curator_corpus.TaskCurator',
-        ) as mock_curator_cls:
+        with self._run_backfill_context() as (mock_curator, mock_tm_cls):
+            mock_curator.backfill_corpus = AsyncMock(return_value=mock_backfill_result)
             mock_tm_instance = AsyncMock()
             mock_tm_instance.get_tasks = AsyncMock(return_value=canned_task_tree)
             mock_tm_cls.return_value = mock_tm_instance
-
-            mock_curator_cls.return_value = mock_curator
 
             result = await run_backfill(
                 config_path=None,
@@ -602,8 +606,6 @@ class TestRunBackfill:
     @pytest.mark.asyncio
     async def test_run_backfill_closes_curator(self):
         """run_backfill() calls curator.close() after a successful backfill."""
-        import contextlib
-
         from fused_memory.maintenance.backfill_curator_corpus import run_backfill
 
         project_root = '/fake/project'
@@ -613,26 +615,12 @@ class TestRunBackfill:
             ],
         }
         mock_backfill_result = BackfillResult(upserted=1, skipped=0, errors=0)
-        mock_curator = AsyncMock()
-        mock_curator.backfill_corpus = AsyncMock(return_value=mock_backfill_result)
-        mock_config = _make_config()
 
-        @contextlib.asynccontextmanager
-        async def fake_maintenance_service(config_path):
-            yield mock_config, MagicMock()
-
-        with patch(
-            'fused_memory.maintenance.backfill_curator_corpus.maintenance_service',
-            new=fake_maintenance_service,
-        ), patch(
-            'fused_memory.maintenance.backfill_curator_corpus.TaskmasterBackend',
-        ) as mock_tm_cls, patch(
-            'fused_memory.maintenance.backfill_curator_corpus.TaskCurator',
-        ) as mock_curator_cls:
+        with self._run_backfill_context() as (mock_curator, mock_tm_cls):
+            mock_curator.backfill_corpus = AsyncMock(return_value=mock_backfill_result)
             mock_tm_instance = AsyncMock()
             mock_tm_instance.get_tasks = AsyncMock(return_value=canned_task_tree)
             mock_tm_cls.return_value = mock_tm_instance
-            mock_curator_cls.return_value = mock_curator
 
             await run_backfill(config_path=None, project_root=project_root)
 
@@ -644,31 +632,14 @@ class TestRunBackfill:
 
         The RuntimeError must propagate to the caller after close() is called.
         """
-        import contextlib
-
         from fused_memory.maintenance.backfill_curator_corpus import run_backfill
 
         project_root = '/fake/project'
-        mock_curator = AsyncMock()
-        mock_config = _make_config()
 
-        @contextlib.asynccontextmanager
-        async def fake_maintenance_service(config_path):
-            yield mock_config, MagicMock()
-
-        with patch(
-            'fused_memory.maintenance.backfill_curator_corpus.maintenance_service',
-            new=fake_maintenance_service,
-        ), patch(
-            'fused_memory.maintenance.backfill_curator_corpus.TaskmasterBackend',
-        ) as mock_tm_cls, patch(
-            'fused_memory.maintenance.backfill_curator_corpus.TaskCurator',
-        ) as mock_curator_cls, patch(
+        with self._run_backfill_context() as (mock_curator, mock_tm_cls), patch(
             'fused_memory.maintenance.backfill_curator_corpus.BackfillManager',
         ) as mock_manager_cls:
             mock_tm_cls.return_value = AsyncMock()
-            mock_curator_cls.return_value = mock_curator
-
             mock_manager_instance = AsyncMock()
             mock_manager_instance.backfill = AsyncMock(side_effect=RuntimeError('backfill failed'))
             mock_manager_cls.return_value = mock_manager_instance
@@ -827,18 +798,13 @@ class TestAutoBackfill:
         config = _make_interceptor_config()
         curator = TaskCurator(config=config, taskmaster=mock_taskmaster)
 
-        from qdrant_client.http.models import CountResult
-        mock_qdrant = AsyncMock()
-        mock_qdrant.collection_exists = AsyncMock(return_value=True)
-        mock_qdrant.count = AsyncMock(return_value=CountResult(count=0))
-
         backfill_called_with: list[tuple] = []
 
         async def mock_backfill_corpus(tasks, project_id):
             backfill_called_with.append((tasks, project_id))
             return BackfillResult(upserted=len(tasks))
 
-        with patch.object(curator, '_get_qdrant', AsyncMock(return_value=mock_qdrant)), \
+        with patch.object(curator, 'corpus_count', AsyncMock(return_value=0)), \
              patch.object(curator, 'backfill_corpus', side_effect=mock_backfill_corpus):
 
             await interceptor._maybe_backfill_corpus(curator, project_root='/fake/project')
