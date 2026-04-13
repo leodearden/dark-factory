@@ -260,6 +260,41 @@ class TestFilterTaskTree:
         pending_ids = [t['id'] for t in result.active_tasks if t['status'] == 'pending']
         assert pending_ids == sorted(pending_ids, reverse=True)
 
+    def test_nested_subtasks_are_included_in_filter(self):
+        """filter_task_tree walks subtasks nested under parent tasks.
+
+        Parent (id='450', in-progress) has two subtasks:
+          - id=2 (pending) → active
+          - id=3 (done)    → done
+
+        Expects: 2 active tasks (parent + pending subtask), done_count=1,
+        total_count=3.
+        """
+        tasks_data = {
+            'tasks': [
+                {
+                    'id': '450',
+                    'title': 'Parent Task',
+                    'status': 'in-progress',
+                    'dependencies': [],
+                    'subtasks': [
+                        {'id': 2, 'title': 'Sub active', 'status': 'pending', 'dependencies': []},
+                        {'id': 3, 'title': 'Sub done', 'status': 'done', 'dependencies': []},
+                    ],
+                }
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert result.total_count == 3
+        assert len(result.active_tasks) == 2
+        assert result.done_count == 1
+
+        active_ids = {str(t['id']) for t in result.active_tasks}
+        assert '450' in active_ids  # parent
+        # Subtask bare-int id=2 should be qualified as '450.2'
+        assert '450.2' in active_ids
+
 
 class TestFormatFilteredTaskTree:
     """Tests for format_filtered_task_tree()."""
