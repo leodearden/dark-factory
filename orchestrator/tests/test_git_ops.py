@@ -483,6 +483,31 @@ class TestFreshenMain:
         assert ref == git_ops.config.main_branch
         assert stale == 3
 
+    async def test_freshen_main_ahead_rev_list_fails(
+        self, git_ops_with_remote: tuple[GitOps, Path], caplog,
+    ):
+        """When ahead rev-list exits non-zero, _freshen_main returns (main_branch, behind) and logs a warning."""
+        git_ops, _origin = git_ops_with_remote
+
+        call_count = 0
+
+        async def fake_run(cmd, cwd=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (0, '', '')                      # fetch succeeds
+            elif call_count == 2:
+                return (0, '3', '')                     # behind rev-list: 3 commits behind
+            return (128, '', 'fatal: bad revision')     # ahead rev-list fails
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+             patch('orchestrator.git_ops._run', side_effect=fake_run):
+            ref, stale = await git_ops._freshen_main()
+
+        assert ref == git_ops.config.main_branch
+        assert stale == 3
+        assert any('rev-list (ahead) failed' in r.message for r in caplog.records)
+
 
 @pytest.mark.asyncio
 class TestCreateWorktreeFreshening:
@@ -510,6 +535,30 @@ class TestCreateWorktreeFreshening:
         """stale_commits is None when no remote is configured (graceful degradation)."""
         worktree_info = await git_ops.create_worktree('no-remote-test')
         assert worktree_info.stale_commits is None
+
+    async def test_create_worktree_revparse_fallback(self, git_ops: GitOps):
+        """When rev-parse of start_ref fails, create_worktree falls back to local main.
+
+        _freshen_main returns 'origin/nonexistent-ref' (a ref that doesn't exist
+        in this no-remote repo). The rev-parse should fail, triggering a fallback
+        to local main. The worktree should still be created successfully with a
+        valid base_commit SHA.
+        """
+        _, local_main_sha, _ = await _run(
+            ['git', 'rev-parse', git_ops.config.main_branch],
+            cwd=git_ops.project_root,
+        )
+        local_main_sha = local_main_sha.strip()
+
+        with patch.object(
+            git_ops, '_freshen_main', return_value=('origin/nonexistent-ref', 3),
+        ):
+            worktree_info = await git_ops.create_worktree('revparse-fallback-test')
+
+        assert (worktree_info.path / 'README.md').exists()
+        assert len(worktree_info.base_commit) == 40
+        assert worktree_info.base_commit == local_main_sha
+        assert worktree_info.stale_commits == 3  # persists through fallback
 
 
 @pytest.mark.asyncio

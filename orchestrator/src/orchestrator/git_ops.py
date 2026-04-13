@@ -235,8 +235,10 @@ class WorktreeInfo:
 
     stale_commits: how far local main was behind the remote at worktree creation
     time.  None means the fetch was unavailable (no remote configured).  0 means
-    already current.  Positive N means main was N commits behind origin/main and
-    the worktree was based on the freshened remote ref instead.
+    already current.  A positive stale_commits value means the remote was ahead by
+    N commits.  When local main has diverged (has unpushed commits), the worktree
+    is based on local main despite the positive count — check this field together
+    with base_commit to determine actual freshness.
     """
     path: Path
     base_commit: str
@@ -347,11 +349,17 @@ class GitOps:
             return self.config.main_branch, 0
 
         # Check for divergence: count commits local main is AHEAD of origin/main
-        _, ahead_out, _ = await _run(
+        rc, ahead_out, _ = await _run(
             ['git', 'rev-list', '--count',
              f'{remote_ref}..{self.config.main_branch}'],
             cwd=self.project_root,
         )
+        if rc != 0:
+            logger.warning(
+                '_freshen_main: rev-list (ahead) failed (rc=%d) — using local %s',
+                rc, self.config.main_branch,
+            )
+            return self.config.main_branch, behind
         try:
             ahead = int(ahead_out.strip())
         except ValueError:
@@ -413,10 +421,24 @@ class GitOps:
         )
 
         # Capture the freshened ref's SHA (used as stable base for diffs)
-        _, base_sha, _ = await _run(
+        rc, base_sha, _ = await _run(
             ['git', 'rev-parse', start_ref],
             cwd=self.project_root,
         )
+        if rc != 0:
+            logger.warning(
+                'create_worktree: rev-parse %s failed (rc=%d) — falling back to local %s',
+                start_ref, rc, self.config.main_branch,
+            )
+            start_ref = self.config.main_branch
+            rc, base_sha, _ = await _run(
+                ['git', 'rev-parse', start_ref],
+                cwd=self.project_root,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f'create_worktree: rev-parse of local {start_ref} also failed (rc={rc})'
+                )
 
         # If worktree already exists, reuse it (common after requeue) —
         # but ONLY if it is a real registered git worktree.  A stale
