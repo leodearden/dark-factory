@@ -1356,6 +1356,7 @@ async def test_call_claude_cli_no_confirm_on_cap_hit():
     # Exactly once — for the success iteration, NOT for the cap-hit iteration
     gate.confirm_account_ok.assert_called_once_with('token-b')
     gate.on_agent_complete.assert_called_once_with(0.0077)
+    gate.release_probe_slot.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1406,4 +1407,23 @@ async def test_call_claude_cli_releases_probe_on_nonzero_exit():
         await agent._call_claude_cli(_MESSAGES, _TOOL_SCHEMAS)
 
     gate.release_probe_slot.assert_called_once_with('token-z')
+    gate.confirm_account_ok.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_empty_stdout_releases_probe():
+    """release_probe_slot is called (not confirm_account_ok) when stdout is empty."""
+    from unittest.mock import AsyncMock as _AsyncMock
+    agent, gate = _make_gated_agent_loop(token='token-empty')
+    mock_proc = _AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = _AsyncMock(return_value=(b'', b''))
+
+    with (
+        patch('asyncio.create_subprocess_exec', return_value=mock_proc),
+        pytest.raises(RuntimeError, match='Claude CLI produced no output'),
+    ):
+        await agent._call_claude_cli(_MESSAGES, _TOOL_SCHEMAS)
+
+    gate.release_probe_slot.assert_called_once_with('token-empty')
     gate.confirm_account_ok.assert_not_called()
