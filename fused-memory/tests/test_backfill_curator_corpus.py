@@ -528,12 +528,15 @@ class TestBackfillPointIdConsistency:
 
 class TestRunBackfill:
     @contextlib.contextmanager
-    def _run_backfill_context(self):
+    def _run_backfill_context(self, *, assert_close: bool = True):
         """Yield ``(mock_curator, mock_tm_cls)`` with the common patch stack applied.
 
         Patches applied: ``maintenance_service``, ``TaskmasterBackend``, ``TaskCurator``.
         ``TaskCurator`` is pre-wired to return ``mock_curator``; tests configure
         ``mock_tm_cls.return_value`` themselves.
+
+        After the ``with`` block exits, asserts ``curator.close()`` was awaited
+        exactly once unless *assert_close* is ``False``.
         """
         mock_config = _make_config()
         mock_curator = AsyncMock()
@@ -552,6 +555,9 @@ class TestRunBackfill:
         ) as mock_curator_cls:
             mock_curator_cls.return_value = mock_curator
             yield mock_curator, mock_tm_cls
+
+        if assert_close:
+            mock_curator.close.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_run_backfill_orchestrates_correctly(self):
@@ -863,3 +869,74 @@ class TestAutoBackfill:
         tasks_arg, project_id_arg = backfill_called_with[0]
         assert len(tasks_arg) == 1
         assert project_id_arg == 'project'
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TaskInterceptor.close() lifecycle
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestTaskInterceptorClose:
+    """Tests for TaskInterceptor.close() resource release and re-use prevention."""
+
+    def _make_interceptor(self, mock_taskmaster=None) -> 'TaskInterceptor':
+        from fused_memory.middleware.task_interceptor import TaskInterceptor
+        config = _make_interceptor_config()
+        return TaskInterceptor(
+            taskmaster=mock_taskmaster,
+            targeted_reconciler=None,
+            event_buffer=MagicMock(),
+            config=config,
+        )
+
+    @pytest.mark.asyncio
+    async def test_close_awaits_curator_close_and_clears(self):
+        """close() awaits curator.close() and sets _curator to None."""
+        interceptor = self._make_interceptor()
+        mock_curator = AsyncMock()
+        interceptor._curator = mock_curator
+
+        await interceptor.close()
+
+        mock_curator.close.assert_awaited_once()
+        assert interceptor._curator is None
+
+    @pytest.mark.asyncio
+    async def test_close_sets_closed_flag(self):
+        """close() sets _closed = True."""
+        interceptor = self._make_interceptor()
+        assert not interceptor._closed
+        await interceptor.close()
+        assert interceptor._closed
+
+    @pytest.mark.asyncio
+    async def test_get_curator_returns_none_after_close(self):
+        """_get_curator() returns None after close(), preventing resource re-creation."""
+        interceptor = self._make_interceptor()
+        await interceptor.close()
+
+        result = await interceptor._get_curator()
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_close_drains_before_releasing_curator(self):
+        """close() calls drain() before closing the curator."""
+        interceptor = self._make_interceptor()
+        mock_curator = AsyncMock()
+        interceptor._curator = mock_curator
+
+        call_order: list[str] = []
+        original_drain = interceptor.drain
+
+        async def tracking_drain():
+            call_order.append('drain')
+            await original_drain()
+
+        mock_curator.close = AsyncMock(
+            side_effect=lambda: call_order.append('curator_close'),
+        )
+        interceptor.drain = tracking_drain  # type: ignore[assignment]
+
+        await interceptor.close()
+
+        assert call_order == ['drain', 'curator_close']

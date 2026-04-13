@@ -57,6 +57,8 @@ class TaskInterceptor:
         self._curator: TaskCurator | None = None
         # One-shot flag: prevents redundant auto-backfill checks on subsequent calls.
         self._backfill_triggered: bool = False
+        # Set by close(); prevents _get_curator() from re-creating a curator.
+        self._closed: bool = False
 
     async def _ensure_taskmaster(self) -> TaskmasterBackend:
         """Return a connected TaskmasterBackend, or raise with a structured error."""
@@ -132,13 +134,15 @@ class TaskInterceptor:
     async def close(self) -> None:
         """Release resources held by the interceptor.
 
-        Closes the :class:`TaskCurator`'s Qdrant connection if the curator
-        was created. Call after :meth:`drain` at shutdown to ensure the
-        connection pool is released cleanly.
+        Drains pending background tasks first (defensive — callers *should*
+        drain before close, but this guarantees correctness even if they
+        forget), then closes the :class:`TaskCurator`'s Qdrant connection.
         """
+        await self.drain()
         if self._curator is not None:
             await self._curator.close()
             self._curator = None
+        self._closed = True
 
     # ── Status transitions (with targeted reconciliation) ──────────────
 
@@ -322,7 +326,11 @@ class TaskInterceptor:
         On first construction, triggers a background backfill check via
         ``_maybe_backfill_corpus()`` so pre-existing tasks are indexed into the
         curator corpus without blocking the caller.
+
+        Returns ``None`` after :meth:`close` to prevent re-creating resources.
         """
+        if self._closed:
+            return None
         if self._curator is not None:
             return self._curator
         if self._config is None or not self._config.curator.enabled:

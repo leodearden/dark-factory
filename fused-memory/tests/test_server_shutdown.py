@@ -70,6 +70,48 @@ class TestGracefulShutdownJournalClosedDespiteMemoryServiceError:
         recon_journal.close.assert_awaited_once()
 
 
+class TestGracefulShutdownClosesTaskInterceptor:
+    @pytest.mark.asyncio
+    async def test_shutdown_closes_task_interceptor(self):
+        """_graceful_shutdown must await task_interceptor.close() on happy path."""
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock()
+
+        task_interceptor = MagicMock()
+        task_interceptor.drain = AsyncMock()
+        task_interceptor.close = AsyncMock()
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=task_interceptor,
+            harness_loop_task=None,
+            recon_journal=None,
+        )
+
+        task_interceptor.close.assert_awaited_once()
+
+
+class TestGracefulShutdownResilientToCloseError:
+    @pytest.mark.asyncio
+    async def test_shutdown_resilient_to_interceptor_close_error(self):
+        """memory_service.close() must be called even if task_interceptor.close() raises."""
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock()
+
+        task_interceptor = MagicMock()
+        task_interceptor.drain = AsyncMock()
+        task_interceptor.close = AsyncMock(side_effect=RuntimeError('close failed'))
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=task_interceptor,
+            harness_loop_task=None,
+            recon_journal=None,
+        )
+
+        memory_service.close.assert_awaited_once()
+
+
 class TestGracefulShutdownResilientToDrainError:
     @pytest.mark.asyncio
     async def test_shutdown_resilient_to_drain_error(self):
@@ -79,6 +121,7 @@ class TestGracefulShutdownResilientToDrainError:
 
         task_interceptor = MagicMock()
         task_interceptor.drain = AsyncMock(side_effect=RuntimeError('drain failed'))
+        task_interceptor.close = AsyncMock()
 
         await _graceful_shutdown(
             memory_service=memory_service,
@@ -99,6 +142,7 @@ class TestGracefulShutdownDrainsTaskInterceptor:
 
         task_interceptor = MagicMock()
         task_interceptor.drain = AsyncMock()
+        task_interceptor.close = AsyncMock()
 
         await _graceful_shutdown(
             memory_service=memory_service,
@@ -223,6 +267,7 @@ class TestGracefulShutdownJournalClosedDespiteDrainError:
 
         task_interceptor = MagicMock()
         task_interceptor.drain = AsyncMock(side_effect=RuntimeError('drain failed'))
+        task_interceptor.close = AsyncMock()
 
         recon_journal = MagicMock()
         recon_journal.close = AsyncMock()
@@ -237,11 +282,11 @@ class TestGracefulShutdownJournalClosedDespiteDrainError:
         recon_journal.close.assert_awaited_once()
 
 
-class TestGracefulShutdownFourStepOrdering:
+class TestGracefulShutdownFiveStepOrdering:
     @pytest.mark.asyncio
     async def test_shutdown_steps_execute_in_correct_order(self):
-        """_graceful_shutdown must execute exactly four steps in order:
-        1. drain  2. harness_cancel  3. memory_close  4. journal_close.
+        """_graceful_shutdown must execute exactly five steps in order:
+        1. drain  2. interceptor_close  3. harness_cancel  4. memory_close  5. journal_close.
 
         Uses side_effect callbacks to append step names to a shared list,
         then asserts the list matches the expected sequence.
@@ -256,6 +301,9 @@ class TestGracefulShutdownFourStepOrdering:
         task_interceptor = MagicMock()
         task_interceptor.drain = AsyncMock(
             side_effect=lambda: call_order.append('drain')
+        )
+        task_interceptor.close = AsyncMock(
+            side_effect=lambda: call_order.append('interceptor_close')
         )
 
         recon_journal = MagicMock()
@@ -284,4 +332,4 @@ class TestGracefulShutdownFourStepOrdering:
             recon_journal=recon_journal,
         )
 
-        assert call_order == ['drain', 'harness_cancel', 'memory_close', 'journal_close']
+        assert call_order == ['drain', 'interceptor_close', 'harness_cancel', 'memory_close', 'journal_close']

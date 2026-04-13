@@ -271,9 +271,10 @@ async def _graceful_shutdown(
 
     Shutdown order:
     1. Drain task_interceptor (flush pending commits / targeted reconciliation).
-    2. Cancel harness loop task (stops background reconciliation + escalation server).
-    3. Close memory_service (backends, durable queue, write journal, event buffer).
-    4. Close reconciliation journal (separate SQLite connection).
+    2. Close task_interceptor (release curator's Qdrant client).
+    3. Cancel harness loop task (stops background reconciliation + escalation server).
+    4. Close memory_service (backends, durable queue, write journal, event buffer).
+    5. Close reconciliation journal (separate SQLite connection).
 
     Each step is independently guarded so a failure in one step does not
     prevent subsequent steps from running.
@@ -283,6 +284,10 @@ async def _graceful_shutdown(
             await task_interceptor.drain()
         except Exception:
             logger.exception('_graceful_shutdown: error draining task_interceptor')
+        try:
+            await task_interceptor.close()
+        except Exception:
+            logger.exception('_graceful_shutdown: error closing task_interceptor')
 
     if harness_loop_task is not None:
         try:
