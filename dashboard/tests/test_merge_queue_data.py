@@ -93,9 +93,13 @@ async def empty_merge_events_conn(empty_merge_events_db):
 # Imports under test (deferred so the test file fails gracefully before impl)
 # ---------------------------------------------------------------------------
 
+from unittest.mock import patch  # noqa: E402
+
 from dashboard.data.merge_queue import (  # noqa: E402
     _align_bucket,
     _bucket_minutes_for_window,
+    _cutoff_iso,
+    _get_durations,
     aggregate_latency_stats,
     aggregate_outcome_distribution,
     aggregate_queue_depth_timeseries,
@@ -906,3 +910,24 @@ class TestMultiDbAggregation:
 
         assert len(result['labels']) >= 3650
         assert len(result['labels']) <= 4000
+
+
+# ---------------------------------------------------------------------------
+# TestCutoffIso (step-1)
+# ---------------------------------------------------------------------------
+
+class TestCutoffIso:
+    def test_cutoff_iso_uses_provided_now(self):
+        """_cutoff_iso(hours=24, now=fixed_dt) returns (fixed_dt - 24h).isoformat()."""
+        fixed_dt = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        expected = (fixed_dt - timedelta(hours=24)).isoformat()
+        result = _cutoff_iso(24, now=fixed_dt)
+        assert result == expected
+
+    def test_cutoff_iso_no_now_uses_current_time(self):
+        """Without now, _cutoff_iso uses datetime.now(UTC) — result is within ±2s of expected."""
+        before = datetime.now(UTC) - timedelta(hours=24) - timedelta(seconds=2)
+        result = _cutoff_iso(24)
+        after = datetime.now(UTC) - timedelta(hours=24) + timedelta(seconds=2)
+        result_dt = datetime.fromisoformat(result)
+        assert before < result_dt < after
