@@ -329,20 +329,14 @@ class TestCollectSnapshot:
             assert row[0] == 1
 
     @pytest.mark.asyncio
-    async def test_symlinked_root_deduplicates_with_known_roots(self, tmp_path):
+    async def test_symlinked_root_deduplicates_with_known_roots(self, symlink_project_setup):
         """If known_project_roots includes the resolved real path, it deduplicates with a symlinked project_root."""
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
+        real_dir, link, db_path = symlink_project_setup
 
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
-
-        # project_root is the symlink; known_project_roots contains the resolved real path
+        # project_root is the symlink; known_project_roots contains the real path
         config = DashboardConfig(
             project_root=link,
-            known_project_roots=[real_dir],  # same underlying dir, unresolved
+            known_project_roots=[real_dir],  # real path; project_root is the symlink pointing here
         )
 
         async with aiosqlite.connect(str(db_path)) as conn:
