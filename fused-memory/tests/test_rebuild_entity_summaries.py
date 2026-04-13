@@ -74,6 +74,24 @@ def _uuid_dispatch(mapping: dict) -> Callable:
 
 
 # ---------------------------------------------------------------------------
+# TestUuidDispatch — unit tests for the _uuid_dispatch helper
+# ---------------------------------------------------------------------------
+
+class TestUuidDispatch:
+    """Unit tests for _uuid_dispatch and the _UuidDispatcher class."""
+
+    @pytest.mark.asyncio
+    async def test_tracks_dispatched_uuids(self):
+        """_uuid_dispatch returns an object that records which uuids were called."""
+        dispatch = _uuid_dispatch({
+            'uuid-1': {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'a', 'new_summary': 'b', 'edge_count': 1},
+            'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'c', 'new_summary': 'd', 'edge_count': 1},
+        })
+        await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
+        assert dispatch.dispatched == {'uuid-1'}
+
+
+# ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.list_entity_nodes
 # ---------------------------------------------------------------------------
 
