@@ -1788,3 +1788,18 @@ class TestPreTriageUsageGateCleanup:
             await steward._pre_triage_suggestions(self._esc())
 
         assert mock_invoke.call_count == 2
+
+    async def test_cancelled_error_releases_probe_slot(self, steward: TaskSteward):
+        """CancelledError (BaseException, not Exception) also triggers release_probe_slot."""
+        gate = self._gate()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.agents.invoke.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=asyncio.CancelledError()),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await steward._pre_triage_suggestions(self._esc())
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')
