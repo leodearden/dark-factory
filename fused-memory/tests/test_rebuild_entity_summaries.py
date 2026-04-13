@@ -140,6 +140,7 @@ class TestUuidDispatch:
             'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'c', 'new_summary': 'd', 'edge_count': 1},
         })
         await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
+        # Set equality also implicitly asserts 'uuid-2' is absent from dispatched.
         assert dispatch.dispatched == {'uuid-1'}
 
     @pytest.mark.asyncio
@@ -197,14 +198,15 @@ class TestUuidDispatch:
             await dispatch('uuid-99', 'Nobody', [], group_id='g', old_summary='x')
 
     def test_dispatch_docstring_documents_exception_support(self):
-        """_uuid_dispatch or _UuidDispatcher docstring mentions exception value support."""
-        combined_doc = (
-            (_uuid_dispatch.__doc__ or '')
-            + (_UuidDispatcher.__doc__ or '')
-        )
-        assert 'exception' in combined_doc.lower(), (
-            '_uuid_dispatch or _UuidDispatcher docstring must mention exception support'
-        )
+        """_uuid_dispatch and _UuidDispatcher both have non-empty docstrings.
+
+        Guards against accidental docstring removal.  A keyword check ('exception')
+        would break on routine rephrasing, so we only assert non-emptiness here;
+        behavioural tests (test_raises_exception_values, test_exception_tracked_in_dispatched)
+        already verify the feature itself.
+        """
+        assert _uuid_dispatch.__doc__, '_uuid_dispatch must have a docstring'
+        assert _UuidDispatcher.__doc__, '_UuidDispatcher must have a docstring'
 
     @pytest.mark.asyncio
     async def test_works_without_markcoroutinefunction(self, monkeypatch):
@@ -973,10 +975,11 @@ class TestRebuildEntitySummaries:
             )
         )
 
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_uuid_dispatch({
+        dispatch = _uuid_dispatch({
             'uuid-1': RuntimeError('FalkorDB timeout'),
             'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'stale2', 'new_summary': 'current2', 'edge_count': 1},
-        }))
+        })
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=dispatch)
         result = await svc.rebuild_entity_summaries(project_id='test')
         assert result['errors'] == 1
         assert result['rebuilt'] == 1
@@ -985,6 +988,7 @@ class TestRebuildEntitySummaries:
         assert 'FalkorDB timeout' in error_detail['error']
         assert error_detail['uuid'] == 'uuid-1'
         svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(group_id='test')
+        dispatch.assert_all_dispatched()
 
     @pytest.mark.asyncio
     async def test_empty_graph_returns_zero_counts(self, mock_config):
