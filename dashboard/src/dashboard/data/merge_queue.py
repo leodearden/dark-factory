@@ -193,18 +193,26 @@ async def outcome_distribution(
     db: aiosqlite.Connection | None,
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> ChartData:
     """Count merge_attempt events by outcome within the window.
 
     Returns ChartData with canonical outcomes first (done, conflict, blocked,
     already_merged), then any unknown outcomes sorted alphabetically.
     Missing canonical outcomes are omitted (count=0 entries are dropped).
+
+    Args:
+        db: aiosqlite connection, or None (returns empty ChartData).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
+            is used. Pass an explicit value to get deterministic results or to
+            share a single timestamp across concurrent per-DB calls.
     """
     if db is None:
         return {'labels': [], 'values': []}
 
     async def _query(conn: aiosqlite.Connection) -> ChartData:
-        since = _cutoff_iso(hours)
+        since = _cutoff_iso(hours, now=now)
         rows = await conn.execute_fetchall(
             "SELECT json_extract(data, '$.outcome') AS outcome, COUNT(*) AS cnt "
             "FROM events "
