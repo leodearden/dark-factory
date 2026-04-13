@@ -197,6 +197,21 @@ class TestNoneResultSetRationale704:
 
         return result
 
+    def test_lines_before_mutation_is_declared_staticmethod(self) -> None:
+        """_lines_before_mutation must be decorated @staticmethod.
+
+        The helper never references self, so declaring it as a regular instance
+        method is a style error.  Inspects via __dict__ to see the raw descriptor
+        rather than going through attribute access (which would unwrap the
+        staticmethod descriptor and return the underlying function, hiding its type).
+        """
+        descriptor = TestNoneResultSetRationale704.__dict__['_lines_before_mutation']
+        assert isinstance(descriptor, staticmethod), (
+            "_lines_before_mutation never references self and must be decorated "
+            "@staticmethod; found descriptor type: "
+            f"{type(descriptor).__name__}"
+        )
+
     def test_none_result_set_test_cites_or_guard(self) -> None:
         """Comment before result_set=None mutation must cite the `or []` guard expression.
 
