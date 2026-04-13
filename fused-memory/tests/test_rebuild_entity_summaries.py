@@ -419,6 +419,84 @@ class TestDetectStaleSummariesDryRun:
 
 
 # ---------------------------------------------------------------------------
+# task-656: GraphitiBackend._build_stale_entry (static helper)
+# ---------------------------------------------------------------------------
+
+class TestBuildStaleEntry:
+    """Unit tests for GraphitiBackend._build_stale_entry static method.
+
+    This helper encapsulates the repeated stale-detection logic shared between
+    _detect_stale_summaries_with_edges and _detect_stale_summaries_dry_run.
+
+    Contract:
+    - Returns None when entity summary is empty (not stale by definition).
+    - Returns None when summary already matches canonical facts (up-to-date).
+    - Returns a stale-entry dict when summary differs from canonical facts.
+    - The returned dict has keys: uuid, name, summary, duplicate_count,
+      stale_line_count, valid_fact_count, summary_line_count.
+    """
+
+    def test_returns_none_for_empty_summary(self, mock_config, make_backend):
+        """Returns None when the entity summary is empty."""
+        entity = {'uuid': 'uuid-1', 'name': 'Alice', 'summary': ''}
+        edges = [{'uuid': 'e1', 'fact': 'some fact', 'name': 'edge1'}]
+        result = GraphitiBackend._build_stale_entry(entity, edges)
+        assert result is None
+
+    def test_returns_none_when_summary_matches_canonical(self, mock_config, make_backend):
+        """Returns None when summary exactly matches the canonical facts join."""
+        entity = {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA\nfactB'}
+        edges = [
+            {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'},
+            {'uuid': 'e2', 'fact': 'factB', 'name': 'edge2'},
+        ]
+        result = GraphitiBackend._build_stale_entry(entity, edges)
+        assert result is None
+
+    def test_returns_stale_dict_when_entity_is_stale(self, mock_config, make_backend):
+        """Returns a dict with correct schema when entity summary differs from canonical."""
+        entity = {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old fact'}
+        edges = [{'uuid': 'e1', 'fact': 'new fact', 'name': 'edge1'}]
+        result = GraphitiBackend._build_stale_entry(entity, edges)
+        assert result is not None
+        expected_keys = {
+            'uuid', 'name', 'summary',
+            'duplicate_count', 'stale_line_count', 'valid_fact_count', 'summary_line_count',
+        }
+        assert set(result.keys()) == expected_keys
+        assert result['uuid'] == 'uuid-1'
+        assert result['name'] == 'Alice'
+        assert result['summary'] == 'old fact'
+        assert result['valid_fact_count'] == 1
+        assert result['summary_line_count'] == 1
+        assert result['stale_line_count'] == 1   # 'old fact' not in valid facts
+        assert result['duplicate_count'] == 0
+
+    def test_handles_duplicate_lines(self, mock_config, make_backend):
+        """duplicate_count counts extra occurrences of duplicated summary lines."""
+        # summary: 'factA\nfactA\nold' — 'factA' appears twice → duplicate_count=1
+        entity = {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA\nfactA\nold'}
+        edges = [{'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'}]
+        result = GraphitiBackend._build_stale_entry(entity, edges)
+        assert result is not None
+        assert result['duplicate_count'] == 1   # one extra 'factA'
+        assert result['stale_line_count'] == 1  # 'old' not in valid_fact_set
+        assert result['valid_fact_count'] == 1  # deduped: only 'factA'
+        assert result['summary_line_count'] == 3
+
+    def test_handles_zero_valid_edges(self, mock_config, make_backend):
+        """Entity with non-empty summary but zero valid edges is reported as stale."""
+        entity = {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA\nfactB'}
+        edges: list = []
+        result = GraphitiBackend._build_stale_entry(entity, edges)
+        assert result is not None
+        assert result['valid_fact_count'] == 0
+        assert result['stale_line_count'] == 2   # both lines are stale
+        assert result['duplicate_count'] == 0
+        assert result['summary_line_count'] == 2
+
+
+# ---------------------------------------------------------------------------
 # step-3: GraphitiBackend.rebuild_entity_summaries
 # ---------------------------------------------------------------------------
 
