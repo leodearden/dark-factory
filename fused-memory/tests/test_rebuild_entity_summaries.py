@@ -202,6 +202,20 @@ class TestUuidDispatch:
             '_uuid_dispatch or _UuidDispatcher docstring must mention exception support'
         )
 
+    @pytest.mark.asyncio
+    async def test_works_without_markcoroutinefunction(self, monkeypatch):
+        """_UuidDispatcher works on Python 3.11 where inspect.markcoroutinefunction is absent.
+
+        Simulates 3.11 by removing the attribute; __init__ must not raise AttributeError
+        and the dispatcher must still be async-callable.
+        """
+        monkeypatch.delattr(inspect, 'markcoroutinefunction', raising=False)
+        dispatch = _uuid_dispatch({
+            'uuid-1': {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'a', 'new_summary': 'b', 'edge_count': 1},
+        })
+        result = await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
+        assert result['uuid'] == 'uuid-1'
+
 
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.list_entity_nodes
