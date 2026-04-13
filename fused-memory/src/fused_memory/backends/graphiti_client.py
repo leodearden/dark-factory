@@ -21,7 +21,6 @@ from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.utils.async_utils import propagate_cancellations
 
 logger = logging.getLogger(__name__)
 
