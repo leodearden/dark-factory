@@ -570,6 +570,60 @@ class TestDetectStaleSummariesDryRun:
         with pytest.raises(asyncio.CancelledError):
             await backend.detect_stale_dry_run(group_id='test')
 
+    @pytest.mark.asyncio
+    async def test_result_correctness_under_parallel_execution(self, mock_config, make_backend):
+        """Stale/clean/empty distribution is preserved correctly under parallel execution.
+
+        10 entities with deterministic distribution:
+        - 4 stale (summary differs from canonical edge facts)
+        - 3 clean (summary matches)
+        - 3 empty-summary (cheap-skipped, not stale)
+
+        Assert:
+        - total_count == 10
+        - stale_list contains exactly the 4 stale entity UUIDs (order-independent)
+        - stale_list does NOT contain any clean or empty-summary UUIDs
+        """
+        backend = make_backend(mock_config)
+
+        stale_uuids = {f'uuid-stale-{i}' for i in range(4)}
+        clean_uuids = {f'uuid-clean-{i}' for i in range(3)}
+        empty_uuids = {f'uuid-empty-{i}' for i in range(3)}
+
+        entities = (
+            [{'uuid': u, 'name': u, 'summary': 'old fact'} for u in sorted(stale_uuids)]
+            + [{'uuid': u, 'name': u, 'summary': 'current fact'} for u in sorted(clean_uuids)]
+            + [{'uuid': u, 'name': u, 'summary': ''} for u in sorted(empty_uuids)]
+        )
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+
+        async def edges_by_uuid(node_uuid, *, group_id):
+            # stale entities: edge fact differs from their summary ('old fact')
+            if node_uuid in stale_uuids:
+                return [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]
+            # clean entities: edge fact matches their summary
+            if node_uuid in clean_uuids:
+                return [{'uuid': 'e2', 'fact': 'current fact', 'name': 'edge2'}]
+            return []
+
+        backend.get_valid_edges_for_node = AsyncMock(side_effect=edges_by_uuid)
+
+        stale_list, total_count = await backend.detect_stale_dry_run(group_id='test')
+
+        assert total_count == 10
+        returned_uuids = {e['uuid'] for e in stale_list}
+        assert returned_uuids == stale_uuids
+        # No clean or empty entities in the stale list
+        assert returned_uuids.isdisjoint(clean_uuids)
+        assert returned_uuids.isdisjoint(empty_uuids)
+        # Empty-summary entities never trigger edge queries
+        for empty_uuid in empty_uuids:
+            # Verify no call was made for empty-summary entities
+            for call in backend.get_valid_edges_for_node.call_args_list:
+                assert call.args[0] != empty_uuid, (
+                    f"Expected no edge fetch for empty-summary entity {empty_uuid}"
+                )
+
 
 # ---------------------------------------------------------------------------
 # task-656: GraphitiBackend._build_stale_entry (static helper)
