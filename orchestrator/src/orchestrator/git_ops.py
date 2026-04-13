@@ -552,9 +552,12 @@ class GitOps:
                     full_branch,
                 )
                 await self.cleanup_merge_worktree(merge_wt)
+                _detail = f'.task/ scrub failed post-merge for {full_branch}'
+                if scrub_result.error:
+                    _detail = f'{_detail}: {scrub_result.error}'
                 return MergeResult(
                     success=False,
-                    details=f'.task/ scrub failed post-merge for {full_branch}',
+                    details=_detail,
                     pre_merge_sha=pre_merge_sha,
                 )
 
