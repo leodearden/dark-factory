@@ -2041,3 +2041,14 @@ class TestPreTriageSuggestionsPath:
             'mcp__fused-memory__get_tasks',
             'mcp__fused-memory__search',
         ]
+
+    async def test_pre_triage_uses_project_root_as_cwd(self, steward):
+        """_pre_triage_suggestions passes config.project_root (not worktree) as cwd."""
+        esc = self._esc_with_suggestions(12)
+        with patch('orchestrator.agents.invoke.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            await steward._pre_triage_suggestions(esc)
+
+        call_kwargs = mock_invoke.call_args.kwargs
+        assert call_kwargs['cwd'] == steward.config.project_root
+        assert call_kwargs['cwd'] != steward.worktree
