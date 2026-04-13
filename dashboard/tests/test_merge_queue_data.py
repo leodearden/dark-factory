@@ -820,7 +820,7 @@ class TestMultiDbAggregation:
         (TypeError from awaiting a non-async attribute, RuntimeError from
         execute_fetchall, etc.) is silently skipped by the aggregators.
         """
-        broken = MagicMock()
+        broken = MagicMock(spec=aiosqlite.Connection)
         broken.execute_fetchall = AsyncMock(side_effect=RuntimeError('simulated broken DB'))
         return broken
 
