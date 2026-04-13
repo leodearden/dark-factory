@@ -1949,3 +1949,46 @@ class TestMergeToMainScrubFailure:
         assert 'cannot amend merge commit' in result.details, (
             f'Expected git stderr in details for operator visibility, got: {result.details!r}'
         )
+
+
+class TestScrubResultInvariant:
+    """Unit tests for ScrubResult.__post_init__ guard.
+
+    The invariant: error may only be non-None when outcome is ScrubOutcome.FAILED.
+    All other (outcome, error) combinations are semantically invalid and should
+    raise ValueError at construction time.
+    """
+
+    def test_clean_with_error_raises(self):
+        """ScrubResult(CLEAN, error=...) must raise ValueError."""
+        with pytest.raises(ValueError):
+            ScrubResult(outcome=ScrubOutcome.CLEAN, error='some error')
+
+    def test_scrubbed_with_error_raises(self):
+        """ScrubResult(SCRUBBED, error=...) must raise ValueError."""
+        with pytest.raises(ValueError):
+            ScrubResult(outcome=ScrubOutcome.SCRUBBED, error='some error')
+
+    def test_failed_with_error_succeeds(self):
+        """ScrubResult(FAILED, error=...) is valid and must not raise."""
+        result = ScrubResult(outcome=ScrubOutcome.FAILED, error='fatal: git error')
+        assert result.outcome == ScrubOutcome.FAILED
+        assert result.error == 'fatal: git error'
+
+    def test_failed_without_error_succeeds(self):
+        """ScrubResult(FAILED) with error=None is valid (no error captured)."""
+        result = ScrubResult(outcome=ScrubOutcome.FAILED)
+        assert result.outcome == ScrubOutcome.FAILED
+        assert result.error is None
+
+    def test_clean_without_error_succeeds(self):
+        """ScrubResult(CLEAN) with error=None is valid."""
+        result = ScrubResult(outcome=ScrubOutcome.CLEAN)
+        assert result.outcome == ScrubOutcome.CLEAN
+        assert result.error is None
+
+    def test_scrubbed_without_error_succeeds(self):
+        """ScrubResult(SCRUBBED) with error=None is valid."""
+        result = ScrubResult(outcome=ScrubOutcome.SCRUBBED)
+        assert result.outcome == ScrubOutcome.SCRUBBED
+        assert result.error is None
