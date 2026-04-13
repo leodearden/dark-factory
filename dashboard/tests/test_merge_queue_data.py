@@ -1116,3 +1116,57 @@ class TestLatencyStatsNow:
         assert captured_nows == [fixed_now], (
             f"Expected _cutoff_iso called once with now={fixed_now!r}, got {captured_nows!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateSpeculativeStatsNow (step-13)
+# ---------------------------------------------------------------------------
+
+class TestAggregateSpeculativeStatsNow:
+    def _make_db(self, tmp_path, name, events):
+        """Create a populated DB with given events list of dicts."""
+        db_path = tmp_path / name
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(MERGE_EVENTS_SCHEMA)
+        for evt in events:
+            _insert_event(conn, **evt)
+        conn.commit()
+        conn.close()
+        return db_path
+
+    @pytest.mark.asyncio
+    async def test_aggregate_speculative_stats_consistent_now(self, tmp_path):
+        """aggregate_speculative_stats resolves now once and threads it to all per-DB calls.
+
+        Events near fixed_now are inside the 24h window for that now, but would be
+        excluded by a real datetime.now(UTC) cutoff (they are 2+ days in the past).
+        Will fail before step-14 impl because aggregate_speculative_stats has no `now` param.
+        """
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        event_time = fixed_now - timedelta(hours=1)
+
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'speculative_merge',
+             'timestamp': event_time, 'data': {'base_sha': 'abc'}},
+        ])
+        db2 = self._make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'speculative_discard',
+             'timestamp': event_time, 'data': {'reason': 'previous_failed'}},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_speculative_stats(
+                [conn1, conn2], hours=24, now=fixed_now,
+            )
+
+        # Both events are inside the window → hit_count=1, discard_count=1, total=2
+        assert result['total'] == 2, (
+            f"Expected total=2 (both events within fixed_now window), got {result}"
+        )
+        assert result['hit_count'] == 1
+        assert result['discard_count'] == 1
