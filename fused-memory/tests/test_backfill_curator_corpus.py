@@ -10,6 +10,8 @@ import pytest
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.task_curator import (
+    DEFAULT_PRIORITY,
+    _PRIORITY_RANK,
     BackfillResult,
     TaskCurator,
 )
@@ -333,6 +335,12 @@ class TestBackfillPointIdConsistency:
         )
         assert captured_payload['priority'] == 'medium', (
             f"Expected 'medium', got {captured_payload['priority']!r}"
+        )
+
+    def test_default_priority_in_priority_rank(self):
+        """DEFAULT_PRIORITY must be a key in _PRIORITY_RANK so sort-key fallback of 99 is never used."""
+        assert DEFAULT_PRIORITY in _PRIORITY_RANK, (
+            f"DEFAULT_PRIORITY {DEFAULT_PRIORITY!r} is not a key in _PRIORITY_RANK {_PRIORITY_RANK}"
         )
 
     @pytest.mark.asyncio
