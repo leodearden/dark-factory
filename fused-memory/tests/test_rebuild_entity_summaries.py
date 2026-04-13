@@ -1892,3 +1892,259 @@ class TestServiceRebuildOrchestration:
         assert len(result['details']) == 2
         assert result['details'][0]['uuid'] == 'uuid-1'
         assert result['details'][0]['status'] == 'rebuilt'
+
+
+# ---------------------------------------------------------------------------
+# TestServiceRebuildOrchestrationForce — step-5/6: service force=True path
+# ---------------------------------------------------------------------------
+
+class TestServiceRebuildOrchestrationForce:
+    """MemoryService.rebuild_entity_summaries() with force=True rebuilds ALL entities."""
+
+    @pytest.fixture
+    def service_force(self, mock_config):
+        """MemoryService with mocked graphiti for force=True path tests."""
+        from fused_memory.services.memory_service import MemoryService
+        svc = MemoryService(mock_config)
+        svc.graphiti = MagicMock()
+        svc.mem0 = MagicMock()
+        svc.durable_queue = MagicMock()
+        svc.durable_queue.enqueue = AsyncMock(return_value=1)
+
+        all_entities = [
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old summary A'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'old summary B'},
+        ]
+        all_edges = {
+            'uuid-1': [{'uuid': 'e1', 'fact': 'fact A'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'fact B'}],
+        }
+        svc.graphiti.list_entity_nodes = AsyncMock(return_value=all_entities)
+        svc.graphiti.get_all_valid_edges = AsyncMock(return_value=all_edges)
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'old summary A',
+             'new_summary': 'new summary A', 'edge_count': 1},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'old summary B',
+             'new_summary': 'new summary B', 'edge_count': 1},
+        ])
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_calls_list_entity_nodes_not_detect(self, service_force):
+        """force=True calls list_entity_nodes, not detect_stale_with_edges."""
+        await service_force.rebuild_entity_summaries(project_id='proj', force=True)
+        service_force.graphiti.list_entity_nodes.assert_awaited_once_with(group_id='proj')
+        # detect methods must NOT be called
+        service_force.graphiti.detect_stale_with_edges = AsyncMock()
+        await service_force.rebuild_entity_summaries(project_id='proj', force=True)
+        service_force.graphiti.detect_stale_with_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_calls_get_all_valid_edges_when_not_dry_run(self, service_force):
+        """force=True, dry_run=False calls get_all_valid_edges."""
+        await service_force.rebuild_entity_summaries(project_id='proj', force=True)
+        service_force.graphiti.get_all_valid_edges.assert_awaited_once_with(group_id='proj')
+
+    @pytest.mark.asyncio
+    async def test_rebuilds_all_entities_not_just_stale(self, service_force):
+        """force=True rebuilds ALL entities (not just stale ones)."""
+        await service_force.rebuild_entity_summaries(project_id='proj', force=True)
+        assert service_force.graphiti.rebuild_entity_from_edges.await_count == 2
+        calls = service_force.graphiti.rebuild_entity_from_edges.call_args_list
+        uuids_called = [c.args[0] for c in calls]
+        assert 'uuid-1' in uuids_called
+        assert 'uuid-2' in uuids_called
+
+    @pytest.mark.asyncio
+    async def test_stale_entities_count_equals_total_entities(self, service_force):
+        """force=True: stale_entities == total_entities in result."""
+        result = await service_force.rebuild_entity_summaries(project_id='proj', force=True)
+        assert result['total_entities'] == 2
+        assert result['stale_entities'] == result['total_entities']
+        assert result['rebuilt'] == 2
+        assert result['errors'] == 0
+
+
+# ---------------------------------------------------------------------------
+# TestServiceRebuildOrchestrationDryRun — step-7/8: dry_run paths
+# ---------------------------------------------------------------------------
+
+class TestServiceRebuildOrchestrationDryRun:
+    """MemoryService.rebuild_entity_summaries() dry_run paths return skipped status."""
+
+    @pytest.fixture
+    def service_dry_run(self, mock_config):
+        """Service with detect_stale_dry_run mocked (force=False, dry_run=True)."""
+        from fused_memory.services.memory_service import MemoryService
+        svc = MemoryService(mock_config)
+        svc.graphiti = MagicMock()
+        svc.mem0 = MagicMock()
+        svc.durable_queue = MagicMock()
+        svc.durable_queue.enqueue = AsyncMock(return_value=1)
+
+        stale = [
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old summary A'},
+        ]
+        svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=(stale, 3))
+        svc.graphiti.detect_stale_with_edges = AsyncMock()
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock()
+        return svc
+
+    @pytest.fixture
+    def service_force_dry_run(self, mock_config):
+        """Service with list_entity_nodes mocked (force=True, dry_run=True)."""
+        from fused_memory.services.memory_service import MemoryService
+        svc = MemoryService(mock_config)
+        svc.graphiti = MagicMock()
+        svc.mem0 = MagicMock()
+        svc.durable_queue = MagicMock()
+        svc.durable_queue.enqueue = AsyncMock(return_value=1)
+
+        all_entities = [
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old summary A'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'old summary B'},
+        ]
+        svc.graphiti.list_entity_nodes = AsyncMock(return_value=all_entities)
+        svc.graphiti.get_all_valid_edges = AsyncMock()
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock()
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_false_dry_run_calls_detect_stale_dry_run(self, service_dry_run):
+        """force=False+dry_run=True calls detect_stale_dry_run, NOT detect_stale_with_edges."""
+        await service_dry_run.rebuild_entity_summaries(project_id='proj', dry_run=True)
+        service_dry_run.graphiti.detect_stale_dry_run.assert_awaited_once_with(group_id='proj')
+        service_dry_run.graphiti.detect_stale_with_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_false_dry_run_returns_skipped_status(self, service_dry_run):
+        """force=False+dry_run=True: entities have status=skipped_dry_run, rebuilt=0."""
+        result = await service_dry_run.rebuild_entity_summaries(project_id='proj', dry_run=True)
+        assert result['total_entities'] == 3
+        assert result['stale_entities'] == 1
+        assert result['rebuilt'] == 0
+        assert result['skipped'] == 1
+        assert result['errors'] == 0
+        assert result['details'][0]['status'] == 'skipped_dry_run'
+        # rebuild_entity_from_edges must NOT be called
+        service_dry_run.graphiti.rebuild_entity_from_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_force_dry_run_calls_list_nodes_not_get_edges(self, service_force_dry_run):
+        """force=True+dry_run=True calls list_entity_nodes but NOT get_all_valid_edges."""
+        await service_force_dry_run.rebuild_entity_summaries(
+            project_id='proj', force=True, dry_run=True
+        )
+        service_force_dry_run.graphiti.list_entity_nodes.assert_awaited_once_with(group_id='proj')
+        service_force_dry_run.graphiti.get_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_force_dry_run_returns_all_entities_as_skipped(self, service_force_dry_run):
+        """force=True+dry_run=True: all entities returned as skipped."""
+        result = await service_force_dry_run.rebuild_entity_summaries(
+            project_id='proj', force=True, dry_run=True
+        )
+        assert result['total_entities'] == 2
+        assert result['stale_entities'] == 2
+        assert result['rebuilt'] == 0
+        assert result['skipped'] == 2
+        assert all(d['status'] == 'skipped_dry_run' for d in result['details'])
+        service_force_dry_run.graphiti.rebuild_entity_from_edges.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# TestServiceRebuildOrchestrationErrors — step-9/10: error handling & cancellation
+# ---------------------------------------------------------------------------
+
+class TestServiceRebuildOrchestrationErrors:
+    """MemoryService.rebuild_entity_summaries() error handling and cancellation."""
+
+    def _make_service(self, mock_config):
+        from fused_memory.services.memory_service import MemoryService
+        svc = MemoryService(mock_config)
+        svc.graphiti = MagicMock()
+        svc.mem0 = MagicMock()
+        svc.durable_queue = MagicMock()
+        svc.durable_queue.enqueue = AsyncMock(return_value=1)
+        stale_entities = [
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old A'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'old B'},
+        ]
+        svc.graphiti.detect_stale_with_edges = AsyncMock(
+            return_value=StaleSummaryResult(
+                stale=stale_entities,
+                all_edges={},
+                total_count=2,
+            )
+        )
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_one_error_one_rebuilt(self, mock_config):
+        """One entity fails with RuntimeError, other succeeds: errors=1, rebuilt=1."""
+        svc = self._make_service(mock_config)
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'old A',
+             'new_summary': 'new A', 'edge_count': 0},
+            RuntimeError('FalkorDB timeout'),
+        ])
+        result = await svc.rebuild_entity_summaries(project_id='proj')
+        assert result['rebuilt'] == 1
+        assert result['errors'] == 1
+        error_details = [d for d in result['details'] if d.get('status') == 'error']
+        assert len(error_details) == 1
+        assert 'FalkorDB timeout' in error_details[0]['error']
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_is_reraised(self, mock_config):
+        """CancelledError in gather results propagates (not swallowed)."""
+        svc = self._make_service(mock_config)
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
+            asyncio.CancelledError(),
+            {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'old B',
+             'new_summary': 'new B', 'edge_count': 0},
+        ])
+        with pytest.raises((asyncio.CancelledError, BaseException)):
+            await svc.rebuild_entity_summaries(project_id='proj')
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_takes_precedence_over_runtime_error(self, mock_config):
+        """CancelledError + RuntimeError in results: CancelledError wins."""
+        svc = self._make_service(mock_config)
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
+            asyncio.CancelledError(),
+            RuntimeError('other error'),
+        ])
+        with pytest.raises((asyncio.CancelledError, BaseException)):
+            await svc.rebuild_entity_summaries(project_id='proj')
+
+    @pytest.mark.asyncio
+    async def test_non_dict_return_raises_type_error(self, mock_config):
+        """Non-dict return from rebuild_entity_from_edges raises TypeError."""
+        svc = self._make_service(mock_config)
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
+            'this_is_a_string_not_a_dict',
+            {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'old B',
+             'new_summary': 'new B', 'edge_count': 0},
+        ])
+        with pytest.raises(TypeError):
+            await svc.rebuild_entity_summaries(project_id='proj')
+
+    @pytest.mark.asyncio
+    async def test_cancellation_warning_log_includes_project_id(self, mock_config, caplog):
+        """Warning log on CancelledError includes project_id."""
+        svc = self._make_service(mock_config)
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
+            asyncio.CancelledError(),
+            asyncio.CancelledError(),
+        ])
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            try:
+                await svc.rebuild_entity_summaries(project_id='my-project')
+            except (asyncio.CancelledError, BaseException):
+                pass
+        # The warning should contain the project_id
+        warning_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('my-project' in m for m in warning_msgs), (
+            f'Expected project_id in cancellation warning; got: {warning_msgs}'
+        )
