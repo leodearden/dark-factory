@@ -943,10 +943,15 @@ class TestMemoryServiceRebuildEntitySummaries:
                 total_count=5,
             )
         )
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
-            {'uuid': 'u1', 'name': 'Alice', 'old_summary': 'old A', 'new_summary': 'new A', 'edge_count': 1},
-            {'uuid': 'u2', 'name': 'Bob', 'old_summary': 'old B', 'new_summary': 'new B', 'edge_count': 1},
-        ])
+        async def _rebuild_svc(uuid, name, edges, *, group_id, old_summary):
+            if uuid == 'u1':
+                return {'uuid': 'u1', 'name': 'Alice', 'old_summary': 'old A', 'new_summary': 'new A', 'edge_count': 1}
+            elif uuid == 'u2':
+                return {'uuid': 'u2', 'name': 'Bob', 'old_summary': 'old B', 'new_summary': 'new B', 'edge_count': 1}
+            else:
+                raise AssertionError(f'_rebuild_svc called with unexpected uuid: {uuid!r}')
+
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_rebuild_svc)
         svc.mem0 = MagicMock()
         svc.durable_queue = MagicMock()
         svc.durable_queue.enqueue = AsyncMock(return_value=1)
