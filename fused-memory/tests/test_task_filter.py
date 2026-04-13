@@ -863,3 +863,56 @@ class TestRenderTaskLineAndFormatTaskList:
         result = format_task_list([t1, t2])
         expected = _render_task_line(t1) + '\n' + _render_task_line(t2)
         assert result == expected
+
+    def test_render_task_line_deps_truthy_non_list(self):
+        """_render_task_line treats any truthy non-list deps value as empty list.
+
+        When a task has 'dependencies' set to a truthy non-list value (int like 42,
+        dict like {'a': 1}, string like 'bad'), the formatter must treat it as [].
+        Bug: `task.get('dependencies') or []` passes truthy non-list values through,
+        causing TypeError on deps[:5] for int/dict, or garbled output for string.
+        """
+        cases = [
+            (42, 'int deps'),
+            ({'a': 1}, 'dict deps'),
+            ('bad', 'string deps'),
+        ]
+        for deps_value, label in cases:
+            task = {'id': 1, 'status': 'pending', 'title': 'X', 'dependencies': deps_value}
+            result = _render_task_line(task)
+            assert 'deps=[]' in result, (
+                f'Expected deps=[] for {label} ({deps_value!r}), got: {result!r}'
+            )
+
+    def test_format_task_list_filters_non_dict_items(self):
+        """format_task_list skips non-dict elements and renders only valid task dicts.
+
+        Cases:
+        (a) mixed list [valid_dict, 42, None, 'bad', valid_dict2] renders only the two dicts;
+        (b) all-non-dict [42, None, 'bad'] returns 'No tasks.';
+        (c) empty [] still returns 'No tasks.' (regression guard).
+
+        Bug: current code calls _render_task_line(t) unconditionally, which calls t.get()
+        and crashes with AttributeError when t is not a dict.
+        """
+        t1 = {'id': 1, 'status': 'pending', 'title': 'Alpha', 'dependencies': []}
+        t2 = {'id': 2, 'status': 'done', 'title': 'Beta', 'dependencies': []}
+
+        # (a) mixed list — only valid dicts rendered
+        result_a = format_task_list([t1, 42, None, 'bad', t2])
+        expected_a = _render_task_line(t1) + '\n' + _render_task_line(t2)
+        assert result_a == expected_a, (
+            f'Expected only valid dicts rendered, got: {result_a!r}'
+        )
+
+        # (b) all non-dicts → 'No tasks.'
+        result_b = format_task_list([42, None, 'bad'])
+        assert result_b == 'No tasks.', (
+            f"Expected 'No tasks.' for all-non-dict input, got: {result_b!r}"
+        )
+
+        # (c) empty list → 'No tasks.' (regression guard)
+        result_c = format_task_list([])
+        assert result_c == 'No tasks.', (
+            f"Expected 'No tasks.' for empty input, got: {result_c!r}"
+        )
