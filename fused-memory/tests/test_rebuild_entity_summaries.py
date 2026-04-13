@@ -1612,7 +1612,7 @@ class TestRebuildEntitySummariesCancellation:
             side_effect=[ValueError('per-entity boom'), None]
         )
 
-        result = await backend.rebuild_entity_summaries(group_id='test', force=True)
+        result = await backend.rebuild_entity_summaries(group_id='grp-cancel-accum', force=True)
 
         assert result['errors'] == 1
         assert result['rebuilt'] == 1
