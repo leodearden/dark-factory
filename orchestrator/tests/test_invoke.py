@@ -10,6 +10,9 @@ import pytest
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
 
 from orchestrator.agents.invoke import (
+    _invoke_claude_with_sandbox,
+    _invoke_codex,
+    _invoke_gemini,
     _parse_codex_output,
     _parse_gemini_output,
     _run_subprocess_local,
@@ -373,6 +376,73 @@ class TestParseGeminiOutputTimedOutIsolation:
                                 duration_ms=100, timed_out=True)
         agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
         assert agent.timed_out is False
+
+
+# ── caller-level timed_out propagation (characterization tests) ───────────────
+
+
+@pytest.mark.asyncio
+class TestCodexCallerPropagatesTimedOut:
+    """_invoke_codex must propagate timed_out=True from subprocess result."""
+
+    async def test_codex_caller_propagates_timed_out(self, tmp_path):
+        """_invoke_codex returns AgentResult with timed_out=True when subprocess timed out."""
+        timed_result = _SubprocessResult(stdout='', stderr='timeout', returncode=1,
+                                         duration_ms=100, timed_out=True)
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=timed_result):
+            agent = await _invoke_codex(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='gpt-5.4', max_budget_usd=1.0,
+                mcp_config=None, sandbox_modules=None, effort=None,
+                timeout_seconds=30.0,
+            )
+        assert agent.timed_out is True
+
+
+@pytest.mark.asyncio
+class TestGeminiCallerPropagatesTimedOut:
+    """_invoke_gemini must propagate timed_out=True from subprocess result."""
+
+    async def test_gemini_caller_propagates_timed_out(self, tmp_path):
+        """_invoke_gemini returns AgentResult with timed_out=True when subprocess timed out."""
+        timed_result = _SubprocessResult(stdout='', stderr='timeout', returncode=1,
+                                         duration_ms=100, timed_out=True)
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=timed_result):
+            agent = await _invoke_gemini(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='gemini-3.1-pro-preview', max_budget_usd=1.0,
+                mcp_config=None, sandbox_modules=None, effort=None,
+                timeout_seconds=30.0,
+            )
+        assert agent.timed_out is True
+
+
+@pytest.mark.asyncio
+class TestSandboxCallerPropagatesTimedOut:
+    """_invoke_claude_with_sandbox must propagate timed_out=True from subprocess result."""
+
+    async def test_sandbox_caller_propagates_timed_out(self, tmp_path):
+        """_invoke_claude_with_sandbox returns timed_out=True when subprocess timed out."""
+        timed_result = _SubprocessResult(stdout='', stderr='timeout', returncode=1,
+                                         duration_ms=100, timed_out=True)
+        with (
+            patch('orchestrator.agents.invoke._run_subprocess',
+                  new_callable=AsyncMock, return_value=timed_result),
+            patch('orchestrator.agents.sandbox.is_bwrap_available', return_value=True),
+            patch('orchestrator.agents.sandbox.build_bwrap_command', side_effect=lambda cmd, *a, **k: cmd),
+        ):
+            agent = await _invoke_claude_with_sandbox(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
+                allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, output_schema=None,
+                permission_mode='bypassPermissions',
+                sandbox_modules=['src'],
+                effort=None, timeout_seconds=30.0,
+            )
+        assert agent.timed_out is True
 
 
 # ===================================================================

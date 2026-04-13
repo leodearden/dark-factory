@@ -1291,6 +1291,26 @@ class TestParseClaudeOutputTimedOutIsolation:
         assert agent.timed_out is False
 
 
+# ── caller-level timed_out propagation (characterization tests) ───────────────
+
+
+@pytest.mark.asyncio
+class TestClaudeCallerPropagatesTimedOut:
+    """invoke_claude_agent must propagate timed_out=True from subprocess result."""
+
+    async def test_claude_caller_propagates_timed_out(self, tmp_path):
+        """invoke_claude_agent returns AgentResult with timed_out=True when subprocess timed out."""
+        timed_result = _SubprocessResult(stdout='', stderr='timeout', returncode=1,
+                                         duration_ms=100, timed_out=True)
+        with patch('shared.cli_invoke._run_subprocess',
+                   new_callable=AsyncMock, return_value=timed_result):
+            agent = await invoke_claude_agent(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', timeout_seconds=30.0,
+            )
+        assert agent.timed_out is True
+
+
 def _make_gate(
     *,
     account_count: int = 2,
