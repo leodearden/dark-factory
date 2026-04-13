@@ -619,6 +619,15 @@ class TestCollectSnapshot:
 
         config = DashboardConfig(project_root=link)
 
+        # Guard: _resolve_project_root walks up from prd_path looking for .taskmaster.
+        # If any ancestor of tmp_path has one, the fallback branch never fires and
+        # this test silently verifies the wrong code path.
+        for ancestor in tmp_path.resolve().parents:
+            assert not (ancestor / '.taskmaster').is_dir(), (
+                f'{ancestor} contains .taskmaster — this test requires no .taskmaster '
+                f'in the ancestor chain so _resolve_project_root exercises its fallback branch'
+            )
+
         # PRD path lives directly under tmp_path (not under real_dir), so
         # _resolve_project_root will walk up from tmp_path, find no .taskmaster,
         # and fall back to config.project_root (the unresolved symlink).
