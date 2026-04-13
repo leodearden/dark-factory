@@ -436,7 +436,7 @@ class TestNearCapStateDistinction:
         #     pause_started_at, resets_at, and closes the global gate).
         gate._handle_cap_detected('test', datetime.now(UTC) - timedelta(minutes=1), acct.token)
         assert acct.capped is True
-        assert acct.pause_started_at is not None  # real path sets this; manual block skipped it
+        assert acct.pause_started_at is not None  # _handle_cap_detected stamps pause_started_at
 
         # (2) Simulate a near-cap warning arriving after the account was capped — uses
         #     oauth_token=acct.token so _resolve_account returns the capped account via
