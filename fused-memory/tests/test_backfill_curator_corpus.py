@@ -415,6 +415,10 @@ class TestBackfillPointIdConsistency:
         assert record_payload is not None
         assert backfill_payload is not None
 
+        # Both payloads must always include updated_at
+        assert 'updated_at' in record_payload, f"record_payload missing 'updated_at': {set(record_payload)}"
+        assert 'updated_at' in backfill_payload, f"backfill_payload missing 'updated_at': {set(backfill_payload)}"
+
         # Key-set equality excluding updated_at (may legitimately differ)
         assert set(record_payload.keys()) - {'updated_at'} == set(backfill_payload.keys()) - {'updated_at'}, (
             f"Key-set mismatch (excluding updated_at): "
