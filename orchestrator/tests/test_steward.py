@@ -1833,3 +1833,21 @@ class TestPreTriageUsageGateCleanup:
             await steward._pre_triage_suggestions(self._esc())
 
         gate.on_agent_complete.assert_called_once_with(0.42)
+
+    async def test_metrics_tracked_after_refactor(self, steward: TaskSteward):
+        """steward.metrics are updated from the invoke_with_cap_retry result."""
+        gate = self._gate()
+        steward.usage_gate = gate
+        mock_result = _make_result(cost=0.77, duration_ms=3500, session_id='sess-triage')
+
+        steward.metrics.invocations = 0
+        steward.metrics.total_cost_usd = 0.0
+        steward.metrics.total_duration_ms = 0
+
+        with patch('orchestrator.agents.invoke.invoke_agent',
+                   new_callable=AsyncMock, return_value=mock_result):
+            await steward._pre_triage_suggestions(self._esc())
+
+        assert steward.metrics.invocations == 1
+        assert steward.metrics.total_cost_usd == pytest.approx(0.77)
+        assert steward.metrics.total_duration_ms == 3500
