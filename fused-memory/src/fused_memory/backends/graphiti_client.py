@@ -831,6 +831,7 @@ class GraphitiBackend:
         Returns:
             List of unique non-empty fact strings in their first-seen order.
         """
+        # f is assigned by the walrus := before isinstance checks str; rejects non-str, empty, whitespace-only
         return list(dict.fromkeys(f for e in edges if isinstance(f := e.get('fact'), str) and f and not f.isspace()))
 
     async def refresh_entity_summary(
