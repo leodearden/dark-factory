@@ -492,6 +492,39 @@ class TestDetectStaleSummariesDryRun:
             f"Expected peak concurrent calls > 1 (parallel), got {peak_concurrent} (sequential)"
         )
 
+    @pytest.mark.asyncio
+    async def test_concurrency_bounded_by_max_concurrency(self, mock_config, make_backend):
+        """Peak concurrent calls never exceeds max_concurrency.
+
+        With 6 entities and max_concurrency=2, the semaphore must hold all but
+        2 calls back — peak_concurrent must be <= 2.
+        """
+        backend = make_backend(mock_config)
+        entities = [
+            {'uuid': f'uuid-{i}', 'name': f'Entity{i}', 'summary': 'fact'}
+            for i in range(6)
+        ]
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+
+        in_flight = 0
+        peak_concurrent = 0
+
+        async def tracking_edges(node_uuid, *, group_id):
+            nonlocal in_flight, peak_concurrent
+            in_flight += 1
+            peak_concurrent = max(peak_concurrent, in_flight)
+            await asyncio.sleep(0)  # yield to event loop so others can contend
+            in_flight -= 1
+            return [{'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'}]
+
+        backend.get_valid_edges_for_node = AsyncMock(side_effect=tracking_edges)
+
+        await backend.detect_stale_dry_run(group_id='test', max_concurrency=2)
+
+        assert peak_concurrent <= 2, (
+            f"Expected peak concurrent calls <= 2 (bounded), got {peak_concurrent}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # task-656: GraphitiBackend._build_stale_entry (static helper)
