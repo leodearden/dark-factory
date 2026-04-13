@@ -909,7 +909,7 @@ class GraphitiBackend:
         rebuilding many entities at once.  The two methods are an intentional
         fork: ``refresh_entity_summary`` is self-contained for single-entity
         callers; ``rebuild_entity_from_edges`` is batch-internal and consumes
-        pre-fetched data from the ``rebuild_entity_summaries`` pipeline.
+        pre-fetched data from the ``MemoryService.rebuild_entity_summaries`` pipeline.
 
         Args:
             node_uuid: UUID of the Entity node to refresh.
@@ -976,7 +976,7 @@ class GraphitiBackend:
     ) -> StaleSummaryResult:
         """Detect stale summaries and return a StaleSummaryResult.
 
-        Shared by detect_stale_summaries (public API) and rebuild_entity_summaries
+        Shared by detect_stale_summaries (public API) and MemoryService.rebuild_entity_summaries
         to avoid a duplicate bulk edge fetch when both are needed.
 
         Args:

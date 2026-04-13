@@ -29,6 +29,7 @@ def _make_svc(mock_config):
     svc.mem0 = MagicMock()
     svc.durable_queue = MagicMock()
     svc.durable_queue.enqueue = AsyncMock(return_value=1)
+    svc._write_journal = None  # guard against __init__ refactoring deferring this attr
     return svc
 
 # ---------------------------------------------------------------------------
