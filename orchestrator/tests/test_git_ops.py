@@ -457,16 +457,18 @@ class TestFreshenMain:
         """When ahead rev-list returns non-numeric stdout, falls back to (main_branch, behind)."""
         git_ops, _origin = git_ops_with_remote
 
-        call_count = 0
-
         async def fake_run(cmd, cwd=None):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
+            if 'fetch' in cmd:
                 return (0, '', '')           # fetch succeeds
-            elif call_count == 2:
-                return (0, '3', '')          # behind rev-list: 3 commits behind
-            return (0, 'not-a-number', '')   # ahead rev-list returns garbage
+            if 'rev-list' in cmd:
+                # Distinguish behind vs ahead by which side of '..' the remote ref is on:
+                #   behind range: <local>..<remote>  (e.g. main..origin/main)
+                #   ahead  range: <remote>..<local>  (e.g. origin/main..main)
+                range_arg = next((arg for arg in cmd if '..' in arg), '')
+                if range_arg.startswith('origin/'):
+                    return (0, 'not-a-number', '')  # ahead rev-list: garbage
+                return (0, '3', '')                 # behind rev-list: 3 behind
+            return (0, '', '')
 
         with patch('orchestrator.git_ops._run', side_effect=fake_run):
             ref, stale = await git_ops._freshen_main()
