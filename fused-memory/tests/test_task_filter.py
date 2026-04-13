@@ -290,8 +290,8 @@ class TestFormatFilteredTaskTree:
         # Output must not exceed max_chars budget (default 50,000)
         assert len(output) <= 50_000
 
-        # Task 51 is beyond the max_tasks=50 cap — must not appear in body
-        assert 'Task title 51' not in output
+        # Task 51 is beyond the max_tasks=50 cap — structural match immune to ID-range changes
+        assert '\n- [51] ' not in output
 
         # Header must contain the max_tasks-cap omission phrase: pins count + verb + intent,
         # tolerates preposition rewording (e.g. 'omitted by' vs 'omitted due to')
@@ -649,6 +649,68 @@ class TestFormatFilteredTaskTree:
         # Must NOT have trailing '...' after the closing bracket
         assert 'deps=[10, 20, 30, 40, 50]...' not in output, (
             f'Found unexpected ellipsis in output: {output!r}'
+        )
+
+    def test_structural_match_resists_id_range_extension(self):
+        """Canary: proves old substring assertion 'Task title 51' is fragile
+        while structural match '\\n- [51] ' correctly detects omission.
+
+        With 600 active tasks having IDs 510..1109, max_tasks=50 shows
+        tasks 510..559.  Task 51 is absent (correctly omitted — it is not
+        in the task set at all).  Titles 'Task title 510'..'Task title 519'
+        each contain 'Task title 51' as a leading substring, so the old
+        assertion::
+
+            assert 'Task title 51' not in output
+
+        would raise AssertionError even though task 51 is correctly absent
+        — a false failure.  The structural assertion::
+
+            assert '\\n- [51] ' not in output
+
+        passes correctly because '[51] ' (bracket-51-space) is a different
+        token from '[510] ' (bracket-510-space) and cannot be confused.
+
+        This test PASSES and documents precisely WHY the structural form was
+        chosen in test_caps_at_max_tasks_and_under_budget.
+        """
+        # 600 tasks, IDs 510..1109.  active[:50] shows IDs 510..559.
+        # Task 51 is not in this set — correctly excluded.
+        active = [
+            _make_task(i, 'pending', f'Task title {i}')
+            for i in range(510, 1110)  # 600 tasks, none is task 51
+        ]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=600,
+        )
+        output = format_filtered_task_tree(tree, max_tasks=50)
+
+        # (a) Old-style substring: 'Task title 51' IS present because
+        #     'Task title 510'..'Task title 519' are shown and each contains
+        #     'Task title 51' as a prefix substring.
+        #     The old assertion `assert 'Task title 51' not in output` would
+        #     raise AssertionError here — a false failure.
+        assert 'Task title 51' in output, (
+            "'Task title 51' must be found as a substring of a shown task title "
+            "(e.g. 'Task title 510'); if absent, the canary is not exercised correctly"
+        )
+
+        # (b) Structural match: '\n- [51] ' is NOT present because task 51 is
+        #     correctly absent.  '[51] ' cannot match '[510] ' — different tokens.
+        assert '\n- [51] ' not in output, (
+            "Task 51 is not in the task set; its rendered line prefix "
+            "'\\n- [51] ' must not appear in output"
+        )
+
+        # (c) End-to-end header check: 600 active tasks minus 50 shown = 550 omitted.
+        #     Confirms the max_tasks cap logic fires correctly for this range of IDs.
+        assert re.search(r'550\s+more active omitted (by|due to) max_tasks cap', output), (
+            "Expected header phrase '550 more active omitted … max_tasks cap' "
+            "(600 tasks − 50 shown = 550 omitted); output was:\n" + output
         )
 
     def test_many_deps_per_task_stays_under_budget(self):
