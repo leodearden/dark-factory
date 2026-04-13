@@ -292,7 +292,7 @@ class TestBackfillPointIdConsistency:
 
     @pytest.mark.asyncio
     async def test_record_task_normalizes_none_fields(self):
-        """record_task() with files_to_modify=None and priority=None stores [] and '' in payload."""
+        """record_task() with files_to_modify=None and priority=None stores [] and 'medium' in payload."""
         from fused_memory.middleware.task_curator import CandidateTask
 
         project_id = 'proj'
@@ -331,8 +331,8 @@ class TestBackfillPointIdConsistency:
         assert captured_payload['files_to_modify'] == [], (
             f"Expected [], got {captured_payload['files_to_modify']!r}"
         )
-        assert captured_payload['priority'] == '', (
-            f"Expected '', got {captured_payload['priority']!r}"
+        assert captured_payload['priority'] == 'medium', (
+            f"Expected 'medium', got {captured_payload['priority']!r}"
         )
 
     @pytest.mark.asyncio
@@ -420,6 +420,84 @@ class TestBackfillPointIdConsistency:
         )
         assert isinstance(backfill_payload['priority'], str), (
             f"backfill priority type: {type(backfill_payload['priority'])}"
+        )
+
+        # Value equality for all shared keys except 'updated_at' (may differ by milliseconds)
+        shared_keys = set(record_payload.keys()) - {'updated_at'}
+        for key in shared_keys:
+            assert record_payload[key] == backfill_payload[key], (
+                f"Value mismatch for key '{key}': "
+                f"record={record_payload[key]!r}, backfill={backfill_payload[key]!r}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_default_priority_alignment(self):
+        """record_task() with default CandidateTask and backfill_corpus() with no priority key both produce 'medium'."""
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        project_id = 'proj'
+        task_id = '50'
+
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        # --- record_task path: CandidateTask with default priority='medium' ---
+        record_payload: dict | None = None
+
+        async def capture_record(*, collection_name, points):
+            nonlocal record_payload
+            record_payload = points[0].payload
+
+        mock_client_r = AsyncMock()
+        mock_client_r.upsert = capture_record
+        mock_embedder_r = AsyncMock()
+        mock_embedder_r.create = AsyncMock(return_value=[0.1] * 10)
+
+        # Use default priority (CandidateTask defaults to 'medium')
+        candidate = CandidateTask(title='Test task', description='Some description')
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client_r), \
+             patch.object(curator, '_get_embedder', return_value=mock_embedder_r), \
+             patch.object(curator, '_ensure_collection', return_value=f'task_curator_{project_id}'):
+
+            await curator.record_task(task_id=task_id, candidate=candidate, project_id=project_id)
+
+        assert record_payload is not None
+
+        # --- backfill_corpus path: task dict with no priority key ---
+        backfill_payload: dict | None = None
+
+        async def capture_backfill(*, collection_name, points):
+            nonlocal backfill_payload
+            backfill_payload = points[0].payload
+
+        mock_client_b = AsyncMock()
+        mock_client_b.upsert = capture_backfill
+        mock_embedder_b = AsyncMock()
+        mock_embedder_b.create = AsyncMock(return_value=[0.1] * 10)
+
+        # Reset lazy-init state so we get a fresh mock
+        curator._qdrant_client = None
+        curator._embedder = None
+        curator._initialized_collections = set()
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client_b), \
+             patch.object(curator, '_get_embedder', return_value=mock_embedder_b), \
+             patch.object(curator, '_ensure_collection', return_value=f'task_curator_{project_id}'):
+
+            await curator.backfill_corpus(
+                [{'id': task_id, 'title': 'Test task', 'description': 'Some description', 'status': 'pending'}],
+                project_id,
+            )
+
+        assert backfill_payload is not None
+
+        # Both paths must produce 'medium' as the canonical default priority
+        assert record_payload['priority'] == 'medium', (
+            f"record_task default priority: expected 'medium', got {record_payload['priority']!r}"
+        )
+        assert backfill_payload['priority'] == 'medium', (
+            f"backfill_corpus default priority: expected 'medium', got {backfill_payload['priority']!r}"
         )
 
 
