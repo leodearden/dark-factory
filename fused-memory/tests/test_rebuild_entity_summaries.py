@@ -805,10 +805,13 @@ class TestRebuildEntitySummaries:
                 total_count=2,
             )
         )
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
-            RuntimeError('FalkorDB timeout'),
-            {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'stale2', 'new_summary': 'current2', 'edge_count': 1},
-        ])
+
+        async def _fail_uuid1(uuid, name, edges, *, group_id, old_summary):
+            if uuid == 'uuid-1':
+                raise RuntimeError('FalkorDB timeout')
+            return {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'stale2', 'new_summary': 'current2', 'edge_count': 1}
+
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_fail_uuid1)
         result = await svc.rebuild_entity_summaries(project_id='test')
         assert result['errors'] == 1
         assert result['rebuilt'] == 1
