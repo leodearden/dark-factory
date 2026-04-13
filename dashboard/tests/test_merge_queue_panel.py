@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from contextlib import ExitStack
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 from dashboard.data.merge_queue import _bucket_minutes_for_window
@@ -487,4 +488,13 @@ class TestPartialsMergeQueueSharedNow:
             f"Aggregators received different `now` values: "
             f"depth={now_depth!r}, outcomes={now_outcomes!r}, "
             f"latency={now_latency!r}, spec={now_spec!r}"
+        )
+
+        # now must be a datetime and must have been captured close to the request
+        assert isinstance(now_depth, datetime), (
+            f"Expected `now` to be a datetime, got {type(now_depth)!r}"
+        )
+        elapsed = (datetime.now(UTC) - now_depth).total_seconds()
+        assert elapsed < 5, (
+            f"`now` value is stale: {elapsed:.1f}s old (expected < 5s)"
         )

@@ -56,6 +56,21 @@ def _bucket_start(t: datetime) -> datetime:
     return t.replace(minute=(t.minute // 15) * 15, second=0, microsecond=0)
 
 
+def _make_db(tmp_path, name, events):
+    """Create a populated DB with the given events list of dicts.
+
+    Each dict is forwarded as kwargs to _insert_event.  Returns the db_path.
+    """
+    db_path = tmp_path / name
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(MERGE_EVENTS_SCHEMA)
+    for evt in events:
+        _insert_event(conn, **evt)
+    conn.commit()
+    conn.close()
+    return db_path
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -948,7 +963,7 @@ class TestOutcomeDistributionNow:
 
         def mock_cutoff_iso(hours: int, *, now=None) -> str:
             captured_nows.append(now)
-            return '2020-01-01T00:00:00+00:00'  # far-past cutoff → no rows matched
+            return '2020-01-01T00:00:00+00:00'  # arbitrary cutoff; test only inspects captured_nows
 
         async with aiosqlite.connect(str(merge_events_db)) as conn:
             conn.row_factory = aiosqlite.Row
@@ -976,7 +991,7 @@ class TestSpeculativeStatsNow:
 
         def mock_cutoff_iso(hours: int, *, now=None) -> str:
             captured_nows.append(now)
-            return '2020-01-01T00:00:00+00:00'  # far-past cutoff → no rows matched
+            return '2020-01-01T00:00:00+00:00'  # arbitrary cutoff; test only inspects captured_nows
 
         async with aiosqlite.connect(str(merge_events_db)) as conn:
             conn.row_factory = aiosqlite.Row
@@ -993,17 +1008,6 @@ class TestSpeculativeStatsNow:
 # ---------------------------------------------------------------------------
 
 class TestAggregateOutcomeDistributionNow:
-    def _make_db(self, tmp_path, name, events):
-        """Create a populated DB with given events list of dicts."""
-        db_path = tmp_path / name
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(MERGE_EVENTS_SCHEMA)
-        for evt in events:
-            _insert_event(conn, **evt)
-        conn.commit()
-        conn.close()
-        return db_path
-
     @pytest.mark.asyncio
     async def test_aggregate_outcome_distribution_consistent_now(self, tmp_path):
         """aggregate_outcome_distribution resolves now once and threads it to all per-DB calls.
@@ -1016,10 +1020,10 @@ class TestAggregateOutcomeDistributionNow:
         # Events at 1h before fixed_now — inside [fixed_now - 24h, fixed_now] window
         event_time = fixed_now - timedelta(hours=1)
 
-        db1 = self._make_db(tmp_path, 'runs1.db', [
+        db1 = _make_db(tmp_path, 'runs1.db', [
             {'event_type': 'merge_attempt', 'timestamp': event_time, 'data': {'outcome': 'done'}},
         ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
+        db2 = _make_db(tmp_path, 'runs2.db', [
             {'event_type': 'merge_attempt', 'timestamp': event_time, 'data': {'outcome': 'done'}},
         ])
 
@@ -1044,17 +1048,6 @@ class TestAggregateOutcomeDistributionNow:
 # ---------------------------------------------------------------------------
 
 class TestAggregateLatencyStatsNow:
-    def _make_db(self, tmp_path, name, events):
-        """Create a populated DB with given events list of dicts."""
-        db_path = tmp_path / name
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(MERGE_EVENTS_SCHEMA)
-        for evt in events:
-            _insert_event(conn, **evt)
-        conn.commit()
-        conn.close()
-        return db_path
-
     @pytest.mark.asyncio
     async def test_aggregate_latency_stats_consistent_now(self, tmp_path):
         """aggregate_latency_stats resolves now once and threads it to all per-DB calls.
@@ -1066,11 +1059,11 @@ class TestAggregateLatencyStatsNow:
         fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
         event_time = fixed_now - timedelta(hours=1)
 
-        db1 = self._make_db(tmp_path, 'runs1.db', [
+        db1 = _make_db(tmp_path, 'runs1.db', [
             {'event_type': 'merge_attempt', 'timestamp': event_time,
              'data': {'outcome': 'done'}, 'duration_ms': 100},
         ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
+        db2 = _make_db(tmp_path, 'runs2.db', [
             {'event_type': 'merge_attempt', 'timestamp': event_time,
              'data': {'outcome': 'done'}, 'duration_ms': 200},
         ])
@@ -1105,7 +1098,7 @@ class TestLatencyStatsNow:
 
         def mock_cutoff_iso(hours: int, *, now=None) -> str:
             captured_nows.append(now)
-            return '2020-01-01T00:00:00+00:00'  # far-past cutoff → no rows matched
+            return '2020-01-01T00:00:00+00:00'  # arbitrary cutoff; test only inspects captured_nows
 
         async with aiosqlite.connect(str(merge_events_db)) as conn:
             conn.row_factory = aiosqlite.Row
@@ -1122,17 +1115,6 @@ class TestLatencyStatsNow:
 # ---------------------------------------------------------------------------
 
 class TestAggregateSpeculativeStatsNow:
-    def _make_db(self, tmp_path, name, events):
-        """Create a populated DB with given events list of dicts."""
-        db_path = tmp_path / name
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(MERGE_EVENTS_SCHEMA)
-        for evt in events:
-            _insert_event(conn, **evt)
-        conn.commit()
-        conn.close()
-        return db_path
-
     @pytest.mark.asyncio
     async def test_aggregate_speculative_stats_consistent_now(self, tmp_path):
         """aggregate_speculative_stats resolves now once and threads it to all per-DB calls.
@@ -1144,11 +1126,11 @@ class TestAggregateSpeculativeStatsNow:
         fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
         event_time = fixed_now - timedelta(hours=1)
 
-        db1 = self._make_db(tmp_path, 'runs1.db', [
+        db1 = _make_db(tmp_path, 'runs1.db', [
             {'event_type': 'speculative_merge',
              'timestamp': event_time, 'data': {'base_sha': 'abc'}},
         ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
+        db2 = _make_db(tmp_path, 'runs2.db', [
             {'event_type': 'speculative_discard',
              'timestamp': event_time, 'data': {'reason': 'previous_failed'}},
         ])
@@ -1169,3 +1151,47 @@ class TestAggregateSpeculativeStatsNow:
         )
         assert result['hit_count'] == 1
         assert result['discard_count'] == 1
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateQueueDepthTimeseriesNow
+# ---------------------------------------------------------------------------
+
+class TestAggregateQueueDepthTimeseriesNow:
+    @pytest.mark.asyncio
+    async def test_aggregate_queue_depth_timeseries_consistent_now(self, tmp_path):
+        """aggregate_queue_depth_timeseries resolves now once and threads it to per-DB calls.
+
+        Events near fixed_now are inside the 24h window for that now, but would be
+        excluded by a real datetime.now(UTC) cutoff (they are 2+ days in the past).
+        Ensures a regression removing `now` from aggregate_queue_depth_timeseries
+        would be caught by this test.
+        """
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        event_time = fixed_now - timedelta(hours=1)
+
+        db1 = _make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt', 'timestamp': event_time,
+             'data': {'outcome': 'done'}},
+        ])
+        db2 = _make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt', 'timestamp': event_time,
+             'data': {'outcome': 'done'}},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_queue_depth_timeseries(
+                [conn1, conn2], hours=24, now=fixed_now,
+            )
+
+        # Both events are inside the fixed_now window → total count == 2
+        total_count = sum(result['values'])
+        assert total_count == 2, (
+            f"Expected 2 events (both inside fixed_now window), got total={total_count}, "
+            f"result={result}"
+        )
