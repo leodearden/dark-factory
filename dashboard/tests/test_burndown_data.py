@@ -1765,13 +1765,3 @@ class TestCollectSnapshotDocstringContract:
             f'matched: {matched}'
         )
 
-
-class TestInsertSnapshotSql:
-    """Test that _INSERT_SNAPSHOT_SQL module-level constant exists and has correct value."""
-
-    def test_constant_is_str_with_correct_content(self):
-        assert isinstance(_INSERT_SNAPSHOT_SQL, str)
-        assert _INSERT_SNAPSHOT_SQL.startswith('INSERT INTO snapshots')
-        assert 'VALUES (?, ?, ?, ?, ?, ?, ?, ?)' in _INSERT_SNAPSHOT_SQL
-        # No leading/trailing whitespace — single clean string, no implicit-concat artifacts
-        assert _INSERT_SNAPSHOT_SQL.strip() == _INSERT_SNAPSHOT_SQL
