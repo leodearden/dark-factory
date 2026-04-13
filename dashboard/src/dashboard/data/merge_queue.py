@@ -255,13 +255,21 @@ async def _get_durations(
     db: aiosqlite.Connection | None,
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> list[float]:
-    """Return sorted list of non-null merge_attempt duration_ms values."""
+    """Return sorted list of non-null merge_attempt duration_ms values.
+
+    Args:
+        db: aiosqlite connection, or None (returns empty list).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
+            is used. Pass an explicit value to share a timestamp with sibling calls.
+    """
     if db is None:
         return []
 
     async def _query(conn: aiosqlite.Connection) -> list[float]:
-        since = _cutoff_iso(hours)
+        since = _cutoff_iso(hours, now=now)
         rows = await conn.execute_fetchall(
             "SELECT duration_ms FROM events "
             "WHERE event_type = 'merge_attempt' "
@@ -293,14 +301,21 @@ async def latency_stats(
     db: aiosqlite.Connection | None,
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> dict:
     """P50/P95/P99 latency and count for merge_attempt events.
 
     Returns {'p50': int, 'p95': int, 'p99': int, 'count': int,
              'mean_ms': float}.
     When no rows have non-null duration_ms, returns all zeros with count=0.
+
+    Args:
+        db: aiosqlite connection, or None (returns all-zeros dict).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
+            is used. Pass an explicit value to share a timestamp with sibling calls.
     """
-    durations = await _get_durations(db, hours=hours)
+    durations = await _get_durations(db, hours=hours, now=now)
     return _compute_latency_stats(sorted(durations))
 
 
