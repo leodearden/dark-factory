@@ -301,6 +301,8 @@ class TaskSteward:
             f'turns={result.turns})'
         )
 
+        is_timeout = _is_timeout_kill(result)
+
         if self.event_store:
             self.event_store.emit(
                 EventType.invocation_end,
@@ -312,13 +314,13 @@ class TaskSteward:
                     'category': escalation.category,
                     'retry_count': retry_count,
                     'account_name': result.account_name,
-                    'timed_out': _is_timeout_kill(result),
+                    'timed_out': is_timeout,
                 },
             )
 
         # Timeout-kill: treat as recoverable — do NOT consume retry budget.
         # The escalation remains pending so the run loop re-queues it naturally.
-        if _is_timeout_kill(result):
+        if is_timeout:
             self.metrics.timeouts_recovered += 1
             self._timeout_counts[escalation.id] = (
                 self._timeout_counts.get(escalation.id, 0) + 1
