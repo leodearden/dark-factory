@@ -44,9 +44,17 @@ BUCKET_LADDER: tuple[tuple[int | None, int], ...] = (
 )
 
 
-def _cutoff_iso(hours: int) -> str:
-    """Return ISO-format cutoff datetime for the given look-back window (hours)."""
-    return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+def _cutoff_iso(hours: int, *, now: datetime | None = None) -> str:
+    """Return ISO-format cutoff datetime for the given look-back window (hours).
+
+    Args:
+        hours: Look-back window in hours.
+        now: Reference timestamp. When None (the default), ``datetime.now(UTC)``
+            is used. Pass an explicit value to get deterministic results or to
+            share a single timestamp across concurrent per-DB calls.
+    """
+    effective_now = now if now is not None else datetime.now(UTC)
+    return (effective_now - timedelta(hours=hours)).isoformat()
 
 
 def _bucket_minutes_for_window(hours: int) -> int:
