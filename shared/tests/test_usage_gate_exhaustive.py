@@ -189,14 +189,16 @@ class TestCapDetectionPatterns:
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is True
 
-    # --- Unknown token caps first uncapped ---
+    # --- Unknown token does not cap any account ---
 
-    def test_unknown_token_caps_first_uncapped(self):
+    def test_unknown_token_does_not_cap_any_account(self):
+        """Explicit unknown token: detect_cap_hit returns False (no account resolved/mutated)."""
         gate = make_gate(['a', 'b'])
-        gate.detect_cap_hit(
+        result = gate.detect_cap_hit(
             '', "You've hit your usage limit resets in 3h", oauth_token='unknown-token'
         )
-        assert gate._accounts[0].capped is True
+        assert result is False
+        assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
 
     # --- No oauth_token and all uncapped ---
@@ -352,16 +354,16 @@ class TestNearCapStateDistinction:
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
 
-    def test_near_cap_unknown_token_falls_back_to_first_uncapped(self):
-        """NEAR_CAP with an unrecognised oauth_token falls back to the first uncapped account."""
+    def test_near_cap_unknown_token_does_not_mark_any_account(self):
+        """NEAR_CAP with an explicit unknown oauth_token: detect_cap_hit returns False (no account resolved/mutated)."""
         gate = make_gate(['a', 'b'])
         result = gate.detect_cap_hit(
             '',
             "You're close to reaching your usage limit. Your plan resets in 4h.",
             oauth_token='unknown-token',
         )
-        assert result is True
-        assert gate._accounts[0].near_cap is True
+        assert result is False
+        assert gate._accounts[0].near_cap is False
         assert gate._accounts[1].near_cap is False
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
@@ -855,10 +857,11 @@ class TestHandleCapDetected:
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is True
 
-    def test_unknown_token_caps_first_uncapped(self):
+    def test_unknown_token_does_not_cap_any_account(self):
+        """Explicit unknown token: _resolve_account returns None, no account is capped."""
         gate = make_gate(['a', 'b'])
         gate._handle_cap_detected('reason', None, 'unknown-token')
-        assert gate._accounts[0].capped is True
+        assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
 
     def test_none_token_caps_first_uncapped(self):
@@ -999,10 +1002,11 @@ class TestHandleNearCapWarning:
         assert gate._accounts[1].capped is False
         assert any('near cap' in r.message.lower() for r in caplog.records)
 
-    def test_unknown_token_marks_first_uncapped(self):
+    def test_unknown_token_does_not_mark_near_cap(self):
+        """Explicit unknown token: _resolve_account returns None, no near_cap set."""
         gate = make_gate(['a', 'b'])
         gate._handle_near_cap_warning('reason', 'unknown-token')
-        assert gate._accounts[0].near_cap is True
+        assert gate._accounts[0].near_cap is False
 
     def test_none_token_marks_first_uncapped(self):
         gate = make_gate(['a', 'b'])
@@ -1018,12 +1022,13 @@ class TestHandleNearCapWarning:
         # _resolve_account returned None → no account state should be modified
         assert gate._accounts[0].near_cap is False
 
-    def test_first_capped_unknown_token_marks_second(self):
+    def test_unknown_token_with_first_capped_does_not_mark_any(self):
+        """Explicit unknown token does not mark near_cap on any account, even if first is capped."""
         gate = make_gate(['a', 'b'])
         gate._accounts[0].capped = True
         gate._handle_near_cap_warning('reason', 'unknown-token')
-        assert gate._accounts[1].near_cap is True
         assert gate._accounts[0].near_cap is False
+        assert gate._accounts[1].near_cap is False
 
     def test_fires_cost_event_with_cost_store(self):
         cost_store = make_mock_cost_store()
@@ -1059,21 +1064,41 @@ class TestResolveAccount:
         acct = gate._resolve_account(token_b)
         assert acct is gate._accounts[1]
 
-    def test_unknown_token_falls_back_to_first_uncapped(self):
+    def test_unknown_token_returns_none(self):
+        """Explicit unknown token returns None (no best-guess fallback)."""
         gate = make_gate(['a', 'b'])
         acct = gate._resolve_account('unknown-token')
-        assert acct is gate._accounts[0]
+        assert acct is None
 
     def test_none_token_falls_back_to_first_uncapped(self):
         gate = make_gate(['a', 'b'])
         acct = gate._resolve_account(None)
         assert acct is gate._accounts[0]
 
-    def test_fallback_skips_capped(self):
+    def test_none_token_fallback_skips_capped(self):
+        """None token (no identity) skips capped accounts in first-uncapped fallback."""
         gate = make_gate(['a', 'b'])
         gate._accounts[0].capped = True
-        acct = gate._resolve_account('unknown-token')
+        acct = gate._resolve_account(None)
         assert acct is gate._accounts[1]
+
+    def test_unknown_token_logs_config_drift_debug(self, caplog):
+        """Explicit unknown token logs a config-drift breadcrumb at DEBUG level (not WARNING).
+
+        The primary WARNING is emitted by the caller ('no matching account'), so
+        _resolve_account downgrades its own message to DEBUG to avoid duplicate
+        WARNING noise for a single event.
+        """
+        gate = make_gate(['a', 'b'])
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
+            acct = gate._resolve_account('unknown-token')
+        assert acct is None
+        assert any('config drift' in r.message.lower() for r in caplog.records)
+        # Must be DEBUG, not WARNING — callers own the WARNING-level signal
+        assert not any(
+            'config drift' in r.message.lower() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        )
 
     def test_all_capped_unknown_token_returns_none(self):
         gate = make_gate(['a', 'b'])

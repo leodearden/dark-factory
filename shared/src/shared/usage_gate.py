@@ -256,9 +256,13 @@ class UsageGate:
     ) -> bool:
         """Scan stderr and result text for cap-hit patterns.
 
-        Marks the specific account identified by ``oauth_token`` as capped
-        and starts its resume probe. Returns True so the retry loop re-calls
-        ``before_invoke()`` to pick the next available account.
+        Returns True if a cap-hit or near-cap pattern was detected **and** an
+        account was successfully resolved and mutated.  Returns False both when
+        no pattern matches and when a pattern matches but ``_resolve_account``
+        returned None (e.g. explicit unknown token / config drift) — in that
+        case no account state changed and the retry loop should not increment
+        consecutive_cap_hits or trigger a cooldown, since before_invoke() would
+        return the same token on the next iteration.
         """
         combined = f'{stderr}\n{result_text}'
 
@@ -266,17 +270,15 @@ class UsageGate:
         if backend == 'codex':
             for pattern in CODEX_CAP_PATTERNS:
                 if pattern.lower() in combined.lower():
-                    self._handle_cap_detected(
+                    return self._handle_cap_detected(
                         f'Codex cap hit: {pattern}', None, oauth_token,
                     )
-                    return True
         elif backend == 'gemini':
             for pattern in GEMINI_CAP_PATTERNS:
                 if pattern.lower() in combined.lower():
-                    self._handle_cap_detected(
+                    return self._handle_cap_detected(
                         f'Gemini cap hit: {pattern}', None, oauth_token,
                     )
-                    return True
 
         # Claude cap/near-cap detection: require both a prefix match AND a
         # secondary confirmation keyword (defence against false positives on
@@ -288,14 +290,12 @@ class UsageGate:
                 if prefix.lower() in combined_lower:
                     resets_at = _parse_resets_at(combined)
                     reason = _extract_cap_message(combined, prefix) or f'Cap detected: {prefix}'
-                    self._handle_cap_detected(reason, resets_at, oauth_token)
-                    return True
+                    return self._handle_cap_detected(reason, resets_at, oauth_token)
 
             for prefix in NEAR_CAP_PREFIXES:
                 if prefix.lower() in combined_lower:
                     reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
-                    self._handle_near_cap_warning(reason, oauth_token)
-                    return True
+                    return self._handle_near_cap_warning(reason, oauth_token)
         else:
             # No confirm keyword — the prefix guard above would have blocked
             # detection anyway, but if a cap-like prefix IS present, emit a
@@ -316,12 +316,16 @@ class UsageGate:
         reason: str,
         resets_at: datetime | None,
         oauth_token: str | None,
-    ) -> None:
-        """Mark the matching account as capped."""
+    ) -> bool:
+        """Mark the matching account as capped.
+
+        Returns True if an account was resolved and mutated; False if
+        ``_resolve_account`` returned None (unknown token / all capped).
+        """
         acct = self._resolve_account(oauth_token)
         if acct is None:
             logger.warning(f'Cap detected but no matching account: {reason}')
-            return
+            return False
 
         acct.capped = True
         acct.near_cap = False
@@ -342,22 +346,28 @@ class UsageGate:
             if self._pause_started_at is None:
                 self._pause_started_at = datetime.now(UTC)
             logger.warning(f'Usage gate PAUSED: {self._paused_reason}')
+        return True
 
     def _handle_near_cap_warning(
         self,
         reason: str,
         oauth_token: str | None,
-    ) -> None:
-        """Record a near-cap warning without blocking the account."""
+    ) -> bool:
+        """Record a near-cap warning without blocking the account.
+
+        Returns True if an account was resolved and mutated; False if
+        ``_resolve_account`` returned None (unknown token / all capped).
+        """
         acct = self._resolve_account(oauth_token)
         if acct is None:
             logger.warning(f'Near-cap warning but no matching account: {reason}')
-            return
+            return False
 
         acct.near_cap = True
         logger.warning(f'Account {acct.name} NEAR CAP: {reason}')
         if self._cost_store:
             self._fire_cost_event(acct.name, 'near_cap', json.dumps({'reason': reason}))
+        return True
 
     def _find_account_by_token(self, token: str) -> AccountState | None:
         for acct in self._accounts:
@@ -366,26 +376,37 @@ class UsageGate:
         return None
 
     def _resolve_account(self, oauth_token: str | None) -> AccountState | None:
-        """Look up an account by token, falling back to the first uncapped account.
+        """Look up an account by token, with two distinct fallback paths.
 
-        Steps:
-        1. If ``oauth_token`` is provided, try an exact token match via
-           ``_find_account_by_token``.
-        2. If no account was found (unknown token or ``None`` token), iterate
-           ``_accounts`` and return the first account that is not capped.
-        3. Return ``None`` if neither step resolves an account.
+        Paths:
+        1. If ``oauth_token`` is provided and ``_find_account_by_token`` returns a
+           match, that account is returned.
+        2. If ``oauth_token`` is provided but *no* match is found (config drift),
+           log a DEBUG breadcrumb and return ``None`` — no best-guess fallback
+           applies.  The caller logs a WARNING ('no matching account') which is
+           the primary user-visible signal; the debug log here avoids duplicate
+           WARNING noise for a single event.
+        3. If ``oauth_token`` is ``None`` (no identity signal at all), fall back to
+           the first uncapped account in ``_accounts``.  Return ``None`` if all
+           accounts are capped.
 
-        The caller is responsible for emitting any 'no matching account' warning
-        and for deciding the appropriate early-return behaviour.  This helper
-        intentionally does not log.
+        The distinction matters because silently attributing cap state to an
+        unrelated account (old path 2) is a worse failure mode than a logged
+        warning with no action.
         """
-        acct = self._find_account_by_token(oauth_token) if oauth_token else None
-        if acct is None:
-            for a in self._accounts:
-                if not a.capped:
-                    acct = a
-                    break
-        return acct
+        if oauth_token:
+            acct = self._find_account_by_token(oauth_token)
+            if acct is None:
+                logger.debug(
+                    'oauth_token provided but does not match any configured account;'
+                    ' possible config drift'
+                )
+            return acct
+        # oauth_token is None: no identity — use first-uncapped fallback
+        for a in self._accounts:
+            if not a.capped:
+                return a
+        return None
 
     def _start_account_resume_probe(self, acct: AccountState) -> None:
         """Start an async resume probe for a specific account."""
