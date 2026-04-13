@@ -28,6 +28,7 @@ import logging
 from dataclasses import dataclass
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
+from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.maintenance._utils import maintenance_service
 from fused_memory.middleware.task_curator import BackfillResult, TaskCurator, _flatten_task_tree
 from fused_memory.models.scope import resolve_project_id
@@ -123,13 +124,13 @@ async def run_backfill(
     # intentional — it keeps parity with other maintenance scripts and ensures
     # the backing stores are healthy before the backfill begins.
     async with maintenance_service(config_path) as (config, _service):
-        # Build a Taskmaster client.
-        if config.taskmaster is None:
-            raise SystemExit(
-                'No taskmaster configuration found in config — cannot backfill. '
-                'Ensure your config.yaml has a [taskmaster] section.'
-            )
-        tm_config = config.taskmaster.model_copy(update={'project_root': project_root})
+        # Build a Taskmaster client.  If no [taskmaster] section exists in the
+        # config we fall back to a minimal TaskmasterConfig so the script still
+        # works when project_root is supplied explicitly on the CLI.
+        if config.taskmaster is not None:
+            tm_config = config.taskmaster.model_copy(update={'project_root': project_root})
+        else:
+            tm_config = TaskmasterConfig(project_root=project_root)
         taskmaster = TaskmasterBackend(config=tm_config)
 
         # Build a TaskCurator (lazy — connects on first use).
