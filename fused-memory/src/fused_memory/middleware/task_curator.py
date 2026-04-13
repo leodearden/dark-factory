@@ -52,6 +52,7 @@ _STATUS_RANK = {
     'done': 4,
 }
 _PRIORITY_RANK = {'high': 0, 'medium': 1, 'low': 2}
+DEFAULT_PRIORITY = 'medium'  # canonical fallback used by both record_task and backfill_corpus
 
 # JSON schema for the curator's structured output — used by invoke_with_cap_retry
 # to constrain the LLM's response.
@@ -562,7 +563,7 @@ class TaskCurator:
                         'title': title,
                         'description': description[:1000],
                         'files_to_modify': files,
-                        'priority': task.get('priority', '') or '',
+                        'priority': task.get('priority', '') or DEFAULT_PRIORITY,
                         'project_id': project_id,
                         'updated_at': datetime.now(UTC).isoformat(),
                     },
