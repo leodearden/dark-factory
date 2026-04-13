@@ -11,6 +11,7 @@ import pytest
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
     GitOps,
+    ScrubOutcome,
     ScrubResult,
     WorktreeInfo,
     _run,
@@ -1322,8 +1323,8 @@ class TestScrubTaskDirFromTree:
             result = await scrub_task_dir_from_tree(worktree_info.path, 'test-rm-fail')
 
         # Return value must be FAILED — git rm failed, scrub did not complete
-        assert result == ScrubResult.FAILED, (
-            f'Expected ScrubResult.FAILED on git rm failure, got {result!r}'
+        assert result.outcome == ScrubOutcome.FAILED, (
+            f'Expected outcome=FAILED on git rm failure, got {result!r}'
         )
 
         # An ERROR must have been logged containing the context label and the stderr
@@ -1373,8 +1374,8 @@ class TestScrubTaskDirFromTree:
             result = await scrub_task_dir_from_tree(worktree_info.path, 'test-happy')
 
         # Return value must be SCRUBBED
-        assert result == ScrubResult.SCRUBBED, (
-            f'Expected ScrubResult.SCRUBBED on success, got {result!r}'
+        assert result.outcome == ScrubOutcome.SCRUBBED, (
+            f'Expected outcome=SCRUBBED on success, got {result!r}'
         )
 
         # No ERROR should have been logged
@@ -1422,8 +1423,8 @@ class TestScrubTaskDirFromTree:
             result = await scrub_task_dir_from_tree(worktree_info.path, 'test-commit-fail')
 
         # Return value must be FAILED — commit did not succeed
-        assert result == ScrubResult.FAILED, (
-            f'Expected ScrubResult.FAILED on commit failure, got {result!r}'
+        assert result.outcome == ScrubOutcome.FAILED, (
+            f'Expected outcome=FAILED on commit failure, got {result!r}'
         )
 
         # An ERROR must have been logged with context and the commit stderr
@@ -1459,7 +1460,7 @@ class TestScrubTaskDirFromTree:
         with patch('orchestrator.git_ops._run', side_effect=mock_run):
             result = await scrub_task_dir_from_tree(worktree_info.path, 'carries-err')
 
-        assert result.outcome == ScrubOutcome.FAILED, (  # type: ignore[name-defined]  # noqa: F821
+        assert result.outcome == ScrubOutcome.FAILED, (
             f'Expected outcome=FAILED on git rm failure, got {result!r}'
         )
         assert result.error is not None, 'Expected error to be set on git rm failure'
@@ -1485,7 +1486,7 @@ class TestScrubTaskDirFromTree:
         with patch('orchestrator.git_ops._run', side_effect=mock_run):
             result = await scrub_task_dir_from_tree(worktree_info.path, 'no-err-ok')
 
-        assert result.outcome == ScrubOutcome.SCRUBBED, (  # type: ignore[name-defined]  # noqa: F821
+        assert result.outcome == ScrubOutcome.SCRUBBED, (
             f'Expected outcome=SCRUBBED on success, got {result!r}'
         )
         assert result.error is None, f'Expected error=None on success, got {result.error!r}'
@@ -1504,7 +1505,7 @@ class TestScrubTaskDirFromTree:
         with patch('orchestrator.git_ops._run', side_effect=mock_run):
             result = await scrub_task_dir_from_tree(worktree_info.path, 'clean-no-err')
 
-        assert result.outcome == ScrubOutcome.CLEAN, (  # type: ignore[name-defined]  # noqa: F821
+        assert result.outcome == ScrubOutcome.CLEAN, (
             f'Expected outcome=CLEAN on empty tree, got {result!r}'
         )
         assert result.error is None, f'Expected error=None on clean, got {result.error!r}'
@@ -1532,7 +1533,7 @@ class TestMergeToMainScrubFailure:
         # Patch _scrub_task_dir_from_tree to return FAILED, simulating a scrub
         # failure after the merge commit has been created.
         async def fake_scrub(*args, **kwargs):
-            return ScrubResult.FAILED
+            return ScrubResult(outcome=ScrubOutcome.FAILED)
 
         with patch(
             'orchestrator.git_ops.scrub_task_dir_from_tree',
@@ -1609,7 +1610,7 @@ class TestMergeToMainScrubFailure:
         await git_ops.commit(worktree_info.path, 'Add scrub-ok file')
 
         async def fake_scrub_ok(*args, **kwargs):
-            return ScrubResult.SCRUBBED
+            return ScrubResult(outcome=ScrubOutcome.SCRUBBED)
 
         with patch(
             'orchestrator.git_ops.scrub_task_dir_from_tree',
