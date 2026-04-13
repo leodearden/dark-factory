@@ -1355,3 +1355,38 @@ class TestFlattenWithSubtasks:
         assert by_id['100']['status'] == 'in-progress'
         assert by_id['100.1']['status'] == 'pending'
         assert by_id['100.1.1']['status'] == 'done'
+
+
+class TestSortOrderWithSubtasks:
+    """Sort order tests for filter_task_tree when subtasks are present."""
+
+    def test_sort_order_with_mixed_parent_and_subtask_ids(self):
+        """Tasks with mixed parent and subtask IDs sort by _STATUS_PRIORITY then -_id_key.
+
+        All tasks are 'pending' (same priority), so sort is purely by -_id_key:
+          451 → _id_key=451 → sort position 0  (highest, first shown)
+          '450'  → _id_key=450 → sort position 1
+          '450.2' → _id_key=450 → sort position 2 (stable: same as parent)
+          '450.1' → _id_key=450 → sort position 3 (stable: same as parent)
+
+        With Python's stable sort, tasks sharing _id_key=450 preserve input order
+        relative to each other: 450, 450.2, 450.1 (as given in input).
+        """
+        tasks_data = {
+            'tasks': [
+                {'id': '450', 'title': 'Parent 450', 'status': 'pending', 'dependencies': [],
+                 'subtasks': [
+                     {'id': '450.2', 'title': 'Sub 450.2', 'status': 'pending', 'dependencies': []},
+                     {'id': '450.1', 'title': 'Sub 450.1', 'status': 'pending', 'dependencies': []},
+                 ]},
+                {'id': 451, 'title': 'Task 451', 'status': 'pending', 'dependencies': []},
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        ids = [str(t['id']) for t in result.active_tasks]
+        # 451 must come before 450 group (higher _id_key → negated → lower sort value)
+        assert ids.index('451') < ids.index('450')
+        assert ids.index('451') < ids.index('450.2')
+        assert ids.index('451') < ids.index('450.1')
+        assert len(ids) == 4
