@@ -1744,3 +1744,26 @@ class TestPreTriageUsageGateCleanup:
             await steward._pre_triage_suggestions(self._esc())
 
         gate.confirm_account_ok.assert_called_once_with('tok-a')
+
+    async def test_release_probe_slot_on_exception(self, steward: TaskSteward):
+        """When invoke_agent raises, release_probe_slot is called with the token.
+
+        FAILS with current code because _pre_triage_suggestions has no try/except
+        around invoke_agent that calls release_probe_slot.
+        PASSES after refactor to invoke_with_cap_retry which has the BaseException handler.
+        """
+        gate = self._gate()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=RuntimeError('subprocess failed')),
+            patch('orchestrator.agents.invoke.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=RuntimeError('subprocess failed')),
+            pytest.raises(RuntimeError, match='subprocess failed'),
+        ):
+            await steward._pre_triage_suggestions(self._esc())
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')
