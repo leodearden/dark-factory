@@ -207,9 +207,14 @@ class TestCanonicalFacts:
     def test_whitespace_only_fact_is_filtered(self):
         """Whitespace-only facts are filtered out, not included in results.
 
-        The filter uses ``if e.get('fact', '').strip()`` so that a string like
-        '   ' strips to '' (falsy) and is excluded.  Only facts with real
+        The filter uses ``if (e.get('fact') or '').strip()`` so that a string
+        like '   ' strips to '' (falsy) and is excluded.  Only facts with real
         non-whitespace content pass through.
+
+        Note: ``e.get('fact', '')`` returns the default only when the key is
+        *absent*; ``(e.get('fact') or '')`` also converts an explicit ``None``
+        value to ``''``, so both missing keys and ``None`` values are handled
+        uniformly before ``.strip()`` is applied.
         """
         edges = [
             {'fact': '   '},  # whitespace-only — filtered out
