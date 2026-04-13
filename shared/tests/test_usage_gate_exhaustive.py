@@ -1104,6 +1104,29 @@ class TestHandleNearCapWarning:
             gate._handle_near_cap_warning('reason', token)
         mock_fire.assert_not_called()
 
+    def test_repeated_calls_fire_cost_event_each_time(self, caplog):
+        """Calling _handle_near_cap_warning twice documents the no-dedup behavior:
+        near_cap stays True, cost event fires on every call, and a WARNING is
+        logged on every call.  If a dedup guard is ever added this test will
+        break intentionally — update the expected counts when that happens."""
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['a'], cost_store=cost_store)
+        token = gate._accounts[0].token
+        with patch.object(gate, '_fire_cost_event') as mock_fire, \
+                caplog.at_level(logging.WARNING, logger='shared.usage_gate'):
+            gate._handle_near_cap_warning('reason', token)
+            gate._handle_near_cap_warning('reason', token)
+        # (a) near_cap is still True after the second call
+        assert gate._accounts[0].near_cap is True
+        # (b) cost event fires exactly twice — no dedup guard exists
+        assert mock_fire.call_count == 2
+        # (c) exactly 2 WARNING log records mention 'near cap'
+        near_cap_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'near cap' in r.message.lower()
+        ]
+        assert len(near_cap_warnings) == 2
+
 
 # =========================================================================
 # TestResolveAccount
