@@ -40,7 +40,7 @@ def _ts_sort_key(entry: dict) -> datetime:
     that malformed entries sort to the end of a descending sort.
     """
     try:
-        return parse_utc(entry.get('timestamp'))
+        return parse_utc(entry.get('timestamp')).astimezone(UTC)
     except (TypeError, ValueError):
         return datetime.min.replace(tzinfo=UTC)
 
