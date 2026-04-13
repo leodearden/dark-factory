@@ -867,15 +867,25 @@ class TestFilterTaskTreeDoneAndCancelledLists:
         assert result.cancelled_count == 0
 
     def test_done_and_cancelled_lists_sort_with_non_int_ids(self):
-        """Non-int ids fall back to _id_key=0 and sort last in descending order; stable sort preserves their mutual order."""
+        """_id_key covers both branches: string-digit ids coerce to int (happy path) and non-parseable ids fall back to 0.
+
+        String-digit id '4' exercises the int()-coercion branch of _id_key; it must sort between
+        int id=5 and int id=3 (i.e. 4 > 3) confirming coercion drives sort order, not input position.
+        Non-parseable ids 'abc' and 'def' exercise the ValueError-fallback branch (_id_key=0) and
+        sort last in descending order; stable sort preserves their mutual input order.
+        """
         tasks_data = {
             'tasks': [
-                # done: two non-int ids ('abc' then 'def') interleaved with ints;
-                # no literal id=0 to avoid sort-stability ambiguity with the fallback key.
+                # done: two non-int ids ('abc' then 'def') and one string-digit id ('4') interleaved
+                # with ints; no literal id=0 to avoid sort-stability ambiguity with the fallback key.
                 {'id': 10, 'title': 'Done 10', 'status': 'done', 'dependencies': []},
                 {'id': 'abc', 'title': 'Done abc', 'status': 'done', 'dependencies': []},
                 {'id': 5, 'title': 'Done 5', 'status': 'done', 'dependencies': []},
                 {'id': 3, 'title': 'Done 3', 'status': 'done', 'dependencies': []},
+                # id='4' is placed AFTER id=3 in input order so that a correct sort
+                # (4 > 3) cannot be confused with a no-op passthrough of input position.
+                # It exercises the int()-coercion (not fallback) path of _id_key.
+                {'id': '4', 'title': 'Done 4', 'status': 'done', 'dependencies': []},
                 {'id': 'def', 'title': 'Done def', 'status': 'done', 'dependencies': []},
                 # cancelled: mix of int and non-int ids
                 {'id': 7, 'title': 'Cancelled 7', 'status': 'cancelled', 'dependencies': []},
@@ -888,12 +898,15 @@ class TestFilterTaskTreeDoneAndCancelledLists:
         done_ids = [t['id'] for t in result.done_tasks]
         cancelled_ids = [t['id'] for t in result.cancelled_tasks]
 
+        # '4' has _id_key=4 via int() coercion (happy path), so it sorts between 5 and 3.
         # 'abc' and 'def' both have _id_key=0 (int() fallback), so they sort last after
-        # all int ids (10 > 5 > 3 > 0). Stable sort preserves their input order: 'abc' before 'def'.
-        assert done_ids == [10, 5, 3, 'abc', 'def'], (
-            f"Expected done_tasks id order [10, 5, 3, 'abc', 'def'] — non-int ids 'abc' and 'def' "
-            f"both have _id_key=0 via the int() fallback, sort last (0 < 3 < 5 < 10 descending), "
-            f"and preserve input order relative to each other (stable sort). Got: {done_ids}"
+        # all int ids (10 > 5 > 4 > 3 > 0). Stable sort preserves their input order: 'abc' before 'def'.
+        assert done_ids == [10, 5, '4', 3, 'abc', 'def'], (
+            f"Expected done_tasks id order [10, 5, '4', 3, 'abc', 'def'] — "
+            f"string-digit id '4' has _id_key=4 via successful int() coercion and sorts between 5 and 3; "
+            f"non-int ids 'abc' and 'def' both have _id_key=0 via the int() fallback, sort last "
+            f"(0 < 3 < 4 < 5 < 10 descending), and preserve input order relative to each other "
+            f"(stable sort). Got: {done_ids}"
         )
 
         # 'xyz' has _id_key=0 (int() fallback), so it sorts last after 7, 2 (both > 0)
