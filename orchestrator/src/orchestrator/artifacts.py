@@ -107,15 +107,8 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
             plan.pop(_NESTED_PLAN_KEY)
             modified = True
 
-    # Rule 4: wrap string prerequisites
-    prereqs = plan.get('prerequisites')
-    if isinstance(prereqs, list):
-        new_prereqs, changed = _wrap_string_items(prereqs, 'pre')
-        if changed:
-            logger.warning('Normalizing plan: wrapping %d string prerequisites as dicts',
-                           sum(1 for p in prereqs if isinstance(p, str)))
-            plan['prerequisites'] = new_prereqs
-            modified = True
+    # Rule 4 (removed): string prerequisites are now rejected by
+    # validate_plan_prerequisites() rather than silently coerced.
 
     # Rule 5: wrap string steps
     steps = plan.get('steps')
@@ -366,6 +359,44 @@ class TaskArtifacts:
             reviews=clean,
             reviewer_errors=errors,
         )
+
+    def validate_plan_prerequisites(self) -> None:
+        """Validate that every prerequisite in plan.json is a dict with required keys.
+
+        Required keys: id, description, status.
+
+        Raises:
+            ValueError: if any prerequisite is not a dict, or a dict is missing any
+                of the required keys {id, description, status}.  The error message
+                lists the offending indices and values so the operator can see exactly
+                which prerequisites were malformed.
+        """
+        REQUIRED_KEYS = {'id', 'description', 'status'}
+        plan = self.read_plan()
+        prerequisites = plan.get('prerequisites', [])
+        if not prerequisites:
+            return None
+
+        errors: list[str] = []
+        for i, item in enumerate(prerequisites):
+            if not isinstance(item, dict):
+                errors.append(
+                    f'  [index {i}] not a dict: {item!r}'
+                )
+            else:
+                missing = REQUIRED_KEYS - item.keys()
+                if missing:
+                    errors.append(
+                        f'  [index {i}] dict missing required keys {sorted(missing)}: {item!r}'
+                    )
+
+        if errors:
+            raise ValueError(
+                'plan.json prerequisites must be dicts with {id, description, status} keys. '
+                'Found malformed prerequisites:\n' + '\n'.join(errors)
+            )
+
+        return None
 
     def stamp_plan_provenance(self, session_id: str) -> None:
         """Stamp _session_id and _created_at into plan.json.

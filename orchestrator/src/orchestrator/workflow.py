@@ -721,6 +721,9 @@ class TaskWorkflow:
                 detail=f'Plan content:\n{plan_dump[:4000]}',
             )
 
+        if outcome := await self._validate_prerequisites_or_block('initial plan'):
+            return outcome
+
         # Stamp provenance and acquire lock
         self.artifacts.stamp_plan_provenance(self.session_id)
         self.artifacts.lock_plan(self.session_id)
@@ -756,6 +759,38 @@ class TaskWorkflow:
             f'{len(self.plan.get("steps", []))} steps'
         )
         return WorkflowOutcome.DONE
+
+    async def _validate_prerequisites_or_block(
+        self, context: str
+    ) -> WorkflowOutcome | None:
+        """Validate prerequisites format; block if invalid.
+
+        Encapsulates the try/validate/except/mark-blocked pattern shared by the
+        initial-plan checkpoint and the replan checkpoint, parameterised by a
+        *context* string that appears in log and escalation messages.
+
+        Args:
+            context: Short description for log/error messages, e.g.
+                     ``'initial plan'`` or ``'replan'``.
+
+        Returns:
+            A :class:`WorkflowOutcome` (BLOCKED) if validation fails,
+            ``None`` if prerequisites are valid.
+        """
+        assert self.artifacts is not None
+        try:
+            self.artifacts.validate_plan_prerequisites()
+        except ValueError as exc:
+            plan_dump = json.dumps(self.plan, indent=2)
+            logger.error(
+                f'Task {self.task_id}: {context} produced plan.json with invalid '
+                f'prerequisites — {exc}'
+            )
+            return await self._mark_blocked(
+                f'Planning failed ({context}): invalid prerequisites format — {exc}',
+                detail=f'Plan content:\n{plan_dump[:4000]}',
+            )
+        return None
 
     async def _repair_plan_schema(self) -> bool:
         """One-shot attempt to fix a plan that is missing ``steps``.
@@ -941,6 +976,8 @@ class TaskWorkflow:
                     'Architect replan produced no valid steps',
                     detail=f'Replan content:\n{plan_dump[:4000]}',
                 )
+            if outcome := await self._validate_prerequisites_or_block('replan'):
+                return outcome
             self.artifacts.stamp_plan_provenance(self.session_id)
             self.metrics.review_cycles += 1
 
