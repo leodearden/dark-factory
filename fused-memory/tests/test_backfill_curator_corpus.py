@@ -638,6 +638,46 @@ class TestRunBackfill:
 
         mock_curator.close.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_run_backfill_closes_curator_on_error(self):
+        """run_backfill() calls curator.close() even when manager.backfill() raises.
+
+        The RuntimeError must propagate to the caller after close() is called.
+        """
+        import contextlib
+
+        from fused_memory.maintenance.backfill_curator_corpus import BackfillManager, run_backfill
+
+        project_root = '/fake/project'
+        mock_curator = AsyncMock()
+        mock_config = _make_config()
+
+        @contextlib.asynccontextmanager
+        async def fake_maintenance_service(config_path):
+            yield mock_config, MagicMock()
+
+        with patch(
+            'fused_memory.maintenance.backfill_curator_corpus.maintenance_service',
+            new=fake_maintenance_service,
+        ), patch(
+            'fused_memory.maintenance.backfill_curator_corpus.TaskmasterBackend',
+        ) as mock_tm_cls, patch(
+            'fused_memory.maintenance.backfill_curator_corpus.TaskCurator',
+        ) as mock_curator_cls, patch(
+            'fused_memory.maintenance.backfill_curator_corpus.BackfillManager',
+        ) as mock_manager_cls:
+            mock_tm_cls.return_value = AsyncMock()
+            mock_curator_cls.return_value = mock_curator
+
+            mock_manager_instance = AsyncMock()
+            mock_manager_instance.backfill = AsyncMock(side_effect=RuntimeError('backfill failed'))
+            mock_manager_cls.return_value = mock_manager_instance
+
+            with pytest.raises(RuntimeError, match='backfill failed'):
+                await run_backfill(config_path=None, project_root=project_root)
+
+        mock_curator.close.assert_awaited_once()
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Steps 10, 11, 13: TaskInterceptor auto-backfill hook
