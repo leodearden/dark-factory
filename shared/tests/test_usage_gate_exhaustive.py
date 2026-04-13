@@ -353,6 +353,8 @@ class TestNearCapStateDistinction:
         assert gate._accounts[1].near_cap is True
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
+        assert gate._open.is_set() is True
+        assert all(a.resume_task is None for a in gate._accounts)  # wait_for_reset=False (default) → no probe
 
     def test_near_cap_unknown_token_does_not_mark_any_account(self):
         """NEAR_CAP with an explicit unknown oauth_token: detect_cap_hit returns False (no account resolved/mutated)."""
@@ -367,6 +369,8 @@ class TestNearCapStateDistinction:
         assert gate._accounts[1].near_cap is False
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
+        assert gate._open.is_set() is True
+        assert all(a.resume_task is None for a in gate._accounts)  # wait_for_reset=False (default) → no probe
 
     def test_near_cap_no_oauth_token_falls_back_to_first_uncapped(self):
         """NEAR_CAP with oauth_token=None falls back to the first uncapped account."""
@@ -379,6 +383,8 @@ class TestNearCapStateDistinction:
         assert result is True
         assert gate._accounts[0].near_cap is True
         assert gate._accounts[1].near_cap is False
+        assert gate._open.is_set() is True
+        assert all(a.resume_task is None for a in gate._accounts)  # wait_for_reset=False (default) → no probe
 
     def test_near_cap_does_not_start_resume_probe(self):
         """NEAR_CAP must NOT launch a resume probe task."""
@@ -492,6 +498,72 @@ class TestNearCapStateDistinction:
         assert gate._accounts[1].near_cap is False
         assert all(not a.capped for a in gate._accounts)
         assert gate._open.is_set() is True
+
+    def test_near_cap_with_precapped_account_falls_back_to_next_uncapped(self):
+        """NEAR_CAP with oauth_token=None skips the pre-capped account and sets near_cap on 'b'.
+
+        Exercises the ``if not a.capped`` skip branch in ``_resolve_account``'s
+        first-uncapped fallback.  Account 'a' is capped via the real
+        ``_handle_cap_detected`` path (not manual field assignment) before the
+        NEAR_CAP message arrives, so ``_resolve_account(None)`` skips it and
+        returns account 'b'.
+        """
+        gate = make_gate(['a', 'b'])
+        acct_a = gate._accounts[0]
+
+        # Pre-cap account 'a' using the real detection path.
+        gate._handle_cap_detected(
+            'pre-capped', datetime.now(UTC) - timedelta(minutes=1), acct_a.token
+        )
+        assert acct_a.capped is True
+
+        # NEAR_CAP with no token — should fall back to first uncapped account ('b').
+        result = gate.detect_cap_hit(
+            '',
+            "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token=None,
+        )
+
+        assert result is True
+        assert gate._accounts[0].capped is True      # 'a' stays capped
+        assert gate._accounts[0].near_cap is False   # cap clears near_cap; NEAR_CAP did not touch 'a'
+        assert gate._accounts[1].near_cap is True    # 'b' got the near-cap flag
+        assert gate._accounts[1].capped is False     # 'b' is not capped
+        assert gate._open.is_set() is True           # NEAR_CAP must never close the gate
+        assert all(a.resume_task is None for a in gate._accounts)  # wait_for_reset=False → no probe
+
+    def test_near_cap_all_accounts_capped_returns_false(self):
+        """NEAR_CAP with oauth_token=None returns False when all accounts are capped.
+
+        Exercises the edge case where ``_resolve_account(None)`` iterates all accounts,
+        finds every one capped (``if not a.capped`` never passes), and returns ``None``.
+        ``_handle_near_cap_warning`` propagates this as ``False`` — no state is mutated.
+        """
+        gate = make_gate(['a', 'b'])
+        acct_a, acct_b = gate._accounts[0], gate._accounts[1]
+
+        # Pre-cap both accounts via the real detection path.
+        gate._handle_cap_detected(
+            'pre-capped-a', datetime.now(UTC) - timedelta(minutes=2), acct_a.token
+        )
+        gate._handle_cap_detected(
+            'pre-capped-b', datetime.now(UTC) - timedelta(minutes=1), acct_b.token
+        )
+        assert acct_a.capped is True
+        assert acct_b.capped is True
+
+        # NEAR_CAP with no token — _resolve_account returns None, no account mutated.
+        result = gate.detect_cap_hit(
+            '',
+            "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token=None,
+        )
+
+        assert result is False                           # no account was resolved
+        assert acct_a.near_cap is False                 # unchanged
+        assert acct_b.near_cap is False                 # unchanged
+        assert acct_a.capped is True                    # still capped
+        assert acct_b.capped is True                    # still capped
 
 
 # =========================================================================
