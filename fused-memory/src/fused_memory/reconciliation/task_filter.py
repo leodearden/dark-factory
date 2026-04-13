@@ -35,8 +35,7 @@ INACTIVE_TASK_STATUSES: frozenset[str] = frozenset({
 })
 
 # Maximum number of done task dicts to retain in FilteredTaskTree.done_tasks.
-# 30 matches the existing done_tasks[:30] cap in the legacy task_knowledge_sync.py
-# prompt renderer, so switching consumers over later is a no-op for output budget.
+# This is the sole cap on done_tasks; consumers rely on filter_task_tree to enforce it.
 MAX_DONE_TASKS_RETAINED: int = 30
 
 # Maximum number of cancelled task dicts to retain in FilteredTaskTree.cancelled_tasks.
