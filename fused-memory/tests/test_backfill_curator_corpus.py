@@ -506,12 +506,12 @@ class TestBackfillPointIdConsistency:
 
         assert backfill_payload is not None
 
-        # Both paths must produce 'medium' as the canonical default priority
-        assert record_payload['priority'] == 'medium', (
-            f"record_task default priority: expected 'medium', got {record_payload['priority']!r}"
+        # Both paths must produce DEFAULT_PRIORITY as the canonical default priority
+        assert record_payload['priority'] == DEFAULT_PRIORITY, (
+            f"record_task default priority: expected {DEFAULT_PRIORITY!r}, got {record_payload['priority']!r}"
         )
-        assert backfill_payload['priority'] == 'medium', (
-            f"backfill_corpus default priority: expected 'medium', got {backfill_payload['priority']!r}"
+        assert backfill_payload['priority'] == DEFAULT_PRIORITY, (
+            f"backfill_corpus default priority: expected {DEFAULT_PRIORITY!r}, got {backfill_payload['priority']!r}"
         )
 
 
