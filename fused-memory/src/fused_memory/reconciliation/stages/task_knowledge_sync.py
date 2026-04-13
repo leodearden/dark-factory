@@ -146,13 +146,15 @@ Use project_root="{self.project_root}" for all task operations.
 
     @staticmethod
     def _check_filtered_tree_invariant(filtered: FilteredTaskTree) -> None:
-        """Emit a WARNING if done_count > 0 but done_tasks is empty (task-782 defensive check).
+        """Emit a WARNING for each violated done/cancelled count↔tasks invariant.
 
         filter_task_tree() always appends to done_tasks when it increments done_count
-        (capped at MAX_DONE_TASKS_RETAINED=30), so this invariant is impossible to violate
-        via the normal code path.  Externally-constructed FilteredTaskTree instances that
-        bypass filter_task_tree() could violate it; this check catches them at the callsite
-        rather than silently dropping data from the "Recently Completed" section.
+        (capped at MAX_DONE_TASKS_RETAINED=30), and always appends to cancelled_tasks
+        when it increments cancelled_count (capped at MAX_CANCELLED_TASKS_RETAINED=15),
+        so both invariants are impossible to violate via the normal code path.
+        Externally-constructed FilteredTaskTree instances that bypass filter_task_tree()
+        could violate either; these checks catch them at the callsite rather than silently
+        dropping data from the "Recently Completed" or "Recently Cancelled" sections.
         """
         if filtered.done_count > 0 and not filtered.done_tasks:
             logger.warning(
@@ -160,6 +162,13 @@ Use project_root="{self.project_root}" for all task operations.
                 'empty. Externally-constructed tree bypassed filter_task_tree() guarantee. '
                 'Recently Completed section will render as empty. (task-782 defensive check)',
                 filtered.done_count,
+            )
+        if filtered.cancelled_count > 0 and not filtered.cancelled_tasks:
+            logger.warning(
+                'FilteredTaskTree invariant violation: cancelled_count=%d but cancelled_tasks is '
+                'empty. Externally-constructed tree bypassed filter_task_tree() guarantee. '
+                'Recently Cancelled section will render as empty. (task-828 defensive check)',
+                filtered.cancelled_count,
             )
 
 
