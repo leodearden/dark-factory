@@ -1278,8 +1278,8 @@ class TestScrubTaskDirFromTree:
             result = await scrub_task_dir_from_tree(worktree_info.path, 'test-clean')
 
         # Return value must be CLEAN — no tracked .task/ files in tree
-        assert result == ScrubResult.CLEAN, (
-            f'Expected ScrubResult.CLEAN when ls-tree is empty, got {result!r}'
+        assert result.outcome == ScrubOutcome.CLEAN, (
+            f'Expected ScrubOutcome.CLEAN when ls-tree is empty, got {result!r}'
         )
 
         # Filesystem .task/ must still exist — rmtree must NOT have run
