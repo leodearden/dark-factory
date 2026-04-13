@@ -817,10 +817,12 @@ class TestCollectSnapshot:
 
         bad_path = config.tasks_json  # the main project's tasks.json path
 
+        unexpected_calls: list = []
+
         def fake_load(path):
             if path == bad_path:
                 raise PermissionError('Permission denied')
-            pytest.fail(f'Unexpected load_task_tree call for {path}')
+            unexpected_calls.append(path)
 
         with (
             patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
@@ -829,6 +831,8 @@ class TestCollectSnapshot:
         ):
             # Must NOT raise — return_exceptions=True absorbs the PermissionError.
             await collect_snapshot(conn, config)
+
+        assert unexpected_calls == [], f'Unexpected load_task_tree calls: {unexpected_calls}'
 
         # (b) zero rows committed — the only root failed, so snapshots is empty.
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
@@ -839,8 +843,8 @@ class TestCollectSnapshot:
         # (c) at least one WARNING record must name the main project and carry exc_info.
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warning_records, 'Expected at least one WARNING log record'
-        combined = ' '.join(r.getMessage() for r in warning_records)
-        assert str(config.project_root) in combined
+        expected_msg = f'Failed to load tasks for {config.project_root}'
+        assert any(expected_msg in r.getMessage() for r in warning_records), f'No warning record matched expected message: {expected_msg!r}'
         assert any(r.exc_info for r in warning_records)
 
     @pytest.mark.parametrize(
