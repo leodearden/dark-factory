@@ -1316,6 +1316,7 @@ class MemoryService:
                             'total_entities': result.get('total_entities', 0),
                             'stale_entities': result.get('stale_entities', 0),
                             'rebuilt': result.get('rebuilt', 0),
+                            'skipped': result.get('skipped', 0),
                             'errors': result.get('errors', 0),
                         } if success else None,
                         success=success,
