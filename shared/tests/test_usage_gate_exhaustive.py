@@ -449,10 +449,7 @@ class TestNearCapStateDistinction:
         assert acct.near_cap is True
         assert acct.capped is True
 
-        # (3) Override _run_probe to return success immediately
-        gate._run_probe = AsyncMock(return_value=True)
-
-        # (4) Run the probe loop — it should detect resets_at in the past, fire probe, succeed.
+        # (3) Run the probe loop — it should detect resets_at in the past, fire probe, succeed.
         #     asyncio.sleep is patched to a no-op so the test is robust against a future change
         #     that adds a minimum-interval floor.
         #
@@ -469,11 +466,11 @@ class TestNearCapStateDistinction:
         with patch('shared.usage_gate.asyncio.sleep', new_callable=AsyncMock):
             await asyncio.wait_for(gate._account_resume_probe_loop(acct), timeout=5)
 
-        # (5) Account must be uncapped AND near_cap must be cleared — FAIL-BEFORE-FIX assertion
+        # (4) Account must be uncapped AND near_cap must be cleared — FAIL-BEFORE-FIX assertion
         assert acct.capped is False
         assert acct.near_cap is False  # This fails until the fix is applied
 
-        # (6) Re-detect near_cap — proves the flag can be set again after the clear
+        # (5) Re-detect near_cap — proves the flag can be set again after the clear
         gate.detect_cap_hit(
             '', "You're close to reaching your usage limit. Your plan resets in 2h."
         )
