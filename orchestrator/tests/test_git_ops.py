@@ -457,6 +457,8 @@ class TestFreshenMain:
         """When ahead rev-list returns non-numeric stdout, falls back to (main_branch, behind)."""
         git_ops, _origin = git_ops_with_remote
 
+        remote_ref = f'{git_ops.config.remote}/'
+
         async def fake_run(cmd, cwd=None):
             if 'fetch' in cmd:
                 return (0, '', '')           # fetch succeeds
@@ -465,7 +467,7 @@ class TestFreshenMain:
                 #   behind range: <local>..<remote>  (e.g. main..origin/main)
                 #   ahead  range: <remote>..<local>  (e.g. origin/main..main)
                 range_arg = next((arg for arg in cmd if '..' in arg), '')
-                if range_arg.startswith('origin/'):
+                if range_arg.startswith(remote_ref):
                     return (0, 'not-a-number', '')  # ahead rev-list: garbage
                 return (0, '3', '')                 # behind rev-list: 3 behind
             return (0, '', '')
@@ -520,7 +522,7 @@ class TestCreateWorktreeFreshening:
         _, expected_sha, _ = await _run(
             ['git', 'rev-parse', 'origin/main'], cwd=git_ops.project_root,
         )
-        assert worktree_info.base_commit.strip() == expected_sha.strip()
+        assert worktree_info.base_commit == expected_sha
 
     async def test_create_worktree_stale_commits_populated(
         self, git_ops_with_remote: tuple[GitOps, Path],
