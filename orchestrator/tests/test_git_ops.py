@@ -399,6 +399,23 @@ class TestFreshenMain:
         assert ref == git_ops.config.main_branch
         assert stale == 0
 
+    async def test_freshen_main_diverged(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """When local and remote have diverged, returns (main_branch, N) with N behind count."""
+        git_ops, origin = git_ops_with_remote
+        local = git_ops.project_root
+        # Add a local-only commit (not pushed to origin)
+        (local / 'local_only.txt').write_text('local only\n')
+        await _run(['git', 'add', '-A'], cwd=local)
+        await _run(['git', 'commit', '-m', 'Local only commit'], cwd=local)
+        # Add a different commit to origin (creates divergence)
+        await _push_n_commits_to_origin(origin, 1, prefix='remote_div')
+        ref, stale = await git_ops._freshen_main()
+        # Diverged: use local ref to avoid losing advance_main commits
+        assert ref == git_ops.config.main_branch
+        assert stale == 1
+
 
 @pytest.mark.asyncio
 class TestCommitTaskStatuses:
