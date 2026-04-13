@@ -8,7 +8,7 @@ Covers:
 - MCP tool rebuild_entity_summaries             (step 5)
 - DISALLOW_MEMORY_WRITES list                   (step 6)
 - RebuildSummariesManager / run_rebuild_summaries (step 7)
-- GraphitiBackend.get_all_valid_edges()           → see test_refresh_entity_summary.py
+- GraphitiBackend.get_all_valid_edges()           (unit tests in test_refresh_entity_summary.py; used here as a mocked dependency)
 """
 from __future__ import annotations
 
