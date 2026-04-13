@@ -1950,6 +1950,38 @@ class TestMergeToMainScrubFailure:
             f'Expected git stderr in details for operator visibility, got: {result.details!r}'
         )
 
+    async def test_merge_to_main_scrub_failure_no_stderr_fallback(
+        self, git_ops: GitOps,
+    ):
+        """merge_to_main must NOT include '(no stderr)' when scrub error is None.
+
+        When scrub_task_dir_from_tree returns FAILED with error=None (e.g. stderr
+        was empty/whitespace), MergeResult.details must not contain the old
+        '(no stderr)' fallback string. The standardised format_error() helper
+        returns '' in that case, so nothing extra is appended.
+        """
+        worktree_info = await git_ops.create_worktree('scrub-no-stderr-branch')
+        (worktree_info.path / 'ns_test.py').write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, 'Add ns_test file')
+
+        async def fake_scrub_no_error(*args, **kwargs):
+            return ScrubResult(outcome=ScrubOutcome.FAILED)  # error=None
+
+        with patch(
+            'orchestrator.git_ops.scrub_task_dir_from_tree',
+            new=fake_scrub_no_error,
+        ):
+            result = await git_ops.merge_to_main(
+                worktree_info.path, 'scrub-no-stderr-branch',
+            )
+
+        assert result.success is False, (
+            f'Expected success=False on scrub failure, got {result.success!r}'
+        )
+        assert '(no stderr)' not in result.details, (
+            f'Expected no "(no stderr)" fallback in details, got: {result.details!r}'
+        )
+
 
 class TestScrubResultInvariant:
     """Unit tests for ScrubResult.__post_init__ guard.
