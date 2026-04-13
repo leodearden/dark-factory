@@ -418,6 +418,18 @@ class TestFreshenMain:
 
 
 @pytest.mark.asyncio
+class TestCreateWorktreeFreshening:
+    async def test_create_worktree_freshens_from_remote(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """Worktree based on remote ref when origin is ahead — new file is present."""
+        git_ops, origin = git_ops_with_remote
+        await _push_n_commits_to_origin(origin, 1, prefix='fresh')
+        worktree_info = await git_ops.create_worktree('freshen-test')
+        assert (worktree_info.path / 'fresh_0.txt').exists()
+
+
+@pytest.mark.asyncio
 class TestCommitTaskStatuses:
     async def test_commits_changed_tasks_json(self, git_ops: GitOps):
         """commit_task_statuses commits only .taskmaster/tasks/tasks.json."""
