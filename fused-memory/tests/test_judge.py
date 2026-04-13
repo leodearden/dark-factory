@@ -606,3 +606,20 @@ async def test_call_judge_cli_releases_probe_on_nonzero_exit(mock_journal):
 
     gate.release_probe_slot.assert_called_once_with('token-jz')
     gate.confirm_account_ok.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_empty_stdout_confirms_gate(mock_journal):
+    """Empty stdout (exit 0) calls confirm_account_ok and on_agent_complete but not release_probe_slot."""
+    judge, gate = _make_gated_judge(mock_journal, token='token-je')
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = AsyncMock(return_value=(b'', b''))
+
+    with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
+        result = await judge._call_judge_cli('Evaluate this.')
+
+    assert result == ''
+    gate.confirm_account_ok.assert_called_once_with('token-je')
+    gate.on_agent_complete.assert_called_once_with(0.0)
+    gate.release_probe_slot.assert_not_called()
