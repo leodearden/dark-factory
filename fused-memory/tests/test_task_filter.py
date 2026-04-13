@@ -7,6 +7,7 @@ import re
 from fused_memory.reconciliation.task_filter import (
     _STATUS_PRIORITY,
     FilteredTaskTree,
+    _id_key,
     _render_task_line,
     filter_task_tree,
     format_filtered_task_tree,
@@ -957,3 +958,31 @@ class TestRenderTaskLineAndFormatTaskList:
         result = format_task_list([t1, t2])
         expected = _render_task_line(t1) + '\n' + _render_task_line(t2)
         assert result == expected
+
+
+class TestIdKey:
+    """Direct unit tests for the module-level _id_key() helper."""
+
+    def test_int_id_returns_int(self):
+        """_id_key returns the int value when 'id' is already an int."""
+        assert _id_key({'id': 42}) == 42
+
+    def test_string_parseable_id_returns_int(self):
+        """_id_key converts a string-encoded integer to int."""
+        assert _id_key({'id': '42'}) == 42
+
+    def test_non_parseable_string_returns_zero(self):
+        """_id_key returns 0 for a non-parseable string like 'abc'."""
+        assert _id_key({'id': 'abc'}) == 0
+
+    def test_none_id_returns_zero(self):
+        """_id_key returns 0 when 'id' is explicitly None."""
+        assert _id_key({'id': None}) == 0
+
+    def test_missing_id_key_returns_zero(self):
+        """_id_key returns 0 when the 'id' key is absent from the dict."""
+        assert _id_key({}) == 0
+
+    def test_float_id_is_truncated_to_int(self):
+        """_id_key returns the int truncation of a float (int(3.9) == 3)."""
+        assert _id_key({'id': 3.9}) == 3
