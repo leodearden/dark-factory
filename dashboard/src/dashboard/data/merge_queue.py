@@ -175,7 +175,7 @@ async def queue_depth_timeseries(
         rows = await conn.execute_fetchall(
             "SELECT timestamp FROM events "
             "WHERE event_type = 'merge_attempt' AND timestamp >= ?",
-            (cutoff.isoformat(),),
+            (cutoff_aligned.isoformat(),),
         )
 
         # Build count map keyed by ISO bucket label
