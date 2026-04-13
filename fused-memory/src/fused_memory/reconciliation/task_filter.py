@@ -106,13 +106,22 @@ def _flatten_with_subtasks(raw_tasks: list[dict]) -> list[dict]:
     Recursively walks each task's 'subtasks' array.  Bare-integer subtask IDs
     are qualified as 'parent_id.subtask_id' using a shallow copy (originals are
     never mutated).  Already-qualified IDs (containing a dot) are left unchanged.
+    The 'subtasks' key is stripped from each emitted dict so the result is a
+    genuinely flat list (no nested arrays on any entry).
+
+    Note on intentional divergence: ``task_curator._flatten_task_tree`` (line 948)
+    performs a similar recursive walk but does *not* qualify subtask IDs — its
+    purpose is shape normalisation, not ID canonicalisation.  Extracting a shared
+    helper would require an ID-qualification callback and add coupling across
+    package boundaries for minimal gain; the implementations are kept separate.
 
     Args:
         raw_tasks: Top-level list of task dicts from a get_tasks response.
 
     Returns:
         Flat list of task dicts (parents first, subtasks immediately following),
-        with subtask IDs qualified to 'parent_id.subtask_id'.
+        with subtask IDs qualified to 'parent_id.subtask_id' and the 'subtasks'
+        key removed from every entry.
     """
     result: list[dict] = []
 
@@ -125,8 +134,9 @@ def _flatten_with_subtasks(raw_tasks: list[dict]) -> list[dict]:
                 if '.' not in tid:
                     # Bare integer subtask id — qualify it
                     task = {**task, 'id': f'{parent_id}.{tid}'}
-            result.append(task)
+            # Capture subtasks before stripping, then emit a clean flat entry
             subtasks = task.get('subtasks')
+            result.append({k: v for k, v in task.items() if k != 'subtasks'})
             if isinstance(subtasks, list) and subtasks:
                 # Use the (possibly newly qualified) id as parent for next level
                 _walk(subtasks, str(task.get('id', '')))

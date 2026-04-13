@@ -1356,6 +1356,30 @@ class TestFlattenWithSubtasks:
         assert by_id['100.1']['status'] == 'pending'
         assert by_id['100.1.1']['status'] == 'done'
 
+    def test_subtasks_key_stripped_from_flattened_entries(self):
+        """'subtasks' key is absent from every dict in the flattened result.
+
+        The output is a genuinely flat list — no nested arrays on any entry,
+        so downstream consumers of FilteredTaskTree.active_tasks are not
+        surprised by leftover subtask arrays.
+        """
+        raw = [
+            {
+                'id': '450',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [
+                    {'id': 2, 'title': 'Child', 'status': 'pending', 'dependencies': []},
+                ],
+            }
+        ]
+        flat = _flatten_with_subtasks(raw)
+        for entry in flat:
+            assert 'subtasks' not in entry, (
+                f"Entry {entry.get('id')} still has 'subtasks' key after flattening"
+            )
+
 
 class TestSortOrderWithSubtasks:
     """Sort order tests for filter_task_tree when subtasks are present."""
