@@ -11,6 +11,7 @@ import aiosqlite
 import pytest
 
 import dashboard.data.merge_queue as _mqmod
+from tests._dt_helpers import make_fixed_datetime_cls
 
 # ---------------------------------------------------------------------------
 # Schema — events table from orchestrator/src/orchestrator/event_store.py
@@ -1867,10 +1868,7 @@ class TestCutoffIso:
         FIXED_NOW = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
         expected = (FIXED_NOW - timedelta(hours=24)).isoformat()
 
-        class _FixedDT(datetime):
-            @classmethod
-            def now(cls, tz=None):
-                return FIXED_NOW
+        _FixedDT = make_fixed_datetime_cls(FIXED_NOW)
 
         with patch.object(_mqmod, 'datetime', _FixedDT):
             result = _cutoff_iso(24)
