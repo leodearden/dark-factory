@@ -825,6 +825,23 @@ class TestRebuildEntitySummaries:
         svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(group_id='test')
 
     @pytest.mark.asyncio
+    async def test_fail_uuid1_rejects_unexpected_uuid(self, mock_config):
+        """_fail_uuid1 must raise AssertionError for unknown uuids — not silently return Bob's dict.
+
+        RED phase: current _fail_uuid1 returns Bob's dict for ANY uuid != 'uuid-1',
+        so calling with 'uuid-99' returns a dict instead of raising AssertionError.
+        This test fails until _fail_uuid1 is hardened with an explicit elif/else guard.
+        """
+        # Mirrors the current (broken) _fail_uuid1 from test_partial_failure_continues
+        async def _fail_uuid1(uuid, name, edges, *, group_id, old_summary):
+            if uuid == 'uuid-1':
+                raise RuntimeError('FalkorDB timeout')
+            return {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'stale2', 'new_summary': 'current2', 'edge_count': 1}
+
+        with pytest.raises(AssertionError, match='unexpected uuid'):
+            await _fail_uuid1('uuid-99', 'Unknown', [], group_id='test', old_summary='x')
+
+    @pytest.mark.asyncio
     async def test_empty_graph_returns_zero_counts(self, mock_config):
         """No entities means all counts are 0."""
         svc = _make_svc(mock_config)
