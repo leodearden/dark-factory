@@ -699,6 +699,18 @@ class TaskWorkflow:
             )
 
         if not self.plan.get('steps'):
+            # Normalization (in read_plan) didn't help — try a one-shot
+            # repair prompt before blocking.
+            logger.warning(
+                'Task %s: plan has no "steps" after normalization — '
+                'attempting repair prompt',
+                self.task_id,
+            )
+            repaired = await self._repair_plan_schema()
+            if repaired:
+                self.plan = self.artifacts.read_plan()
+
+        if not self.plan.get('steps'):
             plan_dump = json.dumps(self.plan, indent=2)
             logger.error(
                 f'Task {self.task_id}: architect wrote plan.json but missing/empty '
@@ -708,6 +720,9 @@ class TaskWorkflow:
                 'Planning failed: plan missing "steps"',
                 detail=f'Plan content:\n{plan_dump[:4000]}',
             )
+
+        if outcome := await self._validate_prerequisites_or_block('initial plan'):
+            return outcome
 
         # Stamp provenance and acquire lock
         self.artifacts.stamp_plan_provenance(self.session_id)
@@ -744,6 +759,107 @@ class TaskWorkflow:
             f'{len(self.plan.get("steps", []))} steps'
         )
         return WorkflowOutcome.DONE
+
+    async def _validate_prerequisites_or_block(
+        self, context: str
+    ) -> WorkflowOutcome | None:
+        """Validate prerequisites format; block if invalid.
+
+        Encapsulates the try/validate/except/mark-blocked pattern shared by the
+        initial-plan checkpoint and the replan checkpoint, parameterised by a
+        *context* string that appears in log and escalation messages.
+
+        Args:
+            context: Short description for log/error messages, e.g.
+                     ``'initial plan'`` or ``'replan'``.
+
+        Returns:
+            A :class:`WorkflowOutcome` (BLOCKED) if validation fails,
+            ``None`` if prerequisites are valid.
+        """
+        assert self.artifacts is not None
+        try:
+            self.artifacts.validate_plan_prerequisites()
+        except ValueError as exc:
+            plan_dump = json.dumps(self.plan, indent=2)
+            logger.error(
+                f'Task {self.task_id}: {context} produced plan.json with invalid '
+                f'prerequisites — {exc}'
+            )
+            return await self._mark_blocked(
+                f'Planning failed ({context}): invalid prerequisites format — {exc}',
+                detail=f'Plan content:\n{plan_dump[:4000]}',
+            )
+        return None
+
+    async def _repair_plan_schema(self) -> bool:
+        """One-shot attempt to fix a plan that is missing ``steps``.
+
+        Sends the broken plan back to the architect with a focused repair
+        prompt.  Returns True if the repaired plan now has a ``steps`` array.
+        """
+        assert self.artifacts is not None  # caller guarantees
+        assert self.worktree is not None
+
+        broken_plan = self.artifacts.read_plan()
+        if not broken_plan:
+            return False
+
+        plan_path = str(self.worktree / '.task' / 'plan.json')
+        plan_dump = json.dumps(broken_plan, indent=2)[:6000]
+
+        repair_prompt = (
+            'The architect produced a plan that is structurally invalid — '
+            'it is missing the required top-level "steps" array.\n\n'
+            f'Here is the broken plan content:\n\n```json\n{plan_dump}\n```\n\n'
+            'The required schema is:\n'
+            '```json\n'
+            '{\n'
+            '  "task_id": "<task id>",\n'
+            '  "title": "<task title>",\n'
+            '  "files": ["path/to/file1.py"],\n'
+            '  "modules": ["<module1>"],\n'
+            '  "analysis": "<analysis>",\n'
+            '  "prerequisites": [\n'
+            '    {"id": "pre-1", "description": "...", "status": "pending", "commit": null}\n'
+            '  ],\n'
+            '  "steps": [\n'
+            '    {"id": "step-1", "type": "test", "description": "...", "status": "pending", "commit": null},\n'
+            '    {"id": "step-2", "type": "impl", "description": "...", "status": "pending", "commit": null}\n'
+            '  ],\n'
+            '  "design_decisions": [\n'
+            '    {"decision": "...", "rationale": "..."}\n'
+            '  ]\n'
+            '}\n'
+            '```\n\n'
+            'Your job: restructure the existing plan content into the required '
+            'schema.  Do NOT explore the codebase or redesign the plan.  Simply '
+            'reorganize the existing keys and values into the correct shape and '
+            f'write the result to `{plan_path}` using the Write tool.'
+        )
+
+        try:
+            await self._invoke(ARCHITECT, repair_prompt, self.worktree)
+        except Exception as e:
+            logger.warning(
+                'Task %s: repair prompt invocation failed: %s',
+                self.task_id, e,
+            )
+            return False
+
+        repaired_plan = self.artifacts.read_plan()
+        if repaired_plan.get('steps'):
+            logger.info(
+                'Task %s: repair prompt succeeded — plan now has %d steps',
+                self.task_id, len(repaired_plan['steps']),
+            )
+            return True
+
+        logger.warning(
+            'Task %s: repair prompt did not produce a valid "steps" array',
+            self.task_id,
+        )
+        return False
 
     async def _execute_verify_review_loop(self) -> WorkflowOutcome:
         """Execute → Verify → Review loop with retry limits."""
@@ -860,6 +976,8 @@ class TaskWorkflow:
                     'Architect replan produced no valid steps',
                     detail=f'Replan content:\n{plan_dump[:4000]}',
                 )
+            if outcome := await self._validate_prerequisites_or_block('replan'):
+                return outcome
             self.artifacts.stamp_plan_provenance(self.session_id)
             self.metrics.review_cycles += 1
 
@@ -899,7 +1017,7 @@ class TaskWorkflow:
                 s['id']
                 for col in ('prerequisites', 'steps')
                 for s in self.plan.get(col, [])
-                if s.get('status') == 'done'
+                if isinstance(s, dict) and s.get('status') == 'done'
             }
 
             prompt = await self.briefing.build_implementer_prompt(
@@ -923,7 +1041,7 @@ class TaskWorkflow:
                 s['id']
                 for col in ('prerequisites', 'steps')
                 for s in self.plan.get(col, [])
-                if s.get('status') == 'done'
+                if isinstance(s, dict) and s.get('status') == 'done'
             }
             newly_completed = sorted(completed_after - completed_before)
             head_commit = await self._get_head_commit()
@@ -933,7 +1051,7 @@ class TaskWorkflow:
                     s.get('description', s['id'])
                     for col in ('prerequisites', 'steps')
                     for s in self.plan.get(col, [])
-                    if s['id'] in newly_completed
+                    if isinstance(s, dict) and s.get('id') in newly_completed
                 ]
                 summary = '; '.join(step_descs)
             else:
@@ -1015,6 +1133,12 @@ class TaskWorkflow:
             diff = await self.git_ops.get_diff_from_base(self.worktree, base_commit)
         else:
             diff = await self.git_ops.get_diff_from_main(self.worktree)
+
+        if not diff or not diff.strip():
+            logger.info(
+                f'Task {self.task_id}: empty diff — skipping judge invocation'
+            )
+            return None
 
         prompt = await self.briefing.build_completion_judge_prompt(
             plan=self.plan,
@@ -2165,7 +2289,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             parts.append(f"Key decisions: {decision_text}")
 
         steps = self.plan.get('steps', [])
-        done_count = sum(1 for s in steps if s.get('status') == 'done')
+        done_count = sum(1 for s in steps if isinstance(s, dict) and s.get('status') == 'done')
         parts.append(f"Steps completed: {done_count}/{len(steps)}")
 
         if self.modules:

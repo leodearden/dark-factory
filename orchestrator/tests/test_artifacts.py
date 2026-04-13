@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import TaskArtifacts, _normalize_plan
 
 
 @pytest.fixture
@@ -499,3 +499,350 @@ class TestReviews:
         assert agg.has_blocking_issues
         assert agg.reviewer_errors == ['reviewer1']
         assert len(agg.blocking_issues) == 1
+
+
+# --- Prerequisites plans for validate_plan_prerequisites tests ---
+
+VALID_PREREQS = [
+    {'id': 'pre-1', 'description': 'Install deps', 'status': 'pending', 'commit': None, 'tests': []},
+    {'id': 'pre-2', 'description': 'Set up config', 'status': 'done', 'commit': 'abc123', 'tests': []},
+]
+
+STRING_PREREQS_PLAN = {
+    'task_id': 'task-1',
+    'steps': [{'id': 'step-1', 'status': 'pending'}],
+    'prerequisites': ['install deps', 'set up config'],
+}
+
+MIXED_PREREQS_PLAN = {
+    'task_id': 'task-1',
+    'steps': [{'id': 'step-1', 'status': 'pending'}],
+    'prerequisites': [
+        {'id': 'pre-1', 'description': 'Install deps', 'status': 'pending'},
+        'set up config',
+    ],
+}
+
+MISSING_KEYS_PREREQS_PLAN = {
+    'task_id': 'task-1',
+    'steps': [{'id': 'step-1', 'status': 'pending'}],
+    'prerequisites': [
+        {'id': 'pre-1', 'description': 'Install deps'},  # missing 'status'
+    ],
+}
+
+VALID_PREREQS_PLAN = {
+    'task_id': 'task-1',
+    'steps': [{'id': 'step-1', 'status': 'pending'}],
+    'prerequisites': VALID_PREREQS,
+}
+
+NO_PREREQS_PLAN = {
+    'task_id': 'task-1',
+    'steps': [{'id': 'step-1', 'status': 'pending'}],
+}
+
+EMPTY_PREREQS_PLAN = {
+    'task_id': 'task-1',
+    'steps': [{'id': 'step-1', 'status': 'pending'}],
+    'prerequisites': [],
+}
+
+
+class TestValidatePlanPrerequisites:
+    """Tests for validate_plan_prerequisites() method on TaskArtifacts."""
+
+    # --- step-1: plain string list raises ValueError ---
+    def test_raises_for_plain_string_prerequisites(self, artifacts: TaskArtifacts):
+        """All plain-string prerequisites list must raise ValueError."""
+        artifacts.write_plan(STRING_PREREQS_PLAN)
+        with pytest.raises(ValueError, match='prerequisites'):
+            artifacts.validate_plan_prerequisites()
+
+    def test_error_message_includes_index_and_value(self, artifacts: TaskArtifacts):
+        """Error message must include the offending index and value."""
+        artifacts.write_plan(STRING_PREREQS_PLAN)
+        with pytest.raises(ValueError) as exc_info:
+            artifacts.validate_plan_prerequisites()
+        msg = str(exc_info.value)
+        assert '[index 0]' in msg  # first offending index
+        assert 'install deps' in msg.lower()
+
+    # --- step-2: mixed list (some strings, some dicts) raises ValueError ---
+    def test_raises_for_mixed_prerequisites(self, artifacts: TaskArtifacts):
+        """Mixed list with at least one non-dict must raise ValueError."""
+        artifacts.write_plan(MIXED_PREREQS_PLAN)
+        with pytest.raises(ValueError, match='prerequisites'):
+            artifacts.validate_plan_prerequisites()
+
+    def test_mixed_error_identifies_string_item_not_dict(self, artifacts: TaskArtifacts):
+        """Error message pinpoints the string item (index 1), not the valid dict."""
+        artifacts.write_plan(MIXED_PREREQS_PLAN)
+        with pytest.raises(ValueError) as exc_info:
+            artifacts.validate_plan_prerequisites()
+        msg = str(exc_info.value)
+        assert '[index 1]' in msg  # second item (index 1) is the string
+
+    # --- step-3: dicts missing required keys raise ValueError ---
+    def test_raises_for_dict_missing_required_keys(self, artifacts: TaskArtifacts):
+        """Dict prerequisite missing 'status' must raise ValueError."""
+        artifacts.write_plan(MISSING_KEYS_PREREQS_PLAN)
+        with pytest.raises(ValueError, match='prerequisites'):
+            artifacts.validate_plan_prerequisites()
+
+    def test_error_message_mentions_missing_key(self, artifacts: TaskArtifacts):
+        """Error message must identify which key is missing."""
+        artifacts.write_plan(MISSING_KEYS_PREREQS_PLAN)
+        with pytest.raises(ValueError) as exc_info:
+            artifacts.validate_plan_prerequisites()
+        msg = str(exc_info.value)
+        assert 'status' in msg
+
+    # --- step-4: valid / absent prerequisites pass silently ---
+    def test_passes_for_valid_dict_prerequisites(self, artifacts: TaskArtifacts):
+        """All required-key dicts must pass without raising."""
+        artifacts.write_plan(VALID_PREREQS_PLAN)
+        result = artifacts.validate_plan_prerequisites()
+        assert result is None
+
+    def test_passes_when_prerequisites_absent(self, artifacts: TaskArtifacts):
+        """Plan with no 'prerequisites' key must pass without raising."""
+        artifacts.write_plan(NO_PREREQS_PLAN)
+        result = artifacts.validate_plan_prerequisites()
+        assert result is None
+
+    def test_passes_for_empty_prerequisites_list(self, artifacts: TaskArtifacts):
+        """Empty prerequisites list must pass without raising."""
+        artifacts.write_plan(EMPTY_PREREQS_PLAN)
+        result = artifacts.validate_plan_prerequisites()
+        assert result is None
+
+
+class TestNormalizePlan:
+    """Tests for _normalize_plan() — auto-fixing malformed architect output."""
+
+    def test_tdd_steps_renamed(self):
+        plan = {
+            'task_id': '1',
+            'tdd_steps': [
+                {'id': 'step-1', 'description': 'Write test', 'status': 'pending'},
+            ],
+        }
+        result, modified = _normalize_plan(plan)
+        assert modified is True
+        assert 'tdd_steps' not in result
+        assert len(result['steps']) == 1
+        assert result['steps'][0]['id'] == 'step-1'
+
+    def test_tdd_plan_renamed(self):
+        plan = {
+            'task_id': '2',
+            'tdd_plan': [
+                {'id': 'step-1', 'description': 'Impl', 'status': 'pending'},
+            ],
+        }
+        result, modified = _normalize_plan(plan)
+        assert modified is True
+        assert 'tdd_plan' not in result
+        assert result['steps'][0]['id'] == 'step-1'
+
+    def test_implementation_steps_renamed(self):
+        plan = {
+            'task_id': '3',
+            'implementation_steps': [
+                {'id': 'step-1', 'description': 'Do thing', 'status': 'pending'},
+            ],
+        }
+        result, modified = _normalize_plan(plan)
+        assert modified is True
+        assert result['steps'][0]['id'] == 'step-1'
+
+    def test_nested_phases_flattened(self):
+        plan = {
+            'task_id': '4',
+            'tdd_implementation_plan': {
+                'phase_0_verification': [
+                    'Verify config is clean',
+                    'Verify imports',
+                ],
+                'phase_1_red': {
+                    'description': 'Write failing test for X',
+                },
+                'phase_2_green': [
+                    {'id': 'impl-1', 'description': 'Implement X'},
+                ],
+            },
+        }
+        result, modified = _normalize_plan(plan)
+        assert modified is True
+        assert 'tdd_implementation_plan' not in result
+        steps = result['steps']
+        # 2 strings from phase_0, 1 dict from phase_1, 1 dict from phase_2
+        assert len(steps) == 4
+        # All items are dicts with id and status
+        for s in steps:
+            assert isinstance(s, dict)
+            assert 'id' in s
+            assert 'status' in s
+
+    def test_string_prerequisites_left_as_is(self):
+        """String prerequisites are NOT normalized (Rule 4 removed).
+
+        validate_plan_prerequisites() now rejects them with a clear error
+        instead of silently coercing.
+        """
+        plan = {
+            'task_id': '5',
+            'steps': [{'id': 'step-1', 'status': 'pending'}],
+            'prerequisites': [
+                'Confirm no ruff D-rules',
+                'Confirm docstring is clean',
+            ],
+        }
+        result, modified = _normalize_plan(plan)
+        assert modified is False
+        prereqs = result['prerequisites']
+        assert len(prereqs) == 2
+        assert prereqs[0] == 'Confirm no ruff D-rules'
+        assert prereqs[1] == 'Confirm docstring is clean'
+
+    def test_string_steps_wrapped(self):
+        plan = {
+            'task_id': '6',
+            'steps': ['Write test', 'Implement feature'],
+        }
+        result, modified = _normalize_plan(plan)
+        assert modified is True
+        assert result['steps'][0]['description'] == 'Write test'
+        assert result['steps'][0]['id'] == 'step-1'
+        assert result['steps'][1]['description'] == 'Implement feature'
+
+    def test_valid_plan_unchanged(self):
+        plan = {
+            'task_id': '7',
+            'steps': [
+                {'id': 'step-1', 'status': 'pending', 'commit': None},
+            ],
+            'prerequisites': [
+                {'id': 'pre-1', 'status': 'done', 'commit': 'abc'},
+            ],
+        }
+        result, modified = _normalize_plan(plan)
+        assert modified is False
+        assert result == plan
+
+    def test_string_prerequisites_not_normalized(self):
+        """String prerequisites are NOT wrapped by _normalize_plan (Rule 4 removed).
+
+        String prerequisites are now rejected by validate_plan_prerequisites()
+        rather than silently coerced into dicts.
+        """
+        plan = {
+            'task_id': '8',
+            'steps': [{'id': 'step-1', 'status': 'pending'}],
+            'prerequisites': [
+                {'id': 'pre-1', 'description': 'Already a dict', 'status': 'done'},
+                'A string prerequisite',
+            ],
+        }
+        result, modified = _normalize_plan(plan)
+        assert modified is False
+        prereqs = result['prerequisites']
+        assert prereqs[0]['id'] == 'pre-1'
+        assert prereqs[1] == 'A string prerequisite'
+
+    def test_empty_plan_unchanged(self):
+        plan: dict = {}
+        result, modified = _normalize_plan(plan)
+        assert modified is False
+        assert result == {}
+
+    def test_alias_not_applied_when_steps_already_exists(self):
+        """tdd_steps is NOT renamed if steps already exists."""
+        plan = {
+            'task_id': '9',
+            'steps': [{'id': 'step-1', 'status': 'pending'}],
+            'tdd_steps': [{'id': 'extra-1', 'status': 'pending'}],
+        }
+        result, modified = _normalize_plan(plan)
+        # tdd_steps is left alone since steps is present
+        assert 'tdd_steps' in result
+        assert len(result['steps']) == 1
+
+
+class TestPlanNormalizationIntegration:
+    """Tests that read_plan() triggers normalization and writes back."""
+
+    def test_read_plan_writes_back_when_normalized(self, artifacts: TaskArtifacts):
+        # Write a malformed plan directly (bypass write_plan to skip schema version)
+        raw = {'task_id': 'task-1', 'tdd_steps': [{'id': 'step-1', 'status': 'pending'}]}
+        (artifacts.root / 'plan.json').write_text(json.dumps(raw))
+
+        plan = artifacts.read_plan()
+        assert 'steps' in plan
+        assert 'tdd_steps' not in plan
+
+        # Re-read from disk — should now be normalized
+        raw_on_disk = json.loads((artifacts.root / 'plan.json').read_text())
+        assert 'steps' in raw_on_disk
+        assert 'tdd_steps' not in raw_on_disk
+
+    def test_read_plan_no_write_when_valid(self, artifacts: TaskArtifacts):
+        valid = {
+            'task_id': 'task-1',
+            'steps': [{'id': 'step-1', 'status': 'pending'}],
+        }
+        (artifacts.root / 'plan.json').write_text(json.dumps(valid))
+        import os
+        mtime_before = os.path.getmtime(artifacts.root / 'plan.json')
+
+        artifacts.read_plan()
+
+        mtime_after = os.path.getmtime(artifacts.root / 'plan.json')
+        assert mtime_before == mtime_after
+
+
+class TestStringItemResilience:
+    """Verify iteration methods don't crash when prerequisites/steps contain strings."""
+
+    def test_update_step_status_survives_string_items(self, artifacts: TaskArtifacts):
+        plan = {
+            'task_id': 'task-1',
+            'prerequisites': ['A string prerequisite'],
+            'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}],
+        }
+        # Write raw to bypass normalization in write_plan
+        (artifacts.root / 'plan.json').write_text(json.dumps(plan))
+
+        # Should not crash — string items are skipped
+        artifacts.update_step_status('step-1', 'done', commit='abc')
+
+    def test_get_pending_steps_survives_string_items(self, artifacts: TaskArtifacts):
+        plan = {
+            'task_id': 'task-1',
+            'prerequisites': ['String prereq'],
+            'steps': [
+                'String step',
+                {'id': 'step-1', 'status': 'pending', 'commit': None},
+            ],
+        }
+        (artifacts.root / 'plan.json').write_text(json.dumps(plan))
+
+        # read_plan normalizes steps (Rule 5) but not prerequisites (Rule 4 removed);
+        # string prerequisites are skipped by the isinstance guard in get_pending_steps
+        pending = artifacts.get_pending_steps()
+        assert len(pending) >= 1
+
+    def test_get_completed_steps_survives_string_items(self, artifacts: TaskArtifacts):
+        plan = {
+            'task_id': 'task-1',
+            'prerequisites': ['String prereq'],
+            'steps': [
+                {'id': 'step-1', 'status': 'done', 'commit': 'abc'},
+            ],
+        }
+        (artifacts.root / 'plan.json').write_text(json.dumps(plan))
+
+        completed = artifacts.get_completed_steps()
+        assert len(completed) == 1
+        assert completed[0]['id'] == 'step-1'

@@ -933,7 +933,7 @@ class TestRunProbe:
 
         Deliberate asymmetry with detect_cap_hit:
         - detect_cap_hit requires BOTH a prefix AND a confirm keyword ('resets', 'usage
-          limit', 'upgrade') to avoid false positives on generic phrases.
+          limit', 'upgrade your plan') to avoid false positives on generic phrases.
         - _run_probe intentionally does NOT apply the confirm-keyword guard.  The probe
           runs only while an account is already capped; any whiff of a cap prefix in the
           probe output means the account is still capped and we must NOT unpause it.
@@ -947,7 +947,7 @@ class TestRunProbe:
         """
         gate, acct = await self._make_probing_gate()
         prefix = CAP_HIT_PREFIXES[0]  # e.g. "You've hit your"
-        # Deliberately no 'resets', 'usage limit', or 'upgrade' in the string.
+        # Deliberately no 'resets', 'usage limit', or 'upgrade your plan' in the string.
         stderr_content = f'{prefix} quota'.encode()
         proc = _make_mock_proc(returncode=0, stderr=stderr_content)
 
