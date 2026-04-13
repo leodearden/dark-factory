@@ -42,7 +42,11 @@ def mock_config():
     config.fused_memory.url = 'http://localhost:8002'
     config.fused_memory.project_id = 'dark_factory'
     config.steward_lifetime_budget = 12.0
-    config.steward_max_attempts = 3
+    # Matches production default (OrchestratorConfig.steward_max_attempts=1).
+    # Safe to use as the global default: tests that exercise the retry guard set
+    # steward_max_attempts explicitly; tests that don't either resolve successfully,
+    # start with retry_count=0 (0 >= 1 is False), or hit the budget guard first.
+    config.steward_max_attempts = 1
     config.steward_completion_timeout = 300.0
     config.steward_max_timeouts_per_escalation = 3
     config.timeouts.steward = 1800.0
@@ -414,37 +418,48 @@ class TestStewardRetryLogic:
 
         assert steward._retry_counts.get('esc-42-1') == 1
 
-    async def test_auto_escalates_after_max_attempts(self, steward, mock_config):
-        mock_config.steward_max_attempts = 2
-        esc = _make_escalation()
-        steward._retry_counts['esc-42-1'] = 2
-
-        await steward._handle_escalation(esc)
-
-        steward.escalation_queue.submit.assert_called_once()
-        submitted = steward.escalation_queue.submit.call_args[0][0]
-        assert submitted.level == 1
-        assert 'Failed after 2 attempts' in submitted.summary
-
-        steward.escalation_queue.resolve.assert_called_once()
-        assert steward.escalation_queue.resolve.call_args[1].get('dismiss') is True
-
-    async def test_auto_escalates_after_one_attempt_with_default_retries(
-        self, steward, mock_config,
+    @pytest.mark.parametrize('max_attempts', [1, 2, 3])
+    async def test_auto_escalates_after_max_attempts(
+        self, steward, mock_config, max_attempts,
     ):
-        mock_config.steward_max_attempts = 1
+        mock_config.steward_max_attempts = max_attempts
         esc = _make_escalation()
-        steward._retry_counts['esc-42-1'] = 1
+        steward._retry_counts['esc-42-1'] = max_attempts
 
         await steward._handle_escalation(esc)
 
         steward.escalation_queue.submit.assert_called_once()
         submitted = steward.escalation_queue.submit.call_args[0][0]
         assert submitted.level == 1
-        assert 'Failed after 1 attempt:' in submitted.summary
+        expected = f'Failed after {max_attempts} attempt{"s" if max_attempts != 1 else ""}:'
+        assert expected in submitted.summary
 
         steward.escalation_queue.resolve.assert_called_once()
         assert steward.escalation_queue.resolve.call_args[1].get('dismiss') is True
+
+    @pytest.mark.parametrize('max_attempts', [1, 2, 3])
+    async def test_retry_guard_does_not_fire_when_below_cap(
+        self, steward, mock_config, max_attempts,
+    ):
+        """Guard must NOT auto-escalate when retry_count is strictly below max_attempts.
+
+        Boundary: retry_count = max_attempts - 1 must take the normal invocation
+        path, leaving escalation_queue.submit uncalled.
+        """
+        mock_config.steward_max_attempts = max_attempts
+        esc = _make_escalation()
+        # One below the cap — guard condition (retry_count >= max_attempts) is False.
+        steward._retry_counts['esc-42-1'] = max_attempts - 1
+        steward.escalation_queue.get.return_value = _make_escalation(status='pending')
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result()
+            await steward._handle_escalation(esc)
+
+        # Guard must NOT have fired.
+        steward.escalation_queue.submit.assert_not_called()
+        # Normal invocation path must have been taken.
+        mock_invoke.assert_called_once()
 
     async def test_different_escalations_have_independent_counts(self, steward):
         for esc_id in ('esc-42-1', 'esc-42-2'):
