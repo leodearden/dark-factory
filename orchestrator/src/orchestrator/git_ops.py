@@ -372,9 +372,21 @@ class GitOps:
             cwd=self.project_root,
         )
 
-        # Capture main's current SHA before creating worktree
+        # ── Freshen main from remote (best-effort) ────────────────────
+        # If origin/main has advanced since session start, use the remote-
+        # tracking ref as the worktree base so agents start from the freshest
+        # code.  Falls back to local main silently when no remote is configured
+        # (e.g. in test repos).  Never mutates the local main ref — that would
+        # interfere with advance_main's CAS logic.
+        start_ref, stale_commits = await self._freshen_main()
+        logger.info(
+            'create_worktree: freshening result: ref=%s, stale_commits=%s',
+            start_ref, stale_commits,
+        )
+
+        # Capture the freshened ref's SHA (used as stable base for diffs)
         _, base_sha, _ = await _run(
-            ['git', 'rev-parse', self.config.main_branch],
+            ['git', 'rev-parse', start_ref],
             cwd=self.project_root,
         )
 
@@ -386,7 +398,11 @@ class GitOps:
             if await self._is_registered_worktree(worktree_path):
                 logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
                 _ensure_task_gitignore(worktree_path)
-                return WorktreeInfo(path=worktree_path, base_commit=base_sha)
+                return WorktreeInfo(
+                    path=worktree_path,
+                    base_commit=base_sha,
+                    stale_commits=stale_commits,
+                )
             else:
                 logger.warning(
                     f'Directory {worktree_path} exists but is NOT a registered '
@@ -403,15 +419,18 @@ class GitOps:
             logger.info(f'Cleaning up stale branch {full_branch} before creating worktree')
             await _run(['git', 'branch', '-D', full_branch], cwd=self.project_root)
 
-        # Create worktree with new branch from main
+        # Create worktree with new branch from the freshened ref
         rc, out, err = await _run(
-            ['git', 'worktree', 'add', '-b', full_branch, str(worktree_path), self.config.main_branch],
+            ['git', 'worktree', 'add', '-b', full_branch, str(worktree_path), start_ref],
             cwd=self.project_root,
         )
         if rc != 0:
             raise RuntimeError(f'Failed to create worktree: {err}')
 
-        logger.info(f'Created worktree at {worktree_path} on branch {full_branch} (base={base_sha[:8]})')
+        logger.info(
+            'Created worktree at %s on branch %s (base=%s, stale_commits=%s)',
+            worktree_path, full_branch, base_sha[:8], stale_commits,
+        )
 
         # ── .task/.gitignore defense layer ────────────────────────────
         # Create .task/.gitignore with "*" so that broad "git add ."
@@ -446,7 +465,11 @@ class GitOps:
                 scrub_result.error or '(no stderr)',
             )
 
-        return WorktreeInfo(path=worktree_path, base_commit=base_sha)
+        return WorktreeInfo(
+            path=worktree_path,
+            base_commit=base_sha,
+            stale_commits=stale_commits,
+        )
 
     async def commit(self, worktree: Path, message: str) -> str | None:
         """Stage all changes and commit. Returns sha or None if nothing to commit.
