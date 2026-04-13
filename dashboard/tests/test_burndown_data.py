@@ -692,15 +692,13 @@ class TestCollectSnapshot:
 
     @pytest.mark.asyncio
     async def test_gather_partial_failure_skips_bad_project(self, burndown_conn_with_config):
-        """One load_task_tree raises OSError; collect_snapshot must either raise
-        cleanly (pre-fix: asyncio.gather propagates the first exception) OR skip
-        the bad project and insert healthy rows (post-fix: return_exceptions=True).
-        Either branch holds the invariant: the failing project never appears in
-        the snapshot table, and no other project is silently corrupted.
+        """One load_task_tree raises OSError; collect_snapshot skips the failing
+        project and inserts healthy rows for the remaining projects.
 
-        This test will exercise different branches before and after Task 519
-        lands. Once 519 is confirmed done a follow-up task can tighten it to
-        only the post-fix branch.
+        Invariant (post Task 519): asyncio.gather(return_exceptions=True) plus
+        per-project isinstance guard mean collect_snapshot does not raise, the
+        failing project is cleanly excluded from the snapshot, and healthy
+        projects are snapshotted normally.
         """
         reify_root = Path('/nonexistent/known/reify')
         autopilot_root = Path('/nonexistent/known/autopilot')
@@ -708,7 +706,6 @@ class TestCollectSnapshot:
         # The path that will raise OSError — reify is the failing root.
         bad_path = reify_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
 
-        raised_oserror = False
         async with burndown_conn_with_config(known_project_roots=[reify_root, autopilot_root]) as (db_path, config, conn):
             # Only map the two healthy roots; the failing root is intentionally absent.
             _tasks_map = {
@@ -725,30 +722,17 @@ class TestCollectSnapshot:
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
-                try:
-                    await collect_snapshot(conn, config)
-                except OSError:
-                    raised_oserror = True
+                await collect_snapshot(conn, config)
 
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
 
             project_ids = {row['project_id'] for row in rows}
 
-            if raised_oserror:
-                # Pre-fix behavior (task 519 not yet landed): asyncio.gather re-raises
-                # the first OSError, so Phase 3 never runs and no rows are inserted.
-                # The invariant is: the failing project's data never appears in the
-                # table, and no partial state is committed.
-                assert len(rows) == 0
-            else:
-                # Post-fix behavior (task 519 landed): return_exceptions=True + per-
-                # project skip means healthy projects are still snapshotted and the
-                # failing project is cleanly excluded.
-                assert len(rows) == 2
-                assert str(reify_root.resolve()) not in project_ids
-                assert str(config.project_root) in project_ids
-                assert str(autopilot_root.resolve()) in project_ids
+            assert len(rows) == 2
+            assert str(reify_root.resolve()) not in project_ids
+            assert str(config.project_root) in project_ids
+            assert str(autopilot_root.resolve()) in project_ids
 
     @pytest.mark.asyncio
     async def test_gather_return_exceptions_preserves_healthy_snapshots(self, burndown_conn_with_config, caplog):
