@@ -2107,6 +2107,55 @@ class TestInvariantAfterTask643:
         return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': []}
 
     @pytest.mark.asyncio
+    async def test_warns_when_filtered_task_tree_violates_cancelled_invariant(
+        self, mock_deps, watermark, caplog
+    ):
+        """Integration guard: a FilteredTaskTree with cancelled_count>0 but empty cancelled_tasks triggers a WARNING.
+
+        This test exercises the full ``assemble_payload`` method intentionally — it
+        verifies that ``_check_filtered_tree_invariant`` is correctly wired into the
+        ``assemble_payload`` call chain for the cancelled pair, not just that the helper
+        itself works.  For isolated testing of the helper, see
+        ``test_check_filtered_tree_invariant_warns_on_cancelled_violation``.
+
+        The invariant-violating state can only be reached by external callers that
+        construct a ``FilteredTaskTree`` directly (bypassing ``filter_task_tree``).
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        # Construct invariant-violating tree: cancelled_count > 0 but cancelled_tasks is empty.
+        # This state is impossible via filter_task_tree() but can arise from external
+        # construction — exactly the case the task-828 defensive check guards against.
+        stage.filtered_task_tree = FilteredTaskTree(
+            active_tasks=[self._make_task(1, 'in-progress')],
+            done_tasks=[],
+            done_count=0,
+            cancelled_tasks=[],
+            cancelled_count=4,
+            other_count=0,
+            total_count=5,
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await stage.assemble_payload([], watermark, [])
+
+        assert any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'cancelled_count' in rec.message
+            and 'cancelled_tasks' in rec.message
+            for rec in caplog.records
+        ), (
+            'Expected a WARNING about cancelled_count/cancelled_tasks invariant from '
+            'fused_memory.reconciliation.stages.task_knowledge_sync, '
+            f'got records: {[(r.name, r.levelno, r.message) for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
     async def test_warns_when_filtered_task_tree_violates_invariant(
         self, mock_deps, watermark, caplog
     ):
