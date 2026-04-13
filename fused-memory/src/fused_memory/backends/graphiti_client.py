@@ -823,13 +823,15 @@ class GraphitiBackend:
 
     @staticmethod
     def _canonical_facts(edges: Sequence[Mapping[str, Any]]) -> list[str]:
-        """Deduplicate edge facts preserving insertion order, skipping missing/falsy values.
+        """Deduplicate edge facts preserving insertion order, skipping missing, empty, or whitespace-only values.
 
         Args:
             edges: List of edge dicts, each optionally containing a 'fact' key.
 
         Returns:
             List of unique non-empty fact strings in their first-seen order.
+            Whitespace-only strings are excluded; values are preserved verbatim
+            (not stripped) in the output.
         """
         return list(dict.fromkeys(e['fact'] for e in edges if (e.get('fact') or '').strip()))
 
