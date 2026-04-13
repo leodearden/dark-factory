@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 # ---------------------------------------------------------------------------
 # Schema — events table from orchestrator/src/orchestrator/event_store.py
@@ -769,6 +770,34 @@ class TestMultiDbAggregation:
         conn.close()
         return db_path
 
+    def _make_broken_mock(self):
+        """Return a mock connection that raises on any real method call.
+
+        The mock just needs to cause *some* exception that escapes with_db() —
+        the exact failure point doesn't matter.  asyncio.gather(return_exceptions=True)
+        catches BaseException at the coroutine level, so any unhandled exception
+        (TypeError from awaiting a non-async attribute, RuntimeError from
+        execute_fetchall, etc.) is silently skipped by the aggregators.
+        """
+        broken = MagicMock()
+        broken.execute_fetchall = AsyncMock(side_effect=RuntimeError('simulated broken DB'))
+        return broken
+
+    async def _run_with_one_broken_db(self, tmp_path, aggregate_fn, events, **kwargs):
+        """Scaffold for resilience tests: one valid DB + one broken mock connection."""
+        db1 = self._make_db(tmp_path, 'runs1.db', events)
+        broken = self._make_broken_mock()
+        async with aiosqlite.connect(str(db1)) as conn1:
+            conn1.row_factory = aiosqlite.Row
+            return await aggregate_fn([conn1, broken], **kwargs)
+
+    async def _run_with_none_entry(self, tmp_path, aggregate_fn, events, **kwargs):
+        """Scaffold for None-entry tests: one valid DB + None in dbs list."""
+        db1 = self._make_db(tmp_path, 'runs1.db', events)
+        async with aiosqlite.connect(str(db1)) as conn1:
+            conn1.row_factory = aiosqlite.Row
+            return await aggregate_fn([conn1, None], **kwargs)
+
     @pytest.mark.asyncio
     async def test_aggregate_queue_depth_timeseries(self, tmp_path):
         """Counts per bucket sum across two DBs."""
@@ -1141,27 +1170,17 @@ class TestMultiDbAggregation:
         """aggregate_queue_depth_timeseries silently skips a DB whose coroutine
         raises RuntimeError (escapes with_db) via gather(return_exceptions=True).
         """
-        from unittest.mock import AsyncMock, MagicMock
-
         now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
         cutoff = now - timedelta(hours=24)
         bucket = _bucket_start(cutoff) + timedelta(hours=22)
-
-        db1 = self._make_db(tmp_path, 'runs1.db', [
+        events = [
             {'event_type': 'merge_attempt',
              'timestamp': bucket + timedelta(minutes=1),
              'data': {'outcome': 'done'}},
-        ])
-
-        broken_mock = MagicMock()
-        broken_mock.execute_fetchall = AsyncMock(side_effect=RuntimeError('simulated broken DB'))
-
-        async with aiosqlite.connect(str(db1)) as conn1:
-            conn1.row_factory = aiosqlite.Row
-            result = await aggregate_queue_depth_timeseries(
-                [conn1, broken_mock], hours=24, now=now,
-            )
-
+        ]
+        result = await self._run_with_one_broken_db(
+            tmp_path, aggregate_queue_depth_timeseries, events, hours=24, now=now,
+        )
         # Broken DB error was silently skipped — no exception raised
         assert len(result['labels']) == 97
         bucket_label = bucket.isoformat()
@@ -1172,23 +1191,16 @@ class TestMultiDbAggregation:
     @pytest.mark.asyncio
     async def test_one_db_raises_outcome_distribution(self, tmp_path):
         """aggregate_outcome_distribution silently skips a broken DB."""
-        from unittest.mock import AsyncMock, MagicMock
-
         now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
+        events = [
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
              'data': {'outcome': 'done'}},
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
              'data': {'outcome': 'done'}},
-        ])
-
-        broken_mock = MagicMock()
-        broken_mock.execute_fetchall = AsyncMock(side_effect=RuntimeError('simulated broken DB'))
-
-        async with aiosqlite.connect(str(db1)) as conn1:
-            conn1.row_factory = aiosqlite.Row
-            result = await aggregate_outcome_distribution([conn1, broken_mock], hours=24)
-
+        ]
+        result = await self._run_with_one_broken_db(
+            tmp_path, aggregate_outcome_distribution, events, hours=24,
+        )
         assert 'done' in result['labels']
         done_idx = result['labels'].index('done')
         assert result['values'][done_idx] == 2  # only from valid DB
@@ -1196,46 +1208,32 @@ class TestMultiDbAggregation:
     @pytest.mark.asyncio
     async def test_one_db_raises_latency_stats(self, tmp_path):
         """aggregate_latency_stats silently skips a broken DB."""
-        from unittest.mock import AsyncMock, MagicMock
-
         now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
+        events = [
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
              'data': {'outcome': 'done'}, 'duration_ms': 100},
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
              'data': {'outcome': 'done'}, 'duration_ms': 200},
-        ])
-
-        broken_mock = MagicMock()
-        broken_mock.execute_fetchall = AsyncMock(side_effect=RuntimeError('simulated broken DB'))
-
-        async with aiosqlite.connect(str(db1)) as conn1:
-            conn1.row_factory = aiosqlite.Row
-            result = await aggregate_latency_stats([conn1, broken_mock], hours=24)
-
+        ]
+        result = await self._run_with_one_broken_db(
+            tmp_path, aggregate_latency_stats, events, hours=24,
+        )
         assert result['count'] == 2
         assert result['mean_ms'] == pytest.approx(150.0, abs=1e-6)
 
     @pytest.mark.asyncio
     async def test_one_db_raises_recent_merges(self, tmp_path):
         """aggregate_recent_merges silently skips a broken DB."""
-        from unittest.mock import AsyncMock, MagicMock
-
         now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
+        events = [
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=1),
              'task_id': 'task-x', 'data': {'outcome': 'done'}},
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=2),
              'task_id': 'task-y', 'data': {'outcome': 'done'}},
-        ])
-
-        broken_mock = MagicMock()
-        broken_mock.execute_fetchall = AsyncMock(side_effect=RuntimeError('simulated broken DB'))
-
-        async with aiosqlite.connect(str(db1)) as conn1:
-            conn1.row_factory = aiosqlite.Row
-            result = await aggregate_recent_merges([conn1, broken_mock], limit=20)
-
+        ]
+        result = await self._run_with_one_broken_db(
+            tmp_path, aggregate_recent_merges, events, limit=20,
+        )
         assert len(result) == 2
         # Newest first
         assert result[0]['task_id'] == 'task-x'
@@ -1244,23 +1242,16 @@ class TestMultiDbAggregation:
     @pytest.mark.asyncio
     async def test_one_db_raises_speculative_stats(self, tmp_path):
         """aggregate_speculative_stats silently skips a broken DB."""
-        from unittest.mock import AsyncMock, MagicMock
-
         now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
+        events = [
             {'event_type': 'speculative_merge', 'timestamp': now - timedelta(minutes=1),
              'data': {'base_sha': 'abc'}},
             {'event_type': 'speculative_merge', 'timestamp': now - timedelta(minutes=2),
              'data': {'base_sha': 'def'}},
-        ])
-
-        broken_mock = MagicMock()
-        broken_mock.execute_fetchall = AsyncMock(side_effect=RuntimeError('simulated broken DB'))
-
-        async with aiosqlite.connect(str(db1)) as conn1:
-            conn1.row_factory = aiosqlite.Row
-            result = await aggregate_speculative_stats([conn1, broken_mock], hours=24)
-
+        ]
+        result = await self._run_with_one_broken_db(
+            tmp_path, aggregate_speculative_stats, events, hours=24,
+        )
         assert result['hit_count'] == 2
         assert result['discard_count'] == 0
         assert result['total'] == 2
@@ -1310,17 +1301,14 @@ class TestMultiDbAggregation:
         now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
         cutoff = now - timedelta(hours=24)
         bucket = _bucket_start(cutoff) + timedelta(hours=22)
-
-        db1 = self._make_db(tmp_path, 'runs1.db', [
+        events = [
             {'event_type': 'merge_attempt',
              'timestamp': bucket + timedelta(minutes=1),
              'data': {'outcome': 'done'}},
-        ])
-
-        async with aiosqlite.connect(str(db1)) as conn1:
-            conn1.row_factory = aiosqlite.Row
-            result = await aggregate_queue_depth_timeseries([conn1, None], hours=24, now=now)
-
+        ]
+        result = await self._run_with_none_entry(
+            tmp_path, aggregate_queue_depth_timeseries, events, hours=24, now=now,
+        )
         assert len(result['labels']) == 97
         bucket_label = bucket.isoformat()
         assert bucket_label in result['labels']
@@ -1331,17 +1319,15 @@ class TestMultiDbAggregation:
     async def test_none_entry_outcome_distribution(self, tmp_path):
         """aggregate_outcome_distribution with [valid_conn, None] merges cleanly."""
         now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
+        events = [
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
              'data': {'outcome': 'done'}},
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
              'data': {'outcome': 'done'}},
-        ])
-
-        async with aiosqlite.connect(str(db1)) as conn1:
-            conn1.row_factory = aiosqlite.Row
-            result = await aggregate_outcome_distribution([conn1, None], hours=24)
-
+        ]
+        result = await self._run_with_none_entry(
+            tmp_path, aggregate_outcome_distribution, events, hours=24,
+        )
         assert 'done' in result['labels']
         done_idx = result['labels'].index('done')
         assert result['values'][done_idx] == 2  # from valid DB only
@@ -1350,17 +1336,15 @@ class TestMultiDbAggregation:
     async def test_none_entry_latency_stats(self, tmp_path):
         """aggregate_latency_stats with [valid_conn, None] merges cleanly."""
         now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
+        events = [
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
              'data': {'outcome': 'done'}, 'duration_ms': 100},
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
              'data': {'outcome': 'done'}, 'duration_ms': 200},
-        ])
-
-        async with aiosqlite.connect(str(db1)) as conn1:
-            conn1.row_factory = aiosqlite.Row
-            result = await aggregate_latency_stats([conn1, None], hours=24)
-
+        ]
+        result = await self._run_with_none_entry(
+            tmp_path, aggregate_latency_stats, events, hours=24,
+        )
         assert result['count'] == 2
         assert result['mean_ms'] == pytest.approx(150.0, abs=1e-6)
 
@@ -1368,17 +1352,15 @@ class TestMultiDbAggregation:
     async def test_none_entry_recent_merges(self, tmp_path):
         """aggregate_recent_merges with [valid_conn, None] merges cleanly."""
         now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
+        events = [
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=1),
              'task_id': 'task-a', 'data': {'outcome': 'done'}},
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=2),
              'task_id': 'task-b', 'data': {'outcome': 'done'}},
-        ])
-
-        async with aiosqlite.connect(str(db1)) as conn1:
-            conn1.row_factory = aiosqlite.Row
-            result = await aggregate_recent_merges([conn1, None], limit=20)
-
+        ]
+        result = await self._run_with_none_entry(
+            tmp_path, aggregate_recent_merges, events, limit=20,
+        )
         assert len(result) == 2
         assert result[0]['task_id'] == 'task-a'
         assert result[1]['task_id'] == 'task-b'
@@ -1387,17 +1369,15 @@ class TestMultiDbAggregation:
     async def test_none_entry_speculative_stats(self, tmp_path):
         """aggregate_speculative_stats with [valid_conn, None] merges cleanly."""
         now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
+        events = [
             {'event_type': 'speculative_merge', 'timestamp': now - timedelta(minutes=1),
              'data': {'base_sha': 'abc'}},
             {'event_type': 'speculative_discard', 'timestamp': now - timedelta(minutes=2),
              'data': {'reason': 'previous_failed'}},
-        ])
-
-        async with aiosqlite.connect(str(db1)) as conn1:
-            conn1.row_factory = aiosqlite.Row
-            result = await aggregate_speculative_stats([conn1, None], hours=24)
-
+        ]
+        result = await self._run_with_none_entry(
+            tmp_path, aggregate_speculative_stats, events, hours=24,
+        )
         assert result['hit_count'] == 1
         assert result['discard_count'] == 1
         assert result['total'] == 2
