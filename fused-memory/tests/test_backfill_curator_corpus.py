@@ -646,7 +646,7 @@ class TestRunBackfill:
         """
         import contextlib
 
-        from fused_memory.maintenance.backfill_curator_corpus import BackfillManager, run_backfill
+        from fused_memory.maintenance.backfill_curator_corpus import run_backfill
 
         project_root = '/fake/project'
         mock_curator = AsyncMock()
