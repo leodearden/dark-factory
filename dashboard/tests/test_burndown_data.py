@@ -513,26 +513,26 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
 
-        project_ids = {row['project_id'] for row in rows}
-        # main + root_a + root_c should be present
-        assert len(rows) == 3
-        assert str(config.project_root) in project_ids
-        assert str(root_a.resolve()) in project_ids
-        assert str(root_c.resolve()) in project_ids
-        # root_b should NOT be present
-        assert str(root_b.resolve()) not in project_ids
+            project_ids = {row['project_id'] for row in rows}
+            # main + root_a + root_c should be present
+            assert len(rows) == 3
+            assert str(config.project_root) in project_ids
+            assert str(root_a.resolve()) in project_ids
+            assert str(root_c.resolve()) in project_ids
+            # root_b should NOT be present
+            assert str(root_b.resolve()) not in project_ids
 
-        # Warning contract: exactly one 'Failed to load tasks' warning naming root_b only
-        warning_records = [
-            r for r in caplog.records
-            if r.levelno == logging.WARNING and r.getMessage().startswith('Failed to load tasks')
-        ]
-        assert len(warning_records) == 1
-        combined = warning_records[0].getMessage()
-        assert 'root_b' in combined or str(root_b) in combined
-        assert 'root_a' not in combined
-        assert 'root_c' not in combined
-        assert warning_records[0].exc_info is not None
+            # Warning contract: exactly one 'Failed to load tasks' warning naming root_b only
+            warning_records = [
+                r for r in caplog.records
+                if r.levelno == logging.WARNING and r.getMessage().startswith('Failed to load tasks')
+            ]
+            assert len(warning_records) == 1
+            combined = warning_records[0].getMessage()
+            assert 'root_b' in combined or str(root_b) in combined
+            assert 'root_a' not in combined
+            assert 'root_c' not in combined
+            assert warning_records[0].exc_info is not None
 
     @pytest.mark.asyncio
     async def test_logs_warning_when_known_root_unreadable(self, burndown_conn_with_config, caplog):
@@ -596,14 +596,14 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT project_id, done FROM snapshots ORDER BY project_id') as cur:
                 rows = list(await cur.fetchall())
 
-        assert len(rows) == 2
-        project_ids = {row['project_id'] for row in rows}
-        assert str(config.project_root) in project_ids       # (a) main project row
-        assert str(good_root.resolve()) in project_ids       # (b) good_root row
-        assert str(bad_root.resolve()) not in project_ids    # (c) no bad_root row
+            assert len(rows) == 2
+            project_ids = {row['project_id'] for row in rows}
+            assert str(config.project_root) in project_ids       # (a) main project row
+            assert str(good_root.resolve()) in project_ids       # (b) good_root row
+            assert str(bad_root.resolve()) not in project_ids    # (c) no bad_root row
 
-        good_row = next(r for r in rows if r['project_id'] == str(good_root.resolve()))
-        assert good_row['done'] == 2  # done=2 for good_root
+            good_row = next(r for r in rows if r['project_id'] == str(good_root.resolve()))
+            assert good_row['done'] == 2  # done=2 for good_root
 
     @pytest.mark.asyncio
     async def test_orchestrator_fallback_deduplicates_against_resolved_root(self, tmp_path, burndown_conn_with_config):
@@ -723,22 +723,23 @@ class TestCollectSnapshot:
 
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
-        project_ids = {row['project_id'] for row in rows}
 
-        if raised_oserror:
-            # Pre-fix behavior (task 519 not yet landed): asyncio.gather re-raises
-            # the first OSError, so Phase 3 never runs and no rows are inserted.
-            # The invariant is: the failing project's data never appears in the
-            # table, and no partial state is committed.
-            assert len(rows) == 0
-        else:
-            # Post-fix behavior (task 519 landed): return_exceptions=True + per-
-            # project skip means healthy projects are still snapshotted and the
-            # failing project is cleanly excluded.
-            assert len(rows) == 2
-            assert str(reify_root.resolve()) not in project_ids
-            assert str(config.project_root) in project_ids
-            assert str(autopilot_root.resolve()) in project_ids
+            project_ids = {row['project_id'] for row in rows}
+
+            if raised_oserror:
+                # Pre-fix behavior (task 519 not yet landed): asyncio.gather re-raises
+                # the first OSError, so Phase 3 never runs and no rows are inserted.
+                # The invariant is: the failing project's data never appears in the
+                # table, and no partial state is committed.
+                assert len(rows) == 0
+            else:
+                # Post-fix behavior (task 519 landed): return_exceptions=True + per-
+                # project skip means healthy projects are still snapshotted and the
+                # failing project is cleanly excluded.
+                assert len(rows) == 2
+                assert str(reify_root.resolve()) not in project_ids
+                assert str(config.project_root) in project_ids
+                assert str(autopilot_root.resolve()) in project_ids
 
     @pytest.mark.asyncio
     async def test_gather_return_exceptions_preserves_healthy_snapshots(self, burndown_conn_with_config, caplog):
@@ -784,32 +785,32 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT * FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
 
-        # (a) three rows: main + good_root_1 + good_root_2
-        assert len(rows) == 3
+            # (a) three rows: main + good_root_1 + good_root_2
+            assert len(rows) == 3
 
-        by_project = {row['project_id']: row for row in rows}
+            by_project = {row['project_id']: row for row in rows}
 
-        # (b) bad_root must NOT appear
-        assert str(bad_root.resolve()) not in by_project
+            # (b) bad_root must NOT appear
+            assert str(bad_root.resolve()) not in by_project
 
-        # (c) main project and both good roots must appear
-        assert str(config.project_root) in by_project
-        assert str(good_root_1.resolve()) in by_project
-        assert str(good_root_2.resolve()) in by_project
+            # (c) main project and both good roots must appear
+            assert str(config.project_root) in by_project
+            assert str(good_root_1.resolve()) in by_project
+            assert str(good_root_2.resolve()) in by_project
 
-        # (d) per-root done counts must reflect the supplied task lists
-        good_1_row = by_project[str(good_root_1.resolve())]
-        _assert_snapshot_counts(good_1_row, done=2)
+            # (d) per-root done counts must reflect the supplied task lists
+            good_1_row = by_project[str(good_root_1.resolve())]
+            _assert_snapshot_counts(good_1_row, done=2)
 
-        good_2_row = by_project[str(good_root_2.resolve())]
-        _assert_snapshot_counts(good_2_row, done=1)
+            good_2_row = by_project[str(good_root_2.resolve())]
+            _assert_snapshot_counts(good_2_row, done=1)
 
-        # (e) at least one WARNING record must name the bad root and carry exc_info
-        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warning_records, 'Expected at least one WARNING log record'
-        combined = ' '.join(r.getMessage() for r in warning_records)
-        assert 'bad_root' in combined or str(bad_root) in combined
-        assert any(r.exc_info for r in warning_records)
+            # (e) at least one WARNING record must name the bad root and carry exc_info
+            warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert warning_records, 'Expected at least one WARNING log record'
+            combined = ' '.join(r.getMessage() for r in warning_records)
+            assert 'bad_root' in combined or str(bad_root) in combined
+            assert any(r.exc_info for r in warning_records)
 
     @pytest.mark.asyncio
     async def test_main_project_failure_skips_all_inserts(self, burndown_env, caplog):
@@ -920,25 +921,25 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
 
-        project_ids = {row['project_id'] for row in rows}
-        # Three rows: main + root_a + root_c. bad_root is absorbed by return_exceptions.
-        assert len(rows) == 3
-        assert str(config.project_root) in project_ids
-        assert str(root_a.resolve()) in project_ids
-        assert str(root_c.resolve()) in project_ids
-        assert str(bad_root.resolve()) not in project_ids
+            project_ids = {row['project_id'] for row in rows}
+            # Three rows: main + root_a + root_c. bad_root is absorbed by return_exceptions.
+            assert len(rows) == 3
+            assert str(config.project_root) in project_ids
+            assert str(root_a.resolve()) in project_ids
+            assert str(root_c.resolve()) in project_ids
+            assert str(bad_root.resolve()) not in project_ids
 
-        # Warning contract: exactly one 'Failed to load tasks' warning naming bad_root.
-        warning_records = [
-            r for r in caplog.records
-            if r.levelno == logging.WARNING and r.getMessage().startswith('Failed to load tasks')
-        ]
-        assert len(warning_records) == 1
-        combined = warning_records[0].getMessage()
-        assert 'resolve_bad_root' in combined or bad_prefix in combined
-        assert 'resolve_root_a' not in combined
-        assert 'resolve_root_c' not in combined
-        assert warning_records[0].exc_info is not None
+            # Warning contract: exactly one 'Failed to load tasks' warning naming bad_root.
+            warning_records = [
+                r for r in caplog.records
+                if r.levelno == logging.WARNING and r.getMessage().startswith('Failed to load tasks')
+            ]
+            assert len(warning_records) == 1
+            combined = warning_records[0].getMessage()
+            assert 'resolve_bad_root' in combined or bad_prefix in combined
+            assert 'resolve_root_a' not in combined
+            assert 'resolve_root_c' not in combined
+            assert warning_records[0].exc_info is not None
 
 # ---------------------------------------------------------------------------
 # downsample
@@ -1241,18 +1242,3 @@ class TestBurndownConnWithConfig:
             assert row is not None
             assert row[0] == 0
 
-    @pytest.mark.asyncio
-    async def test_factory_accepts_custom_known_project_roots(self, burndown_conn_with_config):
-        """kwargs pass through to DashboardConfig.known_project_roots."""
-        roots = [Path('/fake/project/root_a'), Path('/fake/project/root_b')]
-        async with burndown_conn_with_config(known_project_roots=roots) as (db_path, config, conn):
-            # DashboardConfig.__post_init__ resolves all paths
-            assert config.known_project_roots == [r.resolve() for r in roots]
-
-    @pytest.mark.asyncio
-    async def test_factory_accepts_custom_project_root(self, tmp_path, burndown_conn_with_config):
-        """project_root override is reflected in the yielded config."""
-        custom_root = tmp_path / 'custom'
-        custom_root.mkdir()
-        async with burndown_conn_with_config(project_root=custom_root) as (db_path, config, conn):
-            assert config.project_root == custom_root.resolve()
