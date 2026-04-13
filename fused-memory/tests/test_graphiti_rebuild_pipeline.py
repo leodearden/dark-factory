@@ -429,9 +429,9 @@ class TestRebuildEntitySummariesForceDryRun:
 
         await svc.rebuild_entity_summaries(project_id='test', force=True, dry_run=True)
 
-        svc.graphiti.get_all_valid_edges.assert_not_awaited()
-        svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()
-        svc.graphiti.list_entity_nodes.assert_awaited_once()
+        svc.graphiti.get_all_valid_edges.assert_not_awaited()  # type: ignore[attr-defined]
+        svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()  # type: ignore[attr-defined]
+        svc.graphiti.list_entity_nodes.assert_awaited_once()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_force_dry_run_returns_correct_aggregate(self, mock_config):
@@ -455,8 +455,8 @@ class TestRebuildEntitySummariesForceDryRun:
         assert len(result['details']) == len(entities)  # length guard: clear diff before per-element check
         assert result['details'] == expected_details
         assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
-        svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()
-        svc.graphiti.get_all_valid_edges.assert_not_awaited()
+        svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()  # type: ignore[attr-defined]
+        svc.graphiti.get_all_valid_edges.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_force_no_dry_run_calls_get_all_valid_edges(

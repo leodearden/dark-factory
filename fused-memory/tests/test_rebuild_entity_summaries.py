@@ -13,13 +13,14 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Callable
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from fused_memory.backends.graphiti_client import GraphitiBackend, StaleSummaryResult
+from fused_memory.backends.graphiti_client import EdgeDict, GraphitiBackend, StaleSummaryResult
 
 
 def _make_svc(mock_config):
@@ -1909,7 +1910,7 @@ class TestServiceRebuildOrchestration:
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old fact A'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'old fact B'},
         ]
-        all_edges = {
+        all_edges: dict[str, list[EdgeDict]] = {
             'uuid-1': [{'uuid': 'e1', 'fact': 'new fact A', 'name': 'rel1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'new fact B', 'name': 'rel2'}],
         }
@@ -2210,11 +2211,11 @@ class TestServiceRebuildOrchestrationErrors:
             asyncio.CancelledError(),
             asyncio.CancelledError(),
         ])
-        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
-            try:
-                await svc.rebuild_entity_summaries(project_id='my-project')
-            except (asyncio.CancelledError, BaseException):
-                pass
+        with (
+            caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'),
+            contextlib.suppress(asyncio.CancelledError, BaseException),
+        ):
+            await svc.rebuild_entity_summaries(project_id='my-project')
         # The warning should contain the project_id
         warning_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any('my-project' in m for m in warning_msgs), (
@@ -2281,7 +2282,10 @@ class TestRebuildSummariesManagerWithService:
     @pytest.mark.asyncio
     async def test_manager_run_returns_rebuild_result(self):
         """run() returns a RebuildResult with correct field mapping."""
-        from fused_memory.maintenance.rebuild_summaries import RebuildResult, RebuildSummariesManager
+        from fused_memory.maintenance.rebuild_summaries import (
+            RebuildResult,
+            RebuildSummariesManager,
+        )
         mock_svc = self._make_mock_service()
         mock_svc.rebuild_entity_summaries = AsyncMock(return_value={
             'total_entities': 10,
