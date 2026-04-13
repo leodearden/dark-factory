@@ -513,6 +513,14 @@ class TestCreateWorktreeFreshening:
         await _push_n_commits_to_origin(origin, 1, prefix='fresh')
         worktree_info = await git_ops.create_worktree('freshen-test')
         assert (worktree_info.path / 'fresh_0.txt').exists()
+        # Exactly 1 commit was pushed, so stale_commits must reflect that.
+        assert worktree_info.stale_commits == 1
+        # base_commit must match origin/main SHA captured after create_worktree
+        # (which internally fetched, so origin/main is now up-to-date in the local repo).
+        _, expected_sha, _ = await _run(
+            ['git', 'rev-parse', 'origin/main'], cwd=git_ops.project_root,
+        )
+        assert worktree_info.base_commit.strip() == expected_sha.strip()
 
     async def test_create_worktree_stale_commits_populated(
         self, git_ops_with_remote: tuple[GitOps, Path],
