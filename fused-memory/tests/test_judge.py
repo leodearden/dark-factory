@@ -1,5 +1,6 @@
 """Tests for the LLM-as-judge module (judge.py)."""
 
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -486,3 +487,41 @@ async def test_error_trend_disabled_config_no_halt(mock_journal):
     await judge._check_error_trends('proj', verdicts)
 
     assert not judge.is_halted('proj')
+
+
+# ---------------------------------------------------------------------------
+# UsageGate lifecycle: confirm_account_ok / on_agent_complete / release_probe_slot
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_confirms_account_ok_on_success(mock_journal):
+    """_call_judge_cli calls confirm_account_ok and on_agent_complete on success."""
+    config = _make_judge_config(judge_llm_provider='claude-cli', judge_llm_model='sonnet')
+    judge = Judge(config=config, journal=mock_journal)
+
+    gate = MagicMock()
+    gate.before_invoke = AsyncMock(return_value='token-j')
+    gate.detect_cap_hit = MagicMock(return_value=False)
+    judge._usage_gate = gate
+
+    cli_result = json.dumps({
+        'result': 'The verdict is ok.',
+        'session_id': 'sess-j1',
+        'num_input_tokens': 80,
+        'num_output_tokens': 40,
+        'cost_usd': 0.0055,
+    })
+
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = AsyncMock(return_value=(
+        cli_result.encode(), b'',
+    ))
+
+    with patch('asyncio.create_subprocess_exec', new_callable=AsyncMock, return_value=mock_proc):
+        result = await judge._call_judge_cli('Evaluate this.')
+
+    assert result == 'The verdict is ok.'
+    gate.confirm_account_ok.assert_called_once_with('token-j')
+    gate.on_agent_complete.assert_called_once_with(0.0055)
