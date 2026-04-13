@@ -75,7 +75,7 @@ class TaskKnowledgeSync(BaseStage):
         # done_count (capped at MAX_DONE_TASKS_RETAINED=30), so done_tasks is guaranteed
         # non-empty whenever done_count > 0.  No fallback summary branch is needed.
         if filtered.done_tasks:
-            recently_completed_text = format_task_list(filtered.done_tasks[:30])
+            recently_completed_text = format_task_list(filtered.done_tasks)
         else:
             recently_completed_text = format_task_list([])  # 'No tasks.'
 
