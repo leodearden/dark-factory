@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import pytest
 
+import dashboard.data.merge_queue as _mqmod
+
 # ---------------------------------------------------------------------------
 # Schema — events table from orchestrator/src/orchestrator/event_store.py
 # ---------------------------------------------------------------------------
@@ -1425,91 +1427,54 @@ class TestMultiDbAggregation:
 
     # -----------------------------------------------------------------------
     # Gap coverage (b+): all-None dbs — gather(*[fn(None), fn(None)]) path
-    #
-    # Distinct from dbs=[] (gather(*[]) → []) because per-DB functions ARE
-    # called with None and return empty defaults.  These tests confirm the
-    # None-handling in each per-DB function propagates cleanly through the
-    # aggregate layer.
     # -----------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_all_none_dbs_queue_depth(self):
-        """aggregate_queue_depth_timeseries with dbs=[None, None] returns empty ChartData.
+    @pytest.mark.parametrize('patch_target,agg_fn,kwargs,expected', [
+        (
+            'queue_depth_timeseries',
+            aggregate_queue_depth_timeseries,
+            {'hours': 24},
+            {'labels': [], 'values': []},
+        ),
+        (
+            'outcome_distribution',
+            aggregate_outcome_distribution,
+            {'hours': 24},
+            {'labels': [], 'values': []},
+        ),
+        (
+            '_get_durations',
+            aggregate_latency_stats,
+            {'hours': 24},
+            {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0},
+        ),
+        (
+            'recent_merges',
+            aggregate_recent_merges,
+            {'limit': 20},
+            [],
+        ),
+        (
+            'speculative_stats',
+            aggregate_speculative_stats,
+            {'hours': 24},
+            {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0},
+        ),
+    ])
+    async def test_all_none_dbs_spy(self, patch_target, agg_fn, kwargs, expected):
+        """Parametrized: aggregate fn with dbs=[None, None] calls per-DB fn twice with None.
 
-        Spy on queue_depth_timeseries to confirm it was called twice with None —
-        distinguishing this path from dbs=[] where gather(*[]) returns [] immediately.
+        Confirms the gather(*[fn(None), fn(None)]) path is distinct from
+        dbs=[] (gather(*[]) → []) because per-DB functions ARE called with None.
         """
+        wraps_fn = getattr(_mqmod, patch_target)
         with patch(
-            'dashboard.data.merge_queue.queue_depth_timeseries',
-            wraps=queue_depth_timeseries,
+            f'dashboard.data.merge_queue.{patch_target}',
+            wraps=wraps_fn,
         ) as spy:
-            result = await aggregate_queue_depth_timeseries([None, None], hours=24)
-            assert result == {'labels': [], 'values': []}
-            assert spy.call_count == 2
-            for call in spy.call_args_list:
-                assert call.args[0] is None
-
-    @pytest.mark.asyncio
-    async def test_all_none_dbs_outcome_distribution(self):
-        """aggregate_outcome_distribution with dbs=[None, None] returns empty ChartData.
-
-        Spy on outcome_distribution to confirm it was called twice with None.
-        """
-        with patch(
-            'dashboard.data.merge_queue.outcome_distribution',
-            wraps=outcome_distribution,
-        ) as spy:
-            result = await aggregate_outcome_distribution([None, None], hours=24)
-            assert result == {'labels': [], 'values': []}
-            assert spy.call_count == 2
-            for call in spy.call_args_list:
-                assert call.args[0] is None
-
-    @pytest.mark.asyncio
-    async def test_all_none_dbs_latency_stats(self):
-        """aggregate_latency_stats with dbs=[None, None] returns all-zero stats dict.
-
-        Spy on _get_durations (the per-DB function aggregate_latency_stats uses)
-        to confirm it was called twice with None.
-        """
-        with patch(
-            'dashboard.data.merge_queue._get_durations',
-            wraps=_get_durations,
-        ) as spy:
-            result = await aggregate_latency_stats([None, None], hours=24)
-            assert result == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
-            assert spy.call_count == 2
-            for call in spy.call_args_list:
-                assert call.args[0] is None
-
-    @pytest.mark.asyncio
-    async def test_all_none_dbs_recent_merges(self):
-        """aggregate_recent_merges with dbs=[None, None] returns empty list.
-
-        Spy on recent_merges to confirm it was called twice with None.
-        """
-        with patch(
-            'dashboard.data.merge_queue.recent_merges',
-            wraps=recent_merges,
-        ) as spy:
-            result = await aggregate_recent_merges([None, None], limit=20)
-            assert result == []
-            assert spy.call_count == 2
-            for call in spy.call_args_list:
-                assert call.args[0] is None
-
-    @pytest.mark.asyncio
-    async def test_all_none_dbs_speculative_stats(self):
-        """aggregate_speculative_stats with dbs=[None, None] returns all-zero stats dict.
-
-        Spy on speculative_stats to confirm it was called twice with None.
-        """
-        with patch(
-            'dashboard.data.merge_queue.speculative_stats',
-            wraps=speculative_stats,
-        ) as spy:
-            result = await aggregate_speculative_stats([None, None], hours=24)
-            assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+            result = await agg_fn([None, None], **kwargs)
+            assert result == expected
             assert spy.call_count == 2
             for call in spy.call_args_list:
                 assert call.args[0] is None
