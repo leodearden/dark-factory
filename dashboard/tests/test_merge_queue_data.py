@@ -59,6 +59,21 @@ def _bucket_start(t: datetime) -> datetime:
     return t.replace(minute=(t.minute // 15) * 15, second=0, microsecond=0)
 
 
+def _make_db(tmp_path, name, events):
+    """Create a populated DB with the given events list of dicts.
+
+    Each dict is forwarded as kwargs to _insert_event.  Returns the db_path.
+    """
+    db_path = tmp_path / name
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(MERGE_EVENTS_SCHEMA)
+    for evt in events:
+        _insert_event(conn, **evt)
+    conn.commit()
+    conn.close()
+    return db_path
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -99,6 +114,7 @@ async def empty_merge_events_conn(empty_merge_events_db):
 from dashboard.data.merge_queue import (  # noqa: E402
     _align_bucket,
     _bucket_minutes_for_window,
+    _cutoff_iso,
     _get_durations,
     aggregate_latency_stats,
     aggregate_outcome_distribution,
@@ -1221,6 +1237,7 @@ class TestMultiDbAggregation:
         assert len(result['labels']) >= 3650
         assert len(result['labels']) <= 4000
 
+
     @pytest.mark.asyncio
     async def test_aggregate_recent_merges_hours_window(self, tmp_path):
         """aggregate_recent_merges with hours=1 excludes events older than 1 hour."""
@@ -1289,7 +1306,6 @@ class TestMultiDbAggregation:
         # utc-noon (12:00 UTC) is newer than tz-plus5 (08:00 UTC), so must be first
         assert result[0]['task_id'] == 'utc-noon'
         assert result[1]['task_id'] == 'tz-plus5'
-
     # -----------------------------------------------------------------------
     # Gap coverage (a): one DB raises RuntimeError — gather-level resilience
     # -----------------------------------------------------------------------
@@ -1759,3 +1775,274 @@ class TestMultiDbAggregation:
 
         assert result['count'] == 3  # only valid durations from DB2
         assert result['mean_ms'] == pytest.approx(200.0, abs=1e-6)
+
+# ---------------------------------------------------------------------------
+# TestCutoffIso (step-1)
+# ---------------------------------------------------------------------------
+
+class TestCutoffIso:
+    def test_cutoff_iso_uses_provided_now(self):
+        """_cutoff_iso(hours=24, now=fixed_dt) returns (fixed_dt - 24h).isoformat()."""
+        fixed_dt = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        expected = (fixed_dt - timedelta(hours=24)).isoformat()
+        result = _cutoff_iso(24, now=fixed_dt)
+        assert result == expected
+
+    def test_cutoff_iso_no_now_uses_current_time(self):
+        """Without now, _cutoff_iso uses datetime.now(UTC) — result is within ±2s of expected."""
+        before = datetime.now(UTC) - timedelta(hours=24) - timedelta(seconds=2)
+        result = _cutoff_iso(24)
+        after = datetime.now(UTC) - timedelta(hours=24) + timedelta(seconds=2)
+        result_dt = datetime.fromisoformat(result)
+        assert before < result_dt < after
+
+
+# ---------------------------------------------------------------------------
+# TestOutcomeDistributionNow (step-3)
+# ---------------------------------------------------------------------------
+
+class TestOutcomeDistributionNow:
+    @pytest.mark.asyncio
+    async def test_outcome_distribution_threads_now_to_cutoff_iso(self, merge_events_db):
+        """outcome_distribution accepts now and passes it to _cutoff_iso.
+
+        Will fail before step-4 impl because outcome_distribution has no `now` param.
+        """
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        captured_nows: list = []
+
+        def mock_cutoff_iso(hours: int, *, now=None) -> str:
+            captured_nows.append(now)
+            return '2020-01-01T00:00:00+00:00'  # arbitrary cutoff; test only inspects captured_nows
+
+        async with aiosqlite.connect(str(merge_events_db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with patch('dashboard.data.merge_queue._cutoff_iso', side_effect=mock_cutoff_iso):
+                await outcome_distribution(conn, hours=24, now=fixed_now)
+
+        assert captured_nows == [fixed_now], (
+            f"Expected _cutoff_iso called once with now={fixed_now!r}, got {captured_nows!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestSpeculativeStatsNow (step-7)
+# ---------------------------------------------------------------------------
+
+class TestSpeculativeStatsNow:
+    @pytest.mark.asyncio
+    async def test_speculative_stats_threads_now_to_cutoff_iso(self, merge_events_db):
+        """speculative_stats accepts now and passes it to _cutoff_iso.
+
+        Will fail before step-8 impl because speculative_stats has no `now` param.
+        """
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        captured_nows: list = []
+
+        def mock_cutoff_iso(hours: int, *, now=None) -> str:
+            captured_nows.append(now)
+            return '2020-01-01T00:00:00+00:00'  # arbitrary cutoff; test only inspects captured_nows
+
+        async with aiosqlite.connect(str(merge_events_db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with patch('dashboard.data.merge_queue._cutoff_iso', side_effect=mock_cutoff_iso):
+                await speculative_stats(conn, hours=24, now=fixed_now)
+
+        assert captured_nows == [fixed_now], (
+            f"Expected _cutoff_iso called once with now={fixed_now!r}, got {captured_nows!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateOutcomeDistributionNow (step-9)
+# ---------------------------------------------------------------------------
+
+class TestAggregateOutcomeDistributionNow:
+    @pytest.mark.asyncio
+    async def test_aggregate_outcome_distribution_consistent_now(self, tmp_path):
+        """aggregate_outcome_distribution resolves now once and threads it to all per-DB calls.
+
+        Events near fixed_now are inside the 24h window for that now, but would be
+        excluded by a real datetime.now(UTC) cutoff (they are 2+ days in the past).
+        Will fail before step-10 impl because aggregate_outcome_distribution has no `now` param.
+        """
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        # Events at 1h before fixed_now — inside [fixed_now - 24h, fixed_now] window
+        event_time = fixed_now - timedelta(hours=1)
+
+        db1 = _make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt', 'timestamp': event_time, 'data': {'outcome': 'done'}},
+        ])
+        db2 = _make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt', 'timestamp': event_time, 'data': {'outcome': 'done'}},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_outcome_distribution(
+                [conn1, conn2], hours=24, now=fixed_now,
+            )
+
+        # Both events are inside the window → both should appear in the results
+        assert 'done' in result['labels'], f"Expected 'done' in labels, got {result}"
+        done_idx = result['labels'].index('done')
+        assert result['values'][done_idx] == 2  # one event per DB
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateLatencyStatsNow (step-11)
+# ---------------------------------------------------------------------------
+
+class TestAggregateLatencyStatsNow:
+    @pytest.mark.asyncio
+    async def test_aggregate_latency_stats_consistent_now(self, tmp_path):
+        """aggregate_latency_stats resolves now once and threads it to all per-DB calls.
+
+        Events near fixed_now are inside the 24h window for that now, but would be
+        excluded by a real datetime.now(UTC) cutoff (they are 2+ days in the past).
+        Will fail before step-12 impl because aggregate_latency_stats has no `now` param.
+        """
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        event_time = fixed_now - timedelta(hours=1)
+
+        db1 = _make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt', 'timestamp': event_time,
+             'data': {'outcome': 'done'}, 'duration_ms': 100},
+        ])
+        db2 = _make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt', 'timestamp': event_time,
+             'data': {'outcome': 'done'}, 'duration_ms': 200},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_latency_stats([conn1, conn2], hours=24, now=fixed_now)
+
+        # Both events are inside the window → count=2
+        assert result['count'] == 2, (
+            f"Expected count=2 (both events within fixed_now window), got {result}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestLatencyStatsNow (step-5)
+# ---------------------------------------------------------------------------
+
+class TestLatencyStatsNow:
+    @pytest.mark.asyncio
+    async def test_latency_stats_threads_now_to_cutoff_iso(self, merge_events_db):
+        """latency_stats accepts now and threads it through _get_durations to _cutoff_iso.
+
+        Will fail before step-6 impl because latency_stats/_get_durations have no `now` param.
+        """
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        captured_nows: list = []
+
+        def mock_cutoff_iso(hours: int, *, now=None) -> str:
+            captured_nows.append(now)
+            return '2020-01-01T00:00:00+00:00'  # arbitrary cutoff; test only inspects captured_nows
+
+        async with aiosqlite.connect(str(merge_events_db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with patch('dashboard.data.merge_queue._cutoff_iso', side_effect=mock_cutoff_iso):
+                await latency_stats(conn, hours=24, now=fixed_now)
+
+        assert captured_nows == [fixed_now], (
+            f"Expected _cutoff_iso called once with now={fixed_now!r}, got {captured_nows!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateSpeculativeStatsNow (step-13)
+# ---------------------------------------------------------------------------
+
+class TestAggregateSpeculativeStatsNow:
+    @pytest.mark.asyncio
+    async def test_aggregate_speculative_stats_consistent_now(self, tmp_path):
+        """aggregate_speculative_stats resolves now once and threads it to all per-DB calls.
+
+        Events near fixed_now are inside the 24h window for that now, but would be
+        excluded by a real datetime.now(UTC) cutoff (they are 2+ days in the past).
+        Will fail before step-14 impl because aggregate_speculative_stats has no `now` param.
+        """
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        event_time = fixed_now - timedelta(hours=1)
+
+        db1 = _make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'speculative_merge',
+             'timestamp': event_time, 'data': {'base_sha': 'abc'}},
+        ])
+        db2 = _make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'speculative_discard',
+             'timestamp': event_time, 'data': {'reason': 'previous_failed'}},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_speculative_stats(
+                [conn1, conn2], hours=24, now=fixed_now,
+            )
+
+        # Both events are inside the window → hit_count=1, discard_count=1, total=2
+        assert result['total'] == 2, (
+            f"Expected total=2 (both events within fixed_now window), got {result}"
+        )
+        assert result['hit_count'] == 1
+        assert result['discard_count'] == 1
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateQueueDepthTimeseriesNow
+# ---------------------------------------------------------------------------
+
+class TestAggregateQueueDepthTimeseriesNow:
+    @pytest.mark.asyncio
+    async def test_aggregate_queue_depth_timeseries_consistent_now(self, tmp_path):
+        """aggregate_queue_depth_timeseries resolves now once and threads it to per-DB calls.
+
+        Events near fixed_now are inside the 24h window for that now, but would be
+        excluded by a real datetime.now(UTC) cutoff (they are 2+ days in the past).
+        Ensures a regression removing `now` from aggregate_queue_depth_timeseries
+        would be caught by this test.
+        """
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        event_time = fixed_now - timedelta(hours=1)
+
+        db1 = _make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt', 'timestamp': event_time,
+             'data': {'outcome': 'done'}},
+        ])
+        db2 = _make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt', 'timestamp': event_time,
+             'data': {'outcome': 'done'}},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_queue_depth_timeseries(
+                [conn1, conn2], hours=24, now=fixed_now,
+            )
+
+        # Both events are inside the fixed_now window → total count == 2
+        total_count = sum(result['values'])
+        assert total_count == 2, (
+            f"Expected 2 events (both inside fixed_now window), got total={total_count}, "
+            f"result={result}"
+        )
+
