@@ -872,7 +872,7 @@ class TestFilterTaskTreeDoneAndCancelledLists:
         String-digit id '4' exercises the int()-coercion branch of _id_key; it must sort between
         int id=5 and int id=3 (i.e. 4 > 3) confirming coercion drives sort order, not input position.
         Non-parseable ids 'abc' and 'def' exercise the ValueError-fallback branch (_id_key=0) and
-        sort last in descending order; stable sort preserves their mutual input order.
+        sort last in descending order; the -index tiebreaker preserves their input order: abc before def.
         """
         tasks_data = {
             'tasks': [
@@ -900,13 +900,13 @@ class TestFilterTaskTreeDoneAndCancelledLists:
 
         # '4' has _id_key=4 via int() coercion (happy path), so it sorts between 5 and 3.
         # 'abc' and 'def' both have _id_key=0 (int() fallback), so they sort last after
-        # all int ids (10 > 5 > 4 > 3 > 0). Stable sort preserves their input order: 'abc' before 'def'.
+        # all int ids (10 > 5 > 4 > 3 > 0). The -index tiebreaker preserves their input order: 'abc' before 'def'.
         assert done_ids == [10, 5, '4', 3, 'abc', 'def'], (
             f"Expected done_tasks id order [10, 5, '4', 3, 'abc', 'def'] — "
             f"string-digit id '4' has _id_key=4 via successful int() coercion and sorts between 5 and 3; "
             f"non-int ids 'abc' and 'def' both have _id_key=0 via the int() fallback, sort last "
-            f"(0 < 3 < 4 < 5 < 10 descending), and preserve input order relative to each other "
-            f"(stable sort). Got: {done_ids}"
+            f"(0 < 3 < 4 < 5 < 10 descending), and the -index tiebreaker preserves their input order "
+            f"(abc before def). Got: {done_ids}"
         )
 
         # 'xyz' has _id_key=0 (int() fallback), so it sorts last after 7, 2 (both > 0)
