@@ -1930,3 +1930,91 @@ class TestResetTimeParsingEdgeCases:
         # If we're in April, January 1 is in the past
         dt = _parse_resets_at('resets Jan 1, 12am (UTC)')
         assert dt.year >= now.year  # either this year (if Jan is future) or next
+
+
+# =========================================================================
+# TestReleaseProbeSlot
+# =========================================================================
+
+
+class TestReleaseProbeSlot:
+    """UsageGate.release_probe_slot(): clears probe state on exception paths."""
+
+    def test_clears_probe_in_flight_and_resets_probe_count(self):
+        """When probe_in_flight is True, release_probe_slot clears it and resets probe_count."""
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probe_in_flight = True
+        acct.probe_count = 3
+
+        gate.release_probe_slot('fake-token-a')
+
+        assert acct.probe_in_flight is False
+        assert acct.probe_count == 0
+
+    def test_reopens_open_event(self):
+        """release_probe_slot re-opens the _open event when probe was in flight."""
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probe_in_flight = True
+        gate._open.clear()  # simulate gate closed by probe slot claim
+
+        gate.release_probe_slot('fake-token-a')
+
+        assert gate._open.is_set() is True
+
+    def test_noop_when_probe_in_flight_false(self):
+        """release_probe_slot is a no-op when probe_in_flight is already False."""
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probe_in_flight = False
+        acct.probe_count = 5
+        gate._open.clear()  # gate state should not be changed
+
+        gate.release_probe_slot('fake-token-a')
+
+        assert acct.probe_in_flight is False
+        assert acct.probe_count == 5
+        assert gate._open.is_set() is False  # unchanged
+
+    def test_noop_with_unknown_token(self):
+        """release_probe_slot is a no-op with an unrecognised token."""
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probe_in_flight = True
+        acct.probe_count = 2
+        gate._open.clear()
+
+        gate.release_probe_slot('totally-unknown-token')
+
+        # State unchanged — unknown token should not touch the account
+        assert acct.probe_in_flight is True
+        assert acct.probe_count == 2
+        assert gate._open.is_set() is False
+
+    def test_noop_with_none_token(self):
+        """release_probe_slot is a no-op when token is None."""
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probe_in_flight = True
+        acct.probe_count = 1
+        gate._open.clear()
+
+        gate.release_probe_slot(None)
+
+        # State unchanged — None token should not touch the account
+        assert acct.probe_in_flight is True
+        assert acct.probe_count == 1
+        assert gate._open.is_set() is False
+
+    def test_does_not_touch_near_cap_flag(self):
+        """release_probe_slot does NOT modify the near_cap flag."""
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probe_in_flight = True
+        acct.near_cap = True
+
+        gate.release_probe_slot('fake-token-a')
+
+        assert acct.probe_in_flight is False  # cleared
+        assert acct.near_cap is True  # untouched
