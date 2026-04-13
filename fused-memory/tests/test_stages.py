@@ -1489,7 +1489,7 @@ class TestMemoryConsolidatorFilteredTaskTree:
             done_count=0,
             cancelled_count=2,
             other_count=0,
-            total_count=count + 7,
+            total_count=count + 2,  # count active + 0 done + 2 cancelled
         )
 
     @pytest.mark.asyncio
