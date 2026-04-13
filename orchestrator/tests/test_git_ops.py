@@ -2054,7 +2054,7 @@ class TestScrubResultFormatError:
             f'Expected empty string when error is None, got {result.format_error()!r}'
         )
         assert result.format_error(prefix=' Error: ') == '', (
-            f'Expected empty string even with prefix when error is None'
+            'Expected empty string even with prefix when error is None'
         )
 
     def test_clean_with_no_error_returns_empty(self):
