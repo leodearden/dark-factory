@@ -192,6 +192,16 @@ class TestUuidDispatch:
         with pytest.raises(AssertionError, match='unexpected uuid'):
             await dispatch('uuid-99', 'Nobody', [], group_id='g', old_summary='x')
 
+    def test_dispatch_docstring_documents_exception_support(self):
+        """_uuid_dispatch or _UuidDispatcher docstring mentions exception value support."""
+        combined_doc = (
+            (_uuid_dispatch.__doc__ or '')
+            + (_UuidDispatcher.__doc__ or '')
+        )
+        assert 'exception' in combined_doc.lower(), (
+            '_uuid_dispatch or _UuidDispatcher docstring must mention exception support'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.list_entity_nodes
