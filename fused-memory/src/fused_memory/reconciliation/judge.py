@@ -249,9 +249,16 @@ Review this run and provide your verdict as JSON.
                 )
 
             if not stdout_text.strip():
+                if self._usage_gate:
+                    self._usage_gate.confirm_account_ok(oauth_token)
+                    self._usage_gate.on_agent_complete(0.0)
                 return ''
 
             result = json.loads(stdout_text)
+            if self._usage_gate:
+                cost_usd = float(result.get('cost_usd', result.get('total_cost_usd', 0.0)))
+                self._usage_gate.confirm_account_ok(oauth_token)
+                self._usage_gate.on_agent_complete(cost_usd)
             return result.get('result', '')
 
     def _parse_verdict(self, response_text: str, run_id: str) -> JudgeVerdict:
