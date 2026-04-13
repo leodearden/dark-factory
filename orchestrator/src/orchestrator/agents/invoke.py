@@ -373,6 +373,8 @@ def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
 
     Codex outputs multiple JSON lines (JSONL): thread.started, messages,
     thread.completed, etc. We find the completion event for results.
+
+    NOTE: does not set timed_out — callers must apply replace(parsed, timed_out=result.timed_out).
     """
     if not result.stdout.strip():
         return AgentResult(
@@ -534,7 +536,10 @@ async def _invoke_gemini(
 
 
 def _parse_gemini_output(result: _SubprocessResult, model: str) -> AgentResult:
-    """Parse Gemini JSON output into AgentResult."""
+    """Parse Gemini JSON output into AgentResult.
+
+    NOTE: does not set timed_out — callers must apply replace(parsed, timed_out=result.timed_out).
+    """
     if not result.stdout.strip():
         return AgentResult(
             success=False,
