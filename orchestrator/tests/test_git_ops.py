@@ -373,6 +373,15 @@ class TestWorktreeLifecycle:
 
 
 @pytest.mark.asyncio
+class TestFreshenMain:
+    async def test_freshen_main_no_remote(self, git_ops: GitOps):
+        """Without a remote, _freshen_main returns (main_branch, None)."""
+        ref, stale = await git_ops._freshen_main()
+        assert ref == git_ops.config.main_branch
+        assert stale is None
+
+
+@pytest.mark.asyncio
 class TestCommitTaskStatuses:
     async def test_commits_changed_tasks_json(self, git_ops: GitOps):
         """commit_task_statuses commits only .taskmaster/tasks/tasks.json."""
