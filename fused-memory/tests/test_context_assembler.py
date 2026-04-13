@@ -669,7 +669,7 @@ class TestContextAssemblerCancellation:
         Pass 1 is bypassed by patching propagate_cancellations to a no-op, so Pass 2
         sees the bare BaseException value directly.
 
-        With the current ``isinstance(ctx_result, BaseException)`` guard,
+        With the old ``isinstance(ctx_result, BaseException)`` guard,
         KeyboardInterrupt() IS caught and degraded to [] — assemble() returns normally.
         With the narrowed ``isinstance(ctx_result, Exception)`` guard, KeyboardInterrupt()
         is NOT caught and falls through to the list comprehension
