@@ -20,6 +20,11 @@ def parse_utc(ts: str | None) -> datetime:
         UTC; aware inputs are returned with their original tzinfo preserved
         (not necessarily UTC).  Callers that require UTC must call
         ``.astimezone(UTC)`` themselves.
+
+    Note:
+        The name ``parse_utc`` reflects only the naive-input default (naive
+        datetimes get UTC attached).  It does **not** guarantee UTC output
+        for aware inputs — those are returned with their original tzinfo.
     """
     if ts is None:
         raise TypeError('timestamp is None')

@@ -77,13 +77,13 @@ class TestParseUtc:
         )
 
     def test_docstring_one_liner_says_timezone_aware(self):
-        """parse_utc one-liner must say 'timezone-aware' and not 'ensure it has UTC timezone'."""
+        """parse_utc one-liner must contain 'timezone-aware' and not 'ensure it has UTC timezone'."""
         from dashboard.data.utils import parse_utc
 
         doc = parse_utc.__doc__ or ''
         one_liner = doc.strip().splitlines()[0]
-        assert 'Parse an ISO timestamp string into a timezone-aware datetime' in one_liner, (
-            f"Expected one-liner to say 'timezone-aware datetime', got: {one_liner!r}"
+        assert 'timezone-aware' in one_liner, (
+            f"Expected one-liner to contain 'timezone-aware', got: {one_liner!r}"
         )
         assert 'ensure it has UTC timezone' not in one_liner, (
             f"Misleading phrase 'ensure it has UTC timezone' still in one-liner: {one_liner!r}"

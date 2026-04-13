@@ -44,7 +44,7 @@ def partition_burst_state(
         # Idle agents with recent writes are still "active" for display
         last_write_at = agent.get('last_write_at')
         try:
-            last_write = parse_utc(last_write_at)
+            last_write = parse_utc(last_write_at).astimezone(UTC)
             if (now - last_write).total_seconds() < active_threshold_seconds:
                 active.append(agent)
                 continue
@@ -79,8 +79,8 @@ async def get_recent_runs(db: aiosqlite.Connection | None, *, limit: int = 50) -
             duration = None
             if row['completed_at'] is not None:
                 try:
-                    started = parse_utc(row['started_at'])
-                    completed = parse_utc(row['completed_at'])
+                    started = parse_utc(row['started_at']).astimezone(UTC)
+                    completed = parse_utc(row['completed_at']).astimezone(UTC)
                     duration = (completed - started).total_seconds()
                 except (ValueError, TypeError) as exc:
                     logger.debug(
@@ -239,7 +239,7 @@ async def get_buffer_stats(db: aiosqlite.Connection | None) -> dict:
 
         age = None
         if oldest_ts is not None:
-            oldest_dt = parse_utc(oldest_ts)
+            oldest_dt = parse_utc(oldest_ts).astimezone(UTC)
             age = (datetime.now(UTC) - oldest_dt).total_seconds()
 
         return {'buffered_count': count, 'oldest_event_age_seconds': age}
@@ -276,7 +276,7 @@ async def get_burst_state(
             # Apply cooldown: if last write is older than cooldown, agent is idle
             if state == 'bursting':
                 try:
-                    last_write = parse_utc(row['last_write_at'])
+                    last_write = parse_utc(row['last_write_at']).astimezone(UTC)
                     if (now - last_write).total_seconds() > burst_cooldown_seconds:
                         state = 'idle'
                         burst_started = None
