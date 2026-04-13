@@ -53,7 +53,8 @@ _STATUS_RANK = {
 }
 _PRIORITY_RANK = {'high': 0, 'medium': 1, 'low': 2}
 DEFAULT_PRIORITY = 'medium'  # canonical fallback used by both record_task and backfill_corpus
-assert DEFAULT_PRIORITY in _PRIORITY_RANK, f'{DEFAULT_PRIORITY!r} not in _PRIORITY_RANK'
+if DEFAULT_PRIORITY not in _PRIORITY_RANK:
+    raise ValueError(f'{DEFAULT_PRIORITY!r} not in _PRIORITY_RANK')
 
 # JSON schema for the curator's structured output — used by invoke_with_cap_retry
 # to constrain the LLM's response.

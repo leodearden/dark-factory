@@ -338,7 +338,13 @@ class TestBackfillPointIdConsistency:
         )
 
     def test_default_priority_in_priority_rank(self):
-        """DEFAULT_PRIORITY must be a key in _PRIORITY_RANK so sort-key fallback of 99 is never used."""
+        """DEFAULT_PRIORITY must be a key in _PRIORITY_RANK so sort-key fallback of 99 is never used.
+
+        NOTE: This test is intentionally redundant with the module-level ValueError guard in
+        task_curator.py.  If that guard fires, the module won't import and *all* tests in this
+        file will fail before this assertion is ever reached.  The test is kept for documentation
+        purposes — it makes the invariant explicit and searchable in the test suite.
+        """
         assert DEFAULT_PRIORITY in _PRIORITY_RANK, (
             f"DEFAULT_PRIORITY {DEFAULT_PRIORITY!r} is not a key in _PRIORITY_RANK {_PRIORITY_RANK}"
         )
