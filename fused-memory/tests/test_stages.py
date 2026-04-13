@@ -939,6 +939,43 @@ class TestProactiveSampling:
             "The 'Your Task' instruction section should reference the Proactive Task Sample"
         )
 
+    # --- Step: lazy iterable acceptance (task-709) ---
+
+    def test_select_proactive_sample_accepts_lazy_iterable(self):
+        """_select_proactive_sample works with a generator (lazy Iterable[dict]), not a list.
+
+        Verifies the Iterable[dict] type hint is accurate: heapq.nsmallest accepts any
+        iterable, so a generator can be passed directly without first materialising a list.
+        Priority ordering (in-progress/blocked before pending/done) is preserved.
+        """
+
+        def task_generator():
+            yield self._make_task(1, 'done')
+            yield self._make_task(2, 'pending')
+            yield self._make_task(3, 'in-progress')
+            yield self._make_task(4, 'done')
+            yield self._make_task(5, 'blocked')
+            yield self._make_task(6, 'pending')
+
+        result = _select_proactive_sample(task_generator(), 3)
+
+        assert len(result) == 3
+
+        high_priority = {'in-progress', 'blocked'}
+        low_priority = {'pending', 'done'}
+        statuses = [t['status'] for t in result]
+        last_high = max(
+            (i for i, t in enumerate(result) if t['status'] in high_priority),
+            default=-1,
+        )
+        first_low = min(
+            (i for i, t in enumerate(result) if t['status'] in low_priority),
+            default=len(result),
+        )
+        assert last_high < first_low, (
+            f'In-progress/blocked tasks must appear before pending/done. Got: {statuses}'
+        )
+
 
 class TestRunIdValidation(BaseStageValidationTest):
     """BaseStage.run() validates run_id before prompt interpolation."""
