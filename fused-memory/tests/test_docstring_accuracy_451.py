@@ -331,26 +331,43 @@ class TestRefreshEntitySummaryCrossReferencesRebuild:
 
 
 class TestNoStalePrivateMethodReferences:
-    """Self-consistency test: file must not contain stale private method names.
+    """Self-consistency check across all test_docstring_accuracy*.py files.
 
     The test file contained stale private-prefixed method name references in
     comments and docstrings after rebuild_entity_from_edges was made public
-    (task 420).  This test reads the file's own source and asserts no such
-    stale private reference remains.
+    (task 420).  This test scans all test_docstring_accuracy*.py files in the
+    tests/ directory and asserts no such stale private reference remains in any
+    of them.
+
+    Scope is intentionally limited to test_docstring_accuracy*.py rather than
+    all *.py files: other test files legitimately contain test method names
+    that include 'rebuild_entity_from_edges' after a 'test' prefix, producing
+    false-positive substring matches on the forbidden token.
 
     Asserts:
-      (a) the private-prefixed name does not appear literally anywhere in this
-          file (including module docstring, section comments, and class docstrings)
+      (a) the private-prefixed name does not appear literally in any
+          test_docstring_accuracy*.py file (including module docstrings,
+          section comments, and class docstrings)
+
+    NOTE: never write the forbidden token literally anywhere in this file —
+    the self-check will fail.  The token is always constructed via concatenation
+    ('_' + 'rebuild_entity_from_edges') so this file's own source stays clean.
     """
 
     def test_no_stale_private_method_references(self) -> None:
-        """File source must not contain the underscore-prefixed method name."""
+        """No test_docstring_accuracy*.py file may contain the stale method name."""
         import pathlib
-        source = pathlib.Path(__file__).read_text()
+        tests_dir = pathlib.Path(__file__).parent
         # Construct at runtime so this test's own source stays clean.
+        # NOTE: never write the forbidden token literally anywhere in this file —
+        # the self-check will fail.
         forbidden = '_' + 'rebuild_entity_from_edges'
-        assert forbidden not in source, (
-            f"Found stale reference to {forbidden!r} in test file source. "
+        offenders: list[str] = []
+        for py_file in sorted(tests_dir.glob("test_docstring_accuracy*.py")):
+            if forbidden in py_file.read_text():
+                offenders.append(py_file.name)
+        assert not offenders, (
+            f"Found stale reference to {forbidden!r} in: {offenders}. "
             "The method was renamed to the public rebuild_entity_from_edges "
             "in task 420; update all comments and docstrings accordingly."
         )
