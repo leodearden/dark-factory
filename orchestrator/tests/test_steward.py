@@ -419,20 +419,23 @@ class TestStewardRetryLogic:
 
         assert steward._retry_counts.get('esc-42-1') == 1
 
-    @pytest.mark.parametrize('max_attempts', [1, 2, 3])
+    @pytest.mark.parametrize('max_attempts,retry_count', [
+        (1, 1), (2, 2), (3, 3),  # exact boundary: retry_count == max_attempts
+        (2, 3), (1, 3),           # above boundary: retry_count > max_attempts
+    ])
     async def test_auto_escalates_after_max_attempts(
-        self, steward, mock_config, max_attempts,
+        self, steward, mock_config, max_attempts, retry_count,
     ):
         mock_config.steward_max_attempts = max_attempts
         esc = _make_escalation()
-        steward._retry_counts['esc-42-1'] = max_attempts
+        steward._retry_counts['esc-42-1'] = retry_count
 
         await steward._handle_escalation(esc)
 
         steward.escalation_queue.submit.assert_called_once()
         submitted = steward.escalation_queue.submit.call_args[0][0]
         assert submitted.level == 1
-        expected = f'Failed after {max_attempts} attempt{"s" if max_attempts != 1 else ""}:'
+        expected = f'Failed after {retry_count} attempt{"s" if retry_count != 1 else ""}:'
         assert expected in submitted.summary
 
         steward.escalation_queue.resolve.assert_called_once()
@@ -461,6 +464,8 @@ class TestStewardRetryLogic:
         steward.escalation_queue.submit.assert_not_called()
         # Normal invocation path must have been taken.
         mock_invoke.assert_called_once()
+        # Counter must have been incremented: started at max_attempts-1, now max_attempts.
+        assert steward._retry_counts.get('esc-42-1') == max_attempts
 
     async def test_different_escalations_have_independent_counts(self, steward):
         for esc_id in ('esc-42-1', 'esc-42-2'):
