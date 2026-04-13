@@ -812,7 +812,10 @@ class TestRebuildEntitySummaries:
         async def _fail_uuid1(uuid, name, edges, *, group_id, old_summary):
             if uuid == 'uuid-1':
                 raise RuntimeError('FalkorDB timeout')
-            return {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'stale2', 'new_summary': 'current2', 'edge_count': 1}
+            elif uuid == 'uuid-2':
+                return {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'stale2', 'new_summary': 'current2', 'edge_count': 1}
+            else:
+                raise AssertionError(f'_fail_uuid1 called with unexpected uuid: {uuid!r}')
 
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_fail_uuid1)
         result = await svc.rebuild_entity_summaries(project_id='test')
@@ -832,11 +835,14 @@ class TestRebuildEntitySummaries:
         so calling with 'uuid-99' returns a dict instead of raising AssertionError.
         This test fails until _fail_uuid1 is hardened with an explicit elif/else guard.
         """
-        # Mirrors the current (broken) _fail_uuid1 from test_partial_failure_continues
+        # Mirrors the hardened _fail_uuid1 from test_partial_failure_continues
         async def _fail_uuid1(uuid, name, edges, *, group_id, old_summary):
             if uuid == 'uuid-1':
                 raise RuntimeError('FalkorDB timeout')
-            return {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'stale2', 'new_summary': 'current2', 'edge_count': 1}
+            elif uuid == 'uuid-2':
+                return {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'stale2', 'new_summary': 'current2', 'edge_count': 1}
+            else:
+                raise AssertionError(f'_fail_uuid1 called with unexpected uuid: {uuid!r}')
 
         with pytest.raises(AssertionError, match='unexpected uuid'):
             await _fail_uuid1('uuid-99', 'Unknown', [], group_id='test', old_summary='x')
