@@ -483,6 +483,31 @@ class TestFreshenMain:
         assert ref == git_ops.config.main_branch
         assert stale == 3
 
+    async def test_freshen_main_ahead_rev_list_fails(
+        self, git_ops_with_remote: tuple[GitOps, Path], caplog,
+    ):
+        """When ahead rev-list exits non-zero, _freshen_main returns (main_branch, behind) and logs a warning."""
+        git_ops, _origin = git_ops_with_remote
+
+        call_count = 0
+
+        async def fake_run(cmd, cwd=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (0, '', '')                      # fetch succeeds
+            elif call_count == 2:
+                return (0, '3', '')                     # behind rev-list: 3 commits behind
+            return (128, '', 'fatal: bad revision')     # ahead rev-list fails
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            with patch('orchestrator.git_ops._run', side_effect=fake_run):
+                ref, stale = await git_ops._freshen_main()
+
+        assert ref == git_ops.config.main_branch
+        assert stale == 3
+        assert any('rev-list (ahead) failed' in r.message for r in caplog.records)
+
 
 @pytest.mark.asyncio
 class TestCreateWorktreeFreshening:
