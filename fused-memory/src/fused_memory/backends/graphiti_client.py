@@ -21,6 +21,7 @@ from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.utils.async_utils import propagate_cancellations
 
 logger = logging.getLogger(__name__)
 
@@ -1027,24 +1028,44 @@ class GraphitiBackend:
 
         Args:
             group_id: Project graph to query.
+            max_concurrency: Maximum number of concurrent ``get_valid_edges_for_node``
+                requests in flight at once.  Defaults to 10.  Raise or lower to tune
+                the trade-off between latency and DB connection pressure.
 
         Returns:
             Tuple of (stale_list, total_count) where stale_list contains the same
             per-entity dict schema as ``detect_stale_with_edges``
             (uuid, name, summary, duplicate_count, stale_line_count, valid_fact_count,
-            summary_line_count) and total_count is len(all entities).
+            summary_line_count) and total_count is len(all entities).  Order of entries
+            in stale_list matches the order returned by ``list_entity_nodes``.
         """
         entities = await self.list_entity_nodes(group_id=group_id)
+
+        # Separate entities: empty-summary ones are cheap-skipped without any I/O.
+        fetch_entities = [e for e in entities if e['summary']]
+
+        sem = asyncio.Semaphore(max_concurrency)
+
+        async def _fetch_one(entity: dict) -> list:
+            async with sem:
+                return await self.get_valid_edges_for_node(entity['uuid'], group_id=group_id)
+
+        gather_results = await asyncio.gather(
+            *(_fetch_one(e) for e in fetch_entities), return_exceptions=True
+        )
+
+        # Pass 1: propagate CancelledError / KeyboardInterrupt before accumulation.
+        propagate_cancellations(gather_results)
+
+        # Pass 2: re-raise first application-level exception; collect stale entries.
         stale: list[dict] = []
-        for entity in entities:
-            if not entity['summary']:
-                # Empty summary — not stale by definition; skip the async edge fetch.
-                # (_build_stale_entry would also return None, but we avoid the I/O.)
-                continue
-            edges = await self.get_valid_edges_for_node(entity['uuid'], group_id=group_id)
-            entry = self._build_stale_entry(entity, edges)
+        for entity, result in zip(fetch_entities, gather_results):
+            if isinstance(result, Exception):
+                raise result
+            entry = self._build_stale_entry(entity, result)
             if entry is not None:
                 stale.append(entry)
+
         return (stale, len(entities))
 
     async def detect_stale_summaries(self, *, group_id: str) -> list[dict]:
