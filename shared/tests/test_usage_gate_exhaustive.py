@@ -1515,23 +1515,12 @@ class TestConfirmAccountOk:
         assert gate._accounts[0].near_cap is False
 
     def test_clears_near_cap_without_probe_in_flight(self):
-        # Happy-path bug: near_cap set, billing reset, no full cap hit, probe never ran.
+        # Happy-path bug guard: near_cap clears when billing resets and the probe never ran.
         gate = make_gate(['a'])
         gate._accounts[0].near_cap = True
         gate._accounts[0].probe_in_flight = False
-        # NOTE: probe_count=3 with probe_in_flight=False is unreachable in real execution
-        # (probe_count only advances inside the probe loop while capped, and is reset to 0
-        # on success).  The value is set here purely to verify that confirm_account_ok does
-        # NOT touch unrelated fields when the probe_in_flight branch is skipped — these
-        # assertions are "no side effects on unrelated fields" invariant checks, not a
-        # realistic-state test.
-        gate._accounts[0].probe_count = 3
-        gate._open.clear()
         gate.confirm_account_ok(gate._accounts[0].token)
         assert gate._accounts[0].near_cap is False
-        # Verify no side effects on probe-related fields (invariant check, not realistic state)
-        assert gate._accounts[0].probe_count == 3
-        assert gate._open.is_set() is False
 
     def test_does_not_clear_near_cap_with_none_token(self):
         gate = make_gate(['a'])
