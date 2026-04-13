@@ -61,7 +61,7 @@ def _format_task(task: dict, *, display_id: str | None = None) -> str:
             '450.2') so subtasks are cross-referenceable with the Active Task Tree
             section that already uses qualified IDs.
     """
-    tid = display_id if display_id is not None else task.get('id', '?')
+    tid = display_id if display_id else task.get('id', '?')
     title = task.get('title', '?')
     status = task.get('status', '?')
     deps = task.get('dependencies', [])

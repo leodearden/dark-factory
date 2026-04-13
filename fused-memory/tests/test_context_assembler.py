@@ -19,7 +19,9 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.reconciliation.context_assembler import (
     ContextAssembler,
-    _format_task,
+    _format_task,  # Intentional private-API coupling: targeted unit coverage of
+    #                the display_id parameter that the integration tests alone
+    #                cannot isolate as cleanly.
     estimate_tokens,
     format_event,
 )
