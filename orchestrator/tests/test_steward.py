@@ -1803,3 +1803,18 @@ class TestPreTriageUsageGateCleanup:
             await steward._pre_triage_suggestions(self._esc())
 
         gate.release_probe_slot.assert_called_once_with('tok-a')
+
+    async def test_confirm_account_ok_not_called_on_exception(self, steward: TaskSteward):
+        """On exception, confirm_account_ok is NOT called — only release_probe_slot is."""
+        gate = self._gate()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.agents.invoke.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=RuntimeError('crash')),
+            pytest.raises(RuntimeError),
+        ):
+            await steward._pre_triage_suggestions(self._esc())
+
+        gate.confirm_account_ok.assert_not_called()
