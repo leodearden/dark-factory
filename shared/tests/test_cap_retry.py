@@ -77,6 +77,19 @@ def _mock_gate(**overrides) -> MagicMock:
     return gate
 
 
+def test_mock_gate_defaults_include_release_probe_slot():
+    """_mock_gate() should explicitly set release_probe_slot in its defaults.
+
+    Checks vars(gate) rather than hasattr(gate, ...) so that MagicMock's
+    silent auto-attribute creation doesn't produce a false positive.
+    """
+    gate = _mock_gate()
+    assert 'release_probe_slot' in vars(gate), (
+        "_mock_gate() must explicitly set release_probe_slot so the "
+        "exception-cleanup contract is self-documented in the helper."
+    )
+
+
 # Shared patch targets
 _INVOKE_PATCH = 'shared.cli_invoke.invoke_claude_agent'
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
