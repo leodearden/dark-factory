@@ -140,7 +140,7 @@ class ContextAssembler:
 
                 # Deduplicate context items
                 new_items = [
-                    item for item in ctx_result
+                    item for item in ctx_result  # pyright: ignore[reportGeneralTypeIssues]
                     if item.id not in context_items
                 ]
 
