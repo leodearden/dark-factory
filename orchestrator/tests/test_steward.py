@@ -464,6 +464,8 @@ class TestStewardRetryLogic:
         steward.escalation_queue.submit.assert_not_called()
         # Normal invocation path must have been taken.
         mock_invoke.assert_called_once()
+        # Counter must have been incremented: started at max_attempts-1, now max_attempts.
+        assert steward._retry_counts.get('esc-42-1') == max_attempts
 
     async def test_different_escalations_have_independent_counts(self, steward):
         for esc_id in ('esc-42-1', 'esc-42-2'):
