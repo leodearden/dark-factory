@@ -432,6 +432,217 @@ class TestDetectStaleSummariesDryRun:
         # get_valid_edges_for_node must NOT have been called for the empty-summary entity
         backend.get_valid_edges_for_node.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_accepts_max_concurrency_kwarg(self, mock_config, make_backend):
+        """detect_stale_dry_run accepts an optional max_concurrency keyword parameter.
+
+        Calling with max_concurrency=5 must not raise TypeError.
+        Calling with the default (no kwarg) must also still work.
+        Both calls return well-formed (stale_list, total_count) tuples.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'fact'},
+        ])
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'},
+        ])
+
+        # Should not raise TypeError with explicit max_concurrency
+        stale_list, total_count = await backend.detect_stale_dry_run(
+            group_id='test', max_concurrency=5
+        )
+        assert total_count == 1
+
+        # Default (no kwarg) must still work
+        stale_list2, total_count2 = await backend.detect_stale_dry_run(group_id='test')
+        assert total_count2 == 1
+
+    @pytest.mark.asyncio
+    async def test_raises_when_max_concurrency_invalid(self, mock_config, make_backend):
+        """detect_stale_dry_run raises ValueError for max_concurrency < 1.
+
+        Semaphore(0) would deadlock; Semaphore(-1) raises ValueError from stdlib.
+        A clear ValueError with a descriptive message is better than either.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[])
+
+        with pytest.raises(ValueError, match='max_concurrency must be >= 1'):
+            await backend.detect_stale_dry_run(group_id='test', max_concurrency=0)
+
+        with pytest.raises(ValueError, match='max_concurrency must be >= 1'):
+            await backend.detect_stale_dry_run(group_id='test', max_concurrency=-5)
+
+    @pytest.mark.asyncio
+    async def test_edge_fetches_run_concurrently(self, mock_config, make_backend):
+        """Edge fetches overlap rather than running sequentially (peak_concurrent == 5).
+
+        Uses asyncio.Barrier(5) so all 5 coroutines must be in-flight simultaneously
+        before any of them can complete — this provides a deterministic proof of
+        concurrency (not just a scheduler hint via sleep(0)).
+        """
+        n = 5
+        backend = make_backend(mock_config)
+        entities = [
+            {'uuid': f'uuid-{i}', 'name': f'Entity{i}', 'summary': 'fact'}
+            for i in range(n)
+        ]
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+
+        in_flight = 0
+        peak_concurrent = 0
+        barrier = asyncio.Barrier(n)
+
+        async def tracking_edges(node_uuid, *, group_id):
+            nonlocal in_flight, peak_concurrent
+            in_flight += 1
+            peak_concurrent = max(peak_concurrent, in_flight)
+            await barrier.wait()  # all n must arrive before any can continue
+            in_flight -= 1
+            return [{'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'}]
+
+        backend.get_valid_edges_for_node = AsyncMock(side_effect=tracking_edges)
+
+        await backend.detect_stale_dry_run(group_id='test', max_concurrency=n)
+
+        assert peak_concurrent == n, (
+            f"Expected all {n} fetches in-flight simultaneously, got peak={peak_concurrent}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrency_bounded_by_max_concurrency(self, mock_config, make_backend):
+        """Peak concurrent calls never exceeds max_concurrency.
+
+        With 6 entities and max_concurrency=2, the semaphore must hold all but
+        2 calls back — peak_concurrent must be <= 2.
+        """
+        backend = make_backend(mock_config)
+        entities = [
+            {'uuid': f'uuid-{i}', 'name': f'Entity{i}', 'summary': 'fact'}
+            for i in range(6)
+        ]
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+
+        in_flight = 0
+        peak_concurrent = 0
+
+        async def tracking_edges(node_uuid, *, group_id):
+            nonlocal in_flight, peak_concurrent
+            in_flight += 1
+            peak_concurrent = max(peak_concurrent, in_flight)
+            await asyncio.sleep(0)  # yield to event loop so others can contend
+            in_flight -= 1
+            return [{'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'}]
+
+        backend.get_valid_edges_for_node = AsyncMock(side_effect=tracking_edges)
+
+        await backend.detect_stale_dry_run(group_id='test', max_concurrency=2)
+
+        assert peak_concurrent <= 2, (
+            f"Expected peak concurrent calls <= 2 (bounded), got {peak_concurrent}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_exception_propagates_from_gather(self, mock_config, make_backend):
+        """RuntimeError raised by one entity's edge fetch propagates out of detect_stale_dry_run.
+
+        Other entities succeed; the first Exception found in the gather results
+        must be re-raised (not swallowed or returned).
+        """
+        backend = make_backend(mock_config)
+        entities = [
+            {'uuid': 'uuid-ok', 'name': 'OK', 'summary': 'fact'},
+            {'uuid': 'uuid-bad', 'name': 'Bad', 'summary': 'fact'},
+            {'uuid': 'uuid-ok2', 'name': 'OK2', 'summary': 'fact'},
+        ]
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+
+        async def edges_with_error(node_uuid, *, group_id):
+            if node_uuid == 'uuid-bad':
+                raise RuntimeError('db timeout')
+            return [{'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'}]
+
+        backend.get_valid_edges_for_node = AsyncMock(side_effect=edges_with_error)
+
+        with pytest.raises(RuntimeError, match='db timeout'):
+            await backend.detect_stale_dry_run(group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates_from_gather(self, mock_config, make_backend):
+        """asyncio.CancelledError raised during an edge fetch propagates out immediately.
+
+        CancelledError is a BaseException (not Exception), so Pass 1
+        (propagate_cancellations) must re-raise it before Pass 2 even runs.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'fact'},
+        ])
+
+        async def cancel_on_fetch(node_uuid, *, group_id):
+            raise asyncio.CancelledError()
+
+        backend.get_valid_edges_for_node = AsyncMock(side_effect=cancel_on_fetch)
+
+        with pytest.raises(asyncio.CancelledError):
+            await backend.detect_stale_dry_run(group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_result_correctness_under_parallel_execution(self, mock_config, make_backend):
+        """Stale/clean/empty distribution is preserved correctly under parallel execution.
+
+        10 entities with deterministic distribution:
+        - 4 stale (summary differs from canonical edge facts)
+        - 3 clean (summary matches)
+        - 3 empty-summary (cheap-skipped, not stale)
+
+        Assert:
+        - total_count == 10
+        - stale_list contains exactly the 4 stale entity UUIDs (order-independent)
+        - stale_list does NOT contain any clean or empty-summary UUIDs
+        """
+        backend = make_backend(mock_config)
+
+        stale_uuids = {f'uuid-stale-{i}' for i in range(4)}
+        clean_uuids = {f'uuid-clean-{i}' for i in range(3)}
+        empty_uuids = {f'uuid-empty-{i}' for i in range(3)}
+
+        entities = (
+            [{'uuid': u, 'name': u, 'summary': 'old fact'} for u in sorted(stale_uuids)]
+            + [{'uuid': u, 'name': u, 'summary': 'current fact'} for u in sorted(clean_uuids)]
+            + [{'uuid': u, 'name': u, 'summary': ''} for u in sorted(empty_uuids)]
+        )
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+
+        async def edges_by_uuid(node_uuid, *, group_id):
+            # stale entities: edge fact differs from their summary ('old fact')
+            if node_uuid in stale_uuids:
+                return [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]
+            # clean entities: edge fact matches their summary
+            if node_uuid in clean_uuids:
+                return [{'uuid': 'e2', 'fact': 'current fact', 'name': 'edge2'}]
+            return []
+
+        backend.get_valid_edges_for_node = AsyncMock(side_effect=edges_by_uuid)
+
+        # max_concurrency=2 with 10 entities exercises bounding alongside correctness
+        stale_list, total_count = await backend.detect_stale_dry_run(group_id='test', max_concurrency=2)
+
+        assert total_count == 10
+        returned_uuids = {e['uuid'] for e in stale_list}
+        assert returned_uuids == stale_uuids
+        # No clean or empty entities in the stale list
+        assert returned_uuids.isdisjoint(clean_uuids)
+        assert returned_uuids.isdisjoint(empty_uuids)
+        # Empty-summary entities never trigger edge queries
+        for empty_uuid in empty_uuids:
+            # Verify no call was made for empty-summary entities
+            for call in backend.get_valid_edges_for_node.call_args_list:
+                assert call.args[0] != empty_uuid, (
+                    f"Expected no edge fetch for empty-summary entity {empty_uuid}"
+                )
+
 
 # ---------------------------------------------------------------------------
 # task-656: GraphitiBackend._build_stale_entry (static helper)
