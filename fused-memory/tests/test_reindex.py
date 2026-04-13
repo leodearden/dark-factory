@@ -215,9 +215,7 @@ class TestUpdateNodeEmbedding:
         backend._driver._get_graph = MagicMock(return_value=graph)
         embedding = [0.5] * 128
         await backend.update_node_embedding('my-uuid', embedding, group_id='test')
-        call_args = graph.query.call_args
-        args, kwargs = call_args
-        params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        params = extract_params(graph.query.call_args)
         assert params.get('uuid') == 'my-uuid'
         assert params.get('embedding') == embedding
 
@@ -247,9 +245,7 @@ class TestUpdateEdgeEmbedding:
         backend._driver._get_graph = MagicMock(return_value=graph)
         embedding = [0.7] * 64
         await backend.update_edge_embedding('edge-uuid-99', embedding, group_id='test')
-        call_args = graph.query.call_args
-        args, kwargs = call_args
-        params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        params = extract_params(graph.query.call_args)
         assert params.get('uuid') == 'edge-uuid-99'
         assert params.get('embedding') == embedding
 
@@ -333,7 +329,7 @@ class TestDropIndex:
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.drop_index('MyLabel', 'my_field', group_id='test')
         call_args = graph.query.call_args
-        cypher = call_args[0][0]
+        cypher = extract_cypher(call_args)
         assert 'MyLabel' in cypher
         assert 'my_field' in cypher
 
