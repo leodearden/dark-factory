@@ -33,8 +33,8 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _select_proactive_sample,
 )
 from fused_memory.reconciliation.task_filter import (
-    FilteredTaskTree,
     MAX_DONE_TASKS_RETAINED,
+    FilteredTaskTree,
     _id_key,
     filter_task_tree,
 )
