@@ -235,9 +235,12 @@ def build_eval_env() -> dict[str, str]:
                     k, v = line.split("=", 1)
                     env[k.strip()] = v.strip()
 
-    oauth_token = env.get("CLAUDE_OAUTH_TOKEN_G", "")
+    # Prefer account A (interactive token, confirmed uncapped) over G.
+    # UsageGate still cycles through all accounts from usage-accounts.yaml,
+    # so this only affects the initial CLAUDE_CODE_OAUTH_TOKEN default.
+    oauth_token = env.get("CLAUDE_OAUTH_TOKEN_A") or env.get("CLAUDE_OAUTH_TOKEN_G", "")
     if not oauth_token:
-        log("WARNING: CLAUDE_OAUTH_TOKEN_G not found in .env")
+        log("WARNING: no CLAUDE_OAUTH_TOKEN found in .env")
     env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
     return env
 

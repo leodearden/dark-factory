@@ -161,6 +161,9 @@ def status(config_path: Path | None):
               help='Generate report from existing state (no new judge calls)')
 @click.option('--vllm-url', default=None,
               help='vLLM endpoint URL (e.g. http://workstation:8000)')
+@click.option('--worktree', 'worktree_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Reuse an existing eval worktree (skip create + use its .task state)')
 def eval_cmd(
     task_path: Path | None,
     config_name: str | None,
@@ -177,6 +180,7 @@ def eval_cmd(
     reset: bool,
     report_only: bool,
     vllm_url: str | None,
+    worktree_path: Path | None,
 ):
     """Run multi-provider implementor evaluations."""
     try:
@@ -187,9 +191,10 @@ def eval_cmd(
 
     # Inject ANTHROPIC_BASE_URL into vLLM configs when --vllm-url is set
     if vllm_url:
-        from orchestrator.evals.configs import VLLM_EVAL_CONFIGS
-        for cfg in VLLM_EVAL_CONFIGS:
-            cfg.env_overrides['ANTHROPIC_BASE_URL'] = vllm_url
+        from orchestrator.evals.configs import FINAL_RUN_CONFIGS, VLLM_EVAL_CONFIGS
+        for cfg in [*VLLM_EVAL_CONFIGS, *FINAL_RUN_CONFIGS]:
+            if cfg.env_overrides:  # only vLLM configs have env_overrides
+                cfg.env_overrides['ANTHROPIC_BASE_URL'] = vllm_url
 
     if cleanup:
         _run_cleanup(base_config)
@@ -219,12 +224,16 @@ def eval_cmd(
         click.echo('Error: --task is required (or use --matrix / --judge / --plan-only)', err=True)
         sys.exit(1)
 
-    _run_single_eval(task_path, config_name, base_config, force=force, timeout=timeout)
+    _run_single_eval(
+        task_path, config_name, base_config,
+        force=force, timeout=timeout, worktree_path=worktree_path,
+    )
 
 
 def _run_single_eval(
     task_path: Path, config_name: str | None, base_config,
     force: bool = False, timeout: int | None = None,
+    worktree_path: Path | None = None,
 ):
     """Run eval for a single task with one or all configs."""
     from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
@@ -246,6 +255,7 @@ def _run_single_eval(
         for cfg in configs:
             result = await run_eval(
                 task_path, cfg, base_config, timeout_override=timeout,
+                worktree_path=worktree_path,
             )
             click.echo(
                 f'{result.task_id} × {result.config_name}: '

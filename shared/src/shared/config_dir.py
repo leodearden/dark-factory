@@ -50,6 +50,13 @@ class TaskConfigDir:
 
     def write_credentials(self, oauth_token: str) -> None:
         """Write ``.credentials.json`` with the given OAuth token."""
+        # Recreate dir if a previous `claude` CLI process removed it.
+        # Diagnosed 2026-04-13: reviewer_comprehensive hit FileNotFoundError
+        # on the second review cycle — root cause unclear, but defensive
+        # mkdir prevents the failure.
+        if not self._dir.exists():
+            logger.warning('Config dir %s was deleted — recreating', self._dir)
+        self._dir.mkdir(parents=True, exist_ok=True)
         creds = {
             'claudeAiOauth': {
                 'accessToken': oauth_token,

@@ -1,7 +1,67 @@
 # vLLM Local Model Evaluation — Status Report
 
-**Last updated:** 2026-04-13
-**Status:** All 7 baked images built and pushed to Docker Hub (including new MiniMax M2.7). Matrix launch attempted but **blocked by OAuth token issue** — all accounts (including A) report capped when invoked via stored tokens, despite account A working interactively. Runtime FP8 quantization identified as a separate startup bottleneck for reap-139b-fp8. GPU retry with B200→2×H200 fallback implemented. Next session: debug OAuth token mismatch, then relaunch matrix.
+**Last updated:** 2026-04-13 PM
+**Status:** OAuth blocker resolved. Sonnet baseline done. Qwen3-Coder-Next completed df_task_12 (4 timeouts). REAP-139B FP8 and M2.5 NVFP4 running. M2.7 parked (CUDA graph hang on SM120, SSH tunnel crash with enforce_eager). Multiple infra fixes landed.
+
+## Update 2026-04-13 PM: OAuth resolved, first results, infra fixes
+
+### TL;DR
+
+- **OAuth token blocker RESOLVED**: `setup-token` long-lived tokens have independent cap tracking from interactive OAuth tokens. Replaced `CLAUDE_OAUTH_TOKEN_A` in `.env` with the interactive token from `~/.claude/.credentials.json`. `build_eval_env()` updated to prefer token A.
+- **Sonnet baseline df_task_12: DONE** — full pipeline (impl $0.80 → judge $0.09 → debug $0.29 → review $0.87 → fix $0.11 → review $0.16 = $2.32 total). First eval blocked by reviewer credentials bug, resumed with new `--worktree` flag.
+- **Qwen3-Coder-Next FP8 (1×H200): 1/5 done** — df_task_12 done ($23.34, 83 min). 4 tasks timed out at 150 min ($71.84 total).
+- **M2.7 FP8 (4×RTX PRO): PARKED** — CUDA graph compilation hung (100% GPU, 1% VRAM for 2+ hours). Added `enforce_eager=True`, but SSH tunnel died on retry (rc=255). Needs further debugging.
+- **REAP-139B FP8 (2×RTX PRO): RUNNING** — pod created, image pulling. Runtime FP8 quantization = 30-60 min startup.
+- **M2.5 NVFP4 (B200): RETRYING** — no B200 available, retry loop active (5 min intervals, 3h, H200 fallback).
+
+### Bugs fixed this session
+
+| Bug | Fix | File |
+|-----|-----|------|
+| OAuth: stored `setup-token` tokens capped independently | Replaced token A with interactive token; `build_eval_env()` prefers A | `scripts/run_vllm_eval.py`, `.env` |
+| `--vllm-url` not injected into `FINAL_RUN_CONFIGS` | Include both config lists in injection loop | `orchestrator/cli.py` |
+| Reviewer credentials: `FileNotFoundError` on `.credentials.json` | Defensive `mkdir` + warning log in `write_credentials()` | `shared/config_dir.py` |
+| Reviewer error log missing traceback | Added `exc_info=result` to error log | `orchestrator/workflow.py` |
+| M2.7 CUDA graph hang on SM120 | Added `enforce_eager=True` to config | `orchestrator/evals/configs.py` |
+
+### New feature: `--worktree` eval resume
+
+Added `--worktree <path>` to `orchestrator eval` — reuses an existing eval worktree with its `.task/plan.json` state. The workflow sees completed steps and skips straight to the next phase (e.g. reviewer). Used to resume the sonnet baseline from the reviewer phase without re-implementing.
+
+### Results summary (all trials to date)
+
+**Tier 1 — completing tasks:**
+- claude-sonnet-max: df_12 ✅ (new)
+- claude-opus-high: df_12 ✅, df_13 ✅, df_18 timeout (5399L)
+- claude-sonnet-max (prior): df_12 ✅, df_13 ✅, df_18 timeout (8695L)
+- minimax-m25-fp8-new: df_12 ✅, df_13 ✅, reify_12 ✅ (1531L), df_18 timeout
+- qwen3-coder-next-fp8: df_12 ✅ (new, $23.34), df_13/df_18/reify_12/reify_27 timeout
+
+**Tier 2 — partial success:**
+- reap-172b-nvfp4-gb10-new: df_12 ✅, df_13 ✅, df_18 timeout (6086L)
+- reap-139b-awq-new: df_12 ✅
+- reap-139b-fp8-new: df_12 ✅
+
+**Tier 3 — not working:**
+- minimax-m27-fp8: CUDA graph hang + SSH crash (parked)
+- Codex (both), Gemini (both), qwen3-coder-30b, devstral: all blocked/timeout
+
+### Currently running
+
+| Config | Pod | GPU | Status |
+|--------|-----|-----|--------|
+| final-reap-139b-fp8 | 1pjuhicc1iv9rs | 2× RTX PRO 6000 | Image pulling, then 30-60 min runtime quant |
+| final-minimax-m25-nvfp4 | — | B200 (retrying) | No B200 available, retry loop active |
+
+### Next-session priorities
+
+1. **Check running evals** — REAP-139B should be done or nearly done; M2.5 NVFP4 may have found a B200
+2. **Debug M2.7** — SSH crash with enforce_eager needs investigation (try reduced max_model_len, or H200 instead of RTX PRO)
+3. **Launch remaining configs** — `final-reap-139b-awq` (1×H200), `final-reap-172b-nvfp4-gb10` (1×B200), `final-minimax-m25-fp8` (4×RTX PRO)
+4. **Token refresh** — only token A works; other 6 need interactive login to refresh. Token G may have uncapped at 11:00 BST (not yet verified post-reset)
+5. **Elo tournament** once ≥3 configs have full-set results
+
+---
 
 ## Update 2026-04-13: baked images complete, M2.7 added, OAuth blocker found
 

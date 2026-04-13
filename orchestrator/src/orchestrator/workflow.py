@@ -1345,7 +1345,10 @@ class TaskWorkflow:
         # Write results — synthesize ERROR for persistent exceptions
         for role, result in zip(ALL_REVIEWERS, results, strict=True):
             if isinstance(result, Exception):
-                logger.error(f'Reviewer {role.name} failed after retries: {result}')
+                logger.error(
+                    f'Reviewer {role.name} failed after retries: {result}',
+                    exc_info=result,
+                )
                 result = {
                     'reviewer': role.name,
                     'verdict': 'ERROR',

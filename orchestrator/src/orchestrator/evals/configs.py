@@ -362,12 +362,14 @@ FINAL_RUN_CONFIGS = [
     # --- MiniMax-M2.7 FP8 (~220 GB VRAM, ships as FP8) ---
     # ✅ RTX PRO: 4× RTX PRO (384 GB), TP=4 — same GPU config as M2.5 FP8
     # 229B/10B MoE, 196K max context, released 2026-04-11.
+    # enforce_eager=True: CUDA graph compilation hangs on SM120 (2026-04-13)
     _vllm_config('final-minimax-m27-fp8',
         hf_model='MiniMaxAI/MiniMax-M2.7',
         image='leosiriusdawn/runpod-vllm:final-minimax-m27-fp8',
         gpu_type=RTX_PRO_6000, gpu_count=4, container_disk_gb=600,
         max_model_len=131072,
         tool_call_parser='minimax_m2',
+        enforce_eager=True,
         extra_env={'MAX_NUM_SEQS': '5'}),
 
     # --- Qwen3-Coder-Next FP8 (~75 GB VRAM) ---

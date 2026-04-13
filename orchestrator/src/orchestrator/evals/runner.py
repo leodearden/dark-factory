@@ -180,8 +180,16 @@ async def run_eval(
     base_config: OrchestratorConfig | None = None,
     trial: int = 1,
     timeout_override: int | None = None,
+    worktree_path: Path | None = None,
 ) -> EvalResult:
-    """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW."""
+    """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW.
+
+    When *worktree_path* is provided, the eval reuses an existing worktree
+    instead of creating a fresh one.  The worktree's ``.task/plan.json``
+    (with step statuses) is used as the initial plan, so the workflow
+    naturally skips already-completed steps — useful for resuming a
+    blocked eval from the reviewer phase.
+    """
     task = load_task(task_path)
     task_id = task['id']
     project_root = Path(task['project_root'])
@@ -189,11 +197,16 @@ async def run_eval(
     logger.info(f'Starting eval: {task_id} × {config.name} (trial {trial})')
     start_ms = int(time.monotonic() * 1000)
 
-    # 1. Create isolated worktree at pre-task commit (with env setup)
-    worktree, run_id = await create_eval_worktree(
-        project_root, task_id, task['pre_task_commit'],
-        setup_commands=task.get('setup_commands'),
-    )
+    # 1. Create or reuse worktree
+    if worktree_path is not None:
+        worktree = worktree_path
+        run_id = worktree.name
+        logger.info(f'Reusing existing worktree: {worktree}')
+    else:
+        worktree, run_id = await create_eval_worktree(
+            project_root, task_id, task['pre_task_commit'],
+            setup_commands=task.get('setup_commands'),
+        )
 
     # 2. Build orchestrator config for this eval
     orch_config = build_eval_orch_config(config, task, base_config)
@@ -217,14 +230,29 @@ async def run_eval(
     briefing = BriefingAssembler(orch_config)
     mcp = _EvalMcpStub(orch_config.fused_memory.url)
 
-    # 5. Load fixed plan (required for eval mode)
-    initial_plan = task.get('plan')
+    # 5. Load plan — from existing worktree state or task JSON
+    if worktree_path is not None:
+        import json as _json
+        existing_plan_path = worktree / '.task' / 'plan.json'
+        if existing_plan_path.exists():
+            initial_plan = _json.loads(existing_plan_path.read_text())
+            done = sum(1 for s in initial_plan.get('steps', []) if s.get('status') == 'done')
+            logger.info(
+                f'Using existing plan from worktree '
+                f'({done}/{len(initial_plan.get("steps", []))} steps done)'
+            )
+        else:
+            initial_plan = task.get('plan')
+            logger.info('No existing plan in worktree — using task JSON plan')
+    else:
+        initial_plan = task.get('plan')
     if not initial_plan:
         raise ValueError(
             f'Task {task_id} has no embedded plan. '
             f'Run --plan-only to generate one first.'
         )
-    logger.info(f'Using fixed plan ({len(initial_plan.get("steps", []))} steps)')
+    if not worktree_path:
+        logger.info(f'Using fixed plan ({len(initial_plan.get("steps", []))} steps)')
 
     # 5b. Usage gate for account failover (judge hits Claude API, may cap)
     usage_gate: UsageGate | None = None
