@@ -134,11 +134,14 @@ from dashboard.data.merge_queue import (  # noqa: E402
 
 class TestBucketMinutesForWindow:
     @pytest.mark.parametrize('hours,expected', [
+        (0, 15),
         (1, 15),
         (24, 15),
         (25, 60),
+        (167, 60),
         (168, 60),
         (169, 360),
+        (719, 360),
         (720, 360),
         (721, 1440),
         (87600, 1440),
@@ -1234,8 +1237,7 @@ class TestMultiDbAggregation:
             conn2.row_factory = aiosqlite.Row
             result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=87600, now=now)
 
-        assert len(result['labels']) >= 3650
-        assert len(result['labels']) <= 4000
+        assert len(result['labels']) == 3651
 
 
     @pytest.mark.asyncio
