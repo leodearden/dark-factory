@@ -449,7 +449,7 @@ class TaskCurator:
                             'title': candidate.title,
                             'description': candidate.description[:1000],
                             'files_to_modify': candidate.files_to_modify or [],
-                            'priority': candidate.priority or '',
+                            'priority': candidate.priority or DEFAULT_PRIORITY,
                             'project_id': project_id,
                             'updated_at': datetime.now(UTC).isoformat(),
                         },
