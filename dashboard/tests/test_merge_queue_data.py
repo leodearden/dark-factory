@@ -1362,10 +1362,10 @@ class TestMultiDbAggregation:
             wraps=queue_depth_timeseries,
         ) as spy:
             result = await aggregate_queue_depth_timeseries([None, None], hours=24)
-        assert result == {'labels': [], 'values': []}
-        assert spy.call_count == 2
-        for call in spy.call_args_list:
-            assert call.args[0] is None
+            assert result == {'labels': [], 'values': []}
+            assert spy.call_count == 2
+            for call in spy.call_args_list:
+                assert call.args[0] is None
 
     @pytest.mark.asyncio
     async def test_all_none_dbs_outcome_distribution(self):
@@ -1378,10 +1378,10 @@ class TestMultiDbAggregation:
             wraps=outcome_distribution,
         ) as spy:
             result = await aggregate_outcome_distribution([None, None], hours=24)
-        assert result == {'labels': [], 'values': []}
-        assert spy.call_count == 2
-        for call in spy.call_args_list:
-            assert call.args[0] is None
+            assert result == {'labels': [], 'values': []}
+            assert spy.call_count == 2
+            for call in spy.call_args_list:
+                assert call.args[0] is None
 
     @pytest.mark.asyncio
     async def test_all_none_dbs_latency_stats(self):
@@ -1395,10 +1395,10 @@ class TestMultiDbAggregation:
             wraps=_get_durations,
         ) as spy:
             result = await aggregate_latency_stats([None, None], hours=24)
-        assert result == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
-        assert spy.call_count == 2
-        for call in spy.call_args_list:
-            assert call.args[0] is None
+            assert result == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
+            assert spy.call_count == 2
+            for call in spy.call_args_list:
+                assert call.args[0] is None
 
     @pytest.mark.asyncio
     async def test_all_none_dbs_recent_merges(self):
@@ -1411,10 +1411,10 @@ class TestMultiDbAggregation:
             wraps=recent_merges,
         ) as spy:
             result = await aggregate_recent_merges([None, None], limit=20)
-        assert result == []
-        assert spy.call_count == 2
-        for call in spy.call_args_list:
-            assert call.args[0] is None
+            assert result == []
+            assert spy.call_count == 2
+            for call in spy.call_args_list:
+                assert call.args[0] is None
 
     @pytest.mark.asyncio
     async def test_all_none_dbs_speculative_stats(self):
@@ -1427,10 +1427,10 @@ class TestMultiDbAggregation:
             wraps=speculative_stats,
         ) as spy:
             result = await aggregate_speculative_stats([None, None], hours=24)
-        assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
-        assert spy.call_count == 2
-        for call in spy.call_args_list:
-            assert call.args[0] is None
+            assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+            assert spy.call_count == 2
+            for call in spy.call_args_list:
+                assert call.args[0] is None
 
     # -----------------------------------------------------------------------
     # Gap coverage (c): None entries in dbs — per-DB returns empty defaults
