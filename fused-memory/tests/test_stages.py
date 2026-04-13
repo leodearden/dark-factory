@@ -32,7 +32,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     TaskKnowledgeSync,
     _select_proactive_sample,
 )
-from fused_memory.reconciliation.task_filter import MAX_DONE_TASKS_RETAINED
+from fused_memory.reconciliation.task_filter import MAX_DONE_TASKS_RETAINED, _id_key
 
 _MOCK_TYPES = (AsyncMock, MagicMock)
 
@@ -859,6 +859,40 @@ class TestProactiveSampling:
             f'Tasks with same status should be ordered by ID descending. Got: {ids}'
         )
 
+    def test_select_proactive_sample_non_int_ids_sort_equivalent_to_id_key(self):
+        """_select_proactive_sample sorts non-parseable string ids identically to _id_key fallback=0.
+
+        Non-int ids map to 0 via _id_key, so they sort last (after all positive-int ids)
+        within the same status bucket. This documents the expected behaviour and acts as
+        a regression guard before the inline sort_key is replaced with _id_key in step-4.
+        """
+        tasks = [
+            {'id': 'abc', 'title': 'Task abc', 'status': 'pending', 'dependencies': []},
+            {'id': 5, 'title': 'Task 5', 'status': 'pending', 'dependencies': []},
+            {'id': 'xyz', 'title': 'Task xyz', 'status': 'pending', 'dependencies': []},
+            {'id': 2, 'title': 'Task 2', 'status': 'pending', 'dependencies': []},
+        ]
+        result = _select_proactive_sample(tasks, 4)
+        ids = [t['id'] for t in result]
+
+        # int ids (5, 2) must precede non-parseable string ids ('abc', 'xyz')
+        # because _id_key('abc') == _id_key('xyz') == 0 < 2 < 5, sorted descending
+        int_ids = [i for i in ids if isinstance(i, int)]
+        str_ids = [i for i in ids if isinstance(i, str)]
+        assert int_ids == [5, 2], f'Int ids should be [5, 2] descending. Got: {int_ids}'
+        # string ids appear after all int ids
+        last_int_pos = max(ids.index(i) for i in int_ids)
+        first_str_pos = min(ids.index(s) for s in str_ids)
+        assert first_str_pos > last_int_pos, (
+            f'Non-int ids (fallback key=0) must sort after int ids. '
+            f'int_ids at positions {[ids.index(i) for i in int_ids]}, '
+            f'str_ids at positions {[ids.index(s) for s in str_ids]}'
+        )
+        # Verify _id_key agrees: all non-int ids yield 0
+        for t in tasks:
+            if isinstance(t['id'], str):
+                assert _id_key(t) == 0, f'_id_key should return 0 for non-int id {t["id"]!r}'
+
     # --- Step 13: empty task tree handled gracefully ---
 
     @pytest.mark.asyncio
@@ -1486,10 +1520,10 @@ class TestMemoryConsolidatorFilteredTaskTree:
         ]
         return FilteredTaskTree(
             active_tasks=active,
-            done_count=5,
+            done_count=0,
             cancelled_count=2,
             other_count=0,
-            total_count=count + 7,
+            total_count=count + 2,  # count active + 0 done + 2 cancelled
         )
 
     @pytest.mark.asyncio
@@ -1552,6 +1586,16 @@ class TestMemoryConsolidatorFilteredTaskTree:
         assert '### Active Task Tree' in payload
         assert 'Active task 1' in payload
 
+    def test_make_active_tree_summary_line_has_consistent_total(self):
+        """_make_active_tree(3) total_count must equal 3 active + 0 done + 2 cancelled = 5."""
+        from fused_memory.reconciliation.task_filter import format_filtered_task_tree
+        tree = self._make_active_tree(3)
+        rendered = format_filtered_task_tree(tree)
+        assert '5 total' in rendered, (
+            f'Expected total_count=5 (3 active + 0 done + 2 cancelled) '
+            f'but rendered: {rendered!r}'
+        )
+
 
 # ── Tests for task 455: TaskKnowledgeSync filtered task tree injection ─────────
 
@@ -1598,7 +1642,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         stage.project_root = '/tmp/test_project'
         stage.filtered_task_tree = self._make_tree(
             [self._make_task(10, 'in-progress'), self._make_task(20, 'pending')],
-            done_count=5,
+            done_count=0,
         )
 
         payload = await stage.assemble_payload([], watermark, [])
@@ -1609,16 +1653,11 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         assert '### Active Task Tree' in payload
         assert 'Task 10' in payload
         assert 'Task 20' in payload
-        # Recently Completed: done_count > 0 but done_tasks=[] (harness path)
-        # Either the section is absent (future-proof) OR it mentions the count '5'
+        # Recently Completed: done_count=0 and done_tasks=[] → 'No tasks.'
         recently_section = _extract_section(payload, '### Recently Completed Tasks')
-        assert '### Recently Completed Tasks' not in payload or '5' in recently_section, (
-            "Expected '### Recently Completed Tasks' absent or done_count '5' in section body"
-        )
-        # No individual done-task lines anywhere — fixture passes done_tasks=[] so
-        # done tasks are absent regardless of pool composition.
-        assert '(done)' not in payload, (
-            "Unexpected individual done-task line in harness-injected payload"
+        assert '### Recently Completed Tasks' in payload
+        assert 'No tasks.' in recently_section, (
+            f"Expected 'No tasks.' in Recently Completed section, got: {recently_section!r}"
         )
 
     @pytest.mark.asyncio
@@ -1660,7 +1699,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
                 self._make_task(5, 'pending'),
                 self._make_task(6, 'pending'),
             ],
-            done_count=3,
+            done_count=0,
         )
 
         payload = await stage.assemble_payload([], watermark, [])
@@ -1725,25 +1764,35 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         assert 'Task 99' in payload
 
     @pytest.mark.asyncio
-    async def test_recently_completed_shows_count_when_no_done_tasks_objects(
+    async def test_recently_completed_renders_done_titles_via_primary_path(
         self, mock_deps, watermark,
     ):
-        """When filtered_task_tree has done_count > 0 but done_tasks=[], show count summary."""
+        """Primary if-branch: done_tasks populated → all done task titles appear in Recently Completed."""
+        done_tasks = [
+            self._make_task(101, 'done'),
+            self._make_task(102, 'done'),
+            self._make_task(103, 'done'),
+        ]
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
         stage.filtered_task_tree = self._make_tree(
             [self._make_task(10, 'in-progress')],
-            done_count=15,
-            # done_tasks deliberately omitted → empty list
+            done_count=3,
+            done_tasks=done_tasks,
         )
 
         payload = await stage.assemble_payload([], watermark, [])
 
+        # (a) get_tasks must NOT be called
         mock_deps['taskmaster'].get_tasks.assert_not_called()
+        # (b) Recently Completed section must be present
         assert '### Recently Completed Tasks' in payload
-        # Must mention the done count (15) somewhere in the recently completed section
-        assert '15' in payload
+        # (c) Each done task title must appear in the Recently Completed section
+        recently_section = _extract_section(payload, '### Recently Completed Tasks')
+        assert 'Task 101' in recently_section, "Task 101 not found in Recently Completed section"
+        assert 'Task 102' in recently_section, "Task 102 not found in Recently Completed section"
+        assert 'Task 103' in recently_section, "Task 103 not found in Recently Completed section"
 
     @pytest.mark.asyncio
     async def test_recently_completed_populated_on_fallback(self, mock_deps, watermark):

@@ -8,6 +8,8 @@ from contextlib import ExitStack
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from dashboard.data.merge_queue import _bucket_minutes_for_window
 
 # ---------------------------------------------------------------------------
@@ -58,24 +60,43 @@ MOCK_SPEC = {
 
 _UNSET = object()
 
+# Sentinel used by _extract_inline_script to locate the merge-queue partial's
+# own <script> block.  This is the canvas id referenced inside the partial's
+# inline script (merge_queue.html: getOrDestroyChart('mergeQueueDepthChart')).
+# It is unique to this partial and does not appear in any other template's
+# script body, making it a reliable discriminator even if the route is later
+# wrapped in a layout that prepends additional <script> blocks.
+_PARTIAL_SCRIPT_SENTINEL = 'mergeQueueDepthChart'
+
 
 def _extract_inline_script(html: str) -> str:
-    """Extract the body of the first inline <script> block from rendered HTML.
+    """Extract the body of the merge-queue partial's inline <script> block.
 
-    Used by TestMergeQueueListenerLifecycle to scope assertions against the
-    partial's own <script> block rather than the full response text.
+    Uses marker-based selection: iterates all ``<script>`` blocks in the HTML
+    and returns the first whose body contains ``_PARTIAL_SCRIPT_SENTINEL``
+    (``'mergeQueueDepthChart'`` — the canvas id unique to this partial).
 
-    Note: this returns the *first* <script> block by position in the document.
-    Today /partials/merge-queue returns only the partial with no layout wrapper,
-    so the first <script> is the partial's own.  If the route ever gains a
-    layout wrapper whose <script> appears earlier in the document (e.g. the
-    alpine:init listener in base.html / burndown.html / costs.html), this helper
-    would need to be updated to select by a partial-specific marker (e.g.
-    ``'mergeQueueDepthChart'``) rather than by position.
+    This approach is immune to future layout-wrapper changes that prepend other
+    script blocks (e.g. the alpine:init listener in base.html / burndown.html /
+    costs.html): those scripts will not contain the sentinel and are skipped.
+    As a side benefit, ``<script>`` tags embedded inside HTML comments are also
+    typically skipped because their bodies do not carry the sentinel.
+
+    Note: the regex does not parse HTML comments; skipping relies entirely on
+    the sentinel not appearing in the commented block.  If a commented-out
+    ``<script>`` block happens to contain the sentinel, it will be returned
+    instead of the real partial script.
+
+    Raises ``AssertionError`` if no sentinel-bearing script block is found, so
+    failures surface a clear message rather than a downstream ``AttributeError``.
     """
-    match = re.search(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
-    assert match is not None, 'No inline <script> block found in response HTML'
-    return match.group(1)
+    for m in re.finditer(r'<script[^>]*>(.*?)</script>', html, re.DOTALL):
+        if _PARTIAL_SCRIPT_SENTINEL in m.group(1):
+            return m.group(1)
+    raise AssertionError(
+        f'No inline <script> block containing sentinel {_PARTIAL_SCRIPT_SENTINEL!r}'
+        ' found in response HTML'
+    )
 
 
 def _patch_merge_queue_data(
@@ -498,3 +519,127 @@ class TestPartialsMergeQueueSharedNow:
         assert elapsed < 5, (
             f"`now` value is stale: {elapsed:.1f}s old (expected < 5s)"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestExtractInlineScript
+# ---------------------------------------------------------------------------
+
+class TestExtractInlineScript:
+    """Unit tests for the _extract_inline_script helper."""
+
+    def test_skips_foreign_script_before_partial(self):
+        """Marker-based selection returns the partial's own script, not a foreign one.
+
+        This is the primary regression guard for the refactor: a foreign layout
+        script (e.g. alpine:init) appearing BEFORE the partial's own <script>
+        block must be skipped.  The old position-based re.search returns the
+        first script (the alpine:init one), causing the sentinel assertion to
+        fail — this test drives the refactor.
+        """
+        html = (
+            '<html><head>\n'
+            '<script>\n'
+            "document.addEventListener('alpine:init', () => { console.log('init'); });\n"
+            '</script>\n'
+            '</head><body>\n'
+            '<script>\n'
+            "var el = getOrDestroyChart('mergeQueueDepthChart');\n"
+            'function renderAll() { el.render(); }\n'
+            'renderAll();\n'
+            '</script>\n'
+            '</body></html>'
+        )
+        body = _extract_inline_script(html)
+        assert _PARTIAL_SCRIPT_SENTINEL in body
+        assert 'alpine:init' not in body
+
+    def test_raises_assertion_when_no_script_contains_sentinel(self):
+        """AssertionError is raised (with sentinel in message) when no script
+        block carries the mergeQueueDepthChart sentinel.
+
+        Guards against future regressions that silently drop the sentinel from
+        the partial's script or change the canvas id — a clear error message
+        pointing at the missing sentinel is more actionable than a downstream
+        AttributeError on a None return value.
+        """
+        html = (
+            '<html><head>\n'
+            '<script>\n'
+            "document.addEventListener('alpine:init', () => { console.log('init'); });\n"
+            '</script>\n'
+            '</head><body>\n'
+            '<script>\n'
+            "document.addEventListener('htmx:configRequest', (e) => { e.detail.headers['X-CSRFToken'] = 'tok'; });\n"
+            '</script>\n'
+            '</body></html>'
+        )
+        with pytest.raises(AssertionError) as excinfo:
+            _extract_inline_script(html)
+        assert _PARTIAL_SCRIPT_SENTINEL in str(excinfo.value)
+
+    def test_sentinel_in_commented_script_is_still_matched(self):
+        """A commented-out <script> containing the sentinel IS returned first.
+
+        This documents the known limitation of the marker-based approach: the
+        regex does not parse HTML comments.  If a commented-out ``<script>``
+        block happens to contain the sentinel, it will be matched and returned
+        before the real partial script.  The 'skipping' seen in
+        ``test_ignores_script_tag_inside_html_comment`` relies entirely on the
+        commented block not containing the sentinel — not on structural parsing
+        of HTML comments.
+        """
+        html = (
+            '<html><body>\n'
+            '<!-- old partial, kept for reference:\n'
+            '<script>\n'
+            "var el = getOrDestroyChart('mergeQueueDepthChart');  // legacy\n"
+            '</script>\n'
+            '-->\n'
+            '<script>\n'
+            "var el = getOrDestroyChart('mergeQueueDepthChart');\n"
+            'function renderAll() { el.render(); }\n'
+            'renderAll();\n'
+            '</script>\n'
+            '</body></html>'
+        )
+        # The commented-out block contains the sentinel and is matched first.
+        body = _extract_inline_script(html)
+        assert _PARTIAL_SCRIPT_SENTINEL in body
+        # 'function renderAll()' only appears in the real (second) script —
+        # its absence confirms the commented block was returned, not the real one.
+        assert 'function renderAll()' not in body
+
+    def test_ignores_script_tag_inside_html_comment(self):
+        """A <script> tag embedded inside an HTML comment is naturally skipped.
+
+        This documents the 'secondary concern sidestep' from the task details:
+        the marker-based approach ignores commented-out script blocks because
+        their bodies typically do not contain the sentinel.  The real partial
+        script that follows the comment is returned correctly.
+        """
+        html = (
+            '<html><body>\n'
+            '<!-- old layout script, kept for reference:\n'
+            '<script>var x = 1;</script>\n'
+            '-->\n'
+            '<script>\n'
+            "var el = getOrDestroyChart('mergeQueueDepthChart');\n"
+            'function renderAll() { el.render(); }\n'
+            'renderAll();\n'
+            '</script>\n'
+            '</body></html>'
+        )
+        body = _extract_inline_script(html)
+        assert _PARTIAL_SCRIPT_SENTINEL in body
+        assert 'function renderAll()' in body
+        assert 'var x = 1' not in body
+
+    def test_raises_on_no_script_blocks(self):
+        """AssertionError is raised when the HTML has no <script> blocks at all.
+
+        Documents the degenerate edge case: the for-loop in _extract_inline_script
+        does not iterate on empty HTML, falling through to the AssertionError raise.
+        """
+        with pytest.raises(AssertionError):
+            _extract_inline_script('<html><body></body></html>')

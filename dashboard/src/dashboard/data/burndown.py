@@ -8,6 +8,7 @@ connection; route handlers read via DbPool (read-only).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -67,83 +68,145 @@ async def collect_snapshot(
     conn: aiosqlite.Connection,
     config: DashboardConfig,
 ) -> None:
-    """Discover projects and insert one snapshot row per project."""
-    now = datetime.now(UTC).isoformat()
-    # config.project_root is already resolved by DashboardConfig.__post_init__
-    resolved_root = str(config.project_root)
+    """Discover projects and insert one snapshot row per project.
 
-    # Phase 1 — Discovery (sequential, in-memory):
-    # Build the ordered list of (project_id_str, tasks_json_path) tuples to snapshot.
-    # Main project is always first; seen_roots dedup is preserved exactly.
-    # project_root is already canonical (symlink-resolved) so a symlinked
-    # project_root deduplicates correctly against orchestrator /
-    # known_project_roots entries that surface the real path.
-    roots_to_snapshot: list[tuple[str, Path]] = []
-    seen_roots: set[str] = {resolved_root}
-    roots_to_snapshot.append((resolved_root, config.tasks_json))
+    Partial-failure semantics:
 
-    orchestrators = await asyncio.to_thread(find_running_orchestrators)
-    for proc in orchestrators:
-        if proc.get('prd'):
-            project_root = _resolve_project_root(proc['prd'], config.project_root)
-        elif proc.get('config_path'):
-            resolved = _read_project_root_from_config(proc['config_path'])
-            if resolved is None:
-                continue
-            project_root = resolved
+    - **Main project committed first**: the main project is always
+      roots_to_snapshot[0], so its per-project INSERT + commit fires before
+      any extra project is attempted.  A DB failure on an extra cannot roll
+      back a row that is already committed.
+
+    - **Orchestrator discovery is best-effort**: the block that calls
+      find_running_orchestrators and iterates the results is wrapped in
+      try/except.  If it raises, a WARNING is logged and the function
+      degrades gracefully — the main project and known_project_roots are
+      still snapshotted.
+
+    - **Extra inserts are per-project / isolated**: each project in Phase 3
+      gets its own INSERT + commit wrapped in try/except.  A disk-full or
+      constraint error on one project is logged as a WARNING and the loop
+      continues; other projects are unaffected.
+
+    - **Explicit rollback on unexpected error** (defensive guard): if an
+      exception escapes all inner guards (e.g., a future code change
+      introduces a DB write before Phase 3), conn.rollback() is called
+      before re-raising.  This is purely defensive — the realistic failure
+      modes (per-project INSERT errors) are already handled by Phase 3's
+      per-project try/except.  The guard ensures the long-lived writer
+      connection in app.py is left in a clean state even for unexpected
+      regressions.
+    """
+    try:
+        now = datetime.now(UTC).isoformat()
+        # config.project_root is already resolved by DashboardConfig.__post_init__
+        resolved_root = str(config.project_root)
+
+        # Phase 1 — Discovery (sequential, in-memory):
+        # Build the ordered list of (project_id_str, tasks_json_path) tuples to snapshot.
+        # Main project is always first; seen_roots dedup is preserved exactly.
+        # project_root is already canonical (symlink-resolved) so a symlinked
+        # project_root deduplicates correctly against orchestrator /
+        # known_project_roots entries that surface the real path.
+        roots_to_snapshot: list[tuple[str, Path]] = []
+        seen_roots: set[str] = {resolved_root}
+        roots_to_snapshot.append((resolved_root, config.tasks_json))
+
+        try:
+            orchestrators = await asyncio.to_thread(find_running_orchestrators)
+        except Exception:
+            logger.warning(
+                'Orchestrator discovery failed; skipping orchestrator-discovered extras',
+                exc_info=True,
+            )
         else:
-            continue
-        root_str = str(project_root.resolve())
-        if root_str in seen_roots:
-            continue
-        seen_roots.add(root_str)
-        roots_to_snapshot.append((root_str, project_root / '.taskmaster' / 'tasks' / 'tasks.json'))
+            for proc in orchestrators:
+                try:
+                    if proc.get('prd'):
+                        project_root = _resolve_project_root(proc['prd'], config.project_root)
+                    elif proc.get('config_path'):
+                        resolved = _read_project_root_from_config(proc['config_path'])
+                        if resolved is None:
+                            continue
+                        project_root = resolved
+                    else:
+                        continue
+                    # project_root is already resolved by _resolve_project_root / _read_project_root_from_config
+                    root_str = str(project_root)
+                    if root_str in seen_roots:
+                        continue
+                    seen_roots.add(root_str)
+                    roots_to_snapshot.append((root_str, project_root / '.taskmaster' / 'tasks' / 'tasks.json'))
+                except OSError:
+                    logger.warning(
+                        'OSError while resolving orchestrator project root; skipping',
+                        exc_info=True,
+                    )
+                except Exception:
+                    logger.warning(
+                        'Orchestrator entry processing failed; skipping entry',
+                        exc_info=True,
+                    )
 
-    for known_root in config.known_project_roots:
-        # known_root is already resolved by DashboardConfig.__post_init__,
-        # so .resolve() is unnecessary here.  Per-root error isolation for
-        # load failures (PermissionError, etc.) is handled by Phase 2's
-        # return_exceptions=True and Phase 3's exception check below.
-        root_str = str(known_root)
-        if root_str in seen_roots:
-            continue
-        seen_roots.add(root_str)
-        roots_to_snapshot.append((root_str, known_root / '.taskmaster' / 'tasks' / 'tasks.json'))
+        for known_root in config.known_project_roots:
+            # known_root is already resolved by DashboardConfig.__post_init__,
+            # so .resolve() is unnecessary here.  Per-root error isolation for
+            # load failures (PermissionError, etc.) is handled by Phase 2's
+            # return_exceptions=True and Phase 3's exception check below.
+            root_str = str(known_root)
+            if root_str in seen_roots:
+                continue
+            seen_roots.add(root_str)
+            roots_to_snapshot.append((root_str, known_root / '.taskmaster' / 'tasks' / 'tasks.json'))
 
-    # Phase 2 — Parallel read:
-    # All load_task_tree calls are independent (separate files), so run them concurrently.
-    # load_task_tree catches OSError internally and returns [] for unreadable files,
-    # but we pass return_exceptions=True as defense-in-depth so a single failing read
-    # cannot sink the entire cycle and drop all snapshots before commit.
-    all_tasks = await asyncio.gather(
-        *(asyncio.to_thread(load_task_tree, tasks_json) for _, tasks_json in roots_to_snapshot),
-        return_exceptions=True,
-    )
-
-    # Phase 3 — Sequential insert:
-    # aiosqlite serialises writes on a single connection; keep inserts sequential.
-    # Skip any roots whose load raised — log and continue so other snapshots commit.
-    for (root_str, _), tasks in zip(roots_to_snapshot, all_tasks, strict=True):
-        if isinstance(tasks, BaseException):
-            logger.warning('Failed to load tasks for %s', root_str, exc_info=tasks)
-            continue
-        counts = _count_statuses(tasks)
-        await conn.execute(
-            'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            (
-                root_str,
-                now,
-                counts['pending'],
-                counts['in_progress'],
-                counts['blocked'],
-                counts['deferred'],
-                counts['cancelled'],
-                counts['done'],
-            ),
+        # Phase 2 — Parallel read:
+        # All load_task_tree calls are independent (separate files), so run them concurrently.
+        # load_task_tree catches OSError internally and returns [] for unreadable files,
+        # but we pass return_exceptions=True as defense-in-depth so a single failing read
+        # cannot sink the entire cycle and drop all snapshots before commit.
+        all_tasks = await asyncio.gather(
+            *(asyncio.to_thread(load_task_tree, tasks_json) for _, tasks_json in roots_to_snapshot),
+            return_exceptions=True,
         )
 
-    await conn.commit()
+        # Phase 3 — Sequential insert (per-project commit):
+        # aiosqlite serialises writes on a single connection; keep inserts sequential.
+        # Each project gets its own INSERT + commit so a DB failure on one project
+        # cannot roll back rows that were already committed for earlier projects.
+        # Main project is always roots_to_snapshot[0], so its commit fires first.
+        # Skip any roots whose load raised — log and continue so other snapshots commit.
+        # O(N) commits (one fsync per project) are acceptable at current scale
+        # (handful of projects every 10 minutes). If N grows significantly,
+        # consider SAVEPOINT-based isolation for a single trailing fsync.
+        for (root_str, _), tasks in zip(roots_to_snapshot, all_tasks, strict=True):
+            if isinstance(tasks, BaseException):
+                logger.warning('Failed to load tasks for %s', root_str, exc_info=tasks)
+                continue
+            try:
+                counts = _count_statuses(tasks)
+                await conn.execute(
+                    'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                    (
+                        root_str,
+                        now,
+                        counts['pending'],
+                        counts['in_progress'],
+                        counts['blocked'],
+                        counts['deferred'],
+                        counts['cancelled'],
+                        counts['done'],
+                    ),
+                )
+                await conn.commit()
+            except Exception:
+                logger.warning('Failed to insert snapshot for %s', root_str, exc_info=True)
+                with contextlib.suppress(Exception):
+                    await conn.rollback()
+    except Exception:
+        with contextlib.suppress(Exception):
+            await conn.rollback()
+        raise
 
 
 async def downsample(conn: aiosqlite.Connection) -> None:

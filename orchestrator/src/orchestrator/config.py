@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -435,10 +435,10 @@ class OrchestratorConfig(BaseSettings):
     # Per-module overrides (populated by load_config via _discover_module_configs)
     _module_configs: dict[str, ModuleConfig] = PrivateAttr(default_factory=dict)
 
-    @model_validator(mode='after')
-    def _resolve_project_root(self) -> 'OrchestratorConfig':
-        self.project_root = self.project_root.resolve()
-        return self
+    @field_validator('project_root', mode='after')
+    @classmethod
+    def _resolve_project_root(cls, v: Path) -> Path:
+        return v.resolve()
 
     @model_validator(mode='after')
     def _validate_steward_timeout_invariant(self) -> 'OrchestratorConfig':
@@ -465,6 +465,7 @@ class OrchestratorConfig(BaseSettings):
         env_nested_delimiter='__',
         case_sensitive=False,
         extra='ignore',
+        validate_assignment=True,
     )
 
     @classmethod

@@ -137,7 +137,7 @@ async def collect_metrics(
     # Plan completion
     plan = workflow.artifacts.read_plan() if workflow.artifacts else {}
     steps = plan.get('steps', [])
-    done_count = sum(1 for s in steps if s.get('status') == 'done')
+    done_count = sum(1 for s in steps if isinstance(s, dict) and s.get('status') == 'done')
     total_steps = len(steps) if steps else 1
     plan_completion = done_count / total_steps
 

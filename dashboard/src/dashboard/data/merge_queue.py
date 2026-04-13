@@ -27,8 +27,22 @@ import aiosqlite
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
+from dashboard.data.utils import parse_utc
 
 logger = logging.getLogger(__name__)
+
+
+def _ts_sort_key(entry: dict) -> datetime:
+    """Return a UTC-aware datetime sort key for a merge entry dict.
+
+    Parses ``entry['timestamp']`` via :func:`parse_utc`.  Returns
+    ``datetime.min`` (UTC-aware) on missing, None, or unparseable values so
+    that malformed entries sort to the end of a descending sort.
+    """
+    try:
+        return parse_utc(entry.get('timestamp'))
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=UTC)
 
 _CANONICAL_OUTCOMES = ['done', 'conflict', 'blocked', 'already_merged']
 
@@ -46,6 +60,15 @@ BUCKET_LADDER: tuple[tuple[int | None, int], ...] = (
 
 def _cutoff_iso(hours: int, *, now: datetime | None = None) -> str:
     """Return ISO-format cutoff datetime for the given look-back window (hours).
+
+    The returned string has a ``+00:00`` UTC offset.  All query functions
+    compare stored timestamps against this string using SQLite's lexicographic
+    ordering (``timestamp >= ?``).  This works correctly for timestamps stored
+    in UTC format (as produced by ``datetime.now(UTC).isoformat()``), but may
+    silently include or exclude rows whose timestamps carry a non-UTC offset
+    such as ``+05:00``.  The correct long-term fix is to normalise timestamps
+    to UTC at write time; this is a pre-existing pattern shared by all query
+    functions in this module.
 
     Args:
         hours: Look-back window in hours.
@@ -155,11 +178,13 @@ async def queue_depth_timeseries(
             for i in range(num_buckets)
         ]
 
-        # Fetch all merge_attempt events in the window
+        # Fetch all merge_attempt events in the window.
+        # Upper bound is effective_now (not now_aligned) to avoid excluding
+        # events in [now_aligned, effective_now) that belong to the last bucket.
         rows = await conn.execute_fetchall(
             "SELECT timestamp FROM events "
-            "WHERE event_type = 'merge_attempt' AND timestamp >= ?",
-            (cutoff.isoformat(),),
+            "WHERE event_type = 'merge_attempt' AND timestamp >= ? AND timestamp <= ?",
+            (cutoff_aligned.isoformat(), effective_now.isoformat()),
         )
 
         # Build count map keyed by ISO bucket label
@@ -316,7 +341,7 @@ async def latency_stats(
             is used. Pass an explicit value to share a timestamp with sibling calls.
     """
     durations = await _get_durations(db, hours=hours, now=now)
-    return _compute_latency_stats(sorted(durations))
+    return _compute_latency_stats(durations)
 
 
 # ---------------------------------------------------------------------------
@@ -327,8 +352,15 @@ async def recent_merges(
     db: aiosqlite.Connection | None,
     *,
     limit: int = 20,
+    hours: int = 168,
 ) -> list[dict]:
     """Most recent merge_attempt events, newest first.
+
+    Args:
+        db: Async SQLite connection, or None (returns []).
+        limit: Maximum number of rows to return.
+        hours: Look-back window in hours (default 168 = 7 days).  Only
+            events with ``timestamp >= now - hours`` are included.
 
     Returns list of {'task_id', 'run_id', 'outcome', 'duration_ms',
                      'timestamp'} dicts.
@@ -337,15 +369,17 @@ async def recent_merges(
         return []
 
     async def _query(conn: aiosqlite.Connection) -> list[dict]:
+        since = _cutoff_iso(hours)
         rows = await conn.execute_fetchall(
             "SELECT task_id, run_id, "
             "       json_extract(data, '$.outcome') AS outcome, "
             "       duration_ms, timestamp "
             "FROM events "
             "WHERE event_type = 'merge_attempt' "
+            "  AND timestamp >= ? "
             "ORDER BY timestamp DESC "
             "LIMIT ?",
-            (limit,),
+            (since, limit),
         )
         return [
             {
@@ -567,13 +601,20 @@ async def aggregate_recent_merges(
     dbs: list[aiosqlite.Connection | None],
     *,
     limit: int = 20,
+    hours: int = 168,
 ) -> list[dict]:
     """Aggregate recent merges across multiple project DBs.
 
     Concatenates, re-sorts by timestamp DESC, and truncates to limit.
+
+    Args:
+        dbs: List of async SQLite connections (None entries are skipped).
+        limit: Maximum number of rows to return.
+        hours: Look-back window in hours (default 168 = 7 days), passed
+            through to each per-DB :func:`recent_merges` call.
     """
     gather_results = await asyncio.gather(
-        *[recent_merges(db, limit=limit) for db in dbs],
+        *[recent_merges(db, limit=limit, hours=hours) for db in dbs],
         return_exceptions=True,
     )
     merged: list[dict] = []
@@ -583,7 +624,7 @@ async def aggregate_recent_merges(
             continue
         merged.extend(r)
 
-    merged.sort(key=lambda x: x.get('timestamp') or '', reverse=True)
+    merged.sort(key=_ts_sort_key, reverse=True)
     return merged[:limit]
 
 

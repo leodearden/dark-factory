@@ -621,28 +621,47 @@ def bring_up_pod(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle:
             **extra_env,
         }
 
-        for gpu_type in gpu_types_to_try:
-            try:
-                log(f"Trying {gpu_count}× {gpu_type} in {datacenter}...")
-                pod = client.create_pod(
-                    name=f"eval-{cfg.name}",
-                    gpu_type=gpu_type,
-                    image=image,
-                    gpu_count=gpu_count,
-                    container_disk_gb=container_disk,
-                    datacenter=datacenter,
-                    network_volume_id=volume_id,
-                    env_vars=env_vars,
-                )
-                log(f"Pod created: {pod.id} ({gpu_type})")
-                break
-            except Exception as e:
-                log(f"  {gpu_type}: {e}")
-                pod = None
-                continue
+        gpu_retry_deadline = time.monotonic() + args.gpu_retry_minutes * 60
+        gpu_retry_interval = args.gpu_retry_interval
+        while True:
+            for gpu_type in gpu_types_to_try:
+                try:
+                    log(f"Trying {gpu_count}× {gpu_type} in {datacenter}...")
+                    pod = client.create_pod(
+                        name=f"eval-{cfg.name}",
+                        gpu_type=gpu_type,
+                        image=image,
+                        gpu_count=gpu_count,
+                        container_disk_gb=container_disk,
+                        datacenter=datacenter,
+                        network_volume_id=volume_id,
+                        env_vars=env_vars,
+                    )
+                    log(f"Pod created: {pod.id} ({gpu_type})")
+                    break
+                except Exception as e:
+                    log(f"  {gpu_type}: {e}")
+                    pod = None
+                    continue
 
-        if not pod:
-            raise PodBringupFailed("No GPU type available in this datacenter")
+            if pod:
+                break
+
+            remaining = gpu_retry_deadline - time.monotonic()
+            if remaining <= 0:
+                # Deadline expired — try fallback GPU types if configured
+                fallback_types = args.gpu_fallback_types
+                if fallback_types:
+                    log(f"GPU retry deadline expired. Trying fallback: {fallback_types}")
+                    gpu_types_to_try = fallback_types.split(",")
+                    gpu_count = args.gpu_fallback_count or gpu_count
+                    args.gpu_fallback_types = None  # only try fallback once
+                    continue
+                raise PodBringupFailed("No GPU type available after retries")
+
+            log(f"No GPU available. Retrying in {gpu_retry_interval}s "
+                f"({int(remaining)}s until fallback deadline)...")
+            time.sleep(gpu_retry_interval)
 
         log("Waiting for pod + SSH...")
         pod = client.wait_for_pod(
@@ -1258,6 +1277,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--gpu-type",
         default=None,
         help="Force a specific RunPod GPU type id",
+    )
+    p.add_argument(
+        "--gpu-retry-minutes",
+        type=int,
+        default=0,
+        help="Retry GPU allocation for this many minutes before giving up (0=no retry)",
+    )
+    p.add_argument(
+        "--gpu-retry-interval",
+        type=int,
+        default=300,
+        help="Seconds between GPU retry attempts (default: 300 = 5 min)",
+    )
+    p.add_argument(
+        "--gpu-fallback-types",
+        default=None,
+        help="Comma-separated GPU types to try after retry deadline expires (e.g. 'NVIDIA H200,NVIDIA H200 NVL')",
+    )
+    p.add_argument(
+        "--gpu-fallback-count",
+        type=int,
+        default=None,
+        help="GPU count to use with fallback types (e.g. 2 for 2xH200)",
     )
 
     p.add_argument(
