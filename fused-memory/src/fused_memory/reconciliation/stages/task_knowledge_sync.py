@@ -73,11 +73,6 @@ class TaskKnowledgeSync(BaseStage):
         # Render "Recently Completed Tasks" section
         if filtered.done_tasks:
             recently_completed_text = format_task_list(filtered.done_tasks[:30])
-        elif filtered.done_count > 0:
-            recently_completed_text = (
-                f'{filtered.done_count} tasks completed recently '
-                f'(details omitted — too many to list).'
-            )
         else:
             recently_completed_text = format_task_list([])  # 'No tasks.'
 
