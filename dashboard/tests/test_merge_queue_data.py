@@ -1035,3 +1035,39 @@ class TestMultiDbAggregation:
         assert len(result) == 2
         task_ids = {r['task_id'] for r in result}
         assert task_ids == {'recent-a', 'recent-b'}
+
+    @pytest.mark.asyncio
+    async def test_aggregate_recent_merges_mixed_tz_sort(self, tmp_path):
+        """Merges with different UTC offsets sort correctly by chronological order.
+
+        Lexicographic sort would compare '13:00+05:00' > '12:00+00:00' (wrong).
+        Chronological sort: 12:00 UTC > 08:00 UTC (13:00+05:00), so UTC noon
+        must appear first (newest).
+        """
+        # DB1: 2026-04-11T12:00:00+00:00  = 12:00 UTC (newer)
+        # DB2: 2026-04-11T13:00:00+05:00  = 08:00 UTC (older)
+        ts_utc_noon = '2026-04-11T12:00:00+00:00'
+        ts_tz_plus5 = '2026-04-11T13:00:00+05:00'
+
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt', 'timestamp': ts_utc_noon,
+             'task_id': 'utc-noon', 'data': {'outcome': 'done'}},
+        ])
+        db2 = self._make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt', 'timestamp': ts_tz_plus5,
+             'task_id': 'tz-plus5', 'data': {'outcome': 'done'}},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            # Use a large hours window so both events are included
+            result = await aggregate_recent_merges([conn1, conn2], limit=20, hours=87600)
+
+        assert len(result) == 2
+        # utc-noon (12:00 UTC) is newer than tz-plus5 (08:00 UTC), so must be first
+        assert result[0]['task_id'] == 'utc-noon'
+        assert result[1]['task_id'] == 'tz-plus5'
