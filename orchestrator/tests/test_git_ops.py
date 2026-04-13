@@ -153,6 +153,16 @@ async def _push_n_commits_to_origin(
 
 @pytest.mark.asyncio
 class TestWorktreeLifecycle:
+    async def test_worktree_info_stale_commits_field(self, git_ops: GitOps):
+        """WorktreeInfo.stale_commits defaults to None and can be set explicitly."""
+        info_default = WorktreeInfo(path=git_ops.project_root, base_commit='a' * 40)
+        assert info_default.stale_commits is None
+
+        info_explicit = WorktreeInfo(
+            path=git_ops.project_root, base_commit='a' * 40, stale_commits=5,
+        )
+        assert info_explicit.stale_commits == 5
+
     async def test_create_worktree(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-1')
         assert worktree_info.path.exists()
