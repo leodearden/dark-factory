@@ -160,6 +160,29 @@ class TestUuidDispatch:
         with pytest.raises(AssertionError, match='uuid-2'):
             dispatch.assert_all_dispatched()
 
+    @pytest.mark.asyncio
+    async def test_raises_exception_values(self):
+        """Mapping a uuid to a BaseException instance causes dispatch to raise it."""
+        dispatch = _uuid_dispatch({
+            'uuid-1': RuntimeError('boom'),
+            'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'c', 'new_summary': 'd', 'edge_count': 1},
+        })
+        with pytest.raises(RuntimeError, match='boom'):
+            await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
+        result = await dispatch('uuid-2', 'Bob', [], group_id='g', old_summary='c')
+        assert result['uuid'] == 'uuid-2'
+
+    @pytest.mark.asyncio
+    async def test_exception_tracked_in_dispatched(self):
+        """uuid-1 appears in dispatched even when dispatch raises for it."""
+        dispatch = _uuid_dispatch({
+            'uuid-1': RuntimeError('boom'),
+            'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'c', 'new_summary': 'd', 'edge_count': 1},
+        })
+        with pytest.raises(RuntimeError):
+            await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
+        assert 'uuid-1' in dispatch.dispatched
+
 
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.list_entity_nodes
