@@ -1443,3 +1443,102 @@ class TestMultiDbAggregation:
         # Both events are in the current bucket — summed count must be 2
         idx = result['labels'].index(expected_last_label)
         assert result['values'][idx] == 2
+
+    # -----------------------------------------------------------------------
+    # Gap coverage (e): duration_ms=0 and NULL excluded by aggregate path
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_aggregate_latency_zero_duration_excluded(self, tmp_path):
+        """Zero-duration rows are excluded from aggregate latency stats.
+
+        _get_durations filters 'AND duration_ms > 0', so duration_ms=0 rows
+        must not contribute to count or percentiles in the aggregate.
+        """
+        now = datetime.now(UTC)
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
+             'data': {'outcome': 'done'}, 'duration_ms': 0},
+        ])
+        db2 = self._make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
+             'data': {'outcome': 'done'}, 'duration_ms': 500},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_latency_stats([conn1, conn2], hours=24)
+
+        assert result['count'] == 1  # zero-duration row excluded
+        assert result['p50'] == 500
+
+    @pytest.mark.asyncio
+    async def test_aggregate_latency_null_duration_excluded(self, tmp_path):
+        """NULL-duration rows are excluded from aggregate latency stats.
+
+        _get_durations filters 'AND duration_ms IS NOT NULL', so NULL rows
+        must not contribute to count or percentiles in the aggregate.
+        """
+        now = datetime.now(UTC)
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            # duration_ms=None → stored as NULL in SQLite
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
+             'data': {'outcome': 'done'}},
+        ])
+        db2 = self._make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
+             'data': {'outcome': 'done'}, 'duration_ms': 300},
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=7),
+             'data': {'outcome': 'done'}, 'duration_ms': 600},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_latency_stats([conn1, conn2], hours=24)
+
+        assert result['count'] == 2  # NULL row excluded
+        assert result['mean_ms'] == pytest.approx(450.0, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_aggregate_latency_mixed_zero_null_valid(self, tmp_path):
+        """Only valid (non-zero, non-NULL) durations from multiple DBs contribute.
+
+        DB1 has duration_ms=0 and a NULL-duration row; DB2 has three valid rows.
+        Confirms the aggregate path preserves _get_durations' filter and only
+        the three valid durations from DB2 contribute.
+        """
+        now = datetime.now(UTC)
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
+             'data': {'outcome': 'done'}, 'duration_ms': 0},
+            # NULL duration:
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
+             'data': {'outcome': 'done'}},
+        ])
+        db2 = self._make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=7),
+             'data': {'outcome': 'done'}, 'duration_ms': 100},
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=8),
+             'data': {'outcome': 'done'}, 'duration_ms': 200},
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=9),
+             'data': {'outcome': 'done'}, 'duration_ms': 300},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_latency_stats([conn1, conn2], hours=24)
+
+        assert result['count'] == 3  # only valid durations from DB2
+        assert result['mean_ms'] == pytest.approx(200.0, abs=1e-6)
