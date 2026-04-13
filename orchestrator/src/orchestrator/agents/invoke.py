@@ -13,7 +13,6 @@ import logging
 import os
 import tempfile
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -289,8 +288,7 @@ async def _invoke_claude_with_sandbox(
 
             try:
                 result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data)
-                parsed = _parse_claude_output(result)
-                return replace(parsed, timed_out=result.timed_out)
+                return _parse_claude_output(result)
             finally:
                 for path in temp_files:
                     Path(path).unlink(missing_ok=True)
