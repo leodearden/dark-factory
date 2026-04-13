@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from conftest import extract_params
 from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult, run_cleanup
 
@@ -69,8 +70,7 @@ class TestQueryEdgesByTimeRange:
         await backend.query_edges_by_time_range(start=start, end=end, group_id='test')
         call_args = graph.ro_query.call_args
         assert call_args is not None
-        args, kwargs = call_args
-        cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        cypher_params = extract_params(call_args)
         assert cypher_params.get('start') == start
         assert cypher_params.get('end') == end
 
@@ -145,8 +145,7 @@ class TestBulkRemoveEdges:
         all_calls = graph_mock.query.call_args_list
         assert len(all_calls) == 2
         delete_call_args = all_calls[1]
-        args, kwargs = delete_call_args
-        cypher_params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        cypher_params = extract_params(delete_call_args)
         assert cypher_params.get('uuids') == uuids
 
     @pytest.mark.asyncio
