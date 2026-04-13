@@ -26,12 +26,12 @@ class RebuildSummariesManager:
     """Discovers and rebuilds stale Graphiti entity summaries.
 
     Args:
-        backend: A GraphitiBackend instance (must be initialized before use).
+        service: A MemoryService instance (must be initialized before use).
         group_id: FalkorDB graph (project) to operate on.
     """
 
-    def __init__(self, backend, group_id: str = 'dark_factory') -> None:
-        self.backend = backend
+    def __init__(self, service, group_id: str = 'dark_factory') -> None:
+        self.service = service
         self.group_id = group_id
 
     async def run(
@@ -49,8 +49,8 @@ class RebuildSummariesManager:
         Returns:
             RebuildResult with aggregate counts and per-entity details.
         """
-        raw = await self.backend.rebuild_entity_summaries(
-            group_id=self.group_id,
+        raw = await self.service.rebuild_entity_summaries(
+            project_id=self.group_id,
             force=force,
             dry_run=dry_run,
         )
@@ -90,7 +90,7 @@ async def run_rebuild_summaries(
         errors, and details.
     """
     async with maintenance_service(config_path) as (config, service):
-        manager = RebuildSummariesManager(backend=service.graphiti, group_id=group_id)
+        manager = RebuildSummariesManager(service=service, group_id=group_id)
         result = await manager.run(force=force, dry_run=dry_run)
         logger.info(
             'run_rebuild_summaries complete: total=%d stale=%d rebuilt=%d '
