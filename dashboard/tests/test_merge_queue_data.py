@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
@@ -820,17 +820,21 @@ class TestMultiDbAggregation:
         (TypeError from awaiting a non-async attribute, RuntimeError from
         execute_fetchall, etc.) is silently skipped by the aggregators.
         """
-        broken = MagicMock()
+        broken = MagicMock(spec=aiosqlite.Connection)
         broken.execute_fetchall = AsyncMock(side_effect=RuntimeError('simulated broken DB'))
         return broken
 
     async def _run_with_one_broken_db(self, tmp_path, aggregate_fn, events, **kwargs):
-        """Scaffold for resilience tests: one valid DB + one broken mock connection."""
+        """Scaffold for resilience tests: one valid DB + one broken mock connection.
+
+        Returns (result, broken) so callers can assert the broken mock was exercised.
+        """
         db1 = self._make_db(tmp_path, 'runs1.db', events)
         broken = self._make_broken_mock()
         async with aiosqlite.connect(str(db1)) as conn1:
             conn1.row_factory = aiosqlite.Row
-            return await aggregate_fn([conn1, broken], **kwargs)
+            result = await aggregate_fn([conn1, broken], **kwargs)
+            return result, broken
 
     async def _run_with_none_entry(self, tmp_path, aggregate_fn, events, **kwargs):
         """Scaffold for None-entry tests: one valid DB + None in dbs list."""
@@ -1219,7 +1223,7 @@ class TestMultiDbAggregation:
              'timestamp': bucket + timedelta(minutes=1),
              'data': {'outcome': 'done'}},
         ]
-        result = await self._run_with_one_broken_db(
+        result, broken = await self._run_with_one_broken_db(
             tmp_path, aggregate_queue_depth_timeseries, events, hours=24, now=now,
         )
         # Broken DB error was silently skipped — no exception raised
@@ -1228,6 +1232,7 @@ class TestMultiDbAggregation:
         assert bucket_label in result['labels']
         idx = result['labels'].index(bucket_label)
         assert result['values'][idx] == 1  # only from valid DB; broken DB skipped
+        broken.execute_fetchall.assert_called()
 
     @pytest.mark.asyncio
     async def test_one_db_raises_outcome_distribution(self, tmp_path):
@@ -1239,12 +1244,13 @@ class TestMultiDbAggregation:
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
              'data': {'outcome': 'done'}},
         ]
-        result = await self._run_with_one_broken_db(
+        result, broken = await self._run_with_one_broken_db(
             tmp_path, aggregate_outcome_distribution, events, hours=24,
         )
         assert 'done' in result['labels']
         done_idx = result['labels'].index('done')
         assert result['values'][done_idx] == 2  # only from valid DB
+        broken.execute_fetchall.assert_called()
 
     @pytest.mark.asyncio
     async def test_one_db_raises_latency_stats(self, tmp_path):
@@ -1256,11 +1262,12 @@ class TestMultiDbAggregation:
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
              'data': {'outcome': 'done'}, 'duration_ms': 200},
         ]
-        result = await self._run_with_one_broken_db(
+        result, broken = await self._run_with_one_broken_db(
             tmp_path, aggregate_latency_stats, events, hours=24,
         )
         assert result['count'] == 2
         assert result['mean_ms'] == pytest.approx(150.0, abs=1e-6)
+        broken.execute_fetchall.assert_called()
 
     @pytest.mark.asyncio
     async def test_one_db_raises_recent_merges(self, tmp_path):
@@ -1272,13 +1279,14 @@ class TestMultiDbAggregation:
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=2),
              'task_id': 'task-y', 'data': {'outcome': 'done'}},
         ]
-        result = await self._run_with_one_broken_db(
+        result, broken = await self._run_with_one_broken_db(
             tmp_path, aggregate_recent_merges, events, limit=20,
         )
         assert len(result) == 2
         # Newest first
         assert result[0]['task_id'] == 'task-x'
         assert result[1]['task_id'] == 'task-y'
+        broken.execute_fetchall.assert_called()
 
     @pytest.mark.asyncio
     async def test_one_db_raises_speculative_stats(self, tmp_path):
@@ -1290,13 +1298,14 @@ class TestMultiDbAggregation:
             {'event_type': 'speculative_merge', 'timestamp': now - timedelta(minutes=2),
              'data': {'base_sha': 'def'}},
         ]
-        result = await self._run_with_one_broken_db(
+        result, broken = await self._run_with_one_broken_db(
             tmp_path, aggregate_speculative_stats, events, hours=24,
         )
         assert result['hit_count'] == 2
         assert result['discard_count'] == 0
         assert result['total'] == 2
         assert result['hit_rate'] == pytest.approx(1.0, abs=1e-6)
+        broken.execute_fetchall.assert_called()
 
     # -----------------------------------------------------------------------
     # Gap coverage (b): empty dbs=[] — asyncio.gather(*[]) returns []
@@ -1343,33 +1352,85 @@ class TestMultiDbAggregation:
 
     @pytest.mark.asyncio
     async def test_all_none_dbs_queue_depth(self):
-        """aggregate_queue_depth_timeseries with dbs=[None, None] returns empty ChartData."""
-        result = await aggregate_queue_depth_timeseries([None, None], hours=24)
-        assert result == {'labels': [], 'values': []}
+        """aggregate_queue_depth_timeseries with dbs=[None, None] returns empty ChartData.
+
+        Spy on queue_depth_timeseries to confirm it was called twice with None —
+        distinguishing this path from dbs=[] where gather(*[]) returns [] immediately.
+        """
+        with patch(
+            'dashboard.data.merge_queue.queue_depth_timeseries',
+            wraps=queue_depth_timeseries,
+        ) as spy:
+            result = await aggregate_queue_depth_timeseries([None, None], hours=24)
+            assert result == {'labels': [], 'values': []}
+            assert spy.call_count == 2
+            for call in spy.call_args_list:
+                assert call.args[0] is None
 
     @pytest.mark.asyncio
     async def test_all_none_dbs_outcome_distribution(self):
-        """aggregate_outcome_distribution with dbs=[None, None] returns empty ChartData."""
-        result = await aggregate_outcome_distribution([None, None], hours=24)
-        assert result == {'labels': [], 'values': []}
+        """aggregate_outcome_distribution with dbs=[None, None] returns empty ChartData.
+
+        Spy on outcome_distribution to confirm it was called twice with None.
+        """
+        with patch(
+            'dashboard.data.merge_queue.outcome_distribution',
+            wraps=outcome_distribution,
+        ) as spy:
+            result = await aggregate_outcome_distribution([None, None], hours=24)
+            assert result == {'labels': [], 'values': []}
+            assert spy.call_count == 2
+            for call in spy.call_args_list:
+                assert call.args[0] is None
 
     @pytest.mark.asyncio
     async def test_all_none_dbs_latency_stats(self):
-        """aggregate_latency_stats with dbs=[None, None] returns all-zero stats dict."""
-        result = await aggregate_latency_stats([None, None], hours=24)
-        assert result == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
+        """aggregate_latency_stats with dbs=[None, None] returns all-zero stats dict.
+
+        Spy on _get_durations (the per-DB function aggregate_latency_stats uses)
+        to confirm it was called twice with None.
+        """
+        with patch(
+            'dashboard.data.merge_queue._get_durations',
+            wraps=_get_durations,
+        ) as spy:
+            result = await aggregate_latency_stats([None, None], hours=24)
+            assert result == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
+            assert spy.call_count == 2
+            for call in spy.call_args_list:
+                assert call.args[0] is None
 
     @pytest.mark.asyncio
     async def test_all_none_dbs_recent_merges(self):
-        """aggregate_recent_merges with dbs=[None, None] returns empty list."""
-        result = await aggregate_recent_merges([None, None], limit=20)
-        assert result == []
+        """aggregate_recent_merges with dbs=[None, None] returns empty list.
+
+        Spy on recent_merges to confirm it was called twice with None.
+        """
+        with patch(
+            'dashboard.data.merge_queue.recent_merges',
+            wraps=recent_merges,
+        ) as spy:
+            result = await aggregate_recent_merges([None, None], limit=20)
+            assert result == []
+            assert spy.call_count == 2
+            for call in spy.call_args_list:
+                assert call.args[0] is None
 
     @pytest.mark.asyncio
     async def test_all_none_dbs_speculative_stats(self):
-        """aggregate_speculative_stats with dbs=[None, None] returns all-zero stats dict."""
-        result = await aggregate_speculative_stats([None, None], hours=24)
-        assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+        """aggregate_speculative_stats with dbs=[None, None] returns all-zero stats dict.
+
+        Spy on speculative_stats to confirm it was called twice with None.
+        """
+        with patch(
+            'dashboard.data.merge_queue.speculative_stats',
+            wraps=speculative_stats,
+        ) as spy:
+            result = await aggregate_speculative_stats([None, None], hours=24)
+            assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+            assert spy.call_count == 2
+            for call in spy.call_args_list:
+                assert call.args[0] is None
 
     # -----------------------------------------------------------------------
     # Gap coverage (c): None entries in dbs — per-DB returns empty defaults
