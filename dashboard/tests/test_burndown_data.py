@@ -817,10 +817,12 @@ class TestCollectSnapshot:
 
         bad_path = config.tasks_json  # the main project's tasks.json path
 
+        unexpected_calls: list = []
+
         def fake_load(path):
             if path == bad_path:
                 raise PermissionError('Permission denied')
-            pytest.fail(f'Unexpected load_task_tree call for {path}')
+            unexpected_calls.append(path)
 
         with (
             patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
@@ -829,6 +831,8 @@ class TestCollectSnapshot:
         ):
             # Must NOT raise — return_exceptions=True absorbs the PermissionError.
             await collect_snapshot(conn, config)
+
+        assert unexpected_calls == [], f'Unexpected load_task_tree calls: {unexpected_calls}'
 
         # (b) zero rows committed — the only root failed, so snapshots is empty.
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
