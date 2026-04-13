@@ -1259,6 +1259,15 @@ class TestParseClaudeOutputTimedOutDefault:
         assert agent.timed_out is False
 
 
+class TestParseClaudeOutputDocstringContract:
+    """_parse_claude_output docstring must document the timed_out=False contract."""
+
+    def test_docstring_contains_does_not_set_timed_out(self):
+        """_parse_claude_output.__doc__ contains 'does not set timed_out' contract note."""
+        assert _parse_claude_output.__doc__ is not None
+        assert 'does not set timed_out' in _parse_claude_output.__doc__
+
+
 # ── caller-level timed_out propagation (characterization tests) ───────────────
 
 
