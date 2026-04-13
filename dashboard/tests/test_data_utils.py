@@ -76,6 +76,19 @@ class TestParseUtc:
             f"Stale phrase 'propagates ValueError or TypeError from' still in docstring: {doc!r}"
         )
 
+    def test_docstring_one_liner_says_timezone_aware(self):
+        """parse_utc one-liner must say 'timezone-aware' and not 'ensure it has UTC timezone'."""
+        from dashboard.data.utils import parse_utc
+
+        doc = parse_utc.__doc__ or ''
+        one_liner = doc.strip().splitlines()[0]
+        assert 'Parse an ISO timestamp string into a timezone-aware datetime' in one_liner, (
+            f"Expected one-liner to say 'timezone-aware datetime', got: {one_liner!r}"
+        )
+        assert 'ensure it has UTC timezone' not in one_liner, (
+            f"Misleading phrase 'ensure it has UTC timezone' still in one-liner: {one_liner!r}"
+        )
+
 
 class TestTimeagoUsesParseUtc:
     """Tests verifying that app.py uses parse_utc from dashboard.data.utils (DRY)."""
