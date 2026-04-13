@@ -423,14 +423,15 @@ class TestLoadTaskTree:
     )
     def test_permission_error_returns_empty_list(self, tmp_path):
         """OSError raised when reading an unreadable tasks.json is handled; returns []."""
-        import json
-
         from dashboard.data.orchestrator import load_task_tree
 
         tasks_json = tmp_path / 'tasks.json'
         tasks_json.write_text(json.dumps({'tasks': [{'id': '1', 'status': 'done'}]}))
         tasks_json.chmod(0o000)
         try:
+            # Guard: fail loudly if chmod was a no-op on this filesystem
+            with pytest.raises(OSError):
+                tasks_json.read_text()
             result = load_task_tree(tasks_json)
             assert result == []
         finally:
