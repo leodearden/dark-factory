@@ -834,6 +834,58 @@ class GraphitiBackend:
         # f is assigned by the walrus := before isinstance checks str; rejects non-str, empty, whitespace-only
         return list(dict.fromkeys(f for e in edges if isinstance(f := e.get('fact'), str) and f and not f.isspace()))
 
+    @staticmethod
+    def _build_stale_entry(
+        entity: dict,
+        edges: Sequence[Mapping[str, Any]],
+    ) -> dict | None:
+        """Compute a stale-entry diagnostic dict for *entity*, or None if up-to-date.
+
+        Encapsulates the repeated logic shared between
+        ``_detect_stale_summaries_with_edges`` and
+        ``_detect_stale_summaries_dry_run``:
+
+        1. Return None if entity summary is empty (not stale by definition).
+        2. Compute canonical facts via ``_canonical_facts`` and join with newlines.
+        3. Return None if summary already equals the canonical string (up-to-date).
+        4. Compute diagnostic counts (duplicate_count, stale_line_count,
+           valid_fact_count, summary_line_count) and return the stale-entry dict.
+
+        Args:
+            entity: Entity dict with keys 'uuid', 'name', 'summary'.
+            edges:  Valid edges for this entity (same schema as get_valid_edges_for_node).
+
+        Returns:
+            None if the entity is not stale; otherwise a dict with keys:
+            uuid, name, summary, duplicate_count, stale_line_count,
+            valid_fact_count, summary_line_count.
+        """
+        summary = entity['summary']
+        if not summary:
+            return None
+        valid_facts = GraphitiBackend._canonical_facts(edges)
+        canonical = '\n'.join(valid_facts)
+        if summary == canonical:
+            return None
+        # Compute diagnostic counts
+        summary_lines = summary.split('\n')
+        valid_fact_set = set(valid_facts)
+        # duplicate_count: sum of extra occurrences for each unique line that
+        # appears more than once in the current summary.
+        line_counts = Counter(summary_lines)
+        duplicate_count = sum(c - 1 for c in line_counts.values() if c > 1)
+        # stale_line_count: lines in summary not in the valid fact set
+        stale_line_count = sum(1 for line in summary_lines if line not in valid_fact_set)
+        return {
+            'uuid': entity['uuid'],
+            'name': entity['name'],
+            'summary': summary,
+            'duplicate_count': duplicate_count,
+            'stale_line_count': stale_line_count,
+            'valid_fact_count': len(valid_facts),
+            'summary_line_count': len(summary_lines),
+        }
+
     async def refresh_entity_summary(
         self,
         node_uuid: str,
