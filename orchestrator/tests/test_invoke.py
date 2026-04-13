@@ -341,6 +341,20 @@ class TestCodexCallerPropagatesTimedOut:
             )
         assert agent.timed_out is True
 
+    async def test_codex_caller_propagates_timed_out_false(self, tmp_path):
+        """_invoke_codex returns AgentResult with timed_out=False when subprocess did not time out."""
+        not_timed_result = _SubprocessResult(stdout='', stderr='err', returncode=1,
+                                             duration_ms=100, timed_out=False)
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=not_timed_result):
+            agent = await _invoke_codex(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='gpt-5.4', max_budget_usd=1.0,
+                mcp_config=None, sandbox_modules=None, effort=None,
+                timeout_seconds=30.0,
+            )
+        assert agent.timed_out is False
+
 
 @pytest.mark.asyncio
 class TestGeminiCallerPropagatesTimedOut:
