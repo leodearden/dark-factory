@@ -14,6 +14,7 @@ import pytest
 
 from dashboard.config import DashboardConfig
 from dashboard.data.burndown import (
+    _INSERT_SNAPSHOT_SQL,
     BURNDOWN_SCHEMA,
     _count_statuses,
     collect_snapshot,
@@ -48,8 +49,7 @@ def _insert_snapshot(
     done: int = 0,
 ) -> None:
     conn.execute(
-        'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        _INSERT_SNAPSHOT_SQL,
         (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done),
     )
 
@@ -1764,3 +1764,4 @@ class TestCollectSnapshotDocstringContract:
             f'Docstring should mention at least 2 robustness terms from {robustness_terms}; '
             f'matched: {matched}'
         )
+
