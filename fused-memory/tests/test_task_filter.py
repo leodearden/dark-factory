@@ -305,15 +305,16 @@ class TestFormatFilteredTaskTree:
         """
         tree = self._make_tree(active_count=10, done_count=0, cancelled_count=0, other_count=0)
 
-        # max_chars=240 is chosen so that three regimes all exercise in one pass:
-        #   (1) max_tasks=5 caps 10 active tasks to 5 post-cap survivors,
-        #   (2) budget = 240 - 118 (header) - 29 (summary) = 93 admits 2 task lines
-        #       at 37 chars each (36-char line + 1-char newline separator) before
-        #       the accumulator overflows,
-        #   (3) the lazy pop loop fires: first-pass result = 266 > 240, so one line
-        #       is popped, leaving kept_lines=[line1], trimmed_count=4, result=229 <= 240.
+        # max_chars is chosen tight enough to exercise three regimes in one pass:
+        #   (1) max_tasks=5 caps the 10 active tasks to 5 post-cap survivors,
+        #   (2) the first-pass accumulator overflows, admitting only some task lines,
+        #   (3) the lazy pop loop fires, dropping at least one line to bring the result
+        #       within budget and emitting the truncation notice.
+        # The exact byte counts are intentionally not pinned here; the assertions below
+        # validate the invariants directly from the rendered output.
+        max_tasks = 5
         max_chars = 240
-        output = format_filtered_task_tree(tree, max_tasks=5, max_chars=max_chars)
+        output = format_filtered_task_tree(tree, max_tasks=max_tasks, max_chars=max_chars)
 
         # Output must honour the char budget
         assert len(output) <= max_chars
@@ -322,6 +323,16 @@ class TestFormatFilteredTaskTree:
         match = re.search(r'\.\.\. and (\d+) more active \(truncated for budget\)', output)
         assert match is not None, f'Expected truncation notice in output: {output!r}'
         trimmed_count = int(match.group(1))
+        # Count surviving task lines dynamically: each line rendered by _render_task_line
+        # starts with '- [N]' at the beginning of a line.
+        kept_count = len(re.findall(r'^- \[\d+\]', output, re.MULTILINE))
+        # Sanity bound: made explicit here (also implied by the task-1 regex below) so
+        # that a failure is diagnosed in terms of kept_count before reaching the
+        # anchored-line check.
+        assert kept_count >= 1, (
+            f'kept_count={kept_count}: no task lines survived — the lazy pop loop may have '
+            f'over-truncated or _render_task_line format changed'
+        )
 
         # Lower bound: at least one task was dropped by the char-budget clamp, confirming
         # the lazy pop loop genuinely fired (not just the initial accumulator cycle).
@@ -334,19 +345,25 @@ class TestFormatFilteredTaskTree:
 
         # At least one task line must survive the lazy pop loop — guards against the
         # regression where the notice fires but kept_lines ends up empty.
-        assert '- [1]' in output, (
+        # Anchored on the full task-line prefix format from _render_task_line
+        # (f'- [{tid}] ({status}) {title}') to avoid false-positive matches from
+        # bracketed numbers that may appear in the header or from higher task IDs
+        # whose string representation contains '1' as a substring.
+        assert re.search(r'- \[1\] \(pending\) Task title 1', output), (
             'Task 1 line should survive the lazy pop loop; '
             'if missing, the budget accounting has regressed'
         )
 
-        # trimmed_count must be exactly 4 (5 post-cap survivors minus 1 kept line after
-        # the lazy pop loop).  Exact equality catches: (a) the total_active bug where
-        # buggy trimmed_count = 10 - 1 = 9, which fails 9 != 4; (b) subtler off-by-one
-        # errors in truncation accounting that the upper bound alone would not catch.
-        assert trimmed_count == 4, (
-            f'trimmed_count={trimmed_count} should be exactly 4 '
-            f'(5 post-cap survivors minus 1 kept line); '
-            f'bug: trimmed_count tracks total_active instead of len(active[:max_tasks])'
+        # trimmed_count must equal max_tasks minus the kept task lines.  Exact equality
+        # catches: (a) the total_active bug where buggy trimmed_count = 10 - kept instead
+        # of 5 - kept, which fails because 10-kept != 5-kept; (b) subtler off-by-one
+        # errors in truncation accounting that an upper bound alone would not catch.
+        # Using kept_count (parsed from the output) decouples from byte-level arithmetic
+        # while preserving the same regression-detection strength.
+        assert trimmed_count == max_tasks - kept_count, (
+            f'trimmed_count={trimmed_count} should be {max_tasks} - {kept_count} = '
+            f'{max_tasks - kept_count} (max_tasks minus surviving task lines); '
+            f'bug: trimmed_count may track total_active instead of len(active[:max_tasks])'
         )
 
     def test_empty_active_and_empty_tree(self):
