@@ -242,7 +242,7 @@ class TestRunSubprocessLocalTimedOut:
             )
 
         assert result.timed_out is True
-        assert 'Process killed after' in result.stderr
+        assert 'Process killed after 0.1s timeout (SIGTERM+SIGKILL)' in result.stderr
         assert result.returncode == 1
 
 
