@@ -1216,28 +1216,28 @@ class TestRunSubprocessTimedOut:
         assert result.returncode == 0  # grace path preserves returncode
 
 
-# ── _parse_claude_output timed_out default behaviour ─────────────────────────
+# ── _parse_claude_output timed_out propagation ───────────────────────────────
 
 
-class TestParseClaudeOutputTimedOutDefault:
-    """Parser does not propagate timed_out (callers handle it via replace())."""
+class TestParseClaudeOutputPropagatesTimedOut:
+    """Parser propagates timed_out from _SubprocessResult (unforgeable by callers)."""
 
-    def test_timed_out_true_input_yields_false_on_empty_stdout(self):
-        """_parse_claude_output returns timed_out=False regardless of input — empty stdout."""
+    def test_timed_out_true_input_yields_true_on_empty_stdout(self):
+        """_parse_claude_output propagates timed_out=True — empty stdout."""
         sub = _SubprocessResult(stdout='', stderr='timeout stderr', returncode=1,
                                 duration_ms=100, timed_out=True)
         agent = _parse_claude_output(sub)
-        assert agent.timed_out is False
+        assert agent.timed_out is True
 
-    def test_timed_out_true_input_yields_false_on_json_decode_error(self):
-        """_parse_claude_output returns timed_out=False regardless of input — parse error."""
+    def test_timed_out_true_input_yields_true_on_json_decode_error(self):
+        """_parse_claude_output propagates timed_out=True — parse error."""
         sub = _SubprocessResult(stdout='not valid json', stderr='', returncode=1,
                                 duration_ms=100, timed_out=True)
         agent = _parse_claude_output(sub)
-        assert agent.timed_out is False
+        assert agent.timed_out is True
 
-    def test_timed_out_true_input_yields_false_on_normal_parse(self):
-        """_parse_claude_output returns timed_out=False regardless of input — valid JSON."""
+    def test_timed_out_true_input_yields_true_on_normal_parse(self):
+        """_parse_claude_output propagates timed_out=True — valid JSON."""
         valid_json = json.dumps({
             'result': 'ok',
             'subtype': 'success',
@@ -1249,7 +1249,7 @@ class TestParseClaudeOutputTimedOutDefault:
         sub = _SubprocessResult(stdout=valid_json, stderr='', returncode=0,
                                 duration_ms=100, timed_out=True)
         agent = _parse_claude_output(sub)
-        assert agent.timed_out is False
+        assert agent.timed_out is True
 
     def test_timed_out_false_input_yields_false(self):
         """_parse_claude_output returns timed_out=False when input is also False."""
