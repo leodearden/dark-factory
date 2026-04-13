@@ -750,7 +750,7 @@ class TaskWorkflow:
 
     async def _validate_prerequisites_or_block(
         self, context: str
-    ) -> 'WorkflowOutcome | None':
+    ) -> WorkflowOutcome | None:
         """Validate prerequisites format; block if invalid.
 
         Encapsulates the try/validate/except/mark-blocked pattern shared by the
