@@ -189,9 +189,9 @@ class TestCanonicalFacts:
     def test_whitespace_only_fact_is_filtered(self):
         """Whitespace-only facts are filtered out, not included in results.
 
-        The filter uses ``if e.get('fact', '').strip()`` so that a string like
-        '   ' strips to '' (falsy) and is excluded.  Only facts with real
-        non-whitespace content pass through.
+        The filter uses ``isinstance(f, str) and f and not f.isspace()`` so that
+        a string like '   ' is rejected by ``f.isspace()`` and excluded.  Only
+        facts with real non-whitespace content pass through.
         """
         edges = [
             {'fact': '   '},  # whitespace-only — filtered out
@@ -203,10 +203,10 @@ class TestCanonicalFacts:
     def test_whitespace_variants_all_filtered(self):
         """All whitespace-only variants are filtered; content with surrounding whitespace is kept.
 
-        Tabs, newlines, mixed whitespace, and single spaces are all falsy after
-        .strip() and must be excluded.  A fact with real content but leading/
-        trailing whitespace (e.g. '  hello  ') is truthy after strip and must
-        be preserved with its original value.
+        Tabs, newlines, mixed whitespace, and single spaces all return True from
+        ``str.isspace()`` and must be excluded.  A fact with real content but
+        leading/trailing whitespace (e.g. '  hello  ') returns False from
+        ``isspace()`` and must be preserved with its original raw value.
         """
         edges = [
             {'fact': '\t\t'},  # tabs only — filtered
@@ -235,6 +235,39 @@ class TestCanonicalFacts:
         edges = [{'fact': '   '}, {'fact': '\t'}]
         result = GraphitiBackend._canonical_facts(edges)
         assert result == []
+
+    def test_non_string_truthy_fact_is_skipped(self):
+        """Non-string truthy fact values are silently filtered, no AttributeError raised.
+
+        The isinstance type guard must reject int, list, dict, bool, and bytes values
+        even though they are truthy.  Before the fix, ``(42 or '').strip()``
+        would raise AttributeError; the new filter silently skips them.
+        """
+        edges = [
+            {'fact': 42},          # int — truthy but not a string
+            {'fact': ['a']},       # list — truthy but not a string
+            {'fact': {'k': 'v'}},  # dict — truthy but not a string
+            {'fact': True},        # bool — truthy but not a string
+            {'fact': b'hello'},    # bytes — truthy but not a string (serialization boundary)
+        ]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == []
+
+    def test_non_string_fact_mixed_with_valid_strings(self):
+        """Non-string facts are silently dropped; valid string facts are returned.
+
+        Mixing valid string facts with non-string truthy values (int, list, None)
+        must return only the string facts in their original order.
+        """
+        edges = [
+            {'fact': 'A knows B'},
+            {'fact': 42},
+            {'fact': 'C works at Acme'},
+            {'fact': ['x']},
+            {'fact': None},
+        ]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == ['A knows B', 'C works at Acme']
 
 
 # ---------------------------------------------------------------------------
