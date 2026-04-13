@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass, field
+from typing import Any
 
 # --------------------------------------------------------------------------- #
 # Status constants
@@ -265,26 +266,26 @@ def _render_task_line(task: dict) -> str:
     tid = task.get('id', '?')
     title = task.get('title', '?')
     status = task.get('status', '?')
-    deps = task.get('dependencies') or []
+    deps = task.get('dependencies')
+    deps = deps if isinstance(deps, list) else []
     deps_str = str(deps[:5]) + ('...' if len(deps) > 5 else '')
     return f'- [{tid}] ({status}) {title} deps={deps_str}'
 
 
-def format_task_list(tasks: list[dict]) -> str:
+def format_task_list(tasks: list[Any]) -> str:
     """Render a list of task dicts as a newline-joined string.
 
-    Returns 'No tasks.' for an empty list; otherwise joins
-    _render_task_line(t) for each task with newlines.
+    Non-dict elements (e.g. None, int, string) are silently skipped.
+    Returns 'No tasks.' for an empty list, when all elements are non-dict,
+    or when the input contains no valid dict items.
 
     Args:
-        tasks: List of task dicts to render.
+        tasks: List of task dicts to render.  Non-dict items are ignored.
 
     Returns:
         Formatted string suitable for injection into a reconciliation prompt.
     """
-    if not tasks:
-        return 'No tasks.'
-    return '\n'.join(_render_task_line(t) for t in tasks)
+    return '\n'.join(_render_task_line(t) for t in tasks if isinstance(t, dict)) or 'No tasks.'
 
 
 # --------------------------------------------------------------------------- #
