@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -467,8 +469,6 @@ class TestCollectSnapshot:
     @pytest.mark.asyncio
     async def test_continues_when_known_root_unreadable(self, tmp_path, caplog):
         """PermissionError on one known root is skipped; other roots are still snapshotted."""
-        import logging
-
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
@@ -536,8 +536,6 @@ class TestCollectSnapshot:
     @pytest.mark.asyncio
     async def test_logs_warning_when_known_root_unreadable(self, tmp_path, caplog):
         """A WARNING is logged naming the failing root when PermissionError occurs."""
-        import logging
-
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
@@ -786,8 +784,6 @@ class TestCollectSnapshot:
         cannot drop the remaining snapshots.  The test uses OSError (not PermissionError)
         to match task 519's 'unreadable tasks.json' wording.
         """
-        import logging
-
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
@@ -873,8 +869,6 @@ class TestCollectSnapshot:
         previously-untested main-project failure path. Uses path-keyed dispatch so
         the test does not depend on load_task_tree call ordering.
         """
-        import logging
-
         db_path, config, conn = burndown_env
 
         bad_path = config.tasks_json  # the main project's tasks.json path
@@ -917,8 +911,6 @@ class TestCollectSnapshot:
         pipeline — fake_load stands in for any real operation inside load_task_tree
         that might touch Path.resolve (canonicalization, symlink checks, etc.).
         """
-        import logging
-
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
@@ -1334,9 +1326,6 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
         known_project_roots row must be committed; a WARNING mentioning
         'orchestrator' must be emitted with exc_info set.
         """
-        import contextlib
-        import logging
-
         db_path, base_config, conn = burndown_env
         known_root = Path(f'/fake/project/{known_root_suffix}')
         config = DashboardConfig(
@@ -1439,8 +1428,6 @@ class TestCollectSnapshotInsertFailureIsolation:
         the extra's failure is caught per-project with a WARNING, and
         collect_snapshot does not raise.
         """
-        import logging
-
         db_path, base_config, conn = burndown_env
         extra_root = Path('/fake/project/insert_fail_extra_a')
         config = DashboardConfig(
@@ -1505,8 +1492,6 @@ class TestCollectSnapshotInsertFailureIsolation:
         main + extra_a + extra_c are committed, extra_b is absent, and
         exactly one WARNING names extra_b.
         """
-        import logging
-
         db_path, base_config, conn = burndown_env
         extra_a = Path('/fake/project/insert_multi_a')
         extra_b = Path('/fake/project/insert_multi_b')   # the failing one
@@ -1578,8 +1563,6 @@ class TestCollectSnapshotInsertFailureIsolation:
         After step-4: main's failure is caught per-project; the loop continues
         and extra is committed.  A WARNING must name the main project.
         """
-        import logging
-
         db_path, base_config, conn = burndown_env
         extra_root = Path('/fake/project/insert_fail_main_extra')
         config = DashboardConfig(
