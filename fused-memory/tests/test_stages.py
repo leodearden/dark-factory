@@ -32,7 +32,12 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     TaskKnowledgeSync,
     _select_proactive_sample,
 )
-from fused_memory.reconciliation.task_filter import MAX_DONE_TASKS_RETAINED, _id_key
+from fused_memory.reconciliation.task_filter import (
+    FilteredTaskTree,
+    MAX_DONE_TASKS_RETAINED,
+    _id_key,
+    filter_task_tree,
+)
 
 _MOCK_TYPES = (AsyncMock, MagicMock)
 
@@ -2070,3 +2075,77 @@ class TestExtractSectionHelper:
         payload = '### Dup\nfirst body\n### Dup\nsecond body'
         result = _extract_section(payload, '### Dup')
         assert result == '### Dup\nfirst body'
+
+
+class TestInvariantAfterTask643:
+    """Regression guard for the FilteredTaskTree done_count/done_tasks invariant.
+
+    Task 643 removed the dead ``elif filtered.done_count > 0`` branch from
+    ``TaskKnowledgeSync.assemble_payload`` on the grounds that
+    ``filter_task_tree()`` guarantees ``done_count > 0 → len(done_tasks) > 0``
+    (they are always appended together, capped at ``MAX_DONE_TASKS_RETAINED=30``).
+    Task 782 hardens this invariant with a defensive callsite warning and places
+    regression guards here at the stage/callsite layer.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='test_project')
+
+    def _make_task(self, tid: int, status: str) -> dict:
+        return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': []}
+
+    @pytest.mark.asyncio
+    async def test_warns_when_filtered_task_tree_violates_invariant(
+        self, mock_deps, watermark, caplog
+    ):
+        """A FilteredTaskTree with done_count>0 but empty done_tasks triggers a WARNING.
+
+        This guards the defensive check added by task-782 in
+        ``TaskKnowledgeSync.assemble_payload``.  The invariant-violating state can
+        only be reached by external callers that construct a ``FilteredTaskTree``
+        directly (bypassing ``filter_task_tree``).
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        # Construct invariant-violating tree: done_count > 0 but done_tasks is empty.
+        # This state is impossible via filter_task_tree() but can arise from external
+        # construction — exactly the case the task-782 defensive check guards against.
+        stage.filtered_task_tree = FilteredTaskTree(
+            active_tasks=[self._make_task(1, 'in-progress')],
+            done_tasks=[],
+            done_count=5,
+            cancelled_tasks=[],
+            cancelled_count=0,
+            other_count=0,
+            total_count=6,
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await stage.assemble_payload([], watermark, [])
+
+        assert any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'done_count' in rec.message
+            and 'done_tasks' in rec.message
+            for rec in caplog.records
+        ), (
+            'Expected a WARNING about done_count/done_tasks invariant from '
+            'fused_memory.reconciliation.stages.task_knowledge_sync, '
+            f'got records: {[(r.name, r.levelno, r.message) for r in caplog.records]}'
+        )
