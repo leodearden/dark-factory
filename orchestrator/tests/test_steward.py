@@ -1885,3 +1885,194 @@ class TestPreTriageUsageGateCleanup:
         assert isinstance(result, Escalation)
         # invoke_with_cap_retry sets account_name='' when no gate is provided
         assert mock_result.account_name == ''
+
+
+# ---------------------------------------------------------------------------
+# Pre-triage suggestions path — _handle_escalation integration + kwarg contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPreTriageSuggestionsPath:
+    """_handle_escalation threshold gate and _pre_triage_suggestions kwarg contract."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_triage(self):
+        """Replace orchestrator.agents.triage so tests focus on path, not triage logic."""
+        import sys as _sys
+
+        triage_mod = MagicMock()
+        triage_mod.TRIAGE_OUTPUT_SCHEMA = {'type': 'object'}
+        triage_mod.TRIAGE_SYSTEM_PROMPT = 'You are a classifier.'
+        triage_mod.build_triage_prompt = MagicMock(return_value='triage prompt')
+        triage_mod.parse_triage_result = MagicMock(
+            return_value={'accepted': [], 'skipped': [], 'proposed_task_groups': []}
+        )
+        triage_mod.format_pretriaged_detail = MagicMock(return_value='## Pre-triaged')
+        with patch.dict(_sys.modules, {'orchestrator.agents.triage': triage_mod}):
+            yield triage_mod
+
+    @staticmethod
+    def _make_suggestions(n: int) -> list:
+        """Build a list of *n* suggestion dicts (shared by factory methods below)."""
+        return [
+            {
+                'description': f'suggestion {i}', 'location': f'file_{i}.py',
+                'reviewer': 'bot', 'category': 'style',
+            }
+            for i in range(n)
+        ]
+
+    @staticmethod
+    def _esc_with_suggestions(n: int) -> Escalation:
+        """Escalation with *n* JSON suggestions in detail field."""
+        suggestions = TestPreTriageSuggestionsPath._make_suggestions(n)
+        return _make_escalation(detail=json.dumps(suggestions), category='review_suggestions')
+
+    @staticmethod
+    def _hash_esc(n: int) -> Escalation:
+        """Escalation with hash-prefixed detail containing *n* JSON suggestions."""
+        suggestions = TestPreTriageSuggestionsPath._make_suggestions(n)
+        detail = f'#hash:abcdef0123456789#{json.dumps(suggestions)}'
+        return _make_escalation(detail=detail, category='review_suggestions')
+
+    @pytest.mark.parametrize('n', [10, 15])
+    async def test_handle_escalation_triggers_pre_triage_at_threshold(
+        self, steward, n,
+    ):
+        """_handle_escalation calls _pre_triage_suggestions at and above threshold (n=10, 15)."""
+        esc = self._esc_with_suggestions(n)
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+        with (
+            patch.object(
+                steward, '_pre_triage_suggestions',
+                new_callable=AsyncMock, return_value=esc,
+            ) as mock_pre_triage,
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock, return_value=_make_result()),
+        ):
+            await steward._handle_escalation(esc)
+
+        mock_pre_triage.assert_called_once_with(esc)
+
+    @pytest.mark.parametrize('n', [0, 1, 9])
+    async def test_handle_escalation_skips_pre_triage_below_threshold(
+        self, steward, n,
+    ):
+        """_handle_escalation does NOT call _pre_triage_suggestions below threshold (n=0, 1, 9)."""
+        esc = self._esc_with_suggestions(n)
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+        with (
+            patch.object(
+                steward, '_pre_triage_suggestions',
+                new_callable=AsyncMock, return_value=esc,
+            ) as mock_pre_triage,
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock, return_value=_make_result()) as mock_invoke,
+        ):
+            await steward._handle_escalation(esc)
+
+        mock_pre_triage.assert_not_called()
+        mock_invoke.assert_called_once()
+
+    async def test_pre_triaged_detail_injected_into_steward_session(
+        self, steward,
+    ):
+        """Pre-triaged escalation (not original) is passed to briefing builder."""
+        esc = self._esc_with_suggestions(12)
+        pre_triaged_esc = _make_escalation(
+            detail='## Pre-Triaged Results\n8 accepted, 4 skipped',
+            summary='12 suggestions pre-triaged: 8 accepted, 4 skipped',
+            category='review_suggestions',
+        )
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+        with (
+            patch.object(
+                steward, '_pre_triage_suggestions',
+                new_callable=AsyncMock, return_value=pre_triaged_esc,
+            ),
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock, return_value=_make_result()),
+        ):
+            await steward._handle_escalation(esc)
+
+        call_kwargs = steward.briefing.build_steward_initial_prompt.call_args.kwargs
+        assert '## Pre-Triaged Results' in call_kwargs['escalation']['detail']
+
+    async def test_pre_triage_failure_falls_back_in_handle_escalation(
+        self, steward,
+    ):
+        """When _pre_triage_suggestions returns original escalation, steward uses original detail."""
+        esc = self._esc_with_suggestions(12)
+        original_detail = esc.detail
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+        with (
+            patch.object(
+                steward, '_pre_triage_suggestions',
+                new_callable=AsyncMock, return_value=esc,
+            ),
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock, return_value=_make_result()) as mock_invoke,
+        ):
+            await steward._handle_escalation(esc)
+
+        call_kwargs = steward.briefing.build_steward_initial_prompt.call_args.kwargs
+        assert call_kwargs['escalation']['detail'] == original_detail
+        mock_invoke.assert_called_once()
+
+    async def test_pre_triage_passes_correct_allowed_tools(self, steward):
+        """_pre_triage_suggestions passes the exact allowed_tools list to invoke_agent."""
+        esc = self._esc_with_suggestions(12)
+        # Patches invoke_agent at definition site — invoke_with_cap_retry delegates to it
+        # via module-level reference, so patching here intercepts calls through the wrapper.
+        with patch('orchestrator.agents.invoke.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            await steward._pre_triage_suggestions(esc)
+
+        call_kwargs = mock_invoke.call_args.kwargs
+        assert call_kwargs['allowed_tools'] == [
+            'Read', 'Glob', 'Grep',
+            'mcp__fused-memory__get_tasks',
+            'mcp__fused-memory__search',
+        ]
+
+    async def test_pre_triage_uses_project_root_as_cwd(self, steward):
+        """_pre_triage_suggestions passes config.project_root (not worktree) as cwd."""
+        esc = self._esc_with_suggestions(12)
+        # Patches invoke_agent at definition site — invoke_with_cap_retry delegates to it
+        # via module-level reference, so patching here intercepts calls through the wrapper.
+        with patch('orchestrator.agents.invoke.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            await steward._pre_triage_suggestions(esc)
+
+        call_kwargs = mock_invoke.call_args.kwargs
+        assert call_kwargs['cwd'] == steward.config.project_root
+        assert call_kwargs['cwd'] != steward.worktree
+
+    async def test_handle_escalation_strips_hash_prefix_for_threshold(
+        self, steward,
+    ):
+        """Hash-prefixed detail is stripped before len() check; pre-triage is triggered."""
+        esc = self._hash_esc(12)
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+        with (
+            patch.object(
+                steward, '_pre_triage_suggestions',
+                new_callable=AsyncMock, return_value=esc,
+            ) as mock_pre_triage,
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock, return_value=_make_result()),
+        ):
+            await steward._handle_escalation(esc)
+
+        mock_pre_triage.assert_called_once_with(esc)
