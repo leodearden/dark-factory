@@ -993,33 +993,10 @@ class GraphitiBackend:
         all_edges = await self.get_all_valid_edges(group_id=group_id)
         stale: list[dict] = []
         for entity in entities:
-            summary = entity['summary']
-            if not summary:
-                # Empty summary — not stale by definition
-                continue
             edges = all_edges.get(entity['uuid'], [])
-            valid_facts = self._canonical_facts(edges)
-            canonical = '\n'.join(valid_facts)
-            if summary == canonical:
-                continue  # Already up-to-date
-            # Compute diagnostic counts
-            summary_lines = summary.split('\n')
-            valid_fact_set = set(valid_facts)
-            # duplicate_count: sum of extra occurrences for each unique line that
-            # appears more than once in the current summary.
-            line_counts = Counter(summary_lines)
-            duplicate_count = sum(c - 1 for c in line_counts.values() if c > 1)
-            # stale_line_count: lines in summary not in the valid fact set
-            stale_line_count = sum(1 for line in summary_lines if line not in valid_fact_set)
-            stale.append({
-                'uuid': entity['uuid'],
-                'name': entity['name'],
-                'summary': summary,
-                'duplicate_count': duplicate_count,
-                'stale_line_count': stale_line_count,
-                'valid_fact_count': len(valid_facts),
-                'summary_line_count': len(summary_lines),
-            })
+            entry = self._build_stale_entry(entity, edges)
+            if entry is not None:
+                stale.append(entry)
         return StaleSummaryResult(stale=stale, all_edges=all_edges, total_count=len(entities))
 
     async def _detect_stale_summaries_dry_run(
