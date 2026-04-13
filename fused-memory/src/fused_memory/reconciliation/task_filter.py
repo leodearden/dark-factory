@@ -60,10 +60,16 @@ _STATUS_PRIORITY: dict[str, int] = {
 
 
 def _id_key(t: dict) -> int:
-    """Return task id as int for sorting, defaulting to 0 on error."""
+    """Return task id as int for sorting, defaulting to 0 on error.
+
+    For dotted subtask IDs like '450.2' or '450.2.1', returns the parent
+    (first dot-segment) as int, so subtasks sort alongside their parent.
+    """
     tid = t.get('id', 0)
     try:
-        return int(tid)
+        tid_str = str(tid)
+        # For dotted IDs like '450.2', use only the first segment
+        return int(tid_str.split('.')[0])
     except (TypeError, ValueError):
         return 0
 
