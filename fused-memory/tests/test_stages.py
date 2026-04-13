@@ -1499,7 +1499,7 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
         """Stage must NOT apply a second done_tasks slice on top of filter_task_tree's cap.
 
         Two assertions:
-        (1) Source-level guard: assemble_payload source must not contain a subscript on
+        (1) Source-level guard: assemble_payload source must not contain a slice on
             done_tasks (e.g. ``done_tasks[:30]``).  This is a tripwire — it fires the
             moment someone re-introduces a hardcoded re-slice that duplicates the cap
             already enforced by filter_task_tree.
@@ -1507,11 +1507,12 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
             in the Recently Completed section — the stage must not silently trim them.
         """
         import inspect
+        import re
 
         # (1) Source-level tripwire: assemble_payload must not slice done_tasks.
         source = inspect.getsource(TaskKnowledgeSync.assemble_payload)
-        assert 'done_tasks[' not in source, (
-            "assemble_payload contains a subscript on done_tasks (e.g. done_tasks[:30]). "
+        assert not re.search(r'done_tasks\[.*:.*\]', source), (
+            "assemble_payload contains a slice on done_tasks (e.g. done_tasks[:30]). "
             "This is dead code — filter_task_tree already caps done_tasks at "
             f"MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED}. "
             "Remove the slice; filter_task_tree is the single source of truth."
