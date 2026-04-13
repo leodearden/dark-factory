@@ -193,13 +193,9 @@ class TestTasksJsonFor:
         result = _tasks_json_for(tmp_path)
         assert result == tmp_path / '.taskmaster' / 'tasks' / 'tasks.json'
 
-    def test_returns_path_type(self, tmp_path):
+    def test_result_is_relative_to_root(self, tmp_path):
         result = _tasks_json_for(tmp_path)
-        assert isinstance(result, Path)
-
-    def test_arbitrary_root(self):
-        root = Path('/some/project/root')
-        assert _tasks_json_for(root) == Path('/some/project/root/.taskmaster/tasks/tasks.json')
+        assert result.is_relative_to(tmp_path)
 
 
 # ---------------------------------------------------------------------------
