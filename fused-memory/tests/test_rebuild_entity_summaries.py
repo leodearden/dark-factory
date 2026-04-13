@@ -687,6 +687,13 @@ class TestMemoryServiceRebuildEntitySummaries:
         assert result_summary['stale_entities'] == 4
         assert result_summary['rebuilt'] == 3
         assert result_summary['errors'] == 0
+        # Must contain 'skipped' aggregate field
+        assert 'skipped' in result_summary
+        assert result_summary['skipped'] == 1
+        # Key set must be exactly these five aggregate fields — no more, no less
+        assert set(result_summary.keys()) == {
+            'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors'
+        }
 
 
 # ---------------------------------------------------------------------------
