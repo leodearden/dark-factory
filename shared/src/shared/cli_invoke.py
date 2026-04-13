@@ -214,6 +214,7 @@ async def invoke_with_cap_retry(
     while True:
         oauth_token = None
         account_name = ''
+        skip_confirm = False  # set True when heuristic fires but account unresolvable
         if usage_gate:
             oauth_token = await usage_gate.before_invoke()
             account_name = usage_gate.active_account_name or ''
@@ -338,6 +339,10 @@ async def invoke_with_cap_retry(
                     f'{label}: heuristic cap suspected but no account could be marked '
                     f'(token unresolved) — treating as normal failure',
                 )
+                # Calling confirm_account_ok with an unresolvable token would be
+                # semantically misleading (we never confirmed the account is ok —
+                # we simply couldn't identify it).  Skip it for this iteration.
+                skip_confirm = True
             else:
                 consecutive_cap_hits += 1
                 full_cycles = (consecutive_cap_hits - 1) // num_accounts
@@ -389,8 +394,9 @@ async def invoke_with_cap_retry(
             invoke_kwargs['prompt'] = original_prompt
             continue
 
-        if usage_gate:
+        if usage_gate and not skip_confirm:
             usage_gate.confirm_account_ok(oauth_token)
+        if usage_gate:
             usage_gate.on_agent_complete(result.cost_usd)
         break
 

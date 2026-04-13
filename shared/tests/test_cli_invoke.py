@@ -1296,7 +1296,8 @@ class TestHeuristicCapGating:
         assert got.success is False
         mock_invoke.assert_called_once()
         mock_asyncio.sleep.assert_not_called()
-        gate.confirm_account_ok.assert_called_once()
+        # confirm_account_ok is skipped when cap_marked=False (token unresolvable)
+        gate.confirm_account_ok.assert_not_called()
         gate.on_agent_complete.assert_called_once()
 
     async def test_heuristic_cap_retries_when_handle_returns_true(self):
