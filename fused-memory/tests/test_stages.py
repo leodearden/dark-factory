@@ -2313,6 +2313,30 @@ class TestInvariantAfterTask643:
 
         assert not any(rec.levelno == logging.WARNING for rec in caplog.records)
 
+    def test_filter_task_tree_invariant_cancelled_count_and_cancelled_tasks_populated_together(self):
+        """Regression guard: filter_task_tree() sets cancelled_count>0 ↔ cancelled_tasks non-empty.
+
+        Mirrors the done-pair regression guard.  Verifies that any future refactor of
+        filter_task_tree that breaks the cancelled_count↔cancelled_tasks invariant trips
+        this test in addition to guards in test_task_filter.py.
+        """
+        tasks_data = {
+            'tasks': [
+                self._make_task(1, 'cancelled'),
+                self._make_task(2, 'cancelled'),
+                self._make_task(3, 'cancelled'),
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert result.cancelled_count > 0, (
+            f'Expected cancelled_count > 0 for 3 cancelled tasks, got {result.cancelled_count}'
+        )
+        assert len(result.cancelled_tasks) > 0, (
+            f'Expected non-empty cancelled_tasks for cancelled_count={result.cancelled_count}, '
+            f'got cancelled_tasks={result.cancelled_tasks!r}'
+        )
+
     def test_filter_task_tree_invariant_done_count_and_done_tasks_populated_together(self):
         """Regression guard: filter_task_tree() sets done_count>0 ↔ done_tasks non-empty.
 
