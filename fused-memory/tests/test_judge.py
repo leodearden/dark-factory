@@ -525,3 +525,49 @@ async def test_call_judge_cli_confirms_account_ok_on_success(mock_journal):
     assert result == 'The verdict is ok.'
     gate.confirm_account_ok.assert_called_once_with('token-j')
     gate.on_agent_complete.assert_called_once_with(0.0055)
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_releases_probe_on_file_not_found(mock_journal):
+    """release_probe_slot is called when create_subprocess_exec raises FileNotFoundError."""
+    config = _make_judge_config(judge_llm_provider='claude-cli', judge_llm_model='sonnet')
+    judge = Judge(config=config, journal=mock_journal)
+
+    gate = MagicMock()
+    gate.before_invoke = AsyncMock(return_value='token-jx')
+    gate.detect_cap_hit = MagicMock(return_value=False)
+    judge._usage_gate = gate
+
+    with (
+        patch('asyncio.create_subprocess_exec', side_effect=FileNotFoundError),
+        pytest.raises(RuntimeError, match='Claude CLI not found'),
+    ):
+        await judge._call_judge_cli('Evaluate this.')
+
+    gate.release_probe_slot.assert_called_once_with('token-jx')
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_releases_probe_on_timeout(mock_journal):
+    """release_probe_slot is called when wait_for raises TimeoutError."""
+    import asyncio
+
+    config = _make_judge_config(judge_llm_provider='claude-cli', judge_llm_model='sonnet')
+    judge = Judge(config=config, journal=mock_journal)
+
+    gate = MagicMock()
+    gate.before_invoke = AsyncMock(return_value='token-jy')
+    gate.detect_cap_hit = MagicMock(return_value=False)
+    judge._usage_gate = gate
+
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    with (
+        patch('asyncio.create_subprocess_exec', new_callable=AsyncMock, return_value=mock_proc),
+        pytest.raises(RuntimeError, match='timed out'),
+    ):
+        await judge._call_judge_cli('Evaluate this.')
+
+    gate.release_probe_slot.assert_called_once_with('token-jy')
