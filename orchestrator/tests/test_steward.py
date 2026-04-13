@@ -1733,14 +1733,8 @@ class TestPreTriageUsageGateCleanup:
         steward.usage_gate = gate
         mock_result = _make_result(cost=0.5, session_id='sess-triage')
 
-        with (
-            # Intercept direct invoke_agent call in current code (steward namespace)
-            patch('orchestrator.steward.invoke_agent',
-                  new_callable=AsyncMock, return_value=mock_result),
-            # Intercept invoke_with_cap_retry's internal call after refactor (invoke namespace)
-            patch('orchestrator.agents.invoke.invoke_agent',
-                  new_callable=AsyncMock, return_value=mock_result),
-        ):
+        with patch('orchestrator.agents.invoke.invoke_agent',
+                   new_callable=AsyncMock, return_value=mock_result):
             await steward._pre_triage_suggestions(self._esc())
 
         gate.confirm_account_ok.assert_called_once_with('tok-a')
@@ -1756,9 +1750,6 @@ class TestPreTriageUsageGateCleanup:
         steward.usage_gate = gate
 
         with (
-            patch('orchestrator.steward.invoke_agent',
-                  new_callable=AsyncMock,
-                  side_effect=RuntimeError('subprocess failed')),
             patch('orchestrator.agents.invoke.invoke_agent',
                   new_callable=AsyncMock,
                   side_effect=RuntimeError('subprocess failed')),
@@ -1779,8 +1770,6 @@ class TestPreTriageUsageGateCleanup:
         mock_result = _make_result(cost=0.3, session_id='sess-triage')
 
         with (
-            patch('orchestrator.steward.invoke_agent',
-                  new_callable=AsyncMock, return_value=mock_result),
             patch('orchestrator.agents.invoke.invoke_agent',
                   new_callable=AsyncMock, return_value=mock_result) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock),
@@ -1788,6 +1777,33 @@ class TestPreTriageUsageGateCleanup:
             await steward._pre_triage_suggestions(self._esc())
 
         assert mock_invoke.call_count == 2
+
+    async def test_cap_hit_triggers_retry_claude_backend(self, steward: TaskSteward):
+        """On cap hit with backend='claude' and a session_id, the retry uses resume_session_id.
+
+        Exercises the Claude-specific session-resume path in invoke_with_cap_retry
+        (lines 104-106 of invoke.py): when cap is hit the second call should receive
+        resume_session_id so the capped session is resumed rather than restarted fresh.
+        """
+        steward.config.backends.triage = 'claude'
+        gate = self._gate(cap_effects=[True, False])
+        steward.usage_gate = gate
+
+        cap_result = _make_result(cost=0.1, session_id='sess-cap')
+        success_result = _make_result(cost=0.3, session_id='sess-resumed')
+
+        with (
+            patch('orchestrator.agents.invoke.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=[cap_result, success_result]) as mock_invoke,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await steward._pre_triage_suggestions(self._esc())
+
+        assert mock_invoke.call_count == 2
+        # Second call must carry resume_session_id pointing to the capped session
+        _, second_kwargs = mock_invoke.call_args_list[1]
+        assert second_kwargs.get('resume_session_id') == 'sess-cap'
 
     async def test_cancelled_error_releases_probe_slot(self, steward: TaskSteward):
         """CancelledError (BaseException, not Exception) also triggers release_probe_slot."""
@@ -1855,6 +1871,9 @@ class TestPreTriageUsageGateCleanup:
     async def test_no_usage_gate_works(self, steward: TaskSteward):
         """_pre_triage_suggestions completes normally when usage_gate is None."""
         steward.usage_gate = None
+        # Explicit pre-condition: gate is truly absent — guards against accidental re-assignment
+        assert steward.usage_gate is None
+
         mock_result = _make_result(cost=0.1, session_id='sess-triage')
 
         with patch('orchestrator.agents.invoke.invoke_agent',
@@ -1864,3 +1883,5 @@ class TestPreTriageUsageGateCleanup:
         # parse_triage_result returns non-None so a new Escalation is returned
         assert result is not None
         assert isinstance(result, Escalation)
+        # invoke_with_cap_retry sets account_name='' when no gate is provided
+        assert mock_result.account_name == ''
