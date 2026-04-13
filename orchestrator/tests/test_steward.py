@@ -1263,6 +1263,9 @@ class TestStewardTimeoutCap:
         first_submit = steward.escalation_queue.submit.call_args_list[0][0][0]
         assert first_submit.level == 1
         assert 'repeatedly timed out' in first_submit.summary.lower()
+        # Original escalation dismissed exactly once — _auto_escalate_to_human (steward.py line 559)
+        # calls resolve() to dismiss the original; resolve.call_count==1 verifies no double-fire
+        assert steward.escalation_queue.resolve.call_count == 1
         # Re-escalation metric is exactly 1 — not double-counted
         assert steward.metrics.escalations_reescalated == 1
         # Timeout metric reflects the 3 actual invocations
