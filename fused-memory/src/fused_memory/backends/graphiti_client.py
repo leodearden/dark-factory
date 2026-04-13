@@ -226,7 +226,7 @@ class GraphitiBackend:
 
         # Build indices on all existing project graphs (lazy set avoids repeats).
         try:
-            existing = await cast(Any, self._driver).client.list_graphs()
+            existing = await self._require_falkor_client().list_graphs()
             for graph_name in existing:
                 if graph_name != 'default_db' and not graph_name.endswith('_db'):
                     await self._ensure_indices(graph_name)
