@@ -1392,3 +1392,89 @@ async def test_call_claude_cli_no_confirm_on_cap_hit():
     # Exactly once — for the success iteration, NOT for the cap-hit iteration
     gate.confirm_account_ok.assert_called_once_with('token-b')
     gate.on_agent_complete.assert_called_once_with(0.0077)
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_releases_probe_on_file_not_found():
+    """release_probe_slot is called when create_subprocess_exec raises FileNotFoundError."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    config = _make_config(agent_llm_provider='claude-cli', agent_llm_model='opus')
+
+    tools = {
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete',
+            parameters={'type': 'object', 'properties': {}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='Test',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+
+    gate = MagicMock()
+    gate.before_invoke = AsyncMock(return_value='token-x')
+    gate.detect_cap_hit = MagicMock(return_value=False)
+    agent._usage_gate = gate
+
+    messages = [{'role': 'user', 'content': 'test prompt'}]
+    tool_schemas: list = []
+
+    with (
+        patch('asyncio.create_subprocess_exec', side_effect=FileNotFoundError),
+        pytest.raises(RuntimeError, match='Claude CLI not found'),
+    ):
+        await agent._call_claude_cli(messages, tool_schemas)
+
+    gate.release_probe_slot.assert_called_once_with('token-x')
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_releases_probe_on_timeout():
+    """release_probe_slot is called when wait_for raises TimeoutError."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    config = _make_config(agent_llm_provider='claude-cli', agent_llm_model='opus')
+
+    tools = {
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete',
+            parameters={'type': 'object', 'properties': {}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='Test',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+
+    gate = MagicMock()
+    gate.before_invoke = AsyncMock(return_value='token-y')
+    gate.detect_cap_hit = MagicMock(return_value=False)
+    agent._usage_gate = gate
+
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    messages = [{'role': 'user', 'content': 'test prompt'}]
+    tool_schemas: list = []
+
+    with (
+        patch('asyncio.create_subprocess_exec', new_callable=AsyncMock, return_value=mock_proc),
+        pytest.raises(RuntimeError, match='timed out'),
+    ):
+        await agent._call_claude_cli(messages, tool_schemas)
+
+    gate.release_probe_slot.assert_called_once_with('token-y')
