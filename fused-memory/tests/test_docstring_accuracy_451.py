@@ -323,3 +323,34 @@ class TestRefreshEntitySummaryCrossReferencesRebuild:
             "200 characters of each other to provide a use-case routing note for "
             "callers rebuilding many entities at once"
         )
+
+
+# ---------------------------------------------------------------------------
+# Self-consistency: no stale underscore-prefixed method name references
+# ---------------------------------------------------------------------------
+
+
+class TestNoStalePrivateMethodReferences:
+    """Self-consistency test: file must not contain stale private method names.
+
+    The test file referenced _rebuild_entity_from_edges (private-prefixed) in
+    comments and docstrings after the method was renamed to the public
+    rebuild_entity_from_edges (task 420).  This test reads the file's own
+    source and asserts no such stale private reference remains.
+
+    Asserts:
+      (a) the private-prefixed name does not appear literally anywhere in this
+          file (including module docstring, section comments, and class docstrings)
+    """
+
+    def test_no_stale_private_method_references(self) -> None:
+        """File source must not contain the underscore-prefixed method name."""
+        import pathlib
+        source = pathlib.Path(__file__).read_text()
+        # Construct at runtime so this test's own source stays clean.
+        forbidden = '_' + 'rebuild_entity_from_edges'
+        assert forbidden not in source, (
+            f"Found stale reference to {forbidden!r} in test file source. "
+            "The method was renamed to the public rebuild_entity_from_edges "
+            "in task 420; update all comments and docstrings accordingly."
+        )
