@@ -1310,3 +1310,48 @@ class TestFlattenWithSubtasks:
         _flatten_with_subtasks(raw)
         # Original must still have bare int id, not '100.3'
         assert subtask['id'] == 3
+
+    def test_recursive_subtask_nesting(self):
+        """_flatten_with_subtasks handles multi-level nesting.
+
+        parent id='100'
+          subtask id=1  → becomes '100.1'
+            sub-subtask id=1 → becomes '100.1.1'
+
+        All three should appear in flattened output with correct statuses.
+        """
+        raw = [
+            {
+                'id': '100',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [
+                    {
+                        'id': 1,
+                        'title': 'Child',
+                        'status': 'pending',
+                        'dependencies': [],
+                        'subtasks': [
+                            {
+                                'id': 1,
+                                'title': 'Grandchild',
+                                'status': 'done',
+                                'dependencies': [],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+        flat = _flatten_with_subtasks(raw)
+        ids = [str(t['id']) for t in flat]
+        assert '100' in ids
+        assert '100.1' in ids
+        assert '100.1.1' in ids
+        assert len(flat) == 3
+
+        by_id = {str(t['id']): t for t in flat}
+        assert by_id['100']['status'] == 'in-progress'
+        assert by_id['100.1']['status'] == 'pending'
+        assert by_id['100.1.1']['status'] == 'done'
