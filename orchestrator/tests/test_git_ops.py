@@ -558,6 +558,7 @@ class TestCreateWorktreeFreshening:
         assert (worktree_info.path / 'README.md').exists()
         assert len(worktree_info.base_commit) == 40
         assert worktree_info.base_commit == local_main_sha
+        assert worktree_info.stale_commits == 3  # persists through fallback
 
 
 @pytest.mark.asyncio
