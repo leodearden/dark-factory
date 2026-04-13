@@ -1669,3 +1669,78 @@ class TestStewardReleaseProbeSlotOnException:
             )
 
         gate.release_probe_slot.assert_called_once_with('tok-a')
+
+
+# ---------------------------------------------------------------------------
+# Usage gate cleanup in _pre_triage_suggestions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPreTriageUsageGateCleanup:
+    """_pre_triage_suggestions must delegate usage_gate cleanup to invoke_with_cap_retry."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_triage(self):
+        """Replace orchestrator.agents.triage so tests focus on usage_gate, not triage logic."""
+        import sys as _sys
+
+        triage_mod = MagicMock()
+        triage_mod.TRIAGE_OUTPUT_SCHEMA = {'type': 'object'}
+        triage_mod.TRIAGE_SYSTEM_PROMPT = 'You are a classifier.'
+        triage_mod.build_triage_prompt = MagicMock(return_value='triage prompt')
+        triage_mod.parse_triage_result = MagicMock(
+            return_value={'accepted': [], 'skipped': [], 'proposed_task_groups': []}
+        )
+        triage_mod.format_pretriaged_detail = MagicMock(return_value='## Pre-triaged')
+        with patch.dict(_sys.modules, {'orchestrator.agents.triage': triage_mod}):
+            yield triage_mod
+
+    @staticmethod
+    def _esc(n: int = 12) -> Escalation:
+        """Escalation with *n* JSON suggestions in detail field."""
+        suggestions = [
+            {
+                'description': f'suggestion {i}', 'location': f'file_{i}.py',
+                'reviewer': 'bot', 'category': 'style',
+            }
+            for i in range(n)
+        ]
+        return _make_escalation(detail=json.dumps(suggestions), category='review_suggestions')
+
+    @staticmethod
+    def _gate(token: str = 'tok-a', cap_effects=None) -> MagicMock:
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value=token)
+        gate.active_account_name = 'acct-a'
+        gate.confirm_account_ok = MagicMock()
+        gate.release_probe_slot = MagicMock()
+        gate.on_agent_complete = MagicMock()
+        gate.detect_cap_hit = (
+            MagicMock(side_effect=cap_effects)
+            if cap_effects is not None
+            else MagicMock(return_value=False)
+        )
+        return gate
+
+    async def test_confirm_account_ok_called_on_success(self, steward: TaskSteward):
+        """After successful _pre_triage_suggestions, gate.confirm_account_ok('tok-a') is called.
+
+        FAILS with current code because _pre_triage_suggestions never calls confirm_account_ok.
+        PASSES after refactor to invoke_with_cap_retry which calls it on the success path.
+        """
+        gate = self._gate()
+        steward.usage_gate = gate
+        mock_result = _make_result(cost=0.5, session_id='sess-triage')
+
+        with (
+            # Intercept direct invoke_agent call in current code (steward namespace)
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock, return_value=mock_result),
+            # Intercept invoke_with_cap_retry's internal call after refactor (invoke namespace)
+            patch('orchestrator.agents.invoke.invoke_agent',
+                  new_callable=AsyncMock, return_value=mock_result),
+        ):
+            await steward._pre_triage_suggestions(self._esc())
+
+        gate.confirm_account_ok.assert_called_once_with('tok-a')
