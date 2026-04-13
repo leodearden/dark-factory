@@ -183,6 +183,15 @@ class TestUuidDispatch:
             await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
         assert 'uuid-1' in dispatch.dispatched
 
+    @pytest.mark.asyncio
+    async def test_unexpected_uuid_still_raises_assertion(self):
+        """Dispatching a uuid not in the mapping raises AssertionError with 'unexpected uuid'."""
+        dispatch = _uuid_dispatch({
+            'uuid-1': {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'a', 'new_summary': 'b', 'edge_count': 1},
+        })
+        with pytest.raises(AssertionError, match='unexpected uuid'):
+            await dispatch('uuid-99', 'Nobody', [], group_id='g', old_summary='x')
+
 
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.list_entity_nodes
