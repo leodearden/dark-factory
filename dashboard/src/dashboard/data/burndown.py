@@ -53,6 +53,11 @@ _STATUS_MAP: dict[str, str] = {
 
 _ZONE_KEYS = ('pending', 'in_progress', 'blocked', 'deferred', 'cancelled', 'done')
 
+_INSERT_SNAPSHOT_SQL = (
+    'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+)
+
 
 def _count_statuses(tasks: list[dict]) -> dict[str, int]:
     """Count tasks by mapped display zone."""
@@ -185,8 +190,7 @@ async def collect_snapshot(
             try:
                 counts = _count_statuses(tasks)
                 await conn.execute(
-                    'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
-                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                    _INSERT_SNAPSHOT_SQL,
                     (
                         root_str,
                         now,

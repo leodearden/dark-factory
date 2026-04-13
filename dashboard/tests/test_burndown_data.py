@@ -15,6 +15,7 @@ import pytest
 from dashboard.config import DashboardConfig
 from dashboard.data.burndown import (
     BURNDOWN_SCHEMA,
+    _INSERT_SNAPSHOT_SQL,
     _count_statuses,
     collect_snapshot,
     downsample,
@@ -48,8 +49,7 @@ def _insert_snapshot(
     done: int = 0,
 ) -> None:
     conn.execute(
-        'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        _INSERT_SNAPSHOT_SQL,
         (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done),
     )
 
@@ -1770,8 +1770,6 @@ class TestInsertSnapshotSql:
     """Test that _INSERT_SNAPSHOT_SQL module-level constant exists and has correct value."""
 
     def test_constant_is_str_with_correct_content(self):
-        from dashboard.data.burndown import _INSERT_SNAPSHOT_SQL  # noqa: PLC0415
-
         assert isinstance(_INSERT_SNAPSHOT_SQL, str)
         assert _INSERT_SNAPSHOT_SQL.startswith('INSERT INTO snapshots')
         assert 'VALUES (?, ?, ?, ?, ?, ?, ?, ?)' in _INSERT_SNAPSHOT_SQL
