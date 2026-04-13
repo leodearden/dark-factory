@@ -395,15 +395,9 @@ class TestCollectSnapshot:
             assert row[0] == 1  # only one row for reify, not two
 
     @pytest.mark.asyncio
-    async def test_main_project_id_is_resolved_path(self, tmp_path):
+    async def test_main_project_id_is_resolved_path(self, symlink_project_setup):
         """project_id in snapshot must be the resolved path even when project_root is a symlink."""
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
-
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
+        real_dir, link, db_path = symlink_project_setup
 
         config = DashboardConfig(project_root=link)
 
