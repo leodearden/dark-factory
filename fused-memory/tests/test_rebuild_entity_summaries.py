@@ -771,10 +771,15 @@ class TestRebuildEntitySummaries:
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
         })
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'ok', 'new_summary': 'fact1', 'edge_count': 1},
-            {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'also ok', 'new_summary': 'fact2', 'edge_count': 1},
-        ])
+        async def _rebuild_force(uuid, name, edges, *, group_id, old_summary):
+            if uuid == 'uuid-1':
+                return {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'ok', 'new_summary': 'fact1', 'edge_count': 1}
+            elif uuid == 'uuid-2':
+                return {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'also ok', 'new_summary': 'fact2', 'edge_count': 1}
+            else:
+                raise AssertionError(f'_rebuild_force called with unexpected uuid: {uuid!r}')
+
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_rebuild_force)
         result = await svc.rebuild_entity_summaries(project_id='test', force=True)
         assert result['total_entities'] == 2
         assert result['stale_entities'] == 2
@@ -791,11 +796,17 @@ class TestRebuildEntitySummaries:
         a uuid-dispatched callable that includes a strict catch-all.
         """
         svc = _make_svc(mock_config)
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'ok', 'new_summary': 'fact1', 'edge_count': 1},
-            {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'also ok', 'new_summary': 'fact2', 'edge_count': 1},
-        ])
-        with pytest.raises(AssertionError):
+
+        async def _rebuild_force(uuid, name, edges, *, group_id, old_summary):
+            if uuid == 'uuid-1':
+                return {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'ok', 'new_summary': 'fact1', 'edge_count': 1}
+            elif uuid == 'uuid-2':
+                return {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'also ok', 'new_summary': 'fact2', 'edge_count': 1}
+            else:
+                raise AssertionError(f'_rebuild_force called with unexpected uuid: {uuid!r}')
+
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_rebuild_force)
+        with pytest.raises(AssertionError, match='unexpected uuid'):
             await svc.graphiti.rebuild_entity_from_edges(
                 'uuid-99', 'Unknown', [], group_id='test', old_summary='x'
             )
