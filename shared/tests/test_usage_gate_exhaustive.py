@@ -1000,10 +1000,11 @@ class TestHandleNearCapWarning:
         assert gate._accounts[1].capped is False
         assert any('near cap' in r.message.lower() for r in caplog.records)
 
-    def test_unknown_token_marks_first_uncapped(self):
+    def test_unknown_token_does_not_mark_near_cap(self):
+        """Explicit unknown token: _resolve_account returns None, no near_cap set."""
         gate = make_gate(['a', 'b'])
         gate._handle_near_cap_warning('reason', 'unknown-token')
-        assert gate._accounts[0].near_cap is True
+        assert gate._accounts[0].near_cap is False
 
     def test_none_token_marks_first_uncapped(self):
         gate = make_gate(['a', 'b'])
@@ -1019,12 +1020,13 @@ class TestHandleNearCapWarning:
         # _resolve_account returned None → no account state should be modified
         assert gate._accounts[0].near_cap is False
 
-    def test_first_capped_unknown_token_marks_second(self):
+    def test_unknown_token_with_first_capped_does_not_mark_any(self):
+        """Explicit unknown token does not mark near_cap on any account, even if first is capped."""
         gate = make_gate(['a', 'b'])
         gate._accounts[0].capped = True
         gate._handle_near_cap_warning('reason', 'unknown-token')
-        assert gate._accounts[1].near_cap is True
         assert gate._accounts[0].near_cap is False
+        assert gate._accounts[1].near_cap is False
 
     def test_fires_cost_event_with_cost_store(self):
         cost_store = make_mock_cost_store()
