@@ -296,6 +296,24 @@ class TestFilterTaskTree:
         # Subtask bare-int id=2 should be qualified as '450.2'
         assert '450.2' in active_ids
 
+    # --- Step: docstring dict-invariant contract (task-709) ---
+
+    def test_filtered_task_tree_docstring_documents_dict_invariant(self):
+        """FilteredTaskTree.__doc__ must exist and reference the dict-only invariant.
+
+        Guards against accidental docstring removal: downstream consumers of
+        FilteredTaskTree fields (e.g. _select_proactive_sample) omit per-element
+        isinstance checks and rely on this documented contract.
+        """
+        doc = FilteredTaskTree.__doc__
+        assert doc is not None, 'FilteredTaskTree must have a docstring'
+        assert 'dict' in doc, (
+            "FilteredTaskTree docstring must mention 'dict' to document the element-type invariant"
+        )
+        assert 'invariant' in doc, (
+            "FilteredTaskTree docstring must mention 'invariant' to document the invariant contract"
+        )
+
 
 class TestFormatFilteredTaskTree:
     """Tests for format_filtered_task_tree()."""
