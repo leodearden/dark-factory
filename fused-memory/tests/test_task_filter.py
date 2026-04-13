@@ -900,8 +900,11 @@ class TestFormatCancelledSection:
             f'Expected summary "3 done \u2014 omitted" in output, got:\n{output!r}'
         )
 
-        # (d) Old summary format must NOT appear when cancelled section is rendered
-        assert '3 done, 2 cancelled' not in output, (
-            f'Old summary format "3 done, 2 cancelled" must not appear when '
+        # (d) Old summary line format must NOT appear when cancelled section is rendered.
+        # Note: the header always contains '3 done, 2 cancelled' in the stats line; the
+        # assertion checks for the full old summary string (with em dash) which is the
+        # actual old format that must be replaced.
+        assert '3 done, 2 cancelled \u2014 omitted' not in output, (
+            f'Old summary line "3 done, 2 cancelled \u2014 omitted" must not appear when '
             f'cancelled section is rendered, got:\n{output!r}'
         )

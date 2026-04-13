@@ -63,6 +63,11 @@ class FilteredTaskTree:
 
     active_tasks: list[dict] = field(default_factory=list)
     done_tasks: list[dict] = field(default_factory=list)
+    # cancelled_tasks is consumed by two callers:
+    #   1. format_filtered_task_tree — renders '### Recently Cancelled Tasks' section
+    #      when non-empty, giving reconciliation agents visibility into recent cancellations.
+    #   2. _select_proactive_sample in task_knowledge_sync.py — concatenates
+    #      active_tasks + done_tasks + cancelled_tasks for proactive sampling.
     cancelled_tasks: list[dict] = field(default_factory=list)
     done_count: int = 0
     cancelled_count: int = 0
@@ -214,12 +219,26 @@ def format_filtered_task_tree(
     1. max_tasks — at most this many active tasks are rendered (default 50,
        matching the existing active_tasks[:50] cap in Stage 2).
     2. max_chars — secondary safety clamp; if the rendered string still exceeds
-       this after applying max_tasks, lines are trimmed and a truncation notice
-       is appended. (ref: task 455)
+       this after applying max_tasks, active task lines are trimmed and a
+       truncation notice is appended. (ref: task 455)
 
-    The summary line uses the exact format
-    '{done_count} done, {cancelled_count} cancelled — omitted' (em dash)
-    as specified in the task description.
+    The summary line format depends on whether cancelled tasks are present:
+    - When tree.cancelled_tasks is non-empty, a '### Recently Cancelled Tasks'
+      section is rendered between the active body and the summary, and the
+      summary becomes '{done_count} done — omitted' (cancelled no longer
+      omitted since they are displayed in the section).
+    - When tree.cancelled_tasks is empty, the section is omitted and the
+      summary retains the format '{done_count} done, {cancelled_count}
+      cancelled — omitted' for backward compatibility.
+
+    The cancelled section is never truncated by the max_chars clamp — only
+    active task lines are trimmed. The cancelled section length is subtracted
+    from the available budget so that active-task truncation accounts for it.
+
+    Note: cancelled_tasks serves two consumers:
+      1. This formatter — renders the '### Recently Cancelled Tasks' section.
+      2. _select_proactive_sample in task_knowledge_sync.py — concatenates
+         active_tasks + done_tasks + cancelled_tasks for proactive sampling.
 
     Args:
         tree: FilteredTaskTree to render.
@@ -242,9 +261,19 @@ def format_filtered_task_tree(
         f'{tree.other_count} other, {tree.total_count} total)\n'
     )
 
-    summary_line = (
-        f'{tree.done_count} done, {tree.cancelled_count} cancelled \u2014 omitted'
-    )
+    # Build optional cancelled section and choose summary line format conditionally.
+    # When cancelled_tasks is non-empty: render section + update summary (cancelled
+    # are shown, not omitted).  When empty: no section, summary unchanged (backward
+    # compatibility — six existing budget tests calibrate max_chars to the old format).
+    if tree.cancelled_tasks:
+        cancelled_lines = '\n'.join(_render_task_line(t) for t in tree.cancelled_tasks)
+        cancelled_section = f'\n### Recently Cancelled Tasks\n{cancelled_lines}\n'
+        summary_line = f'{tree.done_count} done \u2014 omitted'
+    else:
+        cancelled_section = ''
+        summary_line = (
+            f'{tree.done_count} done, {tree.cancelled_count} cancelled \u2014 omitted'
+        )
 
     if not active:
         body = 'No active tasks.\n'
@@ -252,16 +281,18 @@ def format_filtered_task_tree(
         lines = [_render_task_line(t) for t in active]
         body = '\n'.join(lines) + '\n'
 
-    result = header + body + summary_line
+    result = header + body + cancelled_section + summary_line
 
-    # Secondary max_chars clamp
+    # Secondary max_chars clamp — only active task lines are truncated.
+    # Subtract cancelled_section length from the budget so that active-task
+    # truncation correctly accounts for the space the cancelled section occupies.
     if len(result) > max_chars and active:
         task_lines = body.rstrip('\n').split('\n')
         # Use the full remaining budget — no fixed reserve.  The actual truncation
         # notice length is computed lazily after line accumulation and verified below.
-        budget = max_chars - len(header) - len(summary_line)
+        budget = max_chars - len(header) - len(cancelled_section) - len(summary_line)
         if budget <= 0:
-            return header + summary_line
+            return header + cancelled_section + summary_line
         kept_lines: list[str] = []
         used = 0
         for line in task_lines:
@@ -275,14 +306,14 @@ def format_filtered_task_tree(
         trimmed_count = len(active) - len(kept_lines)
         trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
         body = '\n'.join(kept_lines) + trunc_notice
-        result = header + body + summary_line
+        result = header + body + cancelled_section + summary_line
         while len(result) > max_chars and kept_lines:
             kept_lines.pop()
             trimmed_count = len(active) - len(kept_lines)
             trunc_notice = f'\n... and {trimmed_count} more active (truncated for budget)\n'
             body = '\n'.join(kept_lines) + trunc_notice
-            result = header + body + summary_line
+            result = header + body + cancelled_section + summary_line
         if len(result) > max_chars:
-            return header + summary_line
+            return header + cancelled_section + summary_line
 
     return result
