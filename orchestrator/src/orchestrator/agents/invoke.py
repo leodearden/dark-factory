@@ -529,8 +529,7 @@ async def _invoke_gemini(
         env = dict(os.environ)
 
         result = await _run_subprocess_local(cmd, cwd, env, 'gemini', model, max_budget_usd, timeout_seconds)
-        parsed = _parse_gemini_output(result, model)
-        return replace(parsed, timed_out=result.timed_out)
+        return _parse_gemini_output(result, model)
 
     finally:
         for f in temp_files:
@@ -540,7 +539,7 @@ async def _invoke_gemini(
 def _parse_gemini_output(result: _SubprocessResult, model: str) -> AgentResult:
     """Parse Gemini JSON output into AgentResult.
 
-    NOTE: does not set timed_out — callers must apply replace(parsed, timed_out=result.timed_out).
+    timed_out is propagated directly from result.timed_out on every return path.
     """
     if not result.stdout.strip():
         return AgentResult(
@@ -548,6 +547,7 @@ def _parse_gemini_output(result: _SubprocessResult, model: str) -> AgentResult:
             output='Agent produced no output',
             subtype='error_empty_output',
             stderr=result.stderr,
+            timed_out=result.timed_out,
         )
 
     try:
@@ -558,6 +558,7 @@ def _parse_gemini_output(result: _SubprocessResult, model: str) -> AgentResult:
             output=result.stdout,
             subtype='text_output',
             stderr=result.stderr,
+            timed_out=result.timed_out,
         )
 
     # Gemini output: {"response": "...", "stats": {"input_tokens": N, "output_tokens": N}}
@@ -579,6 +580,7 @@ def _parse_gemini_output(result: _SubprocessResult, model: str) -> AgentResult:
         structured_output=data.get('structured_output'),
         subtype='success' if result.returncode == 0 else 'error',
         stderr=result.stderr,
+        timed_out=result.timed_out,
     )
 
 
