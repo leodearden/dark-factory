@@ -96,6 +96,7 @@ async def empty_merge_events_conn(empty_merge_events_db):
 from dashboard.data.merge_queue import (  # noqa: E402
     _align_bucket,
     _bucket_minutes_for_window,
+    _get_durations,
     aggregate_latency_stats,
     aggregate_outcome_distribution,
     aggregate_queue_depth_timeseries,
@@ -503,6 +504,29 @@ class TestLatencyStats:
 
         assert result == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
 
+    @pytest.mark.asyncio
+    async def test_get_durations_returns_sorted(self, merge_events_db):
+        """_get_durations returns a sorted list even when inserted in non-sorted order.
+
+        Establishes the sorted-output invariant of _get_durations, which latency_stats
+        relies on to avoid a redundant sorted() call.
+        """
+        now = datetime.now(UTC)
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        for ms in [500, 100, 300, 200, 400]:
+            _insert_event(conn_sync, event_type='merge_attempt',
+                          timestamp=now - timedelta(minutes=10),
+                          data={'outcome': 'done'},
+                          duration_ms=ms)
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await _get_durations(db, hours=24)
+
+        assert result == sorted([500.0, 100.0, 300.0, 200.0, 400.0])
+
 
 # ---------------------------------------------------------------------------
 # TestRecentMerges
@@ -560,6 +584,94 @@ class TestRecentMerges:
             result = await recent_merges(db, limit=5)
 
         assert len(result) == 5
+
+    @pytest.mark.xfail(
+        reason=(
+            "Known limitation: SQLite uses lexicographic string comparison for "
+            "the 'timestamp >= ?' filter.  A timestamp stored with a large "
+            "positive offset (e.g. +14:00) can appear after the UTC cutoff "
+            "string even though its UTC-equivalent is before the cutoff.  "
+            "Correct fix: normalise timestamps to UTC on write."
+        ),
+        strict=False,
+    )
+    @pytest.mark.asyncio
+    async def test_recent_merges_sql_string_comparison_tz_limitation(self, merge_events_db):
+        """Non-UTC offsets can bypass the SQL hours-window filter (known limitation).
+
+        The ``AND timestamp >= ?`` clause in ``recent_merges`` compares stored
+        timestamp strings against ``_cutoff_iso()`` (a UTC string) using
+        SQLite's lexicographic ordering.  An event stored with offset ``+14:00``
+        has a local-time component that is 14 hours ahead, so its string
+        representation can sort *after* the cutoff string even though the
+        event's UTC-equivalent time is *before* the cutoff.
+
+        Example (all UTC):
+            now        = T
+            cutoff     = T - 1h  →  stored as  '...T(h-1):MM:SS+00:00'
+            event (UTC) = T - 3h  →  stored as  '...(next day)T01:MM:SS+14:00'
+            SQLite: next-day string > today string  →  INCLUDED  (wrong)
+            Correct:    T-3h < T-1h                →  EXCLUDED
+
+        This test asserts the *correct* behaviour (0 results) and is marked
+        ``xfail`` because the current implementation will include the event.
+        When the underlying limitation is fixed this test will pass.
+        """
+        now = datetime.now(UTC)
+        event_utc = now - timedelta(hours=3)  # 3 h before now → before 1-h cutoff
+        # Represent the same moment in +14:00 local time.
+        # (event_utc + 14h) gives the local clock reading; appending '+14:00'
+        # produces a valid ISO-8601 string whose UTC-equivalent == event_utc.
+        local_dt = event_utc + timedelta(hours=14)
+        ts_non_utc = local_dt.strftime('%Y-%m-%dT%H:%M:%S') + '+14:00'
+
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        _insert_event(conn_sync, event_type='merge_attempt', timestamp=ts_non_utc,
+                      task_id='old-non-utc', run_id='run-tz',
+                      data={'outcome': 'done'})
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await recent_merges(db, limit=20, hours=1)
+
+        # The event is 3 h old in UTC — well outside the 1-h window.
+        # With correct UTC comparison it should not appear; with string
+        # comparison it is incorrectly included.
+        assert len(result) == 0, (
+            f"Event stored as '{ts_non_utc}' (= event_utc {event_utc.isoformat()}) "
+            "was included by the 1-hour filter despite being 3 h before the cutoff. "
+            "This is the known SQLite string-comparison limitation."
+        )
+
+    @pytest.mark.asyncio
+    async def test_hours_window_excludes_old_events(self, merge_events_db):
+        """recent_merges with hours=1 excludes events older than 1 hour."""
+        now = datetime.now(UTC)
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        # 3 events at now-30min (within the 1-hour window)
+        for i in range(3):
+            _insert_event(conn_sync, event_type='merge_attempt',
+                          timestamp=now - timedelta(minutes=30 + i),
+                          task_id=f'recent-{i}', run_id=f'run-r{i}',
+                          data={'outcome': 'done'})
+        # 2 events at now-3hours (outside the 1-hour window)
+        for i in range(2):
+            _insert_event(conn_sync, event_type='merge_attempt',
+                          timestamp=now - timedelta(hours=3 + i),
+                          task_id=f'old-{i}', run_id=f'run-o{i}',
+                          data={'outcome': 'done'})
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await recent_merges(db, limit=20, hours=1)
+
+        assert len(result) == 3
+        task_ids = [r['task_id'] for r in result]
+        assert all(tid.startswith('recent-') for tid in task_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -950,3 +1062,72 @@ class TestMultiDbAggregation:
 
         assert len(result['labels']) >= 3650
         assert len(result['labels']) <= 4000
+
+    @pytest.mark.asyncio
+    async def test_aggregate_recent_merges_hours_window(self, tmp_path):
+        """aggregate_recent_merges with hours=1 excludes events older than 1 hour."""
+        now = datetime.now(UTC)
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': now - timedelta(minutes=30), 'task_id': 'recent-a',
+             'data': {'outcome': 'done'}},
+            {'event_type': 'merge_attempt',
+             'timestamp': now - timedelta(hours=3), 'task_id': 'old-a',
+             'data': {'outcome': 'done'}},
+        ])
+        db2 = self._make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': now - timedelta(minutes=45), 'task_id': 'recent-b',
+             'data': {'outcome': 'done'}},
+            {'event_type': 'merge_attempt',
+             'timestamp': now - timedelta(hours=4), 'task_id': 'old-b',
+             'data': {'outcome': 'done'}},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_recent_merges([conn1, conn2], limit=20, hours=1)
+
+        assert len(result) == 2
+        task_ids = {r['task_id'] for r in result}
+        assert task_ids == {'recent-a', 'recent-b'}
+
+    @pytest.mark.asyncio
+    async def test_aggregate_recent_merges_mixed_tz_sort(self, tmp_path):
+        """Merges with different UTC offsets sort correctly by chronological order.
+
+        Lexicographic sort would compare '13:00+05:00' > '12:00+00:00' (wrong).
+        Chronological sort: 12:00 UTC > 08:00 UTC (13:00+05:00), so UTC noon
+        must appear first (newest).
+        """
+        # DB1: 2026-04-11T12:00:00+00:00  = 12:00 UTC (newer)
+        # DB2: 2026-04-11T13:00:00+05:00  = 08:00 UTC (older)
+        ts_utc_noon = '2026-04-11T12:00:00+00:00'
+        ts_tz_plus5 = '2026-04-11T13:00:00+05:00'
+
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt', 'timestamp': ts_utc_noon,
+             'task_id': 'utc-noon', 'data': {'outcome': 'done'}},
+        ])
+        db2 = self._make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt', 'timestamp': ts_tz_plus5,
+             'task_id': 'tz-plus5', 'data': {'outcome': 'done'}},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            # Use a large hours window so both events are included
+            result = await aggregate_recent_merges([conn1, conn2], limit=20, hours=87600)
+
+        assert len(result) == 2
+        # utc-noon (12:00 UTC) is newer than tz-plus5 (08:00 UTC), so must be first
+        assert result[0]['task_id'] == 'utc-noon'
+        assert result[1]['task_id'] == 'tz-plus5'
