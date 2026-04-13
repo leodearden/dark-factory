@@ -171,7 +171,8 @@ def _render_task_line(task: dict) -> str:
     tid = task.get('id', '?')
     title = task.get('title', '?')
     status = task.get('status', '?')
-    deps = task.get('dependencies') or []
+    deps = task.get('dependencies')
+    deps = list(deps) if isinstance(deps, list) else []
     deps_str = str(deps[:5]) + ('...' if len(deps) > 5 else '')
     return f'- [{tid}] ({status}) {title} deps={deps_str}'
 
@@ -188,9 +189,7 @@ def format_task_list(tasks: list[dict]) -> str:
     Returns:
         Formatted string suitable for injection into a reconciliation prompt.
     """
-    if not tasks:
-        return 'No tasks.'
-    return '\n'.join(_render_task_line(t) for t in tasks)
+    return '\n'.join(_render_task_line(t) for t in tasks if isinstance(t, dict)) or 'No tasks.'
 
 
 # --------------------------------------------------------------------------- #
