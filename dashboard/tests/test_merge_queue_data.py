@@ -1265,3 +1265,37 @@ class TestMultiDbAggregation:
         assert result['discard_count'] == 0
         assert result['total'] == 2
         assert result['hit_rate'] == pytest.approx(1.0, abs=1e-6)
+
+    # -----------------------------------------------------------------------
+    # Gap coverage (b): empty dbs=[] — asyncio.gather(*[]) returns []
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_empty_dbs_queue_depth(self):
+        """aggregate_queue_depth_timeseries with dbs=[] returns empty ChartData."""
+        result = await aggregate_queue_depth_timeseries([], hours=24)
+        assert result == {'labels': [], 'values': []}
+
+    @pytest.mark.asyncio
+    async def test_empty_dbs_outcome_distribution(self):
+        """aggregate_outcome_distribution with dbs=[] returns empty ChartData."""
+        result = await aggregate_outcome_distribution([], hours=24)
+        assert result == {'labels': [], 'values': []}
+
+    @pytest.mark.asyncio
+    async def test_empty_dbs_latency_stats(self):
+        """aggregate_latency_stats with dbs=[] returns all-zero stats dict."""
+        result = await aggregate_latency_stats([], hours=24)
+        assert result == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
+
+    @pytest.mark.asyncio
+    async def test_empty_dbs_recent_merges(self):
+        """aggregate_recent_merges with dbs=[] returns empty list."""
+        result = await aggregate_recent_merges([], limit=20)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_empty_dbs_speculative_stats(self):
+        """aggregate_speculative_stats with dbs=[] returns all-zero stats dict."""
+        result = await aggregate_speculative_stats([], hours=24)
+        assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
