@@ -2248,3 +2248,23 @@ class TestScrubResultFormatError:
         assert result.format_error() == '', (
             f'Expected empty string for SCRUBBED outcome, got {result.format_error()!r}'
         )
+
+    def test_failed_with_empty_string_error_returns_prefix(self):
+        """FAILED with error='' still emits prefix because error is not None.
+
+        Empty string is a valid (if unusual) error value — it is not None.
+        format_error() must use identity semantics (``is not None``) so that:
+        - format_error()             → '' (prefix '' + error '' = '')
+        - format_error(prefix='...')→ '...' (prefix emitted; error appended as '')
+
+        The truthiness check ``if self.error:`` silently swallows the prefix for
+        empty-string errors, which is the bug this test documents.
+        """
+        result = ScrubResult(outcome=ScrubOutcome.FAILED, error='')
+        assert result.format_error() == '', (
+            f'Expected empty string with default prefix, got {result.format_error()!r}'
+        )
+        assert result.format_error(prefix=' Error: ') == ' Error: ', (
+            f'Expected prefix to be emitted for non-None error, '
+            f'got {result.format_error(prefix=" Error: ")!r}'
+        )
