@@ -707,16 +707,32 @@ class TestLatencyStats:
 
     @pytest.mark.asyncio
     async def test_get_durations_returns_sorted(self, merge_events_db):
-        """_get_durations returns a sorted list even when inserted in non-sorted order.
+        """_get_durations returns a sorted list regardless of insertion order.
 
         Establishes the sorted-output invariant of _get_durations, which latency_stats
         relies on to avoid a redundant sorted() call.
+
+        The timestamps are staggered in *reverse* duration order so that if the
+        query were ``ORDER BY timestamp DESC`` (most-recent first) it would return
+        [500, 400, 300, 200, 100].  Because the expected result is [100, 200, 300,
+        400, 500], this proves that ``ORDER BY duration_ms`` is what actually
+        determines the output order — not the timestamp ordering.
         """
         now = datetime.now(UTC)
         conn_sync = sqlite3.connect(str(merge_events_db))
-        for ms in [500, 100, 300, 200, 400]:
+        # duration_ms → timestamp mapping: higher duration = more recent timestamp
+        # timestamp order (most-recent first): 500, 400, 300, 200, 100
+        # duration_ms order (ascending):       100, 200, 300, 400, 500
+        events = [
+            (500, now - timedelta(minutes=1)),
+            (100, now - timedelta(minutes=5)),
+            (300, now - timedelta(minutes=3)),
+            (200, now - timedelta(minutes=4)),
+            (400, now - timedelta(minutes=2)),
+        ]
+        for ms, ts in events:
             _insert_event(conn_sync, event_type='merge_attempt',
-                          timestamp=now - timedelta(minutes=10),
+                          timestamp=ts,
                           data={'outcome': 'done'},
                           duration_ms=ms)
         conn_sync.commit()
@@ -726,7 +742,7 @@ class TestLatencyStats:
             db.row_factory = aiosqlite.Row
             result = await _get_durations(db, hours=24)
 
-        assert result == sorted([500.0, 100.0, 300.0, 200.0, 400.0])
+        assert result == [100.0, 200.0, 300.0, 400.0, 500.0]
 
 
 # ---------------------------------------------------------------------------
