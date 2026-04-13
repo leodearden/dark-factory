@@ -1220,7 +1220,7 @@ class TestRunSubprocessTimedOut:
 
 
 class TestParseClaudeOutputPropagatesTimedOut:
-    """Parser propagates timed_out from _SubprocessResult (unforgeable by callers)."""
+    """Parser always sets timed_out — callers no longer need to patch it post-hoc."""
 
     def test_timed_out_true_input_yields_true_on_empty_stdout(self):
         """_parse_claude_output propagates timed_out=True — empty stdout."""
@@ -1251,9 +1251,31 @@ class TestParseClaudeOutputPropagatesTimedOut:
         agent = _parse_claude_output(sub)
         assert agent.timed_out is True
 
-    def test_timed_out_false_input_yields_false(self):
-        """_parse_claude_output returns timed_out=False when input is also False."""
+    def test_timed_out_false_input_yields_false_on_empty_stdout(self):
+        """_parse_claude_output returns timed_out=False when input is False — empty stdout."""
         sub = _SubprocessResult(stdout='', stderr='some error', returncode=1,
+                                duration_ms=100, timed_out=False)
+        agent = _parse_claude_output(sub)
+        assert agent.timed_out is False
+
+    def test_timed_out_false_input_yields_false_on_json_decode_error(self):
+        """_parse_claude_output returns timed_out=False when input is False — parse error."""
+        sub = _SubprocessResult(stdout='not valid json', stderr='', returncode=1,
+                                duration_ms=100, timed_out=False)
+        agent = _parse_claude_output(sub)
+        assert agent.timed_out is False
+
+    def test_timed_out_false_input_yields_false_on_normal_parse(self):
+        """_parse_claude_output returns timed_out=False when input is False — valid JSON."""
+        valid_json = json.dumps({
+            'result': 'ok',
+            'subtype': 'success',
+            'cost_usd': 0.01,
+            'duration_ms': 100,
+            'num_turns': 1,
+            'session_id': 'sess-test',
+        })
+        sub = _SubprocessResult(stdout=valid_json, stderr='', returncode=0,
                                 duration_ms=100, timed_out=False)
         agent = _parse_claude_output(sub)
         assert agent.timed_out is False

@@ -250,7 +250,7 @@ class TestRunSubprocessLocalTimedOut:
 
 
 class TestParseCodexOutputPropagatesTimedOut:
-    """Parser propagates timed_out from _SubprocessResult (unforgeable by callers)."""
+    """Parser always sets timed_out — callers no longer need to patch it post-hoc."""
 
     def test_timed_out_true_input_yields_true_on_empty_stdout(self):
         """_parse_codex_output propagates timed_out=True — empty stdout."""
@@ -279,16 +279,36 @@ class TestParseCodexOutputPropagatesTimedOut:
         agent = _parse_codex_output(sub, 'gpt-5.4')
         assert agent.timed_out is True
 
-    def test_timed_out_false_input_yields_false(self):
-        """_parse_codex_output returns timed_out=False when input is also False."""
+    def test_timed_out_false_input_yields_false_on_empty_stdout(self):
+        """_parse_codex_output returns timed_out=False when input is False — empty stdout."""
         sub = _SubprocessResult(stdout='', stderr='err', returncode=1,
+                                duration_ms=100, timed_out=False)
+        agent = _parse_codex_output(sub, 'gpt-5.4')
+        assert agent.timed_out is False
+
+    def test_timed_out_false_input_yields_false_on_json_decode_error(self):
+        """_parse_codex_output returns timed_out=False when input is False — parse error."""
+        sub = _SubprocessResult(stdout='not json at all', stderr='', returncode=1,
+                                duration_ms=100, timed_out=False)
+        agent = _parse_codex_output(sub, 'gpt-5.4')
+        assert agent.timed_out is False
+
+    def test_timed_out_false_input_yields_false_on_normal_parse(self):
+        """_parse_codex_output returns timed_out=False when input is False — valid JSONL."""
+        jsonl = json.dumps({'type': 'thread.started', 'thread_id': 'tid-1'}) + '\n'
+        jsonl += json.dumps({
+            'type': 'item.completed',
+            'item': {'type': 'agent_message', 'text': 'hello'},
+        }) + '\n'
+        jsonl += json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 5}}) + '\n'
+        sub = _SubprocessResult(stdout=jsonl, stderr='', returncode=0,
                                 duration_ms=100, timed_out=False)
         agent = _parse_codex_output(sub, 'gpt-5.4')
         assert agent.timed_out is False
 
 
 class TestParseGeminiOutputPropagatesTimedOut:
-    """Parser propagates timed_out from _SubprocessResult (unforgeable by callers)."""
+    """Parser always sets timed_out — callers no longer need to patch it post-hoc."""
 
     def test_timed_out_true_input_yields_true_on_empty_stdout(self):
         """_parse_gemini_output propagates timed_out=True — empty stdout."""
@@ -312,9 +332,24 @@ class TestParseGeminiOutputPropagatesTimedOut:
         agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
         assert agent.timed_out is True
 
-    def test_timed_out_false_input_yields_false(self):
-        """_parse_gemini_output returns timed_out=False when input is also False."""
+    def test_timed_out_false_input_yields_false_on_empty_stdout(self):
+        """_parse_gemini_output returns timed_out=False when input is False — empty stdout."""
         sub = _SubprocessResult(stdout='', stderr='err', returncode=1,
+                                duration_ms=100, timed_out=False)
+        agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
+        assert agent.timed_out is False
+
+    def test_timed_out_false_input_yields_false_on_json_decode_error(self):
+        """_parse_gemini_output returns timed_out=False when input is False — parse error."""
+        sub = _SubprocessResult(stdout='not json', stderr='', returncode=1,
+                                duration_ms=100, timed_out=False)
+        agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
+        assert agent.timed_out is False
+
+    def test_timed_out_false_input_yields_false_on_normal_parse(self):
+        """_parse_gemini_output returns timed_out=False when input is False — valid JSON."""
+        data = json.dumps({'response': 'hi', 'stats': {'input_tokens': 10, 'output_tokens': 5}})
+        sub = _SubprocessResult(stdout=data, stderr='', returncode=0,
                                 duration_ms=100, timed_out=False)
         agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
         assert agent.timed_out is False
