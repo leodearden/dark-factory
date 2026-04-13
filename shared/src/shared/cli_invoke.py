@@ -399,7 +399,6 @@ async def invoke_with_cap_retry(
 
         if usage_gate and not unattributed_cap:
             usage_gate.confirm_account_ok(oauth_token)
-        if usage_gate and not unattributed_cap:
             usage_gate.on_agent_complete(result.cost_usd)
         break
 

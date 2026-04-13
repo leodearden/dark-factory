@@ -1528,9 +1528,9 @@ class TestCancelledErrorReleaseProbeSlot:
 class TestCapRetryUnattributedCapHit:
     """Heuristic cap fires but _handle_cap_detected returns False (token unresolvable).
 
-    In this scenario, skip_confirm (renamed unattributed_cap in step-7) is set
-    True. on_agent_complete must NOT be called and cost_store.save_invocation
-    must record capped=True.
+    In this scenario, unattributed_cap is set True (skip_confirm was renamed to
+    unattributed_cap to better reflect its broader semantics). on_agent_complete
+    must NOT be called and cost_store.save_invocation must record capped=True.
     """
 
     def _make_heuristic_result(self) -> AgentResult:
@@ -1565,6 +1565,7 @@ class TestCapRetryUnattributedCapHit:
             await invoke_with_cap_retry(gate, 'unattributed-task', prompt='hi')
 
         gate.on_agent_complete.assert_not_called()
+        gate.confirm_account_ok.assert_not_called()
 
     async def test_on_agent_complete_called_after_retry_succeeds(self):
         """on_agent_complete IS called once after a heuristic cap-hit retry succeeds.
