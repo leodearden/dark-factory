@@ -1374,3 +1374,56 @@ class TestCapRetryGuardLogging:
         assert any('deadline-label' in m for m in error_msgs), (
             f'Error log should include label. Got: {error_msgs}'
         )
+
+
+# ===================================================================
+# TestReleaseProbeSlotOnException
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestReleaseProbeSlotOnException:
+    """invoke_with_cap_retry calls release_probe_slot() when invoke raises."""
+
+    async def test_release_probe_slot_called_on_runtime_error(self):
+        """release_probe_slot is called with oauth_token when invoke_claude_agent raises."""
+        gate = _mock_gate(
+            before_invoke=AsyncMock(return_value='tok-a'),
+            release_probe_slot=MagicMock(),
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=RuntimeError('boom')),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(RuntimeError, match='boom'),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')
+
+    async def test_runtime_error_propagates(self):
+        """RuntimeError raised by invoke_claude_agent propagates to the caller."""
+        gate = _mock_gate(
+            before_invoke=AsyncMock(return_value='tok-a'),
+            release_probe_slot=MagicMock(),
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=RuntimeError('subprocess failed')),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(RuntimeError, match='subprocess failed'),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+    async def test_confirm_account_ok_not_called_when_invoke_raises(self):
+        """confirm_account_ok is NOT called when invoke_claude_agent raises."""
+        gate = _mock_gate(
+            before_invoke=AsyncMock(return_value='tok-a'),
+            release_probe_slot=MagicMock(),
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=RuntimeError('boom')),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(RuntimeError),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        gate.confirm_account_ok.assert_not_called()
