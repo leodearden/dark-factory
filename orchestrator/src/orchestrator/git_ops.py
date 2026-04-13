@@ -123,7 +123,7 @@ async def scrub_task_dir_from_tree(
     rc, _, err = await _run(['git', 'rm', '-r', '--cached', '--', '.task/'], cwd=cwd)
     if rc != 0:
         logger.error('.task/ scrub failed during %s: git rm --cached failed: %s', context, err)
-        return ScrubResult(outcome=ScrubOutcome.FAILED, error=err.strip())
+        return ScrubResult(outcome=ScrubOutcome.FAILED, error=err.strip() or None)
 
     # Also remove from filesystem if present (cleanup inherited contamination)
     task_dir = cwd / '.task'
@@ -150,7 +150,7 @@ async def scrub_task_dir_from_tree(
 
     if rc != 0:
         logger.error('.task/ scrub failed during %s: could not commit removal: %s', context, err)
-        return ScrubResult(outcome=ScrubOutcome.FAILED, error=err.strip())
+        return ScrubResult(outcome=ScrubOutcome.FAILED, error=err.strip() or None)
 
     logger.info('.task/ scrub completed during %s — %d file(s) removed from tree', context, len(files))
     return ScrubResult(outcome=ScrubOutcome.SCRUBBED)
@@ -352,8 +352,9 @@ class GitOps:
             logger.error(
                 '.task/ scrub FAILED during worktree-creation for %s — the index '
                 'may still be contaminated.  The hard gate at advance_main will '
-                'catch this if contamination reaches main.',
+                'catch this if contamination reaches main. Error: %s',
                 worktree_path,
+                scrub_result.error or '(no stderr)',
             )
 
         return WorktreeInfo(path=worktree_path, base_commit=base_sha)
@@ -813,8 +814,8 @@ class GitOps:
             if scrub_result.outcome == ScrubOutcome.FAILED:
                 logger.error(
                     '.task/ scrub FAILED during advance_main-retry(%d) — index may '
-                    'be contaminated; _assert_no_task_dir will catch it.',
-                    attempt + 1,
+                    'be contaminated; _assert_no_task_dir will catch it. Error: %s',
+                    attempt + 1, scrub_result.error or '(no stderr)',
                 )
             _, new_sha, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=merge_worktree,

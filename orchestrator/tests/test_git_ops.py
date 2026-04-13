@@ -1440,16 +1440,16 @@ class TestScrubTaskDirFromTree:
         )
 
     async def test_scrub_failed_result_carries_error(
-        self, git_ops: GitOps,
+        self, tmp_path: Path,
     ):
         """When git rm fails, the returned ScrubResult must carry the git stderr.
 
         After the ScrubResult → dataclass conversion, the failure path sets
         outcome=ScrubOutcome.FAILED and error=<stderr>.strip().  This test drives
         that conversion by asserting .outcome and .error on the return value.
-        """
-        worktree_info = await git_ops.create_worktree('scrub-carries-err')
 
+        Uses tmp_path directly (no real worktree) since _run is fully mocked.
+        """
         async def mock_run(cmd, cwd=None):
             if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
                 return (0, '.task/tracked.txt', '')
@@ -1458,7 +1458,7 @@ class TestScrubTaskDirFromTree:
             pytest.fail(f'unexpected _run call: {cmd}')
 
         with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            result = await scrub_task_dir_from_tree(worktree_info.path, 'carries-err')
+            result = await scrub_task_dir_from_tree(tmp_path, 'carries-err')
 
         assert result.outcome == ScrubOutcome.FAILED, (
             f'Expected outcome=FAILED on git rm failure, got {result!r}'
@@ -1469,11 +1469,12 @@ class TestScrubTaskDirFromTree:
         )
 
     async def test_scrub_scrubbed_result_has_no_error(
-        self, git_ops: GitOps,
+        self, tmp_path: Path,
     ):
-        """When scrub succeeds, ScrubResult must have outcome=SCRUBBED and error=None."""
-        worktree_info = await git_ops.create_worktree('scrub-no-err-ok')
+        """When scrub succeeds, ScrubResult must have outcome=SCRUBBED and error=None.
 
+        Uses tmp_path directly (no real worktree) since _run is fully mocked.
+        """
         async def mock_run(cmd, cwd=None):
             if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
                 return (0, '.task/tracked.txt', '')
@@ -1484,7 +1485,7 @@ class TestScrubTaskDirFromTree:
             pytest.fail(f'unexpected _run call: {cmd}')
 
         with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            result = await scrub_task_dir_from_tree(worktree_info.path, 'no-err-ok')
+            result = await scrub_task_dir_from_tree(tmp_path, 'no-err-ok')
 
         assert result.outcome == ScrubOutcome.SCRUBBED, (
             f'Expected outcome=SCRUBBED on success, got {result!r}'
@@ -1492,18 +1493,19 @@ class TestScrubTaskDirFromTree:
         assert result.error is None, f'Expected error=None on success, got {result.error!r}'
 
     async def test_scrub_clean_result_has_no_error(
-        self, git_ops: GitOps,
+        self, tmp_path: Path,
     ):
-        """When no .task/ files are present, ScrubResult must have outcome=CLEAN and error=None."""
-        worktree_info = await git_ops.create_worktree('scrub-clean-no-err')
+        """When no .task/ files are present, ScrubResult must have outcome=CLEAN and error=None.
 
+        Uses tmp_path directly (no real worktree) since _run is fully mocked.
+        """
         async def mock_run(cmd, cwd=None):
             if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
                 return (0, '', '')  # empty — no .task/ tracked
             pytest.fail(f'unexpected _run call on clean path: {cmd}')
 
         with patch('orchestrator.git_ops._run', side_effect=mock_run):
-            result = await scrub_task_dir_from_tree(worktree_info.path, 'clean-no-err')
+            result = await scrub_task_dir_from_tree(tmp_path, 'clean-no-err')
 
         assert result.outcome == ScrubOutcome.CLEAN, (
             f'Expected outcome=CLEAN on empty tree, got {result!r}'
@@ -1677,28 +1679,29 @@ class TestMergeToMainScrubFailure:
         # Call merge_to_main with NO mock — uses real scrub_task_dir_from_tree.
         result = await git_ops.merge_to_main(worktree_info.path, 'scrub-real-branch')
 
-        # (a) Merge must succeed.
-        assert result.success is True, (
-            f'Expected success=True when real scrub cleans .task/, got {result.success!r}'
-        )
+        try:
+            # (a) Merge must succeed.
+            assert result.success is True, (
+                f'Expected success=True when real scrub cleans .task/, got {result.success!r}'
+            )
 
-        # (b) A merge commit must have been created.
-        assert result.merge_commit is not None, (
-            'Expected a valid merge_commit SHA when scrub succeeds'
-        )
+            # (b) A merge commit must have been created.
+            assert result.merge_commit is not None, (
+                'Expected a valid merge_commit SHA when scrub succeeds'
+            )
 
-        # (c) Verify .task/ is absent from the merge commit tree.
-        _, task_in_tree, _ = await _run(
-            ['git', 'ls-tree', '-r', '--name-only', result.merge_commit.strip(), '--', '.task/'],
-            cwd=git_ops.project_root,
-        )
-        assert not task_in_tree.strip(), (
-            f'.task/ must be absent from merge commit tree, but found: {task_in_tree!r}'
-        )
-
-        # Clean up the merge worktree.
-        if result.merge_worktree is not None:
-            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+            # (c) Verify .task/ is absent from the merge commit tree.
+            _, task_in_tree, _ = await _run(
+                ['git', 'ls-tree', '-r', '--name-only', result.merge_commit.strip(), '--', '.task/'],
+                cwd=git_ops.project_root,
+            )
+            assert not task_in_tree.strip(), (
+                f'.task/ must be absent from merge commit tree, but found: {task_in_tree!r}'
+            )
+        finally:
+            # Ensure merge worktree is cleaned up even when assertions fail.
+            if result.merge_worktree is not None:
+                await git_ops.cleanup_merge_worktree(result.merge_worktree)
 
     async def test_merge_to_main_scrub_failure_details_include_root_cause(
         self, git_ops: GitOps,
