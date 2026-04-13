@@ -1699,3 +1699,39 @@ class TestMergeToMainScrubFailure:
         # Clean up the merge worktree.
         if result.merge_worktree is not None:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+    async def test_merge_to_main_scrub_failure_details_include_root_cause(
+        self, git_ops: GitOps,
+    ):
+        """merge_to_main must surface ScrubResult.error in MergeResult.details.
+
+        When scrub_task_dir_from_tree returns a ScrubResult with error set,
+        the failure reason (raw git stderr) must appear in MergeResult.details
+        so MergeQueue propagates it to MergeOutcome.reason without log scraping.
+
+        This test is the failing test for step-5.  It will pass once step-6
+        wires scrub_result.error into the details f-string.
+        """
+        worktree_info = await git_ops.create_worktree('scrub-root-cause-branch')
+        (worktree_info.path / 'rc_test.py').write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, 'Add rc_test file')
+
+        root_cause = 'fatal: cannot amend merge commit'
+
+        async def fake_scrub_with_error(*args, **kwargs):
+            return ScrubResult(outcome=ScrubOutcome.FAILED, error=root_cause)
+
+        with patch(
+            'orchestrator.git_ops.scrub_task_dir_from_tree',
+            new=fake_scrub_with_error,
+        ):
+            result = await git_ops.merge_to_main(
+                worktree_info.path, 'scrub-root-cause-branch',
+            )
+
+        assert result.success is False, (
+            f'Expected success=False on scrub failure, got {result.success!r}'
+        )
+        assert 'cannot amend merge commit' in result.details, (
+            f'Expected git stderr in details for operator visibility, got: {result.details!r}'
+        )
