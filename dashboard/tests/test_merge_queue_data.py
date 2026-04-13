@@ -220,6 +220,17 @@ class TestTsSortKey:
         expected_utc = datetime(2026, 4, 1, 4, 30, 0, tzinfo=UTC)
         assert result == expected_utc
 
+    def test_utc_timestamp_unchanged(self):
+        """A UTC-offset timestamp is returned unchanged (same value, UTC offset).
+
+        .astimezone(UTC) must be a no-op for timestamps that are already UTC
+        so that well-formed data passes through without any transformation.
+        """
+        entry = {'timestamp': '2026-04-01T10:00:00+00:00'}
+        result = _ts_sort_key(entry)
+        assert result.utcoffset() == timedelta(0)
+        assert result == datetime(2026, 4, 1, 10, 0, 0, tzinfo=UTC)
+
 
 # ---------------------------------------------------------------------------
 # TestQueueDepthTimeseries
