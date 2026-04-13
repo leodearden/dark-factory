@@ -1777,3 +1777,36 @@ class TestRebuildEntitySummariesTypeGuard:
         assert 'Alice' in msg
         # Gather still runs both tasks; TypeError is raised in the result loop.
         assert backend._rebuild_entity_from_edges.await_count == 2
+
+
+# ---------------------------------------------------------------------------
+# TestBackendPublicAPI — step-1: promoted method names
+# ---------------------------------------------------------------------------
+
+class TestBackendPublicAPI:
+    """GraphitiBackend exposes detect_stale_with_edges, detect_stale_dry_run,
+    and rebuild_entity_from_edges as public (non-underscore) methods."""
+
+    def test_detect_stale_with_edges_is_public(self, mock_config, make_backend):
+        """GraphitiBackend has a callable detect_stale_with_edges method."""
+        backend = make_backend(mock_config)
+        assert hasattr(backend, 'detect_stale_with_edges'), (
+            'detect_stale_with_edges should be a public method on GraphitiBackend'
+        )
+        assert callable(backend.detect_stale_with_edges)
+
+    def test_detect_stale_dry_run_is_public(self, mock_config, make_backend):
+        """GraphitiBackend has a callable detect_stale_dry_run method."""
+        backend = make_backend(mock_config)
+        assert hasattr(backend, 'detect_stale_dry_run'), (
+            'detect_stale_dry_run should be a public method on GraphitiBackend'
+        )
+        assert callable(backend.detect_stale_dry_run)
+
+    def test_rebuild_entity_from_edges_is_public(self, mock_config, make_backend):
+        """GraphitiBackend has a callable rebuild_entity_from_edges method."""
+        backend = make_backend(mock_config)
+        assert hasattr(backend, 'rebuild_entity_from_edges'), (
+            'rebuild_entity_from_edges should be a public method on GraphitiBackend'
+        )
+        assert callable(backend.rebuild_entity_from_edges)
