@@ -950,21 +950,35 @@ class TestCollectSnapshot:
             assert 'resolve_root_c' not in combined
             assert warning_records[0].exc_info is not None
 
+    @pytest.mark.parametrize(
+        'orchestrator_dict,patch_target,canonical_root',
+        [
+            pytest.param(
+                {'prd': None, 'config_path': '/home/leo/src/contract-sentinel/orchestrator.yaml'},
+                'dashboard.data.burndown._read_project_root_from_config',
+                Path('/home/leo/src/contract-sentinel'),
+                id='config_path_branch',
+            ),
+            pytest.param(
+                {'prd': '/home/leo/src/contract-sentinel-prd/prd.md', 'config_path': None},
+                'dashboard.data.burndown._resolve_project_root',
+                Path('/home/leo/src/contract-sentinel-prd'),
+                id='prd_branch',
+            ),
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_orchestrator_project_id_matches_config_helper_return(self, burndown_env):
-        """project_id stored for config_path orchestrators matches str(helper_return) exactly.
+    async def test_orchestrator_project_id_matches_helper_return(
+        self, burndown_env, orchestrator_dict, patch_target, canonical_root
+    ):
+        """project_id stored for orchestrators matches str(helper_return) exactly.
 
-        Contract: _read_project_root_from_config already returns a canonical (resolved)
-        path, so root_str must equal str(helper_return) without any additional .resolve().
-        This test passes before and after the redundant .resolve() is removed because
-        .resolve() is idempotent on already-resolved paths.
+        Contract: both _resolve_project_root and _read_project_root_from_config already
+        return canonical (resolved) paths, so root_str must equal str(helper_return)
+        without any additional .resolve(). Parametrized across both code branches
+        (config_path and prd) to cover the full invariant.
         """
         _, config, conn = burndown_env
-
-        canonical_root = Path('/home/leo/src/contract-sentinel')
-        fake_orchestrators = [
-            {'prd': None, 'config_path': '/home/leo/src/contract-sentinel/orchestrator.yaml'},
-        ]
 
         _tasks_map = {
             config.tasks_json: [],
@@ -973,8 +987,8 @@ class TestCollectSnapshot:
 
         with (
             patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
-            patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
-            patch('dashboard.data.burndown._read_project_root_from_config', return_value=canonical_root),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[orchestrator_dict]),
+            patch(patch_target, return_value=canonical_root),
         ):
             await collect_snapshot(conn, config)
 
@@ -989,42 +1003,34 @@ class TestCollectSnapshot:
         assert row[0] == str(canonical_root)
 
     @pytest.mark.asyncio
-    async def test_orchestrator_project_id_matches_resolve_helper_return(self, burndown_env):
-        """project_id stored for prd orchestrators matches str(helper_return) exactly.
+    async def test_orchestrator_skipped_when_config_helper_returns_none(self, burndown_env):
+        """Orchestrators are silently skipped when _read_project_root_from_config returns None.
 
-        Contract: _resolve_project_root already returns a canonical (resolved) path,
-        so root_str must equal str(helper_return) without any additional .resolve().
-        This test passes before and after the redundant .resolve() is removed because
-        .resolve() is idempotent on already-resolved paths.
+        Documents the guard at burndown.py lines 129-130: when the helper cannot
+        determine the project root (e.g. a relative path in the YAML config that cannot
+        be made absolute), the orchestrator entry is skipped via 'continue' and no
+        snapshot row is created for it.
         """
         _, config, conn = burndown_env
 
-        canonical_root = Path('/home/leo/src/contract-sentinel-prd')
         fake_orchestrators = [
-            {'prd': '/home/leo/src/contract-sentinel-prd/prd.md', 'config_path': None},
+            {'prd': None, 'config_path': '/some/orchestrator.yaml'},
         ]
 
-        _tasks_map = {
-            config.tasks_json: [],
-            canonical_root / '.taskmaster' / 'tasks' / 'tasks.json': [],
-        }
-
         with (
-            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load({config.tasks_json: []})),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
-            patch('dashboard.data.burndown._resolve_project_root', return_value=canonical_root),
+            patch('dashboard.data.burndown._read_project_root_from_config', return_value=None),
         ):
             await collect_snapshot(conn, config)
 
-        async with conn.execute(
-            'SELECT project_id FROM snapshots WHERE project_id = ?', (str(canonical_root),)
-        ) as cur:
-            row = await cur.fetchone()
+        # Only the main project's snapshot row should exist; the orchestrator was skipped.
+        async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
+            count_row = await cur.fetchone()
 
-        # The stored project_id must equal str(canonical_root) directly — the helper's
-        # return value is used as-is, with no additional .resolve() needed.
-        assert row is not None, f'No snapshot row found for project_id={str(canonical_root)!r}'
-        assert row[0] == str(canonical_root)
+        assert count_row[0] == 1, (
+            f'Expected exactly 1 snapshot row (main project only), got {count_row[0]}'
+        )
 
 # ---------------------------------------------------------------------------
 # downsample
