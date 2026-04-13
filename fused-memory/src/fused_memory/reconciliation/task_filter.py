@@ -13,6 +13,7 @@ intent without regressions. (ref: task 455)
 
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass, field
 
 # --------------------------------------------------------------------------- #
@@ -135,14 +136,19 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
 
     active.sort(key=sort_key)
 
-    # Sort done/cancelled by id descending (recency proxy — higher id = more recently created)
-    done.sort(key=_id_key, reverse=True)
+    # Select top-MAX_DONE_TASKS_RETAINED done tasks by id descending (recency proxy).
+    # heapq.nlargest is O(n) heap selection vs O(n log n) sort+slice — significant
+    # when done task counts grow into the hundreds.  Returns results in descending
+    # order, matching the previous sort+slice behavior.
+    done_retained = heapq.nlargest(MAX_DONE_TASKS_RETAINED, done, key=_id_key)
+
+    # Sort cancelled by id descending (display order for the formatter section).
     cancelled.sort(key=_id_key, reverse=True)
 
     total = len(active) + done_count + cancelled_count + other_count
     return FilteredTaskTree(
         active_tasks=active,
-        done_tasks=done[:MAX_DONE_TASKS_RETAINED],
+        done_tasks=done_retained,
         cancelled_tasks=cancelled,
         done_count=done_count,
         cancelled_count=cancelled_count,
