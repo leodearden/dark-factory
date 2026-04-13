@@ -673,8 +673,9 @@ class TestContextAssemblerCancellation:
         ``[item for item in ctx_result ...]``, causing
         ``TypeError: 'KeyboardInterrupt' object is not iterable``.
 
-        This test FAILS with the current code (assemble() returns normally, no TypeError)
-        and PASSES after the guard is narrowed to Exception.
+        This test would FAIL with the old ``isinstance(ctx_result, BaseException)`` guard
+        (assemble() would return normally) and PASSES with the narrowed
+        ``isinstance(ctx_result, Exception)`` guard.
 
         Sister test: test_exception_only_batch_does_not_propagate — verifies that real
         Exception subclasses ARE caught by Pass 2 and degraded gracefully.
@@ -693,7 +694,7 @@ class TestContextAssemblerCancellation:
             return [KeyboardInterrupt()]
 
         with (
-            patch('asyncio.gather', new=_mock_gather),
+            patch('fused_memory.reconciliation.context_assembler.asyncio.gather', new=_mock_gather),
             patch(
                 'fused_memory.reconciliation.context_assembler.propagate_cancellations',
                 new=lambda results: None,
