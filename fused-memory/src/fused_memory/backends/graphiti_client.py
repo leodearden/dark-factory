@@ -972,10 +972,10 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
-    async def _detect_stale_summaries_with_edges(
+    async def detect_stale_with_edges(
         self, *, group_id: str
     ) -> StaleSummaryResult:
-        """Internal: detect stale summaries and return a StaleSummaryResult.
+        """Detect stale summaries and return a StaleSummaryResult.
 
         Shared by detect_stale_summaries (public API) and rebuild_entity_summaries
         to avoid a duplicate bulk edge fetch when both are needed.
@@ -999,22 +999,22 @@ class GraphitiBackend:
                 stale.append(entry)
         return StaleSummaryResult(stale=stale, all_edges=all_edges, total_count=len(entities))
 
-    async def _detect_stale_summaries_dry_run(
+    async def detect_stale_dry_run(
         self, *, group_id: str
     ) -> tuple[list[dict], int]:
-        """Internal: detect stale summaries using per-entity edge fetching (dry_run variant).
+        """Detect stale summaries using per-entity edge fetching (dry_run variant).
 
-        Memory-cheaper alternative to ``_detect_stale_summaries_with_edges`` for use
+        Memory-cheaper alternative to ``detect_stale_with_edges`` for use
         in the ``force=False, dry_run=True`` code path.  Unlike the bulk variant, this
         method never materialises the O(E) all-edges dict because:
 
-        - The dry_run path short-circuits before ``_rebuild_entity_from_edges``, so
+        - The dry_run path short-circuits before ``rebuild_entity_from_edges``, so
           the edges dict is only needed for staleness comparison, not for writing.
         - Fetching edges per-entity (only for non-empty-summary entities) avoids
           holding the full graph's edge data in Python memory when none of it will
           be used to write.
 
-        Trade-off vs ``_detect_stale_summaries_with_edges``:
+        Trade-off vs ``detect_stale_with_edges``:
         - Issues up-to-N targeted ``get_valid_edges_for_node`` queries rather than a
           single bulk ``get_all_valid_edges`` query.
         - Entities with empty summaries are skipped without any edge query (matching
@@ -1026,7 +1026,7 @@ class GraphitiBackend:
 
         Returns:
             Tuple of (stale_list, total_count) where stale_list contains the same
-            per-entity dict schema as ``_detect_stale_summaries_with_edges``
+            per-entity dict schema as ``detect_stale_with_edges``
             (uuid, name, summary, duplicate_count, stale_line_count, valid_fact_count,
             summary_line_count) and total_count is len(all entities).
         """
@@ -1071,10 +1071,10 @@ class GraphitiBackend:
             (pre-rebuild) entity summary text so callers can diff it against
             the canonical fact set without a second DB query.
         """
-        result = await self._detect_stale_summaries_with_edges(group_id=group_id)
+        result = await self.detect_stale_with_edges(group_id=group_id)
         return result.stale
 
-    async def _rebuild_entity_from_edges(
+    async def rebuild_entity_from_edges(
         self, uuid: str, name: str, edges: list[EdgeDict], *, group_id: str,
         old_summary: str,
     ) -> dict[str, Any]:
@@ -1114,7 +1114,7 @@ class GraphitiBackend:
         new_summary = '\n'.join(facts)
         await self.update_node_summary(uuid, new_summary, group_id=group_id)
         logger.info(
-            '_rebuild_entity_from_edges: node=%s name=%r edges=%d new_len=%d',
+            'rebuild_entity_from_edges: node=%s name=%r edges=%d new_len=%d',
             uuid, name, len(edges), len(new_summary),
         )
         return {
@@ -1124,6 +1124,12 @@ class GraphitiBackend:
             'new_summary': new_summary,
             'edge_count': len(edges),
         }
+
+    # Backward-compat aliases for tests that still reference private names.
+    # Removed in step-12 once all callers are migrated.
+    _detect_stale_summaries_with_edges = detect_stale_with_edges
+    _detect_stale_summaries_dry_run = detect_stale_dry_run
+    _rebuild_entity_from_edges = rebuild_entity_from_edges
 
     async def rebuild_entity_summaries(
         self,
