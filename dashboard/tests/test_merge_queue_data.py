@@ -402,6 +402,88 @@ class TestQueueDepthTimeseries:
             f"got {result['values'][idx]}"
         )
 
+    @pytest.mark.asyncio
+    async def test_last_bucket_includes_events_after_now_aligned(self, merge_events_db):
+        """Events in (now_aligned, effective_now] must be counted in the last bucket.
+
+        With now=2026-04-11T12:07:30 UTC and hours=24:
+          effective_now = 2026-04-11T12:07:30+00:00
+          now_aligned   = 2026-04-11T12:00:00+00:00  (floor to 15-min boundary)
+
+        An event at now_aligned + 1 minute (12:01:00) is after the last bucket
+        boundary but before effective_now (12:07:30).  The SQL WHERE clause uses
+        effective_now (not now_aligned) as the upper bound so this event is
+        fetched and then floored into the last bucket (now_aligned).
+        """
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        bucket_min = _bucket_minutes_for_window(24)  # 15 for a 24h window
+        now_aligned = _align_bucket(now, bucket_min)
+
+        # Event is 1 minute after now_aligned and before effective_now
+        event_ts = now_aligned + timedelta(minutes=1)
+        assert event_ts > now_aligned, "Pre-condition: event must be after now_aligned"
+        assert event_ts < now, "Pre-condition: event must be before effective_now"
+
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        _insert_event(conn_sync, event_type='merge_attempt', timestamp=event_ts,
+                      data={'outcome': 'done'})
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await queue_depth_timeseries(db, hours=24, now=now)
+
+        last_label = now_aligned.isoformat()
+        assert last_label in result['labels'], (
+            f"Expected last bucket label {last_label!r} in labels"
+        )
+        idx = result['labels'].index(last_label)
+        assert result['values'][idx] == 1, (
+            f"Last bucket should have count=1 for the event at {event_ts.isoformat()}, "
+            f"got {result['values'][idx]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_last_bucket_includes_event_at_exact_effective_now(self, merge_events_db):
+        """An event timestamped exactly at effective_now must be counted (SQL uses <=).
+
+        With now=2026-04-11T12:07:30 UTC and hours=24:
+          effective_now = 2026-04-11T12:07:30+00:00  (== now)
+          now_aligned   = 2026-04-11T12:00:00+00:00  (floor to 15-min boundary)
+
+        An event at exactly effective_now sits on the inclusive upper boundary of
+        the SQL ``timestamp <= ?`` clause.  It must be fetched and floored into
+        the last bucket (now_aligned).
+        """
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        bucket_min = _bucket_minutes_for_window(24)  # 15 for a 24h window
+        now_aligned = _align_bucket(now, bucket_min)
+
+        # Event is exactly at effective_now — tests the inclusive upper bound
+        event_ts = now  # effective_now == now when now is passed explicitly
+        assert event_ts > now_aligned, "Pre-condition: event must be after now_aligned"
+
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        _insert_event(conn_sync, event_type='merge_attempt', timestamp=event_ts,
+                      data={'outcome': 'done'})
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await queue_depth_timeseries(db, hours=24, now=now)
+
+        last_label = now_aligned.isoformat()
+        assert last_label in result['labels'], (
+            f"Expected last bucket label {last_label!r} in labels"
+        )
+        idx = result['labels'].index(last_label)
+        assert result['values'][idx] == 1, (
+            f"Last bucket should have count=1 for the event at exact effective_now "
+            f"({event_ts.isoformat()}), got {result['values'][idx]}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestOutcomeDistribution
