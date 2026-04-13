@@ -347,11 +347,17 @@ class GitOps:
             return self.config.main_branch, 0
 
         # Check for divergence: count commits local main is AHEAD of origin/main
-        _, ahead_out, _ = await _run(
+        rc, ahead_out, _ = await _run(
             ['git', 'rev-list', '--count',
              f'{remote_ref}..{self.config.main_branch}'],
             cwd=self.project_root,
         )
+        if rc != 0:
+            logger.warning(
+                '_freshen_main: rev-list (ahead) failed (rc=%d) — using local %s',
+                rc, self.config.main_branch,
+            )
+            return self.config.main_branch, behind
         try:
             ahead = int(ahead_out.strip())
         except ValueError:
