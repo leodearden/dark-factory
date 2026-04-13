@@ -59,6 +59,20 @@ def _make_rebuild_spy(backend) -> tuple[list[dict], Callable]:
     return captured_calls, original_rebuild
 
 
+def _uuid_dispatch(mapping: dict) -> Callable:
+    """Return a uuid-dispatched async callable for rebuild_entity_from_edges mocks.
+
+    Calls with uuids in ``mapping`` return the mapped value; any other uuid raises
+    AssertionError immediately so unexpected invocations surface during the test
+    rather than silently succeeding.
+    """
+    async def _side_effect(uuid, name, edges, *, group_id, old_summary):
+        if uuid in mapping:
+            return mapping[uuid]
+        raise AssertionError(f'unexpected uuid: {uuid!r}')
+    return _side_effect
+
+
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.list_entity_nodes
 # ---------------------------------------------------------------------------
@@ -771,45 +785,15 @@ class TestRebuildEntitySummaries:
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
         })
-        async def _rebuild_force(uuid, name, edges, *, group_id, old_summary):
-            if uuid == 'uuid-1':
-                return {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'ok', 'new_summary': 'fact1', 'edge_count': 1}
-            elif uuid == 'uuid-2':
-                return {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'also ok', 'new_summary': 'fact2', 'edge_count': 1}
-            else:
-                raise AssertionError(f'_rebuild_force called with unexpected uuid: {uuid!r}')
-
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_rebuild_force)
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_uuid_dispatch({
+            'uuid-1': {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'ok', 'new_summary': 'fact1', 'edge_count': 1},
+            'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'also ok', 'new_summary': 'fact2', 'edge_count': 1},
+        }))
         result = await svc.rebuild_entity_summaries(project_id='test', force=True)
         assert result['total_entities'] == 2
         assert result['stale_entities'] == 2
         assert result['rebuilt'] == 2
         assert svc.graphiti.rebuild_entity_from_edges.await_count == 2
-
-    @pytest.mark.asyncio
-    async def test_force_rebuild_mock_rejects_unexpected_uuid(self, mock_config):
-        """rebuild_entity_from_edges mock in test_force_rebuilds_all must reject unknown uuids.
-
-        RED phase: the current list-based side_effect pops Alice's dict as the first call
-        regardless of which uuid is passed, so calling with 'uuid-99' returns Alice's dict
-        instead of raising AssertionError. This test fails until the list is replaced with
-        a uuid-dispatched callable that includes a strict catch-all.
-        """
-        svc = _make_svc(mock_config)
-
-        async def _rebuild_force(uuid, name, edges, *, group_id, old_summary):
-            if uuid == 'uuid-1':
-                return {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'ok', 'new_summary': 'fact1', 'edge_count': 1}
-            elif uuid == 'uuid-2':
-                return {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'also ok', 'new_summary': 'fact2', 'edge_count': 1}
-            else:
-                raise AssertionError(f'_rebuild_force called with unexpected uuid: {uuid!r}')
-
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_rebuild_force)
-        with pytest.raises(AssertionError, match='unexpected uuid'):
-            await svc.graphiti.rebuild_entity_from_edges(
-                'uuid-99', 'Unknown', [], group_id='test', old_summary='x'
-            )
 
     @pytest.mark.asyncio
     async def test_returns_aggregate_result(self, mock_config):
@@ -856,26 +840,6 @@ class TestRebuildEntitySummaries:
         assert 'FalkorDB timeout' in error_detail['error']
         assert error_detail['uuid'] == 'uuid-1'
         svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(group_id='test')
-
-    @pytest.mark.asyncio
-    async def test_fail_uuid1_rejects_unexpected_uuid(self, mock_config):
-        """_fail_uuid1 must raise AssertionError for unknown uuids — not silently return Bob's dict.
-
-        RED phase: current _fail_uuid1 returns Bob's dict for ANY uuid != 'uuid-1',
-        so calling with 'uuid-99' returns a dict instead of raising AssertionError.
-        This test fails until _fail_uuid1 is hardened with an explicit elif/else guard.
-        """
-        # Mirrors the hardened _fail_uuid1 from test_partial_failure_continues
-        async def _fail_uuid1(uuid, name, edges, *, group_id, old_summary):
-            if uuid == 'uuid-1':
-                raise RuntimeError('FalkorDB timeout')
-            elif uuid == 'uuid-2':
-                return {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'stale2', 'new_summary': 'current2', 'edge_count': 1}
-            else:
-                raise AssertionError(f'_fail_uuid1 called with unexpected uuid: {uuid!r}')
-
-        with pytest.raises(AssertionError, match='unexpected uuid'):
-            await _fail_uuid1('uuid-99', 'Unknown', [], group_id='test', old_summary='x')
 
     @pytest.mark.asyncio
     async def test_empty_graph_returns_zero_counts(self, mock_config):
@@ -943,33 +907,14 @@ class TestMemoryServiceRebuildEntitySummaries:
                 total_count=5,
             )
         )
-        async def _rebuild_svc(uuid, name, edges, *, group_id, old_summary):
-            if uuid == 'u1':
-                return {'uuid': 'u1', 'name': 'Alice', 'old_summary': 'old A', 'new_summary': 'new A', 'edge_count': 1}
-            elif uuid == 'u2':
-                return {'uuid': 'u2', 'name': 'Bob', 'old_summary': 'old B', 'new_summary': 'new B', 'edge_count': 1}
-            else:
-                raise AssertionError(f'_rebuild_svc called with unexpected uuid: {uuid!r}')
-
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_rebuild_svc)
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_uuid_dispatch({
+            'u1': {'uuid': 'u1', 'name': 'Alice', 'old_summary': 'old A', 'new_summary': 'new A', 'edge_count': 1},
+            'u2': {'uuid': 'u2', 'name': 'Bob', 'old_summary': 'old B', 'new_summary': 'new B', 'edge_count': 1},
+        }))
         svc.mem0 = MagicMock()
         svc.durable_queue = MagicMock()
         svc.durable_queue.enqueue = AsyncMock(return_value=1)
         return svc
-
-    @pytest.mark.asyncio
-    async def test_service_fixture_rebuild_mock_rejects_unexpected_uuid(self, service):
-        """service fixture's rebuild_entity_from_edges mock must reject unknown uuids.
-
-        RED phase: the current list-based side_effect pops Alice's dict for the first
-        call regardless of which uuid is passed, so calling with 'u99' returns Alice's
-        dict instead of raising AssertionError. This test fails until the list is
-        replaced with a uuid-dispatched callable including a strict catch-all.
-        """
-        with pytest.raises(AssertionError):
-            await service.graphiti.rebuild_entity_from_edges(
-                'u99', 'Unknown', [], group_id='test', old_summary='x'
-            )
 
     @pytest.mark.asyncio
     async def test_delegates_to_backend(self, service):
