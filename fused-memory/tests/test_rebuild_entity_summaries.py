@@ -943,15 +943,10 @@ class TestRebuildEntitySummaries:
             )
         )
 
-        async def _fail_uuid1(uuid, name, edges, *, group_id, old_summary):
-            if uuid == 'uuid-1':
-                raise RuntimeError('FalkorDB timeout')
-            elif uuid == 'uuid-2':
-                return {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'stale2', 'new_summary': 'current2', 'edge_count': 1}
-            else:
-                raise AssertionError(f'_fail_uuid1 called with unexpected uuid: {uuid!r}')
-
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_fail_uuid1)
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_uuid_dispatch({
+            'uuid-1': RuntimeError('FalkorDB timeout'),
+            'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'stale2', 'new_summary': 'current2', 'edge_count': 1},
+        }))
         result = await svc.rebuild_entity_summaries(project_id='test')
         assert result['errors'] == 1
         assert result['rebuilt'] == 1
