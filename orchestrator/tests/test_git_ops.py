@@ -500,9 +500,9 @@ class TestFreshenMain:
                 return (0, '3', '')                     # behind rev-list: 3 commits behind
             return (128, '', 'fatal: bad revision')     # ahead rev-list fails
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
-            with patch('orchestrator.git_ops._run', side_effect=fake_run):
-                ref, stale = await git_ops._freshen_main()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+             patch('orchestrator.git_ops._run', side_effect=fake_run):
+            ref, stale = await git_ops._freshen_main()
 
         assert ref == git_ops.config.main_branch
         assert stale == 3
