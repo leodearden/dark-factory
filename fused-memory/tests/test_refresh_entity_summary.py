@@ -890,7 +890,15 @@ class TestMemoryServiceRefreshEntitySummaryJournalFix:
         """When graphiti succeeds but journal.log_write_op raises RuntimeError,
         the result is still returned — journal failure cannot produce a false negative."""
         svc, mock_journal = service_with_journal
-        expected_result = make_rebuild_detail('node-1', 'Alice', old_summary='old', new_summary='Alice knows Bob', edge_count=1)
+        # Use the 5-key shape that graphiti.refresh_entity_summary actually returns
+        # (no 'status' — that key is added by the higher-level rebuild_entity_summaries).
+        expected_result = {
+            'uuid': 'node-1',
+            'name': 'Alice',
+            'old_summary': 'old',
+            'new_summary': 'Alice knows Bob',
+            'edge_count': 1,
+        }
         svc.graphiti.refresh_entity_summary = AsyncMock(return_value=expected_result)
         mock_journal.log_write_op.side_effect = RuntimeError('journal db is full')
 

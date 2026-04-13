@@ -219,67 +219,25 @@ class TestMakeRebuildDetail:
     are keyword-only with sensible defaults.
     """
 
-    def test_returns_dict_with_all_six_keys(self):
-        """Result has exactly the six expected keys: uuid, name, old_summary, new_summary, edge_count, status."""
+    def test_defaults(self):
+        """Positional args are set, all keyword defaults are correct, result is a plain dict."""
         result = make_rebuild_detail('u1', 'Alice')
-        assert set(result.keys()) == {'uuid', 'name', 'old_summary', 'new_summary', 'edge_count', 'status'}
-
-    def test_positional_uuid_is_set(self):
-        """uuid positional argument is reflected in result['uuid']."""
-        result = make_rebuild_detail('my-uuid', 'SomeName')
-        assert result['uuid'] == 'my-uuid'
-
-    def test_positional_name_is_set(self):
-        """name positional argument is reflected in result['name']."""
-        result = make_rebuild_detail('u1', 'Alice')
-        assert result['name'] == 'Alice'
-
-    def test_default_old_summary_is_empty_string(self):
-        """old_summary defaults to '' when not provided."""
-        result = make_rebuild_detail('u1', 'Alice')
-        assert result['old_summary'] == ''
-
-    def test_default_new_summary_is_empty_string(self):
-        """new_summary defaults to '' when not provided."""
-        result = make_rebuild_detail('u1', 'Alice')
-        assert result['new_summary'] == ''
-
-    def test_default_edge_count_is_zero(self):
-        """edge_count defaults to 0 when not provided."""
-        result = make_rebuild_detail('u1', 'Alice')
-        assert result['edge_count'] == 0
-
-    def test_default_status_is_rebuilt(self):
-        """status defaults to 'rebuilt' when not provided."""
-        result = make_rebuild_detail('u1', 'Alice')
-        assert result['status'] == 'rebuilt'
-
-    def test_custom_old_summary_propagates(self):
-        """Providing old_summary=... overrides the default."""
-        result = make_rebuild_detail('u1', 'Alice', old_summary='prior text')
-        assert result['old_summary'] == 'prior text'
-
-    def test_custom_new_summary_propagates(self):
-        """Providing new_summary=... overrides the default."""
-        result = make_rebuild_detail('u1', 'Alice', new_summary='Alice knows Bob')
-        assert result['new_summary'] == 'Alice knows Bob'
-
-    def test_custom_edge_count_propagates(self):
-        """Providing edge_count=... overrides the default."""
-        result = make_rebuild_detail('u1', 'Alice', edge_count=5)
-        assert result['edge_count'] == 5
-
-    def test_custom_status_propagates(self):
-        """Providing status=... overrides the default."""
-        result = make_rebuild_detail('u1', 'Alice', status='skipped')
-        assert result['status'] == 'skipped'
+        assert type(result) is dict
+        assert result == {
+            'uuid': 'u1',
+            'name': 'Alice',
+            'old_summary': '',
+            'new_summary': '',
+            'edge_count': 0,
+            'status': 'rebuilt',
+        }
 
     def test_all_kwargs_set_together(self):
         """All keyword overrides applied simultaneously produce the correct dict."""
         result = make_rebuild_detail(
             'node-1', 'Bob',
             old_summary='old B', new_summary='rebuilt B',
-            edge_count=3, status='rebuilt',
+            edge_count=3, status='skipped',
         )
         assert result == {
             'uuid': 'node-1',
@@ -287,18 +245,22 @@ class TestMakeRebuildDetail:
             'old_summary': 'old B',
             'new_summary': 'rebuilt B',
             'edge_count': 3,
-            'status': 'rebuilt',
+            'status': 'skipped',
         }
 
+    def test_error_param_included_when_provided(self):
+        """Passing error=None adds an 'error' key; omitting it keeps the dict to 6 keys."""
+        without_error = make_rebuild_detail('u1', 'Alice')
+        assert 'error' not in without_error
+
+        with_error = make_rebuild_detail('u1', 'Alice', error=None)
+        assert with_error['error'] is None
+        assert set(with_error.keys()) == {'uuid', 'name', 'old_summary', 'new_summary', 'edge_count', 'status', 'error'}
+
     def test_keyword_args_are_keyword_only(self):
-        """old_summary, new_summary, edge_count, status have kind KEYWORD_ONLY in signature."""
+        """old_summary, new_summary, edge_count, status, error have kind KEYWORD_ONLY in signature."""
         sig = inspect.signature(make_rebuild_detail)
-        for param_name in ('old_summary', 'new_summary', 'edge_count', 'status'):
+        for param_name in ('old_summary', 'new_summary', 'edge_count', 'status', 'error'):
             assert sig.parameters[param_name].kind == inspect.Parameter.KEYWORD_ONLY, (
                 f'{param_name} should be KEYWORD_ONLY'
             )
-
-    def test_returns_plain_dict(self):
-        """Result is a plain dict, not a subclass."""
-        result = make_rebuild_detail('u1', 'Alice')
-        assert type(result) is dict

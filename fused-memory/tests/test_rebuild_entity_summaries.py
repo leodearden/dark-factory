@@ -650,8 +650,8 @@ class TestMemoryServiceRebuildEntitySummaries:
             'skipped': 1,
             'errors': 0,
             'details': [
-                {**make_rebuild_detail('u1', 'Alice', old_summary='old text', new_summary='new text', edge_count=5), 'error': None},
-                {**make_rebuild_detail('u2', 'Bob', old_summary='old bob', new_summary='new bob', edge_count=3), 'error': None},
+                make_rebuild_detail('u1', 'Alice', old_summary='old text', new_summary='new text', edge_count=5, error=None),
+                make_rebuild_detail('u2', 'Bob', old_summary='old bob', new_summary='new bob', edge_count=3, error=None),
             ],
         })
         svc.mem0 = MagicMock()
