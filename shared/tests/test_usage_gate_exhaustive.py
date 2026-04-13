@@ -855,10 +855,11 @@ class TestHandleCapDetected:
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is True
 
-    def test_unknown_token_caps_first_uncapped(self):
+    def test_unknown_token_does_not_cap_any_account(self):
+        """Explicit unknown token: _resolve_account returns None, no account is capped."""
         gate = make_gate(['a', 'b'])
         gate._handle_cap_detected('reason', None, 'unknown-token')
-        assert gate._accounts[0].capped is True
+        assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
 
     def test_none_token_caps_first_uncapped(self):
