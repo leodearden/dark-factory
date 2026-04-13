@@ -189,14 +189,16 @@ class TestCapDetectionPatterns:
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is True
 
-    # --- Unknown token caps first uncapped ---
+    # --- Unknown token does not cap any account ---
 
-    def test_unknown_token_caps_first_uncapped(self):
+    def test_unknown_token_does_not_cap_any_account(self):
+        """Explicit unknown token: detect_cap_hit still returns True but no account is capped."""
         gate = make_gate(['a', 'b'])
-        gate.detect_cap_hit(
+        result = gate.detect_cap_hit(
             '', "You've hit your usage limit resets in 3h", oauth_token='unknown-token'
         )
-        assert gate._accounts[0].capped is True
+        assert result is True
+        assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
 
     # --- No oauth_token and all uncapped ---
@@ -352,8 +354,8 @@ class TestNearCapStateDistinction:
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
 
-    def test_near_cap_unknown_token_falls_back_to_first_uncapped(self):
-        """NEAR_CAP with an unrecognised oauth_token falls back to the first uncapped account."""
+    def test_near_cap_unknown_token_does_not_mark_any_account(self):
+        """NEAR_CAP with an explicit unknown oauth_token: detect_cap_hit returns True but no near_cap set."""
         gate = make_gate(['a', 'b'])
         result = gate.detect_cap_hit(
             '',
@@ -361,7 +363,7 @@ class TestNearCapStateDistinction:
             oauth_token='unknown-token',
         )
         assert result is True
-        assert gate._accounts[0].near_cap is True
+        assert gate._accounts[0].near_cap is False
         assert gate._accounts[1].near_cap is False
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
