@@ -399,7 +399,12 @@ class TaskSteward:
             if self._session_id is not None:
                 kwargs['resume_session_id'] = self._session_id
 
-            result: AgentResult = await invoke_agent(**kwargs)
+            try:
+                result: AgentResult = await invoke_agent(**kwargs)
+            except BaseException:
+                if self.usage_gate is not None:
+                    self.usage_gate.release_probe_slot(oauth_token)
+                raise
 
             # Cap-hit: sleep, then resume session on next account if possible
             if self.usage_gate and self.usage_gate.detect_cap_hit(
