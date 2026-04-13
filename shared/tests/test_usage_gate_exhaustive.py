@@ -192,12 +192,12 @@ class TestCapDetectionPatterns:
     # --- Unknown token does not cap any account ---
 
     def test_unknown_token_does_not_cap_any_account(self):
-        """Explicit unknown token: detect_cap_hit still returns True but no account is capped."""
+        """Explicit unknown token: detect_cap_hit returns False (no account resolved/mutated)."""
         gate = make_gate(['a', 'b'])
         result = gate.detect_cap_hit(
             '', "You've hit your usage limit resets in 3h", oauth_token='unknown-token'
         )
-        assert result is True
+        assert result is False
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
 
@@ -355,14 +355,14 @@ class TestNearCapStateDistinction:
         assert gate._accounts[1].capped is False
 
     def test_near_cap_unknown_token_does_not_mark_any_account(self):
-        """NEAR_CAP with an explicit unknown oauth_token: detect_cap_hit returns True but no near_cap set."""
+        """NEAR_CAP with an explicit unknown oauth_token: detect_cap_hit returns False (no account resolved/mutated)."""
         gate = make_gate(['a', 'b'])
         result = gate.detect_cap_hit(
             '',
             "You're close to reaching your usage limit. Your plan resets in 4h.",
             oauth_token='unknown-token',
         )
-        assert result is True
+        assert result is False
         assert gate._accounts[0].near_cap is False
         assert gate._accounts[1].near_cap is False
         assert gate._accounts[0].capped is False
@@ -1082,13 +1082,23 @@ class TestResolveAccount:
         acct = gate._resolve_account(None)
         assert acct is gate._accounts[1]
 
-    def test_unknown_token_logs_config_drift_warning(self, caplog):
-        """Explicit unknown token logs a config-drift warning at WARNING level."""
+    def test_unknown_token_logs_config_drift_debug(self, caplog):
+        """Explicit unknown token logs a config-drift breadcrumb at DEBUG level (not WARNING).
+
+        The primary WARNING is emitted by the caller ('no matching account'), so
+        _resolve_account downgrades its own message to DEBUG to avoid duplicate
+        WARNING noise for a single event.
+        """
         gate = make_gate(['a', 'b'])
-        with caplog.at_level(logging.WARNING, logger='shared.usage_gate'):
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
             acct = gate._resolve_account('unknown-token')
         assert acct is None
         assert any('config drift' in r.message.lower() for r in caplog.records)
+        # Must be DEBUG, not WARNING — callers own the WARNING-level signal
+        assert not any(
+            'config drift' in r.message.lower() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        )
 
     def test_all_capped_unknown_token_returns_none(self):
         gate = make_gate(['a', 'b'])
