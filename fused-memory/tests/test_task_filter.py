@@ -312,8 +312,9 @@ class TestFormatFilteredTaskTree:
         #       within budget and emitting the truncation notice.
         # The exact byte counts are intentionally not pinned here; the assertions below
         # validate the invariants directly from the rendered output.
+        max_tasks = 5
         max_chars = 240
-        output = format_filtered_task_tree(tree, max_tasks=5, max_chars=max_chars)
+        output = format_filtered_task_tree(tree, max_tasks=max_tasks, max_chars=max_chars)
 
         # Output must honour the char budget
         assert len(output) <= max_chars
@@ -325,6 +326,13 @@ class TestFormatFilteredTaskTree:
         # Count surviving task lines dynamically: each line rendered by _render_task_line
         # starts with '- [N]' at the beginning of a line.
         kept_count = len(re.findall(r'^- \[\d+\]', output, re.MULTILINE))
+        # Sanity bound: made explicit here (also implied by the task-1 regex below) so
+        # that a failure is diagnosed in terms of kept_count before reaching the
+        # anchored-line check.
+        assert kept_count >= 1, (
+            f'kept_count={kept_count}: no task lines survived — the lazy pop loop may have '
+            f'over-truncated or _render_task_line format changed'
+        )
 
         # Lower bound: at least one task was dropped by the char-budget clamp, confirming
         # the lazy pop loop genuinely fired (not just the initial accumulator cycle).
@@ -352,7 +360,6 @@ class TestFormatFilteredTaskTree:
         # errors in truncation accounting that an upper bound alone would not catch.
         # Using kept_count (parsed from the output) decouples from byte-level arithmetic
         # while preserving the same regression-detection strength.
-        max_tasks = 5
         assert trimmed_count == max_tasks - kept_count, (
             f'trimmed_count={trimmed_count} should be {max_tasks} - {kept_count} = '
             f'{max_tasks - kept_count} (max_tasks minus surviving task lines); '
