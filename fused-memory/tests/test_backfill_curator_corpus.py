@@ -372,3 +372,133 @@ class TestRunBackfill:
 
         # Result propagated
         assert result.upserted == 3
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Steps 10, 11, 13: TaskInterceptor auto-backfill hook
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _make_interceptor_config() -> FusedMemoryConfig:
+    """Make a config with curator enabled."""
+    from fused_memory.config.schema import EmbedderConfig
+    cfg = _make_config()
+    cfg.curator.enabled = True
+    return cfg
+
+
+class TestAutoBackfill:
+    """Tests for the auto-backfill hook in TaskInterceptor._maybe_backfill_corpus()."""
+
+    def _make_interceptor(self, mock_taskmaster) -> 'TaskInterceptor':
+        from fused_memory.middleware.task_interceptor import TaskInterceptor
+        config = _make_interceptor_config()
+        return TaskInterceptor(
+            taskmaster=mock_taskmaster,
+            targeted_reconciler=None,
+            event_buffer=MagicMock(),
+            config=config,
+        )
+
+    @pytest.mark.asyncio
+    async def test_interceptor_triggers_backfill_on_empty_collection(self):
+        """_maybe_backfill_corpus() spawns a background backfill when count is 0."""
+        import asyncio
+
+        canned_task_tree = {
+            'tasks': [
+                {'id': '1', 'title': 'Task A', 'description': 'Desc A', 'status': 'done'},
+            ],
+        }
+        mock_taskmaster = AsyncMock()
+        mock_taskmaster.get_tasks = AsyncMock(return_value=canned_task_tree)
+
+        interceptor = self._make_interceptor(mock_taskmaster)
+
+        config = _make_interceptor_config()
+        curator = TaskCurator(config=config, taskmaster=mock_taskmaster)
+
+        # count() returns 0 → trigger backfill
+        from qdrant_client.http.models import CountResult
+        mock_qdrant = AsyncMock()
+        mock_qdrant.collection_exists = AsyncMock(return_value=True)
+        mock_qdrant.count = AsyncMock(return_value=CountResult(count=0))
+
+        backfill_called_with: list[tuple] = []
+
+        async def mock_backfill_corpus(tasks, project_id):
+            backfill_called_with.append((tasks, project_id))
+            return BackfillResult(upserted=len(tasks))
+
+        with patch.object(curator, '_get_qdrant', AsyncMock(return_value=mock_qdrant)), \
+             patch.object(curator, 'backfill_corpus', side_effect=mock_backfill_corpus):
+
+            await interceptor._maybe_backfill_corpus(curator, project_root='/fake/project')
+
+            # Give the background task a moment to run
+            await asyncio.sleep(0.05)
+
+        assert len(backfill_called_with) == 1
+        tasks_arg, project_id_arg = backfill_called_with[0]
+        assert len(tasks_arg) == 1
+        assert project_id_arg == 'project'
+
+    @pytest.mark.asyncio
+    async def test_interceptor_skips_backfill_when_corpus_populated(self):
+        """_maybe_backfill_corpus() does NOT call backfill_corpus() when count > 0."""
+        import asyncio
+
+        mock_taskmaster = AsyncMock()
+        interceptor = self._make_interceptor(mock_taskmaster)
+
+        config = _make_interceptor_config()
+        curator = TaskCurator(config=config, taskmaster=mock_taskmaster)
+
+        from qdrant_client.http.models import CountResult
+        mock_qdrant = AsyncMock()
+        mock_qdrant.collection_exists = AsyncMock(return_value=True)
+        mock_qdrant.count = AsyncMock(return_value=CountResult(count=5))
+
+        backfill_called = False
+
+        async def mock_backfill_corpus(tasks, project_id):
+            nonlocal backfill_called
+            backfill_called = True
+            return BackfillResult()
+
+        with patch.object(curator, '_get_qdrant', AsyncMock(return_value=mock_qdrant)), \
+             patch.object(curator, 'backfill_corpus', side_effect=mock_backfill_corpus):
+
+            await interceptor._maybe_backfill_corpus(curator, project_root='/fake/project')
+            await asyncio.sleep(0.05)
+
+        assert not backfill_called
+
+    @pytest.mark.asyncio
+    async def test_backfill_failure_does_not_block_curator(self):
+        """_maybe_backfill_corpus() failing silently allows _get_curator() to return."""
+        import asyncio
+
+        canned_task_tree = {'tasks': [{'id': '1', 'title': 'T'}]}
+        mock_taskmaster = AsyncMock()
+        mock_taskmaster.get_tasks = AsyncMock(return_value=canned_task_tree)
+
+        interceptor = self._make_interceptor(mock_taskmaster)
+
+        config = _make_interceptor_config()
+        curator = TaskCurator(config=config, taskmaster=mock_taskmaster)
+
+        from qdrant_client.http.models import CountResult
+        mock_qdrant = AsyncMock()
+        mock_qdrant.collection_exists = AsyncMock(return_value=True)
+        mock_qdrant.count = AsyncMock(return_value=CountResult(count=0))
+
+        async def failing_backfill(tasks, project_id):
+            raise RuntimeError('embed is down')
+
+        with patch.object(curator, '_get_qdrant', AsyncMock(return_value=mock_qdrant)), \
+             patch.object(curator, 'backfill_corpus', side_effect=failing_backfill):
+
+            # Must not raise — graceful degradation
+            await interceptor._maybe_backfill_corpus(curator, project_root='/fake/project')
+            await asyncio.sleep(0.05)  # let background task settle
