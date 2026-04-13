@@ -116,6 +116,7 @@ from dashboard.data.merge_queue import (  # noqa: E402
     _bucket_minutes_for_window,
     _cutoff_iso,
     _get_durations,
+    _ts_sort_key,
     aggregate_latency_stats,
     aggregate_outcome_distribution,
     aggregate_queue_depth_timeseries,
@@ -197,6 +198,61 @@ class TestAlignBucket:
         result = _align_bucket(t, 1440)
         assert result.tzinfo is not None
         assert result == datetime(2026, 4, 11, 0, 0, 0, tzinfo=UTC)
+
+
+# ---------------------------------------------------------------------------
+# TestTsSortKey
+# ---------------------------------------------------------------------------
+
+class TestTsSortKey:
+    def test_non_utc_aware_datetime_normalized(self):
+        """A non-UTC-offset timestamp is normalized to UTC.
+
+        '2026-04-01T10:00:00+05:30' represents 04:30:00 UTC.  _ts_sort_key
+        must return a datetime with utcoffset() == timedelta(0) so that
+        downstream key comparisons and serialization are consistent.
+        """
+        entry = {'timestamp': '2026-04-01T10:00:00+05:30'}
+        result = _ts_sort_key(entry)
+        # Must be UTC-normalised
+        assert result.utcoffset() == timedelta(0)
+        # Point-in-time must equal the UTC equivalent
+        expected_utc = datetime(2026, 4, 1, 4, 30, 0, tzinfo=UTC)
+        assert result == expected_utc
+
+    def test_utc_timestamp_unchanged(self):
+        """A UTC-offset timestamp is returned unchanged (same value, UTC offset).
+
+        .astimezone(UTC) must be a no-op for timestamps that are already UTC
+        so that well-formed data passes through without any transformation.
+        """
+        entry = {'timestamp': '2026-04-01T10:00:00+00:00'}
+        result = _ts_sort_key(entry)
+        assert result.utcoffset() == timedelta(0)
+        assert result == datetime(2026, 4, 1, 10, 0, 0, tzinfo=UTC)
+
+    def test_naive_timestamp_gets_utc(self):
+        """A naive timestamp (no tzinfo) gets UTC attached and normalized.
+
+        parse_utc attaches UTC to naive datetimes via replace(tzinfo=UTC).
+        .astimezone(UTC) on a UTC datetime is a no-op, so the result should
+        be UTC-aware and equal to the naive value interpreted as UTC.
+        """
+        entry = {'timestamp': '2026-04-01T10:00:00'}
+        result = _ts_sort_key(entry)
+        assert result.tzinfo is not None
+        assert result.utcoffset() == timedelta(0)
+        assert result == datetime(2026, 4, 1, 10, 0, 0, tzinfo=UTC)
+
+    def test_missing_timestamp_returns_datetime_min(self):
+        """An entry with no 'timestamp' key returns UTC-aware datetime.min.
+
+        Malformed entries must sort to the end of a descending sort.  The
+        fallback value is datetime.min.replace(tzinfo=UTC).
+        """
+        result = _ts_sort_key({})
+        assert result == datetime.min.replace(tzinfo=UTC)
+        assert result.utcoffset() == timedelta(0)
 
 
 # ---------------------------------------------------------------------------
@@ -651,16 +707,32 @@ class TestLatencyStats:
 
     @pytest.mark.asyncio
     async def test_get_durations_returns_sorted(self, merge_events_db):
-        """_get_durations returns a sorted list even when inserted in non-sorted order.
+        """_get_durations returns a sorted list regardless of insertion order.
 
         Establishes the sorted-output invariant of _get_durations, which latency_stats
         relies on to avoid a redundant sorted() call.
+
+        The timestamps are staggered in *reverse* duration order so that if the
+        query were ``ORDER BY timestamp DESC`` (most-recent first) it would return
+        [500, 400, 300, 200, 100].  Because the expected result is [100, 200, 300,
+        400, 500], this proves that ``ORDER BY duration_ms`` is what actually
+        determines the output order — not the timestamp ordering.
         """
         now = datetime.now(UTC)
         conn_sync = sqlite3.connect(str(merge_events_db))
-        for ms in [500, 100, 300, 200, 400]:
+        # duration_ms → timestamp mapping: higher duration = more recent timestamp
+        # timestamp order (most-recent first): 500, 400, 300, 200, 100
+        # duration_ms order (ascending):       100, 200, 300, 400, 500
+        events = [
+            (500, now - timedelta(minutes=1)),
+            (100, now - timedelta(minutes=5)),
+            (300, now - timedelta(minutes=3)),
+            (200, now - timedelta(minutes=4)),
+            (400, now - timedelta(minutes=2)),
+        ]
+        for ms, ts in events:
             _insert_event(conn_sync, event_type='merge_attempt',
-                          timestamp=now - timedelta(minutes=10),
+                          timestamp=ts,
                           data={'outcome': 'done'},
                           duration_ms=ms)
         conn_sync.commit()
@@ -670,7 +742,7 @@ class TestLatencyStats:
             db.row_factory = aiosqlite.Row
             result = await _get_durations(db, hours=24)
 
-        assert result == sorted([500.0, 100.0, 300.0, 200.0, 400.0])
+        assert result == [100.0, 200.0, 300.0, 400.0, 500.0]
 
 
 # ---------------------------------------------------------------------------
