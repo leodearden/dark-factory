@@ -1261,3 +1261,65 @@ async def test_call_claude_cli_sleeps_on_cap_hit():
 
         mock_sleep.assert_called_once_with(_CAP_HIT_COOLDOWN_SECS)
         assert gate.before_invoke.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# UsageGate lifecycle: confirm_account_ok / on_agent_complete / release_probe_slot
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_confirms_account_ok_on_success():
+    """_call_claude_cli calls confirm_account_ok and on_agent_complete on success."""
+    from unittest.mock import AsyncMock
+
+    config = _make_config(agent_llm_provider='claude-cli', agent_llm_model='opus')
+
+    tools = {
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete',
+            parameters={'type': 'object', 'properties': {}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='Test',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+
+    gate = MagicMock()
+    gate.before_invoke = AsyncMock(return_value='token-a')
+    gate.detect_cap_hit = MagicMock(return_value=False)
+    agent._usage_gate = gate
+
+    # Include cost_usd in the CLI JSON response
+    cli_result = json.dumps({
+        'result': '',
+        'session_id': 'sess-1',
+        'num_input_tokens': 100,
+        'num_output_tokens': 50,
+        'cost_usd': 0.0042,
+        'structured_output': json.dumps({
+            'thinking': 'done',
+            'tool_calls': [{'name': 'stage_complete', 'arguments': {}}],
+        }),
+    })
+
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = AsyncMock(return_value=(
+        cli_result.encode(), b'',
+    ))
+
+    messages = [{'role': 'user', 'content': 'test prompt'}]
+    tool_schemas: list = []
+
+    with patch('asyncio.create_subprocess_exec', new_callable=AsyncMock, return_value=mock_proc):
+        await agent._call_claude_cli(messages, tool_schemas)
+
+    gate.confirm_account_ok.assert_called_once_with('token-a')
+    gate.on_agent_complete.assert_called_once_with(0.0042)
