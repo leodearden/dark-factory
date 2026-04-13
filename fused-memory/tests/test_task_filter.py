@@ -8,6 +8,7 @@ from fused_memory.reconciliation.task_filter import (
     _STATUS_PRIORITY,
     MAX_CANCELLED_TASKS_RETAINED,
     FilteredTaskTree,
+    _flatten_with_subtasks,
     _id_key,
     _render_task_line,
     filter_task_tree,
@@ -1242,3 +1243,70 @@ class TestIdKey:
     def test_deep_dotted_id_returns_parent_component(self):
         """_id_key returns the parent (first dot-segment) as int for '450.2.1'."""
         assert _id_key({'id': '450.2.1'}) == 450
+
+
+class TestFlattenWithSubtasks:
+    """Direct unit tests for _flatten_with_subtasks()."""
+
+    def test_bare_subtask_id_is_qualified(self):
+        """Bare-integer subtask id=2 under parent id='450' becomes '450.2'."""
+        raw = [
+            {
+                'id': '450',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [
+                    {'id': 2, 'title': 'Sub', 'status': 'pending', 'dependencies': []},
+                ],
+            }
+        ]
+        flat = _flatten_with_subtasks(raw)
+        ids = [str(t['id']) for t in flat]
+        assert '450' in ids
+        assert '450.2' in ids
+
+    def test_already_qualified_id_is_not_double_qualified(self):
+        """Subtask with id='450.2' (already dotted) stays '450.2', not '450.450.2'."""
+        raw = [
+            {
+                'id': '450',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [
+                    {'id': '450.2', 'title': 'Already qualified', 'status': 'pending', 'dependencies': []},
+                ],
+            }
+        ]
+        flat = _flatten_with_subtasks(raw)
+        ids = [str(t['id']) for t in flat]
+        assert '450.2' in ids
+        assert '450.450.2' not in ids
+
+    def test_no_subtasks_returns_flat_list(self):
+        """Tasks without 'subtasks' key pass through unchanged."""
+        raw = [
+            {'id': 1, 'title': 'A', 'status': 'pending', 'dependencies': []},
+            {'id': 2, 'title': 'B', 'status': 'done', 'dependencies': []},
+        ]
+        flat = _flatten_with_subtasks(raw)
+        assert len(flat) == 2
+        assert flat[0]['id'] == 1
+        assert flat[1]['id'] == 2
+
+    def test_original_subtask_dict_not_mutated(self):
+        """_flatten_with_subtasks creates a shallow copy — original subtask dict is unchanged."""
+        subtask = {'id': 3, 'title': 'Sub', 'status': 'pending', 'dependencies': []}
+        raw = [
+            {
+                'id': '100',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [subtask],
+            }
+        ]
+        _flatten_with_subtasks(raw)
+        # Original must still have bare int id, not '100.3'
+        assert subtask['id'] == 3
