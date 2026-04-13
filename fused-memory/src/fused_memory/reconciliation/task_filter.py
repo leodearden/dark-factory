@@ -60,10 +60,16 @@ _STATUS_PRIORITY: dict[str, int] = {
 
 
 def _id_key(t: dict) -> int:
-    """Return task id as int for sorting, defaulting to 0 on error."""
+    """Return task id as int for sorting, defaulting to 0 on error.
+
+    For dotted subtask IDs like '450.2' or '450.2.1', returns the parent
+    (first dot-segment) as int, so subtasks sort alongside their parent.
+    """
     tid = t.get('id', 0)
     try:
-        return int(tid)
+        tid_str = str(tid)
+        # For dotted IDs like '450.2', use only the first segment
+        return int(tid_str.split('.')[0])
     except (TypeError, ValueError):
         return 0
 
@@ -88,6 +94,55 @@ class FilteredTaskTree:
     cancelled_count: int = 0
     other_count: int = 0
     total_count: int = 0
+
+
+# --------------------------------------------------------------------------- #
+# Subtask flattening
+# --------------------------------------------------------------------------- #
+
+def _flatten_with_subtasks(raw_tasks: list[dict]) -> list[dict]:
+    """Flatten a nested task list into a single flat list including all subtasks.
+
+    Recursively walks each task's 'subtasks' array.  Bare-integer subtask IDs
+    are qualified as 'parent_id.subtask_id' using a shallow copy (originals are
+    never mutated).  Already-qualified IDs (containing a dot) are left unchanged.
+    The 'subtasks' key is stripped from each emitted dict so the result is a
+    genuinely flat list (no nested arrays on any entry).
+
+    Note on intentional divergence: ``task_curator._flatten_task_tree`` (line 948)
+    performs a similar recursive walk but does *not* qualify subtask IDs — its
+    purpose is shape normalisation, not ID canonicalisation.  Extracting a shared
+    helper would require an ID-qualification callback and add coupling across
+    package boundaries for minimal gain; the implementations are kept separate.
+
+    Args:
+        raw_tasks: Top-level list of task dicts from a get_tasks response.
+
+    Returns:
+        Flat list of task dicts (parents first, subtasks immediately following),
+        with subtask IDs qualified to 'parent_id.subtask_id' and the 'subtasks'
+        key removed from every entry.
+    """
+    result: list[dict] = []
+
+    def _walk(tasks: list[dict], parent_id: str | None) -> None:
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            if parent_id is not None:
+                tid = str(task.get('id', ''))
+                if '.' not in tid:
+                    # Bare integer subtask id — qualify it
+                    task = {**task, 'id': f'{parent_id}.{tid}'}
+            # Capture subtasks before stripping, then emit a clean flat entry
+            subtasks = task.get('subtasks')
+            result.append({k: v for k, v in task.items() if k != 'subtasks'})
+            if isinstance(subtasks, list) and subtasks:
+                # Use the (possibly newly qualified) id as parent for next level
+                _walk(subtasks, str(task.get('id', '')))
+
+    _walk(raw_tasks, None)
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -116,6 +171,9 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
     if not isinstance(raw_tasks, list):
         return FilteredTaskTree()
 
+    # Flatten subtasks into the top-level list, qualifying bare-integer IDs
+    all_tasks = _flatten_with_subtasks(raw_tasks)
+
     active: list[dict] = []
     done: list[dict] = []
     cancelled: list[dict] = []
@@ -123,7 +181,7 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
     cancelled_count = 0
     other_count = 0
 
-    for task in raw_tasks:
+    for task in all_tasks:
         if not isinstance(task, dict):
             continue  # Skip non-dict elements defensively
 

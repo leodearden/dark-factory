@@ -8,6 +8,7 @@ from fused_memory.reconciliation.task_filter import (
     _STATUS_PRIORITY,
     MAX_CANCELLED_TASKS_RETAINED,
     FilteredTaskTree,
+    _flatten_with_subtasks,
     _id_key,
     _render_task_line,
     filter_task_tree,
@@ -259,6 +260,41 @@ class TestFilterTaskTree:
 
         pending_ids = [t['id'] for t in result.active_tasks if t['status'] == 'pending']
         assert pending_ids == sorted(pending_ids, reverse=True)
+
+    def test_nested_subtasks_are_included_in_filter(self):
+        """filter_task_tree walks subtasks nested under parent tasks.
+
+        Parent (id='450', in-progress) has two subtasks:
+          - id=2 (pending) → active
+          - id=3 (done)    → done
+
+        Expects: 2 active tasks (parent + pending subtask), done_count=1,
+        total_count=3.
+        """
+        tasks_data = {
+            'tasks': [
+                {
+                    'id': '450',
+                    'title': 'Parent Task',
+                    'status': 'in-progress',
+                    'dependencies': [],
+                    'subtasks': [
+                        {'id': 2, 'title': 'Sub active', 'status': 'pending', 'dependencies': []},
+                        {'id': 3, 'title': 'Sub done', 'status': 'done', 'dependencies': []},
+                    ],
+                }
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert result.total_count == 3
+        assert len(result.active_tasks) == 2
+        assert result.done_count == 1
+
+        active_ids = {str(t['id']) for t in result.active_tasks}
+        assert '450' in active_ids  # parent
+        # Subtask bare-int id=2 should be qualified as '450.2'
+        assert '450.2' in active_ids
 
 
 class TestFormatFilteredTaskTree:
@@ -1199,3 +1235,256 @@ class TestIdKey:
     def test_float_id_is_truncated_to_int(self):
         """_id_key returns the int truncation of a float (int(3.9) == 3)."""
         assert _id_key({'id': 3.9}) == 3
+
+    def test_dotted_subtask_id_returns_parent_component(self):
+        """_id_key returns the parent (first dot-segment) as int for '450.2'."""
+        assert _id_key({'id': '450.2'}) == 450
+
+    def test_deep_dotted_id_returns_parent_component(self):
+        """_id_key returns the parent (first dot-segment) as int for '450.2.1'."""
+        assert _id_key({'id': '450.2.1'}) == 450
+
+
+class TestFlattenWithSubtasks:
+    """Direct unit tests for _flatten_with_subtasks()."""
+
+    def test_bare_subtask_id_is_qualified(self):
+        """Bare-integer subtask id=2 under parent id='450' becomes '450.2'."""
+        raw = [
+            {
+                'id': '450',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [
+                    {'id': 2, 'title': 'Sub', 'status': 'pending', 'dependencies': []},
+                ],
+            }
+        ]
+        flat = _flatten_with_subtasks(raw)
+        ids = [str(t['id']) for t in flat]
+        assert '450' in ids
+        assert '450.2' in ids
+
+    def test_already_qualified_id_is_not_double_qualified(self):
+        """Subtask with id='450.2' (already dotted) stays '450.2', not '450.450.2'."""
+        raw = [
+            {
+                'id': '450',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [
+                    {'id': '450.2', 'title': 'Already qualified', 'status': 'pending', 'dependencies': []},
+                ],
+            }
+        ]
+        flat = _flatten_with_subtasks(raw)
+        ids = [str(t['id']) for t in flat]
+        assert '450.2' in ids
+        assert '450.450.2' not in ids
+
+    def test_no_subtasks_returns_flat_list(self):
+        """Tasks without 'subtasks' key pass through unchanged."""
+        raw = [
+            {'id': 1, 'title': 'A', 'status': 'pending', 'dependencies': []},
+            {'id': 2, 'title': 'B', 'status': 'done', 'dependencies': []},
+        ]
+        flat = _flatten_with_subtasks(raw)
+        assert len(flat) == 2
+        assert flat[0]['id'] == 1
+        assert flat[1]['id'] == 2
+
+    def test_original_subtask_dict_not_mutated(self):
+        """_flatten_with_subtasks creates a shallow copy — original subtask dict is unchanged."""
+        subtask = {'id': 3, 'title': 'Sub', 'status': 'pending', 'dependencies': []}
+        raw = [
+            {
+                'id': '100',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [subtask],
+            }
+        ]
+        _flatten_with_subtasks(raw)
+        # Original must still have bare int id, not '100.3'
+        assert subtask['id'] == 3
+
+    def test_recursive_subtask_nesting(self):
+        """_flatten_with_subtasks handles multi-level nesting.
+
+        parent id='100'
+          subtask id=1  → becomes '100.1'
+            sub-subtask id=1 → becomes '100.1.1'
+
+        All three should appear in flattened output with correct statuses.
+        """
+        raw = [
+            {
+                'id': '100',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [
+                    {
+                        'id': 1,
+                        'title': 'Child',
+                        'status': 'pending',
+                        'dependencies': [],
+                        'subtasks': [
+                            {
+                                'id': 1,
+                                'title': 'Grandchild',
+                                'status': 'done',
+                                'dependencies': [],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+        flat = _flatten_with_subtasks(raw)
+        ids = [str(t['id']) for t in flat]
+        assert '100' in ids
+        assert '100.1' in ids
+        assert '100.1.1' in ids
+        assert len(flat) == 3
+
+        by_id = {str(t['id']): t for t in flat}
+        assert by_id['100']['status'] == 'in-progress'
+        assert by_id['100.1']['status'] == 'pending'
+        assert by_id['100.1.1']['status'] == 'done'
+
+    def test_subtasks_key_stripped_from_flattened_entries(self):
+        """'subtasks' key is absent from every dict in the flattened result.
+
+        The output is a genuinely flat list — no nested arrays on any entry,
+        so downstream consumers of FilteredTaskTree.active_tasks are not
+        surprised by leftover subtask arrays.
+        """
+        raw = [
+            {
+                'id': '450',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [
+                    {'id': 2, 'title': 'Child', 'status': 'pending', 'dependencies': []},
+                ],
+            }
+        ]
+        flat = _flatten_with_subtasks(raw)
+        for entry in flat:
+            assert 'subtasks' not in entry, (
+                f"Entry {entry.get('id')} still has 'subtasks' key after flattening"
+            )
+
+
+class TestSortOrderWithSubtasks:
+    """Sort order tests for filter_task_tree when subtasks are present."""
+
+    def test_sort_order_with_mixed_parent_and_subtask_ids(self):
+        """Tasks with mixed parent and subtask IDs sort by _STATUS_PRIORITY then -_id_key.
+
+        All tasks are 'pending' (same priority), so sort is purely by -_id_key:
+          451 → _id_key=451 → sort position 0  (highest, first shown)
+          '450'  → _id_key=450 → sort position 1
+          '450.2' → _id_key=450 → sort position 2 (stable: same as parent)
+          '450.1' → _id_key=450 → sort position 3 (stable: same as parent)
+
+        With Python's stable sort, tasks sharing _id_key=450 preserve input order
+        relative to each other: 450, 450.2, 450.1 (as given in input).
+        """
+        tasks_data = {
+            'tasks': [
+                {'id': '450', 'title': 'Parent 450', 'status': 'pending', 'dependencies': [],
+                 'subtasks': [
+                     {'id': '450.2', 'title': 'Sub 450.2', 'status': 'pending', 'dependencies': []},
+                     {'id': '450.1', 'title': 'Sub 450.1', 'status': 'pending', 'dependencies': []},
+                 ]},
+                {'id': 451, 'title': 'Task 451', 'status': 'pending', 'dependencies': []},
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        ids = [str(t['id']) for t in result.active_tasks]
+        # 451 must come before 450 group (higher _id_key → negated → lower sort value)
+        assert ids.index('451') < ids.index('450')
+        assert ids.index('451') < ids.index('450.2')
+        assert ids.index('451') < ids.index('450.1')
+        assert len(ids) == 4
+
+
+class TestFormatFilteredTaskTreeWithSubtasks:
+    """Tests for format_filtered_task_tree() when active_tasks contains subtasks."""
+
+    def test_format_renders_qualified_subtask_ids(self):
+        """format_filtered_task_tree renders lines for both parent and qualified subtask IDs."""
+        tree = FilteredTaskTree(
+            active_tasks=[
+                {'id': '450', 'title': 'Parent Task', 'status': 'in-progress', 'dependencies': []},
+                {'id': '450.1', 'title': 'Subtask One', 'status': 'pending', 'dependencies': []},
+            ],
+            done_tasks=[],
+            cancelled_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=2,
+        )
+        output = format_filtered_task_tree(tree)
+        assert '- [450] (in-progress) Parent Task deps=[]' in output
+        assert '- [450.1] (pending) Subtask One deps=[]' in output
+
+
+class TestEndToEndSubtaskPipeline:
+    """End-to-end tests: raw get_tasks response → filter_task_tree → format_filtered_task_tree."""
+
+    def test_e2e_full_pipeline_with_subtasks(self):
+        """Full pipeline: nested raw response → filtered tree → rendered string.
+
+        Raw input has:
+          - Task 100 (in-progress) with subtasks: id=1 (pending), id=2 (done)
+          - Task 101 (done)
+          - Task 102 (cancelled)
+
+        Expected: 2 active (100 + '100.1'), done_count=2 (100.2 + 101),
+        cancelled_count=1, total_count=5.
+        Rendered output must contain qualified subtask IDs and correct header.
+        """
+        tasks_data = {
+            'tasks': [
+                {
+                    'id': 100,
+                    'title': 'Big Feature',
+                    'status': 'in-progress',
+                    'dependencies': [],
+                    'subtasks': [
+                        {'id': 1, 'title': 'Sub A', 'status': 'pending', 'dependencies': []},
+                        {'id': 2, 'title': 'Sub B', 'status': 'done', 'dependencies': []},
+                    ],
+                },
+                {'id': 101, 'title': 'Old Feature', 'status': 'done', 'dependencies': []},
+                {'id': 102, 'title': 'Dropped Feature', 'status': 'cancelled', 'dependencies': []},
+            ]
+        }
+        tree = filter_task_tree(tasks_data)
+        output = format_filtered_task_tree(tree)
+
+        # Count checks
+        assert tree.total_count == 5
+        assert len(tree.active_tasks) == 2
+        assert tree.done_count == 2
+        assert tree.cancelled_count == 1
+
+        # Active IDs: parent 100 and qualified subtask '100.1'
+        active_ids = {str(t['id']) for t in tree.active_tasks}
+        assert '100' in active_ids
+        assert '100.1' in active_ids
+
+        # Rendered output
+        assert '- [100] (in-progress) Big Feature deps=[]' in output
+        assert '- [100.1] (pending) Sub A deps=[]' in output
+        # Summary line shows correct counts
+        assert '2 done, 1 cancelled' in output
