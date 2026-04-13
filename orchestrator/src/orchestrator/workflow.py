@@ -1134,6 +1134,12 @@ class TaskWorkflow:
         else:
             diff = await self.git_ops.get_diff_from_main(self.worktree)
 
+        if not diff or not diff.strip():
+            logger.info(
+                f'Task {self.task_id}: empty diff — skipping judge invocation'
+            )
+            return None
+
         prompt = await self.briefing.build_completion_judge_prompt(
             plan=self.plan,
             iteration_log=iteration_log,
