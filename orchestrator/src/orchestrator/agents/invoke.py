@@ -649,7 +649,7 @@ async def _run_subprocess_local(
         duration_ms = int(time.monotonic() * 1000) - start_ms
         return _SubprocessResult(
             stdout='',
-            stderr=f'Process killed after {timeout_seconds}s timeout',
+            stderr=f'Process killed after {timeout_seconds}s timeout (SIGTERM+SIGKILL)',
             returncode=1,
             duration_ms=duration_ms,
             timed_out=True,
