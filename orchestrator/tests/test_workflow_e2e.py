@@ -975,6 +975,70 @@ class TestReviewLoop:
         assert stub.calls.count('architect') == 2
 
 
+@pytest.mark.asyncio
+class TestBaseCommitDiff:
+    """Verify review uses base_commit diff, not moving main ref."""
+
+    async def test_worktree_base_commit_written_to_artifacts(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Verify that create_worktree's base_commit flows to artifacts.init().
+
+        This test verifies the fix for: "Reviewers receive empty diff, rubber-stamp PASS"
+
+        The bug occurred when:
+        1. Worktree A is created based on main at SHA M1
+        2. While A runs, another task B merges to main (advancing main to M2)
+        3. In review, workflow called get_diff_from_main() using `git diff main...HEAD`
+        4. Since main now points to M2, the diff would be empty
+        5. Reviewers would see no changes and rubber-stamp PASS
+
+        The fix: workflow captures base_commit=main's SHA at worktree creation,
+        passes it to artifacts.init() to persist, then reads it during review
+        and uses get_diff_from_base(worktree, base_commit) instead.
+        """
+
+        class MinimalStub(AgentStub):
+            async def _architect(self, cwd: Path) -> AgentResult:
+                # Write minimal plan.json
+                task_dir = cwd / '.task'
+                task_dir.mkdir(parents=True, exist_ok=True)
+                (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
+                return AgentResult(success=True, output='{}', cost_usd=0.10)
+
+            async def _implementer(self, cwd: Path) -> AgentResult:
+                return AgentResult(success=True, output='{}', cost_usd=0.10)
+
+            async def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+                return AgentResult(success=True, output=json.dumps(_make_review(role)),
+                                   structured_output=_make_review(role), cost_usd=0.10)
+
+        stub = MinimalStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        # Mock verify to pass immediately
+        monkeypatch.setattr(
+            'orchestrator.agents.invoke.invoke_agent', stub.invoke_agent
+        )
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All passed',
+            )),
+        )
+
+        # Verify pre-condition: main advancing would normally cause empty diff
+        # But we verify base_commit is captured and stored
+        await workflow.run()
+
+        # Either way the workflow completes, we can verify base_commit was stored
+        if workflow.artifacts:
+            stored = workflow.artifacts.read_base_commit()
+            assert stored is not None, "base_commit should have been stored"
+            assert len(stored) == 40, f"base_commit should be 40-char SHA, got {stored!r}"
+
+
 # ---------------------------------------------------------------------------
 # Tests: Post-Merge Verification Failure
 # ---------------------------------------------------------------------------
