@@ -1149,6 +1149,41 @@ class TestStewardTimeoutCap:
         # (not a generic return_value — the real queue.get is keyed by id)
         steward.escalation_queue.get.assert_called_with('esc-42-1')
 
+    async def test_success_path_at_boundary_both_counters_max_minus_one(
+        self, steward, mock_config,
+    ):
+        """Success path works when both retry and timeout counters are simultaneously at max-1.
+
+        This is the critical boundary: both guards are exactly one step from firing, but
+        neither should fire on a successful resolution.  Verifies that the else-branch
+        (steward.py lines 347-352) pops both counters cleanly without triggering either
+        guard at lines 222-237.
+        """
+        mock_config.steward_max_attempts = 3
+        mock_config.steward_max_timeouts_per_escalation = 3
+        esc = _make_escalation(id='esc-42-1')
+        # Both counters seeded at max-1 — one increment away from each guard firing
+        steward._retry_counts['esc-42-1'] = 2    # max_attempts - 1
+        steward._timeout_counts['esc-42-1'] = 2  # max_timeouts - 1
+
+        steward.escalation_queue.get.side_effect = lambda eid: _make_escalation(
+            id=eid, status='resolved', resolution='fixed',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(success=True)
+            await steward._handle_escalation(esc)
+
+        # Success path: both counters must be popped — no stale entries at max-1
+        assert 'esc-42-1' not in steward._retry_counts
+        assert 'esc-42-1' not in steward._timeout_counts
+        # Handled metric confirms the else-branch (success) was taken
+        assert steward.metrics.escalations_handled == 1
+        # invoke_agent was called exactly once — neither guard short-circuited it
+        assert mock_invoke.call_count == 1
+        # No re-escalation was submitted — neither guard fired
+        steward.escalation_queue.submit.assert_not_called()
+
     async def test_repeated_timeout_kills_eventually_terminate(
         self, steward, mock_config,
     ):
