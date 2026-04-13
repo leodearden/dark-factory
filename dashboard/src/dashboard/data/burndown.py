@@ -59,6 +59,11 @@ _INSERT_SNAPSHOT_SQL = (
 )
 
 
+def _tasks_json_for(root: Path) -> Path:
+    """Return the canonical tasks.json path for *root*."""
+    return root / '.taskmaster' / 'tasks' / 'tasks.json'
+
+
 def _count_statuses(tasks: list[dict]) -> dict[str, int]:
     """Count tasks by mapped display zone."""
     counts: dict[str, int] = {k: 0 for k in _ZONE_KEYS}
