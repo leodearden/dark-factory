@@ -609,15 +609,9 @@ class TestCollectSnapshot:
         assert good_row['done'] == 2  # done=2 for good_root
 
     @pytest.mark.asyncio
-    async def test_orchestrator_fallback_deduplicates_against_resolved_root(self, tmp_path):
+    async def test_orchestrator_fallback_deduplicates_against_resolved_root(self, symlink_project_setup, tmp_path):
         """When _resolve_project_root falls back to the symlinked config.project_root, it still deduplicates."""
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
-
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
+        real_dir, link, db_path = symlink_project_setup
 
         config = DashboardConfig(project_root=link)
 
