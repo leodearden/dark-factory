@@ -953,6 +953,20 @@ class TestMemoryServiceRebuildEntitySummaries:
         return svc
 
     @pytest.mark.asyncio
+    async def test_service_fixture_rebuild_mock_rejects_unexpected_uuid(self, service):
+        """service fixture's rebuild_entity_from_edges mock must reject unknown uuids.
+
+        RED phase: the current list-based side_effect pops Alice's dict for the first
+        call regardless of which uuid is passed, so calling with 'u99' returns Alice's
+        dict instead of raising AssertionError. This test fails until the list is
+        replaced with a uuid-dispatched callable including a strict catch-all.
+        """
+        with pytest.raises(AssertionError):
+            await service.graphiti.rebuild_entity_from_edges(
+                'u99', 'Unknown', [], group_id='test', old_summary='x'
+            )
+
+    @pytest.mark.asyncio
     async def test_delegates_to_backend(self, service):
         """Service calls graphiti.detect_stale_with_edges with correct group_id."""
         result = await service.rebuild_entity_summaries(
