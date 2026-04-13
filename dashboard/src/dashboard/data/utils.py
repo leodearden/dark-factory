@@ -16,7 +16,10 @@ def parse_utc(ts: str | None) -> datetime:
         ts: ISO 8601 timestamp string.
 
     Returns:
-        A timezone-aware :class:`datetime` in UTC.
+        A timezone-aware :class:`datetime`.  Naive inputs are normalized to
+        UTC; aware inputs are returned with their original tzinfo preserved
+        (not necessarily UTC).  Callers that require UTC must call
+        ``.astimezone(UTC)`` themselves.
     """
     if ts is None:
         raise TypeError('timestamp is None')
