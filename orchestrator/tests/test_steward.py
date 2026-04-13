@@ -1127,9 +1127,10 @@ class TestStewardTimeoutCap:
         # Pre-seed both counters to confirm they get cleaned up on success
         steward._timeout_counts['esc-42-1'] = 1
         steward._retry_counts['esc-42-1'] = 1
-        # Queue returns resolved after the agent handles it
-        steward.escalation_queue.get.return_value = _make_escalation(
-            id='esc-42-1', status='resolved', resolution='fixed',
+        # Queue returns resolved keyed by id — side_effect matches the real queue.get(id) contract
+        # (identical to the pattern in test_repeated_timeout_kills_eventually_terminate)
+        steward.escalation_queue.get.side_effect = lambda eid: _make_escalation(
+            id=eid, status='resolved', resolution='fixed',
         )
 
         with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
