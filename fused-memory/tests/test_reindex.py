@@ -993,18 +993,38 @@ class TestNodeCount:
         assert result == 42
 
 
+class TestRequireFalkorClient:
+    """GraphitiBackend._require_falkor_client() returns the FalkorDB client or raises."""
+
+    def test_returns_driver_client(self, mock_config, make_backend):
+        """Returns the .client attribute of the underlying FalkorDriver."""
+        backend = make_backend(mock_config)
+        sentinel = object()
+        backend._driver.client = sentinel
+        result = backend._require_falkor_client()
+        assert result is sentinel
+
+    def test_raises_when_not_initialized(self, mock_config):
+        """Raises RuntimeError when backend is not initialized (_driver is None)."""
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            backend._require_falkor_client()
+
+
 class TestListGraphs:
     """GraphitiBackend.list_graphs() returns non-system FalkorDB graph names."""
 
     @pytest.mark.asyncio
     async def test_returns_filtered(self, mock_config, make_backend):
-        """Filters out 'default_db' and names ending in '_db' via _driver.client.list_graphs."""
+        """Filters out 'default_db' and names ending in '_db'; delegates to _require_falkor_client."""
         backend = make_backend(mock_config)
-        backend._driver.client.list_graphs = AsyncMock(
-            return_value=['proj_a', 'default_db', 'proj_b', 'internal_db']
-        )
-        result = await backend.list_graphs()
+        with patch.object(backend, '_require_falkor_client') as mock_client_accessor:
+            mock_client_accessor.return_value.list_graphs = AsyncMock(
+                return_value=['proj_a', 'default_db', 'proj_b', 'internal_db']
+            )
+            result = await backend.list_graphs()
         assert result == ['proj_a', 'proj_b']
+        mock_client_accessor.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):

@@ -134,6 +134,11 @@ class GraphitiBackend:
             raise RuntimeError('GraphitiBackend not initialized — call initialize() first')
         return self._driver
 
+    def _require_falkor_client(self) -> Any:
+        """Return the FalkorDB client from the underlying driver."""
+        driver = self._require_driver()
+        return cast(Any, driver).client
+
     async def _ensure_indices(self, group_id: str) -> None:
         """Build indices on *group_id*'s graph if not already done this session."""
         if group_id in self._indexed_graphs:
@@ -221,7 +226,7 @@ class GraphitiBackend:
 
         # Build indices on all existing project graphs (lazy set avoids repeats).
         try:
-            existing = await cast(Any, self._driver).client.list_graphs()
+            existing = await self._require_falkor_client().list_graphs()
             for graph_name in existing:
                 if graph_name != 'default_db' and not graph_name.endswith('_db'):
                     await self._ensure_indices(graph_name)
@@ -1236,8 +1241,8 @@ class GraphitiBackend:
 
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
-        driver = self._require_driver()
-        all_graphs = await cast(Any, driver).client.list_graphs()
+        client = self._require_falkor_client()
+        all_graphs = await client.list_graphs()
         return [g for g in all_graphs if g != 'default_db' and not g.endswith('_db')]
 
     async def node_count(self, graph_name: str) -> int:
