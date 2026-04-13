@@ -1356,6 +1356,93 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
         )
         assert any(r.exc_info for r in warning_records)
 
+    @pytest.mark.asyncio
+    async def test_oserror_from_post_helper_resolve_emits_specific_warning(
+        self, burndown_env, caplog
+    ):
+        """OSError from project_root.resolve() (line 134) after the helper returns
+        must emit a warning specifically mentioning 'resolve', not the generic
+        'processing failed' message, and must not prevent other entries from being
+        snapshotted.
+
+        This tests the untested gap: the .resolve() call AFTER _resolve_project_root
+        or _read_project_root_from_config returns successfully.
+        """
+        import logging
+
+        db_path, base_config, conn = burndown_env
+
+        good_orch_root = Path('/fake/project/orch_resolve_good')
+        bad_orch_root = Path('/fake/project/orch_resolve_bad')
+
+        # Config must be created BEFORE patching Path.resolve so __post_init__ succeeds
+        config = DashboardConfig(
+            project_root=base_config.project_root,
+            known_project_roots=[],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        good_orch_tasks = [{'status': 'done'}]
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            good_orch_root / '.taskmaster' / 'tasks' / 'tasks.json': good_orch_tasks,
+        }
+
+        # Capture bad_prefix BEFORE patching (established pattern from
+        # test_skips_known_root_on_resolve_error)
+        bad_prefix = str(bad_orch_root.resolve())
+
+        original_resolve = Path.resolve
+
+        def selective_bad_resolve(self, *args, **kwargs):
+            if str(self).startswith(bad_prefix):
+                raise OSError('simulated post-helper resolve failure')
+            return original_resolve(self, *args, **kwargs)
+
+        def fake_resolve_project_root(prd_path, fallback):
+            # Return Path directly without calling .resolve() internally.
+            # This simulates the helper succeeding so that line 134's
+            # project_root.resolve() is the source of the OSError.
+            if 'bad' in str(prd_path):
+                return bad_orch_root
+            return good_orch_root
+
+        orchestrator_entries = [
+            {'prd': '/fake/good_prd.md', 'config_path': None},
+            {'prd': '/fake/bad_prd.md', 'config_path': None},
+        ]
+
+        with (
+            caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            patch.object(Path, 'resolve', selective_bad_resolve),
+            patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=orchestrator_entries),
+            patch('dashboard.data.burndown._resolve_project_root', side_effect=fake_resolve_project_root),
+        ):
+            # Must NOT raise despite the injected OSError from project_root.resolve()
+            await collect_snapshot(conn, config)
+
+        async with conn.execute('SELECT project_id FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
+
+        project_ids = {row['project_id'] for row in rows}
+        # Two rows: main project + good orchestrator entry
+        assert len(rows) == 2, f'Expected 2 rows, got {len(rows)}: {project_ids}'
+        assert str(base_config.project_root) in project_ids
+        assert str(good_orch_root.resolve()) in project_ids
+        assert bad_prefix not in project_ids
+
+        # Warning contract: message must specifically mention path resolution
+        # (NOT the generic 'processing failed' message), with exc_info set.
+        # Check for 'resolv' to match both 'resolve' and 'resolving'.
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'Expected at least one WARNING for post-helper resolve failure'
+        combined = ' '.join(r.getMessage() for r in warning_records)
+        assert 'resolv' in combined.lower(), (
+            f'Expected "resolv" (resolve/resolving) in warning message, got: {combined!r}'
+        )
+        assert any(r.exc_info for r in warning_records)
+
 
 # ---------------------------------------------------------------------------
 # DB-side insert failure isolation (#11)
