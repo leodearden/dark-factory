@@ -565,7 +565,7 @@ class TestValidatePlanPrerequisites:
         with pytest.raises(ValueError) as exc_info:
             artifacts.validate_plan_prerequisites()
         msg = str(exc_info.value)
-        assert '0' in msg  # first offending index
+        assert '[index 0]' in msg  # first offending index
         assert 'install deps' in msg.lower()
 
     # --- step-2: mixed list (some strings, some dicts) raises ValueError ---
@@ -581,7 +581,7 @@ class TestValidatePlanPrerequisites:
         with pytest.raises(ValueError) as exc_info:
             artifacts.validate_plan_prerequisites()
         msg = str(exc_info.value)
-        assert '1' in msg  # second item (index 1) is the string
+        assert '[index 1]' in msg  # second item (index 1) is the string
 
     # --- step-3: dicts missing required keys raise ValueError ---
     def test_raises_for_dict_missing_required_keys(self, artifacts: TaskArtifacts):
