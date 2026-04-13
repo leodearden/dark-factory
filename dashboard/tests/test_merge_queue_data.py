@@ -99,7 +99,6 @@ from dashboard.data.merge_queue import (  # noqa: E402
     _align_bucket,
     _bucket_minutes_for_window,
     _cutoff_iso,
-    _get_durations,
     aggregate_latency_stats,
     aggregate_outcome_distribution,
     aggregate_queue_depth_timeseries,
