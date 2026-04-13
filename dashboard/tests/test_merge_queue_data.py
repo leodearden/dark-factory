@@ -990,6 +990,57 @@ class TestSpeculativeStatsNow:
 
 
 # ---------------------------------------------------------------------------
+# TestAggregateOutcomeDistributionNow (step-9)
+# ---------------------------------------------------------------------------
+
+class TestAggregateOutcomeDistributionNow:
+    def _make_db(self, tmp_path, name, events):
+        """Create a populated DB with given events list of dicts."""
+        db_path = tmp_path / name
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(MERGE_EVENTS_SCHEMA)
+        for evt in events:
+            _insert_event(conn, **evt)
+        conn.commit()
+        conn.close()
+        return db_path
+
+    @pytest.mark.asyncio
+    async def test_aggregate_outcome_distribution_consistent_now(self, tmp_path):
+        """aggregate_outcome_distribution resolves now once and threads it to all per-DB calls.
+
+        Events near fixed_now are inside the 24h window for that now, but would be
+        excluded by a real datetime.now(UTC) cutoff (they are 2+ days in the past).
+        Will fail before step-10 impl because aggregate_outcome_distribution has no `now` param.
+        """
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        # Events at 1h before fixed_now — inside [fixed_now - 24h, fixed_now] window
+        event_time = fixed_now - timedelta(hours=1)
+
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt', 'timestamp': event_time, 'data': {'outcome': 'done'}},
+        ])
+        db2 = self._make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt', 'timestamp': event_time, 'data': {'outcome': 'done'}},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_outcome_distribution(
+                [conn1, conn2], hours=24, now=fixed_now,
+            )
+
+        # Both events are inside the window → both should appear in the results
+        assert 'done' in result['labels'], f"Expected 'done' in labels, got {result}"
+        done_idx = result['labels'].index('done')
+        assert result['values'][done_idx] == 2  # one event per DB
+
+
+# ---------------------------------------------------------------------------
 # TestLatencyStatsNow (step-5)
 # ---------------------------------------------------------------------------
 
