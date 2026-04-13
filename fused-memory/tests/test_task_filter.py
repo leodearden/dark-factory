@@ -937,3 +937,46 @@ class TestFormatCancelledSection:
             f'Expected original summary "3 done, 5 cancelled \u2014 omitted" '
             f'when cancelled_tasks=[], got:\n{output!r}'
         )
+
+    def test_format_cancelled_section_budget_accounting(self):
+        """When cancelled_tasks is non-empty and max_chars forces truncation, the
+        cancelled section must survive intact and only active task lines are trimmed.
+
+        The budget calculation subtracts len(cancelled_section) before computing
+        available space for active task lines, so truncation never cuts the
+        cancelled section.
+        """
+        active = [_make_task(i, 'pending', f'Task {i}') for i in range(1, 21)]
+        cancelled = [
+            _make_task(101, 'cancelled', 'Cancelled A'),
+            _make_task(102, 'cancelled', 'Cancelled B'),
+            _make_task(103, 'cancelled', 'Cancelled C'),
+        ]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            cancelled_tasks=cancelled,
+            done_count=5,
+            cancelled_count=3,
+            other_count=0,
+            total_count=28,
+        )
+
+        max_chars = 500  # Tight enough to force active-task truncation
+        output = format_filtered_task_tree(tree, max_chars=max_chars)
+
+        # (a) Output must honour the char budget
+        assert len(output) <= max_chars, (
+            f'Output length {len(output)} exceeds max_chars={max_chars}; '
+            f'budget accounting with cancelled section is broken'
+        )
+
+        # (b) Cancelled section must survive budget truncation
+        assert '### Recently Cancelled Tasks' in output, (
+            f'Expected "### Recently Cancelled Tasks" to survive budget clamp, '
+            f'got:\n{output!r}'
+        )
+
+        # (c) All 3 cancelled task ids must appear (cancelled section is never truncated)
+        assert '- [101]' in output, f'Cancelled task 101 missing from output:\n{output!r}'
+        assert '- [102]' in output, f'Cancelled task 102 missing from output:\n{output!r}'
+        assert '- [103]' in output, f'Cancelled task 103 missing from output:\n{output!r}'
