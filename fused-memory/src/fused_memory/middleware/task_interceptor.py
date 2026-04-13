@@ -55,6 +55,8 @@ class TaskInterceptor:
         # _get_curator() because it pulls in a Qdrant client + embedder.
         self._config = config
         self._curator: TaskCurator | None = None
+        # One-shot flag: prevents redundant auto-backfill checks on subsequent calls.
+        self._backfill_triggered: bool = False
 
     async def _ensure_taskmaster(self) -> TaskmasterBackend:
         """Return a connected TaskmasterBackend, or raise with a structured error."""
@@ -304,7 +306,12 @@ class TaskInterceptor:
     # ── Curator helpers ────────────────────────────────────────────────
 
     async def _get_curator(self) -> TaskCurator | None:
-        """Lazily construct the task curator gate."""
+        """Lazily construct the task curator gate.
+
+        On first construction, triggers a background backfill check via
+        ``_maybe_backfill_corpus()`` so pre-existing tasks are indexed into the
+        curator corpus without blocking the caller.
+        """
         if self._curator is not None:
             return self._curator
         if self._config is None or not self._config.curator.enabled:
@@ -313,19 +320,98 @@ class TaskInterceptor:
             from pathlib import Path as _Path
 
             cwd = None
+            project_root: str | None = None
             if self.taskmaster is not None:
                 pr = getattr(self.taskmaster.config, 'project_root', None)
                 if pr:
                     cwd = _Path(pr)
+                    project_root = str(pr)
             self._curator = TaskCurator(
                 config=self._config,
                 taskmaster=self.taskmaster,
                 cwd=cwd,
             )
+            # Trigger the one-shot backfill check as a background task so the
+            # caller is not delayed by the Qdrant count() round-trip.
+            if project_root is not None:
+                bg = asyncio.create_task(
+                    self._maybe_backfill_corpus(self._curator, project_root),
+                    name='curator-backfill-check',
+                )
+                self._background_tasks.add(bg)
+                bg.add_done_callback(lambda t: self._background_tasks.discard(t))
             return self._curator
         except Exception:
             logger.warning('Failed to create TaskCurator', exc_info=True)
             return None
+
+    async def _maybe_backfill_corpus(self, curator: TaskCurator, project_root: str) -> None:
+        """Trigger a one-shot background backfill if the collection is empty.
+
+        Called after the curator is constructed (or lazily on first use).
+        Checks collection point count via Qdrant. If count is 0 (or the
+        collection doesn't exist), fetches the full task tree, flattens it,
+        and spawns ``curator.backfill_corpus()`` as a fire-and-forget task.
+
+        The ``_backfill_triggered`` flag prevents re-triggering on subsequent
+        calls. All failures degrade silently — nothing here must ever block
+        task creation.
+        """
+        if self._backfill_triggered:
+            return
+        self._backfill_triggered = True
+
+        try:
+            from fused_memory.middleware.task_curator import _flatten_task_tree
+            from fused_memory.models.scope import resolve_project_id
+
+            project_id = resolve_project_id(project_root)
+
+            # Check whether the collection already has tasks via the public API.
+            count = await curator.corpus_count(project_id)
+
+            if count > 0:
+                logger.debug(
+                    'task_curator: corpus for project %s has %d points — skipping auto-backfill',
+                    project_id, count,
+                )
+                return
+
+            # Fetch the task tree so we can backfill.
+            if self.taskmaster is None:
+                return
+            try:
+                tasks_result = await self.taskmaster.get_tasks(project_root)
+                flat_tasks = _flatten_task_tree(tasks_result)
+            except Exception:
+                logger.warning(
+                    'task_curator: auto-backfill: get_tasks failed', exc_info=True,
+                )
+                return
+
+            if not flat_tasks:
+                return
+
+            # Fire and forget.
+            async def _do_backfill() -> None:
+                try:
+                    result = await curator.backfill_corpus(flat_tasks, project_id)
+                    logger.info(
+                        'task_curator: auto-backfill complete — '
+                        'upserted=%d skipped=%d errors=%d',
+                        result.upserted, result.skipped, result.errors,
+                    )
+                except Exception:
+                    logger.warning(
+                        'task_curator: auto-backfill failed', exc_info=True,
+                    )
+
+            bg = asyncio.create_task(_do_backfill(), name='curator-auto-backfill')
+            self._background_tasks.add(bg)
+            bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+
+        except Exception:
+            logger.warning('task_curator: _maybe_backfill_corpus raised', exc_info=True)
 
     @staticmethod
     def _build_candidate(kwargs: dict[str, Any]) -> CandidateTask | None:
