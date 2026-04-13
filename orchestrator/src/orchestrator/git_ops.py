@@ -303,11 +303,17 @@ class GitOps:
             return self.config.main_branch, None
 
         # Count commits local main is BEHIND origin/main
-        _, behind_out, _ = await _run(
+        rc, behind_out, _ = await _run(
             ['git', 'rev-list', '--count',
              f'{self.config.main_branch}..{remote_ref}'],
             cwd=self.project_root,
         )
+        if rc != 0:
+            logger.warning(
+                '_freshen_main: rev-list (behind) failed (rc=%d) — using local %s',
+                rc, self.config.main_branch,
+            )
+            return self.config.main_branch, None
         try:
             behind = int(behind_out.strip())
         except ValueError:
@@ -331,6 +337,7 @@ class GitOps:
             logger.warning(
                 '_freshen_main: unexpected ahead-count output: %r', ahead_out,
             )
+            # Fall back to local main; report behind count as-is (ref is local, not remote)
             return self.config.main_branch, behind
 
         if ahead > 0:

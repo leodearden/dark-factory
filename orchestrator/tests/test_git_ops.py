@@ -148,7 +148,8 @@ async def _push_n_commits_to_origin(
             (temp / f'{prefix}_{i}.txt').write_text(f'{prefix} content {i}\n')
             await _run(['git', 'add', '-A'], cwd=temp)
             await _run(['git', 'commit', '-m', f'{prefix} commit {i}'], cwd=temp)
-        await _run(['git', 'push', 'origin', 'main'], cwd=temp)
+        rc, _, err = await _run(['git', 'push', 'origin', 'main'], cwd=temp)
+        assert rc == 0, f'push to bare origin failed: {err}'
 
 
 @pytest.mark.asyncio
@@ -415,6 +416,72 @@ class TestFreshenMain:
         # Diverged: use local ref to avoid losing advance_main commits
         assert ref == git_ops.config.main_branch
         assert stale == 1
+
+    async def test_freshen_main_behind_rev_list_fails(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """When behind rev-list exits non-zero, _freshen_main returns (main_branch, None)."""
+        git_ops, _origin = git_ops_with_remote
+
+        call_count = 0
+
+        async def fake_run(cmd, cwd=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (0, '', '')          # fetch succeeds
+            return (128, '', 'fatal: bad revision')   # rev-list fails
+
+        with patch('orchestrator.git_ops._run', side_effect=fake_run):
+            ref, stale = await git_ops._freshen_main()
+
+        assert ref == git_ops.config.main_branch
+        assert stale is None
+
+    async def test_freshen_main_behind_count_value_error(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """When behind rev-list returns non-numeric stdout, _freshen_main returns (main_branch, None)."""
+        git_ops, _origin = git_ops_with_remote
+
+        call_count = 0
+
+        async def fake_run(cmd, cwd=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (0, '', '')           # fetch succeeds
+            return (0, 'not-a-number', '')   # rev-list returns garbage
+
+        with patch('orchestrator.git_ops._run', side_effect=fake_run):
+            ref, stale = await git_ops._freshen_main()
+
+        assert ref == git_ops.config.main_branch
+        assert stale is None
+
+    async def test_freshen_main_ahead_count_value_error(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """When ahead rev-list returns non-numeric stdout, falls back to (main_branch, behind)."""
+        git_ops, _origin = git_ops_with_remote
+
+        call_count = 0
+
+        async def fake_run(cmd, cwd=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (0, '', '')           # fetch succeeds
+            elif call_count == 2:
+                return (0, '3', '')          # behind rev-list: 3 commits behind
+            return (0, 'not-a-number', '')   # ahead rev-list returns garbage
+
+        with patch('orchestrator.git_ops._run', side_effect=fake_run):
+            ref, stale = await git_ops._freshen_main()
+
+        # Falls back to local main; reports behind count as-is
+        assert ref == git_ops.config.main_branch
+        assert stale == 3
 
 
 @pytest.mark.asyncio
