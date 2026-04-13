@@ -1810,3 +1810,85 @@ class TestBackendPublicAPI:
             'rebuild_entity_from_edges should be a public method on GraphitiBackend'
         )
         assert callable(backend.rebuild_entity_from_edges)
+
+
+# ---------------------------------------------------------------------------
+# TestServiceRebuildOrchestration — step-3/4: service-layer standard path
+# ---------------------------------------------------------------------------
+
+class TestServiceRebuildOrchestration:
+    """MemoryService.rebuild_entity_summaries() orchestrates the rebuild
+    internally via detect_stale_with_edges + rebuild_entity_from_edges.
+    (force=False, dry_run=False)
+    """
+
+    @pytest.fixture
+    def service(self, mock_config):
+        """MemoryService with mocked graphiti backend methods for orchestration tests."""
+        from fused_memory.services.memory_service import MemoryService
+        svc = MemoryService(mock_config)
+        svc.graphiti = MagicMock()
+        svc.mem0 = MagicMock()
+        svc.durable_queue = MagicMock()
+        svc.durable_queue.enqueue = AsyncMock(return_value=1)
+
+        # detect_stale_with_edges returns two stale entities with pre-fetched edges
+        stale_entities = [
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old fact A'},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'old fact B'},
+        ]
+        all_edges = {
+            'uuid-1': [{'uuid': 'e1', 'fact': 'new fact A', 'name': 'rel1'}],
+            'uuid-2': [{'uuid': 'e2', 'fact': 'new fact B', 'name': 'rel2'}],
+        }
+        svc.graphiti.detect_stale_with_edges = AsyncMock(
+            return_value=StaleSummaryResult(
+                stale=stale_entities,
+                all_edges=all_edges,
+                total_count=3,
+            )
+        )
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'old fact A',
+             'new_summary': 'new fact A', 'edge_count': 1},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'old fact B',
+             'new_summary': 'new fact B', 'edge_count': 1},
+        ])
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_calls_detect_stale_with_edges(self, service):
+        """Service calls graphiti.detect_stale_with_edges with the correct group_id."""
+        await service.rebuild_entity_summaries(project_id='myproject')
+        service.graphiti.detect_stale_with_edges.assert_awaited_once_with(
+            group_id='myproject'
+        )
+
+    @pytest.mark.asyncio
+    async def test_calls_rebuild_per_stale_entity_with_prefetched_edges(self, service):
+        """Service calls graphiti.rebuild_entity_from_edges once per stale entity
+        using the edges already fetched by detect_stale_with_edges."""
+        await service.rebuild_entity_summaries(project_id='myproject')
+        assert service.graphiti.rebuild_entity_from_edges.await_count == 2
+        calls = service.graphiti.rebuild_entity_from_edges.call_args_list
+        # First entity: Alice
+        assert calls[0].args[0] == 'uuid-1'
+        assert calls[0].args[1] == 'Alice'
+        assert calls[0].kwargs['group_id'] == 'myproject'
+        assert calls[0].kwargs['old_summary'] == 'old fact A'
+        # Second entity: Bob
+        assert calls[1].args[0] == 'uuid-2'
+        assert calls[1].args[1] == 'Bob'
+
+    @pytest.mark.asyncio
+    async def test_result_dict_has_correct_keys_and_values(self, service):
+        """Result dict has total_entities/stale_entities/rebuilt/errors/details."""
+        result = await service.rebuild_entity_summaries(project_id='myproject')
+        assert result['total_entities'] == 3
+        assert result['stale_entities'] == 2
+        assert result['rebuilt'] == 2
+        assert result['errors'] == 0
+        assert 'details' in result
+        assert len(result['details']) == 2
+        assert result['details'][0]['uuid'] == 'uuid-1'
+        assert result['details'][0]['status'] == 'rebuilt'
