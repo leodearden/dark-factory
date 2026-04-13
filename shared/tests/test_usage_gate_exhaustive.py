@@ -493,6 +493,39 @@ class TestNearCapStateDistinction:
         assert all(not a.capped for a in gate._accounts)
         assert gate._open.is_set() is True
 
+    def test_near_cap_with_precapped_account_falls_back_to_next_uncapped(self):
+        """NEAR_CAP with oauth_token=None skips the pre-capped account and sets near_cap on 'b'.
+
+        Exercises the ``if not a.capped`` skip branch in ``_resolve_account``'s
+        first-uncapped fallback.  Account 'a' is capped via the real
+        ``_handle_cap_detected`` path (not manual field assignment) before the
+        NEAR_CAP message arrives, so ``_resolve_account(None)`` skips it and
+        returns account 'b'.
+        """
+        gate = make_gate(['a', 'b'])
+        acct_a = gate._accounts[0]
+
+        # Pre-cap account 'a' using the real detection path.
+        gate._handle_cap_detected(
+            'pre-capped', datetime.now(UTC) - timedelta(minutes=1), acct_a.token
+        )
+        assert acct_a.capped is True
+
+        # NEAR_CAP with no token — should fall back to first uncapped account ('b').
+        result = gate.detect_cap_hit(
+            '',
+            "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token=None,
+        )
+
+        assert result is True
+        assert gate._accounts[0].capped is True      # 'a' stays capped
+        assert gate._accounts[0].near_cap is False   # cap clears near_cap; NEAR_CAP did not touch 'a'
+        assert gate._accounts[1].near_cap is True    # 'b' got the near-cap flag
+        assert gate._accounts[1].capped is False     # 'b' is not capped
+        assert gate._open.is_set() is True           # NEAR_CAP must never close the gate
+        assert all(a.resume_task is None for a in gate._accounts)  # wait_for_reset=False → no probe
+
 
 # =========================================================================
 # TestCapHitNowUsingExtraSemantics
