@@ -1352,33 +1352,85 @@ class TestMultiDbAggregation:
 
     @pytest.mark.asyncio
     async def test_all_none_dbs_queue_depth(self):
-        """aggregate_queue_depth_timeseries with dbs=[None, None] returns empty ChartData."""
-        result = await aggregate_queue_depth_timeseries([None, None], hours=24)
+        """aggregate_queue_depth_timeseries with dbs=[None, None] returns empty ChartData.
+
+        Spy on queue_depth_timeseries to confirm it was called twice with None —
+        distinguishing this path from dbs=[] where gather(*[]) returns [] immediately.
+        """
+        with patch(
+            'dashboard.data.merge_queue.queue_depth_timeseries',
+            wraps=queue_depth_timeseries,
+        ) as spy:
+            result = await aggregate_queue_depth_timeseries([None, None], hours=24)
         assert result == {'labels': [], 'values': []}
+        assert spy.call_count == 2
+        for call in spy.call_args_list:
+            assert call.args[0] is None
 
     @pytest.mark.asyncio
     async def test_all_none_dbs_outcome_distribution(self):
-        """aggregate_outcome_distribution with dbs=[None, None] returns empty ChartData."""
-        result = await aggregate_outcome_distribution([None, None], hours=24)
+        """aggregate_outcome_distribution with dbs=[None, None] returns empty ChartData.
+
+        Spy on outcome_distribution to confirm it was called twice with None.
+        """
+        with patch(
+            'dashboard.data.merge_queue.outcome_distribution',
+            wraps=outcome_distribution,
+        ) as spy:
+            result = await aggregate_outcome_distribution([None, None], hours=24)
         assert result == {'labels': [], 'values': []}
+        assert spy.call_count == 2
+        for call in spy.call_args_list:
+            assert call.args[0] is None
 
     @pytest.mark.asyncio
     async def test_all_none_dbs_latency_stats(self):
-        """aggregate_latency_stats with dbs=[None, None] returns all-zero stats dict."""
-        result = await aggregate_latency_stats([None, None], hours=24)
+        """aggregate_latency_stats with dbs=[None, None] returns all-zero stats dict.
+
+        Spy on _get_durations (the per-DB function aggregate_latency_stats uses)
+        to confirm it was called twice with None.
+        """
+        with patch(
+            'dashboard.data.merge_queue._get_durations',
+            wraps=_get_durations,
+        ) as spy:
+            result = await aggregate_latency_stats([None, None], hours=24)
         assert result == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
+        assert spy.call_count == 2
+        for call in spy.call_args_list:
+            assert call.args[0] is None
 
     @pytest.mark.asyncio
     async def test_all_none_dbs_recent_merges(self):
-        """aggregate_recent_merges with dbs=[None, None] returns empty list."""
-        result = await aggregate_recent_merges([None, None], limit=20)
+        """aggregate_recent_merges with dbs=[None, None] returns empty list.
+
+        Spy on recent_merges to confirm it was called twice with None.
+        """
+        with patch(
+            'dashboard.data.merge_queue.recent_merges',
+            wraps=recent_merges,
+        ) as spy:
+            result = await aggregate_recent_merges([None, None], limit=20)
         assert result == []
+        assert spy.call_count == 2
+        for call in spy.call_args_list:
+            assert call.args[0] is None
 
     @pytest.mark.asyncio
     async def test_all_none_dbs_speculative_stats(self):
-        """aggregate_speculative_stats with dbs=[None, None] returns all-zero stats dict."""
-        result = await aggregate_speculative_stats([None, None], hours=24)
+        """aggregate_speculative_stats with dbs=[None, None] returns all-zero stats dict.
+
+        Spy on speculative_stats to confirm it was called twice with None.
+        """
+        with patch(
+            'dashboard.data.merge_queue.speculative_stats',
+            wraps=speculative_stats,
+        ) as spy:
+            result = await aggregate_speculative_stats([None, None], hours=24)
         assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+        assert spy.call_count == 2
+        for call in spy.call_args_list:
+            assert call.args[0] is None
 
     # -----------------------------------------------------------------------
     # Gap coverage (c): None entries in dbs — per-DB returns empty defaults
