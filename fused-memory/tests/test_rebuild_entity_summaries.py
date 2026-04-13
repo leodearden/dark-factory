@@ -1972,9 +1972,11 @@ class TestRebuildEntitySummariesCancellation:
         covered by test_partial_failure_in_update_does_not_cancel_others.
 
         Uses force=True (same mock surface as the other tests in this class) because
-        both branches converge on the same Pass 2 accumulator.  The force=False branch's
-        ValueError accumulation is already covered by test_partial_failure_continues
-        (TestRebuildEntitySummaries class).
+        both branches converge on the same Pass 2 accumulator.
+        Exception-subclass accumulation on the force=False branch is already covered
+        by test_partial_failure_continues (TestRebuildEntitySummaries class),
+        which exercises RuntimeError; this test complements it by proving the
+        Pass 2 guard is isinstance(r, Exception) rather than isinstance(r, RuntimeError).
         """
         svc = two_entity_service
         # First entity's rebuild raises ValueError; second succeeds
