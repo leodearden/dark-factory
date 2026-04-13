@@ -1764,3 +1764,16 @@ class TestCollectSnapshotDocstringContract:
             f'Docstring should mention at least 2 robustness terms from {robustness_terms}; '
             f'matched: {matched}'
         )
+
+
+class TestInsertSnapshotSql:
+    """Test that _INSERT_SNAPSHOT_SQL module-level constant exists and has correct value."""
+
+    def test_constant_is_str_with_correct_content(self):
+        from dashboard.data.burndown import _INSERT_SNAPSHOT_SQL  # noqa: PLC0415
+
+        assert isinstance(_INSERT_SNAPSHOT_SQL, str)
+        assert _INSERT_SNAPSHOT_SQL.startswith('INSERT INTO snapshots')
+        assert 'VALUES (?, ?, ?, ?, ?, ?, ?, ?)' in _INSERT_SNAPSHOT_SQL
+        # No leading/trailing whitespace — single clean string, no implicit-concat artifacts
+        assert _INSERT_SNAPSHOT_SQL == _INSERT_SNAPSHOT_SQL.strip()
