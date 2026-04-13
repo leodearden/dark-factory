@@ -1004,7 +1004,7 @@ class GraphitiBackend:
         return StaleSummaryResult(stale=stale, all_edges=all_edges, total_count=len(entities))
 
     async def detect_stale_dry_run(
-        self, *, group_id: str
+        self, *, group_id: str, max_concurrency: int = 10
     ) -> tuple[list[dict], int]:
         """Detect stale summaries using per-entity edge fetching (dry_run variant).
 
