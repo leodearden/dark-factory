@@ -58,7 +58,7 @@ BUCKET_LADDER: tuple[tuple[int | None, int], ...] = (
 )
 
 
-def _cutoff_iso(hours: int) -> str:
+def _cutoff_iso(hours: int, *, now: datetime | None = None) -> str:
     """Return ISO-format cutoff datetime for the given look-back window (hours).
 
     The returned string has a ``+00:00`` UTC offset.  All query functions
@@ -69,8 +69,15 @@ def _cutoff_iso(hours: int) -> str:
     such as ``+05:00``.  The correct long-term fix is to normalise timestamps
     to UTC at write time; this is a pre-existing pattern shared by all query
     functions in this module.
+
+    Args:
+        hours: Look-back window in hours.
+        now: Reference timestamp. When None (the default), ``datetime.now(UTC)``
+            is used. Pass an explicit value to get deterministic results or to
+            share a single timestamp across concurrent per-DB calls.
     """
-    return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+    effective_now = now if now is not None else datetime.now(UTC)
+    return (effective_now - timedelta(hours=hours)).isoformat()
 
 
 def _bucket_minutes_for_window(hours: int) -> int:
@@ -165,17 +172,19 @@ async def queue_depth_timeseries(
         now_aligned = _align_bucket(effective_now, bucket_min)
 
         # Generate buckets from cutoff_aligned through now_aligned inclusive
-        num_buckets = int((now_aligned - cutoff_aligned) / timedelta(minutes=bucket_min)) + 1
+        num_buckets = (now_aligned - cutoff_aligned) // timedelta(minutes=bucket_min) + 1
         buckets = [
             cutoff_aligned + timedelta(minutes=bucket_min * i)
             for i in range(num_buckets)
         ]
 
-        # Fetch all merge_attempt events in the window
+        # Fetch all merge_attempt events in the window.
+        # Upper bound is effective_now (not now_aligned) to avoid excluding
+        # events in [now_aligned, effective_now) that belong to the last bucket.
         rows = await conn.execute_fetchall(
             "SELECT timestamp FROM events "
-            "WHERE event_type = 'merge_attempt' AND timestamp >= ?",
-            (cutoff.isoformat(),),
+            "WHERE event_type = 'merge_attempt' AND timestamp >= ? AND timestamp <= ?",
+            (cutoff_aligned.isoformat(), effective_now.isoformat()),
         )
 
         # Build count map keyed by ISO bucket label
@@ -209,18 +218,26 @@ async def outcome_distribution(
     db: aiosqlite.Connection | None,
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> ChartData:
     """Count merge_attempt events by outcome within the window.
 
     Returns ChartData with canonical outcomes first (done, conflict, blocked,
     already_merged), then any unknown outcomes sorted alphabetically.
     Missing canonical outcomes are omitted (count=0 entries are dropped).
+
+    Args:
+        db: aiosqlite connection, or None (returns empty ChartData).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
+            is used. Pass an explicit value to get deterministic results or to
+            share a single timestamp across concurrent per-DB calls.
     """
     if db is None:
         return {'labels': [], 'values': []}
 
     async def _query(conn: aiosqlite.Connection) -> ChartData:
-        since = _cutoff_iso(hours)
+        since = _cutoff_iso(hours, now=now)
         rows = await conn.execute_fetchall(
             "SELECT json_extract(data, '$.outcome') AS outcome, COUNT(*) AS cnt "
             "FROM events "
@@ -263,13 +280,21 @@ async def _get_durations(
     db: aiosqlite.Connection | None,
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> list[float]:
-    """Return sorted list of non-null merge_attempt duration_ms values."""
+    """Return sorted list of non-null merge_attempt duration_ms values.
+
+    Args:
+        db: aiosqlite connection, or None (returns empty list).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
+            is used. Pass an explicit value to share a timestamp with sibling calls.
+    """
     if db is None:
         return []
 
     async def _query(conn: aiosqlite.Connection) -> list[float]:
-        since = _cutoff_iso(hours)
+        since = _cutoff_iso(hours, now=now)
         rows = await conn.execute_fetchall(
             "SELECT duration_ms FROM events "
             "WHERE event_type = 'merge_attempt' "
@@ -301,14 +326,21 @@ async def latency_stats(
     db: aiosqlite.Connection | None,
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> dict:
     """P50/P95/P99 latency and count for merge_attempt events.
 
     Returns {'p50': int, 'p95': int, 'p99': int, 'count': int,
              'mean_ms': float}.
     When no rows have non-null duration_ms, returns all zeros with count=0.
+
+    Args:
+        db: aiosqlite connection, or None (returns all-zeros dict).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
+            is used. Pass an explicit value to share a timestamp with sibling calls.
     """
-    durations = await _get_durations(db, hours=hours)
+    durations = await _get_durations(db, hours=hours, now=now)
     return _compute_latency_stats(durations)
 
 
@@ -371,17 +403,24 @@ async def speculative_stats(
     db: aiosqlite.Connection | None,
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> dict:
     """Hit/discard counts and hit rate for speculative merge events.
 
     Returns {'hit_count': int, 'discard_count': int, 'total': int,
              'hit_rate': float}.
+
+    Args:
+        db: aiosqlite connection, or None (returns all-zeros dict).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
+            is used. Pass an explicit value to share a timestamp with sibling calls.
     """
     if db is None:
         return {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
 
     async def _query(conn: aiosqlite.Connection) -> dict:
-        since = _cutoff_iso(hours)
+        since = _cutoff_iso(hours, now=now)
         rows = await conn.execute_fetchall(
             "SELECT event_type, COUNT(*) AS cnt "
             "FROM events "
@@ -478,13 +517,24 @@ async def aggregate_outcome_distribution(
     dbs: list[aiosqlite.Connection | None],
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> ChartData:
     """Aggregate outcome distribution across multiple project DBs.
 
     Counts per outcome are summed; canonical ordering is preserved.
+
+    Args:
+        dbs: List of aiosqlite connections (None entries are tolerated).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp captured **once** for the entire aggregation
+            call and threaded into every per-DB ``outcome_distribution`` query.
+            When None (the default), ``datetime.now(UTC)`` is resolved here so
+            that all concurrent per-DB coroutines share the same cutoff window.
+            Pass an explicit value in tests for full determinism.
     """
+    effective_now = now if now is not None else datetime.now(UTC)
     results = await asyncio.gather(
-        *[outcome_distribution(db, hours=hours) for db in dbs],
+        *[outcome_distribution(db, hours=hours, now=effective_now) for db in dbs],
         return_exceptions=True,
     )
 
@@ -517,14 +567,25 @@ async def aggregate_latency_stats(
     dbs: list[aiosqlite.Connection | None],
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> dict:
     """Aggregate latency stats across multiple project DBs.
 
     Recomputes percentiles from the merged raw duration list.
+
+    Args:
+        dbs: List of aiosqlite connections (None entries are tolerated).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp captured **once** for the entire aggregation
+            call and threaded into every per-DB ``_get_durations`` query.
+            When None (the default), ``datetime.now(UTC)`` is resolved here so
+            that all concurrent per-DB coroutines share the same cutoff window.
+            Pass an explicit value in tests for full determinism.
     """
+    effective_now = now if now is not None else datetime.now(UTC)
     all_durations: list[float] = []
     gather_results = await asyncio.gather(
-        *[_get_durations(db, hours=hours) for db in dbs],
+        *[_get_durations(db, hours=hours, now=effective_now) for db in dbs],
         return_exceptions=True,
     )
     for r in gather_results:
@@ -571,13 +632,24 @@ async def aggregate_speculative_stats(
     dbs: list[aiosqlite.Connection | None],
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> dict:
     """Aggregate speculative stats across multiple project DBs.
 
     Sums hit/discard counts and recomputes hit_rate.
+
+    Args:
+        dbs: List of aiosqlite connections (None entries are tolerated).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp captured **once** for the entire aggregation
+            call and threaded into every per-DB ``speculative_stats`` query.
+            When None (the default), ``datetime.now(UTC)`` is resolved here so
+            that all concurrent per-DB coroutines share the same cutoff window.
+            Pass an explicit value in tests for full determinism.
     """
+    effective_now = now if now is not None else datetime.now(UTC)
     gather_results = await asyncio.gather(
-        *[speculative_stats(db, hours=hours) for db in dbs],
+        *[speculative_stats(db, hours=hours, now=effective_now) for db in dbs],
         return_exceptions=True,
     )
     hit_count = 0

@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from orchestrator.agents.invoke import invoke_agent
+from orchestrator.agents.invoke import invoke_agent, invoke_with_cap_retry
 from orchestrator.agents.roles import STEWARD
 from orchestrator.event_store import EventStore, EventType
 
@@ -301,6 +301,8 @@ class TaskSteward:
             f'turns={result.turns})'
         )
 
+        is_timeout = _is_timeout_kill(result)
+
         if self.event_store:
             self.event_store.emit(
                 EventType.invocation_end,
@@ -312,12 +314,13 @@ class TaskSteward:
                     'category': escalation.category,
                     'retry_count': retry_count,
                     'account_name': result.account_name,
+                    'timed_out': is_timeout,
                 },
             )
 
         # Timeout-kill: treat as recoverable — do NOT consume retry budget.
         # The escalation remains pending so the run loop re-queues it naturally.
-        if _is_timeout_kill(result):
+        if is_timeout:
             self.metrics.timeouts_recovered += 1
             self._timeout_counts[escalation.id] = (
                 self._timeout_counts.get(escalation.id, 0) + 1
@@ -399,7 +402,18 @@ class TaskSteward:
             if self._session_id is not None:
                 kwargs['resume_session_id'] = self._session_id
 
-            result: AgentResult = await invoke_agent(**kwargs)
+            try:
+                result: AgentResult = await invoke_agent(**kwargs)
+            except BaseException:
+                # Safety net: release probe slot on any exception so probe_in_flight
+                # never leaks. See also: shared/cli_invoke.py:invoke_with_cap_retry,
+                # orchestrator/agents/invoke.py:invoke_with_cap_retry
+                if self.usage_gate is not None:
+                    try:
+                        self.usage_gate.release_probe_slot(oauth_token)
+                    except Exception:
+                        logger.warning('release_probe_slot failed', exc_info=True)
+                raise
 
             # Cap-hit: sleep, then resume session on next account if possible
             if self.usage_gate and self.usage_gate.detect_cap_hit(
@@ -473,11 +487,9 @@ class TaskSteward:
         suggestions = json.loads(_strip_hash_prefix(escalation.detail))
         prompt = build_triage_prompt(suggestions, self.task)
 
-        oauth_token = None
-        if self.usage_gate:
-            oauth_token = await self.usage_gate.before_invoke()
-
-        result = await invoke_agent(
+        result = await invoke_with_cap_retry(
+            self.usage_gate,
+            f'Steward for task {self.task_id} [pre-triage]',
             prompt=prompt,
             system_prompt=TRIAGE_SYSTEM_PROMPT,
             cwd=self.config.project_root,
@@ -492,16 +504,12 @@ class TaskSteward:
             output_schema=TRIAGE_OUTPUT_SCHEMA,
             effort=self.config.effort.triage,
             backend=self.config.backends.triage,
-            oauth_token=oauth_token,
         )
 
-        # Track cost against steward metrics
+        # Track cost against steward metrics (invoke_with_cap_retry handles usage_gate cleanup)
         self.metrics.invocations += 1
         self.metrics.total_cost_usd += result.cost_usd
         self.metrics.total_duration_ms += result.duration_ms
-
-        if self.usage_gate:
-            self.usage_gate.on_agent_complete(result.cost_usd)
 
         triage_result = parse_triage_result(result)
         if triage_result is None:

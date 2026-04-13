@@ -6,7 +6,10 @@ import re
 
 from fused_memory.reconciliation.task_filter import (
     _STATUS_PRIORITY,
+    MAX_CANCELLED_TASKS_RETAINED,
     FilteredTaskTree,
+    _flatten_with_subtasks,
+    _id_key,
     _render_task_line,
     filter_task_tree,
     format_filtered_task_tree,
@@ -159,6 +162,31 @@ class TestFilterTaskTree:
             'Consumers should detect overflow via len(done_tasks) < done_count'
         )
 
+    def test_filter_task_tree_caps_cancelled_tasks_at_max_retained(self):
+        """filter_task_tree caps cancelled_tasks at MAX_CANCELLED_TASKS_RETAINED while preserving cancelled_count."""
+        tasks_data = {
+            'tasks': [_make_task(i, 'cancelled') for i in range(1, 51)]  # 50 cancelled tasks
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert len(result.cancelled_tasks) == MAX_CANCELLED_TASKS_RETAINED, (
+            f'Expected {MAX_CANCELLED_TASKS_RETAINED} cancelled tasks retained, '
+            f'got {len(result.cancelled_tasks)}'
+        )
+        assert result.cancelled_count == 50, (
+            f'cancelled_count must reflect full input count (50), got {result.cancelled_count}'
+        )
+        assert len(result.cancelled_tasks) < result.cancelled_count, (
+            'Consumers can detect overflow via len(cancelled_tasks) < cancelled_count'
+        )
+        # Highest IDs (most recent) are retained
+        retained_ids = [t['id'] for t in result.cancelled_tasks]
+        expected_ids = list(range(50, 50 - MAX_CANCELLED_TASKS_RETAINED, -1))
+        assert retained_ids == expected_ids, (
+            f'Expected top-{MAX_CANCELLED_TASKS_RETAINED} ids descending {expected_ids}, '
+            f'got {retained_ids}'
+        )
+
     def test_filter_task_tree_done_tasks_sorted_by_id_desc(self):
         """filter_task_tree returns done_tasks sorted by id desc, highest-30 retained."""
         import random
@@ -232,6 +260,41 @@ class TestFilterTaskTree:
 
         pending_ids = [t['id'] for t in result.active_tasks if t['status'] == 'pending']
         assert pending_ids == sorted(pending_ids, reverse=True)
+
+    def test_nested_subtasks_are_included_in_filter(self):
+        """filter_task_tree walks subtasks nested under parent tasks.
+
+        Parent (id='450', in-progress) has two subtasks:
+          - id=2 (pending) → active
+          - id=3 (done)    → done
+
+        Expects: 2 active tasks (parent + pending subtask), done_count=1,
+        total_count=3.
+        """
+        tasks_data = {
+            'tasks': [
+                {
+                    'id': '450',
+                    'title': 'Parent Task',
+                    'status': 'in-progress',
+                    'dependencies': [],
+                    'subtasks': [
+                        {'id': 2, 'title': 'Sub active', 'status': 'pending', 'dependencies': []},
+                        {'id': 3, 'title': 'Sub done', 'status': 'done', 'dependencies': []},
+                    ],
+                }
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert result.total_count == 3
+        assert len(result.active_tasks) == 2
+        assert result.done_count == 1
+
+        active_ids = {str(t['id']) for t in result.active_tasks}
+        assert '450' in active_ids  # parent
+        # Subtask bare-int id=2 should be qualified as '450.2'
+        assert '450.2' in active_ids
 
 
 class TestFormatFilteredTaskTree:
@@ -804,15 +867,25 @@ class TestFilterTaskTreeDoneAndCancelledLists:
         assert result.cancelled_count == 0
 
     def test_done_and_cancelled_lists_sort_with_non_int_ids(self):
-        """Non-int ids fall back to _id_key=0 and sort last in descending order; stable sort preserves their mutual order."""
+        """_id_key covers both branches: string-digit ids coerce to int (happy path) and non-parseable ids fall back to 0.
+
+        String-digit id '4' exercises the int()-coercion branch of _id_key; it must sort between
+        int id=5 and int id=3 (i.e. 4 > 3) confirming coercion drives sort order, not input position.
+        Non-parseable ids 'abc' and 'def' exercise the ValueError-fallback branch (_id_key=0) and
+        sort last in descending order; the -index tiebreaker preserves their input order: abc before def.
+        """
         tasks_data = {
             'tasks': [
-                # done: two non-int ids ('abc' then 'def') interleaved with ints;
-                # no literal id=0 to avoid sort-stability ambiguity with the fallback key.
+                # done: two non-int ids ('abc' then 'def') and one string-digit id ('4') interleaved
+                # with ints; no literal id=0 to avoid sort-stability ambiguity with the fallback key.
                 {'id': 10, 'title': 'Done 10', 'status': 'done', 'dependencies': []},
                 {'id': 'abc', 'title': 'Done abc', 'status': 'done', 'dependencies': []},
                 {'id': 5, 'title': 'Done 5', 'status': 'done', 'dependencies': []},
                 {'id': 3, 'title': 'Done 3', 'status': 'done', 'dependencies': []},
+                # id='4' is placed AFTER id=3 in input order so that a correct sort
+                # (4 > 3) cannot be confused with a no-op passthrough of input position.
+                # It exercises the int()-coercion (not fallback) path of _id_key.
+                {'id': '4', 'title': 'Done 4', 'status': 'done', 'dependencies': []},
                 {'id': 'def', 'title': 'Done def', 'status': 'done', 'dependencies': []},
                 # cancelled: mix of int and non-int ids
                 {'id': 7, 'title': 'Cancelled 7', 'status': 'cancelled', 'dependencies': []},
@@ -825,12 +898,15 @@ class TestFilterTaskTreeDoneAndCancelledLists:
         done_ids = [t['id'] for t in result.done_tasks]
         cancelled_ids = [t['id'] for t in result.cancelled_tasks]
 
+        # '4' has _id_key=4 via int() coercion (happy path), so it sorts between 5 and 3.
         # 'abc' and 'def' both have _id_key=0 (int() fallback), so they sort last after
-        # all int ids (10 > 5 > 3 > 0). Stable sort preserves their input order: 'abc' before 'def'.
-        assert done_ids == [10, 5, 3, 'abc', 'def'], (
-            f"Expected done_tasks id order [10, 5, 3, 'abc', 'def'] — non-int ids 'abc' and 'def' "
-            f"both have _id_key=0 via the int() fallback, sort last (0 < 3 < 5 < 10 descending), "
-            f"and preserve input order relative to each other (stable sort). Got: {done_ids}"
+        # all int ids (10 > 5 > 4 > 3 > 0). The -index tiebreaker preserves their input order: 'abc' before 'def'.
+        assert done_ids == [10, 5, '4', 3, 'abc', 'def'], (
+            f"Expected done_tasks id order [10, 5, '4', 3, 'abc', 'def'] — "
+            f"string-digit id '4' has _id_key=4 via successful int() coercion and sorts between 5 and 3; "
+            f"non-int ids 'abc' and 'def' both have _id_key=0 via the int() fallback, sort last "
+            f"(0 < 3 < 4 < 5 < 10 descending), and the -index tiebreaker preserves their input order "
+            f"(abc before def). Got: {done_ids}"
         )
 
         # 'xyz' has _id_key=0 (int() fallback), so it sorts last after 7, 2 (both > 0)
@@ -957,3 +1033,524 @@ class TestRenderTaskLineAndFormatTaskList:
         result = format_task_list([t1, t2])
         expected = _render_task_line(t1) + '\n' + _render_task_line(t2)
         assert result == expected
+
+    def test_render_task_line_deps_truthy_non_list(self):
+        """_render_task_line treats any truthy non-list deps value as empty list.
+
+        When a task has 'dependencies' set to a truthy non-list value (int like 42,
+        dict like {'a': 1}, string like 'bad'), the formatter must treat it as [].
+        Bug: `task.get('dependencies') or []` passes truthy non-list values through,
+        causing TypeError on deps[:5] for int/dict, or garbled output for string.
+        """
+        cases = [
+            (42, 'int deps'),
+            ({'a': 1}, 'dict deps'),
+            ('bad', 'string deps'),
+        ]
+        for deps_value, label in cases:
+            task = {'id': 1, 'status': 'pending', 'title': 'X', 'dependencies': deps_value}
+            result = _render_task_line(task)
+            assert 'deps=[]' in result, (
+                f'Expected deps=[] for {label} ({deps_value!r}), got: {result!r}'
+            )
+
+    def test_format_task_list_filters_non_dict_items(self):
+        """format_task_list skips non-dict elements and renders only valid task dicts.
+
+        Cases:
+        (a) mixed list [valid_dict, 42, None, 'bad', valid_dict2] renders only the two dicts;
+        (b) all-non-dict [42, None, 'bad'] returns 'No tasks.';
+        (c) empty [] still returns 'No tasks.' (regression guard).
+
+        Bug: current code calls _render_task_line(t) unconditionally, which calls t.get()
+        and crashes with AttributeError when t is not a dict.
+        """
+        t1 = {'id': 1, 'status': 'pending', 'title': 'Alpha', 'dependencies': []}
+        t2 = {'id': 2, 'status': 'done', 'title': 'Beta', 'dependencies': []}
+
+        # (a) mixed list — only valid dicts rendered
+        result_a = format_task_list([t1, 42, None, 'bad', t2])
+        expected_a = _render_task_line(t1) + '\n' + _render_task_line(t2)
+        assert result_a == expected_a, (
+            f'Expected only valid dicts rendered, got: {result_a!r}'
+        )
+
+        # (b) all non-dicts → 'No tasks.'
+        result_b = format_task_list([42, None, 'bad'])
+        assert result_b == 'No tasks.', (
+            f"Expected 'No tasks.' for all-non-dict input, got: {result_b!r}"
+        )
+
+        # (c) empty list → 'No tasks.' (regression guard)
+        result_c = format_task_list([])
+        assert result_c == 'No tasks.', (
+            f"Expected 'No tasks.' for empty input, got: {result_c!r}"
+        )
+
+
+class TestFormatCancelledSection:
+    """Tests for the '### Recently Cancelled Tasks' section in format_filtered_task_tree."""
+
+    def test_format_cancelled_tasks_section(self):
+        """format_filtered_task_tree renders a '### Recently Cancelled Tasks' section
+        when cancelled_tasks is non-empty, and updates the summary line accordingly.
+        """
+        tree = FilteredTaskTree(
+            active_tasks=[_make_task(1, 'pending'), _make_task(2, 'in-progress')],
+            cancelled_tasks=[_make_task(8, 'cancelled'), _make_task(9, 'cancelled')],
+            done_count=3,
+            cancelled_count=2,
+            other_count=0,
+            total_count=7,
+        )
+        output = format_filtered_task_tree(tree)
+
+        # (a) Section header must be present
+        assert '### Recently Cancelled Tasks' in output, (
+            f'Expected "### Recently Cancelled Tasks" section in output, got:\n{output!r}'
+        )
+
+        # (b) Task lines for both cancelled tasks must appear
+        assert '- [8] (cancelled)' in output, (
+            f'Expected cancelled task line "- [8] (cancelled)" in output, got:\n{output!r}'
+        )
+        assert '- [9] (cancelled)' in output, (
+            f'Expected cancelled task line "- [9] (cancelled)" in output, got:\n{output!r}'
+        )
+
+        # (c) Summary line omits 'cancelled' since they're now shown
+        assert '3 done \u2014 omitted' in output, (
+            f'Expected summary "3 done \u2014 omitted" in output, got:\n{output!r}'
+        )
+
+        # (d) Old summary line format must NOT appear when cancelled section is rendered.
+        # Note: the header always contains '3 done, 2 cancelled' in the stats line; the
+        # assertion checks for the full old summary string (with em dash) which is the
+        # actual old format that must be replaced.
+        assert '3 done, 2 cancelled \u2014 omitted' not in output, (
+            f'Old summary line "3 done, 2 cancelled \u2014 omitted" must not appear when '
+            f'cancelled section is rendered, got:\n{output!r}'
+        )
+
+    def test_format_cancelled_section_omitted_when_empty(self):
+        """When cancelled_tasks=[] (empty), no cancelled section is rendered and
+        the summary line retains the original 'N done, N cancelled — omitted' format.
+
+        This guards backward compatibility: all existing budget tests have
+        cancelled_tasks=[] and must not be affected by the conditional rendering.
+        """
+        tree = FilteredTaskTree(
+            active_tasks=[_make_task(1, 'pending'), _make_task(2, 'in-progress')],
+            # cancelled_tasks left as default empty list
+            done_count=3,
+            cancelled_count=5,
+            other_count=0,
+            total_count=10,
+        )
+        output = format_filtered_task_tree(tree)
+
+        # (a) Section must be absent when cancelled_tasks is empty
+        assert '### Recently Cancelled Tasks' not in output, (
+            f'Section "### Recently Cancelled Tasks" must not appear when '
+            f'cancelled_tasks=[], got:\n{output!r}'
+        )
+
+        # (b) Summary line retains original format (backward compatibility)
+        assert '3 done, 5 cancelled \u2014 omitted' in output, (
+            f'Expected original summary "3 done, 5 cancelled \u2014 omitted" '
+            f'when cancelled_tasks=[], got:\n{output!r}'
+        )
+
+    def test_format_cancelled_section_budget_accounting(self):
+        """When cancelled_tasks is non-empty and max_chars forces truncation, the
+        cancelled section must survive intact and only active task lines are trimmed.
+
+        The budget calculation subtracts len(cancelled_section) before computing
+        available space for active task lines, so truncation never cuts the
+        cancelled section.
+        """
+        active = [_make_task(i, 'pending', f'Task {i}') for i in range(1, 21)]
+        cancelled = [
+            _make_task(101, 'cancelled', 'Cancelled A'),
+            _make_task(102, 'cancelled', 'Cancelled B'),
+            _make_task(103, 'cancelled', 'Cancelled C'),
+        ]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            cancelled_tasks=cancelled,
+            done_count=5,
+            cancelled_count=3,
+            other_count=0,
+            total_count=28,
+        )
+
+        max_chars = 500  # Tight enough to force active-task truncation
+        output = format_filtered_task_tree(tree, max_chars=max_chars)
+
+        # (a) Output must honour the char budget
+        assert len(output) <= max_chars, (
+            f'Output length {len(output)} exceeds max_chars={max_chars}; '
+            f'budget accounting with cancelled section is broken'
+        )
+
+        # (b) Cancelled section must survive budget truncation
+        assert '### Recently Cancelled Tasks' in output, (
+            f'Expected "### Recently Cancelled Tasks" to survive budget clamp, '
+            f'got:\n{output!r}'
+        )
+
+        # (c) All 3 cancelled task ids must appear (cancelled section is never truncated)
+        assert '- [101]' in output, f'Cancelled task 101 missing from output:\n{output!r}'
+        assert '- [102]' in output, f'Cancelled task 102 missing from output:\n{output!r}'
+        assert '- [103]' in output, f'Cancelled task 103 missing from output:\n{output!r}'
+
+    def test_format_cancelled_section_ordering(self):
+        """Sections must appear in order: header stats → active body → cancelled → summary.
+
+        Verifies positional ordering via index() rather than just substring presence —
+        a malformed concatenation order would pass presence-only assertions.
+        """
+        tree = FilteredTaskTree(
+            active_tasks=[_make_task(1, 'pending'), _make_task(2, 'in-progress')],
+            cancelled_tasks=[_make_task(8, 'cancelled'), _make_task(9, 'cancelled')],
+            done_count=3,
+            cancelled_count=2,
+            other_count=0,
+            total_count=7,
+        )
+        output = format_filtered_task_tree(tree)
+
+        pos_active = output.index('- [1]')            # first active task line
+        pos_cancelled_header = output.index('### Recently Cancelled Tasks')
+        pos_summary = output.index('done \u2014 omitted')
+
+        assert pos_active < pos_cancelled_header, (
+            f'Active task lines (pos {pos_active}) must appear before '
+            f'the cancelled section header (pos {pos_cancelled_header})'
+        )
+        assert pos_cancelled_header < pos_summary, (
+            f'Cancelled section header (pos {pos_cancelled_header}) must appear '
+            f'before the summary line (pos {pos_summary})'
+        )
+
+    def test_format_cancelled_section_large_accepted_overflow(self):
+        """Documents accepted behavior: when the cancelled section alone fills the budget,
+        the formatter returns header + cancelled_section + summary_line even if that
+        exceeds max_chars.  With MAX_CANCELLED_TASKS_RETAINED capping the list,
+        this degenerate case only occurs under unrealistically tight budgets.
+
+        The fallback path `return header + cancelled_section + summary_line` (triggered
+        when budget <= 0) is the documented safe exit — it never silently drops the
+        cancelled section or the summary.
+        """
+        # Build the maximum retained cancelled tasks with long titles to ensure
+        # the section is large enough to exhaust a tiny budget.
+        cancelled = [
+            _make_task(
+                100 + i, 'cancelled',
+                'A very long task title that consumes character budget space',
+            )
+            for i in range(MAX_CANCELLED_TASKS_RETAINED)
+        ]
+        tree = FilteredTaskTree(
+            active_tasks=[_make_task(1, 'pending')],
+            cancelled_tasks=cancelled,
+            done_count=2,
+            cancelled_count=MAX_CANCELLED_TASKS_RETAINED,
+            other_count=0,
+            total_count=MAX_CANCELLED_TASKS_RETAINED + 3,
+        )
+
+        # A budget far below the size of the cancelled section alone.
+        tiny_budget = 50
+        output = format_filtered_task_tree(tree, max_chars=tiny_budget)
+
+        # The output exceeds tiny_budget — this is the documented accepted behavior.
+        assert len(output) > tiny_budget, (
+            f'Expected output ({len(output)} chars) to exceed tiny_budget={tiny_budget}; '
+            f'the fallback path emits the full cancelled section regardless of budget'
+        )
+        # The formatter never silently drops the cancelled section or summary line.
+        assert '### Recently Cancelled Tasks' in output
+        assert 'done \u2014 omitted' in output
+
+
+class TestIdKey:
+    """Direct unit tests for the module-level _id_key() helper."""
+
+    def test_int_id_returns_int(self):
+        """_id_key returns the int value when 'id' is already an int."""
+        assert _id_key({'id': 42}) == 42
+
+    def test_string_parseable_id_returns_int(self):
+        """_id_key converts a string-encoded integer to int."""
+        assert _id_key({'id': '42'}) == 42
+
+    def test_non_parseable_string_returns_zero(self):
+        """_id_key returns 0 for a non-parseable string like 'abc'."""
+        assert _id_key({'id': 'abc'}) == 0
+
+    def test_none_id_returns_zero(self):
+        """_id_key returns 0 when 'id' is explicitly None."""
+        assert _id_key({'id': None}) == 0
+
+    def test_missing_id_key_returns_zero(self):
+        """_id_key returns 0 when the 'id' key is absent from the dict."""
+        assert _id_key({}) == 0
+
+    def test_float_id_is_truncated_to_int(self):
+        """_id_key returns the int truncation of a float (int(3.9) == 3)."""
+        assert _id_key({'id': 3.9}) == 3
+
+    def test_dotted_subtask_id_returns_parent_component(self):
+        """_id_key returns the parent (first dot-segment) as int for '450.2'."""
+        assert _id_key({'id': '450.2'}) == 450
+
+    def test_deep_dotted_id_returns_parent_component(self):
+        """_id_key returns the parent (first dot-segment) as int for '450.2.1'."""
+        assert _id_key({'id': '450.2.1'}) == 450
+
+
+class TestFlattenWithSubtasks:
+    """Direct unit tests for _flatten_with_subtasks()."""
+
+    def test_bare_subtask_id_is_qualified(self):
+        """Bare-integer subtask id=2 under parent id='450' becomes '450.2'."""
+        raw = [
+            {
+                'id': '450',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [
+                    {'id': 2, 'title': 'Sub', 'status': 'pending', 'dependencies': []},
+                ],
+            }
+        ]
+        flat = _flatten_with_subtasks(raw)
+        ids = [str(t['id']) for t in flat]
+        assert '450' in ids
+        assert '450.2' in ids
+
+    def test_already_qualified_id_is_not_double_qualified(self):
+        """Subtask with id='450.2' (already dotted) stays '450.2', not '450.450.2'."""
+        raw = [
+            {
+                'id': '450',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [
+                    {'id': '450.2', 'title': 'Already qualified', 'status': 'pending', 'dependencies': []},
+                ],
+            }
+        ]
+        flat = _flatten_with_subtasks(raw)
+        ids = [str(t['id']) for t in flat]
+        assert '450.2' in ids
+        assert '450.450.2' not in ids
+
+    def test_no_subtasks_returns_flat_list(self):
+        """Tasks without 'subtasks' key pass through unchanged."""
+        raw = [
+            {'id': 1, 'title': 'A', 'status': 'pending', 'dependencies': []},
+            {'id': 2, 'title': 'B', 'status': 'done', 'dependencies': []},
+        ]
+        flat = _flatten_with_subtasks(raw)
+        assert len(flat) == 2
+        assert flat[0]['id'] == 1
+        assert flat[1]['id'] == 2
+
+    def test_original_subtask_dict_not_mutated(self):
+        """_flatten_with_subtasks creates a shallow copy — original subtask dict is unchanged."""
+        subtask = {'id': 3, 'title': 'Sub', 'status': 'pending', 'dependencies': []}
+        raw = [
+            {
+                'id': '100',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [subtask],
+            }
+        ]
+        _flatten_with_subtasks(raw)
+        # Original must still have bare int id, not '100.3'
+        assert subtask['id'] == 3
+
+    def test_recursive_subtask_nesting(self):
+        """_flatten_with_subtasks handles multi-level nesting.
+
+        parent id='100'
+          subtask id=1  → becomes '100.1'
+            sub-subtask id=1 → becomes '100.1.1'
+
+        All three should appear in flattened output with correct statuses.
+        """
+        raw = [
+            {
+                'id': '100',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [
+                    {
+                        'id': 1,
+                        'title': 'Child',
+                        'status': 'pending',
+                        'dependencies': [],
+                        'subtasks': [
+                            {
+                                'id': 1,
+                                'title': 'Grandchild',
+                                'status': 'done',
+                                'dependencies': [],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+        flat = _flatten_with_subtasks(raw)
+        ids = [str(t['id']) for t in flat]
+        assert '100' in ids
+        assert '100.1' in ids
+        assert '100.1.1' in ids
+        assert len(flat) == 3
+
+        by_id = {str(t['id']): t for t in flat}
+        assert by_id['100']['status'] == 'in-progress'
+        assert by_id['100.1']['status'] == 'pending'
+        assert by_id['100.1.1']['status'] == 'done'
+
+    def test_subtasks_key_stripped_from_flattened_entries(self):
+        """'subtasks' key is absent from every dict in the flattened result.
+
+        The output is a genuinely flat list — no nested arrays on any entry,
+        so downstream consumers of FilteredTaskTree.active_tasks are not
+        surprised by leftover subtask arrays.
+        """
+        raw = [
+            {
+                'id': '450',
+                'title': 'Parent',
+                'status': 'in-progress',
+                'dependencies': [],
+                'subtasks': [
+                    {'id': 2, 'title': 'Child', 'status': 'pending', 'dependencies': []},
+                ],
+            }
+        ]
+        flat = _flatten_with_subtasks(raw)
+        for entry in flat:
+            assert 'subtasks' not in entry, (
+                f"Entry {entry.get('id')} still has 'subtasks' key after flattening"
+            )
+
+
+class TestSortOrderWithSubtasks:
+    """Sort order tests for filter_task_tree when subtasks are present."""
+
+    def test_sort_order_with_mixed_parent_and_subtask_ids(self):
+        """Tasks with mixed parent and subtask IDs sort by _STATUS_PRIORITY then -_id_key.
+
+        All tasks are 'pending' (same priority), so sort is purely by -_id_key:
+          451 → _id_key=451 → sort position 0  (highest, first shown)
+          '450'  → _id_key=450 → sort position 1
+          '450.2' → _id_key=450 → sort position 2 (stable: same as parent)
+          '450.1' → _id_key=450 → sort position 3 (stable: same as parent)
+
+        With Python's stable sort, tasks sharing _id_key=450 preserve input order
+        relative to each other: 450, 450.2, 450.1 (as given in input).
+        """
+        tasks_data = {
+            'tasks': [
+                {'id': '450', 'title': 'Parent 450', 'status': 'pending', 'dependencies': [],
+                 'subtasks': [
+                     {'id': '450.2', 'title': 'Sub 450.2', 'status': 'pending', 'dependencies': []},
+                     {'id': '450.1', 'title': 'Sub 450.1', 'status': 'pending', 'dependencies': []},
+                 ]},
+                {'id': 451, 'title': 'Task 451', 'status': 'pending', 'dependencies': []},
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        ids = [str(t['id']) for t in result.active_tasks]
+        # 451 must come before 450 group (higher _id_key → negated → lower sort value)
+        assert ids.index('451') < ids.index('450')
+        assert ids.index('451') < ids.index('450.2')
+        assert ids.index('451') < ids.index('450.1')
+        assert len(ids) == 4
+
+
+class TestFormatFilteredTaskTreeWithSubtasks:
+    """Tests for format_filtered_task_tree() when active_tasks contains subtasks."""
+
+    def test_format_renders_qualified_subtask_ids(self):
+        """format_filtered_task_tree renders lines for both parent and qualified subtask IDs."""
+        tree = FilteredTaskTree(
+            active_tasks=[
+                {'id': '450', 'title': 'Parent Task', 'status': 'in-progress', 'dependencies': []},
+                {'id': '450.1', 'title': 'Subtask One', 'status': 'pending', 'dependencies': []},
+            ],
+            done_tasks=[],
+            cancelled_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=2,
+        )
+        output = format_filtered_task_tree(tree)
+        assert '- [450] (in-progress) Parent Task deps=[]' in output
+        assert '- [450.1] (pending) Subtask One deps=[]' in output
+
+
+class TestEndToEndSubtaskPipeline:
+    """End-to-end tests: raw get_tasks response → filter_task_tree → format_filtered_task_tree."""
+
+    def test_e2e_full_pipeline_with_subtasks(self):
+        """Full pipeline: nested raw response → filtered tree → rendered string.
+
+        Raw input has:
+          - Task 100 (in-progress) with subtasks: id=1 (pending), id=2 (done)
+          - Task 101 (done)
+          - Task 102 (cancelled)
+
+        Expected: 2 active (100 + '100.1'), done_count=2 (100.2 + 101),
+        cancelled_count=1, total_count=5.
+        Rendered output must contain qualified subtask IDs and correct header.
+        """
+        tasks_data = {
+            'tasks': [
+                {
+                    'id': 100,
+                    'title': 'Big Feature',
+                    'status': 'in-progress',
+                    'dependencies': [],
+                    'subtasks': [
+                        {'id': 1, 'title': 'Sub A', 'status': 'pending', 'dependencies': []},
+                        {'id': 2, 'title': 'Sub B', 'status': 'done', 'dependencies': []},
+                    ],
+                },
+                {'id': 101, 'title': 'Old Feature', 'status': 'done', 'dependencies': []},
+                {'id': 102, 'title': 'Dropped Feature', 'status': 'cancelled', 'dependencies': []},
+            ]
+        }
+        tree = filter_task_tree(tasks_data)
+        output = format_filtered_task_tree(tree)
+
+        # Count checks
+        assert tree.total_count == 5
+        assert len(tree.active_tasks) == 2
+        assert tree.done_count == 2
+        assert tree.cancelled_count == 1
+
+        # Active IDs: parent 100 and qualified subtask '100.1'
+        active_ids = {str(t['id']) for t in tree.active_tasks}
+        assert '100' in active_ids
+        assert '100.1' in active_ids
+
+        # Rendered output
+        assert '- [100] (in-progress) Big Feature deps=[]' in output
+        assert '- [100.1] (pending) Sub A deps=[]' in output
+        # Summary line shows correct counts
+        assert '2 done, 1 cancelled' in output

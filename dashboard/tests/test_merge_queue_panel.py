@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from contextlib import ExitStack
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -461,6 +462,63 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp);
             resp = client.get('/partials/merge-queue?window=all')
 
         assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# TestPartialsMergeQueueSharedNow (step-15)
+# ---------------------------------------------------------------------------
+
+class TestPartialsMergeQueueSharedNow:
+    def test_partials_merge_queue_passes_shared_now_to_all_aggregators(self, client):
+        """partials_merge_queue captures now once and forwards it to all time-windowed aggregators.
+
+        After step-16 impl, aggregate_queue_depth_timeseries, aggregate_outcome_distribution,
+        aggregate_latency_stats, and aggregate_speculative_stats all receive the same `now` kwarg.
+        aggregate_recent_merges uses limit, not hours, so no `now` is expected there.
+
+        Will fail before step-16 because partials_merge_queue does not pass `now` yet.
+        """
+        mock_depth = AsyncMock(return_value=MOCK_DEPTH)
+        mock_outcomes = AsyncMock(return_value=MOCK_OUTCOMES)
+        mock_latency = AsyncMock(return_value=MOCK_LATENCY)
+        mock_recent = AsyncMock(return_value=MOCK_RECENT)
+        mock_spec = AsyncMock(return_value=MOCK_SPEC)
+
+        with patch('dashboard.app.aggregate_queue_depth_timeseries', mock_depth), \
+             patch('dashboard.app.aggregate_outcome_distribution', mock_outcomes), \
+             patch('dashboard.app.aggregate_latency_stats', mock_latency), \
+             patch('dashboard.app.aggregate_recent_merges', mock_recent), \
+             patch('dashboard.app.aggregate_speculative_stats', mock_spec):
+            resp = client.get('/partials/merge-queue')
+
+        assert resp.status_code == 200
+
+        now_depth = mock_depth.call_args.kwargs.get('now')
+        now_outcomes = mock_outcomes.call_args.kwargs.get('now')
+        now_latency = mock_latency.call_args.kwargs.get('now')
+        now_spec = mock_spec.call_args.kwargs.get('now')
+
+        # All four time-windowed aggregators must receive a non-None now
+        assert now_depth is not None, "aggregate_queue_depth_timeseries was not passed `now`"
+        assert now_outcomes is not None, "aggregate_outcome_distribution was not passed `now`"
+        assert now_latency is not None, "aggregate_latency_stats was not passed `now`"
+        assert now_spec is not None, "aggregate_speculative_stats was not passed `now`"
+
+        # All four must share the exact same now value
+        assert now_depth == now_outcomes == now_latency == now_spec, (
+            f"Aggregators received different `now` values: "
+            f"depth={now_depth!r}, outcomes={now_outcomes!r}, "
+            f"latency={now_latency!r}, spec={now_spec!r}"
+        )
+
+        # now must be a datetime and must have been captured close to the request
+        assert isinstance(now_depth, datetime), (
+            f"Expected `now` to be a datetime, got {type(now_depth)!r}"
+        )
+        elapsed = (datetime.now(UTC) - now_depth).total_seconds()
+        assert elapsed < 5, (
+            f"`now` value is stale: {elapsed:.1f}s old (expected < 5s)"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -418,20 +419,23 @@ class TestStewardRetryLogic:
 
         assert steward._retry_counts.get('esc-42-1') == 1
 
-    @pytest.mark.parametrize('max_attempts', [1, 2, 3])
+    @pytest.mark.parametrize('max_attempts,retry_count', [
+        (1, 1), (2, 2), (3, 3),  # exact boundary: retry_count == max_attempts
+        (2, 3), (1, 3),           # above boundary: retry_count > max_attempts
+    ])
     async def test_auto_escalates_after_max_attempts(
-        self, steward, mock_config, max_attempts,
+        self, steward, mock_config, max_attempts, retry_count,
     ):
         mock_config.steward_max_attempts = max_attempts
         esc = _make_escalation()
-        steward._retry_counts['esc-42-1'] = max_attempts
+        steward._retry_counts['esc-42-1'] = retry_count
 
         await steward._handle_escalation(esc)
 
         steward.escalation_queue.submit.assert_called_once()
         submitted = steward.escalation_queue.submit.call_args[0][0]
         assert submitted.level == 1
-        expected = f'Failed after {max_attempts} attempt{"s" if max_attempts != 1 else ""}:'
+        expected = f'Failed after {retry_count} attempt{"s" if retry_count != 1 else ""}:'
         assert expected in submitted.summary
 
         steward.escalation_queue.resolve.assert_called_once()
@@ -460,6 +464,8 @@ class TestStewardRetryLogic:
         steward.escalation_queue.submit.assert_not_called()
         # Normal invocation path must have been taken.
         mock_invoke.assert_called_once()
+        # Counter must have been incremented: started at max_attempts-1, now max_attempts.
+        assert steward._retry_counts.get('esc-42-1') == max_attempts
 
     async def test_different_escalations_have_independent_counts(self, steward):
         for esc_id in ('esc-42-1', 'esc-42-2'):
@@ -850,6 +856,116 @@ class TestStewardTimeoutKillRecovery:
         assert steward.metrics.timeouts_recovered == 0
         assert steward._timeout_counts.get('esc-42-1', 0) == 0
 
+    async def test_invocation_end_event_contains_timed_out_true_on_timeout_kill(
+        self, steward, mock_config,
+    ):
+        """invocation_end event data must include timed_out=True on timeout-kill."""
+        mock_config.steward_max_attempts = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+        steward.event_store = MagicMock()
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False,
+                timed_out=True,
+                stderr='',
+                cost=1.5,
+                turns=3,
+                session_id='sess-killed',
+            )
+            await steward._handle_escalation(esc)
+
+        steward.event_store.emit.assert_called_once()
+        data = steward.event_store.emit.call_args.kwargs['data']
+        assert data['timed_out'] is True
+
+    async def test_invocation_end_event_contains_timed_out_false_on_normal_failure(
+        self, steward, mock_config,
+    ):
+        """invocation_end event data must include timed_out=False for a plain failure."""
+        mock_config.steward_max_attempts = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+        steward.event_store = MagicMock()
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False,
+                timed_out=False,
+                stderr='Some other CLI error (not a timeout)',
+                cost=0.5,
+            )
+            await steward._handle_escalation(esc)
+
+        steward.event_store.emit.assert_called_once()
+        data = steward.event_store.emit.call_args.kwargs['data']
+        assert data['timed_out'] is False
+
+    async def test_invocation_end_event_timed_out_true_via_stderr_fallback(
+        self, steward, mock_config,
+    ):
+        """timed_out=False but matching stderr must yield timed_out=True in event.
+
+        Verifies the event uses _is_timeout_kill() (stderr fallback included),
+        not just result.timed_out directly.
+        """
+        mock_config.steward_max_attempts = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+        steward.event_store = MagicMock()
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False,
+                timed_out=False,  # structured field absent; only stderr signals timeout
+                stderr='Process killed after 900.0s timeout (SIGTERM+SIGKILL)',
+                cost=1.5,
+                turns=3,
+            )
+            await steward._handle_escalation(esc)
+
+        steward.event_store.emit.assert_called_once()
+        data = steward.event_store.emit.call_args.kwargs['data']
+        assert data['timed_out'] is True
+
+    async def test_invocation_end_event_timed_out_false_on_success(
+        self, steward, mock_config,
+    ):
+        """Successful invocation must yield timed_out=False in the event data.
+
+        Confirms _is_timeout_kill() short-circuits on success.
+        """
+        mock_config.steward_max_attempts = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='resolved',
+        )
+        steward.event_store = MagicMock()
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=True,
+                timed_out=False,
+                cost=1.0,
+                turns=5,
+            )
+            await steward._handle_escalation(esc)
+
+        steward.event_store.emit.assert_called_once()
+        data = steward.event_store.emit.call_args.kwargs['data']
+        assert data['timed_out'] is False
+
 
 # ---------------------------------------------------------------------------
 # Timeout Cap
@@ -1016,9 +1132,10 @@ class TestStewardTimeoutCap:
         # Pre-seed both counters to confirm they get cleaned up on success
         steward._timeout_counts['esc-42-1'] = 1
         steward._retry_counts['esc-42-1'] = 1
-        # Queue returns resolved after the agent handles it
-        steward.escalation_queue.get.return_value = _make_escalation(
-            id='esc-42-1', status='resolved', resolution='fixed',
+        # Queue returns resolved keyed by id — side_effect matches the real queue.get(id) contract
+        # (identical to the pattern in test_repeated_timeout_kills_eventually_terminate)
+        steward.escalation_queue.get.side_effect = lambda eid: _make_escalation(
+            id=eid, status='resolved', resolution='fixed',
         )
 
         with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
@@ -1033,6 +1150,76 @@ class TestStewardTimeoutCap:
         assert steward.metrics.escalations_handled == 1
         # Explicit invocation count — guards against metric being incremented elsewhere
         assert mock_invoke.call_count == 1
+        # Mock fidelity: verify queue.get was called with the exact escalation id
+        # (not a generic return_value — the real queue.get is keyed by id)
+        steward.escalation_queue.get.assert_called_with('esc-42-1')
+
+    async def test_success_path_at_boundary_both_counters_max_minus_one(
+        self, steward, mock_config,
+    ):
+        """Success path works when both retry and timeout counters are simultaneously at max-1.
+
+        This is the critical boundary: both guards are exactly one step from firing, but
+        neither should fire on a successful resolution.  Verifies that the else-branch
+        (steward.py lines 347-352) pops both counters cleanly without triggering either
+        guard at lines 222-237.
+        """
+        mock_config.steward_max_attempts = 3
+        mock_config.steward_max_timeouts_per_escalation = 3
+        esc = _make_escalation(id='esc-42-1')
+        # Both counters seeded at max-1 — one increment away from each guard firing
+        steward._retry_counts['esc-42-1'] = 2    # max_attempts - 1
+        steward._timeout_counts['esc-42-1'] = 2  # max_timeouts - 1
+
+        steward.escalation_queue.get.side_effect = lambda eid: _make_escalation(
+            id=eid, status='resolved', resolution='fixed',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(success=True)
+            await steward._handle_escalation(esc)
+
+        # Success path: both counters must be popped — no stale entries at max-1
+        assert 'esc-42-1' not in steward._retry_counts
+        assert 'esc-42-1' not in steward._timeout_counts
+        # Handled metric confirms the else-branch (success) was taken
+        assert steward.metrics.escalations_handled == 1
+        # invoke_agent was called exactly once — neither guard short-circuited it
+        assert mock_invoke.call_count == 1
+        # No re-escalation was submitted — neither guard fired
+        steward.escalation_queue.submit.assert_not_called()
+        # Mock fidelity: verify queue.get was called with the exact escalation id
+        # (matches the pattern established in test_success_path_cleans_up_counters line 1024)
+        steward.escalation_queue.get.assert_called_with('esc-42-1')
+
+    async def test_both_counters_at_max_triggers_retry_guard_first(
+        self, steward, mock_config,
+    ):
+        """Retry guard fires first when both retry and timeout counters are simultaneously at max.
+
+        steward.py checks the retry-limit guard (line 222) before the timeout-cap guard
+        (line 232).  When both _retry_counts[id] >= max_attempts AND
+        _timeout_counts[id] >= max_timeouts, only the retry guard should fire.
+        The summary 'Failed after 3 attempts' (retry message, not 'repeatedly timed out')
+        proves the order-of-evaluation contract.
+        """
+        mock_config.steward_max_attempts = 3
+        mock_config.steward_max_timeouts_per_escalation = 3
+        esc = _make_escalation(id='esc-42-1')
+        # Both counters at max — retry guard (line 222) is checked first and should win
+        steward._retry_counts['esc-42-1'] = 3    # == max_attempts → retry guard fires
+        steward._timeout_counts['esc-42-1'] = 3  # == max_timeouts — checked second, never reached
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        submitted = _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
+        # Guard-specific assertion: message proves the retry guard (not timeout guard) fired
+        assert 'Failed after 3 attempt' in submitted.summary
+        assert 'repeatedly timed out' not in submitted.summary.lower()
+        # Symmetric resolve assertion: _auto_escalate_to_human dismisses the original exactly once
+        # (consistent with the pattern at test_repeated_timeout_kills_eventually_terminate line 1142)
+        assert steward.escalation_queue.resolve.call_count == 1
 
     async def test_repeated_timeout_kills_eventually_terminate(
         self, steward, mock_config,
@@ -1087,6 +1274,9 @@ class TestStewardTimeoutCap:
         first_submit = steward.escalation_queue.submit.call_args_list[0][0][0]
         assert first_submit.level == 1
         assert 'repeatedly timed out' in first_submit.summary.lower()
+        # Original escalation dismissed exactly once — _auto_escalate_to_human (steward.py line 559)
+        # calls resolve() to dismiss the original; resolve.call_count==1 verifies no double-fire
+        assert steward.escalation_queue.resolve.call_count == 1
         # Re-escalation metric is exactly 1 — not double-counted
         assert steward.metrics.escalations_reescalated == 1
         # Timeout metric reflects the 3 actual invocations
@@ -1378,3 +1568,320 @@ class TestStewardDefaultConfig:
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert 2 <= config.steward_max_timeouts_per_escalation <= 5
+
+
+# ---------------------------------------------------------------------------
+# release_probe_slot on exception in _invoke_with_session
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardReleaseProbeSlotOnException:
+    """_invoke_with_session calls release_probe_slot() when invoke_agent raises."""
+
+    async def test_release_probe_slot_called_on_runtime_error(
+        self, steward, worktree, mock_mcp,
+    ):
+        """release_probe_slot is called with oauth_token when invoke_agent raises."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='tok-a')
+        gate.active_account_name = 'acct-a'
+        gate.confirm_account_ok = MagicMock()
+        gate.release_probe_slot = MagicMock()
+        steward.usage_gate = gate
+
+        mcp_config = {'mcpServers': {}}
+        with (
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=RuntimeError('subprocess failed')),
+            pytest.raises(RuntimeError, match='subprocess failed'),
+        ):
+            await steward._invoke_with_session(
+                prompt='hi', cwd=worktree, mcp_config=mcp_config,
+                per_invocation_budget=5.0, escalation=_make_escalation(),
+            )
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')
+
+    async def test_exception_propagates(self, steward, worktree):
+        """RuntimeError from invoke_agent propagates out of _invoke_with_session."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='tok-a')
+        gate.active_account_name = 'acct-a'
+        gate.release_probe_slot = MagicMock()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=RuntimeError('crash')),
+            pytest.raises(RuntimeError, match='crash'),
+        ):
+            await steward._invoke_with_session(
+                prompt='hi', cwd=worktree, mcp_config={},
+                per_invocation_budget=5.0, escalation=_make_escalation(),
+            )
+
+    async def test_confirm_account_ok_not_called_when_invoke_raises(
+        self, steward, worktree,
+    ):
+        """confirm_account_ok is NOT called when invoke_agent raises."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='tok-a')
+        gate.active_account_name = 'acct-a'
+        gate.confirm_account_ok = MagicMock()
+        gate.release_probe_slot = MagicMock()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=RuntimeError('crash')),
+            pytest.raises(RuntimeError),
+        ):
+            await steward._invoke_with_session(
+                prompt='hi', cwd=worktree, mcp_config={},
+                per_invocation_budget=5.0, escalation=_make_escalation(),
+            )
+
+        gate.confirm_account_ok.assert_not_called()
+
+    async def test_cancelled_error_release_probe_slot(
+        self, steward, worktree,
+    ):
+        """CancelledError (BaseException, not Exception) triggers release_probe_slot."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='tok-a')
+        gate.active_account_name = 'acct-a'
+        gate.release_probe_slot = MagicMock()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=asyncio.CancelledError()),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await steward._invoke_with_session(
+                prompt='hi', cwd=worktree, mcp_config={},
+                per_invocation_budget=5.0, escalation=_make_escalation(),
+            )
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')
+
+
+# ---------------------------------------------------------------------------
+# Usage gate cleanup in _pre_triage_suggestions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPreTriageUsageGateCleanup:
+    """_pre_triage_suggestions must delegate usage_gate cleanup to invoke_with_cap_retry."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_triage(self):
+        """Replace orchestrator.agents.triage so tests focus on usage_gate, not triage logic."""
+        import sys as _sys
+
+        triage_mod = MagicMock()
+        triage_mod.TRIAGE_OUTPUT_SCHEMA = {'type': 'object'}
+        triage_mod.TRIAGE_SYSTEM_PROMPT = 'You are a classifier.'
+        triage_mod.build_triage_prompt = MagicMock(return_value='triage prompt')
+        triage_mod.parse_triage_result = MagicMock(
+            return_value={'accepted': [], 'skipped': [], 'proposed_task_groups': []}
+        )
+        triage_mod.format_pretriaged_detail = MagicMock(return_value='## Pre-triaged')
+        with patch.dict(_sys.modules, {'orchestrator.agents.triage': triage_mod}):
+            yield triage_mod
+
+    @staticmethod
+    def _esc(n: int = 12) -> Escalation:
+        """Escalation with *n* JSON suggestions in detail field."""
+        suggestions = [
+            {
+                'description': f'suggestion {i}', 'location': f'file_{i}.py',
+                'reviewer': 'bot', 'category': 'style',
+            }
+            for i in range(n)
+        ]
+        return _make_escalation(detail=json.dumps(suggestions), category='review_suggestions')
+
+    @staticmethod
+    def _gate(token: str = 'tok-a', cap_effects=None) -> MagicMock:
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value=token)
+        gate.active_account_name = 'acct-a'
+        gate.confirm_account_ok = MagicMock()
+        gate.release_probe_slot = MagicMock()
+        gate.on_agent_complete = MagicMock()
+        gate.detect_cap_hit = (
+            MagicMock(side_effect=cap_effects)
+            if cap_effects is not None
+            else MagicMock(return_value=False)
+        )
+        return gate
+
+    async def test_confirm_account_ok_called_on_success(self, steward: TaskSteward):
+        """After successful _pre_triage_suggestions, gate.confirm_account_ok('tok-a') is called.
+
+        FAILS with current code because _pre_triage_suggestions never calls confirm_account_ok.
+        PASSES after refactor to invoke_with_cap_retry which calls it on the success path.
+        """
+        gate = self._gate()
+        steward.usage_gate = gate
+        mock_result = _make_result(cost=0.5, session_id='sess-triage')
+
+        with patch('orchestrator.agents.invoke.invoke_agent',
+                   new_callable=AsyncMock, return_value=mock_result):
+            await steward._pre_triage_suggestions(self._esc())
+
+        gate.confirm_account_ok.assert_called_once_with('tok-a')
+
+    async def test_release_probe_slot_on_exception(self, steward: TaskSteward):
+        """When invoke_agent raises, release_probe_slot is called with the token.
+
+        FAILS with current code because _pre_triage_suggestions has no try/except
+        around invoke_agent that calls release_probe_slot.
+        PASSES after refactor to invoke_with_cap_retry which has the BaseException handler.
+        """
+        gate = self._gate()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.agents.invoke.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=RuntimeError('subprocess failed')),
+            pytest.raises(RuntimeError, match='subprocess failed'),
+        ):
+            await steward._pre_triage_suggestions(self._esc())
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')
+
+    async def test_cap_hit_triggers_retry(self, steward: TaskSteward):
+        """detect_cap_hit=True on first call triggers a retry; invoke_agent is called twice.
+
+        FAILS with current code because _pre_triage_suggestions never calls detect_cap_hit.
+        PASSES after refactor to invoke_with_cap_retry which loops on cap hits.
+        """
+        gate = self._gate(cap_effects=[True, False])
+        steward.usage_gate = gate
+        mock_result = _make_result(cost=0.3, session_id='sess-triage')
+
+        with (
+            patch('orchestrator.agents.invoke.invoke_agent',
+                  new_callable=AsyncMock, return_value=mock_result) as mock_invoke,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await steward._pre_triage_suggestions(self._esc())
+
+        assert mock_invoke.call_count == 2
+
+    async def test_cap_hit_triggers_retry_claude_backend(self, steward: TaskSteward):
+        """On cap hit with backend='claude' and a session_id, the retry uses resume_session_id.
+
+        Exercises the Claude-specific session-resume path in invoke_with_cap_retry
+        (lines 104-106 of invoke.py): when cap is hit the second call should receive
+        resume_session_id so the capped session is resumed rather than restarted fresh.
+        """
+        steward.config.backends.triage = 'claude'
+        gate = self._gate(cap_effects=[True, False])
+        steward.usage_gate = gate
+
+        cap_result = _make_result(cost=0.1, session_id='sess-cap')
+        success_result = _make_result(cost=0.3, session_id='sess-resumed')
+
+        with (
+            patch('orchestrator.agents.invoke.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=[cap_result, success_result]) as mock_invoke,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await steward._pre_triage_suggestions(self._esc())
+
+        assert mock_invoke.call_count == 2
+        # Second call must carry resume_session_id pointing to the capped session
+        _, second_kwargs = mock_invoke.call_args_list[1]
+        assert second_kwargs.get('resume_session_id') == 'sess-cap'
+
+    async def test_cancelled_error_releases_probe_slot(self, steward: TaskSteward):
+        """CancelledError (BaseException, not Exception) also triggers release_probe_slot."""
+        gate = self._gate()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.agents.invoke.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=asyncio.CancelledError()),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await steward._pre_triage_suggestions(self._esc())
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')
+
+    async def test_confirm_account_ok_not_called_on_exception(self, steward: TaskSteward):
+        """On exception, confirm_account_ok is NOT called — only release_probe_slot is."""
+        gate = self._gate()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.agents.invoke.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=RuntimeError('crash')),
+            pytest.raises(RuntimeError),
+        ):
+            await steward._pre_triage_suggestions(self._esc())
+
+        gate.confirm_account_ok.assert_not_called()
+
+    async def test_on_agent_complete_called(self, steward: TaskSteward):
+        """gate.on_agent_complete(cost) is called after successful pre-triage.
+
+        Previously called explicitly; now delegated to invoke_with_cap_retry.
+        """
+        gate = self._gate()
+        steward.usage_gate = gate
+        mock_result = _make_result(cost=0.42, session_id='sess-triage')
+
+        with patch('orchestrator.agents.invoke.invoke_agent',
+                   new_callable=AsyncMock, return_value=mock_result):
+            await steward._pre_triage_suggestions(self._esc())
+
+        gate.on_agent_complete.assert_called_once_with(0.42)
+
+    async def test_metrics_tracked_after_refactor(self, steward: TaskSteward):
+        """steward.metrics are updated from the invoke_with_cap_retry result."""
+        gate = self._gate()
+        steward.usage_gate = gate
+        mock_result = _make_result(cost=0.77, duration_ms=3500, session_id='sess-triage')
+
+        steward.metrics.invocations = 0
+        steward.metrics.total_cost_usd = 0.0
+        steward.metrics.total_duration_ms = 0
+
+        with patch('orchestrator.agents.invoke.invoke_agent',
+                   new_callable=AsyncMock, return_value=mock_result):
+            await steward._pre_triage_suggestions(self._esc())
+
+        assert steward.metrics.invocations == 1
+        assert steward.metrics.total_cost_usd == pytest.approx(0.77)
+        assert steward.metrics.total_duration_ms == 3500
+
+    async def test_no_usage_gate_works(self, steward: TaskSteward):
+        """_pre_triage_suggestions completes normally when usage_gate is None."""
+        steward.usage_gate = None
+        # Explicit pre-condition: gate is truly absent — guards against accidental re-assignment
+        assert steward.usage_gate is None
+
+        mock_result = _make_result(cost=0.1, session_id='sess-triage')
+
+        with patch('orchestrator.agents.invoke.invoke_agent',
+                   new_callable=AsyncMock, return_value=mock_result):
+            result = await steward._pre_triage_suggestions(self._esc())
+
+        # parse_triage_result returns non-None so a new Escalation is returned
+        assert result is not None
+        assert isinstance(result, Escalation)
+        # invoke_with_cap_retry sets account_name='' when no gate is provided
+        assert mock_result.account_name == ''

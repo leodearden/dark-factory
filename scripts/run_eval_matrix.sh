@@ -30,20 +30,30 @@
 
 set -uo pipefail
 
+# Source .env for OAuth tokens (account A etc.)
+if [ -f /home/leo/src/dark-factory/.env ]; then
+    set -a
+    source /home/leo/src/dark-factory/.env
+    set +a
+fi
+
 # Default to all 5 vLLM configs and all 5 eval tasks. Override via env vars.
 CONFIGS="${CONFIGS:-qwen3-coder-next-fp8-new reap-139b-nvfp4-new reap-172b-nvfp4-gb10-new minimax-m25-nvfp4-new minimax-m25-fp8-new}"
 TASKS="${TASKS:-df_task_12,df_task_13,df_task_18,reify_task_12,reify_task_27}"
 CONCURRENCY="${CONCURRENCY:-5}"
 VERIFY="${VERIFY:-warn}"
-# Inner orchestrator-internal timeout: how long the actual eval can run.
-# Default 360 min (6h) — large enough that "would-be-done" runs have time
-# to actually finish (matrix run #2 had several runs that hit tests/lint/
-# typecheck=True at the 60 min default mark and only needed more time).
 ORCH_TIMEOUT_MIN="${ORCH_TIMEOUT_MIN:-360}"
-# Outer subprocess limit: must be > ORCH_TIMEOUT_MIN so the orchestrator
-# hits its own timeout first and produces a clean result file rather than
-# a hard SIGKILL with no result.
 TIMEOUT_MIN="${TIMEOUT_MIN:-420}"
+
+# B200 fallback: retry for GPU_RETRY_MIN minutes, then fall back to 2×H200.
+GPU_RETRY_MIN="${GPU_RETRY_MIN:-180}"
+GPU_RETRY_INTERVAL="${GPU_RETRY_INTERVAL:-300}"
+
+# B200 configs that need the retry+fallback logic.
+B200_CONFIGS="final-reap-172b-nvfp4-gb10 final-minimax-m25-nvfp4"
+
+PYTHON=/home/leo/src/runpod-toolkit/.venv/bin/python
+LAUNCHER=/home/leo/src/dark-factory/scripts/run_vllm_eval.py
 
 mkdir -p /var/tmp/dark-factory-evals
 
@@ -53,16 +63,34 @@ PORT=8200  # Each config gets its own port; incremented per launch.
 
 for cfg in $CONFIGS; do
     LOG="/var/tmp/dark-factory-evals/matrix-$cfg-$(date +%Y%m%d-%H%M%S).log"
+
     echo "[$(date +%H:%M:%S)] LAUNCH $cfg → $LOG (port $PORT)"
-    python3 /home/leo/src/dark-factory/scripts/run_vllm_eval.py \
-        --config "$cfg" \
-        --tasks "$TASKS" \
-        --concurrency "$CONCURRENCY" \
-        --verify-baseline-clean "$VERIFY" \
-        --task-timeout-min "$TIMEOUT_MIN" \
-        --orch-timeout-min "$ORCH_TIMEOUT_MIN" \
-        --port "$PORT" \
-        > "$LOG" 2>&1 &
+    if echo "$B200_CONFIGS" | grep -qw "$cfg"; then
+        # B200 configs: retry for GPU_RETRY_MIN, then fall back to 2×H200
+        $PYTHON $LAUNCHER \
+            --config "$cfg" \
+            --tasks "$TASKS" \
+            --concurrency "$CONCURRENCY" \
+            --verify-baseline-clean "$VERIFY" \
+            --task-timeout-min "$TIMEOUT_MIN" \
+            --orch-timeout-min "$ORCH_TIMEOUT_MIN" \
+            --port "$PORT" \
+            --gpu-retry-minutes "$GPU_RETRY_MIN" \
+            --gpu-retry-interval "$GPU_RETRY_INTERVAL" \
+            --gpu-fallback-types "NVIDIA H200,NVIDIA H200 NVL" \
+            --gpu-fallback-count 2 \
+            > "$LOG" 2>&1 &
+    else
+        $PYTHON $LAUNCHER \
+            --config "$cfg" \
+            --tasks "$TASKS" \
+            --concurrency "$CONCURRENCY" \
+            --verify-baseline-clean "$VERIFY" \
+            --task-timeout-min "$TIMEOUT_MIN" \
+            --orch-timeout-min "$ORCH_TIMEOUT_MIN" \
+            --port "$PORT" \
+            > "$LOG" 2>&1 &
+    fi
     pid=$!
     PIDS+=("$pid")
     LOG_FOR_PID[$pid]="$LOG"
