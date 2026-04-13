@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from conftest import make_rebuild_detail
 from fused_memory.backends.graphiti_client import (
     EdgeDict,
     StaleSummaryResult,
@@ -107,13 +108,9 @@ class TestRebuildEntitySummariesNamedAccess:
             total_count=5,
         )
         backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
-        backend._rebuild_entity_from_edges = AsyncMock(return_value={
-            'uuid': 'u1',
-            'name': 'A',
-            'old_summary': 'old',
-            'new_summary': 'A: new',
-            'edge_count': 1,
-        })
+        backend._rebuild_entity_from_edges = AsyncMock(
+            return_value=make_rebuild_detail('u1', 'A', old_summary='old', new_summary='A: new', edge_count=1)
+        )
 
         result = await backend.rebuild_entity_summaries(group_id='test', force=False)
 
