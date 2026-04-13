@@ -59,18 +59,168 @@ def _make_rebuild_spy(backend) -> tuple[list[dict], Callable]:
     return captured_calls, original_rebuild
 
 
-def _uuid_dispatch(mapping: dict) -> Callable:
-    """Return a uuid-dispatched async callable for rebuild_entity_from_edges mocks.
+class _UuidDispatcher:
+    """Callable class that dispatches rebuild_entity_from_edges mocks by uuid.
 
-    Calls with uuids in ``mapping`` return the mapped value; any other uuid raises
-    AssertionError immediately so unexpected invocations surface during the test
-    rather than silently succeeding.
+    Tracks which uuids were dispatched in ``self.dispatched`` so callers can
+    verify completeness with ``assert_all_dispatched()``.
+
+    Mapping values may be:
+    - A dict — returned directly as the async result.
+    - A BaseException instance — raised instead of returned, so
+      ``_uuid_dispatch({'uuid-1': RuntimeError('boom'), ...})`` works.
+
+    Any uuid not in the mapping raises AssertionError immediately so unexpected
+    invocations surface during the test rather than silently succeeding.
     """
-    async def _side_effect(uuid, name, edges, *, group_id, old_summary):
-        if uuid in mapping:
-            return mapping[uuid]
-        raise AssertionError(f'unexpected uuid: {uuid!r}')
-    return _side_effect
+
+    def __init__(self, mapping: dict) -> None:
+        self._mapping = mapping
+        self.dispatched: set[str] = set()
+        # Ensure inspect.iscoroutinefunction(self) returns True so that
+        # AsyncMock.side_effect awaits __call__ rather than returning the coroutine.
+        # inspect.markcoroutinefunction was added in Python 3.12; on 3.11 the
+        # guard is omitted — AsyncMock still works because it checks
+        # asyncio.iscoroutine(result) after calling the side_effect callable.
+        if hasattr(inspect, 'markcoroutinefunction'):
+            inspect.markcoroutinefunction(self)
+
+    async def __call__(self, uuid, name, edges, *, group_id, old_summary):
+        self.dispatched.add(uuid)
+        if uuid not in self._mapping:
+            raise AssertionError(f'unexpected uuid: {uuid!r}')
+        value = self._mapping[uuid]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def assert_all_dispatched(self) -> None:
+        """Raise AssertionError if any mapped uuid was never called."""
+        expected = set(self._mapping)
+        missing = expected - self.dispatched
+        if missing:
+            raise AssertionError(f'uuids never dispatched: {missing!r}')
+
+
+def _uuid_dispatch(mapping: dict) -> _UuidDispatcher:
+    """Return a _UuidDispatcher for rebuild_entity_from_edges mocks.
+
+    The returned object is callable (async) and also tracks dispatch state:
+    - ``.dispatched`` — set of uuids that were actually called
+    - ``.assert_all_dispatched()`` — raises if any mapped uuid was skipped
+
+    Mapping values may be dicts (returned) or BaseException instances (raised).
+    Any uuid not in the mapping raises AssertionError immediately.
+
+    Example::
+
+        dispatch = _uuid_dispatch({
+            'uuid-1': RuntimeError('FalkorDB timeout'),
+            'uuid-2': {'uuid': 'uuid-2', ...},
+        })
+        mock.side_effect = dispatch
+        ...
+        dispatch.assert_all_dispatched()
+    """
+    return _UuidDispatcher(mapping)
+
+
+# ---------------------------------------------------------------------------
+# TestUuidDispatch — unit tests for the _uuid_dispatch helper
+# ---------------------------------------------------------------------------
+
+class TestUuidDispatch:
+    """Unit tests for _uuid_dispatch and the _UuidDispatcher class."""
+
+    @pytest.mark.asyncio
+    async def test_tracks_dispatched_uuids(self):
+        """_uuid_dispatch returns an object that records which uuids were called."""
+        dispatch = _uuid_dispatch({
+            'uuid-1': {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'a', 'new_summary': 'b', 'edge_count': 1},
+            'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'c', 'new_summary': 'd', 'edge_count': 1},
+        })
+        await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
+        # Set equality also implicitly asserts 'uuid-2' is absent from dispatched.
+        assert dispatch.dispatched == {'uuid-1'}
+
+    @pytest.mark.asyncio
+    async def test_assert_all_dispatched_passes_when_complete(self):
+        """assert_all_dispatched() does not raise when all mapped uuids were called."""
+        dispatch = _uuid_dispatch({
+            'uuid-1': {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'a', 'new_summary': 'b', 'edge_count': 1},
+            'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'c', 'new_summary': 'd', 'edge_count': 1},
+        })
+        await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
+        await dispatch('uuid-2', 'Bob', [], group_id='g', old_summary='c')
+        dispatch.assert_all_dispatched()  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_assert_all_dispatched_raises_when_incomplete(self):
+        """assert_all_dispatched() raises AssertionError mentioning the missing uuid."""
+        dispatch = _uuid_dispatch({
+            'uuid-1': {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'a', 'new_summary': 'b', 'edge_count': 1},
+            'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'c', 'new_summary': 'd', 'edge_count': 1},
+        })
+        await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
+        with pytest.raises(AssertionError, match='uuid-2'):
+            dispatch.assert_all_dispatched()
+
+    @pytest.mark.asyncio
+    async def test_raises_exception_values(self):
+        """Mapping a uuid to a BaseException instance causes dispatch to raise it."""
+        dispatch = _uuid_dispatch({
+            'uuid-1': RuntimeError('boom'),
+            'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'c', 'new_summary': 'd', 'edge_count': 1},
+        })
+        with pytest.raises(RuntimeError, match='boom'):
+            await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
+        result = await dispatch('uuid-2', 'Bob', [], group_id='g', old_summary='c')
+        assert result['uuid'] == 'uuid-2'
+
+    @pytest.mark.asyncio
+    async def test_exception_tracked_in_dispatched(self):
+        """uuid-1 appears in dispatched even when dispatch raises for it."""
+        dispatch = _uuid_dispatch({
+            'uuid-1': RuntimeError('boom'),
+            'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'c', 'new_summary': 'd', 'edge_count': 1},
+        })
+        with pytest.raises(RuntimeError):
+            await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
+        assert 'uuid-1' in dispatch.dispatched
+
+    @pytest.mark.asyncio
+    async def test_unexpected_uuid_still_raises_assertion(self):
+        """Dispatching a uuid not in the mapping raises AssertionError with 'unexpected uuid'."""
+        dispatch = _uuid_dispatch({
+            'uuid-1': {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'a', 'new_summary': 'b', 'edge_count': 1},
+        })
+        with pytest.raises(AssertionError, match='unexpected uuid'):
+            await dispatch('uuid-99', 'Nobody', [], group_id='g', old_summary='x')
+
+    def test_dispatch_docstring_documents_exception_support(self):
+        """_uuid_dispatch and _UuidDispatcher both have non-empty docstrings.
+
+        Guards against accidental docstring removal.  A keyword check ('exception')
+        would break on routine rephrasing, so we only assert non-emptiness here;
+        behavioural tests (test_raises_exception_values, test_exception_tracked_in_dispatched)
+        already verify the feature itself.
+        """
+        assert _uuid_dispatch.__doc__, '_uuid_dispatch must have a docstring'
+        assert _UuidDispatcher.__doc__, '_UuidDispatcher must have a docstring'
+
+    @pytest.mark.asyncio
+    async def test_works_without_markcoroutinefunction(self, monkeypatch):
+        """_UuidDispatcher works on Python 3.11 where inspect.markcoroutinefunction is absent.
+
+        Simulates 3.11 by removing the attribute; __init__ must not raise AttributeError
+        and the dispatcher must still be async-callable.
+        """
+        monkeypatch.delattr(inspect, 'markcoroutinefunction', raising=False)
+        dispatch = _uuid_dispatch({
+            'uuid-1': {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'a', 'new_summary': 'b', 'edge_count': 1},
+        })
+        result = await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
+        assert result['uuid'] == 'uuid-1'
 
 
 # ---------------------------------------------------------------------------
@@ -785,15 +935,17 @@ class TestRebuildEntitySummaries:
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
         })
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_uuid_dispatch({
+        dispatch = _uuid_dispatch({
             'uuid-1': {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'ok', 'new_summary': 'fact1', 'edge_count': 1},
             'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'also ok', 'new_summary': 'fact2', 'edge_count': 1},
-        }))
+        })
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=dispatch)
         result = await svc.rebuild_entity_summaries(project_id='test', force=True)
         assert result['total_entities'] == 2
         assert result['stale_entities'] == 2
         assert result['rebuilt'] == 2
         assert svc.graphiti.rebuild_entity_from_edges.await_count == 2
+        dispatch.assert_all_dispatched()
 
     @pytest.mark.asyncio
     async def test_returns_aggregate_result(self, mock_config):
@@ -823,15 +975,11 @@ class TestRebuildEntitySummaries:
             )
         )
 
-        async def _fail_uuid1(uuid, name, edges, *, group_id, old_summary):
-            if uuid == 'uuid-1':
-                raise RuntimeError('FalkorDB timeout')
-            elif uuid == 'uuid-2':
-                return {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'stale2', 'new_summary': 'current2', 'edge_count': 1}
-            else:
-                raise AssertionError(f'_fail_uuid1 called with unexpected uuid: {uuid!r}')
-
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_fail_uuid1)
+        dispatch = _uuid_dispatch({
+            'uuid-1': RuntimeError('FalkorDB timeout'),
+            'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'stale2', 'new_summary': 'current2', 'edge_count': 1},
+        })
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=dispatch)
         result = await svc.rebuild_entity_summaries(project_id='test')
         assert result['errors'] == 1
         assert result['rebuilt'] == 1
@@ -840,6 +988,7 @@ class TestRebuildEntitySummaries:
         assert 'FalkorDB timeout' in error_detail['error']
         assert error_detail['uuid'] == 'uuid-1'
         svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(group_id='test')
+        dispatch.assert_all_dispatched()
 
     @pytest.mark.asyncio
     async def test_empty_graph_returns_zero_counts(self, mock_config):
@@ -907,10 +1056,11 @@ class TestMemoryServiceRebuildEntitySummaries:
                 total_count=5,
             )
         )
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_uuid_dispatch({
+        dispatch = _uuid_dispatch({
             'u1': {'uuid': 'u1', 'name': 'Alice', 'old_summary': 'old A', 'new_summary': 'new A', 'edge_count': 1},
             'u2': {'uuid': 'u2', 'name': 'Bob', 'old_summary': 'old B', 'new_summary': 'new B', 'edge_count': 1},
-        }))
+        })
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=dispatch)
         svc.mem0 = MagicMock()
         svc.durable_queue = MagicMock()
         svc.durable_queue.enqueue = AsyncMock(return_value=1)
@@ -928,6 +1078,7 @@ class TestMemoryServiceRebuildEntitySummaries:
             group_id='dark_factory'
         )
         assert result['total_entities'] == 5
+        service.graphiti.rebuild_entity_from_edges.side_effect.assert_all_dispatched()
 
     @pytest.mark.asyncio
     async def test_journal_logs_on_success(self, service):
@@ -2040,24 +2191,28 @@ class TestDocstringCrossReferenceAccuracy716:
 
         Uses ast.parse + ast.walk rather than substring matching so that trivial
         reformatting (multi-line raise, whitespace changes) cannot produce a false
-        negative.  Checks only the positive invariant — that RuntimeError is raised —
+        negative.  Checks only the positive invariant — that RuntimeError is referenced —
         without the overly-broad negative assertion that no ValueError appears anywhere
         in the test body (which would break if a legitimate second scenario were added).
+
+        RuntimeError may be referenced as a direct raise statement OR as an exception
+        instance passed to _uuid_dispatch() — both patterns exercise the same production
+        code path.
         """
         src = inspect.getsource(TestRebuildEntitySummaries.test_partial_failure_continues)
         tree = ast.parse(textwrap.dedent(src))
-        raised_names = {
-            node.exc.func.id
+        # Detect RuntimeError as a raised exception or as an instantiated Call node
+        # (e.g. passed to _uuid_dispatch as a mapping value).
+        error_names = {
+            node.func.id
             for node in ast.walk(tree)
             if (
-                isinstance(node, ast.Raise)
-                and node.exc is not None
-                and isinstance(node.exc, ast.Call)
-                and isinstance(node.exc.func, ast.Name)
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
             )
         }
-        assert 'RuntimeError' in raised_names, (
-            "test_partial_failure_continues must raise RuntimeError — "
+        assert 'RuntimeError' in error_names, (
+            "test_partial_failure_continues must reference RuntimeError — "
             "the cross-reference in test_runtime_error_still_accumulates_in_errors "
             "docstring claims it 'exercises RuntimeError'"
         )
