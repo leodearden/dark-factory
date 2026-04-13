@@ -1446,8 +1446,11 @@ class TestRebuildEntitySummariesCancellation:
         # post-gather propagation path, not a pre-gather short-circuit.
         assert backend.update_node_summary.await_count == 2
 
+        expected_rebuilt = 0  # Pass 1 re-raises before Pass 2 increments counters
+        expected_errors = 0   # Pass 1 re-raises before Pass 2 increments counters
         self._assert_single_cancellation_warning(
-            caplog, group_id='grp-cancel-warn', rebuilt_so_far=0, errors_so_far=0
+            caplog, group_id='grp-cancel-warn',
+            rebuilt_so_far=expected_rebuilt, errors_so_far=expected_errors
         )
 
     @pytest.mark.asyncio
@@ -1473,8 +1476,11 @@ class TestRebuildEntitySummariesCancellation:
         ):
             await backend.rebuild_entity_summaries(group_id='grp-cancel-warn', force=True)
 
+        expected_rebuilt = 0  # Pass 1 re-raises before Pass 2 increments counters
+        expected_errors = 0   # Pass 1 re-raises before Pass 2 increments counters
         self._assert_single_cancellation_warning(
-            caplog, group_id='grp-cancel-warn', rebuilt_so_far=0, errors_so_far=0
+            caplog, group_id='grp-cancel-warn',
+            rebuilt_so_far=expected_rebuilt, errors_so_far=expected_errors
         )
 
     @pytest.mark.asyncio
@@ -1507,8 +1513,11 @@ class TestRebuildEntitySummariesCancellation:
         ):
             await backend.rebuild_entity_summaries(group_id='grp-cancel-warn', force=True)
 
+        expected_rebuilt = 0  # Pass 1 re-raises before Pass 2 increments counters
+        expected_errors = 0   # Pass 1 re-raises before Pass 2 increments counters
         self._assert_single_cancellation_warning(
-            caplog, group_id='grp-cancel-warn', rebuilt_so_far=0, errors_so_far=0
+            caplog, group_id='grp-cancel-warn',
+            rebuilt_so_far=expected_rebuilt, errors_so_far=expected_errors
         )
 
     @pytest.mark.asyncio
