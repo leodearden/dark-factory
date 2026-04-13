@@ -146,7 +146,7 @@ async def collect_snapshot(
                     if root_str in seen_roots:
                         continue
                     seen_roots.add(root_str)
-                    roots_to_snapshot.append((root_str, project_root / '.taskmaster' / 'tasks' / 'tasks.json'))
+                    roots_to_snapshot.append((root_str, _tasks_json_for(project_root)))
                 except OSError:
                     logger.warning(
                         'OSError while resolving orchestrator project root; skipping',
@@ -167,7 +167,7 @@ async def collect_snapshot(
             if root_str in seen_roots:
                 continue
             seen_roots.add(root_str)
-            roots_to_snapshot.append((root_str, known_root / '.taskmaster' / 'tasks' / 'tasks.json'))
+            roots_to_snapshot.append((root_str, _tasks_json_for(known_root)))
 
         # Phase 2 — Parallel read:
         # All load_task_tree calls are independent (separate files), so run them concurrently.
