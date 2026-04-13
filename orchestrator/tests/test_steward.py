@@ -1183,6 +1183,9 @@ class TestStewardTimeoutCap:
         assert mock_invoke.call_count == 1
         # No re-escalation was submitted — neither guard fired
         steward.escalation_queue.submit.assert_not_called()
+        # Mock fidelity: verify queue.get was called with the exact escalation id
+        # (matches the pattern established in test_success_path_cleans_up_counters line 1024)
+        steward.escalation_queue.get.assert_called_with('esc-42-1')
 
     async def test_both_counters_at_max_triggers_retry_guard_first(
         self, steward, mock_config,
@@ -1209,6 +1212,9 @@ class TestStewardTimeoutCap:
         # Guard-specific assertion: message proves the retry guard (not timeout guard) fired
         assert 'Failed after 3 attempt' in submitted.summary
         assert 'repeatedly timed out' not in submitted.summary.lower()
+        # Symmetric resolve assertion: _auto_escalate_to_human dismisses the original exactly once
+        # (consistent with the pattern at test_repeated_timeout_kills_eventually_terminate line 1142)
+        assert steward.escalation_queue.resolve.call_count == 1
 
     async def test_repeated_timeout_kills_eventually_terminate(
         self, steward, mock_config,
