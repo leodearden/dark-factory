@@ -27,8 +27,22 @@ import aiosqlite
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
+from dashboard.data.utils import parse_utc
 
 logger = logging.getLogger(__name__)
+
+
+def _ts_sort_key(entry: dict) -> datetime:
+    """Return a UTC-aware datetime sort key for a merge entry dict.
+
+    Parses ``entry['timestamp']`` via :func:`parse_utc`.  Returns
+    ``datetime.min`` (UTC-aware) on missing, None, or unparseable values so
+    that malformed entries sort to the end of a descending sort.
+    """
+    try:
+        return parse_utc(entry.get('timestamp'))
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=UTC)
 
 _CANONICAL_OUTCOMES = ['done', 'conflict', 'blocked', 'already_merged']
 
@@ -539,7 +553,7 @@ async def aggregate_recent_merges(
             continue
         merged.extend(r)
 
-    merged.sort(key=lambda x: x.get('timestamp') or '', reverse=True)
+    merged.sort(key=_ts_sort_key, reverse=True)
     return merged[:limit]
 
 
