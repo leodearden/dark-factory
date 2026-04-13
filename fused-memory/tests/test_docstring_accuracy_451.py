@@ -1,12 +1,12 @@
 """Tests for docstring accuracy in graphiti_client.py.
 
 Task 451: Fix docstrings — detect_stale_summaries missing 'summary' key +
-cross-reference _rebuild_entity_from_edges vs refresh_entity_summary.
+cross-reference rebuild_entity_from_edges vs refresh_entity_summary.
 
 Three test/impl pairs:
   step-1/2: detect_stale_summaries Returns section must list 'summary' key
-  step-3/4: _rebuild_entity_from_edges docstring must routing-note refresh_entity_summary
-  step-5/6: refresh_entity_summary docstring must routing-note _rebuild_entity_from_edges
+  step-3/4: rebuild_entity_from_edges docstring must routing-note refresh_entity_summary
+  step-5/6: refresh_entity_summary docstring must routing-note rebuild_entity_from_edges
 """
 from __future__ import annotations
 
@@ -231,7 +231,7 @@ class TestDetectStaleSummariesReturnsIncludesSummaryKey:
 
 
 # ---------------------------------------------------------------------------
-# step-3: _rebuild_entity_from_edges must routing-note refresh_entity_summary
+# step-3: rebuild_entity_from_edges must routing-note refresh_entity_summary
 # ---------------------------------------------------------------------------
 
 
@@ -278,7 +278,7 @@ class TestRebuildEntityFromEdgesCrossReferencesRefresh:
 
 
 # ---------------------------------------------------------------------------
-# step-5: refresh_entity_summary must routing-note _rebuild_entity_from_edges
+# step-5: refresh_entity_summary must routing-note rebuild_entity_from_edges
 # ---------------------------------------------------------------------------
 
 
@@ -293,8 +293,8 @@ class TestRefreshEntitySummaryCrossReferencesRebuild:
 
     Asserts:
       (a) docstring is not None and non-empty
-      (b) '_rebuild_entity_from_edges' appears in the docstring
-      (c) 'bulk' and '_rebuild_entity_from_edges' appear in the same sentence
+      (b) 'rebuild_entity_from_edges' appears in the docstring
+      (c) 'bulk' and 'rebuild_entity_from_edges' appear in the same sentence
     """
 
     def _doc(self) -> str:
@@ -322,4 +322,52 @@ class TestRefreshEntitySummaryCrossReferencesRebuild:
             "Docstring must contain 'bulk' and 'rebuild_entity_from_edges' within "
             "200 characters of each other to provide a use-case routing note for "
             "callers rebuilding many entities at once"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Self-consistency: no stale underscore-prefixed method name references
+# ---------------------------------------------------------------------------
+
+
+class TestNoStalePrivateMethodReferences:
+    """Self-consistency check across all test_docstring_accuracy*.py files.
+
+    The test file contained stale private-prefixed method name references in
+    comments and docstrings after rebuild_entity_from_edges was made public
+    (task 420).  This test scans all test_docstring_accuracy*.py files in the
+    tests/ directory and asserts no such stale private reference remains in any
+    of them.
+
+    Scope is intentionally limited to test_docstring_accuracy*.py rather than
+    all *.py files: other test files legitimately contain test method names
+    that include 'rebuild_entity_from_edges' after a 'test' prefix, producing
+    false-positive substring matches on the forbidden token.
+
+    Asserts:
+      (a) the private-prefixed name does not appear literally in any
+          test_docstring_accuracy*.py file (including module docstrings,
+          section comments, and class docstrings)
+
+    NOTE: never write the forbidden token literally anywhere in this file —
+    the self-check will fail.  The token is always constructed via concatenation
+    ('_' + 'rebuild_entity_from_edges') so this file's own source stays clean.
+    """
+
+    def test_no_stale_private_method_references(self) -> None:
+        """No test_docstring_accuracy*.py file may contain the stale method name."""
+        import pathlib
+        tests_dir = pathlib.Path(__file__).parent
+        # Construct at runtime so this test's own source stays clean.
+        # NOTE: never write the forbidden token literally anywhere in this file —
+        # the self-check will fail.
+        forbidden = '_' + 'rebuild_entity_from_edges'
+        offenders: list[str] = []
+        for py_file in sorted(tests_dir.glob("test_docstring_accuracy*.py")):
+            if forbidden in py_file.read_text():
+                offenders.append(py_file.name)
+        assert not offenders, (
+            f"Found stale reference to {forbidden!r} in: {offenders}. "
+            "The method was renamed to the public rebuild_entity_from_edges "
+            "in task 420; update all comments and docstrings accordingly."
         )
