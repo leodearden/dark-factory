@@ -353,6 +353,8 @@ class TestNearCapStateDistinction:
         assert gate._accounts[1].near_cap is True
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
+        assert gate._open.is_set() is True
+        assert all(a.resume_task is None for a in gate._accounts)
 
     def test_near_cap_unknown_token_does_not_mark_any_account(self):
         """NEAR_CAP with an explicit unknown oauth_token: detect_cap_hit returns False (no account resolved/mutated)."""
