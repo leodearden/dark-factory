@@ -1323,3 +1323,72 @@ async def test_call_claude_cli_confirms_account_ok_on_success():
 
     gate.confirm_account_ok.assert_called_once_with('token-a')
     gate.on_agent_complete.assert_called_once_with(0.0042)
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_no_confirm_on_cap_hit():
+    """confirm_account_ok is NOT called on the cap-hit iteration, only on success."""
+    from unittest.mock import AsyncMock
+
+    from fused_memory.reconciliation.agent_loop import _CAP_HIT_COOLDOWN_SECS
+
+    config = _make_config(agent_llm_provider='claude-cli', agent_llm_model='opus')
+
+    tools = {
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete',
+            parameters={'type': 'object', 'properties': {}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    agent = AgentLoop(
+        config=config,
+        system_prompt='Test',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+
+    gate = MagicMock()
+    gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
+    cap_call_count = 0
+
+    def detect_side_effect(*args, **kwargs):
+        nonlocal cap_call_count
+        cap_call_count += 1
+        return cap_call_count == 1  # cap hit first time only
+
+    gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
+    agent._usage_gate = gate
+
+    cli_result = json.dumps({
+        'result': '',
+        'session_id': 'sess-1',
+        'num_input_tokens': 100,
+        'num_output_tokens': 50,
+        'cost_usd': 0.0077,
+        'structured_output': json.dumps({
+            'thinking': 'done',
+            'tool_calls': [{'name': 'stage_complete', 'arguments': {}}],
+        }),
+    })
+
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = AsyncMock(return_value=(
+        cli_result.encode(), b'',
+    ))
+
+    messages = [{'role': 'user', 'content': 'test prompt'}]
+    tool_schemas: list = []
+
+    with (
+        patch('asyncio.create_subprocess_exec', new_callable=AsyncMock, return_value=mock_proc),
+        patch('asyncio.sleep', new_callable=AsyncMock),
+    ):
+        await agent._call_claude_cli(messages, tool_schemas)
+
+    # Exactly once — for the success iteration, NOT for the cap-hit iteration
+    gate.confirm_account_ok.assert_called_once_with('token-b')
+    gate.on_agent_complete.assert_called_once_with(0.0077)
