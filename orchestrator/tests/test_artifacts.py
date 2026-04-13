@@ -685,7 +685,12 @@ class TestNormalizePlan:
             assert 'id' in s
             assert 'status' in s
 
-    def test_string_prerequisites_wrapped(self):
+    def test_string_prerequisites_left_as_is(self):
+        """String prerequisites are NOT normalized (Rule 4 removed).
+
+        validate_plan_prerequisites() now rejects them with a clear error
+        instead of silently coercing.
+        """
         plan = {
             'task_id': '5',
             'steps': [{'id': 'step-1', 'status': 'pending'}],
@@ -695,16 +700,11 @@ class TestNormalizePlan:
             ],
         }
         result, modified = _normalize_plan(plan)
-        assert modified is True
+        assert modified is False
         prereqs = result['prerequisites']
         assert len(prereqs) == 2
-        assert prereqs[0] == {
-            'id': 'pre-1',
-            'description': 'Confirm no ruff D-rules',
-            'status': 'pending',
-            'commit': None,
-        }
-        assert prereqs[1]['id'] == 'pre-2'
+        assert prereqs[0] == 'Confirm no ruff D-rules'
+        assert prereqs[1] == 'Confirm docstring is clean'
 
     def test_string_steps_wrapped(self):
         plan = {
@@ -731,8 +731,12 @@ class TestNormalizePlan:
         assert modified is False
         assert result == plan
 
-    def test_mixed_prerequisite_types(self):
-        """Only string items are wrapped; existing dicts are preserved."""
+    def test_string_prerequisites_not_normalized(self):
+        """String prerequisites are NOT wrapped by _normalize_plan (Rule 4 removed).
+
+        String prerequisites are now rejected by validate_plan_prerequisites()
+        rather than silently coerced into dicts.
+        """
         plan = {
             'task_id': '8',
             'steps': [{'id': 'step-1', 'status': 'pending'}],
@@ -742,15 +746,10 @@ class TestNormalizePlan:
             ],
         }
         result, modified = _normalize_plan(plan)
-        assert modified is True
+        assert modified is False
         prereqs = result['prerequisites']
-        # First item preserved as-is
         assert prereqs[0]['id'] == 'pre-1'
-        assert prereqs[0]['status'] == 'done'
-        # Second item wrapped
-        assert prereqs[1]['id'] == 'pre-2'
-        assert prereqs[1]['description'] == 'A string prerequisite'
-        assert prereqs[1]['status'] == 'pending'
+        assert prereqs[1] == 'A string prerequisite'
 
     def test_empty_plan_unchanged(self):
         plan: dict = {}
@@ -829,9 +828,9 @@ class TestStringItemResilience:
         }
         (artifacts.root / 'plan.json').write_text(json.dumps(plan))
 
-        # read_plan normalizes, but let's also test the guard directly
+        # read_plan normalizes steps (Rule 5) but not prerequisites (Rule 4 removed);
+        # string prerequisites are skipped by the isinstance guard in get_pending_steps
         pending = artifacts.get_pending_steps()
-        # After normalization the string items become dicts, all pending
         assert len(pending) >= 1
 
     def test_get_completed_steps_survives_string_items(self, artifacts: TaskArtifacts):

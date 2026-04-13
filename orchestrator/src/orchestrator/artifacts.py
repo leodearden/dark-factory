@@ -107,15 +107,8 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
             plan.pop(_NESTED_PLAN_KEY)
             modified = True
 
-    # Rule 4: wrap string prerequisites
-    prereqs = plan.get('prerequisites')
-    if isinstance(prereqs, list):
-        new_prereqs, changed = _wrap_string_items(prereqs, 'pre')
-        if changed:
-            logger.warning('Normalizing plan: wrapping %d string prerequisites as dicts',
-                           sum(1 for p in prereqs if isinstance(p, str)))
-            plan['prerequisites'] = new_prereqs
-            modified = True
+    # Rule 4 (removed): string prerequisites are now rejected by
+    # validate_plan_prerequisites() rather than silently coerced.
 
     # Rule 5: wrap string steps
     steps = plan.get('steps')
@@ -370,11 +363,6 @@ class TaskArtifacts:
     def validate_plan_prerequisites(self) -> None:
         """Validate that every prerequisite in plan.json is a dict with required keys.
 
-        Reads the raw plan.json from disk, bypassing :meth:`read_plan` (which
-        applies ``_normalize_plan``).  This is intentional — normalization Rule 4
-        silently wraps string prerequisites into dicts, which would hide the
-        exact malformation this method is designed to catch.
-
         Required keys: id, description, status.
 
         Raises:
@@ -384,10 +372,7 @@ class TaskArtifacts:
                 which prerequisites were malformed.
         """
         REQUIRED_KEYS = {'id', 'description', 'status'}
-        plan_path = self.root / 'plan.json'
-        if not plan_path.exists():
-            return None
-        plan = json.loads(plan_path.read_text())
+        plan = self.read_plan()
         prerequisites = plan.get('prerequisites', [])
         if not prerequisites:
             return None
