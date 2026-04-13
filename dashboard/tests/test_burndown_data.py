@@ -560,7 +560,7 @@ class TestCollectSnapshot:
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warning_records, 'Expected at least one WARNING log record'
         combined = ' '.join(r.getMessage() for r in warning_records)
-        assert 'bad_root' in combined or str(bad_root) in combined
+        assert str(bad_root.resolve()) in combined
         # exc_info must be populated on the warning record
         assert any(r.exc_info for r in warning_records)
 
