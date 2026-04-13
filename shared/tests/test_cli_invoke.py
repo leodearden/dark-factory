@@ -1285,41 +1285,6 @@ def _make_gate(
     return gate
 
 
-class TestMakeGateHelper:
-    """Tests for the _make_gate() factory helper."""
-
-    def test_defaults(self):
-        """_make_gate() with no args returns a MagicMock with all expected defaults."""
-        gate = _make_gate()
-        assert gate.account_count == 2
-        assert gate.detect_cap_hit.return_value is False
-        assert gate._handle_cap_detected.return_value is False
-        assert gate.active_account_name == 'acct-a'
-        # before_invoke is an AsyncMock that returns 'token-a'
-        token = asyncio.run(gate.before_invoke())
-        assert token == 'token-a'
-        # confirm_account_ok and on_agent_complete exist as MagicMocks
-        assert callable(gate.confirm_account_ok)
-        assert callable(gate.on_agent_complete)
-
-    def test_overrides(self):
-        """_make_gate with all kwargs overrides each default correctly."""
-        gate = _make_gate(
-            account_count=1,
-            before_invoke_tokens=['token-a', 'token-b'],
-            handle_cap_detected=True,
-            active_account_name='acct-b',
-        )
-        assert gate.account_count == 1
-        assert gate._handle_cap_detected.return_value is True
-        assert gate.active_account_name == 'acct-b'
-        # side_effect list: first two calls return tokens, third raises StopAsyncIteration
-        assert asyncio.run(gate.before_invoke()) == 'token-a'
-        assert asyncio.run(gate.before_invoke()) == 'token-b'
-        with pytest.raises(StopAsyncIteration):
-            asyncio.run(gate.before_invoke())
-
-
 @pytest.mark.asyncio
 class TestHeuristicCapGating:
     """Tests that the heuristic cap-detection path gates retry on
