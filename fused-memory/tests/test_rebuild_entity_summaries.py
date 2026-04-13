@@ -260,20 +260,20 @@ class TestDetectStaleSummaries:
 
 
 # ---------------------------------------------------------------------------
-# task-526: GraphitiBackend._detect_stale_summaries_dry_run (cheap probe)
+# task-526: GraphitiBackend.detect_stale_dry_run (cheap probe)
 # ---------------------------------------------------------------------------
 
 class TestDetectStaleSummariesDryRun:
-    """Unit tests for GraphitiBackend._detect_stale_summaries_dry_run.
+    """Unit tests for GraphitiBackend.detect_stale_dry_run.
 
-    This private method is the memory-cheaper alternative to
-    ``_detect_stale_summaries_with_edges`` used by the force=False, dry_run=True
+    This method is the memory-cheaper alternative to
+    ``detect_stale_with_edges`` used by the force=False, dry_run=True
     code path in ``rebuild_entity_summaries``.
 
     Unlike the bulk variant, this probe issues up-to-N targeted
     ``get_valid_edges_for_node`` calls (one per non-empty-summary entity)
     and never materialises the O(E) all-edges dict.  The stale dict schema
-    it produces is identical to ``_detect_stale_summaries_with_edges`` so
+    it produces is identical to ``detect_stale_with_edges`` so
     that downstream consumers (e.g. the result['details'] field) see no
     surface-level change.
 
@@ -325,7 +325,7 @@ class TestDetectStaleSummariesDryRun:
 
     @pytest.mark.asyncio
     async def test_flags_stale_entity_with_diagnostic_counts(self, mock_config, make_backend):
-        """Stale entity dict has the same schema as _detect_stale_summaries_with_edges.
+        """Stale entity dict has the same schema as detect_stale_with_edges.
 
         Keys: uuid, name, summary, duplicate_count, stale_line_count,
               valid_fact_count, summary_line_count.
@@ -351,7 +351,7 @@ class TestDetectStaleSummariesDryRun:
         assert len(stale_list) == 1
         entity = stale_list[0]
 
-        # Schema keys must exactly match _detect_stale_summaries_with_edges output
+        # Schema keys must exactly match detect_stale_with_edges output
         expected_keys = {
             'uuid', 'name', 'summary',
             'duplicate_count', 'stale_line_count', 'valid_fact_count', 'summary_line_count',
@@ -414,7 +414,7 @@ class TestDetectStaleSummariesDryRun:
         """Empty-summary entities are cheap-skipped: no get_valid_edges_for_node call.
 
         Empty summaries are 'not stale by definition' (matches the semantics
-        of _detect_stale_summaries_with_edges at graphiti_client.py:905-907).
+        of detect_stale_with_edges at graphiti_client.py:905-907).
         The probe additionally saves the edge query for those entities.
         """
         backend = make_backend(mock_config)
@@ -440,7 +440,7 @@ class TestBuildStaleEntry:
     """Unit tests for GraphitiBackend._build_stale_entry static method.
 
     This helper encapsulates the repeated stale-detection logic shared between
-    _detect_stale_summaries_with_edges and _detect_stale_summaries_dry_run.
+    detect_stale_with_edges and detect_stale_dry_run.
 
     Contract:
     - Returns None when entity summary is empty (not stale by definition).
@@ -1142,7 +1142,7 @@ def two_entity_backend(mock_config, make_backend, make_edge_backend):
     consumers (TestRebuildEntitySummariesParallel.test_partial_failure_in_update_does_not_cancel_others
     and all TestRebuildEntitySummariesCancellation tests except test_cancelled_error_propagates_force_false).
     force=False consumers may intentionally supersede those lower-level mocks by stubbing
-    _detect_stale_summaries_with_edges directly (see test_cancelled_error_propagates_force_false).
+    detect_stale_with_edges directly (see test_cancelled_error_propagates_force_false).
 
     Tests supply their own update_node_summary side_effect to exercise the specific
     scenario under test.
@@ -1444,11 +1444,11 @@ class TestRebuildEntitySummariesParallel:
 
 
 # ---------------------------------------------------------------------------
-# task-432 step-1: _rebuild_entity_from_edges accepts old_summary kwarg
+# task-432 step-1: rebuild_entity_from_edges accepts old_summary kwarg
 # ---------------------------------------------------------------------------
 
 class TestRebuildEntityFromEdgesOldSummary:
-    """_rebuild_entity_from_edges accepts old_summary kwarg and skips get_node_text."""
+    """rebuild_entity_from_edges accepts old_summary kwarg and skips get_node_text."""
 
     @pytest.mark.asyncio
     async def test_rebuild_entity_from_edges_uses_passed_old_summary(

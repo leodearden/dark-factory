@@ -29,7 +29,7 @@ class EdgeDict(TypedDict):
     """Normalised edge dict returned by GraphitiBackend._edge_dict.
 
     Consumed by get_valid_edges_for_node, get_all_valid_edges,
-    _canonical_facts, and _rebuild_entity_from_edges.
+    _canonical_facts, and rebuild_entity_from_edges.
     """
 
     uuid: str
@@ -38,7 +38,7 @@ class EdgeDict(TypedDict):
 
 
 class StaleSummaryResult(NamedTuple):
-    """Structured return type for _detect_stale_summaries_with_edges.
+    """Structured return type for detect_stale_with_edges.
 
     Use named attribute access — the canonical idiom after Task 438/465:
 
@@ -841,8 +841,8 @@ class GraphitiBackend:
         """Compute a stale-entry diagnostic dict for *entity*, or None if up-to-date.
 
         Encapsulates the repeated logic shared between
-        ``_detect_stale_summaries_with_edges`` and
-        ``_detect_stale_summaries_dry_run``:
+        ``detect_stale_with_edges`` and
+        ``detect_stale_dry_run``:
 
         1. Return None if entity summary is empty (not stale by definition).
         2. Compute canonical facts via ``_canonical_facts`` and join with newlines.
@@ -903,12 +903,12 @@ class GraphitiBackend:
         Summary regeneration uses simple fact concatenation (deduped), consistent
         with Graphiti's own _extract_entity_summaries_batch pattern — no LLM call.
 
-        For bulk use see ``_rebuild_entity_from_edges``, which accepts
+        For bulk use see ``rebuild_entity_from_edges``, which accepts
         caller-supplied edges, name, and old_summary to avoid per-entity
         ``get_node_text`` and ``get_valid_edges_for_node`` round-trips when
         rebuilding many entities at once.  The two methods are an intentional
         fork: ``refresh_entity_summary`` is self-contained for single-entity
-        callers; ``_rebuild_entity_from_edges`` is batch-internal and consumes
+        callers; ``rebuild_entity_from_edges`` is batch-internal and consumes
         pre-fetched data from the ``rebuild_entity_summaries`` pipeline.
 
         Args:
@@ -916,7 +916,7 @@ class GraphitiBackend:
             group_id: Project graph to target.
             name: Optional entity name (must be paired with old_summary). When
                 both are supplied, get_node_text is skipped — useful when the
-                caller already has this data (e.g. _rebuild_entity_from_edges).
+                caller already has this data (e.g. rebuild_entity_from_edges).
             old_summary: Optional current summary text (must be paired with name).
 
         Returns:

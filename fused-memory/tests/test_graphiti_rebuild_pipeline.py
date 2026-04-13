@@ -120,7 +120,7 @@ class TestStaleSummaryResult:
 
     @pytest.mark.asyncio
     async def test_detect_stale_summaries_returns_named_result(self, mock_config, make_backend):
-        """_detect_stale_summaries_with_edges returns StaleSummaryResult with named access."""
+        """detect_stale_with_edges returns StaleSummaryResult with named access."""
         backend = make_backend(mock_config)
         backend.list_entity_nodes = AsyncMock(
             return_value=[
@@ -380,22 +380,22 @@ class TestRebuildEntitySummariesForceDryRun:
        edge-fetch guard, a subsequent ``if dry_run:`` block marks every target
        entity as ``'skipped_dry_run'`` and returns immediately, before the
        ``asyncio.Semaphore``-based rebuild loop executes. This is why
-       ``_rebuild_entity_from_edges`` is also never awaited.
+       ``rebuild_entity_from_edges`` is also never awaited.
 
     force=False contrast (updated by task 526)
     ------------------------------------------
     The force=False path branches on ``dry_run`` at the call site in
     ``rebuild_entity_summaries``:
 
-    - ``force=False, dry_run=True`` → calls ``_detect_stale_summaries_dry_run``,
+    - ``force=False, dry_run=True`` → calls ``detect_stale_dry_run``,
       which fetches edges per-entity via ``get_valid_edges_for_node`` and does
       **NOT** call ``get_all_valid_edges``. This is the cheap-probe path added
       by task 526 to avoid materialising the O(E) edge dict when the result is
-      never passed to ``_rebuild_entity_from_edges``.
+      never passed to ``rebuild_entity_from_edges``.
 
-    - ``force=False, dry_run=False`` → calls ``_detect_stale_summaries_with_edges``,
+    - ``force=False, dry_run=False`` → calls ``detect_stale_with_edges``,
       which still issues a single bulk ``get_all_valid_edges`` query. That full
-      edge map is needed because the actual rebuild loop (``_rebuild_entity_from_edges``)
+      edge map is needed because the actual rebuild loop (``rebuild_entity_from_edges``)
       will consume it.
 
     Therefore the edge-fetch skip behaviour pinned by this class applies to both
@@ -849,7 +849,7 @@ class TestCanonicalFactsStalenessRegression:
 
 
 # ---------------------------------------------------------------------------
-# task-492: caller-coverage — _rebuild_entity_from_edges whitespace filter
+# task-492: caller-coverage — rebuild_entity_from_edges whitespace filter
 # ---------------------------------------------------------------------------
 
 
@@ -857,8 +857,8 @@ class TestCanonicalFactsCallerCoverage:
     """_canonical_facts is exercised correctly via the bulk-rebuild call site.
 
     Caller-coverage gap (task-492): _canonical_facts is called by
-    refresh_entity_summary, _detect_stale_summaries_with_edges,
-    _detect_stale_summaries_dry_run, and _rebuild_entity_from_edges.  Only
+    refresh_entity_summary, detect_stale_with_edges,
+    detect_stale_dry_run, and rebuild_entity_from_edges.  Only
     the stale-detection path had a whitespace-regression test before this
     task.  This class pins that the bulk-rebuild path also filters
     whitespace-only facts — a regression in _canonical_facts would corrupt
@@ -870,7 +870,7 @@ class TestCanonicalFactsCallerCoverage:
     async def test_rebuild_entity_from_edges_filters_whitespace_only_facts(
         self, mock_config, make_backend
     ):
-        """_rebuild_entity_from_edges must not write whitespace-only lines to the summary."""
+        """rebuild_entity_from_edges must not write whitespace-only lines to the summary."""
         backend = make_backend(mock_config)
         backend.update_node_summary = AsyncMock()
 
