@@ -1412,3 +1412,55 @@ class TestFormatFilteredTaskTreeWithSubtasks:
         output = format_filtered_task_tree(tree)
         assert '- [450] (in-progress) Parent Task deps=[]' in output
         assert '- [450.1] (pending) Subtask One deps=[]' in output
+
+
+class TestEndToEndSubtaskPipeline:
+    """End-to-end tests: raw get_tasks response → filter_task_tree → format_filtered_task_tree."""
+
+    def test_e2e_full_pipeline_with_subtasks(self):
+        """Full pipeline: nested raw response → filtered tree → rendered string.
+
+        Raw input has:
+          - Task 100 (in-progress) with subtasks: id=1 (pending), id=2 (done)
+          - Task 101 (done)
+          - Task 102 (cancelled)
+
+        Expected: 2 active (100 + '100.1'), done_count=2 (100.2 + 101),
+        cancelled_count=1, total_count=5.
+        Rendered output must contain qualified subtask IDs and correct header.
+        """
+        tasks_data = {
+            'tasks': [
+                {
+                    'id': 100,
+                    'title': 'Big Feature',
+                    'status': 'in-progress',
+                    'dependencies': [],
+                    'subtasks': [
+                        {'id': 1, 'title': 'Sub A', 'status': 'pending', 'dependencies': []},
+                        {'id': 2, 'title': 'Sub B', 'status': 'done', 'dependencies': []},
+                    ],
+                },
+                {'id': 101, 'title': 'Old Feature', 'status': 'done', 'dependencies': []},
+                {'id': 102, 'title': 'Dropped Feature', 'status': 'cancelled', 'dependencies': []},
+            ]
+        }
+        tree = filter_task_tree(tasks_data)
+        output = format_filtered_task_tree(tree)
+
+        # Count checks
+        assert tree.total_count == 5
+        assert len(tree.active_tasks) == 2
+        assert tree.done_count == 2
+        assert tree.cancelled_count == 1
+
+        # Active IDs: parent 100 and qualified subtask '100.1'
+        active_ids = {str(t['id']) for t in tree.active_tasks}
+        assert '100' in active_ids
+        assert '100.1' in active_ids
+
+        # Rendered output
+        assert '- [100] (in-progress) Big Feature deps=[]' in output
+        assert '- [100.1] (pending) Sub A deps=[]' in output
+        # Summary line shows correct counts
+        assert '2 done, 1 cancelled' in output
