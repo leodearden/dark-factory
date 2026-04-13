@@ -428,6 +428,15 @@ class TestCreateWorktreeFreshening:
         worktree_info = await git_ops.create_worktree('freshen-test')
         assert (worktree_info.path / 'fresh_0.txt').exists()
 
+    async def test_create_worktree_stale_commits_populated(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """stale_commits == 2 when origin is 2 commits ahead at create_worktree time."""
+        git_ops, origin = git_ops_with_remote
+        await _push_n_commits_to_origin(origin, 2)
+        worktree_info = await git_ops.create_worktree('stale-commits-test')
+        assert worktree_info.stale_commits == 2
+
 
 @pytest.mark.asyncio
 class TestCommitTaskStatuses:
