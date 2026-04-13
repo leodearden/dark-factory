@@ -1992,3 +1992,42 @@ class TestScrubResultInvariant:
         result = ScrubResult(outcome=ScrubOutcome.SCRUBBED)
         assert result.outcome == ScrubOutcome.SCRUBBED
         assert result.error is None
+
+
+class TestScrubResultFormatError:
+    """Unit tests for ScrubResult.format_error() helper method.
+
+    format_error(prefix='') returns prefix+error when error is set,
+    or empty string when error is None.
+    """
+
+    def test_failed_with_error_default_prefix(self):
+        """FAILED with error and no prefix returns the bare error string."""
+        result = ScrubResult(outcome=ScrubOutcome.FAILED, error='fatal: git rm failed')
+        assert result.format_error() == 'fatal: git rm failed', (
+            f'Expected bare error string, got {result.format_error()!r}'
+        )
+
+    def test_failed_with_error_custom_prefix(self):
+        """FAILED with error and custom prefix returns prefix+error."""
+        result = ScrubResult(outcome=ScrubOutcome.FAILED, error='fatal: git rm failed')
+        assert result.format_error(prefix=' Error: ') == ' Error: fatal: git rm failed', (
+            f'Expected prefixed error, got {result.format_error(prefix=" Error: ")!r}'
+        )
+
+    def test_failed_with_no_error_returns_empty(self):
+        """FAILED with error=None returns empty string regardless of prefix."""
+        result = ScrubResult(outcome=ScrubOutcome.FAILED)
+        assert result.format_error() == '', (
+            f'Expected empty string when error is None, got {result.format_error()!r}'
+        )
+        assert result.format_error(prefix=' Error: ') == '', (
+            f'Expected empty string even with prefix when error is None'
+        )
+
+    def test_clean_with_no_error_returns_empty(self):
+        """CLEAN with error=None returns empty string."""
+        result = ScrubResult(outcome=ScrubOutcome.CLEAN)
+        assert result.format_error() == '', (
+            f'Expected empty string for CLEAN outcome, got {result.format_error()!r}'
+        )
