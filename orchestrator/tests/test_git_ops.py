@@ -2063,3 +2063,10 @@ class TestScrubResultFormatError:
         assert result.format_error() == '', (
             f'Expected empty string for CLEAN outcome, got {result.format_error()!r}'
         )
+
+    def test_scrubbed_with_no_error_returns_empty(self):
+        """SCRUBBED with error=None returns empty string."""
+        result = ScrubResult(outcome=ScrubOutcome.SCRUBBED)
+        assert result.format_error() == '', (
+            f'Expected empty string for SCRUBBED outcome, got {result.format_error()!r}'
+        )

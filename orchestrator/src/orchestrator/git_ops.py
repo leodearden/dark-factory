@@ -88,7 +88,7 @@ class ScrubResult:
         Args:
             prefix: Optional string prepended to the error (e.g. ' Error: ', ': ').
         """
-        if self.error is not None:
+        if self.error:
             return f'{prefix}{self.error}'
         return ''
 
