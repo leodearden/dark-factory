@@ -334,7 +334,11 @@ class TestFormatFilteredTaskTree:
 
         # At least one task line must survive the lazy pop loop — guards against the
         # regression where the notice fires but kept_lines ends up empty.
-        assert '- [1]' in output, (
+        # Anchored on the full task-line prefix format from _render_task_line
+        # (f'- [{tid}] ({status}) {title}') to avoid false-positive matches from
+        # bracketed numbers that may appear in the header or from higher task IDs
+        # whose string representation contains '1' as a substring.
+        assert re.search(r'- \[1\] \(pending\) Task title 1', output), (
             'Task 1 line should survive the lazy pop loop; '
             'if missing, the budget accounting has regressed'
         )
