@@ -130,14 +130,10 @@ def burndown_conn_with_config(tmp_path):
 
 
 @pytest.fixture
-async def burndown_env(tmp_path):
+async def burndown_env(burndown_conn_with_config):
     """Yield (db_path, config, conn) with a fresh burndown DB and open connection."""
-    db_path = tmp_path / 'burndown.db'
-    _create_burndown_db(db_path)
-    config = DashboardConfig(project_root=tmp_path)
-    async with aiosqlite.connect(str(db_path)) as conn:
-        conn.row_factory = aiosqlite.Row
-        yield db_path, config, conn
+    async with burndown_conn_with_config() as triple:
+        yield triple
 
 
 # ---------------------------------------------------------------------------
