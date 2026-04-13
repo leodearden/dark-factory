@@ -17,8 +17,10 @@ def percentile(sorted_values: list[float], p: float) -> float:
 
     Note:
         The caller is responsible for sorting the input list before calling
-        this function.  Both ``get_time_centiles`` (performance.py) and
-        ``_compute_latency_stats`` (merge_queue.py) pre-sort their inputs.
+        this function.  ``get_time_centiles`` (performance.py) pre-sorts its
+        input.  ``_compute_latency_stats`` (merge_queue.py) receives data
+        already sorted via SQL ``ORDER BY duration_ms`` from ``_get_durations``
+        and passes it through unsorted.
     """
     if not sorted_values:
         return 0.0

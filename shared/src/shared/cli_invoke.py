@@ -214,6 +214,9 @@ async def invoke_with_cap_retry(
     while True:
         oauth_token = None
         account_name = ''
+        unattributed_cap = False  # True when heuristic fires but token is unresolvable;
+        # controls: (1) skip confirm_account_ok, (2) skip on_agent_complete,
+        # (3) mark capped=True in cost_store
         if usage_gate:
             oauth_token = await usage_gate.before_invoke()
             account_name = usage_gate.active_account_name or ''
@@ -222,11 +225,22 @@ async def invoke_with_cap_retry(
             config_dir.write_credentials(oauth_token)
 
         started_at = datetime.now(UTC).isoformat()
-        result = await invoke_claude_agent(
-            **invoke_kwargs,
-            oauth_token=oauth_token,
-            config_dir=config_dir.path if config_dir else None,
-        )
+        try:
+            result = await invoke_claude_agent(
+                **invoke_kwargs,
+                oauth_token=oauth_token,
+                config_dir=config_dir.path if config_dir else None,
+            )
+        except BaseException:
+            # Safety net: release probe slot on any exception so probe_in_flight
+            # never leaks. See also: orchestrator/agents/invoke.py:invoke_with_cap_retry,
+            # orchestrator/steward.py:_invoke_with_session
+            if usage_gate is not None:
+                try:
+                    usage_gate.release_probe_slot(oauth_token)
+                except Exception:
+                    logger.warning('release_probe_slot failed', exc_info=True)
+            raise
         completed_at = datetime.now(UTC).isoformat()
 
         if usage_gate and usage_gate.detect_cap_hit(
@@ -317,50 +331,61 @@ async def invoke_with_cap_retry(
                 f'duration={result.duration_ms}ms) — treating as cap hit. '
                 f'Output: {result.output[:200]!r}',
             )
-            usage_gate._handle_cap_detected(
+            cap_marked = usage_gate._handle_cap_detected(
                 f'Heuristic cap: zero-cost instant exit — {result.output[:120]}',
                 None,
                 oauth_token,
             )
-            consecutive_cap_hits += 1
-            full_cycles = (consecutive_cap_hits - 1) // num_accounts
-            cooldown = min(
-                _CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles),
-                _MAX_CAP_COOLDOWN_SECS,
-            )
-            # Cannot resume a session that never ran
-            invoke_kwargs.pop('resume_session_id', None)
-            invoke_kwargs['prompt'] = original_prompt
-            acct_name = usage_gate.active_account_name
-            logger.warning(
-                f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
-            )
-
-            # Guard: raise before sleeping if retry limit or deadline exceeded
-            elapsed = time.monotonic() - retry_start
-            if max_cap_retries is not None and consecutive_cap_hits >= max_cap_retries:
-                logger.error(
-                    f'{label}: giving up after {consecutive_cap_hits} consecutive heuristic cap hits '
-                    f'({elapsed:.1f}s elapsed, {num_accounts} account(s))',
+            if not cap_marked:
+                logger.warning(
+                    f'{label}: heuristic cap suspected but no account could be marked '
+                    f'(token unresolved) — treating as normal failure',
                 )
-                raise AllAccountsCappedException(
-                    retries=consecutive_cap_hits,
-                    elapsed_secs=elapsed,
-                    label=label,
+                # Calling confirm_account_ok with an unresolvable token would be
+                # semantically misleading (we never confirmed the account is ok —
+                # we simply couldn't identify it).  Skip confirm, on_agent_complete,
+                # and mark the persistent record as capped for this iteration.
+                unattributed_cap = True
+            else:
+                consecutive_cap_hits += 1
+                full_cycles = (consecutive_cap_hits - 1) // num_accounts
+                cooldown = min(
+                    _CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles),
+                    _MAX_CAP_COOLDOWN_SECS,
                 )
-            if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
-                logger.error(
-                    f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
-                    f'(heuristic branch, {consecutive_cap_hits} retries, {num_accounts} account(s))',
-                )
-                raise AllAccountsCappedException(
-                    retries=consecutive_cap_hits,
-                    elapsed_secs=elapsed,
-                    label=label,
+                # Cannot resume a session that never ran
+                invoke_kwargs.pop('resume_session_id', None)
+                invoke_kwargs['prompt'] = original_prompt
+                acct_name = usage_gate.active_account_name
+                logger.warning(
+                    f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
                 )
 
-            await asyncio.sleep(cooldown)
-            continue
+                # Guard: raise before sleeping if retry limit or deadline exceeded
+                elapsed = time.monotonic() - retry_start
+                if max_cap_retries is not None and consecutive_cap_hits >= max_cap_retries:
+                    logger.error(
+                        f'{label}: giving up after {consecutive_cap_hits} consecutive heuristic cap hits '
+                        f'({elapsed:.1f}s elapsed, {num_accounts} account(s))',
+                    )
+                    raise AllAccountsCappedException(
+                        retries=consecutive_cap_hits,
+                        elapsed_secs=elapsed,
+                        label=label,
+                    )
+                if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
+                    logger.error(
+                        f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
+                        f'(heuristic branch, {consecutive_cap_hits} retries, {num_accounts} account(s))',
+                    )
+                    raise AllAccountsCappedException(
+                        retries=consecutive_cap_hits,
+                        elapsed_secs=elapsed,
+                        label=label,
+                    )
+
+                await asyncio.sleep(cooldown)
+                continue
 
         # Non-cap-hit failure while resuming → fall back to fresh invocation
         if not result.success and invoke_kwargs.get('resume_session_id'):
@@ -372,7 +397,7 @@ async def invoke_with_cap_retry(
             invoke_kwargs['prompt'] = original_prompt
             continue
 
-        if usage_gate:
+        if usage_gate and not unattributed_cap:
             usage_gate.confirm_account_ok(oauth_token)
             usage_gate.on_agent_complete(result.cost_usd)
         break
@@ -393,7 +418,7 @@ async def invoke_with_cap_retry(
                 cache_read_tokens=result.cache_read_tokens,
                 cache_create_tokens=result.cache_create_tokens,
                 duration_ms=result.duration_ms,
-                capped=False,
+                capped=unattributed_cap,
                 started_at=started_at,
                 completed_at=completed_at,
             )

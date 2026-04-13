@@ -1,7 +1,73 @@
 # vLLM Local Model Evaluation — Status Report
 
-**Last updated:** 2026-04-12
-**Status:** Final-run configs prepared for DGX Spark evaluation scenario. Bridge max_tokens clamping now dynamic (25% of max_model_len). B200 GPU support added. SM120 (RTX PRO 6000) compatibility fully mapped. Reify eval tasks unblocked (cargo symlinked). Ready for final-run execution in next session.
+**Last updated:** 2026-04-13
+**Status:** All 7 baked images built and pushed to Docker Hub (including new MiniMax M2.7). Matrix launch attempted but **blocked by OAuth token issue** — all accounts (including A) report capped when invoked via stored tokens, despite account A working interactively. Runtime FP8 quantization identified as a separate startup bottleneck for reap-139b-fp8. GPU retry with B200→2×H200 fallback implemented. Next session: debug OAuth token mismatch, then relaunch matrix.
+
+## Update 2026-04-13: baked images complete, M2.7 added, OAuth blocker found
+
+### TL;DR
+
+- **All 7 final-run baked images built and pushed to Docker Hub** in a single overnight pipeline session. Total ~8h wall clock (USB HDD bottleneck at ~40 MB/s). Images: `final-qwen3-coder-next-fp8` (104 GB), `final-reap-172b-nvfp4-gb10` (123 GB), `final-minimax-m25-nvfp4` (164 GB), `final-reap-139b-fp8` (164 GB), `final-minimax-m25-fp8` (254 GB), `final-reap-139b-awq` (104 GB).
+- **MiniMax M2.7 added** — new model released 2026-04-11. 229B/10B MoE (same architecture as M2.5), ships as FP8 natively, 196K max context. Downloaded (215 GB to NVMe, ~35 min), baked, and pushed as `final-minimax-m27-fp8` (254 GB). Config added to `configs.py` — same GPU config as M2.5 FP8 (4× RTX PRO 6000, TP=4).
+- **AWQ model downloaded** — `cyankiwi/MiniMax-M2.5-REAP-139B-A10B-AWQ-4bit` was the only missing model (~75 GB, not 23 GB as originally estimated). Downloaded with HF token from `.env`.
+- **B200 GPU unavailable on RunPod** — both B200 configs (`final-reap-172b-nvfp4-gb10`, `final-minimax-m25-nvfp4`) fail at pod creation. Added retry-with-fallback logic: `--gpu-retry-minutes 180 --gpu-retry-interval 300 --gpu-fallback-types "NVIDIA H200,NVIDIA H200 NVL" --gpu-fallback-count 2`. Retries B200 every 5 min for 3h, then falls back to 2×H200.
+- **Runtime FP8 quantization is a 30-60 min startup bottleneck** — `final-reap-139b-fp8` uses `cerebras/MiniMax-M2.5-REAP-139B-A10B` (BF16 source) with `quantization='fp8'`. vLLM quantizes 131 GB of weights on-GPU at startup. The "shm_broadcast block" warning logged every 60s during this is normal. Other configs use pre-quantized weights and boot in 2-14 min.
+- **Matrix script now sources `.env`** — ensures all `CLAUDE_OAUTH_TOKEN_*` env vars are available for the UsageGate failover pool.
+- **Matrix script uses runpod-toolkit venv python** — system python3 lacked the `backoff` module.
+
+### BLOCKER: OAuth token mismatch
+
+All 7 Claude Max accounts (G, F, E, C, B, D, A) report capped when the eval's judge/reviewer invokes `claude` CLI. Account A works interactively in the current session but fails when used by the eval.
+
+**Root cause hypothesis:** `run_vllm_eval.py` line 228-236 explicitly loads `.env` and injects all `CLAUDE_OAUTH_TOKEN_*` vars into the subprocess environment. The stored `CLAUDE_OAUTH_TOKEN_A` in `.env` is a long-lived token from `claude setup-token` (`sk-ant-oat01-W7FGPw...`), but the interactive session uses a different short-lived OAuth token from `~/.claude/.credentials.json` (`sk-ant-oat01-5qxfcq...`). These are different tokens with potentially different billing/cap state.
+
+**Evidence:**
+- Stored token A: "You've hit your limit · resets Apr 16, 10am" (long reset)
+- Interactive token A: working fine right now
+- `env -i` launch still loaded tokens because the launcher reads `.env` directly
+
+**To debug in next session:**
+1. **Test the interactive token directly** — temporarily replace `CLAUDE_OAUTH_TOKEN_A` in `.env` with the token from `~/.claude/.credentials.json` and run a single eval. If it works, the long-lived token is the problem.
+2. **Check if `claude setup-token` tokens have separate billing** — the long-lived token may have been issued under a different account session or billing period than the OAuth login flow.
+3. **Alternative: bypass UsageGate for judge/reviewer** — if only 1 uncapped account exists, running without the multi-account failover (single account mode from `~/.claude/.credentials.json`) avoids the issue entirely. Requires not setting any `CLAUDE_OAUTH_TOKEN_*` in the subprocess env AND not loading `.env`.
+
+### AWQ cold start timing (H200, baked image)
+
+| Phase | Duration |
+|-------|----------|
+| Pod create → SSH available | 12 min (image pull) |
+| SSH → vLLM healthy | 2 min (model load) |
+| **Total cold start** | **~14 min** |
+
+### Baked images — all on Docker Hub
+
+| Tag | Model | Size | GPU Config |
+|-----|-------|------|------------|
+| `final-qwen3-coder-next-fp8` | Qwen3-Coder-Next FP8 | 104 GB | 1× H200 |
+| `final-reap-139b-awq` | REAP-139B AWQ 4-bit | 104 GB | 1× H200 |
+| `final-reap-172b-nvfp4-gb10` | REAP-172B NVFP4 GB10 | 123 GB | 1× B200 (→2× H200 fallback) |
+| `final-minimax-m25-nvfp4` | MiniMax-M2.5 NVFP4 | 164 GB | 1× B200 (→2× H200 fallback) |
+| `final-reap-139b-fp8` | REAP-139B FP8 (runtime quant) | 164 GB | 2× RTX PRO 6000 |
+| `final-minimax-m25-fp8` | MiniMax-M2.5 FP8 | 254 GB | 4× RTX PRO 6000 |
+| `final-minimax-m27-fp8` | MiniMax-M2.7 FP8 (NEW) | 254 GB | 4× RTX PRO 6000 |
+
+### Code changes this session
+
+| File | Change |
+|------|--------|
+| `orchestrator/src/orchestrator/evals/configs.py` | Added `final-minimax-m27-fp8` config |
+| `scripts/run_vllm_eval.py` | GPU retry loop: `--gpu-retry-minutes`, `--gpu-retry-interval`, `--gpu-fallback-types`, `--gpu-fallback-count` |
+| `scripts/run_eval_matrix.sh` | Source `.env`; use runpod-toolkit venv python; B200 configs get retry+fallback args automatically |
+| `config/usage-accounts.yaml` | Account A uncommented |
+
+### Next-session priorities
+
+1. **Debug OAuth token mismatch** (see BLOCKER above) — try interactive token in `.env`, determine if `setup-token` tokens have separate billing
+2. **Relaunch full 7-config matrix** once OAuth is working
+3. **Consider pre-quantizing reap-139b-fp8** — runtime FP8 quantization adds 30-60 min to every pod boot. Could bake a pre-quantized variant or find one on HF.
+4. **Monitor B200 availability** — the retry loop handles this automatically; if B200 never comes up, 2×H200 fallback kicks in after 3h
+
+---
 
 ## Update 2026-04-12: final-run configs, bridge fix, handoff prep
 

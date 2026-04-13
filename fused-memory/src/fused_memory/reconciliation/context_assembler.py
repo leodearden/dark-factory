@@ -127,12 +127,12 @@ class ContextAssembler:
             # — the shared Pass 1 guard used by all gather(return_exceptions=True) callsites.
             # Re-raising here preserves the structured-cancellation contract and prevents
             # the assembler from silently converting a shutdown signal into an empty context list.
-            # See fused_memory.utils.async_utils.propagate_cancellations for the shared
-            # Pass 1 guard contract.
+            # See graphiti_client.rebuild_entity_summaries for the canonical two-pass reference
+            # (Pass 1 via propagate_cancellations + Pass 2 with isinstance(r, Exception)).
             propagate_cancellations(batch_contexts)
 
             for event, ctx_result in zip(batch, batch_contexts, strict=True):
-                if isinstance(ctx_result, BaseException):
+                if isinstance(ctx_result, Exception):
                     logger.warning(
                         f'Context fetch failed for event {event.id}: {ctx_result}'
                     )
@@ -140,7 +140,7 @@ class ContextAssembler:
 
                 # Deduplicate context items
                 new_items = [
-                    item for item in ctx_result
+                    item for item in ctx_result  # pyright: ignore[reportGeneralTypeIssues]  # Pass 1 already re-raised non-Exception BaseExceptions; pyright can't narrow past them
                     if item.id not in context_items
                 ]
 

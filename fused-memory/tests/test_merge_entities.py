@@ -13,6 +13,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from conftest import extract_cypher, extract_params
 
 from fused_memory.backends.graphiti_client import GraphitiBackend, NodeNotFoundError
 
@@ -49,8 +50,7 @@ class TestRedirectNodeEdges:
         await backend.redirect_node_edges(dep_uuid, sur_uuid, group_id='test')
         # First query call should target inter-node edges
         first_call = graph.query.call_args_list[0]
-        args = first_call[0]
-        params = args[1] if len(args) > 1 else {}
+        params = extract_params(first_call)
         # Both UUIDs should appear in params
         assert dep_uuid in params.values() or any(
             dep_uuid in str(v) for v in params.values()
@@ -104,8 +104,7 @@ class TestDeleteEntityNode:
         assert graph.ro_query.await_count == 1
         assert graph.query.await_count == 1
         # The single query call should contain DETACH DELETE
-        args = graph.query.call_args[0]
-        cypher = args[0] if args else ''
+        cypher = extract_cypher(graph.query.call_args)
         assert 'DETACH DELETE' in cypher
 
     @pytest.mark.asyncio
@@ -117,12 +116,10 @@ class TestDeleteEntityNode:
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.delete_entity_node(node_uuid, group_id='test')
         # Pre-check (ro_query) should pass uuid param
-        ro_args = graph.ro_query.call_args[0]
-        ro_params = ro_args[1] if len(ro_args) > 1 else {}
+        ro_params = extract_params(graph.ro_query.call_args)
         assert ro_params.get('uuid') == node_uuid
         # Delete (query) should also pass uuid param
-        q_args = graph.query.call_args[0]
-        q_params = q_args[1] if len(q_args) > 1 else {}
+        q_params = extract_params(graph.query.call_args)
         assert q_params.get('uuid') == node_uuid
         # Exactly-once routing contract: each slot called exactly once
         graph.ro_query.assert_awaited_once()
