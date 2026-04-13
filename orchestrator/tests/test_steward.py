@@ -903,6 +903,64 @@ class TestStewardTimeoutKillRecovery:
         data = steward.event_store.emit.call_args.kwargs['data']
         assert data['timed_out'] is False
 
+    async def test_invocation_end_event_timed_out_true_via_stderr_fallback(
+        self, steward, mock_config,
+    ):
+        """timed_out=False but matching stderr must yield timed_out=True in event.
+
+        Verifies the event uses _is_timeout_kill() (stderr fallback included),
+        not just result.timed_out directly.
+        """
+        mock_config.steward_max_attempts = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='pending',
+        )
+        steward.event_store = MagicMock()
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=False,
+                timed_out=False,  # structured field absent; only stderr signals timeout
+                stderr='Process killed after 900.0s timeout (SIGTERM+SIGKILL)',
+                cost=1.5,
+                turns=3,
+            )
+            await steward._handle_escalation(esc)
+
+        steward.event_store.emit.assert_called_once()
+        data = steward.event_store.emit.call_args.kwargs['data']
+        assert data['timed_out'] is True
+
+    async def test_invocation_end_event_timed_out_false_on_success(
+        self, steward, mock_config,
+    ):
+        """Successful invocation must yield timed_out=False in the event data.
+
+        Confirms _is_timeout_kill() short-circuits on success.
+        """
+        mock_config.steward_max_attempts = 2
+        mock_config.timeouts.steward = 900.0
+        esc = _make_escalation(id='esc-42-1')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-1', status='resolved',
+        )
+        steward.event_store = MagicMock()
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(
+                success=True,
+                timed_out=False,
+                cost=1.0,
+                turns=5,
+            )
+            await steward._handle_escalation(esc)
+
+        steward.event_store.emit.assert_called_once()
+        data = steward.event_store.emit.call_args.kwargs['data']
+        assert data['timed_out'] is False
+
 
 # ---------------------------------------------------------------------------
 # Timeout Cap
