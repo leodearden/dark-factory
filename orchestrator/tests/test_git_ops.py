@@ -2248,3 +2248,20 @@ class TestScrubResultFormatError:
         assert result.format_error() == '', (
             f'Expected empty string for SCRUBBED outcome, got {result.format_error()!r}'
         )
+
+    def test_failed_with_empty_string_error_raises_value_error(self):
+        """FAILED with error='' is rejected at construction time.
+
+        All production call-sites normalise empty/whitespace stderr to None via
+        ``err.strip() or None`` before constructing ScrubResult.  Permitting an
+        empty-string error would create an ambiguous state (``error is not None``
+        but ``not error``).  The __post_init__ guard makes the invariant explicit:
+        ``error`` is either None or a non-empty, non-whitespace-only string.
+        """
+        with pytest.raises(ValueError, match='empty or whitespace-only'):
+            ScrubResult(outcome=ScrubOutcome.FAILED, error='')
+
+    def test_failed_with_whitespace_only_error_raises_value_error(self):
+        """FAILED with error='   ' (whitespace only) is also rejected."""
+        with pytest.raises(ValueError, match='empty or whitespace-only'):
+            ScrubResult(outcome=ScrubOutcome.FAILED, error='   ')
