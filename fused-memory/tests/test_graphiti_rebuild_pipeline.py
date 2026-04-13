@@ -360,15 +360,33 @@ class TestRebuildEntitySummariesForceDryRun:
     branching).
     """
 
+    # ------------------------------------------------------------------
+    # Shared setup helper
+    # ------------------------------------------------------------------
+
+    def _setup_force_dry_run(self, mock_config, make_backend, entities):
+        """Wire a backend for force=True dry_run=True tests.
+
+        Mocks list_entity_nodes, get_all_valid_edges, and
+        _rebuild_entity_from_edges so callers only assert on the specific
+        behaviour under test rather than repeating the same wiring.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        backend._rebuild_entity_from_edges = AsyncMock()
+        return backend
+
+    # ------------------------------------------------------------------
+    # Tests
+    # ------------------------------------------------------------------
+
     @pytest.mark.asyncio
     async def test_force_dry_run_does_not_call_get_all_valid_edges(
         self, mock_config, make_backend, make_stale_list
     ):
         """When force=True and dry_run=True, get_all_valid_edges is NOT called."""
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=make_stale_list())
-        backend.get_all_valid_edges = AsyncMock(return_value={})
-        backend._rebuild_entity_from_edges = AsyncMock()
+        backend = self._setup_force_dry_run(mock_config, make_backend, make_stale_list())
 
         await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=True)
 
@@ -376,29 +394,16 @@ class TestRebuildEntitySummariesForceDryRun:
         backend._rebuild_entity_from_edges.assert_not_awaited()
         backend.list_entity_nodes.assert_awaited_once()
 
-    async def _make_dry_run_result(self, mock_config, make_backend):
-        """Shared setup for force=True dry_run=True tests.
-
-        Returns (backend, entities, result) with a standard 3-entity fixture
-        and all relevant methods mocked.  Extracted to avoid duplicating
-        identical mock-wiring and production-call boilerplate across tests.
-        """
-        backend = make_backend(mock_config)
+    @pytest.mark.asyncio
+    async def test_force_dry_run_returns_correct_aggregate(self, mock_config, make_backend):
+        """When force=True and dry_run=True, result has correct structure."""
         entities = [
             {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
             {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
             {'uuid': 'u3', 'name': 'Carol', 'summary': 'summary C'},
         ]
-        backend.list_entity_nodes = AsyncMock(return_value=entities)
-        backend.get_all_valid_edges = AsyncMock(return_value={})
-        backend._rebuild_entity_from_edges = AsyncMock()
+        backend = self._setup_force_dry_run(mock_config, make_backend, entities)
         result = await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=True)
-        return backend, entities, result
-
-    @pytest.mark.asyncio
-    async def test_force_dry_run_returns_correct_aggregate(self, mock_config, make_backend):
-        """When force=True and dry_run=True, result has correct structure."""
-        backend, entities, result = await self._make_dry_run_result(mock_config, make_backend)
 
         assert result['total_entities'] == len(entities)
         assert result['stale_entities'] == result['total_entities']  # force=True treats every entity as stale
@@ -408,15 +413,8 @@ class TestRebuildEntitySummariesForceDryRun:
         expected_details = [
             {'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities
         ]
-        assert len(result['details']) == len(entities)  # explicit length guard for clearer failure diagnostics
-        # Schema pinning: assert the exact key set on every detail dict to catch accidental schema leaks
-        # (e.g. extra fields added to the dry_run dict in graphiti_client.py).  Checking all dicts rather than
-        # just [0] makes this future-proof if the production code is ever refactored to build details
-        # conditionally per-entity.
-        assert all(set(d.keys()) == {'uuid', 'name', 'status'} for d in result['details'])
-        # Value + order check: projection tolerates nothing extra (guarded above) and verifies sequential order
-        # from the 'for t in targets' loop.
-        assert [{k: d[k] for k in ('uuid', 'name', 'status')} for d in result['details']] == expected_details
+        assert len(result['details']) == len(entities)  # length guard: clear diff before per-element check
+        assert result['details'] == expected_details
         assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
         backend._rebuild_entity_from_edges.assert_not_awaited()
         backend.get_all_valid_edges.assert_not_awaited()
