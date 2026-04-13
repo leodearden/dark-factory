@@ -1144,6 +1144,9 @@ class TestStewardTimeoutCap:
         assert steward.metrics.escalations_handled == 1
         # Explicit invocation count — guards against metric being incremented elsewhere
         assert mock_invoke.call_count == 1
+        # Mock fidelity: verify queue.get was called with the exact escalation id
+        # (not a generic return_value — the real queue.get is keyed by id)
+        steward.escalation_queue.get.assert_called_with('esc-42-1')
 
     async def test_repeated_timeout_kills_eventually_terminate(
         self, steward, mock_config,
