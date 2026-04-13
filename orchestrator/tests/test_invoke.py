@@ -287,30 +287,30 @@ class TestParseCodexOutputPropagatesTimedOut:
         assert agent.timed_out is False
 
 
-class TestParseGeminiOutputTimedOutDefault:
-    """Parser does not propagate timed_out (callers handle it via replace())."""
+class TestParseGeminiOutputPropagatesTimedOut:
+    """Parser propagates timed_out from _SubprocessResult (unforgeable by callers)."""
 
-    def test_timed_out_true_input_yields_false_on_empty_stdout(self):
-        """_parse_gemini_output returns timed_out=False regardless of input — empty stdout."""
+    def test_timed_out_true_input_yields_true_on_empty_stdout(self):
+        """_parse_gemini_output propagates timed_out=True — empty stdout."""
         sub = _SubprocessResult(stdout='', stderr='timeout', returncode=1,
                                 duration_ms=100, timed_out=True)
         agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
-        assert agent.timed_out is False
+        assert agent.timed_out is True
 
-    def test_timed_out_true_input_yields_false_on_json_decode_error(self):
-        """_parse_gemini_output returns timed_out=False regardless of input — parse error."""
+    def test_timed_out_true_input_yields_true_on_json_decode_error(self):
+        """_parse_gemini_output propagates timed_out=True — parse error."""
         sub = _SubprocessResult(stdout='not json', stderr='', returncode=1,
                                 duration_ms=100, timed_out=True)
         agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
-        assert agent.timed_out is False
+        assert agent.timed_out is True
 
-    def test_timed_out_true_input_yields_false_on_normal_parse(self):
-        """_parse_gemini_output returns timed_out=False regardless of input — valid JSON."""
+    def test_timed_out_true_input_yields_true_on_normal_parse(self):
+        """_parse_gemini_output propagates timed_out=True — valid JSON."""
         data = json.dumps({'response': 'hi', 'stats': {'input_tokens': 10, 'output_tokens': 5}})
         sub = _SubprocessResult(stdout=data, stderr='', returncode=0,
                                 duration_ms=100, timed_out=True)
         agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
-        assert agent.timed_out is False
+        assert agent.timed_out is True
 
     def test_timed_out_false_input_yields_false(self):
         """_parse_gemini_output returns timed_out=False when input is also False."""
