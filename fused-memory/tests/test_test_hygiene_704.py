@@ -97,22 +97,27 @@ class TestModuleDocstring704:
         The tracker line must convey that unit tests live in
         test_refresh_entity_summary.py AND that get_all_valid_edges is used
         here as a mocked dependency — not merely redirect with '→ see ...'.
+
+        Assertions are scoped to the module docstring (via _extract_module_docstring)
+        rather than the raw source, so they cannot spuriously pass or fail due to
+        matching text in comments, helper-class docstrings, or other string literals.
         """
         src = _read_sibling('test_rebuild_entity_summaries.py')
+        docstring = _extract_module_docstring(src)
 
-        assert 'unit tests in test_refresh_entity_summary.py' in src, (
+        assert 'unit tests in test_refresh_entity_summary.py' in docstring, (
             "test_rebuild_entity_summaries.py module docstring must contain "
             "'unit tests in test_refresh_entity_summary.py' to accurately convey "
             "where the unit tests for get_all_valid_edges live"
         )
 
-        assert 'used here as a mocked dependency' in src, (
+        assert 'used here as a mocked dependency' in docstring, (
             "test_rebuild_entity_summaries.py module docstring must contain "
             "'used here as a mocked dependency' to clarify that get_all_valid_edges "
             "is still exercised (as a mock) in this file"
         )
 
-        assert '→ see test_refresh_entity_summary.py' not in src, (
+        assert '→ see test_refresh_entity_summary.py' not in docstring, (
             "test_rebuild_entity_summaries.py module docstring must NOT contain "
             "the stale arrow-only phrasing '→ see test_refresh_entity_summary.py'; "
             "replace it with the accurate two-part phrasing that notes both the "
