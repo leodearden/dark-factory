@@ -214,23 +214,31 @@ Review this run and provide your verdict as JSON.
                 env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
 
             try:
-                proc = await _asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=_asyncio.subprocess.DEVNULL,
-                    stdout=_asyncio.subprocess.PIPE,
-                    stderr=_asyncio.subprocess.PIPE,
-                    env=env,
-                )
-            except FileNotFoundError as exc:
-                raise RuntimeError(
-                    'Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code'
-                ) from exc
+                try:
+                    proc = await _asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdin=_asyncio.subprocess.DEVNULL,
+                        stdout=_asyncio.subprocess.PIPE,
+                        stderr=_asyncio.subprocess.PIPE,
+                        env=env,
+                    )
+                except FileNotFoundError as exc:
+                    raise RuntimeError(
+                        'Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code'
+                    ) from exc
 
-            try:
-                stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=600)
-            except TimeoutError as exc:
-                proc.kill()
-                raise RuntimeError('Claude CLI timed out after 600 seconds') from exc
+                try:
+                    stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=600)
+                except TimeoutError as exc:
+                    proc.kill()
+                    raise RuntimeError('Claude CLI timed out after 600 seconds') from exc
+            except BaseException:
+                if self._usage_gate is not None:
+                    try:
+                        self._usage_gate.release_probe_slot(oauth_token)
+                    except Exception:
+                        logger.warning('release_probe_slot failed', exc_info=True)
+                raise
 
             stdout_text = stdout.decode()
             stderr_text = stderr.decode()
