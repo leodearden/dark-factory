@@ -591,13 +591,24 @@ async def aggregate_speculative_stats(
     dbs: list[aiosqlite.Connection | None],
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> dict:
     """Aggregate speculative stats across multiple project DBs.
 
     Sums hit/discard counts and recomputes hit_rate.
+
+    Args:
+        dbs: List of aiosqlite connections (None entries are tolerated).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp captured **once** for the entire aggregation
+            call and threaded into every per-DB ``speculative_stats`` query.
+            When None (the default), ``datetime.now(UTC)`` is resolved here so
+            that all concurrent per-DB coroutines share the same cutoff window.
+            Pass an explicit value in tests for full determinism.
     """
+    effective_now = now if now is not None else datetime.now(UTC)
     gather_results = await asyncio.gather(
-        *[speculative_stats(db, hours=hours) for db in dbs],
+        *[speculative_stats(db, hours=hours, now=effective_now) for db in dbs],
         return_exceptions=True,
     )
     hit_count = 0
