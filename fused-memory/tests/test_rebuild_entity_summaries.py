@@ -19,6 +19,7 @@ from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from conftest import make_rebuild_detail
 
 from fused_memory.backends.graphiti_client import EdgeDict, GraphitiBackend, StaleSummaryResult
 
@@ -763,9 +764,9 @@ class TestMemoryServiceRebuildEntitySummaries:
             )
         )
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
-            {'uuid': 'u1', 'name': 'Alice', 'old_summary': 'old A', 'new_summary': 'new A', 'edge_count': 1},
-            {'uuid': 'u2', 'name': 'Bob', 'old_summary': 'old B', 'new_summary': 'new B', 'edge_count': 1},
-            {'uuid': 'u3', 'name': 'Carol', 'old_summary': 'old C', 'new_summary': 'new C', 'edge_count': 1},
+            make_rebuild_detail('u1', 'Alice', old_summary='old A', new_summary='new A', edge_count=1),
+            make_rebuild_detail('u2', 'Bob', old_summary='old B', new_summary='new B', edge_count=1),
+            make_rebuild_detail('u3', 'Carol', old_summary='old C', new_summary='new C', edge_count=1),
             RuntimeError('dave failed'),  # 1 error
         ])
         mock_journal = MagicMock()
@@ -988,8 +989,7 @@ class TestRebuildSummariesManager:
             'rebuilt': 3,
             'skipped': 0,
             'errors': 0,
-            'details': [{'uuid': 'u1', 'name': 'Alice', 'status': 'rebuilt',
-                         'old_summary': 'old', 'new_summary': 'new', 'edge_count': 2}],
+            'details': [make_rebuild_detail('u1', 'Alice', old_summary='old', new_summary='new', edge_count=2)],
         })
         fake_ctx = make_fake_maintenance_service(mock_cfg, mock_service)
         with patch(

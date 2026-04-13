@@ -10,7 +10,7 @@ import os
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
-from conftest import extract_cypher, extract_params
+from conftest import extract_cypher, extract_params, make_rebuild_detail
 
 # ---------------------------------------------------------------------------
 # preserve_config_path fixture tests
@@ -214,3 +214,62 @@ class TestMakeEdgeBackend:
         make_edge_backend(backend, nodes=[], edges=edges)
         result = await backend.get_all_valid_edges()
         assert result == edges
+
+
+# ---------------------------------------------------------------------------
+# make_rebuild_detail factory tests (task-505 step-1)
+# ---------------------------------------------------------------------------
+
+class TestMakeRebuildDetail:
+    """make_rebuild_detail(uuid, name, *, ...) builds a rebuild-detail dict.
+
+    The factory produces the canonical 6-key dict consumed by rebuild pipeline
+    code and test assertions. uuid and name are positional; all other parameters
+    are keyword-only with sensible defaults.
+    """
+
+    def test_defaults(self):
+        """Positional args are set, all keyword defaults are correct, result is a plain dict."""
+        result = make_rebuild_detail('u1', 'Alice')
+        assert type(result) is dict
+        assert result == {
+            'uuid': 'u1',
+            'name': 'Alice',
+            'old_summary': '',
+            'new_summary': '',
+            'edge_count': 0,
+            'status': 'rebuilt',
+        }
+
+    def test_all_kwargs_set_together(self):
+        """All keyword overrides applied simultaneously produce the correct dict."""
+        result = make_rebuild_detail(
+            'node-1', 'Bob',
+            old_summary='old B', new_summary='rebuilt B',
+            edge_count=3, status='skipped',
+        )
+        assert result == {
+            'uuid': 'node-1',
+            'name': 'Bob',
+            'old_summary': 'old B',
+            'new_summary': 'rebuilt B',
+            'edge_count': 3,
+            'status': 'skipped',
+        }
+
+    def test_error_param_included_when_provided(self):
+        """Passing error=None adds an 'error' key; omitting it keeps the dict to 6 keys."""
+        without_error = make_rebuild_detail('u1', 'Alice')
+        assert 'error' not in without_error
+
+        with_error = make_rebuild_detail('u1', 'Alice', error=None)
+        assert with_error['error'] is None
+        assert set(with_error.keys()) == {'uuid', 'name', 'old_summary', 'new_summary', 'edge_count', 'status', 'error'}
+
+    def test_keyword_args_are_keyword_only(self):
+        """old_summary, new_summary, edge_count, status, error have kind KEYWORD_ONLY in signature."""
+        sig = inspect.signature(make_rebuild_detail)
+        for param_name in ('old_summary', 'new_summary', 'edge_count', 'status', 'error'):
+            assert sig.parameters[param_name].kind == inspect.Parameter.KEYWORD_ONLY, (
+                f'{param_name} should be KEYWORD_ONLY'
+            )

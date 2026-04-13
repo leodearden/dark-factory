@@ -305,6 +305,47 @@ async def assert_ro_query_only(
     return graph
 
 
+_REBUILD_DETAIL_NO_ERROR = object()  # sentinel — distinguishes "error not provided" from None
+
+
+def make_rebuild_detail(
+    uuid: str,
+    name: str,
+    *,
+    old_summary: str = '',
+    new_summary: str = '',
+    edge_count: int = 0,
+    status: str = 'rebuilt',
+    error: Any = _REBUILD_DETAIL_NO_ERROR,
+) -> dict:
+    """Return a rebuild-detail dict for use in rebuild pipeline tests.
+
+    uuid and name are positional; all other parameters are keyword-only.
+
+    The base 6-key shape (uuid, name, old_summary, new_summary, edge_count,
+    status) matches the detail-entry shape that rebuild_entity_summaries
+    constructs when it aggregates results.  Note that the lower-level helpers
+    _rebuild_entity_from_edges and refresh_entity_summary return only the
+    5-key subset (no 'status'); pass a raw 5-key dict when mocking those
+    methods to preserve production fidelity.
+
+    Pass ``error=None`` (or any value) to include an 'error' key in the
+    returned dict — useful for rebuild_entity_summaries detail entries that
+    carry an error field.  When omitted, 'error' is absent from the dict.
+    """
+    d: dict = {
+        'uuid': uuid,
+        'name': name,
+        'old_summary': old_summary,
+        'new_summary': new_summary,
+        'edge_count': edge_count,
+        'status': status,
+    }
+    if error is not _REBUILD_DETAIL_NO_ERROR:
+        d['error'] = error
+    return d
+
+
 def extract_cypher(call_args: Any) -> str:
     """Return the Cypher query string from a mock call_args object.
 

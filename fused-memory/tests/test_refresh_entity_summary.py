@@ -14,7 +14,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from conftest import assert_ro_query_only, extract_cypher, extract_params
+from conftest import assert_ro_query_only, extract_cypher, extract_params, make_rebuild_detail
 
 from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
@@ -538,13 +538,9 @@ class TestMemoryServiceRefreshEntitySummary:
         from fused_memory.services.memory_service import MemoryService
         svc = MemoryService(mock_config)
         svc.graphiti = MagicMock()
-        svc.graphiti.refresh_entity_summary = AsyncMock(return_value={
-            'uuid': 'node-1',
-            'name': 'Alice',
-            'old_summary': 'old',
-            'new_summary': 'Alice knows Bob',
-            'edge_count': 1,
-        })
+        svc.graphiti.refresh_entity_summary = AsyncMock(
+            return_value=make_rebuild_detail('node-1', 'Alice', old_summary='old', new_summary='Alice knows Bob', edge_count=1)
+        )
         svc.mem0 = MagicMock()
         svc.durable_queue = MagicMock()
         svc.durable_queue.enqueue = AsyncMock(return_value=1)
@@ -663,13 +659,9 @@ class TestRefreshEntitySummaryMcpTool:
     def mock_service(self):
         """Mock MemoryService for tool registration."""
         svc = AsyncMock()
-        svc.refresh_entity_summary = AsyncMock(return_value={
-            'uuid': 'node-1',
-            'name': 'Alice',
-            'old_summary': 'old text',
-            'new_summary': 'Alice knows Bob',
-            'edge_count': 1,
-        })
+        svc.refresh_entity_summary = AsyncMock(
+            return_value=make_rebuild_detail('node-1', 'Alice', old_summary='old text', new_summary='Alice knows Bob', edge_count=1)
+        )
         return svc
 
     @pytest.fixture
@@ -898,6 +890,8 @@ class TestMemoryServiceRefreshEntitySummaryJournalFix:
         """When graphiti succeeds but journal.log_write_op raises RuntimeError,
         the result is still returned — journal failure cannot produce a false negative."""
         svc, mock_journal = service_with_journal
+        # Use the 5-key shape that graphiti.refresh_entity_summary actually returns
+        # (no 'status' — that key is added by the higher-level rebuild_entity_summaries).
         expected_result = {
             'uuid': 'node-1',
             'name': 'Alice',

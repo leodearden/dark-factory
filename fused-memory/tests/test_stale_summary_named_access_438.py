@@ -16,6 +16,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from conftest import make_rebuild_detail
 
 from fused_memory.backends.graphiti_client import (
     EdgeDict,
@@ -118,13 +119,9 @@ class TestRebuildEntitySummariesNamedAccess:
             total_count=5,
         )
         svc.graphiti.detect_stale_with_edges = AsyncMock(return_value=detect_result)
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(return_value={
-            'uuid': 'u1',
-            'name': 'A',
-            'old_summary': 'old',
-            'new_summary': 'A: new',
-            'edge_count': 1,
-        })
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(
+            return_value=make_rebuild_detail('u1', 'A', old_summary='old', new_summary='A: new', edge_count=1)
+        )
 
         result = await svc.rebuild_entity_summaries(project_id='test')
 

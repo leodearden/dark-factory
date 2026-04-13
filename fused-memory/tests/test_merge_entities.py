@@ -13,7 +13,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from conftest import extract_cypher, extract_params
+from conftest import extract_cypher, extract_params, make_rebuild_detail
 
 from fused_memory.backends.graphiti_client import GraphitiBackend, NodeNotFoundError
 
@@ -165,13 +165,12 @@ class TestMergeEntities:
             'inter_node_deleted': 0,
         })
         backend.delete_entity_node = AsyncMock()
-        backend.refresh_entity_summary = AsyncMock(return_value={
-            'uuid': 'sur-uuid',
-            'name': 'SurvivingName',
-            'old_summary': 'old sur summary',
-            'new_summary': 'SurvivingName knows Foo\nDeprecatedName knows Bar',
-            'edge_count': 3,
-        })
+        backend.refresh_entity_summary = AsyncMock(return_value=make_rebuild_detail(
+            'sur-uuid', 'SurvivingName',
+            old_summary='old sur summary',
+            new_summary='SurvivingName knows Foo\nDeprecatedName knows Bar',
+            edge_count=3,
+        ))
         return backend
 
     @pytest.mark.asyncio
@@ -217,9 +216,7 @@ class TestMergeEntities:
             side_effect=lambda *a, **kw: call_order.append('delete')
         )
         backend.refresh_entity_summary = AsyncMock(
-            side_effect=lambda *a, **kw: call_order.append('refresh') or {
-                'uuid': 'sur-uuid', 'name': 'S', 'old_summary': '', 'new_summary': '', 'edge_count': 0
-            }
+            side_effect=lambda *a, **kw: call_order.append('refresh') or make_rebuild_detail('sur-uuid', 'S')
         )
         await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
         assert call_order == ['redirect', 'delete', 'refresh']
@@ -251,10 +248,10 @@ class TestMergeEntities:
             'inter_node_deleted': 0,
         })
         backend.delete_entity_node = AsyncMock()
-        backend.refresh_entity_summary = AsyncMock(return_value={
-            'uuid': 'sur-uuid', 'name': 'SurName',
-            'old_summary': 'existing summary', 'new_summary': 'existing summary', 'edge_count': 1,
-        })
+        backend.refresh_entity_summary = AsyncMock(return_value=make_rebuild_detail(
+            'sur-uuid', 'SurName',
+            old_summary='existing summary', new_summary='existing summary', edge_count=1,
+        ))
         result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
         backend.delete_entity_node.assert_awaited_once_with('dep-uuid', group_id='test')
         backend.refresh_entity_summary.assert_awaited_once_with('sur-uuid', group_id='test')

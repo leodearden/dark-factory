@@ -13,6 +13,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from conftest import make_rebuild_detail
 
 from fused_memory.backends.graphiti_client import (
     EdgeDict,
@@ -467,9 +468,9 @@ class TestRebuildEntitySummariesForceDryRun:
         svc = _make_svc(mock_config)
         svc.graphiti.list_entity_nodes = AsyncMock(return_value=make_stale_list())
         svc.graphiti.get_all_valid_edges = AsyncMock(return_value={})
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(return_value={
-            'uuid': 'u1', 'name': 'Alice', 'old_summary': '', 'new_summary': '', 'edge_count': 0,
-        })
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(
+            return_value=make_rebuild_detail('u1', 'Alice')
+        )
 
         await svc.rebuild_entity_summaries(project_id='test', force=True, dry_run=False)
 
@@ -497,13 +498,9 @@ class TestRebuildEntitySummariesDataFlow:
         detect_result = StaleSummaryResult(stale=stale_list, all_edges=all_edges, total_count=10)
         svc.graphiti.detect_stale_with_edges = AsyncMock(return_value=detect_result)
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(
-            return_value={
-                'uuid': 'u1',
-                'name': 'Alice',
-                'old_summary': 'old',
-                'new_summary': 'Alice knows Bob',
-                'edge_count': 1,
-            }
+            return_value=make_rebuild_detail(
+                'u1', 'Alice', old_summary='old', new_summary='Alice knows Bob', edge_count=1
+            )
         )
 
         result = await svc.rebuild_entity_summaries(project_id='test', force=False)
@@ -572,13 +569,7 @@ class TestRebuildEntitySummariesDataFlow:
         )
         svc.graphiti.detect_stale_dry_run = AsyncMock()
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(
-            return_value={
-                'uuid': 'u1',
-                'name': 'Alice',
-                'old_summary': 'some summary',
-                'new_summary': '',
-                'edge_count': 0,
-            }
+            return_value=make_rebuild_detail('u1', 'Alice', old_summary='some summary')
         )
 
         await svc.rebuild_entity_summaries(project_id='test', force=False, dry_run=False)
@@ -675,13 +666,12 @@ class TestRebuildEntitySummariesErrorHandling:
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(
             side_effect=[
                 RuntimeError('boom'),
-                {
-                    'uuid': 'u2',
-                    'name': 'Bob',
-                    'old_summary': '<echoed-old-summary>',
-                    'new_summary': 'Bob summary v2',
-                    'edge_count': 3,
-                },
+                make_rebuild_detail(
+                    'u2', 'Bob',
+                    old_summary='<echoed-old-summary>',
+                    new_summary='Bob summary v2',
+                    edge_count=3,
+                ),
             ]
         )
 
@@ -747,13 +737,7 @@ class TestRebuildEntitySummariesErrorHandling:
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(
             side_effect=[
                 RuntimeError('boom'),
-                {
-                    'uuid': 'u2',
-                    'name': 'Bob',
-                    'old_summary': 'old B',
-                    'new_summary': 'rebuilt B',
-                    'edge_count': 0,
-                },
+                make_rebuild_detail('u2', 'Bob', old_summary='old B', new_summary='rebuilt B'),
             ]
         )
 
