@@ -525,6 +525,51 @@ class TestDetectStaleSummariesDryRun:
             f"Expected peak concurrent calls <= 2 (bounded), got {peak_concurrent}"
         )
 
+    @pytest.mark.asyncio
+    async def test_exception_propagates_from_gather(self, mock_config, make_backend):
+        """RuntimeError raised by one entity's edge fetch propagates out of detect_stale_dry_run.
+
+        Other entities succeed; the first Exception found in the gather results
+        must be re-raised (not swallowed or returned).
+        """
+        backend = make_backend(mock_config)
+        entities = [
+            {'uuid': 'uuid-ok', 'name': 'OK', 'summary': 'fact'},
+            {'uuid': 'uuid-bad', 'name': 'Bad', 'summary': 'fact'},
+            {'uuid': 'uuid-ok2', 'name': 'OK2', 'summary': 'fact'},
+        ]
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+
+        async def edges_with_error(node_uuid, *, group_id):
+            if node_uuid == 'uuid-bad':
+                raise RuntimeError('db timeout')
+            return [{'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'}]
+
+        backend.get_valid_edges_for_node = AsyncMock(side_effect=edges_with_error)
+
+        with pytest.raises(RuntimeError, match='db timeout'):
+            await backend.detect_stale_dry_run(group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates_from_gather(self, mock_config, make_backend):
+        """asyncio.CancelledError raised during an edge fetch propagates out immediately.
+
+        CancelledError is a BaseException (not Exception), so Pass 1
+        (propagate_cancellations) must re-raise it before Pass 2 even runs.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'fact'},
+        ])
+
+        async def cancel_on_fetch(node_uuid, *, group_id):
+            raise asyncio.CancelledError()
+
+        backend.get_valid_edges_for_node = AsyncMock(side_effect=cancel_on_fetch)
+
+        with pytest.raises(asyncio.CancelledError):
+            await backend.detect_stale_dry_run(group_id='test')
+
 
 # ---------------------------------------------------------------------------
 # task-656: GraphitiBackend._build_stale_entry (static helper)
