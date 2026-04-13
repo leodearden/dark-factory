@@ -390,6 +390,15 @@ class TestFreshenMain:
         assert ref == f'{git_ops.config.remote}/{git_ops.config.main_branch}'
         assert stale == 3
 
+    async def test_freshen_main_already_current(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """When local main == origin/main (no new commits), returns (main_branch, 0)."""
+        git_ops, _origin = git_ops_with_remote
+        ref, stale = await git_ops._freshen_main()
+        assert ref == git_ops.config.main_branch
+        assert stale == 0
+
 
 @pytest.mark.asyncio
 class TestCommitTaskStatuses:
