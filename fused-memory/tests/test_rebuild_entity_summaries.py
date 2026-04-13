@@ -12,10 +12,12 @@ Covers:
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import inspect
 import logging
+import textwrap
 from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2017,43 +2019,44 @@ class TestDocstringCrossReferenceAccuracy716:
     """
 
     def test_partial_failure_continues_still_raises_runtime_error_not_value_error(self):
-        """Pin the exception type in the cross-reference target.
+        """Pin the exception type in the cross-reference target via structural AST analysis.
 
-        If someone edits test_partial_failure_continues to raise ValueError (or any
-        non-RuntimeError), the 'exercises RuntimeError' claim in the consumer docstring
-        becomes silently wrong.  This test catches that drift.
+        Uses ast.parse + ast.walk rather than substring matching so that trivial
+        reformatting (multi-line raise, whitespace changes) cannot produce a false
+        negative.  Checks only the positive invariant — that RuntimeError is raised —
+        without the overly-broad negative assertion that no ValueError appears anywhere
+        in the test body (which would break if a legitimate second scenario were added).
         """
         src = inspect.getsource(TestRebuildEntitySummaries.test_partial_failure_continues)
-        assert 'raise RuntimeError(' in src, (
+        tree = ast.parse(textwrap.dedent(src))
+        raised_names = {
+            node.exc.func.id
+            for node in ast.walk(tree)
+            if (
+                isinstance(node, ast.Raise)
+                and node.exc is not None
+                and isinstance(node.exc, ast.Call)
+                and isinstance(node.exc.func, ast.Name)
+            )
+        }
+        assert 'RuntimeError' in raised_names, (
             "test_partial_failure_continues must raise RuntimeError — "
             "the cross-reference in test_runtime_error_still_accumulates_in_errors "
             "docstring claims it 'exercises RuntimeError'"
         )
-        assert 'raise ValueError(' not in src, (
-            "test_partial_failure_continues must NOT raise ValueError — "
-            "that would invalidate the cross-reference claim"
-        )
 
     def test_runtime_error_docstring_describes_runtime_error_cross_reference(self):
-        """Pin the key phrases in the cross-reference source docstring.
+        """Pin only the critical cross-reference invariants in the source docstring.
 
-        If someone edits the docstring of test_runtime_error_still_accumulates_in_errors
-        to reintroduce the stale ValueError claim (or removes the RuntimeError cross-
-        reference), this test will fail.
+        Checks that the stale ValueError claim cannot silently reappear and that the
+        cross-reference to test_partial_failure_continues remains explicit.  Exact
+        phrasing of the surrounding explanation is intentionally not asserted — ordinary
+        rewording of the docstring should not break this guard.
         """
         doc = TestRebuildEntitySummariesCancellation.test_runtime_error_still_accumulates_in_errors.__doc__
         assert doc is not None, "docstring must be present"
         assert 'ValueError accumulation is already covered by test_partial_failure_continues' not in doc, (
             "stale ValueError claim must not appear in docstring"
-        )
-        assert 'Exception-subclass accumulation' in doc, (
-            "'Exception-subclass accumulation' phrase must be present"
-        )
-        assert 'which exercises RuntimeError' in doc, (
-            "'which exercises RuntimeError' phrase must be present"
-        )
-        assert 'isinstance(r, Exception) rather than isinstance(r, RuntimeError)' in doc, (
-            "isinstance comparison phrase must be present"
         )
         assert 'test_partial_failure_continues' in doc, (
             "cross-reference to test_partial_failure_continues must still be explicit"
