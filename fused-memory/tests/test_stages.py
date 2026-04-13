@@ -32,7 +32,12 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     TaskKnowledgeSync,
     _select_proactive_sample,
 )
-from fused_memory.reconciliation.task_filter import MAX_DONE_TASKS_RETAINED, _id_key
+from fused_memory.reconciliation.task_filter import (
+    MAX_DONE_TASKS_RETAINED,
+    FilteredTaskTree,
+    _id_key,
+    filter_task_tree,
+)
 
 _MOCK_TYPES = (AsyncMock, MagicMock)
 
@@ -2070,3 +2075,181 @@ class TestExtractSectionHelper:
         payload = '### Dup\nfirst body\n### Dup\nsecond body'
         result = _extract_section(payload, '### Dup')
         assert result == '### Dup\nfirst body'
+
+
+class TestInvariantAfterTask643:
+    """Regression guard for the FilteredTaskTree done_count/done_tasks invariant.
+
+    Task 643 removed the dead ``elif filtered.done_count > 0`` branch from
+    ``TaskKnowledgeSync.assemble_payload`` on the grounds that
+    ``filter_task_tree()`` guarantees ``done_count > 0 → len(done_tasks) > 0``
+    (they are always appended together, capped at ``MAX_DONE_TASKS_RETAINED=30``).
+    Task 782 hardens this invariant with a defensive callsite warning and places
+    regression guards here at the stage/callsite layer.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='test_project')
+
+    def _make_task(self, tid: int, status: str) -> dict:
+        return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': []}
+
+    @pytest.mark.asyncio
+    async def test_warns_when_filtered_task_tree_violates_invariant(
+        self, mock_deps, watermark, caplog
+    ):
+        """Integration guard: a FilteredTaskTree with done_count>0 but empty done_tasks triggers a WARNING.
+
+        This test exercises the full ``assemble_payload`` method intentionally — it
+        verifies that ``_check_filtered_tree_invariant`` is correctly wired into the
+        ``assemble_payload`` call chain, not just that the helper itself works.  For
+        isolated testing of the helper, see
+        ``test_check_filtered_tree_invariant_warns_on_violation``.
+
+        The invariant-violating state can only be reached by external callers that
+        construct a ``FilteredTaskTree`` directly (bypassing ``filter_task_tree``).
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        # Construct invariant-violating tree: done_count > 0 but done_tasks is empty.
+        # This state is impossible via filter_task_tree() but can arise from external
+        # construction — exactly the case the task-782 defensive check guards against.
+        stage.filtered_task_tree = FilteredTaskTree(
+            active_tasks=[self._make_task(1, 'in-progress')],
+            done_tasks=[],
+            done_count=5,
+            cancelled_tasks=[],
+            cancelled_count=0,
+            other_count=0,
+            total_count=6,
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await stage.assemble_payload([], watermark, [])
+
+        assert any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'done_count' in rec.message
+            and 'done_tasks' in rec.message
+            for rec in caplog.records
+        ), (
+            'Expected a WARNING about done_count/done_tasks invariant from '
+            'fused_memory.reconciliation.stages.task_knowledge_sync, '
+            f'got records: {[(r.name, r.levelno, r.message) for r in caplog.records]}'
+        )
+
+    def test_check_filtered_tree_invariant_warns_on_violation(self, mock_deps, caplog):
+        """Unit test for _check_filtered_tree_invariant: warns when invariant is violated.
+
+        Calls the private helper directly — no ``assemble_payload`` involved — so
+        changes to the rest of ``assemble_payload``'s rendering logic cannot break
+        this test.
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        violating_tree = FilteredTaskTree(
+            active_tasks=[],
+            done_tasks=[],
+            done_count=3,
+            cancelled_tasks=[],
+            cancelled_count=0,
+            other_count=0,
+            total_count=3,
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            stage._check_filtered_tree_invariant(violating_tree)
+
+        assert any(
+            rec.levelno == logging.WARNING
+            and 'done_count' in rec.message
+            and 'done_tasks' in rec.message
+            for rec in caplog.records
+        )
+
+    def test_check_filtered_tree_invariant_no_warning_when_ok(self, mock_deps, caplog):
+        """Unit test for _check_filtered_tree_invariant: no warning when invariant holds."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        ok_tree = FilteredTaskTree(
+            active_tasks=[],
+            done_tasks=[self._make_task(1, 'done')],
+            done_count=1,
+            cancelled_tasks=[],
+            cancelled_count=0,
+            other_count=0,
+            total_count=1,
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            stage._check_filtered_tree_invariant(ok_tree)
+
+        assert not any(rec.levelno == logging.WARNING for rec in caplog.records)
+
+    def test_filter_task_tree_invariant_done_count_and_done_tasks_populated_together(self):
+        """Regression guard: filter_task_tree() sets done_count>0 ↔ done_tasks non-empty.
+
+        Task 643 removed a dead ``elif filtered.done_count > 0`` branch from
+        ``TaskKnowledgeSync.assemble_payload`` on the basis of this invariant.
+        Task 782 places this regression guard at the stage/callsite layer so that
+        any future refactor of ``filter_task_tree`` that breaks the invariant trips
+        this test in addition to the guards in test_task_filter.py.
+        """
+        tasks_data = {
+            'tasks': [
+                self._make_task(1, 'done'),
+                self._make_task(2, 'done'),
+                self._make_task(3, 'done'),
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert result.done_count > 0, (
+            f'Expected done_count > 0 for 3 done tasks, got {result.done_count}'
+        )
+        assert len(result.done_tasks) > 0, (
+            f'Expected non-empty done_tasks for done_count={result.done_count}, '
+            f'got done_tasks={result.done_tasks!r}'
+        )
+
+    def test_filter_task_tree_invariant_holds_with_over_cap_done_tasks(self):
+        """Regression guard: at the >MAX_DONE_TASKS_RETAINED boundary the invariant still holds.
+
+        Even when done_count exceeds MAX_DONE_TASKS_RETAINED=30 (tasks are capped in
+        done_tasks), done_tasks must remain non-empty.  This is the cap-boundary case of
+        the invariant that task-643 relied on.  Task 782 places this guard at the
+        stage/callsite layer to complement test_task_filter.py's existing cap tests.
+        """
+        n_tasks = MAX_DONE_TASKS_RETAINED + 5
+        tasks_data = {
+            'tasks': [self._make_task(i, 'done') for i in range(1, n_tasks + 1)]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert result.done_count > MAX_DONE_TASKS_RETAINED, (
+            f'Expected done_count > {MAX_DONE_TASKS_RETAINED}, got {result.done_count}'
+        )
+        assert len(result.done_tasks) == MAX_DONE_TASKS_RETAINED, (
+            f'Expected done_tasks capped at {MAX_DONE_TASKS_RETAINED}, '
+            f'got {len(result.done_tasks)}'
+        )
+        # Invariant holds implicitly: the assertion above already proves done_tasks
+        # is non-empty (MAX_DONE_TASKS_RETAINED == 30).
