@@ -423,12 +423,8 @@ class TestFreshenMain:
         """When behind rev-list exits non-zero, _freshen_main returns (main_branch, None)."""
         git_ops, _origin = git_ops_with_remote
 
-        call_count = 0
-
         async def fake_run(cmd, cwd=None):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
+            if 'fetch' in cmd:
                 return (0, '', '')          # fetch succeeds
             return (128, '', 'fatal: bad revision')   # rev-list fails
 
@@ -444,12 +440,8 @@ class TestFreshenMain:
         """When behind rev-list returns non-numeric stdout, _freshen_main returns (main_branch, None)."""
         git_ops, _origin = git_ops_with_remote
 
-        call_count = 0
-
         async def fake_run(cmd, cwd=None):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
+            if 'fetch' in cmd:
                 return (0, '', '')           # fetch succeeds
             return (0, 'not-a-number', '')   # rev-list returns garbage
 
@@ -465,16 +457,20 @@ class TestFreshenMain:
         """When ahead rev-list returns non-numeric stdout, falls back to (main_branch, behind)."""
         git_ops, _origin = git_ops_with_remote
 
-        call_count = 0
+        remote_ref = f'{git_ops.config.remote}/'
 
         async def fake_run(cmd, cwd=None):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
+            if 'fetch' in cmd:
                 return (0, '', '')           # fetch succeeds
-            elif call_count == 2:
-                return (0, '3', '')          # behind rev-list: 3 commits behind
-            return (0, 'not-a-number', '')   # ahead rev-list returns garbage
+            if 'rev-list' in cmd:
+                # Distinguish behind vs ahead by which side of '..' the remote ref is on:
+                #   behind range: <local>..<remote>  (e.g. main..origin/main)
+                #   ahead  range: <remote>..<local>  (e.g. origin/main..main)
+                range_arg = next((arg for arg in cmd if '..' in arg), '')
+                if range_arg.startswith(remote_ref):
+                    return (0, 'not-a-number', '')  # ahead rev-list: garbage
+                return (0, '3', '')                 # behind rev-list: 3 behind
+            return (0, '', '')
 
         with patch('orchestrator.git_ops._run', side_effect=fake_run):
             ref, stale = await git_ops._freshen_main()
@@ -519,6 +515,14 @@ class TestCreateWorktreeFreshening:
         await _push_n_commits_to_origin(origin, 1, prefix='fresh')
         worktree_info = await git_ops.create_worktree('freshen-test')
         assert (worktree_info.path / 'fresh_0.txt').exists()
+        # Exactly 1 commit was pushed, so stale_commits must reflect that.
+        assert worktree_info.stale_commits == 1
+        # base_commit must match origin/main SHA captured after create_worktree
+        # (which internally fetched, so origin/main is now up-to-date in the local repo).
+        _, expected_sha, _ = await _run(
+            ['git', 'rev-parse', 'origin/main'], cwd=git_ops.project_root,
+        )
+        assert worktree_info.base_commit == expected_sha
 
     async def test_create_worktree_stale_commits_populated(
         self, git_ops_with_remote: tuple[GitOps, Path],
