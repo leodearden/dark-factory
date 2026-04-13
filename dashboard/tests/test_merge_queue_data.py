@@ -255,6 +255,17 @@ class TestTsSortKey:
         assert result == datetime.min.replace(tzinfo=UTC)
         assert result.utcoffset() == timedelta(0)
 
+    def test_invalid_timestamp_returns_datetime_min(self):
+        """An unparseable timestamp string returns UTC-aware datetime.min.
+
+        The ValueError branch in _ts_sort_key must catch fromisoformat failures
+        and return the same fallback as the missing-key / None cases so that
+        malformed entries sort consistently to the end of a descending sort.
+        """
+        result = _ts_sort_key({'timestamp': 'garbage'})
+        assert result == datetime.min.replace(tzinfo=UTC)
+        assert result.utcoffset() == timedelta(0)
+
 
 # ---------------------------------------------------------------------------
 # TestQueueDepthTimeseries
