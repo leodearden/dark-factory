@@ -138,6 +138,28 @@ class TestUuidDispatch:
         await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
         assert dispatch.dispatched == {'uuid-1'}
 
+    @pytest.mark.asyncio
+    async def test_assert_all_dispatched_passes_when_complete(self):
+        """assert_all_dispatched() does not raise when all mapped uuids were called."""
+        dispatch = _uuid_dispatch({
+            'uuid-1': {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'a', 'new_summary': 'b', 'edge_count': 1},
+            'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'c', 'new_summary': 'd', 'edge_count': 1},
+        })
+        await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
+        await dispatch('uuid-2', 'Bob', [], group_id='g', old_summary='c')
+        dispatch.assert_all_dispatched()  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_assert_all_dispatched_raises_when_incomplete(self):
+        """assert_all_dispatched() raises AssertionError mentioning the missing uuid."""
+        dispatch = _uuid_dispatch({
+            'uuid-1': {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'a', 'new_summary': 'b', 'edge_count': 1},
+            'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'c', 'new_summary': 'd', 'edge_count': 1},
+        })
+        await dispatch('uuid-1', 'Alice', [], group_id='g', old_summary='a')
+        with pytest.raises(AssertionError, match='uuid-2'):
+            dispatch.assert_all_dispatched()
+
 
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.list_entity_nodes
