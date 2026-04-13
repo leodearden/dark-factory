@@ -782,6 +782,25 @@ class TestRebuildEntitySummaries:
         assert svc.graphiti.rebuild_entity_from_edges.await_count == 2
 
     @pytest.mark.asyncio
+    async def test_force_rebuild_mock_rejects_unexpected_uuid(self, mock_config):
+        """rebuild_entity_from_edges mock in test_force_rebuilds_all must reject unknown uuids.
+
+        RED phase: the current list-based side_effect pops Alice's dict as the first call
+        regardless of which uuid is passed, so calling with 'uuid-99' returns Alice's dict
+        instead of raising AssertionError. This test fails until the list is replaced with
+        a uuid-dispatched callable that includes a strict catch-all.
+        """
+        svc = _make_svc(mock_config)
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'ok', 'new_summary': 'fact1', 'edge_count': 1},
+            {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'also ok', 'new_summary': 'fact2', 'edge_count': 1},
+        ])
+        with pytest.raises(AssertionError):
+            await svc.graphiti.rebuild_entity_from_edges(
+                'uuid-99', 'Unknown', [], group_id='test', old_summary='x'
+            )
+
+    @pytest.mark.asyncio
     async def test_returns_aggregate_result(self, mock_config):
         """Returns dict with total_entities, stale_entities, rebuilt, skipped, errors, details."""
         svc = _make_svc(mock_config)
