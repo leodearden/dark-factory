@@ -1949,3 +1949,124 @@ class TestMergeToMainScrubFailure:
         assert 'cannot amend merge commit' in result.details, (
             f'Expected git stderr in details for operator visibility, got: {result.details!r}'
         )
+
+    async def test_merge_to_main_scrub_failure_no_stderr_fallback(
+        self, git_ops: GitOps,
+    ):
+        """merge_to_main must NOT include '(no stderr)' when scrub error is None.
+
+        When scrub_task_dir_from_tree returns FAILED with error=None (e.g. stderr
+        was empty/whitespace), MergeResult.details must not contain the old
+        '(no stderr)' fallback string. The standardised format_error() helper
+        returns '' in that case, so nothing extra is appended.
+        """
+        worktree_info = await git_ops.create_worktree('scrub-no-stderr-branch')
+        (worktree_info.path / 'ns_test.py').write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, 'Add ns_test file')
+
+        async def fake_scrub_no_error(*args, **kwargs):
+            return ScrubResult(outcome=ScrubOutcome.FAILED)  # error=None
+
+        with patch(
+            'orchestrator.git_ops.scrub_task_dir_from_tree',
+            new=fake_scrub_no_error,
+        ):
+            result = await git_ops.merge_to_main(
+                worktree_info.path, 'scrub-no-stderr-branch',
+            )
+
+        assert result.success is False, (
+            f'Expected success=False on scrub failure, got {result.success!r}'
+        )
+        assert '(no stderr)' not in result.details, (
+            f'Expected no "(no stderr)" fallback in details, got: {result.details!r}'
+        )
+
+
+class TestScrubResultInvariant:
+    """Unit tests for ScrubResult.__post_init__ guard.
+
+    The invariant: error may only be non-None when outcome is ScrubOutcome.FAILED.
+    All other (outcome, error) combinations are semantically invalid and should
+    raise ValueError at construction time.
+    """
+
+    def test_clean_with_error_raises(self):
+        """ScrubResult(CLEAN, error=...) must raise ValueError."""
+        with pytest.raises(ValueError):
+            ScrubResult(outcome=ScrubOutcome.CLEAN, error='some error')
+
+    def test_scrubbed_with_error_raises(self):
+        """ScrubResult(SCRUBBED, error=...) must raise ValueError."""
+        with pytest.raises(ValueError):
+            ScrubResult(outcome=ScrubOutcome.SCRUBBED, error='some error')
+
+    def test_failed_with_error_succeeds(self):
+        """ScrubResult(FAILED, error=...) is valid and must not raise."""
+        result = ScrubResult(outcome=ScrubOutcome.FAILED, error='fatal: git error')
+        assert result.outcome == ScrubOutcome.FAILED
+        assert result.error == 'fatal: git error'
+
+    def test_failed_without_error_succeeds(self):
+        """ScrubResult(FAILED) with error=None is valid (no error captured)."""
+        result = ScrubResult(outcome=ScrubOutcome.FAILED)
+        assert result.outcome == ScrubOutcome.FAILED
+        assert result.error is None
+
+    def test_clean_without_error_succeeds(self):
+        """ScrubResult(CLEAN) with error=None is valid."""
+        result = ScrubResult(outcome=ScrubOutcome.CLEAN)
+        assert result.outcome == ScrubOutcome.CLEAN
+        assert result.error is None
+
+    def test_scrubbed_without_error_succeeds(self):
+        """ScrubResult(SCRUBBED) with error=None is valid."""
+        result = ScrubResult(outcome=ScrubOutcome.SCRUBBED)
+        assert result.outcome == ScrubOutcome.SCRUBBED
+        assert result.error is None
+
+
+class TestScrubResultFormatError:
+    """Unit tests for ScrubResult.format_error() helper method.
+
+    format_error(prefix='') returns prefix+error when error is set,
+    or empty string when error is None.
+    """
+
+    def test_failed_with_error_default_prefix(self):
+        """FAILED with error and no prefix returns the bare error string."""
+        result = ScrubResult(outcome=ScrubOutcome.FAILED, error='fatal: git rm failed')
+        assert result.format_error() == 'fatal: git rm failed', (
+            f'Expected bare error string, got {result.format_error()!r}'
+        )
+
+    def test_failed_with_error_custom_prefix(self):
+        """FAILED with error and custom prefix returns prefix+error."""
+        result = ScrubResult(outcome=ScrubOutcome.FAILED, error='fatal: git rm failed')
+        assert result.format_error(prefix=' Error: ') == ' Error: fatal: git rm failed', (
+            f'Expected prefixed error, got {result.format_error(prefix=" Error: ")!r}'
+        )
+
+    def test_failed_with_no_error_returns_empty(self):
+        """FAILED with error=None returns empty string regardless of prefix."""
+        result = ScrubResult(outcome=ScrubOutcome.FAILED)
+        assert result.format_error() == '', (
+            f'Expected empty string when error is None, got {result.format_error()!r}'
+        )
+        assert result.format_error(prefix=' Error: ') == '', (
+            'Expected empty string even with prefix when error is None'
+        )
+
+    def test_clean_with_no_error_returns_empty(self):
+        """CLEAN with error=None returns empty string."""
+        result = ScrubResult(outcome=ScrubOutcome.CLEAN)
+        assert result.format_error() == '', (
+            f'Expected empty string for CLEAN outcome, got {result.format_error()!r}'
+        )
+
+    def test_scrubbed_with_no_error_returns_empty(self):
+        """SCRUBBED with error=None returns empty string."""
+        result = ScrubResult(outcome=ScrubOutcome.SCRUBBED)
+        assert result.format_error() == '', (
+            f'Expected empty string for SCRUBBED outcome, got {result.format_error()!r}'
+        )
