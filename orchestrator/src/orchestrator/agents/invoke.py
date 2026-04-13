@@ -13,6 +13,7 @@ import logging
 import os
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -288,7 +289,8 @@ async def _invoke_claude_with_sandbox(
 
             try:
                 result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data)
-                return _parse_claude_output(result)
+                parsed = _parse_claude_output(result)
+                return replace(parsed, timed_out=result.timed_out)
             finally:
                 for path in temp_files:
                     Path(path).unlink(missing_ok=True)
@@ -358,7 +360,8 @@ async def _invoke_codex(
         env = dict(os.environ)
 
         result = await _run_subprocess_local(cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds)
-        return _parse_codex_output(result, model)
+        parsed = _parse_codex_output(result, model)
+        return replace(parsed, timed_out=result.timed_out)
 
     finally:
         for f in temp_files:
@@ -377,7 +380,6 @@ def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
             output='Agent produced no output',
             subtype='error_empty_output',
             stderr=result.stderr,
-            timed_out=result.timed_out,
         )
 
     # Parse JSONL — collect all events
@@ -401,7 +403,6 @@ def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
                 output=result.stdout,
                 subtype='text_output',
                 stderr=result.stderr,
-                timed_out=result.timed_out,
             )
 
     # Find completion events and collect text
@@ -459,7 +460,6 @@ def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
         session_id=session_id,
         subtype='success' if result.returncode == 0 and not is_error else 'error',
         stderr=result.stderr,
-        timed_out=result.timed_out,
     )
 
 
@@ -525,7 +525,8 @@ async def _invoke_gemini(
         env = dict(os.environ)
 
         result = await _run_subprocess_local(cmd, cwd, env, 'gemini', model, max_budget_usd, timeout_seconds)
-        return _parse_gemini_output(result, model)
+        parsed = _parse_gemini_output(result, model)
+        return replace(parsed, timed_out=result.timed_out)
 
     finally:
         for f in temp_files:
@@ -540,7 +541,6 @@ def _parse_gemini_output(result: _SubprocessResult, model: str) -> AgentResult:
             output='Agent produced no output',
             subtype='error_empty_output',
             stderr=result.stderr,
-            timed_out=result.timed_out,
         )
 
     try:
@@ -551,7 +551,6 @@ def _parse_gemini_output(result: _SubprocessResult, model: str) -> AgentResult:
             output=result.stdout,
             subtype='text_output',
             stderr=result.stderr,
-            timed_out=result.timed_out,
         )
 
     # Gemini output: {"response": "...", "stats": {"input_tokens": N, "output_tokens": N}}
@@ -573,7 +572,6 @@ def _parse_gemini_output(result: _SubprocessResult, model: str) -> AgentResult:
         structured_output=data.get('structured_output'),
         subtype='success' if result.returncode == 0 else 'error',
         stderr=result.stderr,
-        timed_out=result.timed_out,
     )
 
 

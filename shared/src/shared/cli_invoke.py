@@ -9,7 +9,7 @@ import logging
 import os
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -522,7 +522,8 @@ async def _invoke_claude(
             env['ANTHROPIC_BASE_URL'] = bridge.url
 
         result = await _run_subprocess(cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data)
-        return _parse_claude_output(result)
+        parsed = _parse_claude_output(result)
+        return replace(parsed, timed_out=result.timed_out)
     finally:
         for path in temp_files:
             Path(path).unlink(missing_ok=True)
@@ -538,7 +539,6 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             output='Agent produced no output',
             subtype='error_empty_output',
             stderr=result.stderr,
-            timed_out=result.timed_out,
         )
 
     try:
@@ -549,7 +549,6 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             output=result.stdout,
             subtype='text_output',
             stderr=result.stderr,
-            timed_out=result.timed_out,
         )
 
     cost = data.get('cost_usd', data.get('total_cost_usd', 0.0))
@@ -596,7 +595,6 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_create_tokens=cache_create_tokens,
-        timed_out=result.timed_out,
     )
 
 
