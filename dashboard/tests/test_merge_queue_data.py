@@ -1292,6 +1292,45 @@ class TestMultiDbAggregation:
         assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
 
     # -----------------------------------------------------------------------
+    # Gap coverage (b+): all-None dbs — gather(*[fn(None), fn(None)]) path
+    #
+    # Distinct from dbs=[] (gather(*[]) → []) because per-DB functions ARE
+    # called with None and return empty defaults.  These tests confirm the
+    # None-handling in each per-DB function propagates cleanly through the
+    # aggregate layer.
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_all_none_dbs_queue_depth(self):
+        """aggregate_queue_depth_timeseries with dbs=[None, None] returns empty ChartData."""
+        result = await aggregate_queue_depth_timeseries([None, None], hours=24)
+        assert result == {'labels': [], 'values': []}
+
+    @pytest.mark.asyncio
+    async def test_all_none_dbs_outcome_distribution(self):
+        """aggregate_outcome_distribution with dbs=[None, None] returns empty ChartData."""
+        result = await aggregate_outcome_distribution([None, None], hours=24)
+        assert result == {'labels': [], 'values': []}
+
+    @pytest.mark.asyncio
+    async def test_all_none_dbs_latency_stats(self):
+        """aggregate_latency_stats with dbs=[None, None] returns all-zero stats dict."""
+        result = await aggregate_latency_stats([None, None], hours=24)
+        assert result == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
+
+    @pytest.mark.asyncio
+    async def test_all_none_dbs_recent_merges(self):
+        """aggregate_recent_merges with dbs=[None, None] returns empty list."""
+        result = await aggregate_recent_merges([None, None], limit=20)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_all_none_dbs_speculative_stats(self):
+        """aggregate_speculative_stats with dbs=[None, None] returns all-zero stats dict."""
+        result = await aggregate_speculative_stats([None, None], hours=24)
+        assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+
+    # -----------------------------------------------------------------------
     # Gap coverage (c): None entries in dbs — per-DB returns empty defaults
     # -----------------------------------------------------------------------
 
@@ -1423,6 +1462,55 @@ class TestMultiDbAggregation:
         # Both events are in the current bucket — summed count must be 2
         idx = result['labels'].index(expected_last_label)
         assert result['values'][idx] == 2
+
+    @pytest.mark.asyncio
+    async def test_bucket_boundary_events_in_adjacent_buckets(self, tmp_path):
+        """Events straddling a 15-min boundary land in adjacent buckets, not the same one.
+
+        DB1: event at exactly 12:15:00 → bucket 12:15.
+        DB2: event at 12:14:59          → bucket 12:00.
+        Tests the 'divergent label sets' scenario from the aggregate docstring:
+        each DB independently aligns its timestamps, so the aggregate must merge
+        label sets correctly and never collapse boundary events into a single bucket.
+        """
+        base = datetime(2026, 4, 11, 12, 15, 0, tzinfo=UTC)  # exact bucket boundary
+
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': base,                              # 12:15:00 → bucket 12:15
+             'data': {'outcome': 'done'}},
+        ])
+        db2 = self._make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': base - timedelta(seconds=1),      # 12:14:59 → bucket 12:00
+             'data': {'outcome': 'done'}},
+        ])
+
+        now = datetime(2026, 4, 11, 12, 30, 0, tzinfo=UTC)
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=1, now=now)
+
+        labels = result['labels']
+        values = result['values']
+        bucket_1215 = datetime(2026, 4, 11, 12, 15, tzinfo=UTC).isoformat()
+        bucket_1200 = datetime(2026, 4, 11, 12, 0, tzinfo=UTC).isoformat()
+
+        assert bucket_1215 in labels, f"bucket 12:15 missing from {labels}"
+        assert bucket_1200 in labels, f"bucket 12:00 missing from {labels}"
+
+        idx_1215 = labels.index(bucket_1215)
+        idx_1200 = labels.index(bucket_1200)
+
+        # Each event is in its own bucket — no cross-boundary merging
+        assert values[idx_1215] == 1
+        assert values[idx_1200] == 1
+        # 12:15 bucket immediately follows 12:00 bucket (adjacent, one step apart)
+        assert idx_1215 == idx_1200 + 1
 
     # -----------------------------------------------------------------------
     # Gap coverage (e): duration_ms=0 and NULL excluded by aggregate path
