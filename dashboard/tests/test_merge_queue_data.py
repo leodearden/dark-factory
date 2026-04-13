@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
 
 import aiosqlite
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 
 # ---------------------------------------------------------------------------
 # Schema — events table from orchestrator/src/orchestrator/event_store.py
