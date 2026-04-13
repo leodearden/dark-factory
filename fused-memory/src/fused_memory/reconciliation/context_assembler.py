@@ -51,9 +51,17 @@ def _format_memory_result(result) -> str:
     return f'- [{result.id}] ({source}/{cat}): {content}'
 
 
-def _format_task(task: dict) -> str:
-    """Format a task dict into a context line."""
-    tid = task.get('id', '?')
+def _format_task(task: dict, *, display_id: str | None = None) -> str:
+    """Format a task dict into a context line.
+
+    Args:
+        task: Task dict returned by taskmaster.get_task().
+        display_id: When provided, use this as the rendered task ID instead of
+            task.get('id').  Pass the qualified ID from the event payload (e.g.
+            '450.2') so subtasks are cross-referenceable with the Active Task Tree
+            section that already uses qualified IDs.
+    """
+    tid = display_id if display_id is not None else task.get('id', '?')
     title = task.get('title', '?')
     status = task.get('status', '?')
     deps = task.get('dependencies', [])
