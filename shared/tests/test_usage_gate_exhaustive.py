@@ -424,10 +424,8 @@ class TestNearCapStateDistinction:
         explicit token so ``_resolve_account`` returns the already-capped account.  This
         mirrors the defensive case the probe-loop fix guards against.
 
-        ``asyncio.sleep`` is patched so the test is robust against a future minimum-interval
-        change in the probe loop — the patch is scoped to the probe-loop call so the outer
-        ``asyncio.wait_for`` timeout (which uses event-loop timer handles, not sleep) is
-        unaffected.
+        ``asyncio.sleep`` is patched and ``assert_not_awaited`` enforces the invariant that
+        ``resets_at`` in the past yields ``sleep_for=0``, so sleep must not be called.
         """
         gate = make_gate(['a'])
         acct = gate._accounts[0]
