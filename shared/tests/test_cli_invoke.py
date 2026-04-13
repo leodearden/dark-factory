@@ -1258,6 +1258,68 @@ class TestParseClaudeOutputThreadsTimedOut:
         assert agent.timed_out is False
 
 
+def _make_gate(
+    *,
+    account_count: int = 2,
+    before_invoke_tokens: 'str | list[str]' = 'token-a',
+    handle_cap_detected: bool = False,
+    active_account_name: str = 'acct-a',
+) -> MagicMock:
+    """Factory for a MagicMock gate used in TestHeuristicCapGating.
+
+    Exposes the four attributes that vary across the six test cases; the three
+    constant attributes (detect_cap_hit, confirm_account_ok, on_agent_complete)
+    are set unconditionally.
+    """
+    gate = MagicMock()
+    gate.account_count = account_count
+    if isinstance(before_invoke_tokens, list):
+        gate.before_invoke = AsyncMock(side_effect=before_invoke_tokens)
+    else:
+        gate.before_invoke = AsyncMock(return_value=before_invoke_tokens)
+    gate.detect_cap_hit = MagicMock(return_value=False)
+    gate._handle_cap_detected = MagicMock(return_value=handle_cap_detected)
+    gate.confirm_account_ok = MagicMock()
+    gate.active_account_name = active_account_name
+    gate.on_agent_complete = MagicMock()
+    return gate
+
+
+class TestMakeGateHelper:
+    """Tests for the _make_gate() factory helper."""
+
+    def test_defaults(self):
+        """_make_gate() with no args returns a MagicMock with all expected defaults."""
+        gate = _make_gate()
+        assert gate.account_count == 2
+        assert gate.detect_cap_hit.return_value is False
+        assert gate._handle_cap_detected.return_value is False
+        assert gate.active_account_name == 'acct-a'
+        # before_invoke is an AsyncMock that returns 'token-a'
+        token = asyncio.run(gate.before_invoke())
+        assert token == 'token-a'
+        # confirm_account_ok and on_agent_complete exist as MagicMocks
+        assert callable(gate.confirm_account_ok)
+        assert callable(gate.on_agent_complete)
+
+    def test_overrides(self):
+        """_make_gate with all kwargs overrides each default correctly."""
+        gate = _make_gate(
+            account_count=1,
+            before_invoke_tokens=['token-a', 'token-b'],
+            handle_cap_detected=True,
+            active_account_name='acct-b',
+        )
+        assert gate.account_count == 1
+        assert gate._handle_cap_detected.return_value is True
+        assert gate.active_account_name == 'acct-b'
+        # side_effect list: first two calls return tokens, third raises StopAsyncIteration
+        assert asyncio.run(gate.before_invoke()) == 'token-a'
+        assert asyncio.run(gate.before_invoke()) == 'token-b'
+        with pytest.raises(StopAsyncIteration):
+            asyncio.run(gate.before_invoke())
+
+
 @pytest.mark.asyncio
 class TestHeuristicCapGating:
     """Tests that the heuristic cap-detection path gates retry on
