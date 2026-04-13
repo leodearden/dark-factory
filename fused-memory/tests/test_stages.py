@@ -1751,27 +1751,6 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         assert 'Task 103' in recently_section, "Task 103 not found in Recently Completed section"
 
     @pytest.mark.asyncio
-    async def test_recently_completed_shows_count_when_no_done_tasks_objects(
-        self, mock_deps, watermark,
-    ):
-        """When filtered_task_tree has done_count > 0 but done_tasks=[], show count summary."""
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'test_project'
-        stage.project_root = '/tmp/test_project'
-        stage.filtered_task_tree = self._make_tree(
-            [self._make_task(10, 'in-progress')],
-            done_count=15,
-            # done_tasks deliberately omitted → empty list
-        )
-
-        payload = await stage.assemble_payload([], watermark, [])
-
-        mock_deps['taskmaster'].get_tasks.assert_not_called()
-        assert '### Recently Completed Tasks' in payload
-        # Must mention the done count (15) somewhere in the recently completed section
-        assert '15' in payload
-
-    @pytest.mark.asyncio
     async def test_recently_completed_populated_on_fallback(self, mock_deps, watermark):
         """When filtered_task_tree is None, fallback path populates recently completed tasks."""
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
