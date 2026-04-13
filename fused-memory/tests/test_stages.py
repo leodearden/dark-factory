@@ -1529,6 +1529,43 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
             f"Section content:\n{section}"
         )
 
+    # --- Step: other-status exclusion from proactive pool (task-709) ---
+
+    @pytest.mark.asyncio
+    async def test_proactive_sample_pool_excludes_other_status_tasks(self, mock_deps, watermark):
+        """filter_task_tree drops unknown-status tasks before they reach the proactive sample
+        pool; such tasks must not appear in '### Proactive Task Sample'.
+
+        The inline comment at task_knowledge_sync.py:94-95 documents this narrowing:
+        filter_task_tree increments other_count for unknown statuses without appending to
+        any list, so they never enter the itertools.chain pool.
+        """
+        mystery_title = 'Mystery Status Task'
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'in-progress', 'Active Task'),
+                self._make_task(2, 'pending', 'Pending Task'),
+                self._make_task(3, 'done', 'Done Task'),
+                self._make_task(4, 'mystery', mystery_title),  # unknown status -> other_count only
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        proactive_section = _extract_section(payload, '### Proactive Task Sample')
+        assert proactive_section, "Payload must contain '### Proactive Task Sample' section"
+        assert mystery_title not in proactive_section, (
+            f"Other-status task '{mystery_title}' must not appear in proactive sample pool; "
+            f"filter_task_tree drops unknown-status tasks before the pool is built."
+        )
+        # Sanity: at least one known-status task must be in the pool
+        assert 'Active Task' in proactive_section or 'Pending Task' in proactive_section, (
+            "At least one known-status task must appear in the proactive sample section"
+        )
+
 
 # ── Tests for task 455: MemoryConsolidator filtered task tree injection ─────────
 
