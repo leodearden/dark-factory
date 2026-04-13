@@ -533,14 +533,25 @@ async def aggregate_latency_stats(
     dbs: list[aiosqlite.Connection | None],
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> dict:
     """Aggregate latency stats across multiple project DBs.
 
     Recomputes percentiles from the merged raw duration list.
+
+    Args:
+        dbs: List of aiosqlite connections (None entries are tolerated).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp captured **once** for the entire aggregation
+            call and threaded into every per-DB ``_get_durations`` query.
+            When None (the default), ``datetime.now(UTC)`` is resolved here so
+            that all concurrent per-DB coroutines share the same cutoff window.
+            Pass an explicit value in tests for full determinism.
     """
+    effective_now = now if now is not None else datetime.now(UTC)
     all_durations: list[float] = []
     gather_results = await asyncio.gather(
-        *[_get_durations(db, hours=hours) for db in dbs],
+        *[_get_durations(db, hours=hours, now=effective_now) for db in dbs],
         return_exceptions=True,
     )
     for r in gather_results:
