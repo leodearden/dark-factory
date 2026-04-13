@@ -2363,6 +2363,30 @@ class TestInvariantAfterTask643:
             f'got done_tasks={result.done_tasks!r}'
         )
 
+    def test_filter_task_tree_invariant_holds_with_over_cap_cancelled_tasks(self):
+        """Regression guard: at the >MAX_CANCELLED_TASKS_RETAINED boundary the invariant still holds.
+
+        Even when cancelled_count exceeds MAX_CANCELLED_TASKS_RETAINED=15 (tasks are capped
+        in cancelled_tasks), cancelled_tasks must remain non-empty.  Mirrors the done-pair
+        over-cap test placed by task-782 and guards against future refactors of
+        filter_task_tree that might inadvertently empty the cancelled list under the cap.
+        """
+        n_tasks = MAX_CANCELLED_TASKS_RETAINED + 5
+        tasks_data = {
+            'tasks': [self._make_task(i, 'cancelled') for i in range(1, n_tasks + 1)]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert result.cancelled_count > MAX_CANCELLED_TASKS_RETAINED, (
+            f'Expected cancelled_count > {MAX_CANCELLED_TASKS_RETAINED}, got {result.cancelled_count}'
+        )
+        assert len(result.cancelled_tasks) == MAX_CANCELLED_TASKS_RETAINED, (
+            f'Expected cancelled_tasks capped at {MAX_CANCELLED_TASKS_RETAINED}, '
+            f'got {len(result.cancelled_tasks)}'
+        )
+        # Invariant holds implicitly: the assertion above already proves cancelled_tasks
+        # is non-empty (MAX_CANCELLED_TASKS_RETAINED == 15).
+
     def test_filter_task_tree_invariant_holds_with_over_cap_done_tasks(self):
         """Regression guard: at the >MAX_DONE_TASKS_RETAINED boundary the invariant still holds.
 
