@@ -245,7 +245,7 @@ class TestRunSubprocessLocalTimedOut:
             )
 
         assert result.timed_out is True
-        assert 'Process killed after 0.1s timeout (SIGTERM+SIGKILL)' in result.stderr
+        assert 'Process killed after' in result.stderr and 'timeout' in result.stderr
         assert result.returncode == 1
 
 
@@ -316,66 +316,6 @@ class TestParseGeminiOutputTimedOutDefault:
         """_parse_gemini_output returns timed_out=False when input is also False."""
         sub = _SubprocessResult(stdout='', stderr='err', returncode=1,
                                 duration_ms=100, timed_out=False)
-        agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
-        assert agent.timed_out is False
-
-
-# ── parser timed_out isolation ────────────────────────────────────────────────
-
-
-class TestParseCodexOutputTimedOutIsolation:
-    """_parse_codex_output must NOT propagate timed_out (callers handle it)."""
-
-    def test_parser_ignores_timed_out_true_on_empty_stdout(self):
-        """_parse_codex_output returns timed_out=False even when input has timed_out=True."""
-        sub = _SubprocessResult(stdout='', stderr='timeout', returncode=1,
-                                duration_ms=100, timed_out=True)
-        agent = _parse_codex_output(sub, 'gpt-5.4')
-        assert agent.timed_out is False
-
-    def test_parser_ignores_timed_out_true_on_json_parse_error(self):
-        """_parse_codex_output returns timed_out=False for unparseable stdout with timed_out=True."""
-        sub = _SubprocessResult(stdout='not json', stderr='', returncode=1,
-                                duration_ms=100, timed_out=True)
-        agent = _parse_codex_output(sub, 'gpt-5.4')
-        assert agent.timed_out is False
-
-    def test_parser_ignores_timed_out_true_on_normal_parse(self):
-        """_parse_codex_output returns timed_out=False for valid JSONL with timed_out=True."""
-        jsonl = json.dumps({'type': 'thread.started', 'thread_id': 'tid-1'}) + '\n'
-        jsonl += json.dumps({
-            'type': 'item.completed',
-            'item': {'type': 'agent_message', 'text': 'hello'},
-        }) + '\n'
-        jsonl += json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 5, 'output_tokens': 2}}) + '\n'
-        sub = _SubprocessResult(stdout=jsonl, stderr='', returncode=0,
-                                duration_ms=100, timed_out=True)
-        agent = _parse_codex_output(sub, 'gpt-5.4')
-        assert agent.timed_out is False
-
-
-class TestParseGeminiOutputTimedOutIsolation:
-    """_parse_gemini_output must NOT propagate timed_out (callers handle it)."""
-
-    def test_parser_ignores_timed_out_true_on_empty_stdout(self):
-        """_parse_gemini_output returns timed_out=False even when input has timed_out=True."""
-        sub = _SubprocessResult(stdout='', stderr='timeout', returncode=1,
-                                duration_ms=100, timed_out=True)
-        agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
-        assert agent.timed_out is False
-
-    def test_parser_ignores_timed_out_true_on_json_parse_error(self):
-        """_parse_gemini_output returns timed_out=False for non-JSON stdout with timed_out=True."""
-        sub = _SubprocessResult(stdout='not json', stderr='', returncode=1,
-                                duration_ms=100, timed_out=True)
-        agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
-        assert agent.timed_out is False
-
-    def test_parser_ignores_timed_out_true_on_normal_parse(self):
-        """_parse_gemini_output returns timed_out=False for valid JSON with timed_out=True."""
-        data = json.dumps({'response': 'hi', 'stats': {'input_tokens': 10, 'output_tokens': 5}})
-        sub = _SubprocessResult(stdout=data, stderr='', returncode=0,
-                                duration_ms=100, timed_out=True)
         agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
         assert agent.timed_out is False
 

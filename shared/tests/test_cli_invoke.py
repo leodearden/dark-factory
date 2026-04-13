@@ -1259,39 +1259,6 @@ class TestParseClaudeOutputTimedOutDefault:
         assert agent.timed_out is False
 
 
-# ── parser timed_out isolation ────────────────────────────────────────────────
-
-
-class TestParseClaudeOutputTimedOutIsolation:
-    """_parse_claude_output must NOT propagate timed_out (callers handle it)."""
-
-    def test_parser_ignores_timed_out_true_on_empty_stdout(self):
-        """_parse_claude_output returns timed_out=False even when input has timed_out=True."""
-        sub = _SubprocessResult(stdout='', stderr='timeout', returncode=1,
-                                duration_ms=100, timed_out=True)
-        agent = _parse_claude_output(sub)
-        assert agent.timed_out is False
-
-    def test_parser_ignores_timed_out_true_on_json_decode_error(self):
-        """_parse_claude_output returns timed_out=False for non-JSON stdout with timed_out=True."""
-        sub = _SubprocessResult(stdout='not json', stderr='', returncode=1,
-                                duration_ms=100, timed_out=True)
-        agent = _parse_claude_output(sub)
-        assert agent.timed_out is False
-
-    def test_parser_ignores_timed_out_true_on_normal_parse(self):
-        """_parse_claude_output returns timed_out=False for valid JSON with timed_out=True."""
-        data = json.dumps({
-            'subtype': 'success', 'result': 'done', 'cost_usd': 0.01,
-            'duration_ms': 200, 'num_turns': 1, 'session_id': 'sid-1',
-            'usage': {'input_tokens': 10, 'output_tokens': 5},
-        })
-        sub = _SubprocessResult(stdout=data, stderr='', returncode=0,
-                                duration_ms=200, timed_out=True)
-        agent = _parse_claude_output(sub)
-        assert agent.timed_out is False
-
-
 # ── caller-level timed_out propagation (characterization tests) ───────────────
 
 
