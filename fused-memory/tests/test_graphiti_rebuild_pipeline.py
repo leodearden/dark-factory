@@ -252,6 +252,22 @@ class TestCanonicalFacts:
         result = GraphitiBackend._canonical_facts(edges)
         assert result == []
 
+    def test_non_string_fact_mixed_with_valid_strings(self):
+        """Non-string facts are silently dropped; valid string facts are returned.
+
+        Mixing valid string facts with non-string truthy values (int, list, None)
+        must return only the string facts in their original order.
+        """
+        edges = [
+            {'fact': 'A knows B'},
+            {'fact': 42},
+            {'fact': 'C works at Acme'},
+            {'fact': ['x']},
+            {'fact': None},
+        ]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == ['A knows B', 'C works at Acme']
+
 
 # ---------------------------------------------------------------------------
 # step-5: refresh_entity_summary optional name/old_summary params
