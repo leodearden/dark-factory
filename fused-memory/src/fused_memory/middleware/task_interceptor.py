@@ -129,6 +129,17 @@ class TaskInterceptor:
             if isinstance(result, Exception):
                 logger.error('Background task failed during drain: %s', result)
 
+    async def close(self) -> None:
+        """Release resources held by the interceptor.
+
+        Closes the :class:`TaskCurator`'s Qdrant connection if the curator
+        was created. Call after :meth:`drain` at shutdown to ensure the
+        connection pool is released cleanly.
+        """
+        if self._curator is not None:
+            await self._curator.close()
+            self._curator = None
+
     # ── Status transitions (with targeted reconciliation) ──────────────
 
     async def set_task_status(
@@ -351,7 +362,8 @@ class TaskInterceptor:
         Called after the curator is constructed (or lazily on first use).
         Checks collection point count via Qdrant. If count is 0 (or the
         collection doesn't exist), fetches the full task tree, flattens it,
-        and spawns ``curator.backfill_corpus()`` as a fire-and-forget task.
+        and awaits ``curator.backfill_corpus()`` inline (this method itself
+        runs as a background task spawned by ``_get_curator``).
 
         The ``_backfill_triggered`` flag prevents re-triggering on subsequent
         calls. All failures degrade silently — nothing here must ever block
@@ -389,23 +401,17 @@ class TaskInterceptor:
             if not flat_tasks:
                 return
 
-            # Fire and forget.
-            async def _do_backfill() -> None:
-                try:
-                    result = await curator.backfill_corpus(flat_tasks, project_id)
-                    logger.info(
-                        'task_curator: auto-backfill complete — '
-                        'upserted=%d skipped=%d errors=%d',
-                        result.upserted, result.skipped, result.errors,
-                    )
-                except Exception:
-                    logger.warning(
-                        'task_curator: auto-backfill failed', exc_info=True,
-                    )
-
-            bg = asyncio.create_task(_do_backfill(), name='curator-auto-backfill')
-            self._background_tasks.add(bg)
-            bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+            try:
+                result = await curator.backfill_corpus(flat_tasks, project_id)
+                logger.info(
+                    'task_curator: auto-backfill complete — '
+                    'upserted=%d skipped=%d errors=%d',
+                    result.upserted, result.skipped, result.errors,
+                )
+            except Exception:
+                logger.warning(
+                    'task_curator: auto-backfill failed', exc_info=True,
+                )
 
         except Exception:
             logger.warning('task_curator: _maybe_backfill_corpus raised', exc_info=True)

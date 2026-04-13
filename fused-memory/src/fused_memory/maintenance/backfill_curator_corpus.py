@@ -136,8 +136,11 @@ async def run_backfill(
         # Build a TaskCurator (lazy — connects on first use).
         curator = TaskCurator(config=config, taskmaster=taskmaster)
 
-        manager = BackfillManager(config=config, taskmaster=taskmaster, curator=curator)
-        report = await manager.backfill(project_root=project_root)
+        try:
+            manager = BackfillManager(config=config, taskmaster=taskmaster, curator=curator)
+            report = await manager.backfill(project_root=project_root)
+        finally:
+            await curator.close()
 
         return BackfillResult(
             upserted=report.upserted,
