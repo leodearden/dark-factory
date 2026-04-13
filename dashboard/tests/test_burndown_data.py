@@ -478,21 +478,13 @@ class TestCollectSnapshot:
         _assert_snapshot_counts(reify_row, pending=1, done=1)
 
     @pytest.mark.asyncio
-    async def test_continues_when_known_root_unreadable(self, tmp_path, caplog):
+    async def test_continues_when_known_root_unreadable(self, burndown_conn_with_config, caplog):
         """PermissionError on one known root is skipped; other roots are still snapshotted."""
         import logging
-
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
 
         root_a = Path('/fake/project/root_a')
         root_b = Path('/fake/project/root_b')
         root_c = Path('/fake/project/root_c')
-
-        config = DashboardConfig(
-            project_root=tmp_path,
-            known_project_roots=[root_a, root_b, root_c],
-        )
 
         main_tasks = [{'status': 'pending'}]
         root_a_tasks = [{'status': 'done'}]
@@ -502,19 +494,19 @@ class TestCollectSnapshot:
         # concurrently, so an ordered side_effect list can race. The bad path
         # raises PermissionError; return_exceptions=True isolates the failure.
         bad_tasks_json = root_b.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
-        _tasks_map = {
-            config.tasks_json: main_tasks,
-            root_a.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': root_a_tasks,
-            root_c.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': root_c_tasks,
-        }
 
-        def fake_load(path):
-            if path == bad_tasks_json:
-                raise PermissionError('Permission denied')
-            return _tasks_map[path]
+        async with burndown_conn_with_config(known_project_roots=[root_a, root_b, root_c]) as (db_path, config, conn):
+            _tasks_map = {
+                config.tasks_json: main_tasks,
+                root_a.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': root_a_tasks,
+                root_c.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': root_c_tasks,
+            }
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
+            def fake_load(path):
+                if path == bad_tasks_json:
+                    raise PermissionError('Permission denied')
+                return _tasks_map[path]
+
             with (
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
@@ -528,7 +520,7 @@ class TestCollectSnapshot:
         project_ids = {row['project_id'] for row in rows}
         # main + root_a + root_c should be present
         assert len(rows) == 3
-        assert str(tmp_path.resolve()) in project_ids
+        assert str(config.project_root) in project_ids
         assert str(root_a.resolve()) in project_ids
         assert str(root_c.resolve()) in project_ids
         # root_b should NOT be present
@@ -547,29 +539,21 @@ class TestCollectSnapshot:
         assert warning_records[0].exc_info is not None
 
     @pytest.mark.asyncio
-    async def test_logs_warning_when_known_root_unreadable(self, tmp_path, caplog):
+    async def test_logs_warning_when_known_root_unreadable(self, burndown_conn_with_config, caplog):
         """A WARNING is logged naming the failing root when PermissionError occurs."""
         import logging
 
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
-
         bad_root = Path('/fake/project/bad_root')
-
-        config = DashboardConfig(
-            project_root=tmp_path,
-            known_project_roots=[bad_root],
-        )
-
         bad_tasks_json = bad_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
-        _tasks_map: dict = {config.tasks_json: []}
 
-        def fake_load(path):
-            if path == bad_tasks_json:
-                raise PermissionError('Permission denied')
-            return _tasks_map[path]
+        async with burndown_conn_with_config(known_project_roots=[bad_root]) as (db_path, config, conn):
+            _tasks_map: dict = {config.tasks_json: []}
 
-        async with aiosqlite.connect(str(db_path)) as conn:
+            def fake_load(path):
+                if path == bad_tasks_json:
+                    raise PermissionError('Permission denied')
+                return _tasks_map[path]
+
             with (
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
@@ -586,35 +570,27 @@ class TestCollectSnapshot:
         assert any(r.exc_info for r in warning_records)
 
     @pytest.mark.asyncio
-    async def test_first_root_failure_does_not_block_subsequent_inserts(self, tmp_path):
+    async def test_first_root_failure_does_not_block_subsequent_inserts(self, burndown_conn_with_config):
         """If the very first known root fails, subsequent roots still get snapshotted."""
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
-
         bad_root = Path('/fake/project/bad_root')
         good_root = Path('/fake/project/good_root')
-
-        config = DashboardConfig(
-            project_root=tmp_path,
-            known_project_roots=[bad_root, good_root],
-        )
 
         main_tasks = [{'status': 'pending'}]
         good_tasks = [{'status': 'done'}, {'status': 'done'}]
 
         bad_tasks_json = bad_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
-        _tasks_map = {
-            config.tasks_json: main_tasks,
-            good_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': good_tasks,
-        }
 
-        def fake_load(path):
-            if path == bad_tasks_json:
-                raise PermissionError('denied')
-            return _tasks_map[path]
+        async with burndown_conn_with_config(known_project_roots=[bad_root, good_root]) as (db_path, config, conn):
+            _tasks_map = {
+                config.tasks_json: main_tasks,
+                good_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': good_tasks,
+            }
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
+            def fake_load(path):
+                if path == bad_tasks_json:
+                    raise PermissionError('denied')
+                return _tasks_map[path]
+
             with (
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
@@ -626,7 +602,7 @@ class TestCollectSnapshot:
 
         assert len(rows) == 2
         project_ids = {row['project_id'] for row in rows}
-        assert str(tmp_path.resolve()) in project_ids        # (a) main project row
+        assert str(config.project_root) in project_ids       # (a) main project row
         assert str(good_root.resolve()) in project_ids       # (b) good_root row
         assert str(bad_root.resolve()) not in project_ids    # (c) no bad_root row
 
@@ -667,7 +643,7 @@ class TestCollectSnapshot:
         assert count == 1
 
     @pytest.mark.asyncio
-    async def test_load_task_tree_calls_run_concurrently(self, tmp_path):
+    async def test_load_task_tree_calls_run_concurrently(self, burndown_conn_with_config):
         """All load_task_tree calls must run concurrently via asyncio.gather.
 
         Uses a threading.Barrier(N) to detect concurrency: all N threads must
@@ -678,16 +654,8 @@ class TestCollectSnapshot:
         """
         import threading
 
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
-
-        reify_root = tmp_path / 'reify'
-        autopilot_root = tmp_path / 'autopilot'
-
-        config = DashboardConfig(
-            project_root=tmp_path,
-            known_project_roots=[reify_root, autopilot_root],
-        )
+        reify_root = Path('/fake/project/reify')
+        autopilot_root = Path('/fake/project/autopilot')
 
         # 3 distinct roots: main project + 2 known roots (no orchestrators)
         n_roots = 3
@@ -705,7 +673,7 @@ class TestCollectSnapshot:
                 )
             return []
 
-        async with aiosqlite.connect(str(db_path)) as conn:
+        async with burndown_conn_with_config(known_project_roots=[reify_root, autopilot_root]) as (db_path, config, conn):
             with (
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
@@ -718,7 +686,7 @@ class TestCollectSnapshot:
                 assert row[0] == 3
 
     @pytest.mark.asyncio
-    async def test_gather_partial_failure_skips_bad_project(self, tmp_path):
+    async def test_gather_partial_failure_skips_bad_project(self, burndown_conn_with_config):
         """One load_task_tree raises OSError; collect_snapshot must either raise
         cleanly (pre-fix: asyncio.gather propagates the first exception) OR skip
         the bad project and insert healthy rows (post-fix: return_exceptions=True).
@@ -729,34 +697,25 @@ class TestCollectSnapshot:
         lands. Once 519 is confirmed done a follow-up task can tighten it to
         only the post-fix branch.
         """
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
-
         reify_root = Path('/nonexistent/known/reify')
         autopilot_root = Path('/nonexistent/known/autopilot')
-
-        config = DashboardConfig(
-            project_root=tmp_path,
-            known_project_roots=[reify_root, autopilot_root],
-        )
 
         # The path that will raise OSError — reify is the failing root.
         bad_path = reify_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
 
-        # Only map the two healthy roots; the failing root is intentionally absent.
-        _tasks_map = {
-            config.tasks_json: [],
-            autopilot_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': [{'status': 'done'}],
-        }
-
-        def fake_load(path):
-            if path == bad_path:
-                raise OSError('mock disk error')
-            return _tasks_map[path]
-
         raised_oserror = False
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
+        async with burndown_conn_with_config(known_project_roots=[reify_root, autopilot_root]) as (db_path, config, conn):
+            # Only map the two healthy roots; the failing root is intentionally absent.
+            _tasks_map = {
+                config.tasks_json: [],
+                autopilot_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': [{'status': 'done'}],
+            }
+
+            def fake_load(path):
+                if path == bad_path:
+                    raise OSError('mock disk error')
+                return _tasks_map[path]
+
             with (
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
@@ -782,11 +741,11 @@ class TestCollectSnapshot:
             # failing project is cleanly excluded.
             assert len(rows) == 2
             assert str(reify_root.resolve()) not in project_ids
-            assert str(config.project_root.resolve()) in project_ids
+            assert str(config.project_root) in project_ids
             assert str(autopilot_root.resolve()) in project_ids
 
     @pytest.mark.asyncio
-    async def test_gather_return_exceptions_preserves_healthy_snapshots(self, tmp_path, caplog):
+    async def test_gather_return_exceptions_preserves_healthy_snapshots(self, burndown_conn_with_config, caplog):
         """OSError on one known root is isolated; healthy projects are still snapshotted.
 
         Regression anchor for task 519: asyncio.gather(return_exceptions=True) +
@@ -796,36 +755,28 @@ class TestCollectSnapshot:
         """
         import logging
 
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
-
         bad_root = Path('/fake/project/bad_root')
         good_root_1 = Path('/fake/project/good_root_1')
         good_root_2 = Path('/fake/project/good_root_2')
-
-        config = DashboardConfig(
-            project_root=tmp_path,
-            known_project_roots=[bad_root, good_root_1, good_root_2],
-        )
 
         main_tasks = [{'status': 'pending'}]
         good_1_tasks = [{'status': 'done'}, {'status': 'done'}]
         good_2_tasks = [{'status': 'done'}]
 
         bad_tasks_json = bad_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
-        _tasks_map = {
-            config.tasks_json: main_tasks,
-            good_root_1.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': good_1_tasks,
-            good_root_2.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': good_2_tasks,
-        }
 
-        def fake_load(path):
-            if path == bad_tasks_json:
-                raise OSError('mock disk error')
-            return _tasks_map[path]
+        async with burndown_conn_with_config(known_project_roots=[bad_root, good_root_1, good_root_2]) as (db_path, config, conn):
+            _tasks_map = {
+                config.tasks_json: main_tasks,
+                good_root_1.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': good_1_tasks,
+                good_root_2.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': good_2_tasks,
+            }
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
+            def fake_load(path):
+                if path == bad_tasks_json:
+                    raise OSError('mock disk error')
+                return _tasks_map[path]
+
             with (
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
@@ -846,7 +797,7 @@ class TestCollectSnapshot:
         assert str(bad_root.resolve()) not in by_project
 
         # (c) main project and both good roots must appear
-        assert str(tmp_path.resolve()) in by_project
+        assert str(config.project_root) in by_project
         assert str(good_root_1.resolve()) in by_project
         assert str(good_root_2.resolve()) in by_project
 
@@ -914,7 +865,7 @@ class TestCollectSnapshot:
         assert any(r.exc_info for r in warning_records)
 
     @pytest.mark.asyncio
-    async def test_skips_known_root_on_resolve_error(self, tmp_path, caplog):
+    async def test_skips_known_root_on_resolve_error(self, burndown_conn_with_config, caplog):
         """OSError raised from Path.resolve for one known_project_roots entry is
         absorbed by Phase 2's return_exceptions=True: a warning is logged naming
         the failing root, and the remaining known roots are still snapshotted.
@@ -927,29 +878,17 @@ class TestCollectSnapshot:
         """
         import logging
 
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
-
         root_a = Path('/fake/project/resolve_root_a')
         bad_root = Path('/fake/project/resolve_bad_root')
         root_c = Path('/fake/project/resolve_root_c')
-
-        config = DashboardConfig(
-            project_root=tmp_path,
-            known_project_roots=[root_a, bad_root, root_c],
-        )
 
         main_tasks = [{'status': 'pending'}]
         root_a_tasks = [{'status': 'done'}]
         root_c_tasks = [{'status': 'in-progress'}]
 
-        # Capture bad_prefix BEFORE patching so __post_init__ resolve() succeeds normally
+        # Capture bad_prefix BEFORE the factory creates config so DashboardConfig.__post_init__
+        # calls real Path.resolve on known_project_roots without hitting the bad_resolve patch.
         bad_prefix = str(bad_root.resolve())
-        _tasks_map = {
-            config.tasks_json: main_tasks,
-            root_a.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': root_a_tasks,
-            root_c.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': root_c_tasks,
-        }
 
         original_resolve = Path.resolve
 
@@ -958,16 +897,22 @@ class TestCollectSnapshot:
                 raise OSError('simulated Path.resolve failure')
             return original_resolve(self, *args, **kwargs)
 
-        def fake_load(path):
-            # Synthetic: call resolve() so the patched Path.resolve actually fires
-            # during the load pipeline. Real load_task_tree does not call resolve,
-            # but any Path operation — read_text, stat, symlink walk — could raise
-            # OSError. This injection point stands in for that broader category.
-            path.resolve()
-            return _tasks_map[path]
+        async with burndown_conn_with_config(known_project_roots=[root_a, bad_root, root_c]) as (db_path, config, conn):
+            # _tasks_map built here (after config creation, before patch) with real Path.resolve
+            _tasks_map = {
+                config.tasks_json: main_tasks,
+                root_a.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': root_a_tasks,
+                root_c.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': root_c_tasks,
+            }
 
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
+            def fake_load(path):
+                # Synthetic: call resolve() so the patched Path.resolve actually fires
+                # during the load pipeline. Real load_task_tree does not call resolve,
+                # but any Path operation — read_text, stat, symlink walk — could raise
+                # OSError. This injection point stands in for that broader category.
+                path.resolve()
+                return _tasks_map[path]
+
             with (
                 patch.object(Path, 'resolve', bad_resolve),
                 patch('dashboard.data.burndown.load_task_tree', side_effect=fake_load),
@@ -982,7 +927,7 @@ class TestCollectSnapshot:
         project_ids = {row['project_id'] for row in rows}
         # Three rows: main + root_a + root_c. bad_root is absorbed by return_exceptions.
         assert len(rows) == 3
-        assert str(tmp_path.resolve()) in project_ids
+        assert str(config.project_root) in project_ids
         assert str(root_a.resolve()) in project_ids
         assert str(root_c.resolve()) in project_ids
         assert str(bad_root.resolve()) not in project_ids
