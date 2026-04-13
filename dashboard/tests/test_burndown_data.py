@@ -138,7 +138,6 @@ async def burndown_env(burndown_conn_with_config):
         yield triple
 
 
-
 # ---------------------------------------------------------------------------
 # _count_statuses
 # ---------------------------------------------------------------------------
@@ -244,6 +243,7 @@ class TestCollectSnapshot:
             # _resolve_project_root resolve to the same real_dir.
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
+            assert len(rows) == 1
             assert rows[0]['project_id'] == str(real_dir.resolve())
 
     @pytest.mark.asyncio
