@@ -2155,6 +2155,39 @@ class TestInvariantAfterTask643:
             f'got records: {[(r.name, r.levelno, r.message) for r in caplog.records]}'
         )
 
+    def test_check_filtered_tree_invariant_warns_on_cancelled_violation(self, mock_deps, caplog):
+        """Unit test for _check_filtered_tree_invariant: warns when cancelled invariant is violated.
+
+        Calls the private helper directly with a FilteredTaskTree that has
+        cancelled_count=3 but cancelled_tasks=[] — an impossible state from
+        filter_task_tree() but reachable via external construction.  Asserts
+        that a WARNING containing 'cancelled_count' and 'cancelled_tasks' is
+        emitted.  Mirrors test_check_filtered_tree_invariant_warns_on_violation
+        for the done pair.
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        violating_tree = FilteredTaskTree(
+            active_tasks=[],
+            done_tasks=[],
+            done_count=0,
+            cancelled_tasks=[],
+            cancelled_count=3,
+            other_count=0,
+            total_count=3,
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            stage._check_filtered_tree_invariant(violating_tree)
+
+        assert any(
+            rec.levelno == logging.WARNING
+            and 'cancelled_count' in rec.message
+            and 'cancelled_tasks' in rec.message
+            for rec in caplog.records
+        )
+
     def test_check_filtered_tree_invariant_warns_on_violation(self, mock_deps, caplog):
         """Unit test for _check_filtered_tree_invariant: warns when invariant is violated.
 
