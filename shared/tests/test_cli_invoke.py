@@ -1218,67 +1218,35 @@ class TestRunSubprocessTimedOut:
 
 # ── _parse_claude_output timed_out propagation ───────────────────────────────
 
+_CLAUDE_VALID_JSON_STDOUT = json.dumps({
+    'result': 'ok',
+    'subtype': 'success',
+    'cost_usd': 0.01,
+    'duration_ms': 100,
+    'num_turns': 1,
+    'session_id': 'sess-test',
+})
+
 
 class TestParseClaudeOutputPropagatesTimedOut:
     """Parser always sets timed_out — callers no longer need to patch it post-hoc."""
 
-    def test_timed_out_true_input_yields_true_on_empty_stdout(self):
-        """_parse_claude_output propagates timed_out=True — empty stdout."""
-        sub = _SubprocessResult(stdout='', stderr='timeout stderr', returncode=1,
-                                duration_ms=100, timed_out=True)
+    @pytest.mark.parametrize('input_timed_out', [True, False])
+    @pytest.mark.parametrize(
+        'stdout,stderr,returncode',
+        [
+            ('', 'timeout stderr', 1),
+            ('not valid json', '', 1),
+            (_CLAUDE_VALID_JSON_STDOUT, '', 0),
+        ],
+        ids=['empty_stdout', 'json_decode_error', 'normal_parse'],
+    )
+    def test_propagates_timed_out(self, stdout, stderr, returncode, input_timed_out):
+        """_parse_claude_output propagates timed_out from the subprocess result."""
+        sub = _SubprocessResult(stdout=stdout, stderr=stderr, returncode=returncode,
+                                duration_ms=100, timed_out=input_timed_out)
         agent = _parse_claude_output(sub)
-        assert agent.timed_out is True
-
-    def test_timed_out_true_input_yields_true_on_json_decode_error(self):
-        """_parse_claude_output propagates timed_out=True — parse error."""
-        sub = _SubprocessResult(stdout='not valid json', stderr='', returncode=1,
-                                duration_ms=100, timed_out=True)
-        agent = _parse_claude_output(sub)
-        assert agent.timed_out is True
-
-    def test_timed_out_true_input_yields_true_on_normal_parse(self):
-        """_parse_claude_output propagates timed_out=True — valid JSON."""
-        valid_json = json.dumps({
-            'result': 'ok',
-            'subtype': 'success',
-            'cost_usd': 0.01,
-            'duration_ms': 100,
-            'num_turns': 1,
-            'session_id': 'sess-test',
-        })
-        sub = _SubprocessResult(stdout=valid_json, stderr='', returncode=0,
-                                duration_ms=100, timed_out=True)
-        agent = _parse_claude_output(sub)
-        assert agent.timed_out is True
-
-    def test_timed_out_false_input_yields_false_on_empty_stdout(self):
-        """_parse_claude_output returns timed_out=False when input is False — empty stdout."""
-        sub = _SubprocessResult(stdout='', stderr='some error', returncode=1,
-                                duration_ms=100, timed_out=False)
-        agent = _parse_claude_output(sub)
-        assert agent.timed_out is False
-
-    def test_timed_out_false_input_yields_false_on_json_decode_error(self):
-        """_parse_claude_output returns timed_out=False when input is False — parse error."""
-        sub = _SubprocessResult(stdout='not valid json', stderr='', returncode=1,
-                                duration_ms=100, timed_out=False)
-        agent = _parse_claude_output(sub)
-        assert agent.timed_out is False
-
-    def test_timed_out_false_input_yields_false_on_normal_parse(self):
-        """_parse_claude_output returns timed_out=False when input is False — valid JSON."""
-        valid_json = json.dumps({
-            'result': 'ok',
-            'subtype': 'success',
-            'cost_usd': 0.01,
-            'duration_ms': 100,
-            'num_turns': 1,
-            'session_id': 'sess-test',
-        })
-        sub = _SubprocessResult(stdout=valid_json, stderr='', returncode=0,
-                                duration_ms=100, timed_out=False)
-        agent = _parse_claude_output(sub)
-        assert agent.timed_out is False
+        assert agent.timed_out is input_timed_out
 
 
 # ── caller-level timed_out propagation (characterization tests) ───────────────
