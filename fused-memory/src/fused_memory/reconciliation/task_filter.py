@@ -38,6 +38,12 @@ INACTIVE_TASK_STATUSES: frozenset[str] = frozenset({
 # prompt renderer, so switching consumers over later is a no-op for output budget.
 MAX_DONE_TASKS_RETAINED: int = 30
 
+# Maximum number of cancelled task dicts to retain in FilteredTaskTree.cancelled_tasks.
+# Caps the list to prevent the '### Recently Cancelled Tasks' section in
+# format_filtered_task_tree from growing unbounded — that section is exempt from
+# active-task truncation and would single-handedly exceed max_chars without this cap.
+MAX_CANCELLED_TASKS_RETAINED: int = 15
+
 # Status priority for sorting: lower value = higher priority.
 # Matches _select_proactive_sample in task_knowledge_sync.py.
 # 'done': 4 is included so that _select_proactive_sample (which sorts ALL tasks
@@ -91,7 +97,8 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
     Returns:
         FilteredTaskTree with active_tasks sorted by (_STATUS_PRIORITY, -id),
         done_tasks sorted by id descending and capped at MAX_DONE_TASKS_RETAINED,
-        cancelled_tasks sorted by id descending, and aggregate counts for done,
+        cancelled_tasks sorted by id descending and capped at MAX_CANCELLED_TASKS_RETAINED,
+        and aggregate counts for done,
         cancelled, and other (unknown) statuses. done_count/cancelled_count
         reflect the full input counts, not the (possibly capped) list lengths —
         consumers can detect overflow via `len(done_tasks) < done_count`.
@@ -142,19 +149,36 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
     active.sort(key=sort_key)
 
     # Select top-MAX_DONE_TASKS_RETAINED done tasks by id descending (recency proxy).
-    # heapq.nlargest is O(n) heap selection vs O(n log n) sort+slice — significant
-    # when done task counts grow into the hundreds.  Returns results in descending
-    # order, matching the previous sort+slice behavior.
-    done_retained = heapq.nlargest(MAX_DONE_TASKS_RETAINED, done, key=_id_key)
+    # heapq.nlargest is O(n + k log n) heap selection vs O(n log n) sort+slice —
+    # effectively O(n) for constant k=MAX_DONE_TASKS_RETAINED=30.
+    # Composite key (_id_key, -original_index) adds the original list position as a
+    # tiebreaker, guaranteeing stable selection for equal _id_key values (mirrors
+    # Python's stable sort: earlier-appearing tasks win ties).
+    done_retained = [
+        t for _, t in heapq.nlargest(
+            MAX_DONE_TASKS_RETAINED,
+            enumerate(done),
+            key=lambda pair: (_id_key(pair[1]), -pair[0]),
+        )
+    ]
 
-    # Sort cancelled by id descending (display order for the formatter section).
-    cancelled.sort(key=_id_key, reverse=True)
+    # Select top-MAX_CANCELLED_TASKS_RETAINED cancelled tasks by id descending.
+    # Cap prevents the '### Recently Cancelled Tasks' section from growing unbounded
+    # (that section is exempt from active-task truncation in format_filtered_task_tree).
+    # Composite key tiebreaker guarantees stable selection for equal _id_key values.
+    cancelled_retained = [
+        t for _, t in heapq.nlargest(
+            MAX_CANCELLED_TASKS_RETAINED,
+            enumerate(cancelled),
+            key=lambda pair: (_id_key(pair[1]), -pair[0]),
+        )
+    ]
 
     total = len(active) + done_count + cancelled_count + other_count
     return FilteredTaskTree(
         active_tasks=active,
         done_tasks=done_retained,
-        cancelled_tasks=cancelled,
+        cancelled_tasks=cancelled_retained,
         done_count=done_count,
         cancelled_count=cancelled_count,
         other_count=other_count,
