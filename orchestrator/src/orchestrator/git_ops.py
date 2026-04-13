@@ -45,20 +45,31 @@ AdvanceResult = Literal[
 ]
 
 
-class ScrubResult(Enum):
-    """Result of a ``scrub_task_dir_from_tree`` call.
+class ScrubOutcome(Enum):
+    """Outcome discriminant for :class:`ScrubResult`.
 
-    Distinguishes three outcomes so callers can react precisely:
-
-    - ``CLEAN``   — ``.task/`` was not present in the tree; no action taken.
-    - ``SCRUBBED``— ``.task/`` was found and successfully removed from the index.
-    - ``FAILED``  — ``.task/`` was found but could not be removed (git rm or
-                    git commit failed).  The index may still be contaminated;
-                    ``_assert_no_task_dir`` is the downstream hard gate.
+    Kept as a separate Enum so callers get IDE autocomplete and type-checking
+    while the :class:`ScrubResult` dataclass carries the optional error payload.
     """
     CLEAN = auto()
     SCRUBBED = auto()
     FAILED = auto()
+
+
+@dataclass(frozen=True)
+class ScrubResult:
+    """Result of a ``scrub_task_dir_from_tree`` call.
+
+    Distinguishes three outcomes so callers can react precisely:
+
+    - ``ScrubOutcome.CLEAN``   — ``.task/`` was not present in the tree.
+    - ``ScrubOutcome.SCRUBBED``— ``.task/`` was found and successfully removed.
+    - ``ScrubOutcome.FAILED``  — ``.task/`` was found but removal failed.
+                                  The ``error`` field contains the raw git stderr
+                                  for operator diagnostics.
+    """
+    outcome: ScrubOutcome
+    error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -97,11 +108,11 @@ async def scrub_task_dir_from_tree(
         cwd=cwd,
     )
     if rc != 0 or not tracked.strip():
-        return ScrubResult.CLEAN
+        return ScrubResult(outcome=ScrubOutcome.CLEAN)
 
     files = [f for f in tracked.strip().splitlines() if f.strip()]
     if not files:
-        return ScrubResult.CLEAN
+        return ScrubResult(outcome=ScrubOutcome.CLEAN)
 
     logger.warning(
         '.task/ CONTAMINATION detected during %s — removing %d tracked file(s): %s',
@@ -112,7 +123,7 @@ async def scrub_task_dir_from_tree(
     rc, _, err = await _run(['git', 'rm', '-r', '--cached', '--', '.task/'], cwd=cwd)
     if rc != 0:
         logger.error('.task/ scrub failed during %s: git rm --cached failed: %s', context, err)
-        return ScrubResult.FAILED
+        return ScrubResult(outcome=ScrubOutcome.FAILED, error=err.strip() or None)
 
     # Also remove from filesystem if present (cleanup inherited contamination)
     task_dir = cwd / '.task'
@@ -139,10 +150,10 @@ async def scrub_task_dir_from_tree(
 
     if rc != 0:
         logger.error('.task/ scrub failed during %s: could not commit removal: %s', context, err)
-        return ScrubResult.FAILED
+        return ScrubResult(outcome=ScrubOutcome.FAILED, error=err.strip() or None)
 
     logger.info('.task/ scrub completed during %s — %d file(s) removed from tree', context, len(files))
-    return ScrubResult.SCRUBBED
+    return ScrubResult(outcome=ScrubOutcome.SCRUBBED)
 
 
 def _ensure_task_gitignore(worktree: Path) -> None:
@@ -330,19 +341,20 @@ class GitOps:
         scrub_result = await scrub_task_dir_from_tree(
             worktree_path, 'worktree-creation', amend=False,
         )
-        if scrub_result == ScrubResult.SCRUBBED:
+        if scrub_result.outcome == ScrubOutcome.SCRUBBED:
             logger.warning(
                 'MAIN IS CONTAMINATED — .task/ was inherited by new worktree %s. '
                 'The contamination has been removed from this worktree, but main '
                 'still carries .task/.  Run: git rm -r --cached .task/ on main.',
                 worktree_path,
             )
-        elif scrub_result == ScrubResult.FAILED:
+        elif scrub_result.outcome == ScrubOutcome.FAILED:
             logger.error(
                 '.task/ scrub FAILED during worktree-creation for %s — the index '
                 'may still be contaminated.  The hard gate at advance_main will '
-                'catch this if contamination reaches main.',
+                'catch this if contamination reaches main. Error: %s',
                 worktree_path,
+                scrub_result.error or '(no stderr)',
             )
 
         return WorktreeInfo(path=worktree_path, base_commit=base_sha)
@@ -534,16 +546,19 @@ class GitOps:
             # git rm --cached, and amends the merge commit in-place.
             # This is the single most important .task/ defense.
             scrub_result = await scrub_task_dir_from_tree(merge_wt, f'post-merge({full_branch})')
-            if scrub_result == ScrubResult.FAILED:
+            if scrub_result.outcome == ScrubOutcome.FAILED:
                 logger.error(
                     '.task/ scrub FAILED post-merge for %s — aborting merge; '
                     'no advance_main will run.',
                     full_branch,
                 )
                 await self.cleanup_merge_worktree(merge_wt)
+                _detail = f'.task/ scrub failed post-merge for {full_branch}'
+                if scrub_result.error:
+                    _detail = f'{_detail}: {scrub_result.error}'
                 return MergeResult(
                     success=False,
-                    details=f'.task/ scrub failed post-merge for {full_branch}',
+                    details=_detail,
                     pre_merge_sha=pre_merge_sha,
                 )
 
@@ -796,11 +811,11 @@ class GitOps:
             scrub_result = await scrub_task_dir_from_tree(
                 merge_worktree, f'advance_main-retry({attempt + 1})',
             )
-            if scrub_result == ScrubResult.FAILED:
+            if scrub_result.outcome == ScrubOutcome.FAILED:
                 logger.error(
                     '.task/ scrub FAILED during advance_main-retry(%d) — index may '
-                    'be contaminated; _assert_no_task_dir will catch it.',
-                    attempt + 1,
+                    'be contaminated; _assert_no_task_dir will catch it. Error: %s',
+                    attempt + 1, scrub_result.error or '(no stderr)',
                 )
             _, new_sha, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=merge_worktree,

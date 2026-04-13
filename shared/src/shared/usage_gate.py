@@ -49,7 +49,28 @@ CAP_HIT_PREFIXES = [
 # Secondary confirmation — at least one of these keywords must also appear in
 # the same text for a CAP_HIT or NEAR_CAP prefix match to be accepted
 # (defense-in-depth against ambiguous prefix false positives).
-CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade"]
+# NOTE: 'upgrade' was narrowed to multi-word phrases because the bare verb is
+# too common in unrelated CLI messaging (e.g. 'Upgrade to v2 for more features')
+# and would effectively reduce the guard to a near-prefix-only match in those
+# cases.  'upgrade your plan' and 'upgrade your subscription' are natural SaaS
+# cap-message phrases unlikely to appear in non-cap contexts.  The primary
+# defense remains the CAP_HIT_PREFIXES / NEAR_CAP_PREFIXES prefix match.
+#
+# Known verbatim Claude CLI cap-hit messages that motivated this list
+# (update if Claude changes its wording):
+#   "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours."
+#       → 'usage limit', 'resets'
+#   "You've used all available credits. Upgrade your plan for more capacity."
+#       → 'upgrade your plan'
+#   "You're out of extra usage for this billing period. Your plan resets in 2h."
+#       → 'resets'
+#   "You're now using extra compute credits. Your plan resets in 1h."
+#       → 'resets'
+#   "You're close to reaching your usage limit. Your plan resets in 1h."  (near-cap)
+#       → 'usage limit', 'resets'
+# See also: TestCapDetectionPatterns.test_realistic_cap_messages in
+# test_usage_gate_exhaustive.py for the full parametrized fixture set.
+CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade your plan", "upgrade your subscription"]
 
 # Patterns for near-cap warnings (pause proactively)
 NEAR_CAP_PREFIXES = [
@@ -597,6 +618,7 @@ class UsageGate:
         # account is still capped and we must NOT unpause it.  Being
         # conservative here avoids the far worse outcome of unpausing a
         # capped account and burning quota on a still-limited account.
+        # See CAP_CONFIRM_KEYWORDS (module top) for the current keyword list.
         # Do not 'fix' this asymmetry without understanding the safety-margin
         # implications — see test_probe_prefix_only_without_confirm_keyword_still_returns_false.
         for prefixes in (CAP_HIT_PREFIXES, NEAR_CAP_PREFIXES):

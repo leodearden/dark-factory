@@ -108,6 +108,22 @@ async def burndown_env(tmp_path):
         yield db_path, config, conn
 
 
+@pytest.fixture
+def symlink_project_setup(tmp_path):
+    """Return (real_dir, link, db_path) for symlink deduplication tests.
+
+    Creates a real directory, a symlink pointing to it, and a burndown DB.
+    Each test creates its own DashboardConfig since config parameters differ.
+    """
+    real_dir = tmp_path / 'real'
+    real_dir.mkdir()
+    link = tmp_path / 'link'
+    link.symlink_to(real_dir)
+    db_path = tmp_path / 'burndown.db'
+    _create_burndown_db(db_path)
+    return real_dir, link, db_path
+
+
 # ---------------------------------------------------------------------------
 # _count_statuses
 # ---------------------------------------------------------------------------
@@ -184,15 +200,9 @@ class TestCollectSnapshot:
         _assert_snapshot_counts(row, pending=1, in_progress=1, done=2)
 
     @pytest.mark.asyncio
-    async def test_symlinked_root_deduplicates_with_orchestrator(self, tmp_path):
+    async def test_symlinked_root_deduplicates_with_orchestrator(self, symlink_project_setup):
         """Symlinked project_root and orchestrator resolving to real path produce only 1 row."""
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
-
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
+        real_dir, link, db_path = symlink_project_setup
 
         config = DashboardConfig(project_root=link)
 
@@ -200,6 +210,7 @@ class TestCollectSnapshot:
         fake_orchestrators = [{'prd': 'fake_prd.md', 'config_path': None}]
 
         async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
             with (
                 patch('dashboard.data.burndown.load_task_tree', return_value=[]),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
@@ -210,10 +221,15 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
+                assert row[0] == 1  # Only 1 row — symlink and real path should deduplicate
 
-        # Only 1 row — symlink and real path should deduplicate
-        assert count == 1
+            # Distinct from test_main_project_id_is_resolved_path: verifies that the
+            # resolved path is used as the project_id specifically in the orchestrator-
+            # dedup scenario, where both config.project_root and the mocked
+            # _resolve_project_root resolve to the same real_dir.
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+            assert rows[0]['project_id'] == str(real_dir.resolve())
 
     @pytest.mark.asyncio
     async def test_deduplicates_main_project_from_orchestrators(self, burndown_env):
@@ -232,9 +248,7 @@ class TestCollectSnapshot:
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
             row = await cur.fetchone()
             assert row is not None
-            count = row[0]
-
-        assert count == 1
+            assert row[0] == 1
 
     @pytest.mark.asyncio
     async def test_snapshots_known_project_roots_when_no_orchestrators(self, burndown_env):
@@ -324,20 +338,14 @@ class TestCollectSnapshot:
             assert row[0] == 1
 
     @pytest.mark.asyncio
-    async def test_symlinked_root_deduplicates_with_known_roots(self, tmp_path):
+    async def test_symlinked_root_deduplicates_with_known_roots(self, symlink_project_setup):
         """If known_project_roots includes the resolved real path, it deduplicates with a symlinked project_root."""
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
+        real_dir, link, db_path = symlink_project_setup
 
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
-
-        # project_root is the symlink; known_project_roots contains the resolved real path
+        # project_root is the symlink; known_project_roots contains the real path
         config = DashboardConfig(
             project_root=link,
-            known_project_roots=[real_dir],  # same underlying dir, unresolved
+            known_project_roots=[real_dir],  # real path; project_root is the symlink pointing here
         )
 
         async with aiosqlite.connect(str(db_path)) as conn:
@@ -350,10 +358,7 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        # Only 1 row — symlink project_root and known real path deduplicate
-        assert count == 1
+                assert row[0] == 1  # Only 1 row — symlink project_root and known real path deduplicate
 
     @pytest.mark.asyncio
     async def test_dedupes_known_root_against_running_orchestrator(self, burndown_env):
@@ -396,20 +401,12 @@ class TestCollectSnapshot:
                                 (str(reify_root),)) as cur:
             row = await cur.fetchone()
             assert row is not None
-            count = row[0]
-
-        assert count == 1  # only one row for reify, not two
+            assert row[0] == 1  # only one row for reify, not two
 
     @pytest.mark.asyncio
-    async def test_main_project_id_is_resolved_path(self, tmp_path):
+    async def test_main_project_id_is_resolved_path(self, symlink_project_setup):
         """project_id in snapshot must be the resolved path even when project_root is a symlink."""
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
-
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
+        real_dir, link, db_path = symlink_project_setup
 
         config = DashboardConfig(project_root=link)
 
@@ -621,17 +618,23 @@ class TestCollectSnapshot:
         assert good_row['done'] == 2  # done=2 for good_root
 
     @pytest.mark.asyncio
-    async def test_orchestrator_fallback_deduplicates_against_resolved_root(self, tmp_path):
+    async def test_orchestrator_fallback_deduplicates_against_resolved_root(self, symlink_project_setup, tmp_path):
         """When _resolve_project_root falls back to the symlinked config.project_root, it still deduplicates."""
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
-
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
+        real_dir, link, db_path = symlink_project_setup
 
         config = DashboardConfig(project_root=link)
+
+        # Guard: _resolve_project_root walks up from prd_path looking for .taskmaster.
+        # If any ancestor of tmp_path has one, the fallback branch never fires and
+        # this test silently verifies the wrong code path.  Skip (not fail) when the
+        # environment doesn't meet this precondition — a skip is a clearer signal than
+        # an unexpected assertion error.
+        for ancestor in tmp_path.resolve().parents:
+            if (ancestor / '.taskmaster').is_dir():
+                pytest.skip(
+                    f'{ancestor} contains .taskmaster — cannot exercise '
+                    f'_resolve_project_root fallback branch in this environment'
+                )
 
         # PRD path lives directly under tmp_path (not under real_dir), so
         # _resolve_project_root will walk up from tmp_path, find no .taskmaster,
@@ -652,11 +655,9 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        # Only 1 row — the orchestrator fallback targets the same project as the
-        # main project_root; resolved and unresolved paths must deduplicate.
-        assert count == 1
+                # Only 1 row — the orchestrator fallback targets the same project as the
+                # main project_root; resolved and unresolved paths must deduplicate.
+                assert row[0] == 1
 
     @pytest.mark.asyncio
     async def test_load_task_tree_calls_run_concurrently(self, tmp_path):
@@ -1016,9 +1017,7 @@ class TestDownsample:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        assert count == 6  # all preserved
+                assert row[0] == 6  # all preserved
 
     @pytest.mark.asyncio
     async def test_compacts_old_to_hourly(self, tmp_path):
@@ -1041,9 +1040,7 @@ class TestDownsample:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        assert count == 1  # compacted to one per hour
+                assert row[0] == 1  # compacted to one per hour
 
     @pytest.mark.asyncio
     async def test_expires_very_old(self, tmp_path):
@@ -1063,9 +1060,7 @@ class TestDownsample:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        assert count == 1  # only the recent one
+                assert row[0] == 1  # only the recent one
 
 
 # ---------------------------------------------------------------------------
@@ -1205,8 +1200,8 @@ class TestBurndownEnvFixture:
         # (c) conn is a usable aiosqlite connection
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
             row = await cur.fetchone()
-        assert row is not None
-        assert row[0] == 0
+            assert row is not None
+            assert row[0] == 0
 
 
 # ---------------------------------------------------------------------------

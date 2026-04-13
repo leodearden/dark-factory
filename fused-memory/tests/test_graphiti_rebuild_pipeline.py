@@ -189,9 +189,9 @@ class TestCanonicalFacts:
     def test_whitespace_only_fact_is_filtered(self):
         """Whitespace-only facts are filtered out, not included in results.
 
-        The filter uses ``if e.get('fact', '').strip()`` so that a string like
-        '   ' strips to '' (falsy) and is excluded.  Only facts with real
-        non-whitespace content pass through.
+        The filter uses ``isinstance(f, str) and f and not f.isspace()`` so that
+        a string like '   ' is rejected by ``f.isspace()`` and excluded.  Only
+        facts with real non-whitespace content pass through.
         """
         edges = [
             {'fact': '   '},  # whitespace-only — filtered out
@@ -203,10 +203,10 @@ class TestCanonicalFacts:
     def test_whitespace_variants_all_filtered(self):
         """All whitespace-only variants are filtered; content with surrounding whitespace is kept.
 
-        Tabs, newlines, mixed whitespace, and single spaces are all falsy after
-        .strip() and must be excluded.  A fact with real content but leading/
-        trailing whitespace (e.g. '  hello  ') is truthy after strip and must
-        be preserved with its original value.
+        Tabs, newlines, mixed whitespace, and single spaces all return True from
+        ``str.isspace()`` and must be excluded.  A fact with real content but
+        leading/trailing whitespace (e.g. '  hello  ') returns False from
+        ``isspace()`` and must be preserved with its original raw value.
         """
         edges = [
             {'fact': '\t\t'},  # tabs only — filtered
@@ -235,6 +235,39 @@ class TestCanonicalFacts:
         edges = [{'fact': '   '}, {'fact': '\t'}]
         result = GraphitiBackend._canonical_facts(edges)
         assert result == []
+
+    def test_non_string_truthy_fact_is_skipped(self):
+        """Non-string truthy fact values are silently filtered, no AttributeError raised.
+
+        The isinstance type guard must reject int, list, dict, bool, and bytes values
+        even though they are truthy.  Before the fix, ``(42 or '').strip()``
+        would raise AttributeError; the new filter silently skips them.
+        """
+        edges = [
+            {'fact': 42},          # int — truthy but not a string
+            {'fact': ['a']},       # list — truthy but not a string
+            {'fact': {'k': 'v'}},  # dict — truthy but not a string
+            {'fact': True},        # bool — truthy but not a string
+            {'fact': b'hello'},    # bytes — truthy but not a string (serialization boundary)
+        ]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == []
+
+    def test_non_string_fact_mixed_with_valid_strings(self):
+        """Non-string facts are silently dropped; valid string facts are returned.
+
+        Mixing valid string facts with non-string truthy values (int, list, None)
+        must return only the string facts in their original order.
+        """
+        edges = [
+            {'fact': 'A knows B'},
+            {'fact': 42},
+            {'fact': 'C works at Acme'},
+            {'fact': ['x']},
+            {'fact': None},
+        ]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == ['A knows B', 'C works at Acme']
 
 
 # ---------------------------------------------------------------------------
@@ -360,15 +393,33 @@ class TestRebuildEntitySummariesForceDryRun:
     branching).
     """
 
+    # ------------------------------------------------------------------
+    # Shared setup helper
+    # ------------------------------------------------------------------
+
+    def _setup_force_dry_run(self, mock_config, make_backend, entities):
+        """Wire a backend for force=True dry_run=True tests.
+
+        Mocks list_entity_nodes, get_all_valid_edges, and
+        _rebuild_entity_from_edges so callers only assert on the specific
+        behaviour under test rather than repeating the same wiring.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+        backend.get_all_valid_edges = AsyncMock(return_value={})
+        backend._rebuild_entity_from_edges = AsyncMock()
+        return backend
+
+    # ------------------------------------------------------------------
+    # Tests
+    # ------------------------------------------------------------------
+
     @pytest.mark.asyncio
     async def test_force_dry_run_does_not_call_get_all_valid_edges(
         self, mock_config, make_backend, make_stale_list
     ):
         """When force=True and dry_run=True, get_all_valid_edges is NOT called."""
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=make_stale_list())
-        backend.get_all_valid_edges = AsyncMock(return_value={})
-        backend._rebuild_entity_from_edges = AsyncMock()
+        backend = self._setup_force_dry_run(mock_config, make_backend, make_stale_list())
 
         await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=True)
 
@@ -376,29 +427,16 @@ class TestRebuildEntitySummariesForceDryRun:
         backend._rebuild_entity_from_edges.assert_not_awaited()
         backend.list_entity_nodes.assert_awaited_once()
 
-    async def _make_dry_run_result(self, mock_config, make_backend):
-        """Shared setup for force=True dry_run=True tests.
-
-        Returns (backend, entities, result) with a standard 3-entity fixture
-        and all relevant methods mocked.  Extracted to avoid duplicating
-        identical mock-wiring and production-call boilerplate across tests.
-        """
-        backend = make_backend(mock_config)
+    @pytest.mark.asyncio
+    async def test_force_dry_run_returns_correct_aggregate(self, mock_config, make_backend):
+        """When force=True and dry_run=True, result has correct structure."""
         entities = [
             {'uuid': 'u1', 'name': 'Alice', 'summary': 'summary A'},
             {'uuid': 'u2', 'name': 'Bob', 'summary': 'summary B'},
             {'uuid': 'u3', 'name': 'Carol', 'summary': 'summary C'},
         ]
-        backend.list_entity_nodes = AsyncMock(return_value=entities)
-        backend.get_all_valid_edges = AsyncMock(return_value={})
-        backend._rebuild_entity_from_edges = AsyncMock()
+        backend = self._setup_force_dry_run(mock_config, make_backend, entities)
         result = await backend.rebuild_entity_summaries(group_id='test', force=True, dry_run=True)
-        return backend, entities, result
-
-    @pytest.mark.asyncio
-    async def test_force_dry_run_returns_correct_aggregate(self, mock_config, make_backend):
-        """When force=True and dry_run=True, result has correct structure."""
-        backend, entities, result = await self._make_dry_run_result(mock_config, make_backend)
 
         assert result['total_entities'] == len(entities)
         assert result['stale_entities'] == result['total_entities']  # force=True treats every entity as stale
@@ -408,49 +446,11 @@ class TestRebuildEntitySummariesForceDryRun:
         expected_details = [
             {'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities
         ]
-        assert len(result['details']) == len(entities)  # explicit length guard for clearer failure diagnostics
-        # dry_run path appends details sequentially via 'for t in targets', so order is stable
-        assert [{k: d[k] for k in ('uuid', 'name', 'status')} for d in result['details']] == expected_details
+        assert len(result['details']) == len(entities)  # length guard: clear diff before per-element check
+        assert result['details'] == expected_details
         assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
         backend._rebuild_entity_from_edges.assert_not_awaited()
         backend.get_all_valid_edges.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_force_dry_run_detail_tolerates_extra_keys(self, mock_config, make_backend):
-        """Pattern-regression test: projected-key assertion tolerates additive detail schema changes.
-
-        This is a test-suite regression guard, not a production-behavior test. It
-        manually injects an extra field into the returned detail dicts (simulating a
-        future additive schema change) and verifies that:
-          1. The projected-key assertion ({k: d[k] for k in keys}) correctly validates
-             uuid/name/status while ignoring extra fields.
-          2. The old exact-dict equality would fail with extra keys — documenting why
-             the schema-tolerant projection pattern is needed.
-
-        For a production-behavior test covering the full rebuild aggregate, see
-        test_force_dry_run_returns_correct_aggregate.
-        """
-        _, entities, result = await self._make_dry_run_result(mock_config, make_backend)
-
-        # Simulate an additive schema change: inject an extra field into each detail,
-        # as if production had added 'group_id' to the skipped_dry_run record.
-        for d in result['details']:
-            d['group_id'] = 'extra_key_test'
-
-        expected_details = [
-            {'uuid': e['uuid'], 'name': e['name'], 'status': 'skipped_dry_run'} for e in entities
-        ]
-
-        # Confirm the extra key is present (simulation worked)
-        assert all('group_id' in d for d in result['details'])
-
-        # Old exact-dict comparison fails when extra keys are present
-        with pytest.raises(AssertionError):
-            assert result['details'] == expected_details
-
-        # dry_run path appends details sequentially via 'for t in targets', so order is stable
-        # Projected-key comparison tolerates extra keys while preserving order check
-        assert [{k: d[k] for k in ('uuid', 'name', 'status')} for d in result['details']] == expected_details
 
     @pytest.mark.asyncio
     async def test_force_no_dry_run_calls_get_all_valid_edges(

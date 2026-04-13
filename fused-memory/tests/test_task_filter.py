@@ -290,12 +290,12 @@ class TestFormatFilteredTaskTree:
         # Output must not exceed max_chars budget (default 50,000)
         assert len(output) <= 50_000
 
-        # Task 51 is beyond the max_tasks=50 cap — must not appear in body
-        assert 'Task title 51' not in output
+        # Task 51 is beyond the max_tasks=50 cap — structural match immune to ID-range changes
+        assert '\n- [51] ' not in output
 
-        # Header must contain the max_tasks-cap omission phrase: pins count + intent,
+        # Header must contain the max_tasks-cap omission phrase: pins count + verb + intent,
         # tolerates preposition rewording (e.g. 'omitted by' vs 'omitted due to')
-        assert re.search(r'450\s+more active.*max_tasks', output)
+        assert re.search(r'450\s+more active omitted (by|due to) max_tasks cap', output)
 
     def test_char_budget_clamps_below_max_tasks(self):
         """When max_chars forces truncation below the max_tasks cap, the truncation notice
@@ -305,15 +305,16 @@ class TestFormatFilteredTaskTree:
         """
         tree = self._make_tree(active_count=10, done_count=0, cancelled_count=0, other_count=0)
 
-        # max_chars=240 is chosen so that three regimes all exercise in one pass:
-        #   (1) max_tasks=5 caps 10 active tasks to 5 post-cap survivors,
-        #   (2) budget = 240 - 118 (header) - 29 (summary) = 93 admits 2 task lines
-        #       at 37 chars each (36-char line + 1-char newline separator) before
-        #       the accumulator overflows,
-        #   (3) the lazy pop loop fires: first-pass result = 266 > 240, so one line
-        #       is popped, leaving kept_lines=[line1], trimmed_count=4, result=229 <= 240.
+        # max_chars is chosen tight enough to exercise three regimes in one pass:
+        #   (1) max_tasks=5 caps the 10 active tasks to 5 post-cap survivors,
+        #   (2) the first-pass accumulator overflows, admitting only some task lines,
+        #   (3) the lazy pop loop fires, dropping at least one line to bring the result
+        #       within budget and emitting the truncation notice.
+        # The exact byte counts are intentionally not pinned here; the assertions below
+        # validate the invariants directly from the rendered output.
+        max_tasks = 5
         max_chars = 240
-        output = format_filtered_task_tree(tree, max_tasks=5, max_chars=max_chars)
+        output = format_filtered_task_tree(tree, max_tasks=max_tasks, max_chars=max_chars)
 
         # Output must honour the char budget
         assert len(output) <= max_chars
@@ -322,6 +323,16 @@ class TestFormatFilteredTaskTree:
         match = re.search(r'\.\.\. and (\d+) more active \(truncated for budget\)', output)
         assert match is not None, f'Expected truncation notice in output: {output!r}'
         trimmed_count = int(match.group(1))
+        # Count surviving task lines dynamically: each line rendered by _render_task_line
+        # starts with '- [N]' at the beginning of a line.
+        kept_count = len(re.findall(r'^- \[\d+\]', output, re.MULTILINE))
+        # Sanity bound: made explicit here (also implied by the task-1 regex below) so
+        # that a failure is diagnosed in terms of kept_count before reaching the
+        # anchored-line check.
+        assert kept_count >= 1, (
+            f'kept_count={kept_count}: no task lines survived — the lazy pop loop may have '
+            f'over-truncated or _render_task_line format changed'
+        )
 
         # Lower bound: at least one task was dropped by the char-budget clamp, confirming
         # the lazy pop loop genuinely fired (not just the initial accumulator cycle).
@@ -334,19 +345,25 @@ class TestFormatFilteredTaskTree:
 
         # At least one task line must survive the lazy pop loop — guards against the
         # regression where the notice fires but kept_lines ends up empty.
-        assert '- [1]' in output, (
+        # Anchored on the full task-line prefix format from _render_task_line
+        # (f'- [{tid}] ({status}) {title}') to avoid false-positive matches from
+        # bracketed numbers that may appear in the header or from higher task IDs
+        # whose string representation contains '1' as a substring.
+        assert re.search(r'- \[1\] \(pending\) Task title 1', output), (
             'Task 1 line should survive the lazy pop loop; '
             'if missing, the budget accounting has regressed'
         )
 
-        # trimmed_count must be exactly 4 (5 post-cap survivors minus 1 kept line after
-        # the lazy pop loop).  Exact equality catches: (a) the total_active bug where
-        # buggy trimmed_count = 10 - 1 = 9, which fails 9 != 4; (b) subtler off-by-one
-        # errors in truncation accounting that the upper bound alone would not catch.
-        assert trimmed_count == 4, (
-            f'trimmed_count={trimmed_count} should be exactly 4 '
-            f'(5 post-cap survivors minus 1 kept line); '
-            f'bug: trimmed_count tracks total_active instead of len(active[:max_tasks])'
+        # trimmed_count must equal max_tasks minus the kept task lines.  Exact equality
+        # catches: (a) the total_active bug where buggy trimmed_count = 10 - kept instead
+        # of 5 - kept, which fails because 10-kept != 5-kept; (b) subtler off-by-one
+        # errors in truncation accounting that an upper bound alone would not catch.
+        # Using kept_count (parsed from the output) decouples from byte-level arithmetic
+        # while preserving the same regression-detection strength.
+        assert trimmed_count == max_tasks - kept_count, (
+            f'trimmed_count={trimmed_count} should be {max_tasks} - {kept_count} = '
+            f'{max_tasks - kept_count} (max_tasks minus surviving task lines); '
+            f'bug: trimmed_count may track total_active instead of len(active[:max_tasks])'
         )
 
     def test_empty_active_and_empty_tree(self):
@@ -513,37 +530,52 @@ class TestFormatFilteredTaskTree:
             f'the lazy verification loop must pop task lines until the output fits'
         )
 
-    def test_budget_lazy_loop_handles_7_digit_trimmed_count(self):
+    def test_budget_lazy_loop_handles_7_digit_trimmed_count(self, monkeypatch):
         """Regression: format_filtered_task_tree must enforce len(output) <= max_chars even
         when trimmed_count reaches 7+ digits, where a fixed-width reserve approach would
         have under-allocated space for the truncation notice.
 
         The implementation uses a lazy verification loop that re-measures the realized
         notice length after each pop iteration. This test exercises the 7+ digit path
-        (trimmed_count=1_000_000) where a fixed-width reserve keyed on 4-digit trimmed
-        counts would overflow.
+        where a fixed-width reserve keyed on 4-digit trimmed counts would overflow.
 
-        Uses repeated-reference trick ([same_dict]*N) to keep peak allocation under
-        ~100 MB (1M pointers + rendered lines) rather than creating 1M full task dicts.
+        Performance: _render_task_line is monkeypatched to return 'X' (1 char) instead of
+        the real ~25-char line. This collapses per-line cost from ~25 chars to 1 char,
+        reducing peak memory from ~100 MB to ~20 MB and wall time from seconds to
+        sub-second, while preserving lazy-loop + 7-digit-trimmed_count coverage.
+
+        N=1_100_000 ensures trimmed_count is always 7+ digits regardless of how many lines
+        the lazy loop retains (1,100,000 - any_kept ≈ 1,099,500+). max_chars=500 provides
+        330 chars of headroom above the minimum viable output (header+notice+summary=170),
+        making the test insensitive to header format changes while still exercising the
+        lazy loop (initial result=551 > 500).
 
         Failure mode guarded: if the implementation ever switches to a fixed-width reserve
         (e.g. reserving 49 chars for a notice with a 4-digit count), then a 7-digit
         trimmed_count would produce a notice 3 chars longer, causing output to exceed
         max_chars. This test fails loudly in that case.
         """
-        # Task line for title='T', id=1: "- [1] (pending) T deps=[]" = 25 chars.
-        # With N=1_000_001, max_tasks=N, max_chars=200:
-        # header = "### Active Task Tree\n(1000001 active shown, 0 done, 0 cancelled, 0 other, 1000001 total)\n"
+        # Monkeypatch _render_task_line to return 'X' (1 char) for all tasks.
+        # format_filtered_task_tree calls the function via the module-local reference,
+        # so we patch at the module level to ensure the stub is used during the call.
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.task_filter._render_task_line',
+            lambda task: 'X',
+        )
+
+        # Stub lines are 1 char each. With N=1_100_000, max_tasks=N, max_chars=500:
+        # header = "### Active Task Tree\n(1100000 active shown, 0 done, 0 cancelled, 0 other, 1100000 total)\n"
         #        = 89 chars.
         # summary_line = "0 done, 0 cancelled — omitted" = 29 chars.
-        # budget = 200 - 89 - 29 = 82. Each line costs 26 chars (25 + newline).
-        # initial kept_lines = floor(82/26) = 3. trimmed_count starts at 999_998 (6 digits).
-        # After 2 pop iterations: kept_lines=1, trimmed_count=1_000_000 (7 digits).
-        # Result fits within 200 chars with a 5-char slack margin.
+        # budget = 500 - 89 - 29 = 382. Each stub line costs 2 chars (1 char + newline sep).
+        # initial kept = floor(383/2) = 191. trimmed_count = 1_100_000 - 191 = 1_099_809 (7 digits).
+        # Notice = "... and 1099809 more active (truncated for budget)" = 52 chars.
+        # Initial result = 89 + 381 + 52 + 29 = 551 > 500. Lazy loop fires, pops ~26 lines.
+        # After ~26 pops: kept=165, trimmed=1_099_835 (still 7 digits), result=499 ≤ 500. ✓
 
         single_task = {'id': 1, 'title': 'T', 'status': 'pending', 'dependencies': []}
-        n = 1_000_001
-        # Repeated-reference trick: list of n pointers to same dict — keeps memory < 1 MB.
+        n = 1_100_000
+        # Repeated-reference trick: list of n pointers to same dict — keeps memory < 2 MB.
         # Safe only because format_filtered_task_tree treats task dicts as read-only;
         # any future in-place mutation in the formatter (e.g. dep normalization) would
         # alias across all N entries and invalidate the trick.
@@ -556,7 +588,7 @@ class TestFormatFilteredTaskTree:
             total_count=n,
         )
 
-        max_chars = 200  # Tight budget: forces trimmed_count into the 7-digit range
+        max_chars = 500  # Wide enough to avoid header-format sensitivity; lazy loop still fires
         output = format_filtered_task_tree(tree_large, max_tasks=n, max_chars=max_chars)
 
         assert len(output) <= max_chars, (
@@ -570,8 +602,8 @@ class TestFormatFilteredTaskTree:
             f'Truncation notice not found in output; got: {output!r}'
         )
         trimmed_count = int(m.group(1))
-        assert trimmed_count >= 1_000_000, (
-            f'trimmed_count={trimmed_count} is under 1_000_000; '
+        assert len(str(trimmed_count)) >= 7, (
+            f'trimmed_count={trimmed_count} has fewer than 7 digits; '
             f'the 7+ digit path was not exercised (short-circuited?)'
         )
 
@@ -634,6 +666,68 @@ class TestFormatFilteredTaskTree:
         # Must NOT have trailing '...' after the closing bracket
         assert 'deps=[10, 20, 30, 40, 50]...' not in output, (
             f'Found unexpected ellipsis in output: {output!r}'
+        )
+
+    def test_structural_match_resists_id_range_extension(self):
+        """Canary: proves old substring assertion 'Task title 51' is fragile
+        while structural match '\\n- [51] ' correctly detects omission.
+
+        With 600 active tasks having IDs 510..1109, max_tasks=50 shows
+        tasks 510..559.  Task 51 is absent (correctly omitted — it is not
+        in the task set at all).  Titles 'Task title 510'..'Task title 519'
+        each contain 'Task title 51' as a leading substring, so the old
+        assertion::
+
+            assert 'Task title 51' not in output
+
+        would raise AssertionError even though task 51 is correctly absent
+        — a false failure.  The structural assertion::
+
+            assert '\\n- [51] ' not in output
+
+        passes correctly because '[51] ' (bracket-51-space) is a different
+        token from '[510] ' (bracket-510-space) and cannot be confused.
+
+        This test PASSES and documents precisely WHY the structural form was
+        chosen in test_caps_at_max_tasks_and_under_budget.
+        """
+        # 600 tasks, IDs 510..1109.  active[:50] shows IDs 510..559.
+        # Task 51 is not in this set — correctly excluded.
+        active = [
+            _make_task(i, 'pending', f'Task title {i}')
+            for i in range(510, 1110)  # 600 tasks, none is task 51
+        ]
+        tree = FilteredTaskTree(
+            active_tasks=active,
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=600,
+        )
+        output = format_filtered_task_tree(tree, max_tasks=50)
+
+        # (a) Old-style substring: 'Task title 51' IS present because
+        #     'Task title 510'..'Task title 519' are shown and each contains
+        #     'Task title 51' as a prefix substring.
+        #     The old assertion `assert 'Task title 51' not in output` would
+        #     raise AssertionError here — a false failure.
+        assert 'Task title 51' in output, (
+            "'Task title 51' must be found as a substring of a shown task title "
+            "(e.g. 'Task title 510'); if absent, the canary is not exercised correctly"
+        )
+
+        # (b) Structural match: '\n- [51] ' is NOT present because task 51 is
+        #     correctly absent.  '[51] ' cannot match '[510] ' — different tokens.
+        assert '\n- [51] ' not in output, (
+            "Task 51 is not in the task set; its rendered line prefix "
+            "'\\n- [51] ' must not appear in output"
+        )
+
+        # (c) End-to-end header check: 600 active tasks minus 50 shown = 550 omitted.
+        #     Confirms the max_tasks cap logic fires correctly for this range of IDs.
+        assert re.search(r'550\s+more active omitted (by|due to) max_tasks cap', output), (
+            "Expected header phrase '550 more active omitted … max_tasks cap' "
+            "(600 tasks − 50 shown = 550 omitted); output was:\n" + output
         )
 
     def test_many_deps_per_task_stays_under_budget(self):

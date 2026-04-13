@@ -11,6 +11,7 @@ import pytest
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
     GitOps,
+    ScrubOutcome,
     ScrubResult,
     WorktreeInfo,
     _run,
@@ -1277,8 +1278,8 @@ class TestScrubTaskDirFromTree:
             result = await scrub_task_dir_from_tree(worktree_info.path, 'test-clean')
 
         # Return value must be CLEAN — no tracked .task/ files in tree
-        assert result == ScrubResult.CLEAN, (
-            f'Expected ScrubResult.CLEAN when ls-tree is empty, got {result!r}'
+        assert result.outcome == ScrubOutcome.CLEAN, (
+            f'Expected ScrubOutcome.CLEAN when ls-tree is empty, got {result!r}'
         )
 
         # Filesystem .task/ must still exist — rmtree must NOT have run
@@ -1322,8 +1323,8 @@ class TestScrubTaskDirFromTree:
             result = await scrub_task_dir_from_tree(worktree_info.path, 'test-rm-fail')
 
         # Return value must be FAILED — git rm failed, scrub did not complete
-        assert result == ScrubResult.FAILED, (
-            f'Expected ScrubResult.FAILED on git rm failure, got {result!r}'
+        assert result.outcome == ScrubOutcome.FAILED, (
+            f'Expected outcome=FAILED on git rm failure, got {result!r}'
         )
 
         # An ERROR must have been logged containing the context label and the stderr
@@ -1373,8 +1374,8 @@ class TestScrubTaskDirFromTree:
             result = await scrub_task_dir_from_tree(worktree_info.path, 'test-happy')
 
         # Return value must be SCRUBBED
-        assert result == ScrubResult.SCRUBBED, (
-            f'Expected ScrubResult.SCRUBBED on success, got {result!r}'
+        assert result.outcome == ScrubOutcome.SCRUBBED, (
+            f'Expected outcome=SCRUBBED on success, got {result!r}'
         )
 
         # No ERROR should have been logged
@@ -1422,8 +1423,8 @@ class TestScrubTaskDirFromTree:
             result = await scrub_task_dir_from_tree(worktree_info.path, 'test-commit-fail')
 
         # Return value must be FAILED — commit did not succeed
-        assert result == ScrubResult.FAILED, (
-            f'Expected ScrubResult.FAILED on commit failure, got {result!r}'
+        assert result.outcome == ScrubOutcome.FAILED, (
+            f'Expected outcome=FAILED on commit failure, got {result!r}'
         )
 
         # An ERROR must have been logged with context and the commit stderr
@@ -1437,6 +1438,79 @@ class TestScrubTaskDirFromTree:
         assert not sentinel.exists(), (
             'sentinel.txt still exists — rmtree must run before git commit attempt'
         )
+
+    async def test_scrub_failed_result_carries_error(
+        self, tmp_path: Path,
+    ):
+        """When git rm fails, the returned ScrubResult must carry the git stderr.
+
+        After the ScrubResult → dataclass conversion, the failure path sets
+        outcome=ScrubOutcome.FAILED and error=<stderr>.strip().  This test drives
+        that conversion by asserting .outcome and .error on the return value.
+
+        Uses tmp_path directly (no real worktree) since _run is fully mocked.
+        """
+        async def mock_run(cmd, cwd=None):
+            if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
+                return (0, '.task/tracked.txt', '')
+            if cmd[:5] == ['git', 'rm', '-r', '--cached', '--']:
+                return (1, '', 'fatal: pathspec error from git rm')
+            pytest.fail(f'unexpected _run call: {cmd}')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await scrub_task_dir_from_tree(tmp_path, 'carries-err')
+
+        assert result.outcome == ScrubOutcome.FAILED, (
+            f'Expected outcome=FAILED on git rm failure, got {result!r}'
+        )
+        assert result.error is not None, 'Expected error to be set on git rm failure'
+        assert 'pathspec' in result.error, (
+            f'Expected git rm stderr in .error, got: {result.error!r}'
+        )
+
+    async def test_scrub_scrubbed_result_has_no_error(
+        self, tmp_path: Path,
+    ):
+        """When scrub succeeds, ScrubResult must have outcome=SCRUBBED and error=None.
+
+        Uses tmp_path directly (no real worktree) since _run is fully mocked.
+        """
+        async def mock_run(cmd, cwd=None):
+            if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
+                return (0, '.task/tracked.txt', '')
+            if cmd[:5] == ['git', 'rm', '-r', '--cached', '--']:
+                return (0, '', '')
+            if len(cmd) >= 2 and cmd[1] == 'commit':
+                return (0, '', '')
+            pytest.fail(f'unexpected _run call: {cmd}')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await scrub_task_dir_from_tree(tmp_path, 'no-err-ok')
+
+        assert result.outcome == ScrubOutcome.SCRUBBED, (
+            f'Expected outcome=SCRUBBED on success, got {result!r}'
+        )
+        assert result.error is None, f'Expected error=None on success, got {result.error!r}'
+
+    async def test_scrub_clean_result_has_no_error(
+        self, tmp_path: Path,
+    ):
+        """When no .task/ files are present, ScrubResult must have outcome=CLEAN and error=None.
+
+        Uses tmp_path directly (no real worktree) since _run is fully mocked.
+        """
+        async def mock_run(cmd, cwd=None):
+            if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
+                return (0, '', '')  # empty — no .task/ tracked
+            pytest.fail(f'unexpected _run call on clean path: {cmd}')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await scrub_task_dir_from_tree(tmp_path, 'clean-no-err')
+
+        assert result.outcome == ScrubOutcome.CLEAN, (
+            f'Expected outcome=CLEAN on empty tree, got {result!r}'
+        )
+        assert result.error is None, f'Expected error=None on clean, got {result.error!r}'
 
 
 @pytest.mark.asyncio
@@ -1461,7 +1535,7 @@ class TestMergeToMainScrubFailure:
         # Patch _scrub_task_dir_from_tree to return FAILED, simulating a scrub
         # failure after the merge commit has been created.
         async def fake_scrub(*args, **kwargs):
-            return ScrubResult.FAILED
+            return ScrubResult(outcome=ScrubOutcome.FAILED)
 
         with patch(
             'orchestrator.git_ops.scrub_task_dir_from_tree',
@@ -1483,10 +1557,9 @@ class TestMergeToMainScrubFailure:
         assert 'scrub' in result.details.lower(), (
             f'Expected "scrub" in details, got: {result.details!r}'
         )
-        assert (
-            'scrub-fail-branch' in result.details
-            or 'task/scrub-fail-branch' in result.details
-        ), f'Expected branch name in details, got: {result.details!r}'
+        assert 'task/scrub-fail-branch' in result.details, (
+            f'Expected full prefixed branch name in details, got: {result.details!r}'
+        )
 
         # (4) pre_merge_sha must be a valid 40-char SHA
         assert result.pre_merge_sha is not None, 'Expected pre_merge_sha to be set'
@@ -1539,7 +1612,7 @@ class TestMergeToMainScrubFailure:
         await git_ops.commit(worktree_info.path, 'Add scrub-ok file')
 
         async def fake_scrub_ok(*args, **kwargs):
-            return ScrubResult.SCRUBBED
+            return ScrubResult(outcome=ScrubOutcome.SCRUBBED)
 
         with patch(
             'orchestrator.git_ops.scrub_task_dir_from_tree',
@@ -1564,3 +1637,104 @@ class TestMergeToMainScrubFailure:
         # Clean up the merge worktree to avoid polluting other tests.
         if result.merge_worktree is not None:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+    async def test_merge_to_main_scrubs_real_task_dir(
+        self, git_ops: GitOps,
+    ):
+        """merge_to_main strips .task/ from the merge commit via the real scrub.
+
+        Unlike test_merge_to_main_succeeds_when_scrub_cleans_task_dir, this test
+        uses NO mock — it commits a real .task/plan.json file on the feature branch
+        and verifies that merge_to_main produces a clean merge commit with no .task/
+        entries in the tree.  This exercises the real scrub_task_dir_from_tree with
+        amend=True on an actual contaminated merge commit.
+        """
+        # Create a worktree and commit a regular file so the branch has content.
+        worktree_info = await git_ops.create_worktree('scrub-real-branch')
+        (worktree_info.path / 'feature.py').write_text('def feature(): pass\n')
+        await git_ops.commit(worktree_info.path, 'Add feature file')
+
+        # Inject .task/ contamination directly via git commands, bypassing the
+        # safety guards in git_ops.commit (which would normally unstage .task/).
+        # Use -f to force-add past the .task/.gitignore ('*') that create_worktree
+        # places there as a defence-in-depth measure.
+        task_dir = worktree_info.path / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"contamination": true}\n')
+        await _run(['git', 'add', '-f', '.task/plan.json'], cwd=worktree_info.path)
+        await _run(
+            ['git', 'commit', '-m', 'Simulated .task/ contamination'],
+            cwd=worktree_info.path,
+        )
+
+        # Verify contamination is present on the branch before merge.
+        _, ls_before, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'HEAD', '--', '.task/'],
+            cwd=worktree_info.path,
+        )
+        assert '.task/plan.json' in ls_before, (
+            f'Pre-condition: expected .task/plan.json on branch, got: {ls_before!r}'
+        )
+
+        # Call merge_to_main with NO mock — uses real scrub_task_dir_from_tree.
+        result = await git_ops.merge_to_main(worktree_info.path, 'scrub-real-branch')
+
+        try:
+            # (a) Merge must succeed.
+            assert result.success is True, (
+                f'Expected success=True when real scrub cleans .task/, got {result.success!r}'
+            )
+
+            # (b) A merge commit must have been created.
+            assert result.merge_commit is not None, (
+                'Expected a valid merge_commit SHA when scrub succeeds'
+            )
+
+            # (c) Verify .task/ is absent from the merge commit tree.
+            _, task_in_tree, _ = await _run(
+                ['git', 'ls-tree', '-r', '--name-only', result.merge_commit.strip(), '--', '.task/'],
+                cwd=git_ops.project_root,
+            )
+            assert not task_in_tree.strip(), (
+                f'.task/ must be absent from merge commit tree, but found: {task_in_tree!r}'
+            )
+        finally:
+            # Ensure merge worktree is cleaned up even when assertions fail.
+            if result.merge_worktree is not None:
+                await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+    async def test_merge_to_main_scrub_failure_details_include_root_cause(
+        self, git_ops: GitOps,
+    ):
+        """merge_to_main must surface ScrubResult.error in MergeResult.details.
+
+        When scrub_task_dir_from_tree returns a ScrubResult with error set,
+        the failure reason (raw git stderr) must appear in MergeResult.details
+        so MergeQueue propagates it to MergeOutcome.reason without log scraping.
+
+        This test is the failing test for step-5.  It will pass once step-6
+        wires scrub_result.error into the details f-string.
+        """
+        worktree_info = await git_ops.create_worktree('scrub-root-cause-branch')
+        (worktree_info.path / 'rc_test.py').write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, 'Add rc_test file')
+
+        root_cause = 'fatal: cannot amend merge commit'
+
+        async def fake_scrub_with_error(*args, **kwargs):
+            return ScrubResult(outcome=ScrubOutcome.FAILED, error=root_cause)
+
+        with patch(
+            'orchestrator.git_ops.scrub_task_dir_from_tree',
+            new=fake_scrub_with_error,
+        ):
+            result = await git_ops.merge_to_main(
+                worktree_info.path, 'scrub-root-cause-branch',
+            )
+
+        assert result.success is False, (
+            f'Expected success=False on scrub failure, got {result.success!r}'
+        )
+        assert 'cannot amend merge commit' in result.details, (
+            f'Expected git stderr in details for operator visibility, got: {result.details!r}'
+        )
