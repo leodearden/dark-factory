@@ -45,20 +45,31 @@ AdvanceResult = Literal[
 ]
 
 
-class ScrubResult(Enum):
-    """Result of a ``scrub_task_dir_from_tree`` call.
+class ScrubOutcome(Enum):
+    """Outcome discriminant for :class:`ScrubResult`.
 
-    Distinguishes three outcomes so callers can react precisely:
-
-    - ``CLEAN``   — ``.task/`` was not present in the tree; no action taken.
-    - ``SCRUBBED``— ``.task/`` was found and successfully removed from the index.
-    - ``FAILED``  — ``.task/`` was found but could not be removed (git rm or
-                    git commit failed).  The index may still be contaminated;
-                    ``_assert_no_task_dir`` is the downstream hard gate.
+    Kept as a separate Enum so callers get IDE autocomplete and type-checking
+    while the :class:`ScrubResult` dataclass carries the optional error payload.
     """
     CLEAN = auto()
     SCRUBBED = auto()
     FAILED = auto()
+
+
+@dataclass(frozen=True)
+class ScrubResult:
+    """Result of a ``scrub_task_dir_from_tree`` call.
+
+    Distinguishes three outcomes so callers can react precisely:
+
+    - ``ScrubOutcome.CLEAN``   — ``.task/`` was not present in the tree.
+    - ``ScrubOutcome.SCRUBBED``— ``.task/`` was found and successfully removed.
+    - ``ScrubOutcome.FAILED``  — ``.task/`` was found but removal failed.
+                                  The ``error`` field contains the raw git stderr
+                                  for operator diagnostics.
+    """
+    outcome: ScrubOutcome
+    error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -97,11 +108,11 @@ async def scrub_task_dir_from_tree(
         cwd=cwd,
     )
     if rc != 0 or not tracked.strip():
-        return ScrubResult.CLEAN
+        return ScrubResult(outcome=ScrubOutcome.CLEAN)
 
     files = [f for f in tracked.strip().splitlines() if f.strip()]
     if not files:
-        return ScrubResult.CLEAN
+        return ScrubResult(outcome=ScrubOutcome.CLEAN)
 
     logger.warning(
         '.task/ CONTAMINATION detected during %s — removing %d tracked file(s): %s',
@@ -112,7 +123,7 @@ async def scrub_task_dir_from_tree(
     rc, _, err = await _run(['git', 'rm', '-r', '--cached', '--', '.task/'], cwd=cwd)
     if rc != 0:
         logger.error('.task/ scrub failed during %s: git rm --cached failed: %s', context, err)
-        return ScrubResult.FAILED
+        return ScrubResult(outcome=ScrubOutcome.FAILED, error=err.strip() or None)
 
     # Also remove from filesystem if present (cleanup inherited contamination)
     task_dir = cwd / '.task'
@@ -139,10 +150,10 @@ async def scrub_task_dir_from_tree(
 
     if rc != 0:
         logger.error('.task/ scrub failed during %s: could not commit removal: %s', context, err)
-        return ScrubResult.FAILED
+        return ScrubResult(outcome=ScrubOutcome.FAILED, error=err.strip() or None)
 
     logger.info('.task/ scrub completed during %s — %d file(s) removed from tree', context, len(files))
-    return ScrubResult.SCRUBBED
+    return ScrubResult(outcome=ScrubOutcome.SCRUBBED)
 
 
 def _ensure_task_gitignore(worktree: Path) -> None:
@@ -200,9 +211,15 @@ class WorktreeInfo:
 
     The base_commit is the SHA of main at worktree creation time, pinned to
     ensure stable diffs even if main advances during task execution.
+
+    stale_commits: how far local main was behind the remote at worktree creation
+    time.  None means the fetch was unavailable (no remote configured).  0 means
+    already current.  Positive N means main was N commits behind origin/main and
+    the worktree was based on the freshened remote ref instead.
     """
     path: Path
     base_commit: str
+    stale_commits: int | None = None
 
 
 async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
@@ -248,6 +265,96 @@ class GitOps:
                 return True
         return False
 
+    async def _freshen_main(self) -> tuple[str, int | None]:
+        """Fetch from remote and return the freshest ref to use as worktree base.
+
+        Returns:
+            (ref, stale_commits) where:
+            - ref: the git ref to pass to ``git worktree add`` / ``git rev-parse``
+            - stale_commits: None  → fetch failed (no remote configured)
+                             0     → local main is already current with remote
+                             N > 0 → local main was N commits behind remote
+
+        Design decisions:
+        - Best-effort fetch: if fetch fails (no remote in tests), return
+          (main_branch, None) silently — matches the pattern in
+          _create_merge_worktree (line 578).
+        - No mutation of local main ref: advance_main() uses CAS on the local
+          main ref; updating it here could cause spurious CAS failures.  We
+          return the remote-tracking ref (origin/main) as the start-point
+          instead.
+        - Divergence guard: if local main has commits not in origin/main (e.g.
+          from advance_main calls not yet pushed), using origin/main would lose
+          those commits.  In the diverged case we fall back to local main and
+          log a warning.
+        """
+        remote_ref = f'{self.config.remote}/{self.config.main_branch}'
+
+        # Best-effort fetch — silently ignore failure (no remote in tests)
+        rc, _, _ = await _run(
+            ['git', 'fetch', self.config.remote, self.config.main_branch],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            logger.debug(
+                '_freshen_main: fetch from %s failed — using local %s',
+                self.config.remote, self.config.main_branch,
+            )
+            return self.config.main_branch, None
+
+        # Count commits local main is BEHIND origin/main
+        rc, behind_out, _ = await _run(
+            ['git', 'rev-list', '--count',
+             f'{self.config.main_branch}..{remote_ref}'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            logger.warning(
+                '_freshen_main: rev-list (behind) failed (rc=%d) — using local %s',
+                rc, self.config.main_branch,
+            )
+            return self.config.main_branch, None
+        try:
+            behind = int(behind_out.strip())
+        except ValueError:
+            logger.warning(
+                '_freshen_main: unexpected behind-count output: %r', behind_out,
+            )
+            return self.config.main_branch, None
+
+        if behind == 0:
+            return self.config.main_branch, 0
+
+        # Check for divergence: count commits local main is AHEAD of origin/main
+        _, ahead_out, _ = await _run(
+            ['git', 'rev-list', '--count',
+             f'{remote_ref}..{self.config.main_branch}'],
+            cwd=self.project_root,
+        )
+        try:
+            ahead = int(ahead_out.strip())
+        except ValueError:
+            logger.warning(
+                '_freshen_main: unexpected ahead-count output: %r', ahead_out,
+            )
+            # Fall back to local main; report behind count as-is (ref is local, not remote)
+            return self.config.main_branch, behind
+
+        if ahead > 0:
+            logger.warning(
+                '_freshen_main: local %s diverged from %s (%d ahead, %d behind) '
+                '— using local ref to avoid losing advance_main commits',
+                self.config.main_branch, remote_ref, ahead, behind,
+            )
+            return self.config.main_branch, behind
+
+        # Strictly behind: use remote-tracking ref as worktree start-point
+        logger.info(
+            '_freshen_main: local %s is %d commits behind %s — using %s',
+            self.config.main_branch, behind, remote_ref, remote_ref,
+        )
+        return remote_ref, behind
+
     async def create_worktree(self, branch_name: str) -> WorktreeInfo:
         """Create a git worktree for a task branch, based off main.
 
@@ -272,9 +379,21 @@ class GitOps:
             cwd=self.project_root,
         )
 
-        # Capture main's current SHA before creating worktree
+        # ── Freshen main from remote (best-effort) ────────────────────
+        # If origin/main has advanced since session start, use the remote-
+        # tracking ref as the worktree base so agents start from the freshest
+        # code.  Falls back to local main silently when no remote is configured
+        # (e.g. in test repos).  Never mutates the local main ref — that would
+        # interfere with advance_main's CAS logic.
+        start_ref, stale_commits = await self._freshen_main()
+        logger.info(
+            'create_worktree: freshening result: ref=%s, stale_commits=%s',
+            start_ref, stale_commits,
+        )
+
+        # Capture the freshened ref's SHA (used as stable base for diffs)
         _, base_sha, _ = await _run(
-            ['git', 'rev-parse', self.config.main_branch],
+            ['git', 'rev-parse', start_ref],
             cwd=self.project_root,
         )
 
@@ -286,7 +405,11 @@ class GitOps:
             if await self._is_registered_worktree(worktree_path):
                 logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
                 _ensure_task_gitignore(worktree_path)
-                return WorktreeInfo(path=worktree_path, base_commit=base_sha)
+                return WorktreeInfo(
+                    path=worktree_path,
+                    base_commit=base_sha,
+                    stale_commits=stale_commits,
+                )
             else:
                 logger.warning(
                     f'Directory {worktree_path} exists but is NOT a registered '
@@ -303,15 +426,18 @@ class GitOps:
             logger.info(f'Cleaning up stale branch {full_branch} before creating worktree')
             await _run(['git', 'branch', '-D', full_branch], cwd=self.project_root)
 
-        # Create worktree with new branch from main
+        # Create worktree with new branch from the freshened ref
         rc, out, err = await _run(
-            ['git', 'worktree', 'add', '-b', full_branch, str(worktree_path), self.config.main_branch],
+            ['git', 'worktree', 'add', '-b', full_branch, str(worktree_path), start_ref],
             cwd=self.project_root,
         )
         if rc != 0:
             raise RuntimeError(f'Failed to create worktree: {err}')
 
-        logger.info(f'Created worktree at {worktree_path} on branch {full_branch} (base={base_sha[:8]})')
+        logger.info(
+            'Created worktree at %s on branch %s (base=%s, stale_commits=%s)',
+            worktree_path, full_branch, base_sha[:8], stale_commits,
+        )
 
         # ── .task/.gitignore defense layer ────────────────────────────
         # Create .task/.gitignore with "*" so that broad "git add ."
@@ -330,22 +456,27 @@ class GitOps:
         scrub_result = await scrub_task_dir_from_tree(
             worktree_path, 'worktree-creation', amend=False,
         )
-        if scrub_result == ScrubResult.SCRUBBED:
+        if scrub_result.outcome == ScrubOutcome.SCRUBBED:
             logger.warning(
                 'MAIN IS CONTAMINATED — .task/ was inherited by new worktree %s. '
                 'The contamination has been removed from this worktree, but main '
                 'still carries .task/.  Run: git rm -r --cached .task/ on main.',
                 worktree_path,
             )
-        elif scrub_result == ScrubResult.FAILED:
+        elif scrub_result.outcome == ScrubOutcome.FAILED:
             logger.error(
                 '.task/ scrub FAILED during worktree-creation for %s — the index '
                 'may still be contaminated.  The hard gate at advance_main will '
-                'catch this if contamination reaches main.',
+                'catch this if contamination reaches main. Error: %s',
                 worktree_path,
+                scrub_result.error or '(no stderr)',
             )
 
-        return WorktreeInfo(path=worktree_path, base_commit=base_sha)
+        return WorktreeInfo(
+            path=worktree_path,
+            base_commit=base_sha,
+            stale_commits=stale_commits,
+        )
 
     async def commit(self, worktree: Path, message: str) -> str | None:
         """Stage all changes and commit. Returns sha or None if nothing to commit.
@@ -534,11 +665,20 @@ class GitOps:
             # git rm --cached, and amends the merge commit in-place.
             # This is the single most important .task/ defense.
             scrub_result = await scrub_task_dir_from_tree(merge_wt, f'post-merge({full_branch})')
-            if scrub_result == ScrubResult.FAILED:
+            if scrub_result.outcome == ScrubOutcome.FAILED:
                 logger.error(
-                    '.task/ scrub FAILED post-merge for %s — index may still be '
-                    'contaminated; _assert_no_task_dir will catch it at advance_main.',
+                    '.task/ scrub FAILED post-merge for %s — aborting merge; '
+                    'no advance_main will run.',
                     full_branch,
+                )
+                await self.cleanup_merge_worktree(merge_wt)
+                _detail = f'.task/ scrub failed post-merge for {full_branch}'
+                if scrub_result.error:
+                    _detail = f'{_detail}: {scrub_result.error}'
+                return MergeResult(
+                    success=False,
+                    details=_detail,
+                    pre_merge_sha=pre_merge_sha,
                 )
 
             _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
@@ -790,11 +930,11 @@ class GitOps:
             scrub_result = await scrub_task_dir_from_tree(
                 merge_worktree, f'advance_main-retry({attempt + 1})',
             )
-            if scrub_result == ScrubResult.FAILED:
+            if scrub_result.outcome == ScrubOutcome.FAILED:
                 logger.error(
                     '.task/ scrub FAILED during advance_main-retry(%d) — index may '
-                    'be contaminated; _assert_no_task_dir will catch it.',
-                    attempt + 1,
+                    'be contaminated; _assert_no_task_dir will catch it. Error: %s',
+                    attempt + 1, scrub_result.error or '(no stderr)',
                 )
             _, new_sha, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=merge_worktree,

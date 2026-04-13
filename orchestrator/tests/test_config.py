@@ -320,7 +320,7 @@ class TestStewardTimeoutInvariant:
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        with pytest.raises(ValidationError, match=r'Raise timeouts\.steward to >= steward_completion_timeout'):
+        with pytest.raises(ValidationError, match=r'(?i)raise.*timeouts\.steward.*or lower.*steward_completion_timeout'):
             OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=600.0))
 
     def test_env_var_override_triggers_invariant(self, monkeypatch, tmp_path):
@@ -332,8 +332,111 @@ class TestStewardTimeoutInvariant:
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_TIMEOUTS__STEWARD', '300')
+        monkeypatch.setenv('ORCH_STEWARD_COMPLETION_TIMEOUT', '900')
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        # defaults.yaml: steward_completion_timeout=900.0, timeouts.steward=1800
+        # Both sides are test-pinned: timeouts.steward=300, steward_completion_timeout=900
         # env override: timeouts.steward=300 → 300 < 900 → validator must fire
         with pytest.raises(ValidationError, match='steward'):
             OrchestratorConfig()
+
+
+class TestValidateAssignment:
+    """validate_assignment=True must re-run model validators on top-level field mutations."""
+
+    def test_validate_assignment_rejects_steward_completion_timeout_mutation(
+        self, monkeypatch, tmp_path
+    ):
+        """Setting steward_completion_timeout above timeouts.steward must raise ValidationError.
+
+        With validate_assignment=True, this assignment fires _validate_steward_timeout_invariant
+        and raises ValidationError.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        # Construct a valid config: defaults give timeouts.steward=1800, sct=900
+        cfg = OrchestratorConfig()
+        assert cfg.timeouts.steward == 1800.0
+        assert cfg.steward_completion_timeout == 900.0
+        # Mutate steward_completion_timeout to 2000.0 — now above timeouts.steward=1800.
+        # validate_assignment=True fires _validate_steward_timeout_invariant, raising ValidationError.
+        with pytest.raises(ValidationError, match='steward'):
+            cfg.steward_completion_timeout = 2000.0
+
+    def test_validate_assignment_rejects_timeouts_replacement(
+        self, monkeypatch, tmp_path
+    ):
+        """Replacing cfg.timeouts with a TimeoutsConfig that violates the invariant must raise.
+
+        With validate_assignment=True, assigning cfg.timeouts fires _validate_steward_timeout_invariant
+        and raises ValidationError.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        # steward_completion_timeout=900 is valid against default timeouts.steward=1800
+        cfg = OrchestratorConfig(steward_completion_timeout=900.0)
+        assert cfg.steward_completion_timeout == 900.0
+        # Replace timeouts with steward=300 — now 300 < 900, violating the invariant.
+        # validate_assignment=True fires _validate_steward_timeout_invariant, raising ValidationError.
+        with pytest.raises(ValidationError, match='steward'):
+            cfg.timeouts = TimeoutsConfig(steward=300.0)
+
+    def test_validate_assignment_allows_valid_mutation(self, monkeypatch, tmp_path):
+        """A valid mutation of steward_completion_timeout must succeed without errors.
+
+        Regression guard: confirms that validate_assignment does not block
+        mutations that satisfy the invariant. Passes before and after step-4.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        cfg = OrchestratorConfig()
+        # default timeouts.steward=1800, steward_completion_timeout=900
+        # Setting sct=500 is valid (500 <= 1800).
+        cfg.steward_completion_timeout = 500.0
+        assert cfg.steward_completion_timeout == 500.0
+
+    def test_project_root_resolved_on_assignment(self, monkeypatch, tmp_path):
+        """Assigning a relative path to project_root after construction must resolve it to absolute.
+
+        With a @field_validator('project_root', mode='after') and validate_assignment=True,
+        post-construction assignment fires the field validator, resolving the path.
+        This test fails when model_post_init is used (which only fires at construction).
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        cfg = OrchestratorConfig()
+        # Assign a relative path post-construction; the field validator must resolve it
+        cfg.project_root = Path('relative/subdir')
+        assert cfg.project_root.is_absolute() is True
+
+    def test_project_root_field_validator_does_not_double_trigger_model_validator(
+        self, monkeypatch, tmp_path
+    ):
+        """@field_validator must not cause model validators to fire twice during construction.
+
+        With the old model_post_init: assigning self.project_root under validate_assignment=True
+        would trigger a second full model-validation pass (including _validate_steward_timeout_invariant),
+        so model validators fired 2× during construction.
+        With @field_validator('project_root', mode='after'): field-level validation resolves the
+        path without triggering a second model-validation pass, so model validators fire exactly 1×.
+
+        Strategy: subclass OrchestratorConfig with a counting model_validator; assert count == 1.
+        """
+        from pydantic import model_validator as _mv
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        call_count: list[int] = []
+
+        class TrackingConfig(OrchestratorConfig):
+            @_mv(mode='after')
+            def _count_model_validation_pass(self) -> 'TrackingConfig':
+                call_count.append(1)
+                return self
+
+        TrackingConfig()
+
+        assert len(call_count) == 1, (
+            f'Model validators were triggered {len(call_count)} times during construction; '
+            'expected exactly 1. With field_validator, the field-level resolver must not '
+            'cause a second full model-validation pass.'
+        )

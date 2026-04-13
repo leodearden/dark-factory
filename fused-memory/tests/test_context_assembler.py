@@ -480,7 +480,7 @@ class TestContextAssemblerCancellation:
     Two passes:
       - Pass 1 (propagate_cancellations): re-raise any value that is a BaseException
         but NOT an Exception (CancelledError, KeyboardInterrupt, SystemExit).
-      - Pass 2 (accumulation): the per-event zip loop uses ``isinstance(ctx_result, BaseException)``
+      - Pass 2 (accumulation): the per-event zip loop uses ``isinstance(ctx_result, Exception)``
         so only application-level failures degrade to empty context.
     """
 
@@ -655,3 +655,50 @@ class TestContextAssemblerCancellation:
             'first batch (calls 1-10) must complete before the second batch '
             'dispatches and triggers the CancelledError on call 11'
         )
+
+    @pytest.mark.asyncio
+    async def test_pass2_guard_narrowed_to_exception(self, mock_memory):
+        """Pass 2 guard must use isinstance(ctx_result, Exception), not BaseException.
+
+        Defense-in-depth test: injects a KeyboardInterrupt() instance directly into
+        batch_contexts by patching asyncio.gather to return it as a value (avoiding the
+        asyncio task re-raise that would occur if a coroutine actually raised it).
+        Pass 1 is bypassed by patching propagate_cancellations to a no-op, so Pass 2
+        sees the bare BaseException value directly.
+
+        With the current ``isinstance(ctx_result, BaseException)`` guard,
+        KeyboardInterrupt() IS caught and degraded to [] — assemble() returns normally.
+        With the narrowed ``isinstance(ctx_result, Exception)`` guard, KeyboardInterrupt()
+        is NOT caught and falls through to the list comprehension
+        ``[item for item in ctx_result ...]``, causing
+        ``TypeError: 'KeyboardInterrupt' object is not iterable``.
+
+        This test would FAIL with the old ``isinstance(ctx_result, BaseException)`` guard
+        (assemble() would return normally) and PASSES with the narrowed
+        ``isinstance(ctx_result, Exception)`` guard.
+
+        Sister test: test_exception_only_batch_does_not_propagate — verifies that real
+        Exception subclasses ARE caught by Pass 2 and degraded gracefully.
+        """
+        assembler = _make_assembler(memory_service=mock_memory)
+        events = [
+            _make_event(
+                event_type=EventType.memory_added,
+                payload={'content_preview': 'some content'},
+            ),
+        ]
+        watermark = _make_watermark()
+
+        async def _mock_gather(*args, **kwargs):
+            # Return KeyboardInterrupt() as a value — bypasses asyncio task re-raise
+            return [KeyboardInterrupt()]
+
+        with (
+            patch('fused_memory.reconciliation.context_assembler.asyncio.gather', new=_mock_gather),
+            patch(
+                'fused_memory.reconciliation.context_assembler.propagate_cancellations',
+                new=lambda results: None,
+            ),
+            pytest.raises(TypeError),
+        ):
+            await assembler.assemble(events, watermark, 'test-project')

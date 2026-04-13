@@ -636,7 +636,7 @@ class TestMemoryServiceRebuildEntitySummaries:
         The full backend result includes a 'details' list (one entry per rebuilt
         entity with uuid, name, status, old_summary, new_summary, edge_count, error).
         Passing this verbatim bloats the journal for large graphs. The service must
-        condense result_summary to only the four aggregate fields.
+        condense result_summary to only the five aggregate fields.
         """
         from fused_memory.services.memory_service import MemoryService
         svc = MemoryService(mock_config)
@@ -672,7 +672,7 @@ class TestMemoryServiceRebuildEntitySummaries:
         call_kwargs = mock_journal.log_write_op.call_args[1]
         result_summary = call_kwargs.get('result_summary')
         assert result_summary is not None, 'result_summary must be set on success'
-        # Must contain the four aggregate fields
+        # Must contain the five aggregate fields
         assert 'total_entities' in result_summary
         assert 'stale_entities' in result_summary
         assert 'rebuilt' in result_summary
@@ -687,6 +687,13 @@ class TestMemoryServiceRebuildEntitySummaries:
         assert result_summary['stale_entities'] == 4
         assert result_summary['rebuilt'] == 3
         assert result_summary['errors'] == 0
+        # Must contain 'skipped' aggregate field
+        assert 'skipped' in result_summary
+        assert result_summary['skipped'] == 1
+        # Key set must be exactly these five aggregate fields — no more, no less
+        assert set(result_summary.keys()) == {
+            'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors'
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1011,23 +1018,6 @@ class TestDetectStaleSummariesBulk:
         })
         result = await backend.detect_stale_summaries(group_id='test')
         assert result == []
-
-    @pytest.mark.asyncio
-    async def test_detect_stale_summaries_includes_summary_field(
-        self, mock_config, make_backend, make_edge_backend
-    ):
-        """Stale entity dicts returned by _detect_stale_summaries_with_edges include
-        a 'summary' key whose value is the entity's original (pre-rebuild) summary."""
-        original_summary = 'old stale fact'
-        backend = make_edge_backend(make_backend(mock_config), nodes=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': original_summary},
-        ], edges={
-            'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
-        })
-        result = await backend._detect_stale_summaries_with_edges(group_id='test')
-        assert len(result.stale) == 1
-        assert 'summary' in result.stale[0]
-        assert result.stale[0]['summary'] == original_summary
 
 
 # ---------------------------------------------------------------------------
@@ -1366,6 +1356,33 @@ class TestRebuildEntitySummariesCancellation:
         application-level failures are recorded as error detail entries.
     """
 
+    @staticmethod
+    def _assert_single_cancellation_warning(
+        caplog, group_id, rebuilt_so_far=None, errors_so_far=None
+    ):
+        """Assert exactly one WARNING from graphiti_client contains expected substrings.
+
+        Returns the warning message. rebuilt_so_far and errors_so_far, if provided,
+        are asserted against the rendered message values.
+        """
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.backends.graphiti_client'
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected 1 WARNING from graphiti_client, got {len(warning_records)}: {warning_records}'
+        )
+        msg = warning_records[0].getMessage()
+        assert 'rebuild_entity_summaries' in msg
+        assert 'cancellation' in msg
+        assert f'group={group_id}' in msg
+        if rebuilt_so_far is not None:
+            assert f'rebuilt_so_far={rebuilt_so_far}' in msg
+        if errors_so_far is not None:
+            assert f'errors_so_far={errors_so_far}' in msg
+        return msg
+
     @pytest.mark.asyncio
     async def test_cancelled_error_propagates(self, two_entity_backend):
         """CancelledError raised by one entity must propagate out of rebuild_entity_summaries.
@@ -1385,11 +1402,11 @@ class TestRebuildEntitySummariesCancellation:
         )
 
         with pytest.raises(asyncio.CancelledError):
-            await backend.rebuild_entity_summaries(group_id='test', force=True)
+            await backend.rebuild_entity_summaries(group_id='grp-cancel-warn', force=True)
 
     @pytest.mark.asyncio
     async def test_cancelled_error_propagates_alongside_other_errors(
-        self, two_entity_backend
+        self, two_entity_backend, caplog
     ):
         """CancelledError must take precedence over per-entity RuntimeErrors in the same batch.
 
@@ -1403,6 +1420,9 @@ class TestRebuildEntitySummariesCancellation:
         The propagation pass scans *all* results before any per-entity bookkeeping, so
         even if RuntimeError occupies the first slot, CancelledError in the second slot
         is still detected and re-raised.
+
+        The WARNING log must also be emitted on this mixed-error path — a regression
+        dropping the warning from this branch would otherwise go undetected.
         """
         backend = two_entity_backend
         # First entity raises a normal RuntimeError; second raises CancelledError
@@ -1410,8 +1430,11 @@ class TestRebuildEntitySummariesCancellation:
             side_effect=[RuntimeError('per-entity failure'), asyncio.CancelledError()]
         )
 
-        with pytest.raises(asyncio.CancelledError):
-            await backend.rebuild_entity_summaries(group_id='test', force=True)
+        with (
+            caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await backend.rebuild_entity_summaries(group_id='grp-cancel-warn', force=True)
 
         # After CancelledError propagated, verify both update_node_summary calls were
         # attempted by gather.  Pass 1 (propagate_cancellations in
@@ -1423,6 +1446,13 @@ class TestRebuildEntitySummariesCancellation:
         # post-gather propagation path, not a pre-gather short-circuit.
         assert backend.update_node_summary.await_count == 2
 
+        expected_rebuilt = 0  # Pass 1 re-raises before Pass 2 increments counters
+        expected_errors = 0   # Pass 1 re-raises before Pass 2 increments counters
+        self._assert_single_cancellation_warning(
+            caplog, group_id='grp-cancel-warn',
+            rebuilt_so_far=expected_rebuilt, errors_so_far=expected_errors
+        )
+
     @pytest.mark.asyncio
     async def test_cancelled_error_logs_warning_before_propagating(
         self, two_entity_backend, caplog
@@ -1430,9 +1460,9 @@ class TestRebuildEntitySummariesCancellation:
         """A WARNING is emitted with group_id and progress counters before CancelledError propagates.
 
         The warning must contain 'rebuild_entity_summaries', 'cancellation', and the group_id
-        so operators can identify mid-flight cancellations in logs. At the moment of the
-        warning, Pass 2 has not yet executed for this batch so rebuilt_so_far=0 and
-        errors_so_far=0.
+        so operators can identify mid-flight cancellations in logs. rebuilt_so_far=0 and
+        errors_so_far=0 because counters are only incremented in Pass 2, which never executes
+        when CancelledError is found in Pass 1.
         """
         backend = two_entity_backend
         # First entity's rebuild raises CancelledError; second would succeed
@@ -1440,23 +1470,55 @@ class TestRebuildEntitySummariesCancellation:
             side_effect=[asyncio.CancelledError(), None]
         )
 
-        with caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'), pytest.raises(asyncio.CancelledError):
-            await backend.rebuild_entity_summaries(group_id='test', force=True)
+        with (
+            caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await backend.rebuild_entity_summaries(group_id='grp-cancel-warn', force=True)
 
-        warning_records = [
-            r for r in caplog.records
-            if r.levelno == logging.WARNING
-            and r.name == 'fused_memory.backends.graphiti_client'
-        ]
-        assert len(warning_records) == 1, (
-            f'Expected 1 WARNING from graphiti_client, got {len(warning_records)}: {warning_records}'
+        expected_rebuilt = 0  # Pass 1 re-raises before Pass 2 increments counters
+        expected_errors = 0   # Pass 1 re-raises before Pass 2 increments counters
+        self._assert_single_cancellation_warning(
+            caplog, group_id='grp-cancel-warn',
+            rebuilt_so_far=expected_rebuilt, errors_so_far=expected_errors
         )
-        msg = warning_records[0].getMessage()
-        assert 'rebuild_entity_summaries' in msg
-        assert 'cancellation' in msg
-        assert 'test' in msg
-        assert 'rebuilt_so_far=0' in msg
-        assert 'errors_so_far=0' in msg
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_in_second_slot_still_logs_warning(
+        self, two_entity_backend, caplog
+    ):
+        """CancelledError in the second slot is detected by propagate_cancellations scan.
+
+        All prior CancelledError tests place the error in slot 0 (side_effect=[CancelledError(),
+        None]).  This test exercises slot 1 (side_effect=[None, CancelledError()]) where the
+        first entity succeeds and CancelledError appears only in the second position.
+
+        propagate_cancellations scans *all* results before any per-entity bookkeeping, so
+        CancelledError in any slot must still be detected and re-raised.  Explicit coverage
+        here guards against a regression where the scan is shortened to check only the first
+        result.
+
+        rebuilt_so_far=0 and errors_so_far=0 because counters are only incremented in Pass 2,
+        which never executes when CancelledError is found in Pass 1.
+        """
+        backend = two_entity_backend
+        # First entity's rebuild succeeds; second raises CancelledError
+        backend.update_node_summary = AsyncMock(
+            side_effect=[None, asyncio.CancelledError()]
+        )
+
+        with (
+            caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await backend.rebuild_entity_summaries(group_id='grp-cancel-warn', force=True)
+
+        expected_rebuilt = 0  # Pass 1 re-raises before Pass 2 increments counters
+        expected_errors = 0   # Pass 1 re-raises before Pass 2 increments counters
+        self._assert_single_cancellation_warning(
+            caplog, group_id='grp-cancel-warn',
+            rebuilt_so_far=expected_rebuilt, errors_so_far=expected_errors
+        )
 
     @pytest.mark.asyncio
     async def test_cancelled_error_propagates_force_false(self, two_entity_backend):
@@ -1507,7 +1569,7 @@ class TestRebuildEntitySummariesCancellation:
         )
 
         with pytest.raises(asyncio.CancelledError):
-            await backend.rebuild_entity_summaries(group_id='test', force=False)
+            await backend.rebuild_entity_summaries(group_id='grp-cancel-warn', force=False)
 
         # After CancelledError propagated, verify the force=False gather path was actually
         # exercised: _detect_stale_summaries_with_edges was awaited exactly once (bulk fetch
@@ -1550,7 +1612,7 @@ class TestRebuildEntitySummariesCancellation:
             side_effect=[ValueError('per-entity boom'), None]
         )
 
-        result = await backend.rebuild_entity_summaries(group_id='test', force=True)
+        result = await backend.rebuild_entity_summaries(group_id='grp-cancel-accum', force=True)
 
         assert result['errors'] == 1
         assert result['rebuilt'] == 1

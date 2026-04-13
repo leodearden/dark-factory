@@ -700,7 +700,7 @@ async def partials_merge_queue(request: Request):
         aggregate_queue_depth_timeseries(dbs, hours=hours),
         aggregate_outcome_distribution(dbs, hours=hours),
         aggregate_latency_stats(dbs, hours=hours),
-        aggregate_recent_merges(dbs, limit=20),
+        aggregate_recent_merges(dbs, limit=20, hours=hours),
         aggregate_speculative_stats(dbs, hours=hours),
         return_exceptions=True,
     )

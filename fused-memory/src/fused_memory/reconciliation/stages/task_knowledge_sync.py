@@ -70,14 +70,12 @@ class TaskKnowledgeSync(BaseStage):
                     tasks_data = {}
             filtered = filter_task_tree(tasks_data)
 
-        # Render "Recently Completed Tasks" section
+        # Render "Recently Completed Tasks" section.
+        # Invariant: filter_task_tree() always appends to done_tasks when it increments
+        # done_count (capped at MAX_DONE_TASKS_RETAINED=30), so done_tasks is guaranteed
+        # non-empty whenever done_count > 0.  No fallback summary branch is needed.
         if filtered.done_tasks:
             recently_completed_text = format_task_list(filtered.done_tasks[:30])
-        elif filtered.done_count > 0:
-            recently_completed_text = (
-                f'{filtered.done_count} tasks completed recently '
-                f'(details omitted — too many to list).'
-            )
         else:
             recently_completed_text = format_task_list([])  # 'No tasks.'
 
@@ -223,18 +221,12 @@ def _select_proactive_sample(tasks: list[dict], n: int) -> list[dict]:
     FilteredTaskTree.active_tasks/done_tasks/cancelled_tasks fields, which
     filter_task_tree already pre-validates to be dict-only.
     """
-    # Import from task_filter — the single source of truth for status priority
-    from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY  # noqa: PLC0415
+    # Import from task_filter — the single source of truth for status priority and id parsing
+    from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY, _id_key  # noqa: PLC0415
 
     def sort_key(t: dict) -> tuple[int, int]:
         status = t.get('status', 'pending')
         priority = _STATUS_PRIORITY.get(status, len(_STATUS_PRIORITY))
-        # Negate ID so that higher IDs sort first within the same priority
-        tid = t.get('id', 0)
-        try:
-            tid_int = int(tid)
-        except (TypeError, ValueError):
-            tid_int = 0
-        return (priority, -tid_int)
+        return (priority, -_id_key(t))
 
     return heapq.nsmallest(n, tasks, key=sort_key)

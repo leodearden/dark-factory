@@ -106,10 +106,10 @@ class BriefingAssembler:
 
         identity = self._agent_identity(effective_tid, 'implementer')
 
-        completed = [s for s in plan.get('steps', []) if s.get('status') == 'done']
-        pending = [s for s in plan.get('steps', []) if s.get('status') == 'pending']
-        pre_completed = [s for s in plan.get('prerequisites', []) if s.get('status') == 'done']
-        pre_pending = [s for s in plan.get('prerequisites', []) if s.get('status') == 'pending']
+        completed = [s for s in plan.get('steps', []) if isinstance(s, dict) and s.get('status') == 'done']
+        pending = [s for s in plan.get('steps', []) if isinstance(s, dict) and s.get('status') == 'pending']
+        pre_completed = [s for s in plan.get('prerequisites', []) if isinstance(s, dict) and s.get('status') == 'done']
+        pre_pending = [s for s in plan.get('prerequisites', []) if isinstance(s, dict) and s.get('status') == 'pending']
 
         log_summary = ''
         if iteration_log:

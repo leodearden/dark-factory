@@ -136,6 +136,7 @@ async def burndown_env(burndown_conn_with_config):
         yield triple
 
 
+
 # ---------------------------------------------------------------------------
 # _count_statuses
 # ---------------------------------------------------------------------------
@@ -233,10 +234,15 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
+                assert row[0] == 1  # Only 1 row — symlink and real path should deduplicate
 
-        # Only 1 row — symlink and real path should deduplicate
-        assert count == 1
+            # Distinct from test_main_project_id_is_resolved_path: verifies that the
+            # resolved path is used as the project_id specifically in the orchestrator-
+            # dedup scenario, where both config.project_root and the mocked
+            # _resolve_project_root resolve to the same real_dir.
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+            assert rows[0]['project_id'] == str(real_dir.resolve())
 
     @pytest.mark.asyncio
     async def test_deduplicates_main_project_from_orchestrators(self, burndown_env):
@@ -255,9 +261,7 @@ class TestCollectSnapshot:
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
             row = await cur.fetchone()
             assert row is not None
-            count = row[0]
-
-        assert count == 1
+            assert row[0] == 1
 
     @pytest.mark.asyncio
     async def test_snapshots_known_project_roots_when_no_orchestrators(self, burndown_env):
@@ -365,10 +369,7 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        # Only 1 row — symlink project_root and known real path deduplicate
-        assert count == 1
+                assert row[0] == 1  # Only 1 row — symlink project_root and known real path deduplicate
 
     @pytest.mark.asyncio
     async def test_dedupes_known_root_against_running_orchestrator(self, burndown_env):
@@ -411,9 +412,7 @@ class TestCollectSnapshot:
                                 (str(reify_root),)) as cur:
             row = await cur.fetchone()
             assert row is not None
-            count = row[0]
-
-        assert count == 1  # only one row for reify, not two
+            assert row[0] == 1  # only one row for reify, not two
 
     @pytest.mark.asyncio
     async def test_main_project_id_is_resolved_path(self, tmp_path, burndown_conn_with_config):
@@ -613,6 +612,18 @@ class TestCollectSnapshot:
         link = tmp_path / 'link'
         link.symlink_to(real_dir)
 
+        # Guard: _resolve_project_root walks up from prd_path looking for .taskmaster.
+        # If any ancestor of tmp_path has one, the fallback branch never fires and
+        # this test silently verifies the wrong code path.  Skip (not fail) when the
+        # environment doesn't meet this precondition — a skip is a clearer signal than
+        # an unexpected assertion error.
+        for ancestor in tmp_path.resolve().parents:
+            if (ancestor / '.taskmaster').is_dir():
+                pytest.skip(
+                    f'{ancestor} contains .taskmaster — cannot exercise '
+                    f'_resolve_project_root fallback branch in this environment'
+                )
+
         # PRD path lives directly under tmp_path (not under real_dir), so
         # _resolve_project_root will walk up from tmp_path, find no .taskmaster,
         # and fall back to config.project_root (the unresolved symlink).
@@ -632,11 +643,9 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        # Only 1 row — the orchestrator fallback targets the same project as the
-        # main project_root; resolved and unresolved paths must deduplicate.
-        assert count == 1
+                # Only 1 row — the orchestrator fallback targets the same project as the
+                # main project_root; resolved and unresolved paths must deduplicate.
+                assert row[0] == 1
 
     @pytest.mark.asyncio
     async def test_load_task_tree_calls_run_concurrently(self, burndown_conn_with_config):
@@ -966,9 +975,7 @@ class TestDownsample:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        assert count == 6  # all preserved
+                assert row[0] == 6  # all preserved
 
     @pytest.mark.asyncio
     async def test_compacts_old_to_hourly(self, tmp_path):
@@ -991,9 +998,7 @@ class TestDownsample:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        assert count == 1  # compacted to one per hour
+                assert row[0] == 1  # compacted to one per hour
 
     @pytest.mark.asyncio
     async def test_expires_very_old(self, tmp_path):
@@ -1013,9 +1018,7 @@ class TestDownsample:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        assert count == 1  # only the recent one
+                assert row[0] == 1  # only the recent one
 
 
 # ---------------------------------------------------------------------------
@@ -1155,8 +1158,8 @@ class TestBurndownEnvFixture:
         # (c) conn is a usable aiosqlite connection
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
             row = await cur.fetchone()
-        assert row is not None
-        assert row[0] == 0
+            assert row is not None
+            assert row[0] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1242,3 +1245,466 @@ class TestBurndownConnWithConfig:
             assert row is not None
             assert row[0] == 0
 
+
+# ---------------------------------------------------------------------------
+# Orchestrator-discovery failure isolation (#12)
+# ---------------------------------------------------------------------------
+
+
+class TestCollectSnapshotOrchestratorDiscoveryFailure:
+    """Verify that orchestrator-discovery failures degrade gracefully.
+
+    A single parameterized test covers three injection points:
+
+    (a) ``find_running_orchestrators()`` itself raises — outer try/except catches it.
+    (b) ``_resolve_project_root()`` raises for a PRD-based entry — inner per-entry
+        try/except catches it; other entries and known_project_roots still proceed.
+    (c) ``_read_project_root_from_config()`` raises for a config_path-based entry —
+        same inner try/except handles it.
+
+    In all cases collect_snapshot must not raise, must commit both the main
+    project row and the known_project_roots row, and must emit a WARNING that
+    mentions 'orchestrator' with exc_info set.
+    """
+
+    @pytest.mark.parametrize(
+        'find_orch_kwargs, secondary_target, secondary_kwargs, known_root_suffix',
+        [
+            pytest.param(
+                {'side_effect': RuntimeError('subprocess exploded')},
+                None,
+                None,
+                'orch_disc_test_a',
+                id='find_running_orchestrators_raises',
+            ),
+            pytest.param(
+                {'return_value': [{'prd': 'fake_prd.md', 'config_path': None}]},
+                'dashboard.data.burndown._resolve_project_root',
+                {'side_effect': OSError('prd path not found')},
+                'orch_disc_test_b',
+                id='resolve_project_root_raises',
+            ),
+            pytest.param(
+                {'return_value': [{'prd': None, 'config_path': '/fake/orchestrator.yaml'}]},
+                'dashboard.data.burndown._read_project_root_from_config',
+                {'side_effect': OSError('YAML parse error')},
+                'orch_disc_test_c',
+                id='read_project_root_from_config_raises',
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_orchestrator_discovery_failure_preserves_main_and_known_roots(
+        self,
+        burndown_env,
+        caplog,
+        find_orch_kwargs,
+        secondary_target,
+        secondary_kwargs,
+        known_root_suffix,
+    ):
+        """Orchestrator-discovery failure must degrade gracefully.
+
+        collect_snapshot must not raise; both the main project row and the
+        known_project_roots row must be committed; a WARNING mentioning
+        'orchestrator' must be emitted with exc_info set.
+        """
+        import contextlib
+        import logging
+
+        db_path, base_config, conn = burndown_env
+        known_root = Path(f'/fake/project/{known_root_suffix}')
+        config = DashboardConfig(
+            project_root=base_config.project_root,
+            known_project_roots=[known_root],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        known_tasks = [{'status': 'done'}]
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            known_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': known_tasks,
+        }
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'))
+            stack.enter_context(
+                patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map))
+            )
+            stack.enter_context(
+                patch('dashboard.data.burndown.find_running_orchestrators', **find_orch_kwargs)
+            )
+            if secondary_target is not None:
+                stack.enter_context(patch(secondary_target, **secondary_kwargs))
+            # Must NOT raise despite the injected failure
+            await collect_snapshot(conn, config)
+
+        async with conn.execute('SELECT project_id FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
+
+        project_ids = {row['project_id'] for row in rows}
+        assert len(rows) == 2, f'Expected 2 rows, got {len(rows)}: {project_ids}'
+        assert str(base_config.project_root) in project_ids
+        assert str(known_root.resolve()) in project_ids
+
+        # A WARNING naming orchestrator discovery must be logged with exc_info
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'Expected at least one WARNING for orchestrator discovery failure'
+        combined = ' '.join(r.getMessage() for r in warning_records)
+        assert 'orchestrator' in combined.lower(), (
+            f'Expected "orchestrator" in warning message, got: {combined!r}'
+        )
+        assert any(r.exc_info for r in warning_records)
+
+
+# ---------------------------------------------------------------------------
+# DB-side insert failure isolation (#11)
+# ---------------------------------------------------------------------------
+
+
+class TestCollectSnapshotInsertFailureIsolation:
+    """Verify that a DB-side INSERT failure is isolated to the offending project.
+
+    These tests are written in TDD red-phase for step-4 of task 539.  They
+    fail before the per-project commit + try/except is added to Phase 3,
+    because the current single trailing commit means any INSERT failure rolls
+    back ALL previously buffered inserts (or propagates before commit runs).
+    """
+
+    # ------------------------------------------------------------------
+    # Helper: build a conn.execute wrapper that raises for a target project
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_execute_wrapper(original_execute, failing_project_ids: set):
+        """Return an async wrapper around original_execute that raises OperationalError
+        when an INSERT INTO snapshots targets one of the failing_project_ids.
+
+        The returned callable exposes a ``trigger_count`` list attribute that is
+        appended to each time the wrapper fires.  Tests must assert
+        ``wrapper.trigger_count`` after the run to guard against silent
+        pass-through if the SQL text is ever reformatted.
+        """
+
+        class ExecuteWrapper:
+            trigger_count: list[int]
+
+            def __init__(self) -> None:
+                self.trigger_count = []
+
+            async def __call__(self, sql: str, params: tuple = ()) -> object:
+                if (
+                    'INSERT INTO snapshots' in sql
+                    and params
+                    and params[0] in failing_project_ids
+                ):
+                    self.trigger_count.append(1)
+                    raise aiosqlite.OperationalError('mock disk full')
+                return await original_execute(sql, params)
+
+        return ExecuteWrapper()
+
+    @pytest.mark.asyncio
+    async def test_db_error_on_extra_insert_preserves_main_snapshot(
+        self, burndown_env, caplog
+    ):
+        """OperationalError on an extra's INSERT must not roll back the main row.
+
+        After step-4: main row is committed before the extra is attempted;
+        the extra's failure is caught per-project with a WARNING, and
+        collect_snapshot does not raise.
+        """
+        import logging
+
+        db_path, base_config, conn = burndown_env
+        extra_root = Path('/fake/project/insert_fail_extra_a')
+        config = DashboardConfig(
+            project_root=base_config.project_root,
+            known_project_roots=[extra_root],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        extra_tasks = [{'status': 'done'}]
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            extra_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_tasks,
+        }
+
+        extra_id = str(extra_root.resolve())
+        original_execute = conn.execute
+        wrapper = self._make_execute_wrapper(original_execute, {extra_id})
+        conn.execute = wrapper
+        try:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                # Must NOT raise despite the extra's INSERT failing
+                await collect_snapshot(conn, config)
+        finally:
+            conn.execute = original_execute
+
+        # Guard: the wrapper must have actually fired — prevents silent pass-through
+        # if the SQL text is ever reformatted and the string-match stops working.
+        assert wrapper.trigger_count, (
+            'execute_wrapper was never triggered — SQL interception may have silently broken'
+        )
+
+        async with conn.execute('SELECT project_id FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
+
+        project_ids = {row['project_id'] for row in rows}
+        # Main row must be committed (extra's failure must not roll it back)
+        assert str(base_config.project_root) in project_ids, (
+            f'Main project missing from committed rows: {project_ids}'
+        )
+        # Extra must NOT be present (its INSERT failed)
+        assert extra_id not in project_ids
+
+        # A WARNING naming the failing extra must be logged
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'Expected a WARNING for the failing extra INSERT'
+        combined = ' '.join(r.getMessage() for r in warning_records)
+        assert 'insert_fail_extra_a' in combined or extra_id in combined, (
+            f'Expected extra path in warning message, got: {combined!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_db_error_on_extra_insert_preserves_other_extras(
+        self, burndown_env, caplog
+    ):
+        """OperationalError on the middle extra must not affect main or flanking extras.
+
+        Main + 3 extras; middle extra_b's INSERT raises.  After step-4:
+        main + extra_a + extra_c are committed, extra_b is absent, and
+        exactly one WARNING names extra_b.
+        """
+        import logging
+
+        db_path, base_config, conn = burndown_env
+        extra_a = Path('/fake/project/insert_multi_a')
+        extra_b = Path('/fake/project/insert_multi_b')   # the failing one
+        extra_c = Path('/fake/project/insert_multi_c')
+        config = DashboardConfig(
+            project_root=base_config.project_root,
+            known_project_roots=[extra_a, extra_b, extra_c],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        extra_a_tasks = [{'status': 'done'}]
+        extra_b_tasks = [{'status': 'done'}, {'status': 'done'}]
+        extra_c_tasks = [{'status': 'in-progress'}]
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            extra_a.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_a_tasks,
+            extra_b.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_b_tasks,
+            extra_c.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_c_tasks,
+        }
+
+        extra_b_id = str(extra_b.resolve())
+        original_execute = conn.execute
+        wrapper = self._make_execute_wrapper(original_execute, {extra_b_id})
+        conn.execute = wrapper
+        try:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                await collect_snapshot(conn, config)
+        finally:
+            conn.execute = original_execute
+
+        # Guard: the wrapper must have actually fired
+        assert wrapper.trigger_count, (
+            'execute_wrapper was never triggered — SQL interception may have silently broken'
+        )
+
+        async with conn.execute('SELECT project_id FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
+
+        project_ids = {row['project_id'] for row in rows}
+        assert len(rows) == 3, (
+            f'Expected 3 rows (main + extra_a + extra_c), got {len(rows)}: {project_ids}'
+        )
+        assert str(base_config.project_root) in project_ids
+        assert str(extra_a.resolve()) in project_ids
+        assert str(extra_c.resolve()) in project_ids
+        assert extra_b_id not in project_ids
+
+        # Exactly one WARNING naming extra_b
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and (
+                'insert_multi_b' in r.getMessage() or extra_b_id in r.getMessage()
+            )
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING naming extra_b, got {len(warning_records)}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_db_error_on_main_insert_preserves_extras(
+        self, burndown_env, caplog
+    ):
+        """OperationalError on the main project's INSERT must not prevent extras from being committed.
+
+        After step-4: main's failure is caught per-project; the loop continues
+        and extra is committed.  A WARNING must name the main project.
+        """
+        import logging
+
+        db_path, base_config, conn = burndown_env
+        extra_root = Path('/fake/project/insert_fail_main_extra')
+        config = DashboardConfig(
+            project_root=base_config.project_root,
+            known_project_roots=[extra_root],
+        )
+
+        main_tasks = [{'status': 'pending'}]
+        extra_tasks = [{'status': 'done'}]
+        _tasks_map = {
+            config.tasks_json: main_tasks,
+            extra_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json': extra_tasks,
+        }
+
+        main_id = str(base_config.project_root)
+        original_execute = conn.execute
+        wrapper = self._make_execute_wrapper(original_execute, {main_id})
+        conn.execute = wrapper
+        try:
+            with (
+                patch('dashboard.data.burndown.load_task_tree', side_effect=_fake_load(_tasks_map)),
+                patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+            ):
+                await collect_snapshot(conn, config)
+        finally:
+            conn.execute = original_execute
+
+        # Guard: the wrapper must have actually fired
+        assert wrapper.trigger_count, (
+            'execute_wrapper was never triggered — SQL interception may have silently broken'
+        )
+
+        async with conn.execute('SELECT project_id FROM snapshots') as cur:
+            rows = list(await cur.fetchall())
+
+        project_ids = {row['project_id'] for row in rows}
+        # Extra must be committed (main's failure must not prevent it)
+        assert str(extra_root.resolve()) in project_ids, (
+            f'Extra missing from committed rows: {project_ids}'
+        )
+        # Main must NOT be present (its INSERT failed)
+        assert main_id not in project_ids
+
+        # A WARNING naming the main project must be logged
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, 'Expected a WARNING for the failing main INSERT'
+        combined = ' '.join(r.getMessage() for r in warning_records)
+        assert str(base_config.project_root) in combined, (
+            f'Expected main project path in warning, got: {combined!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Explicit rollback on unexpected error (#13)
+# ---------------------------------------------------------------------------
+
+
+class TestCollectSnapshotExplicitRollback:
+    """Verify that an unexpected exception triggers an explicit conn.rollback() before re-raising.
+
+    This test is written in TDD red-phase for step-6 of task 539.  It fails
+    before the outer try/except is added to collect_snapshot, because the
+    current code relies on aiosqlite's implicit rollback-on-close which does
+    not work correctly for a long-lived persistent connection (as used in
+    app.py lifespan).
+    """
+
+    @pytest.mark.asyncio
+    async def test_explicit_rollback_on_unexpected_error(self, burndown_env):
+        """An unexpected exception inside collect_snapshot must trigger conn.rollback()
+        and re-raise the original exception.
+
+        Injection point: patch `dashboard.data.burndown.datetime` so that
+        `datetime.now(UTC).isoformat()` raises RuntimeError('clock failure').
+        This fires before any per-project try/except, so the outer except
+        must catch it, call rollback, then re-raise.
+
+        Asserts:
+        (a) RuntimeError propagates out of collect_snapshot.
+        (b) conn.rollback was called at least once before the re-raise.
+        """
+        from unittest.mock import patch as _patch
+
+        db_path, config, conn = burndown_env
+
+        # Spy on conn.rollback
+        original_rollback = conn.rollback
+        rollback_calls = []
+
+        async def rollback_spy():
+            rollback_calls.append(1)
+            return await original_rollback()
+
+        conn.rollback = rollback_spy
+
+        # Patch datetime.now to raise RuntimeError — fires before any per-project try/except
+        class _FakeDatetime:
+            @staticmethod
+            def now(tz=None):
+                raise RuntimeError('clock failure')
+
+        try:
+            with (
+                _patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+                _patch('dashboard.data.burndown.datetime', _FakeDatetime),
+                pytest.raises(RuntimeError, match='clock failure'),
+            ):
+                await collect_snapshot(conn, config)
+        finally:
+            conn.rollback = original_rollback
+
+        # (b) rollback must have been called before the re-raise
+        assert rollback_calls, (
+            'Expected conn.rollback() to be called before re-raising the RuntimeError'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Docstring contract (#13 — partial-failure semantics)
+# ---------------------------------------------------------------------------
+
+
+class TestCollectSnapshotDocstringContract:
+    """Verify that collect_snapshot's docstring documents all four partial-failure facts.
+
+    This test is written in TDD red-phase for step-8 of task 539.  It fails
+    before the docstring is updated, because the current one-liner says nothing
+    about main-first commit order, orchestrator degradation, per-project
+    best-effort inserts, or explicit rollback.
+    """
+
+    def test_docstring_documents_partial_failure_semantics(self):
+        """collect_snapshot.__doc__ must be a non-trivial multi-line docstring.
+
+        Exact wording is enforced by code review, not the test suite — brittle
+        keyword assertions break when synonyms are used without any behavioral
+        change.  Instead we verify the docstring is substantive (>= 5 non-empty
+        lines) and mentions at least a couple of robustness concepts.
+        """
+        doc = collect_snapshot.__doc__ or ''
+        non_empty_lines = [line.strip() for line in doc.splitlines() if line.strip()]
+        assert len(non_empty_lines) >= 5, (
+            f'Docstring must be non-trivial (>= 5 non-empty lines); '
+            f'got {len(non_empty_lines)}: {doc!r}'
+        )
+        doc_lower = doc.lower()
+        robustness_terms = {'commit', 'rollback', 'fail', 'error', 'except', 'isolat', 'orchestrator'}
+        matched = [t for t in robustness_terms if t in doc_lower]
+        assert len(matched) >= 2, (
+            f'Docstring should mention at least 2 robustness terms from {robustness_terms}; '
+            f'matched: {matched}'
+        )

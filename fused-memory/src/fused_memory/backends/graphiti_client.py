@@ -823,7 +823,7 @@ class GraphitiBackend:
 
     @staticmethod
     def _canonical_facts(edges: Sequence[Mapping[str, Any]]) -> list[str]:
-        """Deduplicate edge facts preserving insertion order, skipping missing/falsy values.
+        """Deduplicate edge facts preserving insertion order, skipping non-string, empty, and whitespace-only values.
 
         Args:
             edges: List of edge dicts, each optionally containing a 'fact' key.
@@ -831,7 +831,8 @@ class GraphitiBackend:
         Returns:
             List of unique non-empty fact strings in their first-seen order.
         """
-        return list(dict.fromkeys(e['fact'] for e in edges if (e.get('fact') or '').strip()))
+        # f is assigned by the walrus := before isinstance checks str; rejects non-str, empty, whitespace-only
+        return list(dict.fromkeys(f for e in edges if isinstance(f := e.get('fact'), str) and f and not f.isspace()))
 
     async def refresh_entity_summary(
         self,
@@ -1379,8 +1380,8 @@ class GraphitiBackend:
 
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
-        client = self._require_client()
-        all_graphs = await cast(Any, client.driver).client.list_graphs()
+        driver = self._require_driver()
+        all_graphs = await cast(Any, driver).client.list_graphs()
         return [g for g in all_graphs if g != 'default_db' and not g.endswith('_db')]
 
     async def node_count(self, graph_name: str) -> int:
@@ -1388,8 +1389,7 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
         """
-        driver = self._require_driver()
-        graph: Any = driver._get_graph(graph_name)
+        graph: Any = self._graph_for(graph_name)
         result = await graph.ro_query('MATCH (n) RETURN count(n) as count')
         return result.result_set[0][0] if result.result_set else 0
 
