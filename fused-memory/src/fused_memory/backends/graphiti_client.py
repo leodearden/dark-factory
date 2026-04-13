@@ -134,6 +134,11 @@ class GraphitiBackend:
             raise RuntimeError('GraphitiBackend not initialized — call initialize() first')
         return self._driver
 
+    def _require_falkor_client(self) -> Any:
+        """Return the FalkorDB client from the underlying driver."""
+        driver = self._require_driver()
+        return cast(Any, driver).client
+
     async def _ensure_indices(self, group_id: str) -> None:
         """Build indices on *group_id*'s graph if not already done this session."""
         if group_id in self._indexed_graphs:
