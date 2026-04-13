@@ -48,10 +48,10 @@ class TestModuleDocstring704:
       (a) the substring 'unit tests in test_refresh_entity_summary.py' is present
       (b) the substring 'used here as a mocked dependency' is present
       (c) the old arrow-only phrasing '→ see test_refresh_entity_summary.py' is NOT present
-    """
 
-    def _source(self) -> str:
-        return _read_sibling('test_rebuild_entity_summaries.py')
+    NOTE: These assertions match literal substrings. If the pinned wording is ever
+    rephrased, update the assertions in this class to match the new text.
+    """
 
     def test_rebuild_entity_summaries_docstring_marks_get_all_valid_edges_as_mocked_dependency(
         self,
@@ -62,7 +62,7 @@ class TestModuleDocstring704:
         test_refresh_entity_summary.py AND that get_all_valid_edges is used
         here as a mocked dependency — not merely redirect with '→ see ...'.
         """
-        src = self._source()
+        src = _read_sibling('test_rebuild_entity_summaries.py')
 
         assert 'unit tests in test_refresh_entity_summary.py' in src, (
             "test_rebuild_entity_summaries.py module docstring must contain "
@@ -76,9 +76,9 @@ class TestModuleDocstring704:
             "is still exercised (as a mock) in this file"
         )
 
-        assert '\u2192 see test_refresh_entity_summary.py' not in src, (
+        assert '→ see test_refresh_entity_summary.py' not in src, (
             "test_rebuild_entity_summaries.py module docstring must NOT contain "
-            "the stale arrow-only phrasing '\u2192 see test_refresh_entity_summary.py'; "
+            "the stale arrow-only phrasing '→ see test_refresh_entity_summary.py'; "
             "replace it with the accurate two-part phrasing that notes both the "
             "unit-test location and the mocked-dependency usage"
         )
@@ -100,27 +100,61 @@ class TestNoneResultSetRationale704:
     why this test exists.
 
     Asserts:
-      (a) the substring 'or []' appears in the comment lines within ~5 lines
-          before the `result_set = None` assignment inside
+      (a) the substring 'or []' appears in the contiguous comment/blank lines
+          immediately before the `result_set = None` assignment inside
           test_none_result_set_returns_empty_dict
       (b) the comment also references 'get_all_valid_edges' by name
+
+    NOTE: These assertions match literal substrings. If the pinned wording is ever
+    rephrased, update the assertions in this class to match the new text.
     """
 
-    def _source(self) -> str:
-        return _read_sibling('test_refresh_entity_summary.py')
-
     def _lines_before_mutation(self) -> list[str]:
-        """Return up to 5 comment/blank lines immediately before `result_set = None`."""
-        src = self._source()
+        """Return contiguous comment/blank lines immediately before the mutation.
+
+        Scoped to the body of test_none_result_set_returns_empty_dict — finds the
+        function definition first and searches forward within it for the mutation
+        marker, so a second occurrence of the marker added elsewhere in the file
+        will not silently anchor the check to the wrong site.
+
+        Walks backward from the mutation collecting contiguous comment/blank lines
+        rather than using a fixed-size window, so future additions to the comment
+        block (extra context sentences, blank-line separators) don't push existing
+        lines outside the slice and cause a false failure.
+        """
+        src = _read_sibling('test_refresh_entity_summary.py')
         lines = src.splitlines()
+        fn_marker = 'def test_none_result_set_returns_empty_dict'
         mutation_marker = 'graph.ro_query.return_value.result_set = None'
-        # Find the mutation line inside test_none_result_set_returns_empty_dict
-        for idx, line in enumerate(lines):
-            if mutation_marker in line:
-                # Return up to 5 lines immediately preceding the mutation
-                start = max(0, idx - 5)
-                return lines[start:idx]
-        return []
+
+        # Locate the enclosing function definition
+        fn_idx: int | None = None
+        for i, line in enumerate(lines):
+            if fn_marker in line:
+                fn_idx = i
+                break
+        if fn_idx is None:
+            return []
+
+        # Search forward within the function body for the mutation marker
+        mutation_idx: int | None = None
+        for i in range(fn_idx + 1, len(lines)):
+            if mutation_marker in lines[i]:
+                mutation_idx = i
+                break
+        if mutation_idx is None:
+            return []
+
+        # Walk backward collecting contiguous comment/blank lines
+        result: list[str] = []
+        for i in range(mutation_idx - 1, fn_idx, -1):
+            stripped = lines[i].strip()
+            if stripped.startswith('#') or stripped == '':
+                result.insert(0, lines[i])
+            else:
+                break
+
+        return result
 
     def test_none_result_set_test_cites_or_guard(self) -> None:
         """Comment before result_set=None mutation must cite the `or []` guard expression.
@@ -133,7 +167,8 @@ class TestNoneResultSetRationale704:
         preceding = self._lines_before_mutation()
         assert preceding, (
             "Could not find 'graph.ro_query.return_value.result_set = None' in "
-            "test_refresh_entity_summary.py — has the mutation line been renamed?"
+            "test_none_result_set_returns_empty_dict of test_refresh_entity_summary.py "
+            "— has the mutation line or the enclosing function been renamed?"
         )
         combined = '\n'.join(preceding)
 
