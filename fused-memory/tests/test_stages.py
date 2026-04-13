@@ -1655,7 +1655,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
                 self._make_task(5, 'pending'),
                 self._make_task(6, 'pending'),
             ],
-            done_count=3,
+            done_count=0,
         )
 
         payload = await stage.assemble_payload([], watermark, [])
