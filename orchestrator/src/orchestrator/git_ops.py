@@ -71,6 +71,13 @@ class ScrubResult:
     outcome: ScrubOutcome
     error: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.error is not None and self.outcome is not ScrubOutcome.FAILED:
+            raise ValueError(
+                f'ScrubResult.error must only be set when outcome is FAILED, '
+                f'got outcome={self.outcome!r} with error={self.error!r}'
+            )
+
 
 # ---------------------------------------------------------------------------
 # .task/ contamination helpers
