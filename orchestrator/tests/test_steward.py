@@ -1957,3 +1957,24 @@ class TestPreTriageSuggestionsPath:
             await steward._handle_escalation(esc)
 
         mock_pre_triage.assert_called_once_with(esc)
+
+    async def test_handle_escalation_skips_pre_triage_below_threshold(
+        self, steward,
+    ):
+        """_handle_escalation does NOT call _pre_triage_suggestions below threshold (n=9)."""
+        esc = self._esc_with_suggestions(9)
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+        with (
+            patch.object(
+                steward, '_pre_triage_suggestions',
+                new_callable=AsyncMock, return_value=esc,
+            ) as mock_pre_triage,
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock, return_value=_make_result()) as mock_invoke,
+        ):
+            await steward._handle_escalation(esc)
+
+        mock_pre_triage.assert_not_called()
+        mock_invoke.assert_called_once()
