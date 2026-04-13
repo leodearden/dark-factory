@@ -1936,3 +1936,24 @@ class TestPreTriageSuggestionsPath:
         ]
         detail = f'#hash:abcdef0123456789#{json.dumps(suggestions)}'
         return _make_escalation(detail=detail, category='review_suggestions')
+
+    @pytest.mark.parametrize('n', [10, 15])
+    async def test_handle_escalation_triggers_pre_triage_at_threshold(
+        self, steward, n,
+    ):
+        """_handle_escalation calls _pre_triage_suggestions at and above threshold (n=10, 15)."""
+        esc = self._esc_with_suggestions(n)
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+        with (
+            patch.object(
+                steward, '_pre_triage_suggestions',
+                new_callable=AsyncMock, return_value=esc,
+            ) as mock_pre_triage,
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock, return_value=_make_result()),
+        ):
+            await steward._handle_escalation(esc)
+
+        mock_pre_triage.assert_called_once_with(esc)
