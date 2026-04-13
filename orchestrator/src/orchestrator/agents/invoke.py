@@ -360,8 +360,7 @@ async def _invoke_codex(
         env = dict(os.environ)
 
         result = await _run_subprocess_local(cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds)
-        parsed = _parse_codex_output(result, model)
-        return replace(parsed, timed_out=result.timed_out)
+        return _parse_codex_output(result, model)
 
     finally:
         for f in temp_files:
@@ -374,7 +373,7 @@ def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
     Codex outputs multiple JSON lines (JSONL): thread.started, messages,
     thread.completed, etc. We find the completion event for results.
 
-    NOTE: does not set timed_out — callers must apply replace(parsed, timed_out=result.timed_out).
+    timed_out is propagated directly from result.timed_out on every return path.
     """
     if not result.stdout.strip():
         return AgentResult(
@@ -382,6 +381,7 @@ def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
             output='Agent produced no output',
             subtype='error_empty_output',
             stderr=result.stderr,
+            timed_out=result.timed_out,
         )
 
     # Parse JSONL — collect all events
@@ -405,6 +405,7 @@ def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
                 output=result.stdout,
                 subtype='text_output',
                 stderr=result.stderr,
+                timed_out=result.timed_out,
             )
 
     # Find completion events and collect text
@@ -462,6 +463,7 @@ def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
         session_id=session_id,
         subtype='success' if result.returncode == 0 and not is_error else 'error',
         stderr=result.stderr,
+        timed_out=result.timed_out,
     )
 
 
