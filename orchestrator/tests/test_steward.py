@@ -634,7 +634,14 @@ class TestIsTimeoutKill:
     """Pin each branch of the _is_timeout_kill helper with direct calls."""
 
     def test_success_true_short_circuits_to_false(self):
-        """success=True must return False regardless of timed_out or stderr."""
+        """success=True short-circuits to False — no timeout-kill recovery needed.
+
+        A process that timed out but still emitted valid JSON during the
+        5-second SIGTERM grace period (see _SIGTERM_GRACE_SECS in
+        shared/src/shared/cli_invoke.py) is treated as a successful
+        completion: the steward skips timeout-kill recovery because the
+        agent produced a usable result before being reaped.
+        """
         result = _make_result(success=True, timed_out=True, stderr='Process killed after 900.0s timeout')
         assert _is_timeout_kill(result) is False
 

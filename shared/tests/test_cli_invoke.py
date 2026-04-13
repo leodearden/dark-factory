@@ -1216,27 +1216,28 @@ class TestRunSubprocessTimedOut:
         assert result.returncode == 0  # grace path preserves returncode
 
 
-# ── _parse_claude_output threads timed_out ────────────────────────────────
+# ── _parse_claude_output timed_out default behaviour ─────────────────────────
 
 
-class TestParseClaudeOutputThreadsTimedOut:
+class TestParseClaudeOutputTimedOutDefault:
+    """Parser does not propagate timed_out (callers handle it via replace())."""
 
-    def test_timed_out_threads_through_empty_stdout_path(self):
-        """_parse_claude_output propagates timed_out=True for empty-stdout result."""
+    def test_timed_out_true_input_yields_false_on_empty_stdout(self):
+        """_parse_claude_output returns timed_out=False regardless of input — empty stdout."""
         sub = _SubprocessResult(stdout='', stderr='timeout stderr', returncode=1,
                                 duration_ms=100, timed_out=True)
         agent = _parse_claude_output(sub)
-        assert agent.timed_out is True
+        assert agent.timed_out is False
 
-    def test_timed_out_threads_through_json_decode_error_path(self):
-        """_parse_claude_output propagates timed_out=True for non-JSON stdout."""
+    def test_timed_out_true_input_yields_false_on_json_decode_error(self):
+        """_parse_claude_output returns timed_out=False regardless of input — parse error."""
         sub = _SubprocessResult(stdout='not valid json', stderr='', returncode=1,
                                 duration_ms=100, timed_out=True)
         agent = _parse_claude_output(sub)
-        assert agent.timed_out is True
+        assert agent.timed_out is False
 
-    def test_timed_out_threads_through_normal_parse_path(self):
-        """_parse_claude_output propagates timed_out=True for valid JSON result."""
+    def test_timed_out_true_input_yields_false_on_normal_parse(self):
+        """_parse_claude_output returns timed_out=False regardless of input — valid JSON."""
         valid_json = json.dumps({
             'result': 'ok',
             'subtype': 'success',
@@ -1248,14 +1249,34 @@ class TestParseClaudeOutputThreadsTimedOut:
         sub = _SubprocessResult(stdout=valid_json, stderr='', returncode=0,
                                 duration_ms=100, timed_out=True)
         agent = _parse_claude_output(sub)
-        assert agent.timed_out is True
+        assert agent.timed_out is False
 
-    def test_timed_out_false_passes_through(self):
-        """_parse_claude_output propagates timed_out=False (negative case)."""
+    def test_timed_out_false_input_yields_false(self):
+        """_parse_claude_output returns timed_out=False when input is also False."""
         sub = _SubprocessResult(stdout='', stderr='some error', returncode=1,
                                 duration_ms=100, timed_out=False)
         agent = _parse_claude_output(sub)
         assert agent.timed_out is False
+
+
+# ── caller-level timed_out propagation (characterization tests) ───────────────
+
+
+@pytest.mark.asyncio
+class TestClaudeCallerPropagatesTimedOut:
+    """invoke_claude_agent must propagate timed_out=True from subprocess result."""
+
+    async def test_claude_caller_propagates_timed_out(self, tmp_path):
+        """invoke_claude_agent returns AgentResult with timed_out=True when subprocess timed out."""
+        timed_result = _SubprocessResult(stdout='', stderr='timeout', returncode=1,
+                                         duration_ms=100, timed_out=True)
+        with patch('shared.cli_invoke._run_subprocess',
+                   new_callable=AsyncMock, return_value=timed_result):
+            agent = await invoke_claude_agent(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', timeout_seconds=30.0,
+            )
+        assert agent.timed_out is True
 
 
 def _make_gate(
