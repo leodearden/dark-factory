@@ -114,6 +114,10 @@ def symlink_project_setup(tmp_path):
 
     Creates a real directory, a symlink pointing to it, and a burndown DB.
     Each test creates its own DashboardConfig since config parameters differ.
+
+    Note: row_factory is NOT set on any connection by this fixture. Callers
+    that need dict-like row access must set conn.row_factory = aiosqlite.Row
+    on their own connection.
     """
     real_dir = tmp_path / 'real'
     real_dir.mkdir()
