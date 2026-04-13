@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import pytest
 
+import dashboard.data.merge_queue as _mqmod
+
 # ---------------------------------------------------------------------------
 # Schema — events table from orchestrator/src/orchestrator/event_store.py
 # ---------------------------------------------------------------------------
@@ -1510,6 +1512,56 @@ class TestMultiDbAggregation:
         ) as spy:
             result = await aggregate_speculative_stats([None, None], hours=24)
             assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+            assert spy.call_count == 2
+            for call in spy.call_args_list:
+                assert call.args[0] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('patch_target,agg_fn,kwargs,expected', [
+        (
+            'queue_depth_timeseries',
+            aggregate_queue_depth_timeseries,
+            {'hours': 24},
+            {'labels': [], 'values': []},
+        ),
+        (
+            'outcome_distribution',
+            aggregate_outcome_distribution,
+            {'hours': 24},
+            {'labels': [], 'values': []},
+        ),
+        (
+            '_get_durations',
+            aggregate_latency_stats,
+            {'hours': 24},
+            {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0},
+        ),
+        (
+            'recent_merges',
+            aggregate_recent_merges,
+            {'limit': 20},
+            [],
+        ),
+        (
+            'speculative_stats',
+            aggregate_speculative_stats,
+            {'hours': 24},
+            {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0},
+        ),
+    ])
+    async def test_all_none_dbs_spy(self, patch_target, agg_fn, kwargs, expected):
+        """Parametrized: aggregate fn with dbs=[None, None] calls per-DB fn twice with None.
+
+        Confirms the gather(*[fn(None), fn(None)]) path is distinct from
+        dbs=[] (gather(*[]) → []) because per-DB functions ARE called with None.
+        """
+        wraps_fn = getattr(_mqmod, patch_target)
+        with patch(
+            f'dashboard.data.merge_queue.{patch_target}',
+            wraps=wraps_fn,
+        ) as spy:
+            result = await agg_fn([None, None], **kwargs)
+            assert result == expected
             assert spy.call_count == 2
             for call in spy.call_args_list:
                 assert call.args[0] is None
