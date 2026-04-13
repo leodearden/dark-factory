@@ -2052,3 +2052,23 @@ class TestPreTriageSuggestionsPath:
         call_kwargs = mock_invoke.call_args.kwargs
         assert call_kwargs['cwd'] == steward.config.project_root
         assert call_kwargs['cwd'] != steward.worktree
+
+    async def test_handle_escalation_strips_hash_prefix_for_threshold(
+        self, steward,
+    ):
+        """Hash-prefixed detail is stripped before len() check; pre-triage is triggered."""
+        esc = self._hash_esc(12)
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+        with (
+            patch.object(
+                steward, '_pre_triage_suggestions',
+                new_callable=AsyncMock, return_value=esc,
+            ) as mock_pre_triage,
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock, return_value=_make_result()),
+        ):
+            await steward._handle_escalation(esc)
+
+        mock_pre_triage.assert_called_once_with(esc)
