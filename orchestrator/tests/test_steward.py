@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -1378,3 +1379,104 @@ class TestStewardDefaultConfig:
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert 2 <= config.steward_max_timeouts_per_escalation <= 5
+
+
+# ---------------------------------------------------------------------------
+# release_probe_slot on exception in _invoke_with_session
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardReleaseProbeSlotOnException:
+    """_invoke_with_session calls release_probe_slot() when invoke_agent raises."""
+
+    async def test_release_probe_slot_called_on_runtime_error(
+        self, steward, worktree, mock_mcp,
+    ):
+        """release_probe_slot is called with oauth_token when invoke_agent raises."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='tok-a')
+        gate.active_account_name = 'acct-a'
+        gate.confirm_account_ok = MagicMock()
+        gate.release_probe_slot = MagicMock()
+        steward.usage_gate = gate
+
+        mcp_config = {'mcpServers': {}}
+        with (
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=RuntimeError('subprocess failed')),
+            pytest.raises(RuntimeError, match='subprocess failed'),
+        ):
+            await steward._invoke_with_session(
+                prompt='hi', cwd=worktree, mcp_config=mcp_config,
+                per_invocation_budget=5.0, escalation=_make_escalation(),
+            )
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')
+
+    async def test_exception_propagates(self, steward, worktree):
+        """RuntimeError from invoke_agent propagates out of _invoke_with_session."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='tok-a')
+        gate.active_account_name = 'acct-a'
+        gate.release_probe_slot = MagicMock()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=RuntimeError('crash')),
+            pytest.raises(RuntimeError, match='crash'),
+        ):
+            await steward._invoke_with_session(
+                prompt='hi', cwd=worktree, mcp_config={},
+                per_invocation_budget=5.0, escalation=_make_escalation(),
+            )
+
+    async def test_confirm_account_ok_not_called_when_invoke_raises(
+        self, steward, worktree,
+    ):
+        """confirm_account_ok is NOT called when invoke_agent raises."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='tok-a')
+        gate.active_account_name = 'acct-a'
+        gate.confirm_account_ok = MagicMock()
+        gate.release_probe_slot = MagicMock()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=RuntimeError('crash')),
+            pytest.raises(RuntimeError),
+        ):
+            await steward._invoke_with_session(
+                prompt='hi', cwd=worktree, mcp_config={},
+                per_invocation_budget=5.0, escalation=_make_escalation(),
+            )
+
+        gate.confirm_account_ok.assert_not_called()
+
+    async def test_cancelled_error_release_probe_slot(
+        self, steward, worktree,
+    ):
+        """CancelledError (BaseException, not Exception) triggers release_probe_slot."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='tok-a')
+        gate.active_account_name = 'acct-a'
+        gate.release_probe_slot = MagicMock()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=asyncio.CancelledError()),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await steward._invoke_with_session(
+                prompt='hi', cwd=worktree, mcp_config={},
+                per_invocation_budget=5.0, escalation=_make_escalation(),
+            )
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')
