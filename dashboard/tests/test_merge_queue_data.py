@@ -111,8 +111,6 @@ async def empty_merge_events_conn(empty_merge_events_db):
 # Imports under test (deferred so the test file fails gracefully before impl)
 # ---------------------------------------------------------------------------
 
-from unittest.mock import patch  # noqa: E402
-
 from dashboard.data.merge_queue import (  # noqa: E402
     _align_bucket,
     _bucket_minutes_for_window,
