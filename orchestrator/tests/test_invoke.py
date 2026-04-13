@@ -320,6 +320,20 @@ class TestParseGeminiOutputTimedOutDefault:
         assert agent.timed_out is False
 
 
+class TestParseCodexGeminiOutputDocstringContract:
+    """Parser docstrings must document the timed_out=False contract."""
+
+    def test_parse_codex_docstring_contains_does_not_set_timed_out(self):
+        """_parse_codex_output.__doc__ contains 'does not set timed_out' contract note."""
+        assert _parse_codex_output.__doc__ is not None
+        assert 'does not set timed_out' in _parse_codex_output.__doc__
+
+    def test_parse_gemini_docstring_contains_does_not_set_timed_out(self):
+        """_parse_gemini_output.__doc__ contains 'does not set timed_out' contract note."""
+        assert _parse_gemini_output.__doc__ is not None
+        assert 'does not set timed_out' in _parse_gemini_output.__doc__
+
+
 # ── caller-level timed_out propagation (characterization tests) ───────────────
 
 
