@@ -98,7 +98,7 @@ class _UuidDispatcher:
             raise AssertionError(f'uuids never dispatched: {missing!r}')
 
 
-def _uuid_dispatch(mapping: dict) -> '_UuidDispatcher':
+def _uuid_dispatch(mapping: dict) -> _UuidDispatcher:
     """Return a _UuidDispatcher for rebuild_entity_from_edges mocks.
 
     The returned object is callable (async) and also tracks dispatch state:
