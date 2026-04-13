@@ -6,8 +6,8 @@ import re
 
 from fused_memory.reconciliation.task_filter import (
     _STATUS_PRIORITY,
-    FilteredTaskTree,
     MAX_CANCELLED_TASKS_RETAINED,
+    FilteredTaskTree,
     _render_task_line,
     filter_task_tree,
     format_filtered_task_tree,
