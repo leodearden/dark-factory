@@ -297,7 +297,7 @@ class UsageGate:
                     reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
                     return self._handle_near_cap_warning(reason, oauth_token)
         else:
-            # No confirm keyword — the prefix guard above would have blocked
+            # No confirm keyword — the confirm-keyword guard above would have blocked
             # detection anyway, but if a cap-like prefix IS present, emit a
             # debug breadcrumb so silent false-negatives leave a trace
             # (e.g. stderr truncation or Claude changes its message format).
