@@ -1767,3 +1767,24 @@ class TestPreTriageUsageGateCleanup:
             await steward._pre_triage_suggestions(self._esc())
 
         gate.release_probe_slot.assert_called_once_with('tok-a')
+
+    async def test_cap_hit_triggers_retry(self, steward: TaskSteward):
+        """detect_cap_hit=True on first call triggers a retry; invoke_agent is called twice.
+
+        FAILS with current code because _pre_triage_suggestions never calls detect_cap_hit.
+        PASSES after refactor to invoke_with_cap_retry which loops on cap hits.
+        """
+        gate = self._gate(cap_effects=[True, False])
+        steward.usage_gate = gate
+        mock_result = _make_result(cost=0.3, session_id='sess-triage')
+
+        with (
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock, return_value=mock_result),
+            patch('orchestrator.agents.invoke.invoke_agent',
+                  new_callable=AsyncMock, return_value=mock_result) as mock_invoke,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await steward._pre_triage_suggestions(self._esc())
+
+        assert mock_invoke.call_count == 2
