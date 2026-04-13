@@ -2163,3 +2163,100 @@ class TestBackendNoLongerHasRebuildEntitySummaries:
             'rebuild_entity_summaries must be removed from GraphitiBackend '
             '— batch orchestration now lives in MemoryService'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestRebuildSummariesManagerWithService — step-13/14: manager uses MemoryService
+# ---------------------------------------------------------------------------
+
+class TestRebuildSummariesManagerWithService:
+    """After step-14, RebuildSummariesManager must accept a MemoryService (not backend)."""
+
+    def _make_mock_service(self):
+        """Return a MagicMock representing MemoryService with a mocked rebuild method."""
+        from fused_memory.services.memory_service import MemoryService
+        mock_svc = MagicMock(spec=MemoryService)
+        mock_svc.rebuild_entity_summaries = AsyncMock(return_value={
+            'total_entities': 5,
+            'stale_entities': 2,
+            'rebuilt': 2,
+            'skipped': 0,
+            'errors': 0,
+            'details': [],
+        })
+        return mock_svc
+
+    def test_manager_accepts_service_argument(self):
+        """RebuildSummariesManager.__init__ accepts 'service' keyword, not 'backend'."""
+        from fused_memory.maintenance.rebuild_summaries import RebuildSummariesManager
+        mock_svc = self._make_mock_service()
+        # This must not raise; manager should accept 'service=' kwarg
+        manager = RebuildSummariesManager(service=mock_svc, group_id='test_proj')
+        assert manager.service is mock_svc
+
+    @pytest.mark.asyncio
+    async def test_manager_run_delegates_to_service_rebuild(self):
+        """run() calls service.rebuild_entity_summaries with correct project_id/force/dry_run."""
+        from fused_memory.maintenance.rebuild_summaries import RebuildSummariesManager
+        mock_svc = self._make_mock_service()
+        manager = RebuildSummariesManager(service=mock_svc, group_id='test_proj')
+        result = await manager.run(force=True, dry_run=True)
+        mock_svc.rebuild_entity_summaries.assert_awaited_once_with(
+            project_id='test_proj', force=True, dry_run=True
+        )
+        assert result.total_entities == 5
+
+    @pytest.mark.asyncio
+    async def test_manager_run_returns_rebuild_result(self):
+        """run() returns a RebuildResult with correct field mapping."""
+        from fused_memory.maintenance.rebuild_summaries import RebuildResult, RebuildSummariesManager
+        mock_svc = self._make_mock_service()
+        mock_svc.rebuild_entity_summaries = AsyncMock(return_value={
+            'total_entities': 10,
+            'stale_entities': 4,
+            'rebuilt': 3,
+            'skipped': 1,
+            'errors': 0,
+            'details': [{'uuid': 'u1', 'name': 'Alice', 'status': 'rebuilt'}],
+        })
+        manager = RebuildSummariesManager(service=mock_svc, group_id='proj')
+        result = await manager.run()
+        assert isinstance(result, RebuildResult)
+        assert result.total_entities == 10
+        assert result.stale_entities == 4
+        assert result.rebuilt == 3
+        assert result.skipped == 1
+        assert result.errors == 0
+        assert len(result.details) == 1
+
+    @pytest.mark.asyncio
+    async def test_run_entrypoint_passes_service_not_graphiti(self, make_fake_maintenance_service):
+        """run_rebuild_summaries passes service (not service.graphiti) to manager."""
+        from fused_memory.maintenance.rebuild_summaries import run_rebuild_summaries
+        from fused_memory.services.memory_service import MemoryService
+
+        mock_cfg = MagicMock()
+        mock_service = MagicMock(spec=MemoryService)
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
+            'total_entities': 3,
+            'stale_entities': 1,
+            'rebuilt': 1,
+            'skipped': 0,
+            'errors': 0,
+            'details': [],
+        })
+        # Ensure service.graphiti.rebuild_entity_summaries does NOT exist
+        # so if manager wrongly calls service.graphiti.rebuild_entity_summaries it'll error
+        mock_service.graphiti = MagicMock()
+        del mock_service.graphiti.rebuild_entity_summaries
+
+        fake_ctx = make_fake_maintenance_service(mock_cfg, mock_service)
+        with patch(
+            'fused_memory.maintenance.rebuild_summaries.maintenance_service',
+            side_effect=fake_ctx,
+        ):
+            result = await run_rebuild_summaries(config_path='/fake/config.yaml', group_id='proj')
+
+        # Service-level method must have been called (not backend-level)
+        mock_service.rebuild_entity_summaries.assert_awaited_once()
+        assert result.total_entities == 3
