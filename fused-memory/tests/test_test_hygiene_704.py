@@ -40,10 +40,7 @@ def _extract_module_docstring(src: str) -> str:
     Use this instead of raw-source substring search when the intent is to pin
     wording that belongs in the module docstring specifically.
     """
-    try:
-        return ast.get_docstring(ast.parse(src)) or ''
-    except SyntaxError:
-        return ''
+    return ast.get_docstring(ast.parse(src)) or ''
 
 
 def test_extract_module_docstring_returns_only_the_docstring() -> None:
@@ -57,6 +54,10 @@ def test_extract_module_docstring_returns_only_the_docstring() -> None:
     synthetic_src = (
         '"""Module docstring containing in_docstring_marker here."""\n'
         '# in_comment_marker appears only in this comment, not the docstring\n'
+        'def f():\n'
+        '    "in_fn_literal_marker"\n'
+        'class C:\n'
+        '    "in_class_docstring_marker"\n'
         'x = 1\n'
     )
     result = _extract_module_docstring(synthetic_src)
@@ -68,6 +69,27 @@ def test_extract_module_docstring_returns_only_the_docstring() -> None:
         "_extract_module_docstring must NOT include comment text — "
         "'in_comment_marker' appears only in a comment, not in the docstring"
     )
+    assert 'in_fn_literal_marker' not in result, (
+        "_extract_module_docstring must NOT include string literals in "
+        "function bodies — 'in_fn_literal_marker' is inside def f()"
+    )
+    assert 'in_class_docstring_marker' not in result, (
+        "_extract_module_docstring must NOT include class-level docstrings — "
+        "'in_class_docstring_marker' is a class C docstring, not module-level"
+    )
+
+
+def test_extract_module_docstring_raises_on_syntax_error() -> None:
+    """_extract_module_docstring must propagate SyntaxError, not swallow it.
+
+    If a target file becomes syntactically invalid, the raw traceback
+    identifying the parse error is more actionable than a downstream
+    assertion about docstring wording.
+    """
+    import pytest
+
+    with pytest.raises(SyntaxError):
+        _extract_module_docstring('def broken(:\n')
 
 
 # ---------------------------------------------------------------------------
