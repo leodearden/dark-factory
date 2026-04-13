@@ -235,8 +235,10 @@ class WorktreeInfo:
 
     stale_commits: how far local main was behind the remote at worktree creation
     time.  None means the fetch was unavailable (no remote configured).  0 means
-    already current.  Positive N means main was N commits behind origin/main and
-    the worktree was based on the freshened remote ref instead.
+    already current.  A positive stale_commits value means the remote was ahead by
+    N commits.  When local main has diverged (has unpushed commits), the worktree
+    is based on local main despite the positive count — check this field together
+    with base_commit to determine actual freshness.
     """
     path: Path
     base_commit: str
