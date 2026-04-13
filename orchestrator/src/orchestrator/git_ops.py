@@ -211,9 +211,15 @@ class WorktreeInfo:
 
     The base_commit is the SHA of main at worktree creation time, pinned to
     ensure stable diffs even if main advances during task execution.
+
+    stale_commits: how far local main was behind the remote at worktree creation
+    time.  None means the fetch was unavailable (no remote configured).  0 means
+    already current.  Positive N means main was N commits behind origin/main and
+    the worktree was based on the freshened remote ref instead.
     """
     path: Path
     base_commit: str
+    stale_commits: int | None = None
 
 
 async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
