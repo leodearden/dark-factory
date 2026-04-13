@@ -2104,40 +2104,6 @@ class TestEvalSchedulerCachedStatus:
 
 
 # ---------------------------------------------------------------------------
-# Static Protocol conformance checks (pyright-verified)
-#
-# This block MUST live at the bottom of the file, after the FakeScheduler class
-# definition (line ~361). Placing it at the top would require forward-referencing
-# FakeScheduler() before its definition, which forces a # type: ignore[name-defined]
-# suppression. pyright then infers the expression type as Unknown, which trivially
-# satisfies any Protocol — making the check catch nothing. Keeping the block here
-# allows pyright to resolve FakeScheduler to its concrete class and verify full
-# structural conformance (parameter names, types, return types, positional-only
-# markers), not just attribute presence.
-#
-# CI gate — how enforcement actually reaches this file:
-#   • hooks/project-checks (invoked by hooks/pre-commit on main-branch commits)
-#     iterates over PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard) and
-#     runs `uv run pyright` from each package directory, failing the commit on
-#     any error.
-#   • [tool.pyright] include = ["src", "tests"] in orchestrator/pyproject.toml
-#     ensures every file under orchestrator/tests/ — including this one — is
-#     type-checked when pyright runs from orchestrator/.
-#   Both legs of the gate are pinned by tests/test_pyright_gate_for_workflow_e2e.py,
-#   so accidental removal of either fails at normal pytest time.
-#
-# Experimental verification: enforcement was confirmed in commit 357fa4d6a5 and
-# re-verified during task 699 by temporarily mutating FakeScheduler.get_cached_status
-# to return `int | None`; pyright flagged line 2098 with reportAssignmentType as
-# expected, then the file was reverted.
-#
-# Runtime belt-and-braces: TestFakeSchedulerCachedStatus and
-# TestEvalSchedulerCachedStatus (above) provide runtime coverage of
-# get_cached_status behaviour — the static conformance block only catches
-# signature drift, not behavioural regressions.
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Tests: Prerequisites format validation
 # ---------------------------------------------------------------------------
 
