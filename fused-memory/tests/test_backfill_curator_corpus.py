@@ -290,6 +290,138 @@ class TestBackfillPointIdConsistency:
         assert backfill_point_id is not None
         assert record_task_point_id == backfill_point_id
 
+    @pytest.mark.asyncio
+    async def test_record_task_normalizes_none_fields(self):
+        """record_task() with files_to_modify=None and priority=None stores [] and '' in payload."""
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        project_id = 'proj'
+        task_id = '99'
+
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        captured_payload: dict | None = None
+
+        async def capture_upsert(*, collection_name, points):
+            nonlocal captured_payload
+            captured_payload = points[0].payload
+
+        mock_client = AsyncMock()
+        mock_client.upsert = capture_upsert
+        mock_embedder = AsyncMock()
+        mock_embedder.create = AsyncMock(return_value=[0.1] * 10)
+
+        candidate = CandidateTask(title='T', description='D')
+        # Explicitly override to None, simulating a caller that omits the defaults.
+        candidate.files_to_modify = None  # type: ignore[assignment]
+        candidate.priority = None  # type: ignore[assignment]
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client), \
+             patch.object(curator, '_get_embedder', return_value=mock_embedder), \
+             patch.object(curator, '_ensure_collection', return_value=f'task_curator_{project_id}'):
+
+            await curator.record_task(
+                task_id=task_id,
+                candidate=candidate,
+                project_id=project_id,
+            )
+
+        assert captured_payload is not None
+        assert captured_payload['files_to_modify'] == [], (
+            f"Expected [], got {captured_payload['files_to_modify']!r}"
+        )
+        assert captured_payload['priority'] == '', (
+            f"Expected '', got {captured_payload['priority']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_record_task_and_backfill_payload_shapes_match(self):
+        """record_task() and backfill_corpus() produce payloads with identical types."""
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        project_id = 'proj'
+        task_id = '77'
+
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        # --- record_task path ---
+        record_payload: dict | None = None
+
+        async def capture_record(*, collection_name, points):
+            nonlocal record_payload
+            record_payload = points[0].payload
+
+        mock_client_r = AsyncMock()
+        mock_client_r.upsert = capture_record
+        mock_embedder_r = AsyncMock()
+        mock_embedder_r.create = AsyncMock(return_value=[0.1] * 10)
+
+        candidate = CandidateTask(
+            title='My task',
+            description='A desc',
+            files_to_modify=['a.py'],
+            priority='high',
+        )
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client_r), \
+             patch.object(curator, '_get_embedder', return_value=mock_embedder_r), \
+             patch.object(curator, '_ensure_collection', return_value=f'task_curator_{project_id}'):
+
+            await curator.record_task(task_id=task_id, candidate=candidate, project_id=project_id)
+
+        # --- backfill_corpus path ---
+        backfill_payload: dict | None = None
+
+        async def capture_backfill(*, collection_name, points):
+            nonlocal backfill_payload
+            backfill_payload = points[0].payload
+
+        mock_client_b = AsyncMock()
+        mock_client_b.upsert = capture_backfill
+        mock_embedder_b = AsyncMock()
+        mock_embedder_b.create = AsyncMock(return_value=[0.1] * 10)
+
+        # Reset lazy-init state
+        curator._qdrant_client = None
+        curator._embedder = None
+        curator._initialized_collections = set()
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client_b), \
+             patch.object(curator, '_get_embedder', return_value=mock_embedder_b), \
+             patch.object(curator, '_ensure_collection', return_value=f'task_curator_{project_id}'):
+
+            await curator.backfill_corpus(
+                [{'id': task_id, 'title': 'My task', 'description': 'A desc',
+                  'files_to_modify': ['a.py'], 'priority': 'high', 'status': 'pending'}],
+                project_id,
+            )
+
+        assert record_payload is not None
+        assert backfill_payload is not None
+
+        # Keys must match
+        assert set(record_payload.keys()) == set(backfill_payload.keys()), (
+            f"Key mismatch: record={set(record_payload)}, backfill={set(backfill_payload)}"
+        )
+
+        # files_to_modify must be a list in both
+        assert isinstance(record_payload['files_to_modify'], list), (
+            f"record_task files_to_modify type: {type(record_payload['files_to_modify'])}"
+        )
+        assert isinstance(backfill_payload['files_to_modify'], list), (
+            f"backfill files_to_modify type: {type(backfill_payload['files_to_modify'])}"
+        )
+
+        # priority must be a str in both
+        assert isinstance(record_payload['priority'], str), (
+            f"record_task priority type: {type(record_payload['priority'])}"
+        )
+        assert isinstance(backfill_payload['priority'], str), (
+            f"backfill priority type: {type(backfill_payload['priority'])}"
+        )
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Step 8: run_backfill() orchestration
