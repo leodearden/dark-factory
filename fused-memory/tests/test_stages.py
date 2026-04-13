@@ -1486,7 +1486,7 @@ class TestMemoryConsolidatorFilteredTaskTree:
         ]
         return FilteredTaskTree(
             active_tasks=active,
-            done_count=5,
+            done_count=0,
             cancelled_count=2,
             other_count=0,
             total_count=count + 7,
