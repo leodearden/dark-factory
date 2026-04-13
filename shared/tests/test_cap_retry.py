@@ -1427,3 +1427,79 @@ class TestReleaseProbeSlotOnException:
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
 
         gate.confirm_account_ok.assert_not_called()
+
+
+# ===================================================================
+# TestProbeSlotLifecycleIntegration
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestProbeSlotLifecycleIntegration:
+    """End-to-end probe slot lifecycle using a real UsageGate (not mock)."""
+
+    async def test_probe_slot_released_after_invoke_raises(self):
+        """Full lifecycle: probe slot claimed then released on exception.
+
+        Scenario: gate with one account, probing=True → before_invoke claims
+        the probe slot (probe_in_flight=True, _open cleared) → invoke raises →
+        release_probe_slot clears state → gate is not deadlocked.
+        """
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        # Simulate account just recovered from a cap hit (probe loop succeeded)
+        acct.probing = True
+
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=RuntimeError('subprocess failed')),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(RuntimeError, match='subprocess failed'),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        # Probe slot must be fully released
+        assert acct.probe_in_flight is False, 'probe_in_flight must be cleared'
+        assert acct.probe_count == 0, 'probe_count must be reset to 0'
+        assert gate._open.is_set(), '_open event must be re-opened (gate not deadlocked)'
+
+
+# ===================================================================
+# TestCancelledErrorReleaseProbeSlot
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCancelledErrorReleaseProbeSlot:
+    """CancelledError (BaseException, not Exception) tests the catch-all path."""
+
+    async def test_cancelled_error_triggers_release_probe_slot(self):
+        """asyncio.CancelledError is a BaseException — must be caught and release_probe_slot called."""
+        import asyncio as _asyncio
+
+        gate = _mock_gate(
+            before_invoke=AsyncMock(return_value='tok-a'),
+            release_probe_slot=MagicMock(),
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=_asyncio.CancelledError()),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(_asyncio.CancelledError),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')
+
+    async def test_cancelled_error_propagates(self):
+        """CancelledError must propagate (not be swallowed by the except handler)."""
+        import asyncio as _asyncio
+
+        gate = _mock_gate(
+            before_invoke=AsyncMock(return_value='tok-a'),
+            release_probe_slot=MagicMock(),
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=_asyncio.CancelledError()),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(_asyncio.CancelledError),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
