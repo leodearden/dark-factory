@@ -1112,10 +1112,10 @@ class TestHandleNearCapWarning:
         cost_store = make_mock_cost_store()
         gate = make_gate(['a'], cost_store=cost_store)
         token = gate._accounts[0].token
-        with patch.object(gate, '_fire_cost_event') as mock_fire:
-            with caplog.at_level(logging.WARNING, logger='shared.usage_gate'):
-                gate._handle_near_cap_warning('reason', token)
-                gate._handle_near_cap_warning('reason', token)
+        with patch.object(gate, '_fire_cost_event') as mock_fire, \
+                caplog.at_level(logging.WARNING, logger='shared.usage_gate'):
+            gate._handle_near_cap_warning('reason', token)
+            gate._handle_near_cap_warning('reason', token)
         # (a) near_cap is still True after the second call
         assert gate._accounts[0].near_cap is True
         # (b) cost event fires exactly twice — no dedup guard exists
