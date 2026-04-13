@@ -1059,8 +1059,8 @@ class GraphitiBackend:
 
         # Pass 2: re-raise first application-level exception; collect stale entries.
         stale: list[dict] = []
-        for entity, result in zip(fetch_entities, gather_results):
-            if isinstance(result, Exception):
+        for entity, result in zip(fetch_entities, gather_results, strict=True):
+            if isinstance(result, BaseException):
                 raise result
             entry = self._build_stale_entry(entity, result)
             if entry is not None:
