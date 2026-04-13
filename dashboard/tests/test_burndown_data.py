@@ -807,6 +807,10 @@ class TestCollectSnapshot:
             assert str(good_root_1.resolve()) in by_project
             assert str(good_root_2.resolve()) in by_project
 
+            # (c') main project row must record the correct pending count
+            main_row = by_project[str(config.project_root)]
+            _assert_snapshot_counts(main_row, pending=1)
+
             # (d) per-root done counts must reflect the supplied task lists
             good_1_row = by_project[str(good_root_1.resolve())]
             _assert_snapshot_counts(good_1_row, done=2)
@@ -818,7 +822,7 @@ class TestCollectSnapshot:
             warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
             assert warning_records, 'Expected at least one WARNING log record'
             combined = ' '.join(r.getMessage() for r in warning_records)
-            assert 'bad_root' in combined or str(bad_root) in combined
+            assert str(bad_root.resolve()) in combined
             assert any(r.exc_info for r in warning_records)
 
     @pytest.mark.asyncio
