@@ -2218,6 +2218,32 @@ class TestInvariantAfterTask643:
             for rec in caplog.records
         )
 
+    def test_check_filtered_tree_invariant_no_warning_when_cancelled_ok(self, mock_deps, caplog):
+        """Unit test for _check_filtered_tree_invariant: no warning when cancelled invariant holds.
+
+        Constructs a FilteredTaskTree with cancelled_count=2 and cancelled_tasks populated
+        with 2 tasks — the invariant holds.  Asserts no WARNING records are emitted.
+        Verifies the new check does not false-positive on valid trees.  Mirrors
+        test_check_filtered_tree_invariant_no_warning_when_ok for the done pair.
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        ok_tree = FilteredTaskTree(
+            active_tasks=[],
+            done_tasks=[],
+            done_count=0,
+            cancelled_tasks=[self._make_task(1, 'cancelled'), self._make_task(2, 'cancelled')],
+            cancelled_count=2,
+            other_count=0,
+            total_count=2,
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            stage._check_filtered_tree_invariant(ok_tree)
+
+        assert not any(rec.levelno == logging.WARNING for rec in caplog.records)
+
     def test_check_filtered_tree_invariant_no_warning_when_ok(self, mock_deps, caplog):
         """Unit test for _check_filtered_tree_invariant: no warning when invariant holds."""
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
