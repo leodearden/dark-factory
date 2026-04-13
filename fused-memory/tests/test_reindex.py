@@ -4,7 +4,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from conftest import assert_ro_query_only, extract_cypher
+from conftest import assert_ro_query_only, extract_cypher, extract_params
 
 from fused_memory.backends.graphiti_client import (
     EdgeNotFoundError,
@@ -57,7 +57,7 @@ class TestQueryStaleNodeEmbeddings:
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.query_stale_node_embeddings(expected_dim=768, group_id='test')
         graph.ro_query.assert_called_once()
-        cypher = graph.ro_query.call_args[0][0]
+        cypher = extract_cypher(graph.ro_query.call_args)
         assert 'Entity' in cypher
         assert 'name_embedding' in cypher
 
@@ -99,7 +99,7 @@ class TestQueryStaleEdgeEmbeddings:
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.query_stale_edge_embeddings(expected_dim=768, group_id='test')
         graph.ro_query.assert_called_once()
-        cypher = graph.ro_query.call_args[0][0]
+        cypher = extract_cypher(graph.ro_query.call_args)
         assert 'RELATES_TO' in cypher
         assert 'fact_embedding' in cypher
 
@@ -140,9 +140,7 @@ class TestGetNodeText:
         graph = make_graph_mock([['Node', 'Summary']])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_node_text('specific-uuid', group_id='test')
-        call_kwargs = graph.ro_query.call_args
-        args, kwargs = call_kwargs
-        params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        params = extract_params(graph.ro_query.call_args)
         assert params.get('uuid') == 'specific-uuid'
 
     @pytest.mark.asyncio
@@ -184,9 +182,7 @@ class TestGetEdgeText:
         graph = make_graph_mock([['name', 'fact']])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_edge_text('specific-edge-uuid', group_id='test')
-        call_kwargs = graph.ro_query.call_args
-        args, kwargs = call_kwargs
-        params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        params = extract_params(graph.ro_query.call_args)
         assert params.get('uuid') == 'specific-edge-uuid'
 
     @pytest.mark.asyncio
