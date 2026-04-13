@@ -423,12 +423,8 @@ class TestFreshenMain:
         """When behind rev-list exits non-zero, _freshen_main returns (main_branch, None)."""
         git_ops, _origin = git_ops_with_remote
 
-        call_count = 0
-
         async def fake_run(cmd, cwd=None):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
+            if 'fetch' in cmd:
                 return (0, '', '')          # fetch succeeds
             return (128, '', 'fatal: bad revision')   # rev-list fails
 
