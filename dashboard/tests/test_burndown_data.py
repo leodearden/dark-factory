@@ -216,22 +216,17 @@ class TestCollectSnapshot:
         _assert_snapshot_counts(row, pending=1, in_progress=1, done=2)
 
     @pytest.mark.asyncio
-    async def test_symlinked_root_deduplicates_with_orchestrator(self, tmp_path):
+    async def test_symlinked_root_deduplicates_with_orchestrator(self, tmp_path, burndown_conn_with_config):
         """Symlinked project_root and orchestrator resolving to real path produce only 1 row."""
         real_dir = tmp_path / 'real'
         real_dir.mkdir()
         link = tmp_path / 'link'
         link.symlink_to(real_dir)
 
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
-
-        config = DashboardConfig(project_root=link)
-
         # Orchestrator resolves the same project via _resolve_project_root to the real path
         fake_orchestrators = [{'prd': 'fake_prd.md', 'config_path': None}]
 
-        async with aiosqlite.connect(str(db_path)) as conn:
+        async with burndown_conn_with_config(project_root=link) as (db_path, config, conn):
             with (
                 patch('dashboard.data.burndown.load_task_tree', return_value=[]),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
@@ -356,23 +351,15 @@ class TestCollectSnapshot:
             assert row[0] == 1
 
     @pytest.mark.asyncio
-    async def test_symlinked_root_deduplicates_with_known_roots(self, tmp_path):
+    async def test_symlinked_root_deduplicates_with_known_roots(self, tmp_path, burndown_conn_with_config):
         """If known_project_roots includes the resolved real path, it deduplicates with a symlinked project_root."""
         real_dir = tmp_path / 'real'
         real_dir.mkdir()
         link = tmp_path / 'link'
         link.symlink_to(real_dir)
 
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
-
         # project_root is the symlink; known_project_roots contains the resolved real path
-        config = DashboardConfig(
-            project_root=link,
-            known_project_roots=[real_dir],  # same underlying dir, unresolved
-        )
-
-        async with aiosqlite.connect(str(db_path)) as conn:
+        async with burndown_conn_with_config(project_root=link, known_project_roots=[real_dir]) as (db_path, config, conn):
             with (
                 patch('dashboard.data.burndown.load_task_tree', return_value=[]),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
@@ -433,20 +420,14 @@ class TestCollectSnapshot:
         assert count == 1  # only one row for reify, not two
 
     @pytest.mark.asyncio
-    async def test_main_project_id_is_resolved_path(self, tmp_path):
+    async def test_main_project_id_is_resolved_path(self, tmp_path, burndown_conn_with_config):
         """project_id in snapshot must be the resolved path even when project_root is a symlink."""
         real_dir = tmp_path / 'real'
         real_dir.mkdir()
         link = tmp_path / 'link'
         link.symlink_to(real_dir)
 
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
-
-        config = DashboardConfig(project_root=link)
-
-        async with aiosqlite.connect(str(db_path)) as conn:
-            conn.row_factory = aiosqlite.Row
+        async with burndown_conn_with_config(project_root=link) as (db_path, config, conn):
             with (
                 patch('dashboard.data.burndown.load_task_tree', return_value=[]),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
@@ -653,17 +634,12 @@ class TestCollectSnapshot:
         assert good_row['done'] == 2  # done=2 for good_root
 
     @pytest.mark.asyncio
-    async def test_orchestrator_fallback_deduplicates_against_resolved_root(self, tmp_path):
+    async def test_orchestrator_fallback_deduplicates_against_resolved_root(self, tmp_path, burndown_conn_with_config):
         """When _resolve_project_root falls back to the symlinked config.project_root, it still deduplicates."""
         real_dir = tmp_path / 'real'
         real_dir.mkdir()
         link = tmp_path / 'link'
         link.symlink_to(real_dir)
-
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
-
-        config = DashboardConfig(project_root=link)
 
         # PRD path lives directly under tmp_path (not under real_dir), so
         # _resolve_project_root will walk up from tmp_path, find no .taskmaster,
@@ -671,7 +647,7 @@ class TestCollectSnapshot:
         prd_path = str(tmp_path / 'fake_prd.md')
         fake_orchestrators = [{'prd': prd_path, 'config_path': None}]
 
-        async with aiosqlite.connect(str(db_path)) as conn:
+        async with burndown_conn_with_config(project_root=link) as (db_path, config, conn):
             with (
                 patch('dashboard.data.burndown.load_task_tree', return_value=[]),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
