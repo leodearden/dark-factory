@@ -422,6 +422,76 @@ class TestBackfillPointIdConsistency:
             f"backfill priority type: {type(backfill_payload['priority'])}"
         )
 
+        # Value equality for all shared keys except 'updated_at' (may differ by milliseconds)
+        shared_keys = set(record_payload.keys()) - {'updated_at'}
+        for key in shared_keys:
+            assert record_payload[key] == backfill_payload[key], (
+                f"Value mismatch for key '{key}': "
+                f"record={record_payload[key]!r}, backfill={backfill_payload[key]!r}"
+            )
+
+        # Sub-case: default/missing priority produces identical 'medium' in both paths
+        record_payload2: dict | None = None
+
+        async def capture_record2(*, collection_name, points):
+            nonlocal record_payload2
+            record_payload2 = points[0].payload
+
+        mock_client_r2 = AsyncMock()
+        mock_client_r2.upsert = capture_record2
+        mock_embedder_r2 = AsyncMock()
+        mock_embedder_r2.create = AsyncMock(return_value=[0.1] * 10)
+
+        curator._qdrant_client = None
+        curator._embedder = None
+        curator._initialized_collections = set()
+
+        # CandidateTask with default priority (no explicit value)
+        candidate_default = CandidateTask(title='Default prio', description='no explicit priority')
+
+        with patch.object(curator, '_get_qdrant', return_value=mock_client_r2), \
+             patch.object(curator, '_get_embedder', return_value=mock_embedder_r2), \
+             patch.object(curator, '_ensure_collection', return_value=f'task_curator_{project_id}'):
+
+            await curator.record_task(task_id='78', candidate=candidate_default, project_id=project_id)
+
+        backfill_payload2: dict | None = None
+
+        async def capture_backfill2(*, collection_name, points):
+            nonlocal backfill_payload2
+            backfill_payload2 = points[0].payload
+
+        mock_client_b2 = AsyncMock()
+        mock_client_b2.upsert = capture_backfill2
+        mock_embedder_b2 = AsyncMock()
+        mock_embedder_b2.create = AsyncMock(return_value=[0.1] * 10)
+
+        curator._qdrant_client = None
+        curator._embedder = None
+        curator._initialized_collections = set()
+
+        # Task dict without a 'priority' key at all
+        with patch.object(curator, '_get_qdrant', return_value=mock_client_b2), \
+             patch.object(curator, '_get_embedder', return_value=mock_embedder_b2), \
+             patch.object(curator, '_ensure_collection', return_value=f'task_curator_{project_id}'):
+
+            await curator.backfill_corpus(
+                [{'id': '78', 'title': 'Default prio', 'description': 'no explicit priority', 'status': 'pending'}],
+                project_id,
+            )
+
+        assert record_payload2 is not None
+        assert backfill_payload2 is not None
+        assert record_payload2['priority'] == 'medium', (
+            f"record_task default priority: expected 'medium', got {record_payload2['priority']!r}"
+        )
+        assert backfill_payload2['priority'] == 'medium', (
+            f"backfill_corpus missing priority key: expected 'medium', got {backfill_payload2['priority']!r}"
+        )
+        assert record_payload2['priority'] == backfill_payload2['priority'], (
+            f"Default priority mismatch: record={record_payload2['priority']!r}, backfill={backfill_payload2['priority']!r}"
+        )
+
     @pytest.mark.asyncio
     async def test_default_priority_alignment(self):
         """record_task() with default CandidateTask and backfill_corpus() with no priority key both produce 'medium'."""
