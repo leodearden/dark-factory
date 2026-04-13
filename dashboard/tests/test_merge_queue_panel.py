@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from dashboard.data.merge_queue import _bucket_minutes_for_window
+from tests._dt_helpers import make_fixed_datetime_cls
 
 # ---------------------------------------------------------------------------
 # Mock data
@@ -478,13 +479,18 @@ class TestPartialsMergeQueueSharedNow:
 
         Will fail before step-16 because partials_merge_queue does not pass `now` yet.
         """
+        FIXED_NOW = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+
+        _FixedDT = make_fixed_datetime_cls(FIXED_NOW)
+
         mock_depth = AsyncMock(return_value=MOCK_DEPTH)
         mock_outcomes = AsyncMock(return_value=MOCK_OUTCOMES)
         mock_latency = AsyncMock(return_value=MOCK_LATENCY)
         mock_recent = AsyncMock(return_value=MOCK_RECENT)
         mock_spec = AsyncMock(return_value=MOCK_SPEC)
 
-        with patch('dashboard.app.aggregate_queue_depth_timeseries', mock_depth), \
+        with patch('dashboard.app.datetime', _FixedDT), \
+             patch('dashboard.app.aggregate_queue_depth_timeseries', mock_depth), \
              patch('dashboard.app.aggregate_outcome_distribution', mock_outcomes), \
              patch('dashboard.app.aggregate_latency_stats', mock_latency), \
              patch('dashboard.app.aggregate_recent_merges', mock_recent), \
@@ -511,13 +517,12 @@ class TestPartialsMergeQueueSharedNow:
             f"latency={now_latency!r}, spec={now_spec!r}"
         )
 
-        # now must be a datetime and must have been captured close to the request
+        # now must be a datetime and must equal the fixed value exactly
         assert isinstance(now_depth, datetime), (
             f"Expected `now` to be a datetime, got {type(now_depth)!r}"
         )
-        elapsed = (datetime.now(UTC) - now_depth).total_seconds()
-        assert elapsed < 5, (
-            f"`now` value is stale: {elapsed:.1f}s old (expected < 5s)"
+        assert now_depth == FIXED_NOW, (
+            f"`now` value does not match fixed clock: got {now_depth!r}"
         )
 
 

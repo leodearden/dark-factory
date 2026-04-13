@@ -11,6 +11,7 @@ import aiosqlite
 import pytest
 
 import dashboard.data.merge_queue as _mqmod
+from tests._dt_helpers import make_fixed_datetime_cls
 
 # ---------------------------------------------------------------------------
 # Schema — events table from orchestrator/src/orchestrator/event_store.py
@@ -1863,64 +1864,42 @@ class TestCutoffIso:
         assert result == expected
 
     def test_cutoff_iso_no_now_uses_current_time(self):
-        """Without now, _cutoff_iso uses datetime.now(UTC) — result is within ±2s of expected."""
-        before = datetime.now(UTC) - timedelta(hours=24) - timedelta(seconds=2)
-        result = _cutoff_iso(24)
-        after = datetime.now(UTC) - timedelta(hours=24) + timedelta(seconds=2)
-        result_dt = datetime.fromisoformat(result)
-        assert before < result_dt < after
+        """Without now, _cutoff_iso uses datetime.now(UTC) — result matches mocked clock exactly."""
+        FIXED_NOW = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        expected = (FIXED_NOW - timedelta(hours=24)).isoformat()
+
+        _FixedDT = make_fixed_datetime_cls(FIXED_NOW)
+
+        with patch.object(_mqmod, 'datetime', _FixedDT):
+            result = _cutoff_iso(24)
+
+        assert result == expected
 
 
 # ---------------------------------------------------------------------------
-# TestOutcomeDistributionNow (step-3)
+# TestNowThreadingToCutoffIso (step-3)
 # ---------------------------------------------------------------------------
 
-class TestOutcomeDistributionNow:
+@pytest.mark.parametrize(
+    'fn_under_test',
+    [outcome_distribution, speculative_stats, latency_stats],
+    ids=lambda fn: fn.__name__,
+)
+class TestNowThreadingToCutoffIso:
     @pytest.mark.asyncio
-    async def test_outcome_distribution_threads_now_to_cutoff_iso(self, merge_events_db):
-        """outcome_distribution accepts now and passes it to _cutoff_iso.
-
-        Will fail before step-4 impl because outcome_distribution has no `now` param.
-        """
+    async def test_threads_now_to_cutoff_iso(self, fn_under_test, merge_events_db):
+        """fn_under_test accepts now and passes it through to _cutoff_iso."""
         fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
         captured_nows: list = []
 
         def mock_cutoff_iso(hours: int, *, now=None) -> str:
             captured_nows.append(now)
-            return '2020-01-01T00:00:00+00:00'  # arbitrary cutoff; test only inspects captured_nows
+            return '2020-01-01T00:00:00+00:00'
 
         async with aiosqlite.connect(str(merge_events_db)) as conn:
             conn.row_factory = aiosqlite.Row
             with patch('dashboard.data.merge_queue._cutoff_iso', side_effect=mock_cutoff_iso):
-                await outcome_distribution(conn, hours=24, now=fixed_now)
-
-        assert captured_nows == [fixed_now], (
-            f"Expected _cutoff_iso called once with now={fixed_now!r}, got {captured_nows!r}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# TestSpeculativeStatsNow (step-7)
-# ---------------------------------------------------------------------------
-
-class TestSpeculativeStatsNow:
-    @pytest.mark.asyncio
-    async def test_speculative_stats_threads_now_to_cutoff_iso(self, merge_events_db):
-        """speculative_stats accepts now and passes it to _cutoff_iso.
-
-        Will fail before step-8 impl because speculative_stats has no `now` param.
-        """
-        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
-        captured_nows: list = []
-
-        def mock_cutoff_iso(hours: int, *, now=None) -> str:
-            captured_nows.append(now)
-            return '2020-01-01T00:00:00+00:00'  # arbitrary cutoff; test only inspects captured_nows
-
-        async with aiosqlite.connect(str(merge_events_db)) as conn:
-            conn.row_factory = aiosqlite.Row
-            with patch('dashboard.data.merge_queue._cutoff_iso', side_effect=mock_cutoff_iso):
-                await speculative_stats(conn, hours=24, now=fixed_now)
+                await fn_under_test(conn, hours=24, now=fixed_now)
 
         assert captured_nows == [fixed_now], (
             f"Expected _cutoff_iso called once with now={fixed_now!r}, got {captured_nows!r}"
@@ -2003,34 +1982,6 @@ class TestAggregateLatencyStatsNow:
         # Both events are inside the window → count=2
         assert result['count'] == 2, (
             f"Expected count=2 (both events within fixed_now window), got {result}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# TestLatencyStatsNow (step-5)
-# ---------------------------------------------------------------------------
-
-class TestLatencyStatsNow:
-    @pytest.mark.asyncio
-    async def test_latency_stats_threads_now_to_cutoff_iso(self, merge_events_db):
-        """latency_stats accepts now and threads it through _get_durations to _cutoff_iso.
-
-        Will fail before step-6 impl because latency_stats/_get_durations have no `now` param.
-        """
-        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
-        captured_nows: list = []
-
-        def mock_cutoff_iso(hours: int, *, now=None) -> str:
-            captured_nows.append(now)
-            return '2020-01-01T00:00:00+00:00'  # arbitrary cutoff; test only inspects captured_nows
-
-        async with aiosqlite.connect(str(merge_events_db)) as conn:
-            conn.row_factory = aiosqlite.Row
-            with patch('dashboard.data.merge_queue._cutoff_iso', side_effect=mock_cutoff_iso):
-                await latency_stats(conn, hours=24, now=fixed_now)
-
-        assert captured_nows == [fixed_now], (
-            f"Expected _cutoff_iso called once with now={fixed_now!r}, got {captured_nows!r}"
         )
 
 
