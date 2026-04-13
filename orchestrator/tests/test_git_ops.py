@@ -437,6 +437,13 @@ class TestCreateWorktreeFreshening:
         worktree_info = await git_ops.create_worktree('stale-commits-test')
         assert worktree_info.stale_commits == 2
 
+    async def test_create_worktree_stale_commits_none_without_remote(
+        self, git_ops: GitOps,
+    ):
+        """stale_commits is None when no remote is configured (graceful degradation)."""
+        worktree_info = await git_ops.create_worktree('no-remote-test')
+        assert worktree_info.stale_commits is None
+
 
 @pytest.mark.asyncio
 class TestCommitTaskStatuses:
