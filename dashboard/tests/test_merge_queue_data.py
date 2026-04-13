@@ -825,12 +825,16 @@ class TestMultiDbAggregation:
         return broken
 
     async def _run_with_one_broken_db(self, tmp_path, aggregate_fn, events, **kwargs):
-        """Scaffold for resilience tests: one valid DB + one broken mock connection."""
+        """Scaffold for resilience tests: one valid DB + one broken mock connection.
+
+        Returns (result, broken) so callers can assert the broken mock was exercised.
+        """
         db1 = self._make_db(tmp_path, 'runs1.db', events)
         broken = self._make_broken_mock()
         async with aiosqlite.connect(str(db1)) as conn1:
             conn1.row_factory = aiosqlite.Row
-            return await aggregate_fn([conn1, broken], **kwargs)
+            result = await aggregate_fn([conn1, broken], **kwargs)
+            return result, broken
 
     async def _run_with_none_entry(self, tmp_path, aggregate_fn, events, **kwargs):
         """Scaffold for None-entry tests: one valid DB + None in dbs list."""
