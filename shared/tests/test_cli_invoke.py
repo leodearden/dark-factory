@@ -1261,7 +1261,7 @@ class TestParseClaudeOutputThreadsTimedOut:
 def _make_gate(
     *,
     account_count: int = 2,
-    before_invoke_tokens: 'str | list[str]' = 'token-a',
+    before_invoke_tokens: str | list[str] = 'token-a',
     handle_cap_detected: bool = False,
     active_account_name: str = 'acct-a',
 ) -> MagicMock:
