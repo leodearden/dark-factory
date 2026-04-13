@@ -13,13 +13,13 @@ from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
     TaskCurator,
-    flatten_task_tree,
     _parse_decision,
     _PoolEntry,
     _task_dependencies,
     _task_files,
     _to_pool_entry,
     _trim_pool,
+    flatten_task_tree,
 )
 
 # ----------------------------------------------------------------------

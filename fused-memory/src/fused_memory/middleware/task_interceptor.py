@@ -12,8 +12,8 @@ from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
     TaskCurator,
-    flatten_task_tree,
     _to_pool_entry,
+    flatten_task_tree,
 )
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -521,12 +521,12 @@ class TaskInterceptor:
         project_id = resolve_project_id(project_root)
 
         pre_ids = {
-            str(t.get('id', '')) for t in _flatten_task_tree(pre_snapshot)
+            str(t.get('id', '')) for t in flatten_task_tree(pre_snapshot)
             if t.get('id')
         }
         post_snapshot = await tm.get_tasks(project_root)
         new_task_dicts = [
-            t for t in _flatten_task_tree(post_snapshot)
+            t for t in flatten_task_tree(post_snapshot)
             if str(t.get('id', '')) and str(t.get('id', '')) not in pre_ids
         ]
         if not new_task_dicts:
