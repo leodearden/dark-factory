@@ -1104,7 +1104,7 @@ class TestHandleNearCapWarning:
             gate._handle_near_cap_warning('reason', token)
         mock_fire.assert_not_called()
 
-    def test_repeated_calls_are_idempotent(self, caplog):
+    def test_repeated_calls_fire_cost_event_each_time(self, caplog):
         """Calling _handle_near_cap_warning twice documents the no-dedup behavior:
         near_cap stays True, cost event fires on every call, and a WARNING is
         logged on every call.  If a dedup guard is ever added this test will
