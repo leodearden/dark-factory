@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tests._dt_helpers import make_fixed_datetime_cls
 from dashboard.data.merge_queue import _bucket_minutes_for_window
+from tests._dt_helpers import make_fixed_datetime_cls
 
 # ---------------------------------------------------------------------------
 # Mock data
