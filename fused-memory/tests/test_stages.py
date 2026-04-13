@@ -1492,6 +1492,60 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
             f"Section content:\n{section}"
         )
 
+    @pytest.mark.asyncio
+    async def test_stage_does_not_apply_second_slice_on_done_tasks(
+        self, mock_deps, watermark
+    ):
+        """Stage must NOT apply a second done_tasks slice on top of filter_task_tree's cap.
+
+        Two assertions:
+        (1) Source-level guard: assemble_payload source must not contain a subscript on
+            done_tasks (e.g. ``done_tasks[:30]``).  This is a tripwire — it fires the
+            moment someone re-introduces a hardcoded re-slice that duplicates the cap
+            already enforced by filter_task_tree.
+        (2) Behavioral guard: exactly MAX_DONE_TASKS_RETAINED done tasks must ALL appear
+            in the Recently Completed section — the stage must not silently trim them.
+        """
+        import inspect
+
+        # (1) Source-level tripwire: assemble_payload must not slice done_tasks.
+        source = inspect.getsource(TaskKnowledgeSync.assemble_payload)
+        assert 'done_tasks[' not in source, (
+            "assemble_payload contains a subscript on done_tasks (e.g. done_tasks[:30]). "
+            "This is dead code — filter_task_tree already caps done_tasks at "
+            f"MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED}. "
+            "Remove the slice; filter_task_tree is the single source of truth."
+        )
+
+        # (2) Behavioral guard: all MAX_DONE_TASKS_RETAINED tasks pass through uncut.
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(i, 'done')
+                for i in range(1, MAX_DONE_TASKS_RETAINED + 1)
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, '### Recently Completed Tasks')
+        assert section, "Payload missing '### Recently Completed Tasks' section"
+
+        # All MAX_DONE_TASKS_RETAINED tasks must appear — no second slice should trim them.
+        missing = [
+            tid
+            for tid in range(1, MAX_DONE_TASKS_RETAINED + 1)
+            if f'- [{tid}] ' not in section
+        ]
+        assert not missing, (
+            f"Tasks {missing} missing from Recently Completed section. "
+            f"The stage may be applying a redundant slice that trims "
+            f"filter_task_tree's already-capped output.\n"
+            f"Section content:\n{section}"
+        )
+
 
 # ── Tests for task 455: MemoryConsolidator filtered task tree injection ─────────
 
