@@ -879,7 +879,7 @@ class TestAutoBackfill:
 class TestTaskInterceptorClose:
     """Tests for TaskInterceptor.close() resource release and re-use prevention."""
 
-    def _make_interceptor(self, mock_taskmaster=None) -> 'TaskInterceptor':
+    def _make_interceptor(self, mock_taskmaster=None) -> TaskInterceptor:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         config = _make_interceptor_config()
         return TaskInterceptor(
