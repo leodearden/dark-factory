@@ -419,10 +419,24 @@ class GitOps:
         )
 
         # Capture the freshened ref's SHA (used as stable base for diffs)
-        _, base_sha, _ = await _run(
+        rc, base_sha, _ = await _run(
             ['git', 'rev-parse', start_ref],
             cwd=self.project_root,
         )
+        if rc != 0:
+            logger.warning(
+                'create_worktree: rev-parse %s failed (rc=%d) — falling back to local %s',
+                start_ref, rc, self.config.main_branch,
+            )
+            start_ref = self.config.main_branch
+            rc, base_sha, _ = await _run(
+                ['git', 'rev-parse', start_ref],
+                cwd=self.project_root,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f'create_worktree: rev-parse of local {start_ref} also failed (rc={rc})'
+                )
 
         # If worktree already exists, reuse it (common after requeue) —
         # but ONLY if it is a real registered git worktree.  A stale
