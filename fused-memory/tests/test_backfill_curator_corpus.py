@@ -292,7 +292,7 @@ class TestBackfillPointIdConsistency:
 
     @pytest.mark.asyncio
     async def test_record_task_normalizes_none_fields(self):
-        """record_task() with files_to_modify=None and priority=None stores [] and '' in payload."""
+        """record_task() with files_to_modify=None and priority=None stores [] and 'medium' in payload."""
         from fused_memory.middleware.task_curator import CandidateTask
 
         project_id = 'proj'
@@ -331,8 +331,8 @@ class TestBackfillPointIdConsistency:
         assert captured_payload['files_to_modify'] == [], (
             f"Expected [], got {captured_payload['files_to_modify']!r}"
         )
-        assert captured_payload['priority'] == '', (
-            f"Expected '', got {captured_payload['priority']!r}"
+        assert captured_payload['priority'] == 'medium', (
+            f"Expected 'medium', got {captured_payload['priority']!r}"
         )
 
     @pytest.mark.asyncio
