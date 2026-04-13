@@ -1219,7 +1219,7 @@ class TestMultiDbAggregation:
              'timestamp': bucket + timedelta(minutes=1),
              'data': {'outcome': 'done'}},
         ]
-        result = await self._run_with_one_broken_db(
+        result, broken = await self._run_with_one_broken_db(
             tmp_path, aggregate_queue_depth_timeseries, events, hours=24, now=now,
         )
         # Broken DB error was silently skipped — no exception raised
@@ -1228,6 +1228,7 @@ class TestMultiDbAggregation:
         assert bucket_label in result['labels']
         idx = result['labels'].index(bucket_label)
         assert result['values'][idx] == 1  # only from valid DB; broken DB skipped
+        broken.execute_fetchall.assert_called()
 
     @pytest.mark.asyncio
     async def test_one_db_raises_outcome_distribution(self, tmp_path):
@@ -1239,12 +1240,13 @@ class TestMultiDbAggregation:
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
              'data': {'outcome': 'done'}},
         ]
-        result = await self._run_with_one_broken_db(
+        result, broken = await self._run_with_one_broken_db(
             tmp_path, aggregate_outcome_distribution, events, hours=24,
         )
         assert 'done' in result['labels']
         done_idx = result['labels'].index('done')
         assert result['values'][done_idx] == 2  # only from valid DB
+        broken.execute_fetchall.assert_called()
 
     @pytest.mark.asyncio
     async def test_one_db_raises_latency_stats(self, tmp_path):
@@ -1256,11 +1258,12 @@ class TestMultiDbAggregation:
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
              'data': {'outcome': 'done'}, 'duration_ms': 200},
         ]
-        result = await self._run_with_one_broken_db(
+        result, broken = await self._run_with_one_broken_db(
             tmp_path, aggregate_latency_stats, events, hours=24,
         )
         assert result['count'] == 2
         assert result['mean_ms'] == pytest.approx(150.0, abs=1e-6)
+        broken.execute_fetchall.assert_called()
 
     @pytest.mark.asyncio
     async def test_one_db_raises_recent_merges(self, tmp_path):
@@ -1272,13 +1275,14 @@ class TestMultiDbAggregation:
             {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=2),
              'task_id': 'task-y', 'data': {'outcome': 'done'}},
         ]
-        result = await self._run_with_one_broken_db(
+        result, broken = await self._run_with_one_broken_db(
             tmp_path, aggregate_recent_merges, events, limit=20,
         )
         assert len(result) == 2
         # Newest first
         assert result[0]['task_id'] == 'task-x'
         assert result[1]['task_id'] == 'task-y'
+        broken.execute_fetchall.assert_called()
 
     @pytest.mark.asyncio
     async def test_one_db_raises_speculative_stats(self, tmp_path):
@@ -1290,13 +1294,14 @@ class TestMultiDbAggregation:
             {'event_type': 'speculative_merge', 'timestamp': now - timedelta(minutes=2),
              'data': {'base_sha': 'def'}},
         ]
-        result = await self._run_with_one_broken_db(
+        result, broken = await self._run_with_one_broken_db(
             tmp_path, aggregate_speculative_stats, events, hours=24,
         )
         assert result['hit_count'] == 2
         assert result['discard_count'] == 0
         assert result['total'] == 2
         assert result['hit_rate'] == pytest.approx(1.0, abs=1e-6)
+        broken.execute_fetchall.assert_called()
 
     # -----------------------------------------------------------------------
     # Gap coverage (b): empty dbs=[] — asyncio.gather(*[]) returns []
