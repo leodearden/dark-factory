@@ -1598,7 +1598,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         stage.project_root = '/tmp/test_project'
         stage.filtered_task_tree = self._make_tree(
             [self._make_task(10, 'in-progress'), self._make_task(20, 'pending')],
-            done_count=5,
+            done_count=0,
         )
 
         payload = await stage.assemble_payload([], watermark, [])
@@ -1609,16 +1609,11 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         assert '### Active Task Tree' in payload
         assert 'Task 10' in payload
         assert 'Task 20' in payload
-        # Recently Completed: done_count > 0 but done_tasks=[] (harness path)
-        # Either the section is absent (future-proof) OR it mentions the count '5'
+        # Recently Completed: done_count=0 and done_tasks=[] → 'No tasks.'
         recently_section = _extract_section(payload, '### Recently Completed Tasks')
-        assert '### Recently Completed Tasks' not in payload or '5' in recently_section, (
-            "Expected '### Recently Completed Tasks' absent or done_count '5' in section body"
-        )
-        # No individual done-task lines anywhere — fixture passes done_tasks=[] so
-        # done tasks are absent regardless of pool composition.
-        assert '(done)' not in payload, (
-            "Unexpected individual done-task line in harness-injected payload"
+        assert '### Recently Completed Tasks' in payload
+        assert 'No tasks.' in recently_section, (
+            f"Expected 'No tasks.' in Recently Completed section, got: {recently_section!r}"
         )
 
     @pytest.mark.asyncio
