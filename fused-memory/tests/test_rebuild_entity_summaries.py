@@ -1402,7 +1402,7 @@ class TestRebuildEntitySummariesCancellation:
         )
 
         with pytest.raises(asyncio.CancelledError):
-            await backend.rebuild_entity_summaries(group_id='test', force=True)
+            await backend.rebuild_entity_summaries(group_id='grp-cancel-warn', force=True)
 
     @pytest.mark.asyncio
     async def test_cancelled_error_propagates_alongside_other_errors(
@@ -1434,7 +1434,7 @@ class TestRebuildEntitySummariesCancellation:
             caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'),
             pytest.raises(asyncio.CancelledError),
         ):
-            await backend.rebuild_entity_summaries(group_id='test', force=True)
+            await backend.rebuild_entity_summaries(group_id='grp-cancel-warn', force=True)
 
         # After CancelledError propagated, verify both update_node_summary calls were
         # attempted by gather.  Pass 1 (propagate_cancellations in
@@ -1446,8 +1446,11 @@ class TestRebuildEntitySummariesCancellation:
         # post-gather propagation path, not a pre-gather short-circuit.
         assert backend.update_node_summary.await_count == 2
 
+        expected_rebuilt = 0  # Pass 1 re-raises before Pass 2 increments counters
+        expected_errors = 0   # Pass 1 re-raises before Pass 2 increments counters
         self._assert_single_cancellation_warning(
-            caplog, group_id='test', rebuilt_so_far=0, errors_so_far=0
+            caplog, group_id='grp-cancel-warn',
+            rebuilt_so_far=expected_rebuilt, errors_so_far=expected_errors
         )
 
     @pytest.mark.asyncio
@@ -1471,10 +1474,13 @@ class TestRebuildEntitySummariesCancellation:
             caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'),
             pytest.raises(asyncio.CancelledError),
         ):
-            await backend.rebuild_entity_summaries(group_id='test', force=True)
+            await backend.rebuild_entity_summaries(group_id='grp-cancel-warn', force=True)
 
+        expected_rebuilt = 0  # Pass 1 re-raises before Pass 2 increments counters
+        expected_errors = 0   # Pass 1 re-raises before Pass 2 increments counters
         self._assert_single_cancellation_warning(
-            caplog, group_id='test', rebuilt_so_far=0, errors_so_far=0
+            caplog, group_id='grp-cancel-warn',
+            rebuilt_so_far=expected_rebuilt, errors_so_far=expected_errors
         )
 
     @pytest.mark.asyncio
@@ -1505,10 +1511,13 @@ class TestRebuildEntitySummariesCancellation:
             caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'),
             pytest.raises(asyncio.CancelledError),
         ):
-            await backend.rebuild_entity_summaries(group_id='test', force=True)
+            await backend.rebuild_entity_summaries(group_id='grp-cancel-warn', force=True)
 
+        expected_rebuilt = 0  # Pass 1 re-raises before Pass 2 increments counters
+        expected_errors = 0   # Pass 1 re-raises before Pass 2 increments counters
         self._assert_single_cancellation_warning(
-            caplog, group_id='test', rebuilt_so_far=0, errors_so_far=0
+            caplog, group_id='grp-cancel-warn',
+            rebuilt_so_far=expected_rebuilt, errors_so_far=expected_errors
         )
 
     @pytest.mark.asyncio
@@ -1560,7 +1569,7 @@ class TestRebuildEntitySummariesCancellation:
         )
 
         with pytest.raises(asyncio.CancelledError):
-            await backend.rebuild_entity_summaries(group_id='test', force=False)
+            await backend.rebuild_entity_summaries(group_id='grp-cancel-warn', force=False)
 
         # After CancelledError propagated, verify the force=False gather path was actually
         # exercised: _detect_stale_summaries_with_edges was awaited exactly once (bulk fetch
@@ -1603,7 +1612,7 @@ class TestRebuildEntitySummariesCancellation:
             side_effect=[ValueError('per-entity boom'), None]
         )
 
-        result = await backend.rebuild_entity_summaries(group_id='test', force=True)
+        result = await backend.rebuild_entity_summaries(group_id='grp-cancel-accum', force=True)
 
         assert result['errors'] == 1
         assert result['rebuilt'] == 1
