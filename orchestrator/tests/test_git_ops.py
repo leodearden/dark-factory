@@ -1679,6 +1679,35 @@ class TestScrubTaskDirFromTree:
             f'Expected git rm stderr in .error, got: {result.error!r}'
         )
 
+    async def test_scrub_failed_whitespace_stderr_collapses_to_none(
+        self, tmp_path: Path,
+    ):
+        """Whitespace-only git rm stderr must collapse to error=None.
+
+        The production code uses ``err.strip() or None`` (git_ops.py:126) so that
+        whitespace-only stderr (e.g. '   \\n') is normalised to None rather than
+        stored as a meaningless whitespace string.  This companion test to
+        test_scrub_failed_result_carries_error drives that normalisation branch.
+
+        Uses tmp_path directly (no real worktree) since _run is fully mocked.
+        """
+        async def mock_run(cmd, cwd=None):
+            if cmd[:4] == ['git', 'ls-tree', '-r', '--name-only'] and '.task/' in cmd:
+                return (0, '.task/tracked.txt', '')
+            if cmd[:5] == ['git', 'rm', '-r', '--cached', '--']:
+                return (1, '', '   \n')
+            pytest.fail(f'unexpected _run call: {cmd}')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await scrub_task_dir_from_tree(tmp_path, 'whitespace-err')
+
+        assert result.outcome == ScrubOutcome.FAILED, (
+            f'Expected outcome=FAILED on git rm failure, got {result!r}'
+        )
+        assert result.error is None, (
+            f'Expected error=None for whitespace-only stderr, got: {result.error!r}'
+        )
+
     async def test_scrub_scrubbed_result_has_no_error(
         self, tmp_path: Path,
     ):
@@ -1722,6 +1751,100 @@ class TestScrubTaskDirFromTree:
             f'Expected outcome=CLEAN on empty tree, got {result!r}'
         )
         assert result.error is None, f'Expected error=None on clean, got {result.error!r}'
+
+    async def test_scrub_amend_false_creates_new_commit(
+        self, git_ops: GitOps,
+    ):
+        """scrub_task_dir_from_tree(amend=False) extends the commit chain.
+
+        The amend=False path (used by create_worktree, line 342 of git_ops.py)
+        must create a NEW child commit rather than rewriting the existing one.
+        This integration test verifies against a real git repository:
+        (a) outcome == SCRUBBED and error is None,
+        (b) HEAD moved to a new SHA after the scrub,
+        (c) the old HEAD is the first parent of the new HEAD (new commit, not amend),
+        (d) .task/ is absent from the new HEAD commit tree,
+        (e) the new commit message contains 'chore: remove .task/ contamination'.
+
+        Uses git_ops fixture for a real git repo — no mocks.
+        """
+        # Create a worktree on a fresh branch with a regular commit.
+        worktree_info = await git_ops.create_worktree('amend-false-branch')
+        (worktree_info.path / 'work.py').write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, 'Add work file')
+
+        # Inject .task/ contamination, bypassing the .task/.gitignore defence.
+        task_dir = worktree_info.path / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"contamination": true}\n')
+        await _run(['git', 'add', '-f', '.task/plan.json'], cwd=worktree_info.path)
+        await _run(
+            ['git', 'commit', '-m', 'Simulated .task/ contamination'],
+            cwd=worktree_info.path,
+        )
+
+        # Record HEAD before scrub.
+        _, old_head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree_info.path)
+        old_head = old_head.strip()
+        assert len(old_head) == 40, f'Pre-condition: expected 40-char SHA, got {old_head!r}'
+
+        # Verify contamination is present before scrub.
+        _, ls_before, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'HEAD', '--', '.task/'],
+            cwd=worktree_info.path,
+        )
+        assert '.task/plan.json' in ls_before, (
+            f'Pre-condition: expected .task/plan.json in tree, got: {ls_before!r}'
+        )
+
+        # Call scrub with amend=False — must create a new child commit.
+        result = await scrub_task_dir_from_tree(
+            worktree_info.path, 'amend-false-test', amend=False,
+        )
+
+        # (a) Outcome must be SCRUBBED with no error.
+        assert result.outcome == ScrubOutcome.SCRUBBED, (
+            f'Expected outcome=SCRUBBED, got {result!r}'
+        )
+        assert result.error is None, (
+            f'Expected error=None on successful scrub, got: {result.error!r}'
+        )
+
+        # (b) HEAD must have moved to a new SHA.
+        _, new_head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree_info.path)
+        new_head = new_head.strip()
+        assert new_head != old_head, (
+            f'Expected HEAD to move after amend=False scrub, but still {old_head!r}'
+        )
+
+        # (c) Old HEAD must be the first parent of new HEAD — proves a new child
+        #     commit was created rather than an amendment of the contamination commit.
+        _, parent, _ = await _run(
+            ['git', 'rev-parse', 'HEAD^'],
+            cwd=worktree_info.path,
+        )
+        assert parent.strip() == old_head, (
+            f'Expected old HEAD ({old_head}) to be parent of new HEAD, '
+            f'but HEAD^ is {parent.strip()!r}'
+        )
+
+        # (d) .task/ must be absent from the new HEAD commit tree.
+        _, task_in_tree, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'HEAD', '--', '.task/'],
+            cwd=worktree_info.path,
+        )
+        assert not task_in_tree.strip(), (
+            f'.task/ must be absent from new commit tree, but found: {task_in_tree!r}'
+        )
+
+        # (e) New commit message must contain the expected scrub marker text.
+        _, commit_msg, _ = await _run(
+            ['git', 'log', '-1', '--format=%B'],
+            cwd=worktree_info.path,
+        )
+        assert 'chore: remove .task/ contamination' in commit_msg, (
+            f'Expected commit message to contain scrub marker, got: {commit_msg!r}'
+        )
 
 
 @pytest.mark.asyncio
