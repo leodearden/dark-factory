@@ -2180,3 +2180,29 @@ class TestInvariantAfterTask643:
             assert result.done_tasks, (
                 'Invariant violated: done_count > 0 but done_tasks is empty'
             )
+
+    def test_filter_task_tree_invariant_holds_with_over_cap_done_tasks(self):
+        """Regression guard: at the >MAX_DONE_TASKS_RETAINED boundary the invariant still holds.
+
+        Even when done_count exceeds MAX_DONE_TASKS_RETAINED=30 (tasks are capped in
+        done_tasks), done_tasks must remain non-empty.  This is the cap-boundary case of
+        the invariant that task-643 relied on.  Task 782 places this guard at the
+        stage/callsite layer to complement test_task_filter.py's existing cap tests.
+        """
+        n_tasks = MAX_DONE_TASKS_RETAINED + 5
+        tasks_data = {
+            'tasks': [self._make_task(i, 'done') for i in range(1, n_tasks + 1)]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert result.done_count > MAX_DONE_TASKS_RETAINED, (
+            f'Expected done_count > {MAX_DONE_TASKS_RETAINED}, got {result.done_count}'
+        )
+        assert len(result.done_tasks) == MAX_DONE_TASKS_RETAINED, (
+            f'Expected done_tasks capped at {MAX_DONE_TASKS_RETAINED}, '
+            f'got {len(result.done_tasks)}'
+        )
+        # Invariant clause: even at the cap boundary, done_count > 0 implies done_tasks non-empty
+        assert len(result.done_tasks) > 0, (
+            'Invariant violated at cap boundary: done_tasks is empty despite done_count > 0'
+        )
