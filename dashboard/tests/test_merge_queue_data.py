@@ -1131,3 +1131,40 @@ class TestMultiDbAggregation:
         # utc-noon (12:00 UTC) is newer than tz-plus5 (08:00 UTC), so must be first
         assert result[0]['task_id'] == 'utc-noon'
         assert result[1]['task_id'] == 'tz-plus5'
+
+    # -----------------------------------------------------------------------
+    # Gap coverage (a): one DB raises RuntimeError — gather-level resilience
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_one_db_raises_queue_depth_timeseries(self, tmp_path):
+        """aggregate_queue_depth_timeseries silently skips a DB whose coroutine
+        raises RuntimeError (escapes with_db) via gather(return_exceptions=True).
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        cutoff = now - timedelta(hours=24)
+        bucket = _bucket_start(cutoff) + timedelta(hours=22)
+
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': bucket + timedelta(minutes=1),
+             'data': {'outcome': 'done'}},
+        ])
+
+        broken_mock = MagicMock()
+        broken_mock.execute_fetchall = AsyncMock(side_effect=RuntimeError('simulated broken DB'))
+
+        async with aiosqlite.connect(str(db1)) as conn1:
+            conn1.row_factory = aiosqlite.Row
+            result = await aggregate_queue_depth_timeseries(
+                [conn1, broken_mock], hours=24, now=now,
+            )
+
+        # Broken DB error was silently skipped — no exception raised
+        assert len(result['labels']) == 97
+        bucket_label = bucket.isoformat()
+        assert bucket_label in result['labels']
+        idx = result['labels'].index(bucket_label)
+        assert result['values'][idx] == 1  # only from valid DB; broken DB skipped
