@@ -588,6 +588,7 @@ async def test_call_judge_cli_no_confirm_on_cap_hit(mock_journal):
     # Exactly once — for the success iteration, NOT for the cap-hit iteration
     gate.confirm_account_ok.assert_called_once_with('token-jb')
     gate.on_agent_complete.assert_called_once_with(0.0099)
+    gate.release_probe_slot.assert_not_called()
 
 
 @pytest.mark.asyncio
