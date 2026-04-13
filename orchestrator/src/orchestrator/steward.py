@@ -312,6 +312,7 @@ class TaskSteward:
                     'category': escalation.category,
                     'retry_count': retry_count,
                     'account_name': result.account_name,
+                    'timed_out': _is_timeout_kill(result),
                 },
             )
 
