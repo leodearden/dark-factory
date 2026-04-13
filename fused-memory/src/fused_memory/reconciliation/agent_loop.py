@@ -436,6 +436,11 @@ class AgentLoop:
                 + int(result.get('num_output_tokens', 0))
             )
 
+            if self._usage_gate:
+                cost_usd = float(result.get('cost_usd', result.get('total_cost_usd', 0.0)))
+                self._usage_gate.confirm_account_ok(oauth_token)
+                self._usage_gate.on_agent_complete(cost_usd)
+
             return _CLIResponseAdapter(structured)
 
 
