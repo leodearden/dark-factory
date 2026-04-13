@@ -1402,3 +1402,44 @@ class TestMultiDbAggregation:
         assert result['discard_count'] == 1
         assert result['total'] == 2
         assert result['hit_rate'] == pytest.approx(0.5, abs=1e-6)
+
+    # -----------------------------------------------------------------------
+    # Gap coverage (d): current-bucket-tail regression
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_current_bucket_tail_regression(self, tmp_path):
+        """Near-now events from two DBs land in the last (current) bucket.
+
+        Verifies that: (a) the current bucket is always present as the last
+        label, and (b) events inserted at now-1min and now-30s each contribute
+        to the same current bucket so the summed count is 2.
+        """
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': now - timedelta(minutes=1),
+             'data': {'outcome': 'done'}},
+        ])
+        db2 = self._make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': now - timedelta(seconds=30),
+             'data': {'outcome': 'done'}},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=24, now=now)
+
+        # The last label must be the current aligned bucket (12:00:00 for 12:07:30)
+        expected_last_label = _align_bucket(now, 15).isoformat()
+        assert result['labels'][-1] == expected_last_label
+
+        # Both events are in the current bucket — summed count must be 2
+        idx = result['labels'].index(expected_last_label)
+        assert result['values'][idx] == 2
