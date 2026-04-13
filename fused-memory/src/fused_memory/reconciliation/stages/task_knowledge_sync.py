@@ -6,6 +6,7 @@ from __future__ import annotations
 import heapq
 import itertools
 import json
+import logging
 from collections.abc import Iterable
 
 from fused_memory.models.reconciliation import (
@@ -30,6 +31,8 @@ from fused_memory.reconciliation.task_filter import (
     format_filtered_task_tree,
     format_task_list,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class TaskKnowledgeSync(BaseStage):
@@ -72,10 +75,25 @@ class TaskKnowledgeSync(BaseStage):
                     tasks_data = {}
             filtered = filter_task_tree(tasks_data)
 
+        # Defensive invariant check (task-782): done_count > 0 must imply done_tasks
+        # non-empty.  filter_task_tree() always appends to done_tasks when it increments
+        # done_count (capped at MAX_DONE_TASKS_RETAINED=30), so this state is impossible
+        # via the normal code path.  Externally-constructed FilteredTaskTree instances
+        # (e.g. from harness callers that build the dataclass directly) could violate it;
+        # this warning catches such cases at the callsite rather than silently dropping data.
+        if filtered.done_count > 0 and not filtered.done_tasks:
+            logger.warning(
+                'FilteredTaskTree invariant violation: done_count=%d but done_tasks is '
+                'empty. Externally-constructed tree bypassed filter_task_tree() guarantee. '
+                'Recently Completed section will render as empty. (task-782 defensive check)',
+                filtered.done_count,
+            )
+
         # Render "Recently Completed Tasks" section.
         # Invariant: filter_task_tree() always appends to done_tasks when it increments
         # done_count (capped at MAX_DONE_TASKS_RETAINED=30), so done_tasks is guaranteed
         # non-empty whenever done_count > 0.  No fallback summary branch is needed.
+        # The defensive check above catches externally-constructed trees that violate it.
         if filtered.done_tasks:
             recently_completed_text = format_task_list(filtered.done_tasks)
         else:
