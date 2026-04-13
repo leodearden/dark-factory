@@ -121,6 +121,15 @@ class RewrittenTask:
 
 
 @dataclass
+class BackfillResult:
+    """Result of a backfill_corpus() call."""
+
+    upserted: int = 0
+    skipped: int = 0
+    errors: int = 0
+
+
+@dataclass
 class CuratorDecision:
     """Result of a curator call. Always returned — never raised."""
 
@@ -425,9 +434,7 @@ class TaskCurator:
 
             from qdrant_client.models import PointStruct
 
-            point_id = str(
-                uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f'{project_id}/{task_id}'),
-            )
+            point_id = self._point_id(project_id, task_id)
             client = await self._get_qdrant()
             await client.upsert(
                 collection_name=collection,
@@ -463,6 +470,96 @@ class TaskCurator:
         Same deterministic point id as record_task, so this is idempotent.
         """
         await self.record_task(task_id, candidate, project_id)
+
+    @staticmethod
+    def _point_id(project_id: str, task_id: str) -> str:
+        """Deterministic UUID5 point ID for a task in a project.
+
+        Shared by record_task() and backfill_corpus() to ensure idempotent overlap.
+        """
+        return str(uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f'{project_id}/{task_id}'))
+
+    async def backfill_corpus(
+        self,
+        tasks: list[dict],
+        project_id: str,
+    ) -> BackfillResult:
+        """Upsert embeddings for a flat list of existing task dicts.
+
+        Idempotent: uses the same deterministic UUID5 point-ID scheme as
+        record_task(). Re-running just re-upserts the same points.
+
+        Args:
+            tasks: Flat list of task dicts (as returned by _flatten_task_tree).
+            project_id: Project identifier used for the collection name and point IDs.
+
+        Returns:
+            BackfillResult with counts of upserted, skipped, and error tasks.
+        """
+        if not tasks:
+            return BackfillResult()
+
+        result = BackfillResult()
+        collection = await self._ensure_collection(project_id)
+        embedder = await self._get_embedder()
+        client = await self._get_qdrant()
+
+        from qdrant_client.models import PointStruct
+
+        # Embed all tasks with bounded concurrency.
+        sem = __import__('asyncio').Semaphore(10)
+        points: list[PointStruct] = []
+
+        async def _embed_one(task: dict) -> None:
+            task_id = str(task.get('id', '') or '')
+            title = str(task.get('title', '') or '').strip()
+            if not title:
+                result.skipped += 1
+                return
+
+            description = str(task.get('description', '') or '')
+            files = _task_files(task)
+            text = self._embedding_text(title, description, files)
+
+            try:
+                async with sem:
+                    embedding = await embedder.create(text)
+            except Exception:
+                logger.warning(
+                    'task_curator: backfill embed failed for task %s', task_id, exc_info=True,
+                )
+                result.errors += 1
+                return
+
+            point_id = self._point_id(project_id, task_id)
+            points.append(
+                PointStruct(
+                    id=point_id,
+                    vector=embedding,
+                    payload={
+                        'task_id': task_id,
+                        'title': title,
+                        'description': description[:1000],
+                        'files_to_modify': files,
+                        'project_id': project_id,
+                        'updated_at': datetime.now(UTC).isoformat(),
+                    },
+                )
+            )
+
+        import asyncio as _asyncio
+
+        await _asyncio.gather(*[_embed_one(t) for t in tasks])
+
+        if points:
+            await client.upsert(collection_name=collection, points=points)
+            result.upserted = len(points)
+
+        logger.info(
+            'task_curator: backfill_corpus complete project=%s upserted=%d skipped=%d errors=%d',
+            project_id, result.upserted, result.skipped, result.errors,
+        )
+        return result
 
     async def close(self) -> None:
         if self._qdrant_client is not None:
