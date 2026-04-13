@@ -373,6 +373,6 @@ class ContextAssembler:
             ContextItem(
                 id=f'task:{parent_id}',
                 source='task',
-                formatted=_format_task(task),
+                formatted=_format_task(task, display_id=str(parent_id)),
             ),
         ]
