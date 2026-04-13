@@ -145,6 +145,32 @@ Use project_root="{self.project_root}" for all task operations.
 """
 
     @staticmethod
+    def _warn_if_count_tasks_mismatch(
+        count: int,
+        tasks: list,
+        count_label: str,
+        tasks_label: str,
+        section_label: str,
+        task_ref: str,
+    ) -> None:
+        """Emit a WARNING when a count>0/tasks-empty invariant is violated.
+
+        Extracted to avoid repeating the same guard pattern for each
+        count↔tasks pair (done, cancelled, and any future additions).
+        """
+        if count > 0 and not tasks:
+            logger.warning(
+                'FilteredTaskTree invariant violation: %s=%d but %s is '
+                'empty. Externally-constructed tree bypassed filter_task_tree() guarantee. '
+                '%s section will render as empty. (%s defensive check)',
+                count_label,
+                count,
+                tasks_label,
+                section_label,
+                task_ref,
+            )
+
+    @staticmethod
     def _check_filtered_tree_invariant(filtered: FilteredTaskTree) -> None:
         """Emit a WARNING for each violated done/cancelled count↔tasks invariant.
 
@@ -156,20 +182,22 @@ Use project_root="{self.project_root}" for all task operations.
         could violate either; these checks catch them at the callsite rather than silently
         dropping data from the "Recently Completed" or "Recently Cancelled" sections.
         """
-        if filtered.done_count > 0 and not filtered.done_tasks:
-            logger.warning(
-                'FilteredTaskTree invariant violation: done_count=%d but done_tasks is '
-                'empty. Externally-constructed tree bypassed filter_task_tree() guarantee. '
-                'Recently Completed section will render as empty. (task-782 defensive check)',
-                filtered.done_count,
-            )
-        if filtered.cancelled_count > 0 and not filtered.cancelled_tasks:
-            logger.warning(
-                'FilteredTaskTree invariant violation: cancelled_count=%d but cancelled_tasks is '
-                'empty. Externally-constructed tree bypassed filter_task_tree() guarantee. '
-                'Recently Cancelled section will render as empty. (task-828 defensive check)',
-                filtered.cancelled_count,
-            )
+        TaskKnowledgeSync._warn_if_count_tasks_mismatch(
+            filtered.done_count,
+            filtered.done_tasks,
+            'done_count',
+            'done_tasks',
+            'Recently Completed',
+            'task-782',
+        )
+        TaskKnowledgeSync._warn_if_count_tasks_mismatch(
+            filtered.cancelled_count,
+            filtered.cancelled_tasks,
+            'cancelled_count',
+            'cancelled_tasks',
+            'Recently Cancelled',
+            'task-828',
+        )
 
 
 class IntegrityCheck(BaseStage):

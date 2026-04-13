@@ -2127,6 +2127,7 @@ class TestInvariantAfterTask643:
         # Construct invariant-violating tree: cancelled_count > 0 but cancelled_tasks is empty.
         # This state is impossible via filter_task_tree() but can arise from external
         # construction — exactly the case the task-828 defensive check guards against.
+        # total_count = 1 active + 0 done + 4 cancelled + 0 other = 5
         stage.filtered_task_tree = FilteredTaskTree(
             active_tasks=[self._make_task(1, 'in-progress')],
             done_tasks=[],
@@ -2141,8 +2142,9 @@ class TestInvariantAfterTask643:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            await stage.assemble_payload([], watermark, [])
+            payload = await stage.assemble_payload([], watermark, [])
 
+        # The warning must be emitted…
         assert any(
             rec.levelno == logging.WARNING
             and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
@@ -2153,6 +2155,11 @@ class TestInvariantAfterTask643:
             'Expected a WARNING about cancelled_count/cancelled_tasks invariant from '
             'fused_memory.reconciliation.stages.task_knowledge_sync, '
             f'got records: {[(r.name, r.levelno, r.message) for r in caplog.records]}'
+        )
+        # …but the warning must be non-fatal: assemble_payload still returns a valid payload.
+        assert payload and 'Stage 2' in payload, (
+            f'assemble_payload should complete and return a Stage 2 payload even when '
+            f'the cancelled invariant is violated; got: {payload!r}'
         )
 
     @pytest.mark.asyncio
