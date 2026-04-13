@@ -2250,6 +2250,43 @@ class TestArchitectPromptGuidance:
 
 
 # ---------------------------------------------------------------------------
+# File-structure invariants
+# ---------------------------------------------------------------------------
+
+
+class TestFileStructureInvariants:
+    """Structural invariants about test_workflow_e2e.py itself.
+
+    These meta-tests catch accidental duplication or deletion of critical
+    comment blocks and code sections that must appear exactly once.
+    """
+
+    def test_conformance_comment_header_appears_exactly_once(self) -> None:
+        """The 'Static Protocol conformance checks (pyright-verified)' header must appear exactly once.
+
+        This guards against the orphaned-duplicate scenario: if an edit accidentally
+        leaves a stale copy of the comment block mid-file (while the real block with
+        the ``if TYPE_CHECKING:`` code lives near the bottom), this test fails loudly
+        rather than silently misleading future readers. See task 735.
+
+        Counts only lines whose stripped content IS the header comment (excludes
+        string literals inside test code that happen to contain the same text).
+        """
+        content = Path(__file__).read_text()
+        # Count only lines whose stripped content is exactly the header comment,
+        # not string literals inside test code that happen to reference it.
+        header_line = "# Static Protocol conformance checks (pyright-verified)"
+        count = sum(1 for line in content.splitlines() if line.strip() == header_line)
+        assert count == 1, (
+            f"Expected exactly 1 comment line matching {header_line!r} in {__file__}, "
+            f"found {count}. An orphaned duplicate of the conformance comment "
+            "block must be removed — keep only the real block near the end of "
+            "the file that precedes the 'if TYPE_CHECKING:' conformance code. "
+            "See task 735."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Static Protocol conformance checks (pyright-verified)
 #
 # This block MUST live at the bottom of the file, after the FakeScheduler class
