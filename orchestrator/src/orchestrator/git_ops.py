@@ -488,9 +488,9 @@ class GitOps:
             logger.error(
                 '.task/ scrub FAILED during worktree-creation for %s — the index '
                 'may still be contaminated.  The hard gate at advance_main will '
-                'catch this if contamination reaches main. Error: %s',
+                'catch this if contamination reaches main.%s',
                 worktree_path,
-                scrub_result.error or '(no stderr)',
+                scrub_result.format_error(prefix=' Error: '),
             )
 
         return WorktreeInfo(
@@ -693,9 +693,7 @@ class GitOps:
                     full_branch,
                 )
                 await self.cleanup_merge_worktree(merge_wt)
-                _detail = f'.task/ scrub failed post-merge for {full_branch}'
-                if scrub_result.error:
-                    _detail = f'{_detail}: {scrub_result.error}'
+                _detail = f'.task/ scrub failed post-merge for {full_branch}{scrub_result.format_error(prefix=": ")}'
                 return MergeResult(
                     success=False,
                     details=_detail,
@@ -954,8 +952,8 @@ class GitOps:
             if scrub_result.outcome == ScrubOutcome.FAILED:
                 logger.error(
                     '.task/ scrub FAILED during advance_main-retry(%d) — index may '
-                    'be contaminated; _assert_no_task_dir will catch it. Error: %s',
-                    attempt + 1, scrub_result.error or '(no stderr)',
+                    'be contaminated; _assert_no_task_dir will catch it.%s',
+                    attempt + 1, scrub_result.format_error(prefix=' Error: '),
                 )
             _, new_sha, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=merge_worktree,
