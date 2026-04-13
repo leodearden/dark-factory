@@ -696,12 +696,13 @@ async def partials_merge_queue(request: Request):
     hours = days * 24
     window_raw = request.query_params.get('window', '7d')
 
+    effective_now = datetime.now(UTC)
     depth, outcomes, latency, recent, spec = await asyncio.gather(
-        aggregate_queue_depth_timeseries(dbs, hours=hours),
-        aggregate_outcome_distribution(dbs, hours=hours),
-        aggregate_latency_stats(dbs, hours=hours),
+        aggregate_queue_depth_timeseries(dbs, hours=hours, now=effective_now),
+        aggregate_outcome_distribution(dbs, hours=hours, now=effective_now),
+        aggregate_latency_stats(dbs, hours=hours, now=effective_now),
         aggregate_recent_merges(dbs, limit=20),
-        aggregate_speculative_stats(dbs, hours=hours),
+        aggregate_speculative_stats(dbs, hours=hours, now=effective_now),
         return_exceptions=True,
     )
 
