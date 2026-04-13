@@ -369,17 +369,24 @@ async def speculative_stats(
     db: aiosqlite.Connection | None,
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> dict:
     """Hit/discard counts and hit rate for speculative merge events.
 
     Returns {'hit_count': int, 'discard_count': int, 'total': int,
              'hit_rate': float}.
+
+    Args:
+        db: aiosqlite connection, or None (returns all-zeros dict).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
+            is used. Pass an explicit value to share a timestamp with sibling calls.
     """
     if db is None:
         return {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
 
     async def _query(conn: aiosqlite.Connection) -> dict:
-        since = _cutoff_iso(hours)
+        since = _cutoff_iso(hours, now=now)
         rows = await conn.execute_fetchall(
             "SELECT event_type, COUNT(*) AS cnt "
             "FROM events "
