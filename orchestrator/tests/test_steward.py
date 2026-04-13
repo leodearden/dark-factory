@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -1456,3 +1457,26 @@ class TestStewardReleaseProbeSlotOnException:
             )
 
         gate.confirm_account_ok.assert_not_called()
+
+    async def test_cancelled_error_release_probe_slot(
+        self, steward, worktree,
+    ):
+        """CancelledError (BaseException, not Exception) triggers release_probe_slot."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='tok-a')
+        gate.active_account_name = 'acct-a'
+        gate.release_probe_slot = MagicMock()
+        steward.usage_gate = gate
+
+        with (
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock,
+                  side_effect=asyncio.CancelledError()),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await steward._invoke_with_session(
+                prompt='hi', cwd=worktree, mcp_config={},
+                per_invocation_budget=5.0, escalation=_make_escalation(),
+            )
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')

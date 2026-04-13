@@ -87,8 +87,14 @@ async def invoke_with_cap_retry(
                 config_dir=config_dir.path if config_dir else None,
             )
         except BaseException:
+            # Safety net: release probe slot on any exception so probe_in_flight
+            # never leaks. See also: shared/cli_invoke.py:invoke_with_cap_retry,
+            # orchestrator/steward.py:_invoke_with_session
             if usage_gate is not None:
-                usage_gate.release_probe_slot(oauth_token)
+                try:
+                    usage_gate.release_probe_slot(oauth_token)
+                except Exception:
+                    logger.warning('release_probe_slot failed', exc_info=True)
             raise
 
         if usage_gate and usage_gate.detect_cap_hit(

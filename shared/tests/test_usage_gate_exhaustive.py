@@ -2018,3 +2018,30 @@ class TestReleaseProbeSlot:
 
         assert acct.probe_in_flight is False  # cleared
         assert acct.near_cap is True  # untouched
+
+    def test_noop_after_handle_cap_detected_already_cleared(self):
+        """release_probe_slot is a no-op after _handle_cap_detected() already cleared probe_in_flight.
+
+        This tests the key idempotency guarantee: _handle_cap_detected() sets
+        probe_in_flight=False and (in a single-account gate) clears _open.
+        A subsequent release_probe_slot() call must not re-open _open, since the
+        account is capped and the gate should stay closed.
+        """
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probe_in_flight = True
+
+        # Simulate cap detection path: _handle_cap_detected clears probe_in_flight
+        # and (all accounts capped) also clears the global _open event.
+        gate._handle_cap_detected('rate-limit', None, 'fake-token-a')
+
+        # Preconditions after cap detection:
+        assert acct.probe_in_flight is False
+        assert acct.capped is True
+        assert gate._open.is_set() is False  # gate closed because all accounts capped
+
+        # release_probe_slot must be a no-op — probe was already cleared by cap detection
+        gate.release_probe_slot('fake-token-a')
+
+        assert gate._open.is_set() is False  # still closed — NOT re-opened
+        assert acct.capped is True  # capped flag untouched

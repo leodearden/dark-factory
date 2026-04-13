@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -347,7 +348,7 @@ class TestReleaseProbeSlotOnException:
         gate.release_probe_slot.assert_called_once_with('tok-a')
 
     async def test_runtime_error_propagates(self):
-        """RuntimeError raised by invoke_agent propagates to the caller."""
+        """RuntimeError raised by invoke_agent propagates with its message intact."""
         gate = MagicMock()
         gate.before_invoke = AsyncMock(return_value='tok-a')
         gate.active_account_name = 'acct-a'
@@ -359,10 +360,12 @@ class TestReleaseProbeSlotOnException:
                 new_callable=AsyncMock,
                 side_effect=RuntimeError('crash'),
             ),
-            pytest.raises(RuntimeError, match='crash'),
+            pytest.raises(RuntimeError) as exc_info,
         ):
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi',
                                         system_prompt='sys', cwd='/tmp')
+
+        assert str(exc_info.value) == 'crash'  # error message preserved verbatim
 
     async def test_confirm_account_ok_not_called_when_invoke_raises(self):
         """confirm_account_ok is NOT called when invoke_agent raises."""
@@ -384,3 +387,23 @@ class TestReleaseProbeSlotOnException:
                                         system_prompt='sys', cwd='/tmp')
 
         gate.confirm_account_ok.assert_not_called()
+
+    async def test_cancelled_error_release_probe_slot(self):
+        """CancelledError (BaseException, not Exception) triggers release_probe_slot."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='tok-a')
+        gate.active_account_name = 'acct-a'
+        gate.release_probe_slot = MagicMock()
+
+        with (
+            patch(
+                'orchestrator.agents.invoke.invoke_agent',
+                new_callable=AsyncMock,
+                side_effect=asyncio.CancelledError(),
+            ),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi',
+                                        system_prompt='sys', cwd='/tmp')
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')
