@@ -171,11 +171,13 @@ async def queue_depth_timeseries(
             for i in range(num_buckets)
         ]
 
-        # Fetch all merge_attempt events in the window
+        # Fetch all merge_attempt events in the window.
+        # Upper bound is effective_now (not now_aligned) to avoid excluding
+        # events in [now_aligned, effective_now) that belong to the last bucket.
         rows = await conn.execute_fetchall(
             "SELECT timestamp FROM events "
-            "WHERE event_type = 'merge_attempt' AND timestamp >= ?",
-            (cutoff.isoformat(),),
+            "WHERE event_type = 'merge_attempt' AND timestamp >= ? AND timestamp <= ?",
+            (cutoff_aligned.isoformat(), effective_now.isoformat()),
         )
 
         # Build count map keyed by ISO bucket label
