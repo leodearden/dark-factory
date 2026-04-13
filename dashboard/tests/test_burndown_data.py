@@ -108,6 +108,22 @@ async def burndown_env(tmp_path):
         yield db_path, config, conn
 
 
+@pytest.fixture
+def symlink_project_setup(tmp_path):
+    """Return (real_dir, link, db_path) for symlink deduplication tests.
+
+    Creates a real directory, a symlink pointing to it, and a burndown DB.
+    Each test creates its own DashboardConfig since config parameters differ.
+    """
+    real_dir = tmp_path / 'real'
+    real_dir.mkdir()
+    link = tmp_path / 'link'
+    link.symlink_to(real_dir)
+    db_path = tmp_path / 'burndown.db'
+    _create_burndown_db(db_path)
+    return real_dir, link, db_path
+
+
 # ---------------------------------------------------------------------------
 # _count_statuses
 # ---------------------------------------------------------------------------
