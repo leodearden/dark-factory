@@ -79,7 +79,11 @@ class _UuidDispatcher:
         self.dispatched: set[str] = set()
         # Ensure inspect.iscoroutinefunction(self) returns True so that
         # AsyncMock.side_effect awaits __call__ rather than returning the coroutine.
-        inspect.markcoroutinefunction(self)
+        # inspect.markcoroutinefunction was added in Python 3.12; on 3.11 the
+        # guard is omitted — AsyncMock still works because it checks
+        # asyncio.iscoroutine(result) after calling the side_effect callable.
+        if hasattr(inspect, 'markcoroutinefunction'):
+            inspect.markcoroutinefunction(self)
 
     async def __call__(self, uuid, name, edges, *, group_id, old_summary):
         self.dispatched.add(uuid)
