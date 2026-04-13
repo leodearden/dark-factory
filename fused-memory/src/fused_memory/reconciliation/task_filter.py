@@ -59,6 +59,15 @@ _STATUS_PRIORITY: dict[str, int] = {
 }
 
 
+def _id_key(t: dict) -> int:
+    """Return task id as int for sorting, defaulting to 0 on error."""
+    tid = t.get('id', 0)
+    try:
+        return int(tid)
+    except (TypeError, ValueError):
+        return 0
+
+
 # --------------------------------------------------------------------------- #
 # Data model
 # --------------------------------------------------------------------------- #
@@ -131,14 +140,6 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
         else:
             # Unknown status (or None) → other
             other_count += 1
-
-    def _id_key(t: dict) -> int:
-        """Return task id as int for sorting, defaulting to 0 on error."""
-        tid = t.get('id', 0)
-        try:
-            return int(tid)
-        except (TypeError, ValueError):
-            return 0
 
     # Sort active tasks: by priority ascending, then by ID descending (higher = more recent)
     def sort_key(t: dict) -> tuple[int, int]:

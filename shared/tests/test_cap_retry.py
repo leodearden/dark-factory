@@ -72,9 +72,23 @@ def _mock_gate(**overrides) -> MagicMock:
     gate.active_account_name = overrides.pop('active_account_name', 'acct')
     gate.on_agent_complete = overrides.pop('on_agent_complete', MagicMock())
     gate.confirm_account_ok = overrides.pop('confirm_account_ok', MagicMock())
+    gate.release_probe_slot = overrides.pop('release_probe_slot', MagicMock())
     for k, v in overrides.items():
         setattr(gate, k, v)
     return gate
+
+
+def test_mock_gate_defaults_include_release_probe_slot():
+    """_mock_gate() should explicitly set release_probe_slot in its defaults.
+
+    Checks vars(gate) rather than hasattr(gate, ...) so that MagicMock's
+    silent auto-attribute creation doesn't produce a false positive.
+    """
+    gate = _mock_gate()
+    assert 'release_probe_slot' in vars(gate), (
+        "_mock_gate() must explicitly set release_probe_slot so the "
+        "exception-cleanup contract is self-documented in the helper."
+    )
 
 
 # Shared patch targets
@@ -1374,3 +1388,132 @@ class TestCapRetryGuardLogging:
         assert any('deadline-label' in m for m in error_msgs), (
             f'Error log should include label. Got: {error_msgs}'
         )
+
+
+# ===================================================================
+# TestReleaseProbeSlotOnException
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestReleaseProbeSlotOnException:
+    """invoke_with_cap_retry calls release_probe_slot() when invoke raises."""
+
+    async def test_release_probe_slot_called_on_runtime_error(self):
+        """release_probe_slot is called with oauth_token when invoke_claude_agent raises."""
+        gate = _mock_gate(
+            before_invoke=AsyncMock(return_value='tok-a'),
+            release_probe_slot=MagicMock(),
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=RuntimeError('boom')),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(RuntimeError, match='boom'),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')
+
+    async def test_runtime_error_propagates(self):
+        """RuntimeError raised by invoke_claude_agent propagates to the caller."""
+        gate = _mock_gate(
+            before_invoke=AsyncMock(return_value='tok-a'),
+            release_probe_slot=MagicMock(),
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=RuntimeError('subprocess failed')),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(RuntimeError, match='subprocess failed'),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+    async def test_confirm_account_ok_not_called_when_invoke_raises(self):
+        """confirm_account_ok is NOT called when invoke_claude_agent raises."""
+        gate = _mock_gate(
+            before_invoke=AsyncMock(return_value='tok-a'),
+            release_probe_slot=MagicMock(),
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=RuntimeError('boom')),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(RuntimeError),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        gate.confirm_account_ok.assert_not_called()
+
+
+# ===================================================================
+# TestProbeSlotLifecycleIntegration
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestProbeSlotLifecycleIntegration:
+    """End-to-end probe slot lifecycle using a real UsageGate (not mock)."""
+
+    async def test_probe_slot_released_after_invoke_raises(self):
+        """Full lifecycle: probe slot claimed then released on exception.
+
+        Scenario: gate with one account, probing=True → before_invoke claims
+        the probe slot (probe_in_flight=True, _open cleared) → invoke raises →
+        release_probe_slot clears state → gate is not deadlocked.
+        """
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        # Simulate account just recovered from a cap hit (probe loop succeeded)
+        acct.probing = True
+
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=RuntimeError('subprocess failed')),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(RuntimeError, match='subprocess failed'),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        # Probe slot must be fully released
+        assert acct.probe_in_flight is False, 'probe_in_flight must be cleared'
+        assert acct.probe_count == 0, 'probe_count must be reset to 0'
+        assert gate._open.is_set(), '_open event must be re-opened (gate not deadlocked)'
+
+
+# ===================================================================
+# TestCancelledErrorReleaseProbeSlot
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCancelledErrorReleaseProbeSlot:
+    """CancelledError (BaseException, not Exception) tests the catch-all path."""
+
+    async def test_cancelled_error_triggers_release_probe_slot(self):
+        """asyncio.CancelledError is a BaseException — must be caught and release_probe_slot called."""
+        import asyncio as _asyncio
+
+        gate = _mock_gate(
+            before_invoke=AsyncMock(return_value='tok-a'),
+            release_probe_slot=MagicMock(),
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=_asyncio.CancelledError()),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(_asyncio.CancelledError),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')
+
+    async def test_cancelled_error_propagates(self):
+        """CancelledError must propagate (not be swallowed by the except handler)."""
+        import asyncio as _asyncio
+
+        gate = _mock_gate(
+            before_invoke=AsyncMock(return_value='tok-a'),
+            release_probe_slot=MagicMock(),
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=_asyncio.CancelledError()),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(_asyncio.CancelledError),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi')

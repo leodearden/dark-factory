@@ -18,6 +18,7 @@ to ``action="create"`` so task creation is never blocked.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -51,6 +52,7 @@ _STATUS_RANK = {
     'done': 4,
 }
 _PRIORITY_RANK = {'high': 0, 'medium': 1, 'low': 2}
+DEFAULT_PRIORITY = 'medium'  # canonical fallback used by both record_task and backfill_corpus
 
 # JSON schema for the curator's structured output — used by invoke_with_cap_retry
 # to constrain the LLM's response.
@@ -86,7 +88,7 @@ class CandidateTask:
     description: str = ''
     details: str = ''
     files_to_modify: list[str] = field(default_factory=list)
-    priority: str = 'medium'
+    priority: str = DEFAULT_PRIORITY
     spawned_from: str | None = None  # task id of the review-chain anchor
     spawn_context: str = 'manual'  # review | steward-triage | expand | parse_prd | manual
 
@@ -118,6 +120,15 @@ class RewrittenTask:
     details: str
     files_to_modify: list[str]
     priority: str
+
+
+@dataclass
+class BackfillResult:
+    """Result of a backfill_corpus() call."""
+
+    upserted: int = 0
+    skipped: int = 0
+    errors: int = 0
 
 
 @dataclass
@@ -425,9 +436,7 @@ class TaskCurator:
 
             from qdrant_client.models import PointStruct
 
-            point_id = str(
-                uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f'{project_id}/{task_id}'),
-            )
+            point_id = self._point_id(project_id, task_id)
             client = await self._get_qdrant()
             await client.upsert(
                 collection_name=collection,
@@ -439,8 +448,8 @@ class TaskCurator:
                             'task_id': task_id,
                             'title': candidate.title,
                             'description': candidate.description[:1000],
-                            'files_to_modify': candidate.files_to_modify,
-                            'priority': candidate.priority,
+                            'files_to_modify': candidate.files_to_modify or [],
+                            'priority': candidate.priority or DEFAULT_PRIORITY,
                             'project_id': project_id,
                             'updated_at': datetime.now(UTC).isoformat(),
                         },
@@ -463,6 +472,115 @@ class TaskCurator:
         Same deterministic point id as record_task, so this is idempotent.
         """
         await self.record_task(task_id, candidate, project_id)
+
+    @staticmethod
+    def _point_id(project_id: str, task_id: str) -> str:
+        """Deterministic UUID5 point ID for a task in a project.
+
+        Shared by record_task() and backfill_corpus() to ensure idempotent overlap.
+        """
+        return str(uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f'{project_id}/{task_id}'))
+
+    async def corpus_count(self, project_id: str) -> int:
+        """Return the number of points in the curator corpus for a project.
+
+        Returns 0 if the collection does not exist or an error occurs.
+        This public method encapsulates collection-existence + count logic so
+        callers (e.g. TaskInterceptor) don't need to access private methods.
+        """
+        try:
+            client = await self._get_qdrant()
+            collection_name = self._collection_name(project_id)
+            if not await client.collection_exists(collection_name):
+                return 0
+            result = await client.count(collection_name=collection_name)
+            return result.count
+        except Exception:
+            logger.warning(
+                'task_curator: corpus_count failed for project %s', project_id, exc_info=True,
+            )
+            return 0
+
+    async def backfill_corpus(
+        self,
+        tasks: list[dict],
+        project_id: str,
+    ) -> BackfillResult:
+        """Upsert embeddings for a flat list of existing task dicts.
+
+        Idempotent: uses the same deterministic UUID5 point-ID scheme as
+        record_task(). Re-running just re-upserts the same points.
+
+        Args:
+            tasks: Flat list of task dicts (as returned by flatten_task_tree).
+            project_id: Project identifier used for the collection name and point IDs.
+
+        Returns:
+            BackfillResult with counts of upserted, skipped, and error tasks.
+        """
+        if not tasks:
+            return BackfillResult()
+
+        result = BackfillResult()
+        collection = await self._ensure_collection(project_id)
+        embedder = await self._get_embedder()
+        client = await self._get_qdrant()
+
+        from qdrant_client.models import PointStruct
+
+        # Embed all tasks with bounded concurrency.
+        sem = asyncio.Semaphore(10)
+        points: list[PointStruct] = []
+
+        async def _embed_one(task: dict) -> None:
+            task_id = str(task.get('id', '') or '')
+            title = str(task.get('title', '') or '').strip()
+            if not title:
+                result.skipped += 1
+                return
+
+            description = str(task.get('description', '') or '')
+            files = _task_files(task)
+            text = self._embedding_text(title, description, files)
+
+            try:
+                async with sem:
+                    embedding = await embedder.create(text)
+            except Exception:
+                logger.warning(
+                    'task_curator: backfill embed failed for task %s', task_id, exc_info=True,
+                )
+                result.errors += 1
+                return
+
+            point_id = self._point_id(project_id, task_id)
+            points.append(
+                PointStruct(
+                    id=point_id,
+                    vector=embedding,
+                    payload={
+                        'task_id': task_id,
+                        'title': title,
+                        'description': description[:1000],
+                        'files_to_modify': files,
+                        'priority': task.get('priority') or DEFAULT_PRIORITY,
+                        'project_id': project_id,
+                        'updated_at': datetime.now(UTC).isoformat(),
+                    },
+                )
+            )
+
+        await asyncio.gather(*[_embed_one(t) for t in tasks])
+
+        if points:
+            await client.upsert(collection_name=collection, points=points)
+            result.upserted = len(points)
+
+        logger.info(
+            'task_curator: backfill_corpus complete project=%s upserted=%d skipped=%d errors=%d',
+            project_id, result.upserted, result.skipped, result.errors,
+        )
+        return result
 
     async def close(self) -> None:
         if self._qdrant_client is not None:
@@ -539,7 +657,7 @@ class TaskCurator:
         if self._taskmaster is not None and candidate_modules:
             try:
                 tasks_result = await self._taskmaster.get_tasks(project_root)
-                all_tasks_flat = _flatten_task_tree(tasks_result)
+                all_tasks_flat = flatten_task_tree(tasks_result)
             except Exception as exc:
                 logger.debug('task_curator: get_tasks failed: %s', exc)
 
@@ -672,7 +790,7 @@ class TaskCurator:
                 payload.get('files_to_modify', []) or [], depth=lock_depth,
             ),
             status='unknown',
-            priority=str(payload.get('priority', 'medium')),
+            priority=str(payload.get('priority', DEFAULT_PRIORITY)),
             source=source,
             combine_eligible=False,  # unknown status → treat as drop-only
         )
@@ -822,13 +940,13 @@ def _to_pool_entry(
         files_to_modify=files,
         module_keys=files_to_modules(files, depth=lock_depth),
         status=status,
-        priority=str(task.get('priority', 'medium')),
+        priority=str(task.get('priority', DEFAULT_PRIORITY)),
         source=source,
         combine_eligible=(status == 'pending'),
     )
 
 
-def _flatten_task_tree(tasks_result: dict) -> list[dict]:
+def flatten_task_tree(tasks_result: dict) -> list[dict]:
     """Walk a get_tasks response and return a flat list of task dicts."""
     out: list[dict] = []
 
@@ -971,7 +1089,7 @@ def _parse_decision(
                 description=str(rt.get('description', '')),
                 details=str(rt.get('details', '')),
                 files_to_modify=[str(f) for f in (rt.get('files_to_modify') or [])],
-                priority=str(rt.get('priority', 'medium')),
+                priority=str(rt.get('priority', DEFAULT_PRIORITY)),
             )
         except Exception as exc:
             return CuratorDecision(

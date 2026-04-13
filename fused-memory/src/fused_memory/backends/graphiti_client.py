@@ -823,7 +823,7 @@ class GraphitiBackend:
 
     @staticmethod
     def _canonical_facts(edges: Sequence[Mapping[str, Any]]) -> list[str]:
-        """Deduplicate edge facts preserving insertion order, skipping missing/falsy values.
+        """Deduplicate edge facts preserving insertion order, skipping non-string, empty, and whitespace-only values.
 
         Args:
             edges: List of edge dicts, each optionally containing a 'fact' key.
@@ -831,7 +831,60 @@ class GraphitiBackend:
         Returns:
             List of unique non-empty fact strings in their first-seen order.
         """
-        return list(dict.fromkeys(e['fact'] for e in edges if (e.get('fact') or '').strip()))
+        # f is assigned by the walrus := before isinstance checks str; rejects non-str, empty, whitespace-only
+        return list(dict.fromkeys(f for e in edges if isinstance(f := e.get('fact'), str) and f and not f.isspace()))
+
+    @staticmethod
+    def _build_stale_entry(
+        entity: dict,
+        edges: Sequence[Mapping[str, Any]],
+    ) -> dict | None:
+        """Compute a stale-entry diagnostic dict for *entity*, or None if up-to-date.
+
+        Encapsulates the repeated logic shared between
+        ``_detect_stale_summaries_with_edges`` and
+        ``_detect_stale_summaries_dry_run``:
+
+        1. Return None if entity summary is empty (not stale by definition).
+        2. Compute canonical facts via ``_canonical_facts`` and join with newlines.
+        3. Return None if summary already equals the canonical string (up-to-date).
+        4. Compute diagnostic counts (duplicate_count, stale_line_count,
+           valid_fact_count, summary_line_count) and return the stale-entry dict.
+
+        Args:
+            entity: Entity dict with keys 'uuid', 'name', 'summary'.
+            edges:  Valid edges for this entity (same schema as get_valid_edges_for_node).
+
+        Returns:
+            None if the entity is not stale; otherwise a dict with keys:
+            uuid, name, summary, duplicate_count, stale_line_count,
+            valid_fact_count, summary_line_count.
+        """
+        summary = entity['summary']
+        if not summary:
+            return None
+        valid_facts = GraphitiBackend._canonical_facts(edges)
+        canonical = '\n'.join(valid_facts)
+        if summary == canonical:
+            return None
+        # Compute diagnostic counts
+        summary_lines = summary.split('\n')
+        valid_fact_set = set(valid_facts)
+        # duplicate_count: sum of extra occurrences for each unique line that
+        # appears more than once in the current summary.
+        line_counts = Counter(summary_lines)
+        duplicate_count = sum(c - 1 for c in line_counts.values() if c > 1)
+        # stale_line_count: lines in summary not in the valid fact set
+        stale_line_count = sum(1 for line in summary_lines if line not in valid_fact_set)
+        return {
+            'uuid': entity['uuid'],
+            'name': entity['name'],
+            'summary': summary,
+            'duplicate_count': duplicate_count,
+            'stale_line_count': stale_line_count,
+            'valid_fact_count': len(valid_facts),
+            'summary_line_count': len(summary_lines),
+        }
 
     async def refresh_entity_summary(
         self,
@@ -940,33 +993,10 @@ class GraphitiBackend:
         all_edges = await self.get_all_valid_edges(group_id=group_id)
         stale: list[dict] = []
         for entity in entities:
-            summary = entity['summary']
-            if not summary:
-                # Empty summary — not stale by definition
-                continue
             edges = all_edges.get(entity['uuid'], [])
-            valid_facts = self._canonical_facts(edges)
-            canonical = '\n'.join(valid_facts)
-            if summary == canonical:
-                continue  # Already up-to-date
-            # Compute diagnostic counts
-            summary_lines = summary.split('\n')
-            valid_fact_set = set(valid_facts)
-            # duplicate_count: sum of extra occurrences for each unique line that
-            # appears more than once in the current summary.
-            line_counts = Counter(summary_lines)
-            duplicate_count = sum(c - 1 for c in line_counts.values() if c > 1)
-            # stale_line_count: lines in summary not in the valid fact set
-            stale_line_count = sum(1 for line in summary_lines if line not in valid_fact_set)
-            stale.append({
-                'uuid': entity['uuid'],
-                'name': entity['name'],
-                'summary': summary,
-                'duplicate_count': duplicate_count,
-                'stale_line_count': stale_line_count,
-                'valid_fact_count': len(valid_facts),
-                'summary_line_count': len(summary_lines),
-            })
+            entry = self._build_stale_entry(entity, edges)
+            if entry is not None:
+                stale.append(entry)
         return StaleSummaryResult(stale=stale, all_edges=all_edges, total_count=len(entities))
 
     async def _detect_stale_summaries_dry_run(
@@ -1003,30 +1033,14 @@ class GraphitiBackend:
         entities = await self.list_entity_nodes(group_id=group_id)
         stale: list[dict] = []
         for entity in entities:
-            summary = entity['summary']
-            if not summary:
-                # Empty summary — not stale by definition; skip without an edge query.
+            if not entity['summary']:
+                # Empty summary — not stale by definition; skip the async edge fetch.
+                # (_build_stale_entry would also return None, but we avoid the I/O.)
                 continue
             edges = await self.get_valid_edges_for_node(entity['uuid'], group_id=group_id)
-            valid_facts = self._canonical_facts(edges)
-            canonical = '\n'.join(valid_facts)
-            if summary == canonical:
-                continue  # Already up-to-date
-            # Compute diagnostic counts (same schema as _detect_stale_summaries_with_edges)
-            summary_lines = summary.split('\n')
-            valid_fact_set = set(valid_facts)
-            line_counts = Counter(summary_lines)
-            duplicate_count = sum(c - 1 for c in line_counts.values() if c > 1)
-            stale_line_count = sum(1 for line in summary_lines if line not in valid_fact_set)
-            stale.append({
-                'uuid': entity['uuid'],
-                'name': entity['name'],
-                'summary': summary,
-                'duplicate_count': duplicate_count,
-                'stale_line_count': stale_line_count,
-                'valid_fact_count': len(valid_facts),
-                'summary_line_count': len(summary_lines),
-            })
+            entry = self._build_stale_entry(entity, edges)
+            if entry is not None:
+                stale.append(entry)
         return (stale, len(entities))
 
     async def detect_stale_summaries(self, *, group_id: str) -> list[dict]:
@@ -1143,7 +1157,9 @@ class GraphitiBackend:
             - ``errors``: number of per-entity refresh failures.
             - ``details``: list of per-entity result dicts.
         """
-        # Declare before if/else for explicit scoping — all branches assign these.
+        # Declare before if/else — targets and total_entities are assigned by all branches;
+        # all_edges is only populated by branches that consume it (the force=False,
+        # dry_run=True path intentionally leaves it empty).
         targets: list[dict] = []
         all_edges: dict[str, list[EdgeDict]] = {}
         total_entities: int = 0
@@ -1379,8 +1395,8 @@ class GraphitiBackend:
 
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
-        client = self._require_client()
-        all_graphs = await cast(Any, client.driver).client.list_graphs()
+        driver = self._require_driver()
+        all_graphs = await cast(Any, driver).client.list_graphs()
         return [g for g in all_graphs if g != 'default_db' and not g.endswith('_db')]
 
     async def node_count(self, graph_name: str) -> int:
@@ -1388,8 +1404,7 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
         """
-        driver = self._require_driver()
-        graph: Any = driver._get_graph(graph_name)
+        graph: Any = self._graph_for(graph_name)
         result = await graph.ro_query('MATCH (n) RETURN count(n) as count')
         return result.result_set[0][0] if result.result_set else 0
 

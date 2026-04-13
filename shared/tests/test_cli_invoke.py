@@ -1256,3 +1256,224 @@ class TestParseClaudeOutputThreadsTimedOut:
                                 duration_ms=100, timed_out=False)
         agent = _parse_claude_output(sub)
         assert agent.timed_out is False
+
+
+@pytest.mark.asyncio
+class TestHeuristicCapGating:
+    """Tests that the heuristic cap-detection path gates retry on
+    _handle_cap_detected's return value."""
+
+    async def test_heuristic_cap_no_retry_when_handle_returns_false(self):
+        """Heuristic fires but _handle_cap_detected returns False → no retry."""
+        gate = MagicMock()
+        gate.account_count = 2
+        gate.before_invoke = AsyncMock(return_value='token-a')
+        gate.detect_cap_hit = MagicMock(return_value=False)
+        gate._handle_cap_detected = MagicMock(return_value=False)
+        gate.confirm_account_ok = MagicMock()
+        gate.active_account_name = 'acct-a'
+        gate.on_agent_complete = MagicMock()
+
+        # Craft a result that triggers the heuristic: error, zero cost, instant
+        heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                return_value=heuristic_result,
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            # With max_cap_retries=1 the bug raises AllAccountsCappedException
+            # on the first heuristic hit.  The fix should return without raising.
+            got = await invoke_with_cap_retry(
+                gate, 'test-label',
+                prompt='hi', max_cap_retries=1,
+            )
+
+        assert got.success is False
+        mock_invoke.assert_called_once()
+        mock_asyncio.sleep.assert_not_called()
+        # confirm_account_ok is skipped when cap_marked=False (token unresolvable)
+        gate.confirm_account_ok.assert_not_called()
+        gate.on_agent_complete.assert_called_once()
+
+    async def test_heuristic_cap_retries_when_handle_returns_true(self):
+        """Heuristic fires and _handle_cap_detected returns True → retry happens."""
+        gate = MagicMock()
+        gate.account_count = 2
+        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
+        gate.detect_cap_hit = MagicMock(return_value=False)
+        gate._handle_cap_detected = MagicMock(return_value=True)
+        gate.confirm_account_ok = MagicMock()
+        gate.active_account_name = 'acct-b'
+        gate.on_agent_complete = MagicMock()
+
+        heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
+        ok_result = _make_result(success=True, cost_usd=0.5)
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[heuristic_result, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            got = await invoke_with_cap_retry(gate, 'test-label', prompt='hi')
+
+        assert got.success is True
+        assert mock_invoke.call_count == 2
+        mock_asyncio.sleep.assert_called_once_with(_CAP_HIT_COOLDOWN_SECS)
+
+    async def test_heuristic_cap_unresolved_token_logs_warning(self, caplog):
+        """When _handle_cap_detected returns False, warning is logged."""
+        gate = MagicMock()
+        gate.account_count = 2
+        gate.before_invoke = AsyncMock(return_value='token-a')
+        gate.detect_cap_hit = MagicMock(return_value=False)
+        gate._handle_cap_detected = MagicMock(return_value=False)
+        gate.confirm_account_ok = MagicMock()
+        gate.active_account_name = 'acct-a'
+        gate.on_agent_complete = MagicMock()
+
+        heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                return_value=heuristic_result,
+            ),
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            await invoke_with_cap_retry(gate, 'test-label', prompt='hi', max_cap_retries=1)
+
+        assert 'suspicious zero-cost instant exit' in caplog.text
+        assert 'heuristic cap suspected but no account could be marked' in caplog.text
+        assert 'token unresolved' in caplog.text
+
+    async def test_heuristic_cap_false_does_not_increment_consecutive_hits(self):
+        """_handle_cap_detected returning False never increments consecutive_cap_hits."""
+        gate = MagicMock()
+        gate.account_count = 2
+        gate.before_invoke = AsyncMock(return_value='token-a')
+        gate.detect_cap_hit = MagicMock(return_value=False)
+        gate._handle_cap_detected = MagicMock(return_value=False)
+        gate.confirm_account_ok = MagicMock()
+        gate.active_account_name = 'acct-a'
+        gate.on_agent_complete = MagicMock()
+
+        heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[heuristic_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            # Unlimited retries: if consecutive_cap_hits were incremented the loop
+            # would never terminate (or exhaust side_effect).  The fix must exit
+            # immediately without incrementing the counter.  Using side_effect
+            # (finite list) means a spurious retry raises StopIteration instantly
+            # rather than hanging — faster and more descriptive failure.
+            got = await invoke_with_cap_retry(
+                gate, 'test-label',
+                prompt='hi', max_cap_retries=None, cap_retry_deadline_secs=None,
+            )
+
+        # invoke_claude_agent called exactly once — no retry loop entered
+        mock_invoke.assert_called_once()
+        mock_asyncio.sleep.assert_not_called()
+        assert got.success is False
+
+    async def test_heuristic_cap_false_falls_through_to_resume_fallback(self):
+        """cap_marked=False + resume_session_id → resume-fallback retries fresh, no sleep.
+
+        This exercises the secondary path: heuristic fires but _handle_cap_detected
+        returns False (token unresolvable), so the code falls through to the
+        resume-session fallback (line ~372) which pops resume_session_id and
+        retries from scratch — exactly one fresh retry, zero sleeps.
+        """
+        gate = MagicMock()
+        gate.account_count = 2
+        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
+        gate.detect_cap_hit = MagicMock(return_value=False)
+        gate._handle_cap_detected = MagicMock(return_value=False)
+        gate.confirm_account_ok = MagicMock()
+        gate.active_account_name = 'acct-a'
+        gate.on_agent_complete = MagicMock()
+
+        # First call: heuristic-triggering failure with a prior resume_session_id
+        heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
+        ok_result = _make_result(success=True, cost_usd=0.5)
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[heuristic_result, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            # Simulate a prior pattern-match cap hit that left resume_session_id set
+            got = await invoke_with_cap_retry(
+                gate, 'test-label',
+                prompt='hi', resume_session_id='sess-123',
+            )
+
+        assert got.success is True
+        # Two calls: first (heuristic+resume-fallback triggers retry), second succeeds
+        assert mock_invoke.call_count == 2
+        # No cap-hit cooldown sleep — resume-fallback retries immediately
+        mock_asyncio.sleep.assert_not_called()
+
+    async def test_heuristic_cap_exponential_backoff_on_consecutive_hits(self):
+        """Two consecutive heuristic-True hits produce exponentially increasing cooldowns.
+
+        With account_count=1, each hit increments full_cycles:
+          hit 1 → full_cycles=0 → cooldown = _CAP_HIT_COOLDOWN_SECS * 2^0
+          hit 2 → full_cycles=1 → cooldown = _CAP_HIT_COOLDOWN_SECS * 2^1
+        This pins the counter-increment and backoff formula for the heuristic path.
+        """
+        gate = MagicMock()
+        gate.account_count = 1  # single account → full_cycles increments every hit
+        gate.before_invoke = AsyncMock(return_value='token-a')
+        gate.detect_cap_hit = MagicMock(return_value=False)
+        gate._handle_cap_detected = MagicMock(return_value=True)
+        gate.confirm_account_ok = MagicMock()
+        gate.active_account_name = 'acct-a'
+        gate.on_agent_complete = MagicMock()
+
+        heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
+        ok_result = _make_result(success=True, cost_usd=0.5)
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[heuristic_result, heuristic_result, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            got = await invoke_with_cap_retry(gate, 'test-label', prompt='hi')
+
+        assert got.success is True
+        assert mock_invoke.call_count == 3
+        assert mock_asyncio.sleep.call_count == 2
+
+        # Cooldown should double on the second hit
+        first_cooldown = mock_asyncio.sleep.call_args_list[0][0][0]
+        second_cooldown = mock_asyncio.sleep.call_args_list[1][0][0]
+        assert first_cooldown == _CAP_HIT_COOLDOWN_SECS
+        assert second_cooldown == _CAP_HIT_COOLDOWN_SECS * 2

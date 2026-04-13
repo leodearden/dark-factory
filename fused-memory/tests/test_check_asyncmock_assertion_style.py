@@ -195,7 +195,7 @@ def func_b():
 def _assert_violation_output(stdout: str, bad_file: Path) -> None:
     """Assert that checker stdout matches the violation-report contract.
 
-    Checks: full bad_file path present, line-3 reference present,
+    Checks: full bad_file path present, anchored line-3 reference present,
     assert_not_awaited keyword present, assert_not_called keyword present.
 
     Shared by TestCliExitCodes (sys.executable) and TestHooksIntegration
@@ -205,8 +205,8 @@ def _assert_violation_output(stdout: str, bad_file: Path) -> None:
     assert str(bad_file) in stdout, (
         f'Expected bad_file path in violation output, got: {stdout!r}'
     )
-    assert ':3:' in stdout, (
-        f'Expected line-3 reference in violation output, got: {stdout!r}'
+    assert f'{bad_file}:3:' in stdout, (
+        f'Expected anchored line-3 reference in violation output, got: {stdout!r}'
     )
     assert 'assert_not_awaited' in stdout, (
         f'Expected assert_not_awaited in violation output, got: {stdout!r}'
@@ -305,10 +305,13 @@ class TestHooksIntegration:
         (`echo ok # run check_asyncmock_assertion_style.py`). Without this, either comment form
         would land in invocation_lines and fail the python3/no-uv-run assertions on a benign edit.
 
-        The `fused-memory/tests` scan-target assertion is applied at file level (not per line)
-        so a future shell-variable refactor like `TESTS_DIR=fused-memory/tests; python3 .../check.py
-        "$TESTS_DIR"` does not break the test — the literal still appears in the hook file, just
-        not necessarily on the same line as the python3 invocation.
+        The `fused-memory/tests` scan-target assertion checks each line's non-comment portion
+        (`line.split('#')[0]`) so that a comment-only occurrence like
+        `# asyncmock assertion-style check (fused-memory/tests only)` does not satisfy it.
+        The check is still at file level (not requiring the literal on the same line as the
+        python3 invocation), so a future shell-variable refactor like
+        `TESTS_DIR=fused-memory/tests; python3 .../check.py "$TESTS_DIR"` still passes —
+        the literal appears in the hook file's non-comment code, just not on the python3 line.
         """
         hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
         content = hooks_path.read_text(encoding='utf-8')
@@ -317,8 +320,9 @@ class TestHooksIntegration:
             if 'check_asyncmock_assertion_style.py' in line.split('#')[0]
         ]
         assert invocation_lines, 'No invocation of check_asyncmock_assertion_style.py found in hooks/project-checks'
-        assert 'fused-memory/tests' in content, (
-            'Expected fused-memory/tests scan target to appear somewhere in hooks/project-checks'
+        assert any('fused-memory/tests' in line.split('#')[0]  # Naive comment strip — safe for this literal
+                   for line in content.splitlines()), (
+            'Expected fused-memory/tests scan target in non-comment code in hooks/project-checks'
         )
         for line in invocation_lines:
             assert re.search(r'\bpython3(?:\.\d+)?\b', line), (

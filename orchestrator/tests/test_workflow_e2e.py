@@ -2104,6 +2104,166 @@ class TestEvalSchedulerCachedStatus:
 
 
 # ---------------------------------------------------------------------------
+# Tests: Prerequisites format validation
+# ---------------------------------------------------------------------------
+
+
+class StringPrereqsArchitectStub(AgentStub):
+    """AgentStub subclass that writes a plan with plain-string prerequisites."""
+
+    async def _architect(self, cwd: Path) -> AgentResult:
+        task_dir = cwd / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        bad_plan = {
+            'task_id': '42',
+            'title': 'Add farewell function',
+            'modules': ['lib'],
+            'analysis': 'Simple function addition with TDD',
+            'prerequisites': ['install deps', 'set up config'],  # plain strings — invalid
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'type': 'test',
+                    'description': 'Write failing test for farewell()',
+                    'status': 'pending',
+                    'commit': None,
+                },
+            ],
+            '_schema_version': 1,
+        }
+        (task_dir / 'plan.json').write_text(json.dumps(bad_plan, indent=2) + '\n')
+        return AgentResult(success=True, output='Plan created', cost_usd=0.50)
+
+
+@pytest.mark.asyncio
+class TestPrerequisitesValidation:
+    """Workflow blocks with descriptive error when architect writes string prerequisites."""
+
+    async def test_string_prerequisites_block_workflow(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """Architect plan with ['string prereq'] prerequisites causes BLOCKED outcome.
+
+        The escalation message must mention 'prerequisites' (descriptive error),
+        not a generic AttributeError crash.  This verifies that validate_plan_prerequisites()
+        is called at the plan checkpoint rather than failing silently later.
+        """
+        stub = StringPrereqsArchitectStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.statuses['42'][-1] == 'blocked'
+
+        # The escalation must describe the prerequisites problem, not a generic crash
+        escalations = queue.get_by_task('42')
+        assert len(escalations) == 1
+        esc = escalations[0]
+        # summary or detail must mention 'prerequisites' to confirm the validation ran
+        assert 'prerequisites' in esc.summary.lower() or 'prerequisites' in (esc.detail or '').lower()
+
+
+# ---------------------------------------------------------------------------
+# Tests: ARCHITECT prompt guidance
+# ---------------------------------------------------------------------------
+
+
+class TestArchitectPromptGuidance:
+    """ARCHITECT system_prompt must contain negative guidance about prerequisites format."""
+
+    def test_architect_prompt_prerequisites_must_not_say_plain_string(self):
+        """ARCHITECT prompt must contain 'NOT a plain string' guidance about prerequisites."""
+        from orchestrator.agents.roles import ARCHITECT
+
+        prompt = ARCHITECT.system_prompt
+        # The specific negative-guidance phrase modelled on the 'steps vs tdd_plan' warning
+        assert 'NOT a plain string' in prompt or 'not a plain string' in prompt.lower()
+
+    def test_architect_prompt_prerequisites_guidance_mentions_string_rejection(self):
+        """ARCHITECT prompt must explicitly state string prerequisites are rejected."""
+        from orchestrator.agents.roles import ARCHITECT
+
+        prompt = ARCHITECT.system_prompt
+        # Must say that prerequisites must be dicts (allowing for markdown backticks around the word)
+        assert 'prerequisites' in prompt and ('MUST be' in prompt or 'must be a dict' in prompt.lower())
+
+    def test_architect_prompt_prerequisites_guidance_is_near_steps_warning(self):
+        """Both the steps warning and prerequisites guidance must appear in the ## Important section.
+
+        The original test used a 600-character proximity window, which is fragile — any insertion
+        between the two warnings would break the test spuriously.  Instead we check that both
+        directives appear in the same logical section (the '## Important' block), which is stable
+        under prompt reformatting.
+        """
+        from orchestrator.agents.roles import ARCHITECT
+
+        prompt = ARCHITECT.system_prompt
+        steps_warning = 'top-level key for your plan steps MUST be'
+        assert steps_warning in prompt
+
+        # Both warnings must live inside the ## Important section — locate it and
+        # extract from that point onward to avoid false positives from other sections.
+        assert '## Important' in prompt, 'ARCHITECT prompt must contain a "## Important" section'
+        important_idx = prompt.index('## Important')
+        important_section = prompt[important_idx:]
+        assert steps_warning in important_section, (
+            'Steps-format warning must appear in the ## Important section'
+        )
+        assert 'prerequisites' in important_section.lower() and (
+            'dict' in important_section.lower() or 'NOT a plain string' in important_section
+        ), 'Prerequisites guidance must appear in the ## Important section'
+
+
+# ---------------------------------------------------------------------------
+# File-structure invariants
+# ---------------------------------------------------------------------------
+
+
+class TestFileStructureInvariants:
+    """Structural invariants about test_workflow_e2e.py itself.
+
+    These meta-tests catch accidental duplication or deletion of critical
+    comment blocks and code sections that must appear exactly once.
+    """
+
+    def test_conformance_comment_header_appears_exactly_once(self) -> None:
+        """The 'Static Protocol conformance checks (pyright-verified)' header must appear exactly once.
+
+        This guards against the orphaned-duplicate scenario: if an edit accidentally
+        leaves a stale copy of the comment block mid-file (while the real block with
+        the ``if TYPE_CHECKING:`` code lives near the bottom), this test fails loudly
+        rather than silently misleading future readers. See task 735.
+
+        Counts only lines whose stripped content IS the header comment (excludes
+        string literals inside test code that happen to contain the same text).
+        """
+        content = Path(__file__).read_text()
+        # Count only lines whose stripped content is exactly the header comment,
+        # not string literals inside test code that happen to reference it.
+        header_line = "# Static Protocol conformance checks (pyright-verified)"
+        count = sum(1 for line in content.splitlines() if line.strip() == header_line)
+        assert count == 1, (
+            f"Expected exactly 1 comment line matching {header_line!r} in {__file__}, "
+            f"found {count}. An orphaned duplicate of the conformance comment "
+            "block must be removed — keep only the real block near the end of "
+            "the file that precedes the 'if TYPE_CHECKING:' conformance code. "
+            "See task 735."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Static Protocol conformance checks (pyright-verified)
 #
 # This block MUST live at the bottom of the file, after the FakeScheduler class

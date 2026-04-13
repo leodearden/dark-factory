@@ -4,7 +4,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from conftest import assert_ro_query_only, extract_cypher
+from conftest import assert_ro_query_only, extract_cypher, extract_params
 
 from fused_memory.backends.graphiti_client import (
     EdgeNotFoundError,
@@ -57,7 +57,7 @@ class TestQueryStaleNodeEmbeddings:
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.query_stale_node_embeddings(expected_dim=768, group_id='test')
         graph.ro_query.assert_called_once()
-        cypher = graph.ro_query.call_args[0][0]
+        cypher = extract_cypher(graph.ro_query.call_args)
         assert 'Entity' in cypher
         assert 'name_embedding' in cypher
 
@@ -99,7 +99,7 @@ class TestQueryStaleEdgeEmbeddings:
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.query_stale_edge_embeddings(expected_dim=768, group_id='test')
         graph.ro_query.assert_called_once()
-        cypher = graph.ro_query.call_args[0][0]
+        cypher = extract_cypher(graph.ro_query.call_args)
         assert 'RELATES_TO' in cypher
         assert 'fact_embedding' in cypher
 
@@ -140,9 +140,7 @@ class TestGetNodeText:
         graph = make_graph_mock([['Node', 'Summary']])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_node_text('specific-uuid', group_id='test')
-        call_kwargs = graph.ro_query.call_args
-        args, kwargs = call_kwargs
-        params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        params = extract_params(graph.ro_query.call_args)
         assert params.get('uuid') == 'specific-uuid'
 
     @pytest.mark.asyncio
@@ -184,9 +182,7 @@ class TestGetEdgeText:
         graph = make_graph_mock([['name', 'fact']])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_edge_text('specific-edge-uuid', group_id='test')
-        call_kwargs = graph.ro_query.call_args
-        args, kwargs = call_kwargs
-        params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        params = extract_params(graph.ro_query.call_args)
         assert params.get('uuid') == 'specific-edge-uuid'
 
     @pytest.mark.asyncio
@@ -219,9 +215,7 @@ class TestUpdateNodeEmbedding:
         backend._driver._get_graph = MagicMock(return_value=graph)
         embedding = [0.5] * 128
         await backend.update_node_embedding('my-uuid', embedding, group_id='test')
-        call_args = graph.query.call_args
-        args, kwargs = call_args
-        params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        params = extract_params(graph.query.call_args)
         assert params.get('uuid') == 'my-uuid'
         assert params.get('embedding') == embedding
 
@@ -251,9 +245,7 @@ class TestUpdateEdgeEmbedding:
         backend._driver._get_graph = MagicMock(return_value=graph)
         embedding = [0.7] * 64
         await backend.update_edge_embedding('edge-uuid-99', embedding, group_id='test')
-        call_args = graph.query.call_args
-        args, kwargs = call_args
-        params = args[1] if len(args) > 1 else kwargs.get('params', {})
+        params = extract_params(graph.query.call_args)
         assert params.get('uuid') == 'edge-uuid-99'
         assert params.get('embedding') == embedding
 
@@ -337,7 +329,7 @@ class TestDropIndex:
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.drop_index('MyLabel', 'my_field', group_id='test')
         call_args = graph.query.call_args
-        cypher = call_args[0][0]
+        cypher = extract_cypher(call_args)
         assert 'MyLabel' in cypher
         assert 'my_field' in cypher
 
@@ -952,8 +944,8 @@ class TestNodeCount:
         """Returns the integer count from result_set[0][0]."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([[42]])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        result = await backend.node_count('my_graph')
+        with patch.object(backend, '_graph_for', return_value=graph):
+            result = await backend.node_count('my_graph')
         assert result == 42
 
     @pytest.mark.asyncio
@@ -961,14 +953,22 @@ class TestNodeCount:
         """Returns 0 when result_set is empty."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        result = await backend.node_count('empty_graph')
+        with patch.object(backend, '_graph_for', return_value=graph):
+            result = await backend.node_count('empty_graph')
         assert result == 0
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
-        """Raises RuntimeError when client is None."""
+        """Raises RuntimeError when backend is not initialized (both client and _driver are None)."""
         backend = GraphitiBackend(mock_config)  # client is None
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.node_count('some_graph')
+
+    @pytest.mark.asyncio
+    async def test_raises_when_driver_explicitly_none(self, mock_config, make_backend):
+        """Raises RuntimeError when _driver is explicitly None (client is set but driver is not)."""
+        backend = make_backend(mock_config)  # client is set via make_backend
+        backend._driver = None
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.node_count('some_graph')
 
@@ -977,7 +977,38 @@ class TestNodeCount:
         """node_count uses ro_query (read-only path) and never calls graph.query."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([[7]])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-        await backend.node_count('test_graph')
+        with patch.object(backend, '_graph_for', return_value=graph):
+            await backend.node_count('test_graph')
         graph.ro_query.assert_awaited_once()
         graph.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_graph_for(self, mock_config, make_backend, make_graph_mock):
+        """node_count delegates graph resolution to _graph_for, not _require_driver._get_graph."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([[42]])
+        with patch.object(backend, '_graph_for', return_value=graph) as mock_graph_for:
+            result = await backend.node_count('my_graph')
+        mock_graph_for.assert_called_once_with('my_graph')
+        assert result == 42
+
+
+class TestListGraphs:
+    """GraphitiBackend.list_graphs() returns non-system FalkorDB graph names."""
+
+    @pytest.mark.asyncio
+    async def test_returns_filtered(self, mock_config, make_backend):
+        """Filters out 'default_db' and names ending in '_db' via _driver.client.list_graphs."""
+        backend = make_backend(mock_config)
+        backend._driver.client.list_graphs = AsyncMock(
+            return_value=['proj_a', 'default_db', 'proj_b', 'internal_db']
+        )
+        result = await backend.list_graphs()
+        assert result == ['proj_a', 'proj_b']
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        """Raises RuntimeError when backend is not initialized (_driver is None)."""
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.list_graphs()

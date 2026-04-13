@@ -189,14 +189,16 @@ class TestCapDetectionPatterns:
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is True
 
-    # --- Unknown token caps first uncapped ---
+    # --- Unknown token does not cap any account ---
 
-    def test_unknown_token_caps_first_uncapped(self):
+    def test_unknown_token_does_not_cap_any_account(self):
+        """Explicit unknown token: detect_cap_hit returns False (no account resolved/mutated)."""
         gate = make_gate(['a', 'b'])
-        gate.detect_cap_hit(
+        result = gate.detect_cap_hit(
             '', "You've hit your usage limit resets in 3h", oauth_token='unknown-token'
         )
-        assert gate._accounts[0].capped is True
+        assert result is False
+        assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
 
     # --- No oauth_token and all uncapped ---
@@ -245,7 +247,7 @@ class TestCapDetectionPatterns:
                 True,
             ),
             (
-                "You've used all available credits. Upgrade for more capacity.",
+                "You've used all available credits. Upgrade your plan for more capacity.",
                 True,
             ),
             (
@@ -261,6 +263,13 @@ class TestCapDetectionPatterns:
                 "You're close to reaching your plan limit. Your plan resets in 5h.",
                 True,
             ),
+            # Negative case: bare 'upgrade' no longer satisfies the confirm-keyword
+            # guard after task-662 narrowing to 'upgrade your plan' / 'upgrade your
+            # subscription'.  This was previously a True row before narrowing.
+            (
+                "You've used all available credits. Upgrade for more capacity.",
+                False,
+            ),
         ],
         ids=[
             'cap_hit_prefix_hit_your',
@@ -268,6 +277,7 @@ class TestCapDetectionPatterns:
             'cap_hit_prefix_out_of_extra',
             'cap_hit_prefix_now_using_extra',
             'near_cap_prefix_close_to',
+            'cap_hit_prefix_used_bare_upgrade_negative',
         ],
     )
     def test_realistic_cap_messages(self, message, expected):
@@ -343,20 +353,24 @@ class TestNearCapStateDistinction:
         assert gate._accounts[1].near_cap is True
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
+        assert gate._open.is_set() is True
+        assert all(a.resume_task is None for a in gate._accounts)  # wait_for_reset=False (default) → no probe
 
-    def test_near_cap_unknown_token_falls_back_to_first_uncapped(self):
-        """NEAR_CAP with an unrecognised oauth_token falls back to the first uncapped account."""
+    def test_near_cap_unknown_token_does_not_mark_any_account(self):
+        """NEAR_CAP with an explicit unknown oauth_token: detect_cap_hit returns False (no account resolved/mutated)."""
         gate = make_gate(['a', 'b'])
         result = gate.detect_cap_hit(
             '',
             "You're close to reaching your usage limit. Your plan resets in 4h.",
             oauth_token='unknown-token',
         )
-        assert result is True
-        assert gate._accounts[0].near_cap is True
+        assert result is False
+        assert gate._accounts[0].near_cap is False
         assert gate._accounts[1].near_cap is False
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
+        assert gate._open.is_set() is True
+        assert all(a.resume_task is None for a in gate._accounts)  # wait_for_reset=False (default) → no probe
 
     def test_near_cap_no_oauth_token_falls_back_to_first_uncapped(self):
         """NEAR_CAP with oauth_token=None falls back to the first uncapped account."""
@@ -369,6 +383,8 @@ class TestNearCapStateDistinction:
         assert result is True
         assert gate._accounts[0].near_cap is True
         assert gate._accounts[1].near_cap is False
+        assert gate._open.is_set() is True
+        assert all(a.resume_task is None for a in gate._accounts)  # wait_for_reset=False (default) → no probe
 
     def test_near_cap_does_not_start_resume_probe(self):
         """NEAR_CAP must NOT launch a resume probe task."""
@@ -408,10 +424,8 @@ class TestNearCapStateDistinction:
         explicit token so ``_resolve_account`` returns the already-capped account.  This
         mirrors the defensive case the probe-loop fix guards against.
 
-        ``asyncio.sleep`` is patched so the test is robust against a future minimum-interval
-        change in the probe loop — the patch is scoped to the probe-loop call so the outer
-        ``asyncio.wait_for`` timeout (which uses event-loop timer handles, not sleep) is
-        unaffected.
+        ``asyncio.sleep`` is patched and ``assert_not_awaited`` enforces the invariant that
+        ``resets_at`` in the past yields ``sleep_for=0``, so sleep must not be called.
         """
         gate = make_gate(['a'])
         acct = gate._accounts[0]
@@ -420,7 +434,7 @@ class TestNearCapStateDistinction:
         #     pause_started_at, resets_at, and closes the global gate).
         gate._handle_cap_detected('test', datetime.now(UTC) - timedelta(minutes=1), acct.token)
         assert acct.capped is True
-        assert acct.pause_started_at is not None  # real path sets this; manual block skipped it
+        assert acct.pause_started_at is not None  # _handle_cap_detected stamps pause_started_at
 
         # (2) Simulate a near-cap warning arriving after the account was capped — uses
         #     oauth_token=acct.token so _resolve_account returns the capped account via
@@ -433,31 +447,16 @@ class TestNearCapStateDistinction:
         assert acct.near_cap is True
         assert acct.capped is True
 
-        # (3) Override _run_probe to return success immediately
-        gate._run_probe = AsyncMock(return_value=True)
-
-        # (4) Run the probe loop — it should detect resets_at in the past, fire probe, succeed.
-        #     asyncio.sleep is patched to a no-op so the test is robust against a future change
-        #     that adds a minimum-interval floor.
-        #
-        #     NOTE on patch scope: `patch('shared.usage_gate.asyncio.sleep', ...)` replaces the
-        #     module-level attribute in shared.usage_gate for the duration of this block — it is
-        #     technically a process-wide change, not a local one.  This is safe here because:
-        #       1. pytest runs tests single-threaded, so no concurrent task is affected.
-        #       2. The scope is tightly bounded to the probe-loop call itself.
-        #       3. asyncio.wait_for uses event-loop timer handles internally (not asyncio.sleep),
-        #          so the 5 s timeout guard is unaffected by the patch.
-        #     If _account_resume_probe_loop is ever refactored to spawn concurrent subtasks that
-        #     also call asyncio.sleep, this patch would silently no-op those calls too — at that
-        #     point consider injecting a sleep callable (e.g. gate._sleep) via config instead.
-        with patch('shared.usage_gate.asyncio.sleep', new_callable=AsyncMock):
+        # (3) Run probe loop; assert_not_awaited enforces resets_at-in-the-past → sleep_for=0 invariant.
+        with patch('shared.usage_gate.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
             await asyncio.wait_for(gate._account_resume_probe_loop(acct), timeout=5)
+            mock_sleep.assert_not_awaited()
 
-        # (5) Account must be uncapped AND near_cap must be cleared — FAIL-BEFORE-FIX assertion
+        # (4) Account must be uncapped AND near_cap must be cleared — FAIL-BEFORE-FIX assertion
         assert acct.capped is False
         assert acct.near_cap is False  # This fails until the fix is applied
 
-        # (6) Re-detect near_cap — proves the flag can be set again after the clear
+        # (5) Re-detect near_cap — proves the flag can be set again after the clear
         gate.detect_cap_hit(
             '', "You're close to reaching your usage limit. Your plan resets in 2h."
         )
@@ -482,6 +481,72 @@ class TestNearCapStateDistinction:
         assert gate._accounts[1].near_cap is False
         assert all(not a.capped for a in gate._accounts)
         assert gate._open.is_set() is True
+
+    def test_near_cap_with_precapped_account_falls_back_to_next_uncapped(self):
+        """NEAR_CAP with oauth_token=None skips the pre-capped account and sets near_cap on 'b'.
+
+        Exercises the ``if not a.capped`` skip branch in ``_resolve_account``'s
+        first-uncapped fallback.  Account 'a' is capped via the real
+        ``_handle_cap_detected`` path (not manual field assignment) before the
+        NEAR_CAP message arrives, so ``_resolve_account(None)`` skips it and
+        returns account 'b'.
+        """
+        gate = make_gate(['a', 'b'])
+        acct_a = gate._accounts[0]
+
+        # Pre-cap account 'a' using the real detection path.
+        gate._handle_cap_detected(
+            'pre-capped', datetime.now(UTC) - timedelta(minutes=1), acct_a.token
+        )
+        assert acct_a.capped is True
+
+        # NEAR_CAP with no token — should fall back to first uncapped account ('b').
+        result = gate.detect_cap_hit(
+            '',
+            "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token=None,
+        )
+
+        assert result is True
+        assert gate._accounts[0].capped is True      # 'a' stays capped
+        assert gate._accounts[0].near_cap is False   # cap clears near_cap; NEAR_CAP did not touch 'a'
+        assert gate._accounts[1].near_cap is True    # 'b' got the near-cap flag
+        assert gate._accounts[1].capped is False     # 'b' is not capped
+        assert gate._open.is_set() is True           # NEAR_CAP must never close the gate
+        assert all(a.resume_task is None for a in gate._accounts)  # wait_for_reset=False → no probe
+
+    def test_near_cap_all_accounts_capped_returns_false(self):
+        """NEAR_CAP with oauth_token=None returns False when all accounts are capped.
+
+        Exercises the edge case where ``_resolve_account(None)`` iterates all accounts,
+        finds every one capped (``if not a.capped`` never passes), and returns ``None``.
+        ``_handle_near_cap_warning`` propagates this as ``False`` — no state is mutated.
+        """
+        gate = make_gate(['a', 'b'])
+        acct_a, acct_b = gate._accounts[0], gate._accounts[1]
+
+        # Pre-cap both accounts via the real detection path.
+        gate._handle_cap_detected(
+            'pre-capped-a', datetime.now(UTC) - timedelta(minutes=2), acct_a.token
+        )
+        gate._handle_cap_detected(
+            'pre-capped-b', datetime.now(UTC) - timedelta(minutes=1), acct_b.token
+        )
+        assert acct_a.capped is True
+        assert acct_b.capped is True
+
+        # NEAR_CAP with no token — _resolve_account returns None, no account mutated.
+        result = gate.detect_cap_hit(
+            '',
+            "You're close to reaching your usage limit. Your plan resets in 4h.",
+            oauth_token=None,
+        )
+
+        assert result is False                           # no account was resolved
+        assert acct_a.near_cap is False                 # unchanged
+        assert acct_b.near_cap is False                 # unchanged
+        assert acct_a.capped is True                    # still capped
+        assert acct_b.capped is True                    # still capped
 
 
 # =========================================================================
@@ -552,11 +617,15 @@ class TestCapHitNowUsingExtraSemantics:
 class TestCapConfirmKeywordEnforcement:
     """Asserts that detect_cap_hit requires BOTH a matching prefix AND at least one CAP_CONFIRM_KEYWORDS entry.
 
-    The secondary keyword guard ('resets', 'usage limit', 'upgrade') must be
-    present in the combined text before routing to _handle_cap_detected or
-    _handle_near_cap_warning. This is the defense-in-depth guard against false
-    positives on ambiguous generic prefixes like 'You've used' or 'You're close
-    to'.
+    The secondary keyword guard ('resets', 'usage limit', 'upgrade your plan',
+    'upgrade your subscription') must be present in the combined text before
+    routing to _handle_cap_detected or _handle_near_cap_warning. This is the
+    defense-in-depth guard against false positives on ambiguous generic prefixes
+    like 'You've used' or 'You're close to'.
+
+    Note: 'upgrade' was narrowed to multi-word phrases (task 662) because the
+    bare verb is too common in unrelated CLI messaging and would reduce the guard
+    to near-prefix-only behaviour in false-positive scenarios.
     """
 
     def test_cap_hit_prefix_without_confirm_keyword_returns_false(self):
@@ -594,13 +663,39 @@ class TestCapConfirmKeywordEnforcement:
         assert result is True
         assert acct.capped is True
 
-    def test_cap_hit_prefix_with_upgrade_keyword_returns_true(self):
-        """Prefix + 'upgrade' secondary keyword must trigger CAP_HIT detection."""
+    def test_cap_hit_prefix_with_upgrade_your_plan_keyword_returns_true(self):
+        """Prefix + 'upgrade your plan' secondary keyword must trigger CAP_HIT detection."""
         gate = make_gate(['a'])
-        result = gate.detect_cap_hit('', "You've used all credits. Upgrade for more.")
+        result = gate.detect_cap_hit('', "You've used all credits. Upgrade your plan for more.")
         acct = gate._accounts[0]
         assert result is True
         assert acct.capped is True
+
+    def test_cap_hit_prefix_with_upgrade_your_subscription_keyword_returns_true(self):
+        """Prefix + 'upgrade your subscription' secondary keyword must trigger CAP_HIT detection."""
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit(
+            '', "You've used all credits. Upgrade your subscription for more."
+        )
+        acct = gate._accounts[0]
+        assert result is True
+        assert acct.capped is True
+
+    def test_non_cap_upgrade_message_returns_false(self):
+        """Non-cap 'upgrade' message must NOT be misclassified as a cap hit.
+
+        The bare word 'upgrade' is a common English verb that appears in many
+        unrelated CLI messages (e.g. tool version announcements).  A message like
+        "You've used the CLI. Upgrade to v2 for more features." matches the
+        'You've used' prefix AND the broad bare 'upgrade' keyword — so it would
+        produce a false cap-hit under the old ['resets', 'usage limit', 'upgrade']
+        guard.  After narrowing to 'upgrade your plan' this test must return False.
+        """
+        gate = make_gate(['a'])
+        result = gate.detect_cap_hit('', "You've used the CLI. Upgrade to v2 for more features.")
+        acct = gate._accounts[0]
+        assert result is False
+        assert acct.capped is False
 
     def test_near_cap_prefix_with_confirm_keyword_returns_true(self):
         """NEAR_CAP prefix + secondary keyword must trigger near-cap detection."""
@@ -817,9 +912,16 @@ class TestHandleCapDetected:
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is True
 
-    def test_unknown_token_caps_first_uncapped(self):
+    def test_unknown_token_does_not_cap_any_account(self):
+        """Explicit unknown token: _resolve_account returns None, no account is capped."""
         gate = make_gate(['a', 'b'])
         gate._handle_cap_detected('reason', None, 'unknown-token')
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[1].capped is False
+
+    def test_none_token_caps_first_uncapped(self):
+        gate = make_gate(['a', 'b'])
+        gate._handle_cap_detected('reason', None, None)
         assert gate._accounts[0].capped is True
         assert gate._accounts[1].capped is False
 
@@ -936,6 +1038,74 @@ class TestHandleCapDetected:
 
 
 # =========================================================================
+# TestHandleNearCapWarning
+# =========================================================================
+
+
+class TestHandleNearCapWarning:
+    """_handle_near_cap_warning: account marking, logging, and cost events."""
+
+    def test_marks_correct_account_by_token(self, caplog):
+        gate = make_gate(['a', 'b'])
+        token_b = gate._accounts[1].token
+        with caplog.at_level(logging.WARNING, logger='shared.usage_gate'):
+            gate._handle_near_cap_warning('reason', token_b)
+        assert gate._accounts[1].near_cap is True
+        assert gate._accounts[0].near_cap is False
+        # Neither account should be capped — near-cap only
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[1].capped is False
+        assert any('near cap' in r.message.lower() for r in caplog.records)
+
+    def test_unknown_token_does_not_mark_near_cap(self):
+        """Explicit unknown token: _resolve_account returns None, no near_cap set."""
+        gate = make_gate(['a', 'b'])
+        gate._handle_near_cap_warning('reason', 'unknown-token')
+        assert gate._accounts[0].near_cap is False
+
+    def test_none_token_marks_first_uncapped(self):
+        gate = make_gate(['a', 'b'])
+        gate._handle_near_cap_warning('reason', None)
+        assert gate._accounts[0].near_cap is True
+
+    def test_all_capped_unknown_token_logs_warning(self, caplog):
+        gate = make_gate(['a'])
+        gate._accounts[0].capped = True
+        with caplog.at_level(logging.WARNING, logger='shared.usage_gate'):
+            gate._handle_near_cap_warning('reason', 'unknown-token')
+        assert any('no matching account' in r.message.lower() for r in caplog.records)
+        # _resolve_account returned None → no account state should be modified
+        assert gate._accounts[0].near_cap is False
+
+    def test_unknown_token_with_first_capped_does_not_mark_any(self):
+        """Explicit unknown token does not mark near_cap on any account, even if first is capped."""
+        gate = make_gate(['a', 'b'])
+        gate._accounts[0].capped = True
+        gate._handle_near_cap_warning('reason', 'unknown-token')
+        assert gate._accounts[0].near_cap is False
+        assert gate._accounts[1].near_cap is False
+
+    def test_fires_cost_event_with_cost_store(self):
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['a'], cost_store=cost_store)
+        token = gate._accounts[0].token
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._handle_near_cap_warning('reason', token)
+        mock_fire.assert_called_once_with(
+            gate._accounts[0].name,
+            'near_cap',
+            json.dumps({'reason': 'reason'}),
+        )
+
+    def test_no_cost_event_without_cost_store(self):
+        gate = make_gate(['a'], cost_store=None)
+        token = gate._accounts[0].token
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._handle_near_cap_warning('reason', token)
+        mock_fire.assert_not_called()
+
+
+# =========================================================================
 # TestResolveAccount
 # =========================================================================
 
@@ -949,21 +1119,41 @@ class TestResolveAccount:
         acct = gate._resolve_account(token_b)
         assert acct is gate._accounts[1]
 
-    def test_unknown_token_falls_back_to_first_uncapped(self):
+    def test_unknown_token_returns_none(self):
+        """Explicit unknown token returns None (no best-guess fallback)."""
         gate = make_gate(['a', 'b'])
         acct = gate._resolve_account('unknown-token')
-        assert acct is gate._accounts[0]
+        assert acct is None
 
     def test_none_token_falls_back_to_first_uncapped(self):
         gate = make_gate(['a', 'b'])
         acct = gate._resolve_account(None)
         assert acct is gate._accounts[0]
 
-    def test_fallback_skips_capped(self):
+    def test_none_token_fallback_skips_capped(self):
+        """None token (no identity) skips capped accounts in first-uncapped fallback."""
         gate = make_gate(['a', 'b'])
         gate._accounts[0].capped = True
-        acct = gate._resolve_account('unknown-token')
+        acct = gate._resolve_account(None)
         assert acct is gate._accounts[1]
+
+    def test_unknown_token_logs_config_drift_debug(self, caplog):
+        """Explicit unknown token logs a config-drift breadcrumb at DEBUG level (not WARNING).
+
+        The primary WARNING is emitted by the caller ('no matching account'), so
+        _resolve_account downgrades its own message to DEBUG to avoid duplicate
+        WARNING noise for a single event.
+        """
+        gate = make_gate(['a', 'b'])
+        with caplog.at_level(logging.DEBUG, logger='shared.usage_gate'):
+            acct = gate._resolve_account('unknown-token')
+        assert acct is None
+        assert any('config drift' in r.message.lower() for r in caplog.records)
+        # Must be DEBUG, not WARNING — callers own the WARNING-level signal
+        assert not any(
+            'config drift' in r.message.lower() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        )
 
     def test_all_capped_unknown_token_returns_none(self):
         gate = make_gate(['a', 'b'])
@@ -1308,23 +1498,12 @@ class TestConfirmAccountOk:
         assert gate._accounts[0].near_cap is False
 
     def test_clears_near_cap_without_probe_in_flight(self):
-        # Happy-path bug: near_cap set, billing reset, no full cap hit, probe never ran.
+        # Happy-path bug guard: near_cap clears when billing resets and the probe never ran.
         gate = make_gate(['a'])
         gate._accounts[0].near_cap = True
         gate._accounts[0].probe_in_flight = False
-        # NOTE: probe_count=3 with probe_in_flight=False is unreachable in real execution
-        # (probe_count only advances inside the probe loop while capped, and is reset to 0
-        # on success).  The value is set here purely to verify that confirm_account_ok does
-        # NOT touch unrelated fields when the probe_in_flight branch is skipped — these
-        # assertions are "no side effects on unrelated fields" invariant checks, not a
-        # realistic-state test.
-        gate._accounts[0].probe_count = 3
-        gate._open.clear()
         gate.confirm_account_ok(gate._accounts[0].token)
         assert gate._accounts[0].near_cap is False
-        # Verify no side effects on probe-related fields (invariant check, not realistic state)
-        assert gate._accounts[0].probe_count == 3
-        assert gate._open.is_set() is False
 
     def test_does_not_clear_near_cap_with_none_token(self):
         gate = make_gate(['a'])
@@ -1795,3 +1974,118 @@ class TestResetTimeParsingEdgeCases:
         # If we're in April, January 1 is in the past
         dt = _parse_resets_at('resets Jan 1, 12am (UTC)')
         assert dt.year >= now.year  # either this year (if Jan is future) or next
+
+
+# =========================================================================
+# TestReleaseProbeSlot
+# =========================================================================
+
+
+class TestReleaseProbeSlot:
+    """UsageGate.release_probe_slot(): clears probe state on exception paths."""
+
+    def test_clears_probe_in_flight_and_resets_probe_count(self):
+        """When probe_in_flight is True, release_probe_slot clears it and resets probe_count."""
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probe_in_flight = True
+        acct.probe_count = 3
+
+        gate.release_probe_slot('fake-token-a')
+
+        assert acct.probe_in_flight is False
+        assert acct.probe_count == 0
+
+    def test_reopens_open_event(self):
+        """release_probe_slot re-opens the _open event when probe was in flight."""
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probe_in_flight = True
+        gate._open.clear()  # simulate gate closed by probe slot claim
+
+        gate.release_probe_slot('fake-token-a')
+
+        assert gate._open.is_set() is True
+
+    def test_noop_when_probe_in_flight_false(self):
+        """release_probe_slot is a no-op when probe_in_flight is already False."""
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probe_in_flight = False
+        acct.probe_count = 5
+        gate._open.clear()  # gate state should not be changed
+
+        gate.release_probe_slot('fake-token-a')
+
+        assert acct.probe_in_flight is False
+        assert acct.probe_count == 5
+        assert gate._open.is_set() is False  # unchanged
+
+    def test_noop_with_unknown_token(self):
+        """release_probe_slot is a no-op with an unrecognised token."""
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probe_in_flight = True
+        acct.probe_count = 2
+        gate._open.clear()
+
+        gate.release_probe_slot('totally-unknown-token')
+
+        # State unchanged — unknown token should not touch the account
+        assert acct.probe_in_flight is True
+        assert acct.probe_count == 2
+        assert gate._open.is_set() is False
+
+    def test_noop_with_none_token(self):
+        """release_probe_slot is a no-op when token is None."""
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probe_in_flight = True
+        acct.probe_count = 1
+        gate._open.clear()
+
+        gate.release_probe_slot(None)
+
+        # State unchanged — None token should not touch the account
+        assert acct.probe_in_flight is True
+        assert acct.probe_count == 1
+        assert gate._open.is_set() is False
+
+    def test_does_not_touch_near_cap_flag(self):
+        """release_probe_slot does NOT modify the near_cap flag."""
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probe_in_flight = True
+        acct.near_cap = True
+
+        gate.release_probe_slot('fake-token-a')
+
+        assert acct.probe_in_flight is False  # cleared
+        assert acct.near_cap is True  # untouched
+
+    def test_noop_after_handle_cap_detected_already_cleared(self):
+        """release_probe_slot is a no-op after _handle_cap_detected() already cleared probe_in_flight.
+
+        This tests the key idempotency guarantee: _handle_cap_detected() sets
+        probe_in_flight=False and (in a single-account gate) clears _open.
+        A subsequent release_probe_slot() call must not re-open _open, since the
+        account is capped and the gate should stay closed.
+        """
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probe_in_flight = True
+
+        # Simulate cap detection path: _handle_cap_detected clears probe_in_flight
+        # and (all accounts capped) also clears the global _open event.
+        gate._handle_cap_detected('rate-limit', None, 'fake-token-a')
+
+        # Preconditions after cap detection:
+        assert acct.probe_in_flight is False
+        assert acct.capped is True
+        assert gate._open.is_set() is False  # gate closed because all accounts capped
+
+        # release_probe_slot must be a no-op — probe was already cleared by cap detection
+        gate.release_probe_slot('fake-token-a')
+
+        assert gate._open.is_set() is False  # still closed — NOT re-opened
+        assert acct.capped is True  # capped flag untouched

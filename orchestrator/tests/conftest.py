@@ -8,12 +8,16 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-# Insert this worktree's src directory at the front of sys.path so that
-# `import orchestrator` loads the local (possibly modified) code rather than
-# whatever editable install the shared .venv has pinned to the main tree.
+# Insert this worktree's src directories at the front of sys.path so that
+# `import orchestrator` and `import shared` load the local (possibly modified)
+# code rather than whatever editable install the uv workspace has pinned to
+# the main tree.
 _SRC = Path(__file__).parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+_SHARED_SRC = Path(__file__).parent.parent.parent / "shared" / "src"
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
 
 from shared.config_models import AccountConfig, UsageCapConfig  # noqa: E402
 from shared.usage_gate import AccountState, UsageGate  # noqa: E402
