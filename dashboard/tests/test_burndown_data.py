@@ -210,6 +210,7 @@ class TestCollectSnapshot:
         fake_orchestrators = [{'prd': 'fake_prd.md', 'config_path': None}]
 
         async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
             with (
                 patch('dashboard.data.burndown.load_task_tree', return_value=[]),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=fake_orchestrators),
@@ -222,9 +223,13 @@ class TestCollectSnapshot:
                 assert row is not None
                 assert row[0] == 1  # Only 1 row — symlink and real path should deduplicate
 
+            # Distinct from test_main_project_id_is_resolved_path: verifies that the
+            # resolved path is used as the project_id specifically in the orchestrator-
+            # dedup scenario, where both config.project_root and the mocked
+            # _resolve_project_root resolve to the same real_dir.
             async with conn.execute('SELECT project_id FROM snapshots') as cur:
                 rows = list(await cur.fetchall())
-            assert rows[0][0] == str(real_dir.resolve())
+            assert rows[0]['project_id'] == str(real_dir.resolve())
 
     @pytest.mark.asyncio
     async def test_deduplicates_main_project_from_orchestrators(self, burndown_env):
@@ -621,12 +626,15 @@ class TestCollectSnapshot:
 
         # Guard: _resolve_project_root walks up from prd_path looking for .taskmaster.
         # If any ancestor of tmp_path has one, the fallback branch never fires and
-        # this test silently verifies the wrong code path.
+        # this test silently verifies the wrong code path.  Skip (not fail) when the
+        # environment doesn't meet this precondition — a skip is a clearer signal than
+        # an unexpected assertion error.
         for ancestor in tmp_path.resolve().parents:
-            assert not (ancestor / '.taskmaster').is_dir(), (
-                f'{ancestor} contains .taskmaster — this test requires no .taskmaster '
-                f'in the ancestor chain so _resolve_project_root exercises its fallback branch'
-            )
+            if (ancestor / '.taskmaster').is_dir():
+                pytest.skip(
+                    f'{ancestor} contains .taskmaster — cannot exercise '
+                    f'_resolve_project_root fallback branch in this environment'
+                )
 
         # PRD path lives directly under tmp_path (not under real_dir), so
         # _resolve_project_root will walk up from tmp_path, find no .taskmaster,
