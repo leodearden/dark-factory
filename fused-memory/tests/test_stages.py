@@ -32,7 +32,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     TaskKnowledgeSync,
     _select_proactive_sample,
 )
-from fused_memory.reconciliation.task_filter import MAX_DONE_TASKS_RETAINED
+from fused_memory.reconciliation.task_filter import MAX_DONE_TASKS_RETAINED, _id_key
 
 _MOCK_TYPES = (AsyncMock, MagicMock)
 
@@ -858,6 +858,40 @@ class TestProactiveSampling:
         assert ids == sorted(ids, reverse=True), (
             f'Tasks with same status should be ordered by ID descending. Got: {ids}'
         )
+
+    def test_select_proactive_sample_non_int_ids_sort_equivalent_to_id_key(self):
+        """_select_proactive_sample sorts non-parseable string ids identically to _id_key fallback=0.
+
+        Non-int ids map to 0 via _id_key, so they sort last (after all positive-int ids)
+        within the same status bucket. This documents the expected behaviour and acts as
+        a regression guard before the inline sort_key is replaced with _id_key in step-4.
+        """
+        tasks = [
+            {'id': 'abc', 'title': 'Task abc', 'status': 'pending', 'dependencies': []},
+            {'id': 5, 'title': 'Task 5', 'status': 'pending', 'dependencies': []},
+            {'id': 'xyz', 'title': 'Task xyz', 'status': 'pending', 'dependencies': []},
+            {'id': 2, 'title': 'Task 2', 'status': 'pending', 'dependencies': []},
+        ]
+        result = _select_proactive_sample(tasks, 4)
+        ids = [t['id'] for t in result]
+
+        # int ids (5, 2) must precede non-parseable string ids ('abc', 'xyz')
+        # because _id_key('abc') == _id_key('xyz') == 0 < 2 < 5, sorted descending
+        int_ids = [i for i in ids if isinstance(i, int)]
+        str_ids = [i for i in ids if isinstance(i, str)]
+        assert int_ids == [5, 2], f'Int ids should be [5, 2] descending. Got: {int_ids}'
+        # string ids appear after all int ids
+        last_int_pos = max(ids.index(i) for i in int_ids)
+        first_str_pos = min(ids.index(s) for s in str_ids)
+        assert first_str_pos > last_int_pos, (
+            f'Non-int ids (fallback key=0) must sort after int ids. '
+            f'int_ids at positions {[ids.index(i) for i in int_ids]}, '
+            f'str_ids at positions {[ids.index(s) for s in str_ids]}'
+        )
+        # Verify _id_key agrees: all non-int ids yield 0
+        for t in tasks:
+            if isinstance(t['id'], str):
+                assert _id_key(t) == 0, f'_id_key should return 0 for non-int id {t["id"]!r}'
 
     # --- Step 13: empty task tree handled gracefully ---
 
