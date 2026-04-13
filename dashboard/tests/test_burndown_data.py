@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -521,8 +523,6 @@ class TestCollectSnapshot:
     @pytest.mark.asyncio
     async def test_logs_warning_when_known_root_unreadable(self, burndown_conn_with_config, caplog):
         """A WARNING is logged naming the failing root when PermissionError occurs."""
-        import logging
-
         bad_root = Path('/fake/project/bad_root')
         bad_tasks_json = bad_root.resolve() / '.taskmaster' / 'tasks' / 'tasks.json'
 
@@ -728,8 +728,6 @@ class TestCollectSnapshot:
         cannot drop the remaining snapshots.  The test uses OSError (not PermissionError)
         to match task 519's 'unreadable tasks.json' wording.
         """
-        import logging
-
         bad_root = Path('/fake/project/bad_root')
         good_root_1 = Path('/fake/project/good_root_1')
         good_root_2 = Path('/fake/project/good_root_2')
@@ -811,8 +809,6 @@ class TestCollectSnapshot:
         previously-untested main-project failure path. Uses path-keyed dispatch so
         the test does not depend on load_task_tree call ordering.
         """
-        import logging
-
         db_path, config, conn = burndown_env
 
         bad_path = config.tasks_json  # the main project's tasks.json path
@@ -1293,9 +1289,6 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
         known_project_roots row must be committed; a WARNING mentioning
         'orchestrator' must be emitted with exc_info set.
         """
-        import contextlib
-        import logging
-
         db_path, base_config, conn = burndown_env
         known_root = Path(f'/fake/project/{known_root_suffix}')
         config = DashboardConfig(
@@ -1352,8 +1345,6 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
         This tests the untested gap: the .resolve() call AFTER _resolve_project_root
         or _read_project_root_from_config returns successfully.
         """
-        import logging
-
         db_path, base_config, conn = burndown_env
 
         good_orch_root = Path('/fake/project/orch_resolve_good')
@@ -1485,8 +1476,6 @@ class TestCollectSnapshotInsertFailureIsolation:
         the extra's failure is caught per-project with a WARNING, and
         collect_snapshot does not raise.
         """
-        import logging
-
         db_path, base_config, conn = burndown_env
         extra_root = Path('/fake/project/insert_fail_extra_a')
         config = DashboardConfig(
@@ -1551,8 +1540,6 @@ class TestCollectSnapshotInsertFailureIsolation:
         main + extra_a + extra_c are committed, extra_b is absent, and
         exactly one WARNING names extra_b.
         """
-        import logging
-
         db_path, base_config, conn = burndown_env
         extra_a = Path('/fake/project/insert_multi_a')
         extra_b = Path('/fake/project/insert_multi_b')   # the failing one
@@ -1624,8 +1611,6 @@ class TestCollectSnapshotInsertFailureIsolation:
         After step-4: main's failure is caught per-project; the loop continues
         and extra is committed.  A WARNING must name the main project.
         """
-        import logging
-
         db_path, base_config, conn = burndown_env
         extra_root = Path('/fake/project/insert_fail_main_extra')
         config = DashboardConfig(
