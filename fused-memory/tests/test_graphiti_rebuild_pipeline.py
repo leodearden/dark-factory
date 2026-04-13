@@ -189,9 +189,9 @@ class TestCanonicalFacts:
     def test_whitespace_only_fact_is_filtered(self):
         """Whitespace-only facts are filtered out, not included in results.
 
-        The filter uses ``if e.get('fact', '').strip()`` so that a string like
-        '   ' strips to '' (falsy) and is excluded.  Only facts with real
-        non-whitespace content pass through.
+        The filter uses ``isinstance(f, str) and f and not f.isspace()`` so that
+        a string like '   ' is rejected by ``f.isspace()`` and excluded.  Only
+        facts with real non-whitespace content pass through.
         """
         edges = [
             {'fact': '   '},  # whitespace-only — filtered out
@@ -203,10 +203,10 @@ class TestCanonicalFacts:
     def test_whitespace_variants_all_filtered(self):
         """All whitespace-only variants are filtered; content with surrounding whitespace is kept.
 
-        Tabs, newlines, mixed whitespace, and single spaces are all falsy after
-        .strip() and must be excluded.  A fact with real content but leading/
-        trailing whitespace (e.g. '  hello  ') is truthy after strip and must
-        be preserved with its original value.
+        Tabs, newlines, mixed whitespace, and single spaces all return True from
+        ``str.isspace()`` and must be excluded.  A fact with real content but
+        leading/trailing whitespace (e.g. '  hello  ') returns False from
+        ``isspace()`` and must be preserved with its original raw value.
         """
         edges = [
             {'fact': '\t\t'},  # tabs only — filtered
