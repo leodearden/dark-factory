@@ -333,18 +333,15 @@ class TestRunBackfill:
 
         mock_config = _make_config()
 
+        import contextlib
+
+        @contextlib.asynccontextmanager
         async def fake_maintenance_service(config_path):
-            import contextlib
-
-            @contextlib.asynccontextmanager
-            async def _cm():
-                yield mock_config, MagicMock()
-
-            return _cm()
+            yield mock_config, MagicMock()
 
         with patch(
             'fused_memory.maintenance.backfill_curator_corpus.maintenance_service',
-            side_effect=fake_maintenance_service,
+            new=fake_maintenance_service,
         ), patch(
             'fused_memory.maintenance.backfill_curator_corpus.TaskmasterBackend',
         ) as mock_tm_cls, patch(
