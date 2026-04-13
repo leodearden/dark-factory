@@ -2148,3 +2148,18 @@ class TestServiceRebuildOrchestrationErrors:
         assert any('my-project' in m for m in warning_msgs), (
             f'Expected project_id in cancellation warning; got: {warning_msgs}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestBackendNoLongerHasRebuildEntitySummaries — step-11/12: remove from backend
+# ---------------------------------------------------------------------------
+
+class TestBackendNoLongerHasRebuildEntitySummaries:
+    """After step-12 cleanup, GraphitiBackend must NOT have rebuild_entity_summaries."""
+
+    def test_backend_lacks_rebuild_entity_summaries(self):
+        """GraphitiBackend.rebuild_entity_summaries must not exist after removal."""
+        assert not hasattr(GraphitiBackend, 'rebuild_entity_summaries'), (
+            'rebuild_entity_summaries must be removed from GraphitiBackend '
+            '— batch orchestration now lives in MemoryService'
+        )
