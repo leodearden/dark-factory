@@ -349,7 +349,7 @@ class TestPreTriageSuggestions:
 
         esc = _make_escalation(detail=json.dumps(suggestions))
 
-        with patch('orchestrator.steward.invoke_agent',
+        with patch('orchestrator.steward.invoke_with_cap_retry',
                    return_value=_fake_agent_result(structured_output=triage_output)):
             result = await steward._pre_triage_suggestions(esc)
 
@@ -386,7 +386,7 @@ class TestPreTriageSuggestions:
         bad_result = _fake_agent_result(structured_output=None)
         bad_result.success = False
 
-        with patch('orchestrator.steward.invoke_agent', return_value=bad_result):
+        with patch('orchestrator.steward.invoke_with_cap_retry', return_value=bad_result):
             result = await steward._pre_triage_suggestions(esc)
 
         # Original escalation returned unchanged
@@ -407,7 +407,7 @@ class TestPreTriageSuggestions:
         }
         result = _fake_agent_result(cost=0.75, structured_output=triage_output)
 
-        with patch('orchestrator.steward.invoke_agent', return_value=result):
+        with patch('orchestrator.steward.invoke_with_cap_retry', return_value=result):
             await steward._pre_triage_suggestions(esc)
 
         assert steward.metrics.total_cost_usd == 0.75
@@ -434,7 +434,7 @@ class TestPreTriageSuggestions:
             ],
         }
 
-        with patch('orchestrator.steward.invoke_agent',
+        with patch('orchestrator.steward.invoke_with_cap_retry',
                    return_value=_fake_agent_result(structured_output=triage_output)):
             result = await steward._pre_triage_suggestions(esc)
 

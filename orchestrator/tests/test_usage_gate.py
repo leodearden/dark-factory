@@ -339,14 +339,19 @@ class TestDetectCapHitMultiAccount:
         # Global gate closed — all capped
         assert not gate._open.is_set()
 
-    def test_unknown_token_caps_first_uncapped(self):
+    def test_unknown_token_returns_false(self):
+        """Unknown tokens cannot be attributed to any account — detect_cap_hit
+        returns False so the retry loop doesn't incorrectly increment
+        consecutive_cap_hits for a token that won't be retried anyway.
+        """
         gate = _make_gate()
         hit = gate.detect_cap_hit(
             "You've hit your usage limit", '', 'claude', oauth_token='unknown-token',
         )
-        assert hit is True
-        assert gate._accounts[0].capped is True
-        # B still available
+        assert hit is False
+        # No account state mutated
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[1].capped is False
         assert gate._open.is_set()
 
 
