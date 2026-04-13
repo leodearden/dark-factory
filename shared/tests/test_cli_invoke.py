@@ -1256,3 +1256,45 @@ class TestParseClaudeOutputThreadsTimedOut:
                                 duration_ms=100, timed_out=False)
         agent = _parse_claude_output(sub)
         assert agent.timed_out is False
+
+
+@pytest.mark.asyncio
+class TestHeuristicCapGating:
+    """Tests that the heuristic cap-detection path gates retry on
+    _handle_cap_detected's return value."""
+
+    async def test_heuristic_cap_no_retry_when_handle_returns_false(self):
+        """Heuristic fires but _handle_cap_detected returns False → no retry."""
+        gate = MagicMock()
+        gate.account_count = 2
+        gate.before_invoke = AsyncMock(return_value='token-a')
+        gate.detect_cap_hit = MagicMock(return_value=False)
+        gate._handle_cap_detected = MagicMock(return_value=False)
+        gate.confirm_account_ok = MagicMock()
+        gate.active_account_name = 'acct-a'
+        gate.on_agent_complete = MagicMock()
+
+        # Craft a result that triggers the heuristic: error, zero cost, instant
+        heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                return_value=heuristic_result,
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            # With max_cap_retries=1 the bug raises AllAccountsCappedException
+            # on the first heuristic hit.  The fix should return without raising.
+            got = await invoke_with_cap_retry(
+                gate, 'test-label',
+                prompt='hi', max_cap_retries=1,
+            )
+
+        assert got.success is False
+        mock_invoke.assert_called_once()
+        mock_asyncio.sleep.assert_not_called()
+        gate.confirm_account_ok.assert_called_once()
+        gate.on_agent_complete.assert_called_once()
