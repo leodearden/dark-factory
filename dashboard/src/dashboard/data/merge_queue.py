@@ -516,13 +516,20 @@ async def aggregate_recent_merges(
     dbs: list[aiosqlite.Connection | None],
     *,
     limit: int = 20,
+    hours: int = 168,
 ) -> list[dict]:
     """Aggregate recent merges across multiple project DBs.
 
     Concatenates, re-sorts by timestamp DESC, and truncates to limit.
+
+    Args:
+        dbs: List of async SQLite connections (None entries are skipped).
+        limit: Maximum number of rows to return.
+        hours: Look-back window in hours (default 168 = 7 days), passed
+            through to each per-DB :func:`recent_merges` call.
     """
     gather_results = await asyncio.gather(
-        *[recent_merges(db, limit=limit) for db in dbs],
+        *[recent_merges(db, limit=limit, hours=hours) for db in dbs],
         return_exceptions=True,
     )
     merged: list[dict] = []
