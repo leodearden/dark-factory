@@ -116,6 +116,7 @@ from dashboard.data.merge_queue import (  # noqa: E402
     _bucket_minutes_for_window,
     _cutoff_iso,
     _get_durations,
+    _ts_sort_key,
     aggregate_latency_stats,
     aggregate_outcome_distribution,
     aggregate_queue_depth_timeseries,
@@ -197,6 +198,27 @@ class TestAlignBucket:
         result = _align_bucket(t, 1440)
         assert result.tzinfo is not None
         assert result == datetime(2026, 4, 11, 0, 0, 0, tzinfo=UTC)
+
+
+# ---------------------------------------------------------------------------
+# TestTsSortKey
+# ---------------------------------------------------------------------------
+
+class TestTsSortKey:
+    def test_non_utc_aware_datetime_normalized(self):
+        """A non-UTC-offset timestamp is normalized to UTC.
+
+        '2026-04-01T10:00:00+05:30' represents 04:30:00 UTC.  _ts_sort_key
+        must return a datetime with utcoffset() == timedelta(0) so that
+        downstream key comparisons and serialization are consistent.
+        """
+        entry = {'timestamp': '2026-04-01T10:00:00+05:30'}
+        result = _ts_sort_key(entry)
+        # Must be UTC-normalised
+        assert result.utcoffset() == timedelta(0)
+        # Point-in-time must equal the UTC equivalent
+        expected_utc = datetime(2026, 4, 1, 4, 30, 0, tzinfo=UTC)
+        assert result == expected_utc
 
 
 # ---------------------------------------------------------------------------
