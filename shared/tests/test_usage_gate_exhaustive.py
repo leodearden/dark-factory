@@ -383,6 +383,8 @@ class TestNearCapStateDistinction:
         assert result is True
         assert gate._accounts[0].near_cap is True
         assert gate._accounts[1].near_cap is False
+        assert gate._open.is_set() is True
+        assert all(a.resume_task is None for a in gate._accounts)
 
     def test_near_cap_does_not_start_resume_probe(self):
         """NEAR_CAP must NOT launch a resume probe task."""
