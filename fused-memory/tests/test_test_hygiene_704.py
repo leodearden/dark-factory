@@ -23,12 +23,51 @@ robust than importing the test module (which would perturb pytest collection).
 """
 from __future__ import annotations
 
+import ast
 import pathlib
 
 
 def _read_sibling(name: str) -> str:
     """Return the raw source text of a sibling test file."""
     return (pathlib.Path(__file__).parent / name).read_text(encoding='utf-8')
+
+
+def _extract_module_docstring(src: str) -> str:
+    """Return the module-level docstring of the given source, or '' if absent.
+
+    Scopes substring checks to the docstring alone — excludes comment text,
+    string literals in function bodies, and any other non-docstring content.
+    Use this instead of raw-source substring search when the intent is to pin
+    wording that belongs in the module docstring specifically.
+    """
+    try:
+        return ast.get_docstring(ast.parse(src)) or ''
+    except SyntaxError:
+        return ''
+
+
+def test_extract_module_docstring_returns_only_the_docstring() -> None:
+    """_extract_module_docstring must return only the module docstring, not comments.
+
+    Constructs a synthetic source string where 'in_docstring_marker' appears
+    in the module docstring and 'in_comment_marker' appears in a line comment
+    (but NOT in the docstring).  Proves that the helper scopes substring checks
+    to the docstring alone, excluding comment text and other string literals.
+    """
+    synthetic_src = (
+        '"""Module docstring containing in_docstring_marker here."""\n'
+        '# in_comment_marker appears only in this comment, not the docstring\n'
+        'x = 1\n'
+    )
+    result = _extract_module_docstring(synthetic_src)
+    assert 'in_docstring_marker' in result, (
+        "_extract_module_docstring must return the module docstring text, "
+        "which contains 'in_docstring_marker'"
+    )
+    assert 'in_comment_marker' not in result, (
+        "_extract_module_docstring must NOT include comment text — "
+        "'in_comment_marker' appears only in a comment, not in the docstring"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -61,22 +100,27 @@ class TestModuleDocstring704:
         The tracker line must convey that unit tests live in
         test_refresh_entity_summary.py AND that get_all_valid_edges is used
         here as a mocked dependency — not merely redirect with '→ see ...'.
+
+        Assertions are scoped to the module docstring (via _extract_module_docstring)
+        rather than the raw source, so they cannot spuriously pass or fail due to
+        matching text in comments, helper-class docstrings, or other string literals.
         """
         src = _read_sibling('test_rebuild_entity_summaries.py')
+        docstring = _extract_module_docstring(src)
 
-        assert 'unit tests in test_refresh_entity_summary.py' in src, (
+        assert 'unit tests in test_refresh_entity_summary.py' in docstring, (
             "test_rebuild_entity_summaries.py module docstring must contain "
             "'unit tests in test_refresh_entity_summary.py' to accurately convey "
             "where the unit tests for get_all_valid_edges live"
         )
 
-        assert 'used here as a mocked dependency' in src, (
+        assert 'used here as a mocked dependency' in docstring, (
             "test_rebuild_entity_summaries.py module docstring must contain "
             "'used here as a mocked dependency' to clarify that get_all_valid_edges "
             "is still exercised (as a mock) in this file"
         )
 
-        assert '→ see test_refresh_entity_summary.py' not in src, (
+        assert '→ see test_refresh_entity_summary.py' not in docstring, (
             "test_rebuild_entity_summaries.py module docstring must NOT contain "
             "the stale arrow-only phrasing '→ see test_refresh_entity_summary.py'; "
             "replace it with the accurate two-part phrasing that notes both the "
@@ -109,7 +153,8 @@ class TestNoneResultSetRationale704:
     rephrased, update the assertions in this class to match the new text.
     """
 
-    def _lines_before_mutation(self) -> list[str]:
+    @staticmethod
+    def _lines_before_mutation() -> list[str]:
         """Return contiguous comment/blank lines immediately before the mutation.
 
         Scoped to the body of test_none_result_set_returns_empty_dict — finds the
