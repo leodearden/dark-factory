@@ -432,6 +432,32 @@ class TestDetectStaleSummariesDryRun:
         # get_valid_edges_for_node must NOT have been called for the empty-summary entity
         backend.get_valid_edges_for_node.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_accepts_max_concurrency_kwarg(self, mock_config, make_backend):
+        """detect_stale_dry_run accepts an optional max_concurrency keyword parameter.
+
+        Calling with max_concurrency=5 must not raise TypeError.
+        Calling with the default (no kwarg) must also still work.
+        Both calls return well-formed (stale_list, total_count) tuples.
+        """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'fact'},
+        ])
+        backend.get_valid_edges_for_node = AsyncMock(return_value=[
+            {'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'},
+        ])
+
+        # Should not raise TypeError with explicit max_concurrency
+        stale_list, total_count = await backend.detect_stale_dry_run(
+            group_id='test', max_concurrency=5
+        )
+        assert total_count == 1
+
+        # Default (no kwarg) must still work
+        stale_list2, total_count2 = await backend.detect_stale_dry_run(group_id='test')
+        assert total_count2 == 1
+
 
 # ---------------------------------------------------------------------------
 # task-656: GraphitiBackend._build_stale_entry (static helper)
