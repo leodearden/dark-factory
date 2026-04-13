@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1996,6 +1997,65 @@ class TestRebuildEntitySummariesCancellation:
         error_detail = next((d for d in result['details'] if d['status'] == 'error'), None)
         assert error_detail is not None, f"expected an 'error' entry in details; got {result['details']}"
         assert 'per-entity boom' in error_detail['error']
+
+
+# ---------------------------------------------------------------------------
+# Task-716: regression guard — cross-reference accuracy between
+#           test_runtime_error_still_accumulates_in_errors and
+#           test_partial_failure_continues
+# ---------------------------------------------------------------------------
+
+class TestDocstringCrossReferenceAccuracy716:
+    """Regression guard: pin both sides of the cross-reference.
+
+    test_runtime_error_still_accumulates_in_errors (TestRebuildEntitySummariesCancellation)
+    references test_partial_failure_continues (TestRebuildEntitySummaries) in its docstring.
+    These tests pin (a) the exception type raised in the target test and (b) the key phrases
+    in the source docstring so that future drift on either side triggers a failure.
+    """
+
+    def test_partial_failure_continues_still_raises_runtime_error_not_value_error(self):
+        """Pin the exception type in the cross-reference target.
+
+        If someone edits test_partial_failure_continues to raise ValueError (or any
+        non-RuntimeError), the 'exercises RuntimeError' claim in the consumer docstring
+        becomes silently wrong.  This test catches that drift.
+        """
+        src = inspect.getsource(TestRebuildEntitySummaries.test_partial_failure_continues)
+        assert 'raise RuntimeError(' in src, (
+            "test_partial_failure_continues must raise RuntimeError — "
+            "the cross-reference in test_runtime_error_still_accumulates_in_errors "
+            "docstring claims it 'exercises RuntimeError'"
+        )
+        assert 'raise ValueError(' not in src, (
+            "test_partial_failure_continues must NOT raise ValueError — "
+            "that would invalidate the cross-reference claim"
+        )
+
+    def test_runtime_error_docstring_describes_runtime_error_cross_reference(self):
+        """Pin the key phrases in the cross-reference source docstring.
+
+        If someone edits the docstring of test_runtime_error_still_accumulates_in_errors
+        to reintroduce the stale ValueError claim (or removes the RuntimeError cross-
+        reference), this test will fail.
+        """
+        doc = TestRebuildEntitySummariesCancellation.test_runtime_error_still_accumulates_in_errors.__doc__
+        assert doc is not None, "docstring must be present"
+        assert 'ValueError accumulation is already covered by test_partial_failure_continues' not in doc, (
+            "stale ValueError claim must not appear in docstring"
+        )
+        assert 'Exception-subclass accumulation' in doc, (
+            "'Exception-subclass accumulation' phrase must be present"
+        )
+        assert 'which exercises RuntimeError' in doc, (
+            "'which exercises RuntimeError' phrase must be present"
+        )
+        assert 'isinstance(r, Exception) rather than isinstance(r, RuntimeError)' in doc, (
+            "isinstance comparison phrase must be present"
+        )
+        assert 'test_partial_failure_continues' in doc, (
+            "cross-reference to test_partial_failure_continues must still be explicit"
+        )
 
 
 # ---------------------------------------------------------------------------
