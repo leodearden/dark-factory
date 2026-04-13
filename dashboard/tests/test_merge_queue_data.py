@@ -361,6 +361,47 @@ class TestQueueDepthTimeseries:
                 f"is not exactly 1 day"
             )
 
+    @pytest.mark.asyncio
+    async def test_first_bucket_includes_events_before_cutoff(self, merge_events_db):
+        """Events in [cutoff_aligned, cutoff) must be counted in the first bucket.
+
+        With now=2026-04-11T12:07:30 UTC and hours=24:
+          cutoff         = 2026-04-10T12:07:30+00:00
+          cutoff_aligned = 2026-04-10T12:00:00+00:00  (floor to 15-min boundary)
+
+        An event at cutoff_aligned + 1 minute (12:01:00) is inside the first
+        bucket's time range but falls before cutoff (12:07:30).  The SQL WHERE
+        clause must use cutoff_aligned (not cutoff) so this event is fetched.
+        """
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        bucket_min = _bucket_minutes_for_window(24)  # 15 for a 24h window
+        cutoff = now - timedelta(hours=24)
+        cutoff_aligned = _align_bucket(cutoff, bucket_min)
+
+        # Event is 1 minute after the first bucket boundary and before cutoff
+        event_ts = cutoff_aligned + timedelta(minutes=1)
+        assert event_ts < cutoff, "Pre-condition: event must be before cutoff"
+
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        _insert_event(conn_sync, event_type='merge_attempt', timestamp=event_ts,
+                      data={'outcome': 'done'})
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await queue_depth_timeseries(db, hours=24, now=now)
+
+        first_label = cutoff_aligned.isoformat()
+        assert first_label in result['labels'], (
+            f"Expected first bucket label {first_label!r} in labels"
+        )
+        idx = result['labels'].index(first_label)
+        assert result['values'][idx] == 1, (
+            f"First bucket should have count=1 for the event at {event_ts.isoformat()}, "
+            f"got {result['values'][idx]}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestOutcomeDistribution
