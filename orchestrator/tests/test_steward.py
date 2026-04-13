@@ -2027,3 +2027,17 @@ class TestPreTriageSuggestionsPath:
         call_kwargs = steward.briefing.build_steward_initial_prompt.call_args.kwargs
         assert call_kwargs['escalation']['detail'] == original_detail
         mock_invoke.assert_called_once()
+
+    async def test_pre_triage_passes_correct_allowed_tools(self, steward):
+        """_pre_triage_suggestions passes the exact allowed_tools list to invoke_agent."""
+        esc = self._esc_with_suggestions(12)
+        with patch('orchestrator.agents.invoke.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            await steward._pre_triage_suggestions(esc)
+
+        call_kwargs = mock_invoke.call_args.kwargs
+        assert call_kwargs['allowed_tools'] == [
+            'Read', 'Glob', 'Grep',
+            'mcp__fused-memory__get_tasks',
+            'mcp__fused-memory__search',
+        ]
