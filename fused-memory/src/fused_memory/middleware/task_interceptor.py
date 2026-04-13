@@ -346,8 +346,8 @@ class TaskInterceptor:
         self._backfill_triggered = True
 
         try:
-            from fused_memory.models.scope import resolve_project_id
             from fused_memory.middleware.task_curator import _flatten_task_tree
+            from fused_memory.models.scope import resolve_project_id
 
             project_id = resolve_project_id(project_root)
             collection_name = curator._collection_name(project_id)
@@ -358,7 +358,6 @@ class TaskInterceptor:
                 if not await client.collection_exists(collection_name):
                     count = 0
                 else:
-                    from qdrant_client.http.models import CountResult
                     count_result = await client.count(collection_name=collection_name)
                     count = count_result.count
             except Exception:
