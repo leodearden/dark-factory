@@ -288,3 +288,90 @@ class TestBackfillPointIdConsistency:
 
         assert backfill_point_id is not None
         assert record_task_point_id == backfill_point_id
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 8: run_backfill() orchestration
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestRunBackfill:
+    @pytest.mark.asyncio
+    async def test_run_backfill_orchestrates_correctly(self):
+        """run_backfill() fetches tasks, flattens, then calls backfill_corpus()."""
+        from fused_memory.maintenance.backfill_curator_corpus import run_backfill
+
+        project_root = '/fake/project'
+        project_id = 'project'
+
+        canned_task_tree = {
+            'tasks': [
+                {'id': '100', 'title': 'Task A', 'description': 'Desc A', 'status': 'done'},
+                {
+                    'id': '101',
+                    'title': 'Task B',
+                    'description': 'Desc B',
+                    'status': 'pending',
+                    'subtasks': [
+                        {'id': '101.1', 'title': 'Sub B1', 'description': '', 'status': 'pending'},
+                    ],
+                },
+            ],
+        }
+
+        # Expected flat list after _flatten_task_tree
+        from fused_memory.middleware.task_curator import _flatten_task_tree
+        expected_flat = _flatten_task_tree(canned_task_tree)  # 3 tasks
+
+        mock_backfill_result = BackfillResult(upserted=3, skipped=0, errors=0)
+
+        mock_taskmaster = AsyncMock()
+        mock_taskmaster.get_tasks = AsyncMock(return_value=canned_task_tree)
+
+        mock_curator = AsyncMock()
+        mock_curator.backfill_corpus = AsyncMock(return_value=mock_backfill_result)
+
+        mock_config = _make_config()
+
+        async def fake_maintenance_service(config_path):
+            import contextlib
+
+            @contextlib.asynccontextmanager
+            async def _cm():
+                yield mock_config, MagicMock()
+
+            return _cm()
+
+        with patch(
+            'fused_memory.maintenance.backfill_curator_corpus.maintenance_service',
+            side_effect=fake_maintenance_service,
+        ), patch(
+            'fused_memory.maintenance.backfill_curator_corpus.TaskmasterBackend',
+        ) as mock_tm_cls, patch(
+            'fused_memory.maintenance.backfill_curator_corpus.TaskCurator',
+        ) as mock_curator_cls:
+            mock_tm_instance = AsyncMock()
+            mock_tm_instance.get_tasks = AsyncMock(return_value=canned_task_tree)
+            mock_tm_cls.return_value = mock_tm_instance
+
+            mock_curator_cls.return_value = mock_curator
+
+            result = await run_backfill(
+                config_path=None,
+                project_root=project_root,
+            )
+
+        # get_tasks called with the project_root
+        mock_tm_instance.get_tasks.assert_called_once_with(project_root)
+
+        # backfill_corpus called with flattened list and correct project_id
+        mock_curator.backfill_corpus.assert_called_once()
+        call_args = mock_curator.backfill_corpus.call_args
+        flat_tasks = call_args.args[0] if call_args.args else call_args.kwargs.get('tasks')
+        passed_project_id = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get('project_id')
+
+        assert len(flat_tasks) == 3  # parent + parent + subtask
+        assert passed_project_id == project_id
+
+        # Result propagated
+        assert result.upserted == 3
