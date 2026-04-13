@@ -333,8 +333,8 @@ class TestBackfillPointIdConsistency:
         assert captured_payload['files_to_modify'] == [], (
             f"Expected [], got {captured_payload['files_to_modify']!r}"
         )
-        assert captured_payload['priority'] == 'medium', (
-            f"Expected 'medium', got {captured_payload['priority']!r}"
+        assert captured_payload['priority'] == DEFAULT_PRIORITY, (
+            f"Expected {DEFAULT_PRIORITY!r}, got {captured_payload['priority']!r}"
         )
 
     def test_default_priority_in_priority_rank(self):
@@ -415,9 +415,14 @@ class TestBackfillPointIdConsistency:
         assert record_payload is not None
         assert backfill_payload is not None
 
-        # Keys must match
-        assert set(record_payload.keys()) == set(backfill_payload.keys()), (
-            f"Key mismatch: record={set(record_payload)}, backfill={set(backfill_payload)}"
+        # Both payloads must always include updated_at
+        assert 'updated_at' in record_payload, f"record_payload missing 'updated_at': {set(record_payload)}"
+        assert 'updated_at' in backfill_payload, f"backfill_payload missing 'updated_at': {set(backfill_payload)}"
+
+        # Key-set equality excluding updated_at (may legitimately differ)
+        assert set(record_payload.keys()) - {'updated_at'} == set(backfill_payload.keys()) - {'updated_at'}, (
+            f"Key-set mismatch (excluding updated_at): "
+            f"record={set(record_payload) - {'updated_at'}}, backfill={set(backfill_payload) - {'updated_at'}}"
         )
 
         # files_to_modify must be a list in both
@@ -434,12 +439,6 @@ class TestBackfillPointIdConsistency:
         )
         assert isinstance(backfill_payload['priority'], str), (
             f"backfill priority type: {type(backfill_payload['priority'])}"
-        )
-
-        # Key-set equality excluding updated_at (documents intent: updated_at may legitimately differ)
-        assert set(record_payload.keys()) - {'updated_at'} == set(backfill_payload.keys()) - {'updated_at'}, (
-            f"Key-set mismatch (excluding updated_at): "
-            f"record={set(record_payload) - {'updated_at'}}, backfill={set(backfill_payload) - {'updated_at'}}"
         )
 
         # Value equality for all shared keys except 'updated_at' (may differ by milliseconds)
