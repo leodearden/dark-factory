@@ -306,7 +306,12 @@ class TaskInterceptor:
     # ── Curator helpers ────────────────────────────────────────────────
 
     async def _get_curator(self) -> TaskCurator | None:
-        """Lazily construct the task curator gate."""
+        """Lazily construct the task curator gate.
+
+        On first construction, triggers a background backfill check via
+        ``_maybe_backfill_corpus()`` so pre-existing tasks are indexed into the
+        curator corpus without blocking the caller.
+        """
         if self._curator is not None:
             return self._curator
         if self._config is None or not self._config.curator.enabled:
@@ -315,15 +320,26 @@ class TaskInterceptor:
             from pathlib import Path as _Path
 
             cwd = None
+            project_root: str | None = None
             if self.taskmaster is not None:
                 pr = getattr(self.taskmaster.config, 'project_root', None)
                 if pr:
                     cwd = _Path(pr)
+                    project_root = str(pr)
             self._curator = TaskCurator(
                 config=self._config,
                 taskmaster=self.taskmaster,
                 cwd=cwd,
             )
+            # Trigger the one-shot backfill check as a background task so the
+            # caller is not delayed by the Qdrant count() round-trip.
+            if project_root is not None:
+                bg = asyncio.create_task(
+                    self._maybe_backfill_corpus(self._curator, project_root),
+                    name='curator-backfill-check',
+                )
+                self._background_tasks.add(bg)
+                bg.add_done_callback(lambda t: self._background_tasks.discard(t))
             return self._curator
         except Exception:
             logger.warning('Failed to create TaskCurator', exc_info=True)
@@ -350,27 +366,14 @@ class TaskInterceptor:
             from fused_memory.models.scope import resolve_project_id
 
             project_id = resolve_project_id(project_root)
-            collection_name = curator._collection_name(project_id)
 
-            # Check whether the collection already has tasks.
-            client = await curator._get_qdrant()
-            try:
-                if not await client.collection_exists(collection_name):
-                    count = 0
-                else:
-                    count_result = await client.count(collection_name=collection_name)
-                    count = count_result.count
-            except Exception:
-                logger.warning(
-                    'task_curator: backfill check failed for collection %s',
-                    collection_name, exc_info=True,
-                )
-                return
+            # Check whether the collection already has tasks via the public API.
+            count = await curator.corpus_count(project_id)
 
             if count > 0:
                 logger.debug(
-                    'task_curator: collection %s has %d points — skipping auto-backfill',
-                    collection_name, count,
+                    'task_curator: corpus for project %s has %d points — skipping auto-backfill',
+                    project_id, count,
                 )
                 return
 

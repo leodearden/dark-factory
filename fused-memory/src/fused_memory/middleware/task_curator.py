@@ -18,6 +18,7 @@ to ``action="create"`` so task creation is never blocked.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -479,6 +480,26 @@ class TaskCurator:
         """
         return str(uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f'{project_id}/{task_id}'))
 
+    async def corpus_count(self, project_id: str) -> int:
+        """Return the number of points in the curator corpus for a project.
+
+        Returns 0 if the collection does not exist or an error occurs.
+        This public method encapsulates collection-existence + count logic so
+        callers (e.g. TaskInterceptor) don't need to access private methods.
+        """
+        try:
+            client = await self._get_qdrant()
+            collection_name = self._collection_name(project_id)
+            if not await client.collection_exists(collection_name):
+                return 0
+            result = await client.count(collection_name=collection_name)
+            return result.count
+        except Exception:
+            logger.warning(
+                'task_curator: corpus_count failed for project %s', project_id, exc_info=True,
+            )
+            return 0
+
     async def backfill_corpus(
         self,
         tasks: list[dict],
@@ -507,7 +528,7 @@ class TaskCurator:
         from qdrant_client.models import PointStruct
 
         # Embed all tasks with bounded concurrency.
-        sem = __import__('asyncio').Semaphore(10)
+        sem = asyncio.Semaphore(10)
         points: list[PointStruct] = []
 
         async def _embed_one(task: dict) -> None:
@@ -541,15 +562,14 @@ class TaskCurator:
                         'title': title,
                         'description': description[:1000],
                         'files_to_modify': files,
+                        'priority': task.get('priority', ''),
                         'project_id': project_id,
                         'updated_at': datetime.now(UTC).isoformat(),
                     },
                 )
             )
 
-        import asyncio as _asyncio
-
-        await _asyncio.gather(*[_embed_one(t) for t in tasks])
+        await asyncio.gather(*[_embed_one(t) for t in tasks])
 
         if points:
             await client.upsert(collection_name=collection, points=points)
