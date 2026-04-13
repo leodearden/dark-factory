@@ -7,6 +7,7 @@ import re
 from fused_memory.reconciliation.task_filter import (
     _STATUS_PRIORITY,
     FilteredTaskTree,
+    MAX_CANCELLED_TASKS_RETAINED,
     _render_task_line,
     filter_task_tree,
     format_filtered_task_tree,
@@ -157,6 +158,31 @@ class TestFilterTaskTree:
         )
         assert len(result.done_tasks) < result.done_count, (
             'Consumers should detect overflow via len(done_tasks) < done_count'
+        )
+
+    def test_filter_task_tree_caps_cancelled_tasks_at_max_retained(self):
+        """filter_task_tree caps cancelled_tasks at MAX_CANCELLED_TASKS_RETAINED while preserving cancelled_count."""
+        tasks_data = {
+            'tasks': [_make_task(i, 'cancelled') for i in range(1, 51)]  # 50 cancelled tasks
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert len(result.cancelled_tasks) == MAX_CANCELLED_TASKS_RETAINED, (
+            f'Expected {MAX_CANCELLED_TASKS_RETAINED} cancelled tasks retained, '
+            f'got {len(result.cancelled_tasks)}'
+        )
+        assert result.cancelled_count == 50, (
+            f'cancelled_count must reflect full input count (50), got {result.cancelled_count}'
+        )
+        assert len(result.cancelled_tasks) < result.cancelled_count, (
+            'Consumers can detect overflow via len(cancelled_tasks) < cancelled_count'
+        )
+        # Highest IDs (most recent) are retained
+        retained_ids = [t['id'] for t in result.cancelled_tasks]
+        expected_ids = list(range(50, 50 - MAX_CANCELLED_TASKS_RETAINED, -1))
+        assert retained_ids == expected_ids, (
+            f'Expected top-{MAX_CANCELLED_TASKS_RETAINED} ids descending {expected_ids}, '
+            f'got {retained_ids}'
         )
 
     def test_filter_task_tree_done_tasks_sorted_by_id_desc(self):
@@ -980,3 +1006,73 @@ class TestFormatCancelledSection:
         assert '- [101]' in output, f'Cancelled task 101 missing from output:\n{output!r}'
         assert '- [102]' in output, f'Cancelled task 102 missing from output:\n{output!r}'
         assert '- [103]' in output, f'Cancelled task 103 missing from output:\n{output!r}'
+
+    def test_format_cancelled_section_ordering(self):
+        """Sections must appear in order: header stats → active body → cancelled → summary.
+
+        Verifies positional ordering via index() rather than just substring presence —
+        a malformed concatenation order would pass presence-only assertions.
+        """
+        tree = FilteredTaskTree(
+            active_tasks=[_make_task(1, 'pending'), _make_task(2, 'in-progress')],
+            cancelled_tasks=[_make_task(8, 'cancelled'), _make_task(9, 'cancelled')],
+            done_count=3,
+            cancelled_count=2,
+            other_count=0,
+            total_count=7,
+        )
+        output = format_filtered_task_tree(tree)
+
+        pos_active = output.index('- [1]')            # first active task line
+        pos_cancelled_header = output.index('### Recently Cancelled Tasks')
+        pos_summary = output.index('done \u2014 omitted')
+
+        assert pos_active < pos_cancelled_header, (
+            f'Active task lines (pos {pos_active}) must appear before '
+            f'the cancelled section header (pos {pos_cancelled_header})'
+        )
+        assert pos_cancelled_header < pos_summary, (
+            f'Cancelled section header (pos {pos_cancelled_header}) must appear '
+            f'before the summary line (pos {pos_summary})'
+        )
+
+    def test_format_cancelled_section_large_accepted_overflow(self):
+        """Documents accepted behavior: when the cancelled section alone fills the budget,
+        the formatter returns header + cancelled_section + summary_line even if that
+        exceeds max_chars.  With MAX_CANCELLED_TASKS_RETAINED capping the list,
+        this degenerate case only occurs under unrealistically tight budgets.
+
+        The fallback path `return header + cancelled_section + summary_line` (triggered
+        when budget <= 0) is the documented safe exit — it never silently drops the
+        cancelled section or the summary.
+        """
+        # Build the maximum retained cancelled tasks with long titles to ensure
+        # the section is large enough to exhaust a tiny budget.
+        cancelled = [
+            _make_task(
+                100 + i, 'cancelled',
+                'A very long task title that consumes character budget space',
+            )
+            for i in range(MAX_CANCELLED_TASKS_RETAINED)
+        ]
+        tree = FilteredTaskTree(
+            active_tasks=[_make_task(1, 'pending')],
+            cancelled_tasks=cancelled,
+            done_count=2,
+            cancelled_count=MAX_CANCELLED_TASKS_RETAINED,
+            other_count=0,
+            total_count=MAX_CANCELLED_TASKS_RETAINED + 3,
+        )
+
+        # A budget far below the size of the cancelled section alone.
+        tiny_budget = 50
+        output = format_filtered_task_tree(tree, max_chars=tiny_budget)
+
+        # The output exceeds tiny_budget — this is the documented accepted behavior.
+        assert len(output) > tiny_budget, (
+            f'Expected output ({len(output)} chars) to exceed tiny_budget={tiny_budget}; '
+            f'the fallback path emits the full cancelled section regardless of budget'
+        )
+        # The formatter never silently drops the cancelled section or summary line.
+        assert '### Recently Cancelled Tasks' in output
+        assert 'done \u2014 omitted' in output
