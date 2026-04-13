@@ -863,3 +863,45 @@ class TestRenderTaskLineAndFormatTaskList:
         result = format_task_list([t1, t2])
         expected = _render_task_line(t1) + '\n' + _render_task_line(t2)
         assert result == expected
+
+
+class TestFormatCancelledSection:
+    """Tests for the '### Recently Cancelled Tasks' section in format_filtered_task_tree."""
+
+    def test_format_cancelled_tasks_section(self):
+        """format_filtered_task_tree renders a '### Recently Cancelled Tasks' section
+        when cancelled_tasks is non-empty, and updates the summary line accordingly.
+        """
+        tree = FilteredTaskTree(
+            active_tasks=[_make_task(1, 'pending'), _make_task(2, 'in-progress')],
+            cancelled_tasks=[_make_task(8, 'cancelled'), _make_task(9, 'cancelled')],
+            done_count=3,
+            cancelled_count=2,
+            other_count=0,
+            total_count=7,
+        )
+        output = format_filtered_task_tree(tree)
+
+        # (a) Section header must be present
+        assert '### Recently Cancelled Tasks' in output, (
+            f'Expected "### Recently Cancelled Tasks" section in output, got:\n{output!r}'
+        )
+
+        # (b) Task lines for both cancelled tasks must appear
+        assert '- [8] (cancelled)' in output, (
+            f'Expected cancelled task line "- [8] (cancelled)" in output, got:\n{output!r}'
+        )
+        assert '- [9] (cancelled)' in output, (
+            f'Expected cancelled task line "- [9] (cancelled)" in output, got:\n{output!r}'
+        )
+
+        # (c) Summary line omits 'cancelled' since they're now shown
+        assert '3 done \u2014 omitted' in output, (
+            f'Expected summary "3 done \u2014 omitted" in output, got:\n{output!r}'
+        )
+
+        # (d) Old summary format must NOT appear when cancelled section is rendered
+        assert '3 done, 2 cancelled' not in output, (
+            f'Old summary format "3 done, 2 cancelled" must not appear when '
+            f'cancelled section is rendered, got:\n{output!r}'
+        )
