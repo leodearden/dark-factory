@@ -150,7 +150,8 @@ class TestNoneResultSetRationale704:
     rephrased, update the assertions in this class to match the new text.
     """
 
-    def _lines_before_mutation(self) -> list[str]:
+    @staticmethod
+    def _lines_before_mutation() -> list[str]:
         """Return contiguous comment/blank lines immediately before the mutation.
 
         Scoped to the body of test_none_result_set_returns_empty_dict — finds the
