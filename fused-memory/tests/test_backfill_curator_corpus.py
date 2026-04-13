@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -11,8 +12,10 @@ from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.task_curator import (
     BackfillResult,
     TaskCurator,
-    _flatten_task_tree,
 )
+
+if TYPE_CHECKING:
+    from fused_memory.middleware.task_interceptor import TaskInterceptor
 
 
 def _make_config() -> FusedMemoryConfig:
@@ -68,7 +71,7 @@ class TestBackfillCorpus:
              patch.object(curator, '_get_embedder', return_value=mock_embedder), \
              patch.object(curator, '_ensure_collection', return_value=f'task_curator_{project_id}'):
 
-            result = await curator.backfill_corpus(tasks, project_id)
+            await curator.backfill_corpus(tasks, project_id)
 
         # upsert must have been called exactly once
         mock_client.upsert.assert_called_once()
@@ -319,10 +322,6 @@ class TestRunBackfill:
             ],
         }
 
-        # Expected flat list after _flatten_task_tree
-        from fused_memory.middleware.task_curator import _flatten_task_tree
-        expected_flat = _flatten_task_tree(canned_task_tree)  # 3 tasks
-
         mock_backfill_result = BackfillResult(upserted=3, skipped=0, errors=0)
 
         mock_taskmaster = AsyncMock()
@@ -381,7 +380,6 @@ class TestRunBackfill:
 
 def _make_interceptor_config() -> FusedMemoryConfig:
     """Make a config with curator enabled."""
-    from fused_memory.config.schema import EmbedderConfig
     cfg = _make_config()
     cfg.curator.enabled = True
     return cfg
@@ -390,7 +388,7 @@ def _make_interceptor_config() -> FusedMemoryConfig:
 class TestAutoBackfill:
     """Tests for the auto-backfill hook in TaskInterceptor._maybe_backfill_corpus()."""
 
-    def _make_interceptor(self, mock_taskmaster) -> 'TaskInterceptor':
+    def _make_interceptor(self, mock_taskmaster) -> TaskInterceptor:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         config = _make_interceptor_config()
         return TaskInterceptor(

@@ -119,13 +119,9 @@ async def run_backfill(
     async with maintenance_service(config_path) as (config, service):
         # Build a Taskmaster client.
         tm_config = config.taskmaster
-        if tm_config is None:
-            raise RuntimeError(
-                'backfill_curator_corpus: config.taskmaster is not configured — '
-                'cannot fetch task tree.'
-            )
-        tm_config_with_root = tm_config.model_copy(update={'project_root': project_root})
-        taskmaster = TaskmasterBackend(config=tm_config_with_root)
+        if tm_config is not None:
+            tm_config = tm_config.model_copy(update={'project_root': project_root})
+        taskmaster = TaskmasterBackend(config=tm_config)  # type: ignore[arg-type]
 
         # Build a TaskCurator (lazy — connects on first use).
         curator = TaskCurator(config=config, taskmaster=taskmaster)
