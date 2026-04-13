@@ -1863,12 +1863,19 @@ class TestCutoffIso:
         assert result == expected
 
     def test_cutoff_iso_no_now_uses_current_time(self):
-        """Without now, _cutoff_iso uses datetime.now(UTC) — result is within ±2s of expected."""
-        before = datetime.now(UTC) - timedelta(hours=24) - timedelta(seconds=2)
-        result = _cutoff_iso(24)
-        after = datetime.now(UTC) - timedelta(hours=24) + timedelta(seconds=2)
-        result_dt = datetime.fromisoformat(result)
-        assert before < result_dt < after
+        """Without now, _cutoff_iso uses datetime.now(UTC) — result matches mocked clock exactly."""
+        FIXED_NOW = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        expected = (FIXED_NOW - timedelta(hours=24)).isoformat()
+
+        class _FixedDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return FIXED_NOW
+
+        with patch.object(_mqmod, 'datetime', _FixedDT):
+            result = _cutoff_iso(24)
+
+        assert result == expected
 
 
 # ---------------------------------------------------------------------------
