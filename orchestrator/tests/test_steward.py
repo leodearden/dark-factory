@@ -1885,3 +1885,54 @@ class TestPreTriageUsageGateCleanup:
         assert isinstance(result, Escalation)
         # invoke_with_cap_retry sets account_name='' when no gate is provided
         assert mock_result.account_name == ''
+
+
+# ---------------------------------------------------------------------------
+# Pre-triage suggestions path — _handle_escalation integration + kwarg contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPreTriageSuggestionsPath:
+    """_handle_escalation threshold gate and _pre_triage_suggestions kwarg contract."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_triage(self):
+        """Replace orchestrator.agents.triage so tests focus on path, not triage logic."""
+        import sys as _sys
+
+        triage_mod = MagicMock()
+        triage_mod.TRIAGE_OUTPUT_SCHEMA = {'type': 'object'}
+        triage_mod.TRIAGE_SYSTEM_PROMPT = 'You are a classifier.'
+        triage_mod.build_triage_prompt = MagicMock(return_value='triage prompt')
+        triage_mod.parse_triage_result = MagicMock(
+            return_value={'accepted': [], 'skipped': [], 'proposed_task_groups': []}
+        )
+        triage_mod.format_pretriaged_detail = MagicMock(return_value='## Pre-triaged')
+        with patch.dict(_sys.modules, {'orchestrator.agents.triage': triage_mod}):
+            yield triage_mod
+
+    @staticmethod
+    def _esc_with_suggestions(n: int) -> Escalation:
+        """Escalation with *n* JSON suggestions in detail field."""
+        suggestions = [
+            {
+                'description': f'suggestion {i}', 'location': f'file_{i}.py',
+                'reviewer': 'bot', 'category': 'style',
+            }
+            for i in range(n)
+        ]
+        return _make_escalation(detail=json.dumps(suggestions), category='review_suggestions')
+
+    @staticmethod
+    def _hash_esc(n: int) -> Escalation:
+        """Escalation with hash-prefixed detail containing *n* JSON suggestions."""
+        suggestions = [
+            {
+                'description': f'suggestion {i}', 'location': f'file_{i}.py',
+                'reviewer': 'bot', 'category': 'style',
+            }
+            for i in range(n)
+        ]
+        detail = f'#hash:abcdef0123456789#{json.dumps(suggestions)}'
+        return _make_escalation(detail=detail, category='review_suggestions')
