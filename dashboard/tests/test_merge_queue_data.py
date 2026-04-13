@@ -1299,3 +1299,106 @@ class TestMultiDbAggregation:
         """aggregate_speculative_stats with dbs=[] returns all-zero stats dict."""
         result = await aggregate_speculative_stats([], hours=24)
         assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+
+    # -----------------------------------------------------------------------
+    # Gap coverage (c): None entries in dbs — per-DB returns empty defaults
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_none_entry_queue_depth(self, tmp_path):
+        """aggregate_queue_depth_timeseries with [valid_conn, None] merges cleanly."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        cutoff = now - timedelta(hours=24)
+        bucket = _bucket_start(cutoff) + timedelta(hours=22)
+
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': bucket + timedelta(minutes=1),
+             'data': {'outcome': 'done'}},
+        ])
+
+        async with aiosqlite.connect(str(db1)) as conn1:
+            conn1.row_factory = aiosqlite.Row
+            result = await aggregate_queue_depth_timeseries([conn1, None], hours=24, now=now)
+
+        assert len(result['labels']) == 97
+        bucket_label = bucket.isoformat()
+        assert bucket_label in result['labels']
+        idx = result['labels'].index(bucket_label)
+        assert result['values'][idx] == 1  # valid DB only; None contributed nothing
+
+    @pytest.mark.asyncio
+    async def test_none_entry_outcome_distribution(self, tmp_path):
+        """aggregate_outcome_distribution with [valid_conn, None] merges cleanly."""
+        now = datetime.now(UTC)
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
+             'data': {'outcome': 'done'}},
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
+             'data': {'outcome': 'done'}},
+        ])
+
+        async with aiosqlite.connect(str(db1)) as conn1:
+            conn1.row_factory = aiosqlite.Row
+            result = await aggregate_outcome_distribution([conn1, None], hours=24)
+
+        assert 'done' in result['labels']
+        done_idx = result['labels'].index('done')
+        assert result['values'][done_idx] == 2  # from valid DB only
+
+    @pytest.mark.asyncio
+    async def test_none_entry_latency_stats(self, tmp_path):
+        """aggregate_latency_stats with [valid_conn, None] merges cleanly."""
+        now = datetime.now(UTC)
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
+             'data': {'outcome': 'done'}, 'duration_ms': 100},
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
+             'data': {'outcome': 'done'}, 'duration_ms': 200},
+        ])
+
+        async with aiosqlite.connect(str(db1)) as conn1:
+            conn1.row_factory = aiosqlite.Row
+            result = await aggregate_latency_stats([conn1, None], hours=24)
+
+        assert result['count'] == 2
+        assert result['mean_ms'] == pytest.approx(150.0, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_none_entry_recent_merges(self, tmp_path):
+        """aggregate_recent_merges with [valid_conn, None] merges cleanly."""
+        now = datetime.now(UTC)
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=1),
+             'task_id': 'task-a', 'data': {'outcome': 'done'}},
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=2),
+             'task_id': 'task-b', 'data': {'outcome': 'done'}},
+        ])
+
+        async with aiosqlite.connect(str(db1)) as conn1:
+            conn1.row_factory = aiosqlite.Row
+            result = await aggregate_recent_merges([conn1, None], limit=20)
+
+        assert len(result) == 2
+        assert result[0]['task_id'] == 'task-a'
+        assert result[1]['task_id'] == 'task-b'
+
+    @pytest.mark.asyncio
+    async def test_none_entry_speculative_stats(self, tmp_path):
+        """aggregate_speculative_stats with [valid_conn, None] merges cleanly."""
+        now = datetime.now(UTC)
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'speculative_merge', 'timestamp': now - timedelta(minutes=1),
+             'data': {'base_sha': 'abc'}},
+            {'event_type': 'speculative_discard', 'timestamp': now - timedelta(minutes=2),
+             'data': {'reason': 'previous_failed'}},
+        ])
+
+        async with aiosqlite.connect(str(db1)) as conn1:
+            conn1.row_factory = aiosqlite.Row
+            result = await aggregate_speculative_stats([conn1, None], hours=24)
+
+        assert result['hit_count'] == 1
+        assert result['discard_count'] == 1
+        assert result['total'] == 2
+        assert result['hit_rate'] == pytest.approx(0.5, abs=1e-6)
