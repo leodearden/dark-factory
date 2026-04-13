@@ -75,25 +75,15 @@ class TaskKnowledgeSync(BaseStage):
                     tasks_data = {}
             filtered = filter_task_tree(tasks_data)
 
-        # Defensive invariant check (task-782): done_count > 0 must imply done_tasks
-        # non-empty.  filter_task_tree() always appends to done_tasks when it increments
-        # done_count (capped at MAX_DONE_TASKS_RETAINED=30), so this state is impossible
-        # via the normal code path.  Externally-constructed FilteredTaskTree instances
-        # (e.g. from harness callers that build the dataclass directly) could violate it;
-        # this warning catches such cases at the callsite rather than silently dropping data.
-        if filtered.done_count > 0 and not filtered.done_tasks:
-            logger.warning(
-                'FilteredTaskTree invariant violation: done_count=%d but done_tasks is '
-                'empty. Externally-constructed tree bypassed filter_task_tree() guarantee. '
-                'Recently Completed section will render as empty. (task-782 defensive check)',
-                filtered.done_count,
-            )
+        # Defensive invariant check (task-782): see _check_filtered_tree_invariant.
+        self._check_filtered_tree_invariant(filtered)
 
         # Render "Recently Completed Tasks" section.
         # Invariant: filter_task_tree() always appends to done_tasks when it increments
         # done_count (capped at MAX_DONE_TASKS_RETAINED=30), so done_tasks is guaranteed
         # non-empty whenever done_count > 0.  No fallback summary branch is needed.
-        # The defensive check above catches externally-constructed trees that violate it.
+        # _check_filtered_tree_invariant() warns for externally-constructed trees that
+        # violate this.
         if filtered.done_tasks:
             recently_completed_text = format_task_list(filtered.done_tasks)
         else:
@@ -153,6 +143,24 @@ that may now be met, and done tasks for missing knowledge capture.
 {_STAGE2_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
 Use project_root="{self.project_root}" for all task operations.
 """
+
+    @staticmethod
+    def _check_filtered_tree_invariant(filtered: FilteredTaskTree) -> None:
+        """Emit a WARNING if done_count > 0 but done_tasks is empty (task-782 defensive check).
+
+        filter_task_tree() always appends to done_tasks when it increments done_count
+        (capped at MAX_DONE_TASKS_RETAINED=30), so this invariant is impossible to violate
+        via the normal code path.  Externally-constructed FilteredTaskTree instances that
+        bypass filter_task_tree() could violate it; this check catches them at the callsite
+        rather than silently dropping data from the "Recently Completed" section.
+        """
+        if filtered.done_count > 0 and not filtered.done_tasks:
+            logger.warning(
+                'FilteredTaskTree invariant violation: done_count=%d but done_tasks is '
+                'empty. Externally-constructed tree bypassed filter_task_tree() guarantee. '
+                'Recently Completed section will render as empty. (task-782 defensive check)',
+                filtered.done_count,
+            )
 
 
 class IntegrityCheck(BaseStage):

@@ -2109,12 +2109,16 @@ class TestInvariantAfterTask643:
     async def test_warns_when_filtered_task_tree_violates_invariant(
         self, mock_deps, watermark, caplog
     ):
-        """A FilteredTaskTree with done_count>0 but empty done_tasks triggers a WARNING.
+        """Integration guard: a FilteredTaskTree with done_count>0 but empty done_tasks triggers a WARNING.
 
-        This guards the defensive check added by task-782 in
-        ``TaskKnowledgeSync.assemble_payload``.  The invariant-violating state can
-        only be reached by external callers that construct a ``FilteredTaskTree``
-        directly (bypassing ``filter_task_tree``).
+        This test exercises the full ``assemble_payload`` method intentionally — it
+        verifies that ``_check_filtered_tree_invariant`` is correctly wired into the
+        ``assemble_payload`` call chain, not just that the helper itself works.  For
+        isolated testing of the helper, see
+        ``test_check_filtered_tree_invariant_warns_on_violation``.
+
+        The invariant-violating state can only be reached by external callers that
+        construct a ``FilteredTaskTree`` directly (bypassing ``filter_task_tree``).
         """
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
@@ -2150,6 +2154,56 @@ class TestInvariantAfterTask643:
             f'got records: {[(r.name, r.levelno, r.message) for r in caplog.records]}'
         )
 
+    def test_check_filtered_tree_invariant_warns_on_violation(self, mock_deps, caplog):
+        """Unit test for _check_filtered_tree_invariant: warns when invariant is violated.
+
+        Calls the private helper directly — no ``assemble_payload`` involved — so
+        changes to the rest of ``assemble_payload``'s rendering logic cannot break
+        this test.
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        violating_tree = FilteredTaskTree(
+            active_tasks=[],
+            done_tasks=[],
+            done_count=3,
+            cancelled_tasks=[],
+            cancelled_count=0,
+            other_count=0,
+            total_count=3,
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            stage._check_filtered_tree_invariant(violating_tree)
+
+        assert any(
+            rec.levelno == logging.WARNING
+            and 'done_count' in rec.message
+            and 'done_tasks' in rec.message
+            for rec in caplog.records
+        )
+
+    def test_check_filtered_tree_invariant_no_warning_when_ok(self, mock_deps, caplog):
+        """Unit test for _check_filtered_tree_invariant: no warning when invariant holds."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        ok_tree = FilteredTaskTree(
+            active_tasks=[],
+            done_tasks=[self._make_task(1, 'done')],
+            done_count=1,
+            cancelled_tasks=[],
+            cancelled_count=0,
+            other_count=0,
+            total_count=1,
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            stage._check_filtered_tree_invariant(ok_tree)
+
+        assert not any(rec.levelno == logging.WARNING for rec in caplog.records)
+
     def test_filter_task_tree_invariant_done_count_and_done_tasks_populated_together(self):
         """Regression guard: filter_task_tree() sets done_count>0 ↔ done_tasks non-empty.
 
@@ -2175,11 +2229,6 @@ class TestInvariantAfterTask643:
             f'Expected non-empty done_tasks for done_count={result.done_count}, '
             f'got done_tasks={result.done_tasks!r}'
         )
-        # Explicit invariant assertion: done_count > 0 implies done_tasks non-empty
-        if result.done_count > 0:
-            assert result.done_tasks, (
-                'Invariant violated: done_count > 0 but done_tasks is empty'
-            )
 
     def test_filter_task_tree_invariant_holds_with_over_cap_done_tasks(self):
         """Regression guard: at the >MAX_DONE_TASKS_RETAINED boundary the invariant still holds.
@@ -2202,7 +2251,5 @@ class TestInvariantAfterTask643:
             f'Expected done_tasks capped at {MAX_DONE_TASKS_RETAINED}, '
             f'got {len(result.done_tasks)}'
         )
-        # Invariant clause: even at the cap boundary, done_count > 0 implies done_tasks non-empty
-        assert len(result.done_tasks) > 0, (
-            'Invariant violated at cap boundary: done_tasks is empty despite done_count > 0'
-        )
+        # Invariant holds implicitly: the assertion above already proves done_tasks
+        # is non-empty (MAX_DONE_TASKS_RETAINED == 30).
