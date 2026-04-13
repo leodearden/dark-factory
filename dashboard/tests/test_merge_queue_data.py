@@ -1879,6 +1879,36 @@ class TestCutoffIso:
 
 
 # ---------------------------------------------------------------------------
+# TestNowThreadingToCutoffIso (step-3)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    'fn_under_test',
+    [outcome_distribution, speculative_stats, latency_stats],
+    ids=lambda fn: fn.__name__,
+)
+class TestNowThreadingToCutoffIso:
+    @pytest.mark.asyncio
+    async def test_threads_now_to_cutoff_iso(self, fn_under_test, merge_events_db):
+        """fn_under_test accepts now and passes it through to _cutoff_iso."""
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        captured_nows: list = []
+
+        def mock_cutoff_iso(hours: int, *, now=None) -> str:
+            captured_nows.append(now)
+            return '2020-01-01T00:00:00+00:00'
+
+        async with aiosqlite.connect(str(merge_events_db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with patch('dashboard.data.merge_queue._cutoff_iso', side_effect=mock_cutoff_iso):
+                await fn_under_test(conn, hours=24, now=fixed_now)
+
+        assert captured_nows == [fixed_now], (
+            f"Expected _cutoff_iso called once with now={fixed_now!r}, got {captured_nows!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestOutcomeDistributionNow (step-3)
 # ---------------------------------------------------------------------------
 
