@@ -389,23 +389,17 @@ class TaskInterceptor:
             if not flat_tasks:
                 return
 
-            # Fire and forget.
-            async def _do_backfill() -> None:
-                try:
-                    result = await curator.backfill_corpus(flat_tasks, project_id)
-                    logger.info(
-                        'task_curator: auto-backfill complete — '
-                        'upserted=%d skipped=%d errors=%d',
-                        result.upserted, result.skipped, result.errors,
-                    )
-                except Exception:
-                    logger.warning(
-                        'task_curator: auto-backfill failed', exc_info=True,
-                    )
-
-            bg = asyncio.create_task(_do_backfill(), name='curator-auto-backfill')
-            self._background_tasks.add(bg)
-            bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+            try:
+                result = await curator.backfill_corpus(flat_tasks, project_id)
+                logger.info(
+                    'task_curator: auto-backfill complete — '
+                    'upserted=%d skipped=%d errors=%d',
+                    result.upserted, result.skipped, result.errors,
+                )
+            except Exception:
+                logger.warning(
+                    'task_curator: auto-backfill failed', exc_info=True,
+                )
 
         except Exception:
             logger.warning('task_curator: _maybe_backfill_corpus raised', exc_info=True)
