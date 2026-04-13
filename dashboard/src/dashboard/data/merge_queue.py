@@ -172,7 +172,7 @@ async def queue_depth_timeseries(
         now_aligned = _align_bucket(effective_now, bucket_min)
 
         # Generate buckets from cutoff_aligned through now_aligned inclusive
-        num_buckets = int((now_aligned - cutoff_aligned) / timedelta(minutes=bucket_min)) + 1
+        num_buckets = (now_aligned - cutoff_aligned) // timedelta(minutes=bucket_min) + 1
         buckets = [
             cutoff_aligned + timedelta(minutes=bucket_min * i)
             for i in range(num_buckets)
