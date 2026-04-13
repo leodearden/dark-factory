@@ -89,9 +89,81 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
     return GitOps(git_config, git_repo)
 
 
+async def _setup_repo_with_remote(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a bare origin repo and a local clone for remote-fetch tests."""
+    origin = tmp_path / 'origin.git'
+    origin.mkdir()
+    await _run(['git', 'init', '--bare', '-b', 'main'], cwd=origin)
+
+    # Seed origin via a temp non-bare repo
+    seed = tmp_path / 'seed'
+    seed.mkdir()
+    await _run(['git', 'init', '-b', 'main'], cwd=seed)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=seed)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=seed)
+    (seed / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=seed)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=seed)
+    await _run(['git', 'remote', 'add', 'origin', str(origin)], cwd=seed)
+    await _run(['git', 'push', 'origin', 'main'], cwd=seed)
+
+    # Clone origin to local
+    local = tmp_path / 'local'
+    await _run(['git', 'clone', str(origin), str(local)])
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=local)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=local)
+
+    return origin, local
+
+
+@pytest.fixture
+def git_repo_with_remote(tmp_path: Path) -> tuple[Path, Path]:
+    """Bare origin repo and a local clone with configured user (origin_path, local_path)."""
+    return asyncio.run(_setup_repo_with_remote(tmp_path))
+
+
+@pytest.fixture
+def git_ops_with_remote(
+    git_config: GitConfig,
+    git_repo_with_remote: tuple[Path, Path],
+) -> tuple[GitOps, Path]:
+    """GitOps against a local clone that has a configured remote (origin)."""
+    origin, local = git_repo_with_remote
+    return GitOps(git_config, local), origin
+
+
+async def _push_n_commits_to_origin(
+    origin: Path,
+    n: int,
+    prefix: str = 'remote',
+) -> None:
+    """Push n new commits to the bare origin repo via a temporary clone."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        temp = Path(td) / 'temp_push'
+        await _run(['git', 'clone', str(origin), str(temp)])
+        await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=temp)
+        await _run(['git', 'config', 'user.name', 'Test'], cwd=temp)
+        for i in range(n):
+            (temp / f'{prefix}_{i}.txt').write_text(f'{prefix} content {i}\n')
+            await _run(['git', 'add', '-A'], cwd=temp)
+            await _run(['git', 'commit', '-m', f'{prefix} commit {i}'], cwd=temp)
+        rc, _, err = await _run(['git', 'push', 'origin', 'main'], cwd=temp)
+        assert rc == 0, f'push to bare origin failed: {err}'
+
 
 @pytest.mark.asyncio
 class TestWorktreeLifecycle:
+    async def test_worktree_info_stale_commits_field(self, git_ops: GitOps):
+        """WorktreeInfo.stale_commits defaults to None and can be set explicitly."""
+        info_default = WorktreeInfo(path=git_ops.project_root, base_commit='a' * 40)
+        assert info_default.stale_commits is None
+
+        info_explicit = WorktreeInfo(
+            path=git_ops.project_root, base_commit='a' * 40, stale_commits=5,
+        )
+        assert info_explicit.stale_commits == 5
+
     async def test_create_worktree(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-1')
         assert worktree_info.path.exists()
@@ -299,6 +371,145 @@ class TestWorktreeLifecycle:
             assert not leak_dirs, (
                 f'Leaked merge worktree directories on disk: {leak_dirs}'
             )
+
+
+@pytest.mark.asyncio
+class TestFreshenMain:
+    async def test_freshen_main_no_remote(self, git_ops: GitOps):
+        """Without a remote, _freshen_main returns (main_branch, None)."""
+        ref, stale = await git_ops._freshen_main()
+        assert ref == git_ops.config.main_branch
+        assert stale is None
+
+    async def test_freshen_main_remote_ahead(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """When origin/main is 3 commits ahead, returns ('origin/main', 3)."""
+        git_ops, origin = git_ops_with_remote
+        await _push_n_commits_to_origin(origin, 3)
+        ref, stale = await git_ops._freshen_main()
+        assert ref == f'{git_ops.config.remote}/{git_ops.config.main_branch}'
+        assert stale == 3
+
+    async def test_freshen_main_already_current(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """When local main == origin/main (no new commits), returns (main_branch, 0)."""
+        git_ops, _origin = git_ops_with_remote
+        ref, stale = await git_ops._freshen_main()
+        assert ref == git_ops.config.main_branch
+        assert stale == 0
+
+    async def test_freshen_main_diverged(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """When local and remote have diverged, returns (main_branch, N) with N behind count."""
+        git_ops, origin = git_ops_with_remote
+        local = git_ops.project_root
+        # Add a local-only commit (not pushed to origin)
+        (local / 'local_only.txt').write_text('local only\n')
+        await _run(['git', 'add', '-A'], cwd=local)
+        await _run(['git', 'commit', '-m', 'Local only commit'], cwd=local)
+        # Add a different commit to origin (creates divergence)
+        await _push_n_commits_to_origin(origin, 1, prefix='remote_div')
+        ref, stale = await git_ops._freshen_main()
+        # Diverged: use local ref to avoid losing advance_main commits
+        assert ref == git_ops.config.main_branch
+        assert stale == 1
+
+    async def test_freshen_main_behind_rev_list_fails(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """When behind rev-list exits non-zero, _freshen_main returns (main_branch, None)."""
+        git_ops, _origin = git_ops_with_remote
+
+        call_count = 0
+
+        async def fake_run(cmd, cwd=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (0, '', '')          # fetch succeeds
+            return (128, '', 'fatal: bad revision')   # rev-list fails
+
+        with patch('orchestrator.git_ops._run', side_effect=fake_run):
+            ref, stale = await git_ops._freshen_main()
+
+        assert ref == git_ops.config.main_branch
+        assert stale is None
+
+    async def test_freshen_main_behind_count_value_error(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """When behind rev-list returns non-numeric stdout, _freshen_main returns (main_branch, None)."""
+        git_ops, _origin = git_ops_with_remote
+
+        call_count = 0
+
+        async def fake_run(cmd, cwd=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (0, '', '')           # fetch succeeds
+            return (0, 'not-a-number', '')   # rev-list returns garbage
+
+        with patch('orchestrator.git_ops._run', side_effect=fake_run):
+            ref, stale = await git_ops._freshen_main()
+
+        assert ref == git_ops.config.main_branch
+        assert stale is None
+
+    async def test_freshen_main_ahead_count_value_error(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """When ahead rev-list returns non-numeric stdout, falls back to (main_branch, behind)."""
+        git_ops, _origin = git_ops_with_remote
+
+        call_count = 0
+
+        async def fake_run(cmd, cwd=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (0, '', '')           # fetch succeeds
+            elif call_count == 2:
+                return (0, '3', '')          # behind rev-list: 3 commits behind
+            return (0, 'not-a-number', '')   # ahead rev-list returns garbage
+
+        with patch('orchestrator.git_ops._run', side_effect=fake_run):
+            ref, stale = await git_ops._freshen_main()
+
+        # Falls back to local main; reports behind count as-is
+        assert ref == git_ops.config.main_branch
+        assert stale == 3
+
+
+@pytest.mark.asyncio
+class TestCreateWorktreeFreshening:
+    async def test_create_worktree_freshens_from_remote(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """Worktree based on remote ref when origin is ahead — new file is present."""
+        git_ops, origin = git_ops_with_remote
+        await _push_n_commits_to_origin(origin, 1, prefix='fresh')
+        worktree_info = await git_ops.create_worktree('freshen-test')
+        assert (worktree_info.path / 'fresh_0.txt').exists()
+
+    async def test_create_worktree_stale_commits_populated(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """stale_commits == 2 when origin is 2 commits ahead at create_worktree time."""
+        git_ops, origin = git_ops_with_remote
+        await _push_n_commits_to_origin(origin, 2)
+        worktree_info = await git_ops.create_worktree('stale-commits-test')
+        assert worktree_info.stale_commits == 2
+
+    async def test_create_worktree_stale_commits_none_without_remote(
+        self, git_ops: GitOps,
+    ):
+        """stale_commits is None when no remote is configured (graceful degradation)."""
+        worktree_info = await git_ops.create_worktree('no-remote-test')
+        assert worktree_info.stale_commits is None
 
 
 @pytest.mark.asyncio
