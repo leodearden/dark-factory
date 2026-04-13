@@ -88,7 +88,7 @@ class CandidateTask:
     description: str = ''
     details: str = ''
     files_to_modify: list[str] = field(default_factory=list)
-    priority: str = 'medium'
+    priority: str = DEFAULT_PRIORITY
     spawned_from: str | None = None  # task id of the review-chain anchor
     spawn_context: str = 'manual'  # review | steward-triage | expand | parse_prd | manual
 
@@ -563,7 +563,7 @@ class TaskCurator:
                         'title': title,
                         'description': description[:1000],
                         'files_to_modify': files,
-                        'priority': task.get('priority', '') or DEFAULT_PRIORITY,
+                        'priority': task.get('priority') or DEFAULT_PRIORITY,
                         'project_id': project_id,
                         'updated_at': datetime.now(UTC).isoformat(),
                     },
@@ -790,7 +790,7 @@ class TaskCurator:
                 payload.get('files_to_modify', []) or [], depth=lock_depth,
             ),
             status='unknown',
-            priority=str(payload.get('priority', 'medium')),
+            priority=str(payload.get('priority', DEFAULT_PRIORITY)),
             source=source,
             combine_eligible=False,  # unknown status → treat as drop-only
         )
@@ -940,7 +940,7 @@ def _to_pool_entry(
         files_to_modify=files,
         module_keys=files_to_modules(files, depth=lock_depth),
         status=status,
-        priority=str(task.get('priority', 'medium')),
+        priority=str(task.get('priority', DEFAULT_PRIORITY)),
         source=source,
         combine_eligible=(status == 'pending'),
     )
@@ -1089,7 +1089,7 @@ def _parse_decision(
                 description=str(rt.get('description', '')),
                 details=str(rt.get('details', '')),
                 files_to_modify=[str(f) for f in (rt.get('files_to_modify') or [])],
-                priority=str(rt.get('priority', 'medium')),
+                priority=str(rt.get('priority', DEFAULT_PRIORITY)),
             )
         except Exception as exc:
             return CuratorDecision(
