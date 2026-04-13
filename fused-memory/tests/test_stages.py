@@ -1725,6 +1725,37 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         assert 'Task 99' in payload
 
     @pytest.mark.asyncio
+    async def test_recently_completed_renders_done_titles_via_primary_path(
+        self, mock_deps, watermark,
+    ):
+        """Primary if-branch: done_tasks populated → all done task titles appear in Recently Completed."""
+        done_tasks = [
+            self._make_task(101, 'done'),
+            self._make_task(102, 'done'),
+            self._make_task(103, 'done'),
+        ]
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        stage.filtered_task_tree = self._make_tree(
+            [self._make_task(10, 'in-progress')],
+            done_count=3,
+            done_tasks=done_tasks,
+        )
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        # (a) get_tasks must NOT be called
+        mock_deps['taskmaster'].get_tasks.assert_not_called()
+        # (b) Recently Completed section must be present
+        assert '### Recently Completed Tasks' in payload
+        # (c) Each done task title must appear in the Recently Completed section
+        recently_section = _extract_section(payload, '### Recently Completed Tasks')
+        assert 'Task 101' in recently_section, "Task 101 not found in Recently Completed section"
+        assert 'Task 102' in recently_section, "Task 102 not found in Recently Completed section"
+        assert 'Task 103' in recently_section, "Task 103 not found in Recently Completed section"
+
+    @pytest.mark.asyncio
     async def test_recently_completed_shows_count_when_no_done_tasks_objects(
         self, mock_deps, watermark,
     ):
