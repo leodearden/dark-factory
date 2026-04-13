@@ -2004,3 +2004,26 @@ class TestPreTriageSuggestionsPath:
 
         call_kwargs = steward.briefing.build_steward_initial_prompt.call_args.kwargs
         assert '## Pre-Triaged Results' in call_kwargs['escalation']['detail']
+
+    async def test_pre_triage_failure_falls_back_in_handle_escalation(
+        self, steward,
+    ):
+        """When _pre_triage_suggestions returns original escalation, steward uses original detail."""
+        esc = self._esc_with_suggestions(12)
+        original_detail = esc.detail
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+        with (
+            patch.object(
+                steward, '_pre_triage_suggestions',
+                new_callable=AsyncMock, return_value=esc,
+            ),
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock, return_value=_make_result()) as mock_invoke,
+        ):
+            await steward._handle_escalation(esc)
+
+        call_kwargs = steward.briefing.build_steward_initial_prompt.call_args.kwargs
+        assert call_kwargs['escalation']['detail'] == original_detail
+        mock_invoke.assert_called_once()
