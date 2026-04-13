@@ -23,12 +23,24 @@ robust than importing the test module (which would perturb pytest collection).
 """
 from __future__ import annotations
 
+import ast
 import pathlib
 
 
 def _read_sibling(name: str) -> str:
     """Return the raw source text of a sibling test file."""
     return (pathlib.Path(__file__).parent / name).read_text(encoding='utf-8')
+
+
+def _extract_module_docstring(src: str) -> str:
+    """Return the module-level docstring of the given source, or '' if absent.
+
+    Scopes substring checks to the docstring alone — excludes comment text,
+    string literals in function bodies, and any other non-docstring content.
+    Use this instead of raw-source substring search when the intent is to pin
+    wording that belongs in the module docstring specifically.
+    """
+    return ast.get_docstring(ast.parse(src)) or ''
 
 
 def test_extract_module_docstring_returns_only_the_docstring() -> None:
