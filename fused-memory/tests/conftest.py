@@ -305,6 +305,32 @@ async def assert_ro_query_only(
     return graph
 
 
+def make_rebuild_detail(
+    uuid: str,
+    name: str,
+    *,
+    old_summary: str = '',
+    new_summary: str = '',
+    edge_count: int = 0,
+    status: str = 'rebuilt',
+) -> dict:
+    """Return a rebuild-detail dict with the six canonical keys.
+
+    uuid and name are positional; all other parameters are keyword-only.
+    This mirrors the dict shape returned by _rebuild_entity_from_edges and
+    refresh_entity_summary, and is the shared factory used across the rebuild
+    pipeline test suite.
+    """
+    return {
+        'uuid': uuid,
+        'name': name,
+        'old_summary': old_summary,
+        'new_summary': new_summary,
+        'edge_count': edge_count,
+        'status': status,
+    }
+
+
 def extract_cypher(call_args: Any) -> str:
     """Return the Cypher query string from a mock call_args object.
 
