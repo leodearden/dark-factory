@@ -366,26 +366,35 @@ class UsageGate:
         return None
 
     def _resolve_account(self, oauth_token: str | None) -> AccountState | None:
-        """Look up an account by token, falling back to the first uncapped account.
+        """Look up an account by token, with two distinct fallback paths.
 
-        Steps:
-        1. If ``oauth_token`` is provided, try an exact token match via
-           ``_find_account_by_token``.
-        2. If no account was found (unknown token or ``None`` token), iterate
-           ``_accounts`` and return the first account that is not capped.
-        3. Return ``None`` if neither step resolves an account.
+        Paths:
+        1. If ``oauth_token`` is provided and ``_find_account_by_token`` returns a
+           match, that account is returned.
+        2. If ``oauth_token`` is provided but *no* match is found (config drift),
+           log a WARNING and return ``None`` — no best-guess fallback applies.
+           The caller's existing 'no matching account' warning will also fire.
+        3. If ``oauth_token`` is ``None`` (no identity signal at all), fall back to
+           the first uncapped account in ``_accounts``.  Return ``None`` if all
+           accounts are capped.
 
-        The caller is responsible for emitting any 'no matching account' warning
-        and for deciding the appropriate early-return behaviour.  This helper
-        intentionally does not log.
+        The distinction matters because silently attributing cap state to an
+        unrelated account (old path 2) is a worse failure mode than a logged
+        warning with no action.
         """
-        acct = self._find_account_by_token(oauth_token) if oauth_token else None
-        if acct is None:
-            for a in self._accounts:
-                if not a.capped:
-                    acct = a
-                    break
-        return acct
+        if oauth_token:
+            acct = self._find_account_by_token(oauth_token)
+            if acct is None:
+                logger.warning(
+                    'oauth_token provided but does not match any configured account;'
+                    ' possible config drift'
+                )
+            return acct
+        # oauth_token is None: no identity — use first-uncapped fallback
+        for a in self._accounts:
+            if not a.capped:
+                return a
+        return None
 
     def _start_account_resume_probe(self, acct: AccountState) -> None:
         """Start an async resume probe for a specific account."""
