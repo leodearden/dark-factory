@@ -19,6 +19,7 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.reconciliation.context_assembler import (
     ContextAssembler,
+    _format_task,
     estimate_tokens,
     format_event,
 )
@@ -702,3 +703,31 @@ class TestContextAssemblerCancellation:
             pytest.raises(TypeError),
         ):
             await assembler.assemble(events, watermark, 'test-project')
+
+
+# ── _format_task display_id ──────────────────────────────────────────
+
+
+def test_format_task_display_id_overrides_bare_int_id():
+    """When display_id='450.2' is passed, output uses qualified ID not bare int."""
+    task = {
+        'id': 2,
+        'title': 'Fix subtask',
+        'status': 'in-progress',
+        'dependencies': [],
+    }
+    result = _format_task(task, display_id='450.2')
+    assert '[task:450.2]' in result
+    assert '[task:2]' not in result
+
+
+def test_format_task_no_display_id_uses_task_id_field():
+    """Without display_id, output uses task.get('id') — backward-compatible."""
+    task = {
+        'id': '42',
+        'title': 'Top-level task',
+        'status': 'done',
+        'dependencies': [1, 3],
+    }
+    result = _format_task(task)
+    assert '[task:42]' in result
