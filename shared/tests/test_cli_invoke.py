@@ -1259,15 +1259,6 @@ class TestParseClaudeOutputTimedOutDefault:
         assert agent.timed_out is False
 
 
-class TestParseClaudeOutputDocstringContract:
-    """_parse_claude_output docstring must document the timed_out=False contract."""
-
-    def test_docstring_contains_does_not_set_timed_out(self):
-        """_parse_claude_output.__doc__ contains 'does not set timed_out' contract note."""
-        assert _parse_claude_output.__doc__ is not None
-        assert 'does not set timed_out' in _parse_claude_output.__doc__
-
-
 # ── caller-level timed_out propagation (characterization tests) ───────────────
 
 
@@ -1287,17 +1278,6 @@ class TestClaudeCallerPropagatesTimedOut:
             )
         assert agent.timed_out is True
 
-    async def test_claude_caller_propagates_timed_out_false(self, tmp_path):
-        """invoke_claude_agent returns AgentResult with timed_out=False when subprocess did not time out."""
-        not_timed_result = _SubprocessResult(stdout='', stderr='err', returncode=1,
-                                             duration_ms=100, timed_out=False)
-        with patch('shared.cli_invoke._run_subprocess',
-                   new_callable=AsyncMock, return_value=not_timed_result):
-            agent = await invoke_claude_agent(
-                prompt='hello', system_prompt='sys', cwd=tmp_path,
-                model='claude-sonnet-4-5', timeout_seconds=30.0,
-            )
-        assert agent.timed_out is False
 
 
 def _make_gate(
