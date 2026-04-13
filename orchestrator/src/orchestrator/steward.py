@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from orchestrator.agents.invoke import invoke_agent
+from orchestrator.agents.invoke import invoke_agent, invoke_with_cap_retry
 from orchestrator.agents.roles import STEWARD
 from orchestrator.event_store import EventStore, EventType
 
@@ -487,11 +487,9 @@ class TaskSteward:
         suggestions = json.loads(_strip_hash_prefix(escalation.detail))
         prompt = build_triage_prompt(suggestions, self.task)
 
-        oauth_token = None
-        if self.usage_gate:
-            oauth_token = await self.usage_gate.before_invoke()
-
-        result = await invoke_agent(
+        result = await invoke_with_cap_retry(
+            self.usage_gate,
+            f'Steward for task {self.task_id} [pre-triage]',
             prompt=prompt,
             system_prompt=TRIAGE_SYSTEM_PROMPT,
             cwd=self.config.project_root,
@@ -506,16 +504,12 @@ class TaskSteward:
             output_schema=TRIAGE_OUTPUT_SCHEMA,
             effort=self.config.effort.triage,
             backend=self.config.backends.triage,
-            oauth_token=oauth_token,
         )
 
-        # Track cost against steward metrics
+        # Track cost against steward metrics (invoke_with_cap_retry handles usage_gate cleanup)
         self.metrics.invocations += 1
         self.metrics.total_cost_usd += result.cost_usd
         self.metrics.total_duration_ms += result.duration_ms
-
-        if self.usage_gate:
-            self.usage_gate.on_agent_complete(result.cost_usd)
 
         triage_result = parse_triage_result(result)
         if triage_result is None:
