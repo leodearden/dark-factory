@@ -1552,6 +1552,16 @@ class TestMemoryConsolidatorFilteredTaskTree:
         assert '### Active Task Tree' in payload
         assert 'Active task 1' in payload
 
+    def test_make_active_tree_summary_line_has_consistent_total(self):
+        """_make_active_tree(3) total_count must equal 3 active + 0 done + 2 cancelled = 5."""
+        from fused_memory.reconciliation.task_filter import format_filtered_task_tree
+        tree = self._make_active_tree(3)
+        rendered = format_filtered_task_tree(tree)
+        assert '5 total' in rendered, (
+            f'Expected total_count=5 (3 active + 0 done + 2 cancelled) '
+            f'but rendered: {rendered!r}'
+        )
+
 
 # ── Tests for task 455: TaskKnowledgeSync filtered task tree injection ─────────
 
