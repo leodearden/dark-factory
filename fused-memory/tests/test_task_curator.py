@@ -13,7 +13,7 @@ from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
     TaskCurator,
-    _flatten_task_tree,
+    flatten_task_tree,
     _parse_decision,
     _PoolEntry,
     _task_dependencies,
@@ -99,7 +99,7 @@ class TestToPoolEntry:
 class TestFlattenTaskTree:
     def test_flat(self):
         tasks = {'tasks': [{'id': '1'}, {'id': '2'}]}
-        assert [t['id'] for t in _flatten_task_tree(tasks)] == ['1', '2']
+        assert [t['id'] for t in flatten_task_tree(tasks)] == ['1', '2']
 
     def test_nested(self):
         tasks = {
@@ -108,16 +108,16 @@ class TestFlattenTaskTree:
                 {'id': '2'},
             ],
         }
-        assert [t['id'] for t in _flatten_task_tree(tasks)] == ['1', '1.1', '1.2', '2']
+        assert [t['id'] for t in flatten_task_tree(tasks)] == ['1', '1.1', '1.2', '2']
 
     def test_data_wrapper(self):
         tasks = {'data': {'tasks': [{'id': '1'}]}}
-        assert [t['id'] for t in _flatten_task_tree(tasks)] == ['1']
+        assert [t['id'] for t in flatten_task_tree(tasks)] == ['1']
 
     def test_empty(self):
-        assert _flatten_task_tree({}) == []
+        assert flatten_task_tree({}) == []
 
-    def test_flatten_task_tree_public_name(self):
+    def testflatten_task_tree_public_name(self):
         """flatten_task_tree (no leading underscore) is importable as a public API."""
         from fused_memory.middleware.task_curator import flatten_task_tree
         result = flatten_task_tree({'tasks': [{'id': '1'}]})

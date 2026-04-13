@@ -12,7 +12,7 @@ from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
     TaskCurator,
-    _flatten_task_tree,
+    flatten_task_tree,
     _to_pool_entry,
 )
 from fused_memory.models.reconciliation import (
@@ -362,7 +362,7 @@ class TaskInterceptor:
         self._backfill_triggered = True
 
         try:
-            from fused_memory.middleware.task_curator import _flatten_task_tree
+            from fused_memory.middleware.task_curator import flatten_task_tree
             from fused_memory.models.scope import resolve_project_id
 
             project_id = resolve_project_id(project_root)
@@ -382,7 +382,7 @@ class TaskInterceptor:
                 return
             try:
                 tasks_result = await self.taskmaster.get_tasks(project_root)
-                flat_tasks = _flatten_task_tree(tasks_result)
+                flat_tasks = flatten_task_tree(tasks_result)
             except Exception:
                 logger.warning(
                     'task_curator: auto-backfill: get_tasks failed', exc_info=True,
