@@ -244,6 +244,16 @@ class TestTsSortKey:
         assert result.utcoffset() == timedelta(0)
         assert result == datetime(2026, 4, 1, 10, 0, 0, tzinfo=UTC)
 
+    def test_missing_timestamp_returns_datetime_min(self):
+        """An entry with no 'timestamp' key returns UTC-aware datetime.min.
+
+        Malformed entries must sort to the end of a descending sort.  The
+        fallback value is datetime.min.replace(tzinfo=UTC).
+        """
+        result = _ts_sort_key({})
+        assert result == datetime.min.replace(tzinfo=UTC)
+        assert result.utcoffset() == timedelta(0)
+
 
 # ---------------------------------------------------------------------------
 # TestQueueDepthTimeseries
