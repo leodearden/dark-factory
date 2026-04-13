@@ -532,7 +532,10 @@ async def _invoke_claude(
 
 
 def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
-    """Parse Claude Code JSON output into AgentResult."""
+    """Parse Claude Code JSON output into AgentResult.
+
+    NOTE: does not set timed_out — callers must apply replace(parsed, timed_out=result.timed_out).
+    """
     if not result.stdout.strip():
         return AgentResult(
             success=False,

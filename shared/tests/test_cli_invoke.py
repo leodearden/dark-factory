@@ -1279,6 +1279,7 @@ class TestClaudeCallerPropagatesTimedOut:
         assert agent.timed_out is True
 
 
+
 def _make_gate(
     *,
     account_count: int = 2,
