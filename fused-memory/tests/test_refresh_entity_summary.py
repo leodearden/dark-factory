@@ -287,6 +287,9 @@ class TestGetAllValidEdges:
         """result_set=None from the driver is treated as empty — returns {}."""
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
+        # Defensive-coding pin: get_all_valid_edges() uses `result.result_set or []`
+        # to tolerate a driver that returns None instead of an empty list — this
+        # test exercises that guard.
         # Override the awaited return value to have result_set=None, simulating
         # a driver that returns None instead of an empty list.
         graph.ro_query.return_value.result_set = None
