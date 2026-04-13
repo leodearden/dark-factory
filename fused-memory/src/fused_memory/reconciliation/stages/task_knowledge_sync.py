@@ -70,14 +70,12 @@ class TaskKnowledgeSync(BaseStage):
                     tasks_data = {}
             filtered = filter_task_tree(tasks_data)
 
-        # Render "Recently Completed Tasks" section
+        # Render "Recently Completed Tasks" section.
+        # Invariant: filter_task_tree() always appends to done_tasks when it increments
+        # done_count (capped at MAX_DONE_TASKS_RETAINED=30), so done_tasks is guaranteed
+        # non-empty whenever done_count > 0.  No fallback summary branch is needed.
         if filtered.done_tasks:
             recently_completed_text = format_task_list(filtered.done_tasks[:30])
-        elif filtered.done_count > 0:
-            recently_completed_text = (
-                f'{filtered.done_count} tasks completed recently '
-                f'(details omitted — too many to list).'
-            )
         else:
             recently_completed_text = format_task_list([])  # 'No tasks.'
 

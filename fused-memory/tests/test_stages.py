@@ -1486,10 +1486,10 @@ class TestMemoryConsolidatorFilteredTaskTree:
         ]
         return FilteredTaskTree(
             active_tasks=active,
-            done_count=5,
+            done_count=0,
             cancelled_count=2,
             other_count=0,
-            total_count=count + 7,
+            total_count=count + 2,  # count active + 0 done + 2 cancelled
         )
 
     @pytest.mark.asyncio
@@ -1552,6 +1552,16 @@ class TestMemoryConsolidatorFilteredTaskTree:
         assert '### Active Task Tree' in payload
         assert 'Active task 1' in payload
 
+    def test_make_active_tree_summary_line_has_consistent_total(self):
+        """_make_active_tree(3) total_count must equal 3 active + 0 done + 2 cancelled = 5."""
+        from fused_memory.reconciliation.task_filter import format_filtered_task_tree
+        tree = self._make_active_tree(3)
+        rendered = format_filtered_task_tree(tree)
+        assert '5 total' in rendered, (
+            f'Expected total_count=5 (3 active + 0 done + 2 cancelled) '
+            f'but rendered: {rendered!r}'
+        )
+
 
 # ── Tests for task 455: TaskKnowledgeSync filtered task tree injection ─────────
 
@@ -1598,7 +1608,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         stage.project_root = '/tmp/test_project'
         stage.filtered_task_tree = self._make_tree(
             [self._make_task(10, 'in-progress'), self._make_task(20, 'pending')],
-            done_count=5,
+            done_count=0,
         )
 
         payload = await stage.assemble_payload([], watermark, [])
@@ -1609,16 +1619,11 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         assert '### Active Task Tree' in payload
         assert 'Task 10' in payload
         assert 'Task 20' in payload
-        # Recently Completed: done_count > 0 but done_tasks=[] (harness path)
-        # Either the section is absent (future-proof) OR it mentions the count '5'
+        # Recently Completed: done_count=0 and done_tasks=[] → 'No tasks.'
         recently_section = _extract_section(payload, '### Recently Completed Tasks')
-        assert '### Recently Completed Tasks' not in payload or '5' in recently_section, (
-            "Expected '### Recently Completed Tasks' absent or done_count '5' in section body"
-        )
-        # No individual done-task lines anywhere — fixture passes done_tasks=[] so
-        # done tasks are absent regardless of pool composition.
-        assert '(done)' not in payload, (
-            "Unexpected individual done-task line in harness-injected payload"
+        assert '### Recently Completed Tasks' in payload
+        assert 'No tasks.' in recently_section, (
+            f"Expected 'No tasks.' in Recently Completed section, got: {recently_section!r}"
         )
 
     @pytest.mark.asyncio
@@ -1660,7 +1665,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
                 self._make_task(5, 'pending'),
                 self._make_task(6, 'pending'),
             ],
-            done_count=3,
+            done_count=0,
         )
 
         payload = await stage.assemble_payload([], watermark, [])
@@ -1725,25 +1730,35 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
         assert 'Task 99' in payload
 
     @pytest.mark.asyncio
-    async def test_recently_completed_shows_count_when_no_done_tasks_objects(
+    async def test_recently_completed_renders_done_titles_via_primary_path(
         self, mock_deps, watermark,
     ):
-        """When filtered_task_tree has done_count > 0 but done_tasks=[], show count summary."""
+        """Primary if-branch: done_tasks populated → all done task titles appear in Recently Completed."""
+        done_tasks = [
+            self._make_task(101, 'done'),
+            self._make_task(102, 'done'),
+            self._make_task(103, 'done'),
+        ]
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
         stage.project_id = 'test_project'
         stage.project_root = '/tmp/test_project'
         stage.filtered_task_tree = self._make_tree(
             [self._make_task(10, 'in-progress')],
-            done_count=15,
-            # done_tasks deliberately omitted → empty list
+            done_count=3,
+            done_tasks=done_tasks,
         )
 
         payload = await stage.assemble_payload([], watermark, [])
 
+        # (a) get_tasks must NOT be called
         mock_deps['taskmaster'].get_tasks.assert_not_called()
+        # (b) Recently Completed section must be present
         assert '### Recently Completed Tasks' in payload
-        # Must mention the done count (15) somewhere in the recently completed section
-        assert '15' in payload
+        # (c) Each done task title must appear in the Recently Completed section
+        recently_section = _extract_section(payload, '### Recently Completed Tasks')
+        assert 'Task 101' in recently_section, "Task 101 not found in Recently Completed section"
+        assert 'Task 102' in recently_section, "Task 102 not found in Recently Completed section"
+        assert 'Task 103' in recently_section, "Task 103 not found in Recently Completed section"
 
     @pytest.mark.asyncio
     async def test_recently_completed_populated_on_fallback(self, mock_deps, watermark):
