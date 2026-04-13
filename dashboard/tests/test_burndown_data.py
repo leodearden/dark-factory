@@ -200,15 +200,9 @@ class TestCollectSnapshot:
         _assert_snapshot_counts(row, pending=1, in_progress=1, done=2)
 
     @pytest.mark.asyncio
-    async def test_symlinked_root_deduplicates_with_orchestrator(self, tmp_path):
+    async def test_symlinked_root_deduplicates_with_orchestrator(self, symlink_project_setup):
         """Symlinked project_root and orchestrator resolving to real path produce only 1 row."""
-        real_dir = tmp_path / 'real'
-        real_dir.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(real_dir)
-
-        db_path = tmp_path / 'burndown.db'
-        _create_burndown_db(db_path)
+        real_dir, link, db_path = symlink_project_setup
 
         config = DashboardConfig(project_root=link)
 
