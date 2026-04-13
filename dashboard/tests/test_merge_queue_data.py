@@ -585,6 +585,66 @@ class TestRecentMerges:
 
         assert len(result) == 5
 
+    @pytest.mark.xfail(
+        reason=(
+            "Known limitation: SQLite uses lexicographic string comparison for "
+            "the 'timestamp >= ?' filter.  A timestamp stored with a large "
+            "positive offset (e.g. +14:00) can appear after the UTC cutoff "
+            "string even though its UTC-equivalent is before the cutoff.  "
+            "Correct fix: normalise timestamps to UTC on write."
+        ),
+        strict=False,
+    )
+    @pytest.mark.asyncio
+    async def test_recent_merges_sql_string_comparison_tz_limitation(self, merge_events_db):
+        """Non-UTC offsets can bypass the SQL hours-window filter (known limitation).
+
+        The ``AND timestamp >= ?`` clause in ``recent_merges`` compares stored
+        timestamp strings against ``_cutoff_iso()`` (a UTC string) using
+        SQLite's lexicographic ordering.  An event stored with offset ``+14:00``
+        has a local-time component that is 14 hours ahead, so its string
+        representation can sort *after* the cutoff string even though the
+        event's UTC-equivalent time is *before* the cutoff.
+
+        Example (all UTC):
+            now        = T
+            cutoff     = T - 1h  →  stored as  '...T(h-1):MM:SS+00:00'
+            event (UTC) = T - 3h  →  stored as  '...(next day)T01:MM:SS+14:00'
+            SQLite: next-day string > today string  →  INCLUDED  (wrong)
+            Correct:    T-3h < T-1h                →  EXCLUDED
+
+        This test asserts the *correct* behaviour (0 results) and is marked
+        ``xfail`` because the current implementation will include the event.
+        When the underlying limitation is fixed this test will pass.
+        """
+        now = datetime.now(UTC)
+        event_utc = now - timedelta(hours=3)  # 3 h before now → before 1-h cutoff
+        # Represent the same moment in +14:00 local time.
+        # (event_utc + 14h) gives the local clock reading; appending '+14:00'
+        # produces a valid ISO-8601 string whose UTC-equivalent == event_utc.
+        local_dt = event_utc + timedelta(hours=14)
+        ts_non_utc = local_dt.strftime('%Y-%m-%dT%H:%M:%S') + '+14:00'
+
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        _insert_event(conn_sync, event_type='merge_attempt', timestamp=ts_non_utc,
+                      task_id='old-non-utc', run_id='run-tz',
+                      data={'outcome': 'done'})
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await recent_merges(db, limit=20, hours=1)
+
+        # The event is 3 h old in UTC — well outside the 1-h window.
+        # With correct UTC comparison it should not appear; with string
+        # comparison it is incorrectly included.
+        assert len(result) == 0, (
+            f"Event stored as '{ts_non_utc}' (= event_utc {event_utc.isoformat()}) "
+            "was included by the 1-hour filter despite being 3 h before the cutoff. "
+            "This is the known SQLite string-comparison limitation."
+        )
+
     @pytest.mark.asyncio
     async def test_hours_window_excludes_old_events(self, merge_events_db):
         """recent_merges with hours=1 excludes events older than 1 hour."""

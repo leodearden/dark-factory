@@ -59,7 +59,17 @@ BUCKET_LADDER: tuple[tuple[int | None, int], ...] = (
 
 
 def _cutoff_iso(hours: int) -> str:
-    """Return ISO-format cutoff datetime for the given look-back window (hours)."""
+    """Return ISO-format cutoff datetime for the given look-back window (hours).
+
+    The returned string has a ``+00:00`` UTC offset.  All query functions
+    compare stored timestamps against this string using SQLite's lexicographic
+    ordering (``timestamp >= ?``).  This works correctly for timestamps stored
+    in UTC format (as produced by ``datetime.now(UTC).isoformat()``), but may
+    silently include or exclude rows whose timestamps carry a non-UTC offset
+    such as ``+05:00``.  The correct long-term fix is to normalise timestamps
+    to UTC at write time; this is a pre-existing pattern shared by all query
+    functions in this module.
+    """
     return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
 
 
