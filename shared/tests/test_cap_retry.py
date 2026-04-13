@@ -72,6 +72,7 @@ def _mock_gate(**overrides) -> MagicMock:
     gate.active_account_name = overrides.pop('active_account_name', 'acct')
     gate.on_agent_complete = overrides.pop('on_agent_complete', MagicMock())
     gate.confirm_account_ok = overrides.pop('confirm_account_ok', MagicMock())
+    gate.release_probe_slot = overrides.pop('release_probe_slot', MagicMock())
     for k, v in overrides.items():
         setattr(gate, k, v)
     return gate
