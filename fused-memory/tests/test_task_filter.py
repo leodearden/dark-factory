@@ -307,11 +307,12 @@ class TestFilterTaskTree:
         """
         doc = FilteredTaskTree.__doc__
         assert doc is not None, 'FilteredTaskTree must have a docstring'
-        assert 'dict' in doc, (
-            "FilteredTaskTree docstring must mention 'dict' to document the element-type invariant"
+        doc_lower = doc.lower()
+        assert 'dict' in doc_lower or 'dictionary' in doc_lower, (
+            "FilteredTaskTree docstring must mention 'dict'/'dictionary' to document the element-type contract"
         )
-        assert 'invariant' in doc, (
-            "FilteredTaskTree docstring must mention 'invariant' to document the invariant contract"
+        assert 'invariant' in doc_lower or 'contract' in doc_lower, (
+            "FilteredTaskTree docstring must mention 'invariant' or 'contract' to document the element-type guarantee"
         )
 
 

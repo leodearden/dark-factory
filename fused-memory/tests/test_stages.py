@@ -961,6 +961,14 @@ class TestProactiveSampling:
 
         assert len(result) == 3
 
+        # Verify the correct 3 tasks were selected (highest-priority ones)
+        # Generator: done, pending, in-progress, done, blocked, pending
+        # Top-3 by priority: in-progress(0) > blocked(1) > pending(3)
+        assert {t['status'] for t in result} == {'in-progress', 'blocked', 'pending'}, (
+            f'Expected top-priority tasks {{in-progress, blocked, pending}}, got: '
+            f'{[t["status"] for t in result]}'
+        )
+
         high_priority = {'in-progress', 'blocked'}
         low_priority = {'pending', 'done'}
         statuses = [t['status'] for t in result]
@@ -975,6 +983,18 @@ class TestProactiveSampling:
         assert last_high < first_low, (
             f'In-progress/blocked tasks must appear before pending/done. Got: {statuses}'
         )
+
+    # --- Step: empty iterable (task-709 amendment) ---
+
+    def test_select_proactive_sample_empty_iterable_returns_empty_list(self):
+        """_select_proactive_sample with an empty iterable returns [] without error.
+
+        Explicit edge-case guard: heapq.nsmallest handles empty input correctly, and
+        this test ensures the Iterable[dict] signature doesn't introduce any early
+        access that would fail on empty generators.
+        """
+        assert _select_proactive_sample(iter([]), 5) == []
+        assert _select_proactive_sample(iter([]), 0) == []
 
 
 class TestRunIdValidation(BaseStageValidationTest):
