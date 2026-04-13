@@ -14,8 +14,8 @@ import pytest
 
 from dashboard.config import DashboardConfig
 from dashboard.data.burndown import (
-    BURNDOWN_SCHEMA,
     _INSERT_SNAPSHOT_SQL,
+    BURNDOWN_SCHEMA,
     _count_statuses,
     collect_snapshot,
     downsample,
@@ -1774,4 +1774,4 @@ class TestInsertSnapshotSql:
         assert _INSERT_SNAPSHOT_SQL.startswith('INSERT INTO snapshots')
         assert 'VALUES (?, ?, ?, ?, ?, ?, ?, ?)' in _INSERT_SNAPSHOT_SQL
         # No leading/trailing whitespace — single clean string, no implicit-concat artifacts
-        assert _INSERT_SNAPSHOT_SQL == _INSERT_SNAPSHOT_SQL.strip()
+        assert _INSERT_SNAPSHOT_SQL.strip() == _INSERT_SNAPSHOT_SQL
