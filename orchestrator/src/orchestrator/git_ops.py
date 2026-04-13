@@ -265,6 +265,89 @@ class GitOps:
                 return True
         return False
 
+    async def _freshen_main(self) -> tuple[str, int | None]:
+        """Fetch from remote and return the freshest ref to use as worktree base.
+
+        Returns:
+            (ref, stale_commits) where:
+            - ref: the git ref to pass to ``git worktree add`` / ``git rev-parse``
+            - stale_commits: None  → fetch failed (no remote configured)
+                             0     → local main is already current with remote
+                             N > 0 → local main was N commits behind remote
+
+        Design decisions:
+        - Best-effort fetch: if fetch fails (no remote in tests), return
+          (main_branch, None) silently — matches the pattern in
+          _create_merge_worktree (line 578).
+        - No mutation of local main ref: advance_main() uses CAS on the local
+          main ref; updating it here could cause spurious CAS failures.  We
+          return the remote-tracking ref (origin/main) as the start-point
+          instead.
+        - Divergence guard: if local main has commits not in origin/main (e.g.
+          from advance_main calls not yet pushed), using origin/main would lose
+          those commits.  In the diverged case we fall back to local main and
+          log a warning.
+        """
+        remote_ref = f'{self.config.remote}/{self.config.main_branch}'
+
+        # Best-effort fetch — silently ignore failure (no remote in tests)
+        rc, _, _ = await _run(
+            ['git', 'fetch', self.config.remote, self.config.main_branch],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            logger.debug(
+                '_freshen_main: fetch from %s failed — using local %s',
+                self.config.remote, self.config.main_branch,
+            )
+            return self.config.main_branch, None
+
+        # Count commits local main is BEHIND origin/main
+        _, behind_out, _ = await _run(
+            ['git', 'rev-list', '--count',
+             f'{self.config.main_branch}..{remote_ref}'],
+            cwd=self.project_root,
+        )
+        try:
+            behind = int(behind_out.strip())
+        except ValueError:
+            logger.warning(
+                '_freshen_main: unexpected behind-count output: %r', behind_out,
+            )
+            return self.config.main_branch, None
+
+        if behind == 0:
+            return self.config.main_branch, 0
+
+        # Check for divergence: count commits local main is AHEAD of origin/main
+        _, ahead_out, _ = await _run(
+            ['git', 'rev-list', '--count',
+             f'{remote_ref}..{self.config.main_branch}'],
+            cwd=self.project_root,
+        )
+        try:
+            ahead = int(ahead_out.strip())
+        except ValueError:
+            logger.warning(
+                '_freshen_main: unexpected ahead-count output: %r', ahead_out,
+            )
+            return self.config.main_branch, behind
+
+        if ahead > 0:
+            logger.warning(
+                '_freshen_main: local %s diverged from %s (%d ahead, %d behind) '
+                '— using local ref to avoid losing advance_main commits',
+                self.config.main_branch, remote_ref, ahead, behind,
+            )
+            return self.config.main_branch, behind
+
+        # Strictly behind: use remote-tracking ref as worktree start-point
+        logger.info(
+            '_freshen_main: local %s is %d commits behind %s — using %s',
+            self.config.main_branch, behind, remote_ref, remote_ref,
+        )
+        return remote_ref, behind
+
     async def create_worktree(self, branch_name: str) -> WorktreeInfo:
         """Create a git worktree for a task branch, based off main.
 
