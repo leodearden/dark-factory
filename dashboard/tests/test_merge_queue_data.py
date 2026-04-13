@@ -1223,7 +1223,7 @@ class TestMultiDbAggregation:
 
     @pytest.mark.asyncio
     async def test_aggregate_all_window_bounded(self, tmp_path):
-        """aggregate_queue_depth_timeseries at hours=87600 produces ≤4000 buckets."""
+        """aggregate_queue_depth_timeseries at hours=87600 produces exactly 3651 buckets."""
         now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
 
         db1 = self._make_db(tmp_path, 'runs1.db', [])
