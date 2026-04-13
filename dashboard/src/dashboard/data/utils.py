@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 
 def parse_utc(ts: str | None) -> datetime:
-    """Parse an ISO timestamp string and ensure it has UTC timezone.
+    """Parse an ISO timestamp string into a timezone-aware datetime.
 
     Naive datetimes (no tzinfo) get UTC attached.  Aware datetimes are
     returned unchanged.  None raises TypeError explicitly.  Other invalid
@@ -20,6 +20,11 @@ def parse_utc(ts: str | None) -> datetime:
         UTC; aware inputs are returned with their original tzinfo preserved
         (not necessarily UTC).  Callers that require UTC must call
         ``.astimezone(UTC)`` themselves.
+
+    Note:
+        The name ``parse_utc`` reflects only the naive-input default (naive
+        datetimes get UTC attached).  It does **not** guarantee UTC output
+        for aware inputs — those are returned with their original tzinfo.
     """
     if ts is None:
         raise TypeError('timestamp is None')

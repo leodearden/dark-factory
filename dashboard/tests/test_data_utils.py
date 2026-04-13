@@ -76,6 +76,19 @@ class TestParseUtc:
             f"Stale phrase 'propagates ValueError or TypeError from' still in docstring: {doc!r}"
         )
 
+    def test_docstring_one_liner_says_timezone_aware(self):
+        """parse_utc one-liner must contain 'timezone-aware' and not 'ensure it has UTC timezone'."""
+        from dashboard.data.utils import parse_utc
+
+        doc = parse_utc.__doc__ or ''
+        one_liner = doc.strip().splitlines()[0]
+        assert 'timezone-aware' in one_liner, (
+            f"Expected one-liner to contain 'timezone-aware', got: {one_liner!r}"
+        )
+        assert 'ensure it has UTC timezone' not in one_liner, (
+            f"Misleading phrase 'ensure it has UTC timezone' still in one-liner: {one_liner!r}"
+        )
+
 
 class TestTimeagoUsesParseUtc:
     """Tests verifying that app.py uses parse_utc from dashboard.data.utils (DRY)."""
@@ -89,5 +102,24 @@ class TestTimeagoUsesParseUtc:
         # Use a dynamic timestamp 5 minutes in the past to avoid hardcoded date rot.
         # timedelta(minutes=5) yields exactly 300s, so total_minutes == 5 exactly.
         ts = (datetime.now(UTC) - timedelta(minutes=5)).replace(tzinfo=None).isoformat()
+        assert timeago(ts) == '5m ago'
+
+    def test_non_utc_offset_timeago_uses_astimezone(self):
+        """timeago with a non-UTC-offset timestamp returns the correct relative time string.
+
+        The timestamp '5 minutes ago' expressed in +05:30 offset must still
+        produce '5m ago'.  This verifies that .astimezone(UTC) is applied
+        (consistent with the _ts_sort_key pattern) and that cross-tz arithmetic
+        is correct.
+        """
+        from datetime import UTC, datetime, timedelta, timezone
+
+        from dashboard.app import timeago
+
+        # Build a timestamp 5 minutes ago expressed in IST (+05:30).
+        ist = timezone(timedelta(hours=5, minutes=30))
+        five_min_ago_utc = datetime.now(UTC) - timedelta(minutes=5)
+        five_min_ago_ist = five_min_ago_utc.astimezone(ist)
+        ts = five_min_ago_ist.isoformat()
         assert timeago(ts) == '5m ago'
 
