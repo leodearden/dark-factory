@@ -179,6 +179,24 @@ class TestCanonicalFacts:
         result = GraphitiBackend._canonical_facts(edges)
         assert result == ['A knows B']
 
+    def test_or_idiom_converts_none_before_strip(self):
+        """Explicit None is handled by the ``or ''`` idiom, not the dict.get default.
+
+        The filter is ``(e.get('fact') or '').strip()``.  ``e.get('fact')``
+        returns ``None`` when the key exists with value ``None``; the ``or ''``
+        then converts it to ``''`` before ``.strip()`` is called.  This is
+        distinct from ``e.get('fact', '')`` which only substitutes the default
+        when the key is *absent* — it would leave an explicit ``None`` in place
+        and cause ``.strip()`` to raise ``AttributeError``.  Both missing keys
+        and explicit ``None`` values are therefore filtered identically.
+        """
+        edges = [
+            {'fact': None},    # key present, value None — filtered via ``or ''``
+            {'fact': 'A knows B'},
+        ]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == ['A knows B']
+
     def test_returns_list_not_set(self):
         """Return type is list, not set (order matters)."""
         edges = [{'fact': 'A'}, {'fact': 'B'}]
