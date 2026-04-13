@@ -210,10 +210,7 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        # Only 1 row — symlink and real path should deduplicate
-        assert count == 1
+                assert row[0] == 1  # Only 1 row — symlink and real path should deduplicate
 
     @pytest.mark.asyncio
     async def test_deduplicates_main_project_from_orchestrators(self, burndown_env):
@@ -232,9 +229,7 @@ class TestCollectSnapshot:
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
             row = await cur.fetchone()
             assert row is not None
-            count = row[0]
-
-        assert count == 1
+            assert row[0] == 1
 
     @pytest.mark.asyncio
     async def test_snapshots_known_project_roots_when_no_orchestrators(self, burndown_env):
@@ -350,10 +345,7 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        # Only 1 row — symlink project_root and known real path deduplicate
-        assert count == 1
+                assert row[0] == 1  # Only 1 row — symlink project_root and known real path deduplicate
 
     @pytest.mark.asyncio
     async def test_dedupes_known_root_against_running_orchestrator(self, burndown_env):
@@ -396,9 +388,7 @@ class TestCollectSnapshot:
                                 (str(reify_root),)) as cur:
             row = await cur.fetchone()
             assert row is not None
-            count = row[0]
-
-        assert count == 1  # only one row for reify, not two
+            assert row[0] == 1  # only one row for reify, not two
 
     @pytest.mark.asyncio
     async def test_main_project_id_is_resolved_path(self, tmp_path):
@@ -652,11 +642,9 @@ class TestCollectSnapshot:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        # Only 1 row — the orchestrator fallback targets the same project as the
-        # main project_root; resolved and unresolved paths must deduplicate.
-        assert count == 1
+                # Only 1 row — the orchestrator fallback targets the same project as the
+                # main project_root; resolved and unresolved paths must deduplicate.
+                assert row[0] == 1
 
     @pytest.mark.asyncio
     async def test_load_task_tree_calls_run_concurrently(self, tmp_path):
@@ -1016,9 +1004,7 @@ class TestDownsample:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        assert count == 6  # all preserved
+                assert row[0] == 6  # all preserved
 
     @pytest.mark.asyncio
     async def test_compacts_old_to_hourly(self, tmp_path):
@@ -1041,9 +1027,7 @@ class TestDownsample:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        assert count == 1  # compacted to one per hour
+                assert row[0] == 1  # compacted to one per hour
 
     @pytest.mark.asyncio
     async def test_expires_very_old(self, tmp_path):
@@ -1063,9 +1047,7 @@ class TestDownsample:
             async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
                 row = await cur.fetchone()
                 assert row is not None
-                count = row[0]
-
-        assert count == 1  # only the recent one
+                assert row[0] == 1  # only the recent one
 
 
 # ---------------------------------------------------------------------------
@@ -1205,8 +1187,8 @@ class TestBurndownEnvFixture:
         # (c) conn is a usable aiosqlite connection
         async with conn.execute('SELECT COUNT(*) FROM snapshots') as cur:
             row = await cur.fetchone()
-        assert row is not None
-        assert row[0] == 0
+            assert row is not None
+            assert row[0] == 0
 
 
 # ---------------------------------------------------------------------------
