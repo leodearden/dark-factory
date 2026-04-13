@@ -2149,3 +2149,34 @@ class TestInvariantAfterTask643:
             'fused_memory.reconciliation.stages.task_knowledge_sync, '
             f'got records: {[(r.name, r.levelno, r.message) for r in caplog.records]}'
         )
+
+    def test_filter_task_tree_invariant_done_count_and_done_tasks_populated_together(self):
+        """Regression guard: filter_task_tree() sets done_count>0 ↔ done_tasks non-empty.
+
+        Task 643 removed a dead ``elif filtered.done_count > 0`` branch from
+        ``TaskKnowledgeSync.assemble_payload`` on the basis of this invariant.
+        Task 782 places this regression guard at the stage/callsite layer so that
+        any future refactor of ``filter_task_tree`` that breaks the invariant trips
+        this test in addition to the guards in test_task_filter.py.
+        """
+        tasks_data = {
+            'tasks': [
+                self._make_task(1, 'done'),
+                self._make_task(2, 'done'),
+                self._make_task(3, 'done'),
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert result.done_count > 0, (
+            f'Expected done_count > 0 for 3 done tasks, got {result.done_count}'
+        )
+        assert len(result.done_tasks) > 0, (
+            f'Expected non-empty done_tasks for done_count={result.done_count}, '
+            f'got done_tasks={result.done_tasks!r}'
+        )
+        # Explicit invariant assertion: done_count > 0 implies done_tasks non-empty
+        if result.done_count > 0:
+            assert result.done_tasks, (
+                'Invariant violated: done_count > 0 but done_tasks is empty'
+            )
