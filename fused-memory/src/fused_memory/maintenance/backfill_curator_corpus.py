@@ -116,12 +116,21 @@ async def run_backfill(
     Returns:
         BackfillResult with upserted, skipped, and errors counts.
     """
-    async with maintenance_service(config_path) as (config, service):
+    # maintenance_service is used here for consistent CONFIG_PATH resolution and
+    # lifecycle management (override_config_path context), even though this
+    # script only uses `config` from the yielded tuple and does not require the
+    # full MemoryService (Graphiti + Mem0).  The unused `service` variable is
+    # intentional — it keeps parity with other maintenance scripts and ensures
+    # the backing stores are healthy before the backfill begins.
+    async with maintenance_service(config_path) as (config, _service):
         # Build a Taskmaster client.
-        tm_config = config.taskmaster
-        if tm_config is not None:
-            tm_config = tm_config.model_copy(update={'project_root': project_root})
-        taskmaster = TaskmasterBackend(config=tm_config)  # type: ignore[arg-type]
+        if config.taskmaster is None:
+            raise SystemExit(
+                'No taskmaster configuration found in config — cannot backfill. '
+                'Ensure your config.yaml has a [taskmaster] section.'
+            )
+        tm_config = config.taskmaster.model_copy(update={'project_root': project_root})
+        taskmaster = TaskmasterBackend(config=tm_config)
 
         # Build a TaskCurator (lazy — connects on first use).
         curator = TaskCurator(config=config, taskmaster=taskmaster)

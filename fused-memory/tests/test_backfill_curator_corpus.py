@@ -198,12 +198,10 @@ class TestBackfillEdgeCases:
         ]
         project_id = 'proj'
 
-        call_count = 0
-
         async def maybe_fail(text: str):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
+            # Fail deterministically based on the task content rather than call
+            # order, so this test is not sensitive to asyncio.gather scheduling.
+            if 'Fails' in text:
                 raise RuntimeError('embed API down')
             return [0.1] * 10
 
@@ -500,3 +498,49 @@ class TestAutoBackfill:
             # Must not raise — graceful degradation
             await interceptor._maybe_backfill_corpus(curator, project_root='/fake/project')
             await asyncio.sleep(0.05)  # let background task settle
+
+    @pytest.mark.asyncio
+    async def test_get_curator_triggers_backfill_on_first_call(self):
+        """_get_curator() fires _maybe_backfill_corpus() as a background task on first construction.
+
+        This integration test exercises the full _get_curator → _maybe_backfill_corpus
+        path, confirming that the wiring is live (not just that _maybe_backfill_corpus
+        works in isolation).
+        """
+        import asyncio
+
+        canned_task_tree = {
+            'tasks': [
+                {'id': '1', 'title': 'Task A', 'description': 'Desc A', 'status': 'done'},
+            ],
+        }
+        mock_taskmaster = AsyncMock()
+        # Provide project_root so _get_curator() extracts it and calls _maybe_backfill_corpus.
+        mock_taskmaster.config = MagicMock()
+        mock_taskmaster.config.project_root = '/fake/project'
+        mock_taskmaster.get_tasks = AsyncMock(return_value=canned_task_tree)
+
+        interceptor = self._make_interceptor(mock_taskmaster)
+
+        backfill_called_with: list[tuple] = []
+
+        async def mock_backfill(tasks, project_id):
+            backfill_called_with.append((tasks, project_id))
+            return BackfillResult(upserted=len(tasks))
+
+        with patch('fused_memory.middleware.task_interceptor.TaskCurator') as mock_curator_cls:
+            mock_curator_instance = AsyncMock()
+            mock_curator_instance.corpus_count = AsyncMock(return_value=0)
+            mock_curator_instance.backfill_corpus = mock_backfill
+            mock_curator_cls.return_value = mock_curator_instance
+
+            curator = await interceptor._get_curator()
+
+            # Allow the background tasks (backfill check + backfill) to complete.
+            await asyncio.sleep(0.1)
+
+        assert curator is mock_curator_instance
+        assert len(backfill_called_with) == 1
+        tasks_arg, project_id_arg = backfill_called_with[0]
+        assert len(tasks_arg) == 1
+        assert project_id_arg == 'project'
