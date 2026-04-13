@@ -1,12 +1,12 @@
 """Tests for docstring accuracy in graphiti_client.py.
 
 Task 451: Fix docstrings — detect_stale_summaries missing 'summary' key +
-cross-reference _rebuild_entity_from_edges vs refresh_entity_summary.
+cross-reference rebuild_entity_from_edges vs refresh_entity_summary.
 
 Three test/impl pairs:
   step-1/2: detect_stale_summaries Returns section must list 'summary' key
-  step-3/4: _rebuild_entity_from_edges docstring must routing-note refresh_entity_summary
-  step-5/6: refresh_entity_summary docstring must routing-note _rebuild_entity_from_edges
+  step-3/4: rebuild_entity_from_edges docstring must routing-note refresh_entity_summary
+  step-5/6: refresh_entity_summary docstring must routing-note rebuild_entity_from_edges
 """
 from __future__ import annotations
 
@@ -231,7 +231,7 @@ class TestDetectStaleSummariesReturnsIncludesSummaryKey:
 
 
 # ---------------------------------------------------------------------------
-# step-3: _rebuild_entity_from_edges must routing-note refresh_entity_summary
+# step-3: rebuild_entity_from_edges must routing-note refresh_entity_summary
 # ---------------------------------------------------------------------------
 
 
@@ -278,7 +278,7 @@ class TestRebuildEntityFromEdgesCrossReferencesRefresh:
 
 
 # ---------------------------------------------------------------------------
-# step-5: refresh_entity_summary must routing-note _rebuild_entity_from_edges
+# step-5: refresh_entity_summary must routing-note rebuild_entity_from_edges
 # ---------------------------------------------------------------------------
 
 
@@ -293,8 +293,8 @@ class TestRefreshEntitySummaryCrossReferencesRebuild:
 
     Asserts:
       (a) docstring is not None and non-empty
-      (b) '_rebuild_entity_from_edges' appears in the docstring
-      (c) 'bulk' and '_rebuild_entity_from_edges' appear in the same sentence
+      (b) 'rebuild_entity_from_edges' appears in the docstring
+      (c) 'bulk' and 'rebuild_entity_from_edges' appear in the same sentence
     """
 
     def _doc(self) -> str:
@@ -333,10 +333,10 @@ class TestRefreshEntitySummaryCrossReferencesRebuild:
 class TestNoStalePrivateMethodReferences:
     """Self-consistency test: file must not contain stale private method names.
 
-    The test file referenced _rebuild_entity_from_edges (private-prefixed) in
-    comments and docstrings after the method was renamed to the public
-    rebuild_entity_from_edges (task 420).  This test reads the file's own
-    source and asserts no such stale private reference remains.
+    The test file contained stale private-prefixed method name references in
+    comments and docstrings after rebuild_entity_from_edges was made public
+    (task 420).  This test reads the file's own source and asserts no such
+    stale private reference remains.
 
     Asserts:
       (a) the private-prefixed name does not appear literally anywhere in this
