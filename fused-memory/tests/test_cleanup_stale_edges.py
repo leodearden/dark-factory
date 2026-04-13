@@ -4,8 +4,8 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from conftest import extract_params
+
 from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.maintenance.cleanup_stale_edges import CleanupManager, CleanupResult, run_cleanup
 
