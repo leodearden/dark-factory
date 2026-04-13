@@ -117,13 +117,6 @@ class TestFlattenTaskTree:
     def test_empty(self):
         assert flatten_task_tree({}) == []
 
-    def testflatten_task_tree_public_name(self):
-        """flatten_task_tree (no leading underscore) is importable as a public API."""
-        from fused_memory.middleware.task_curator import flatten_task_tree
-        result = flatten_task_tree({'tasks': [{'id': '1'}]})
-        assert result == [{'id': '1'}]
-
-
 class TestTrimPool:
     def _entry(self, task_id: str, source: str) -> _PoolEntry:
         return _PoolEntry(

@@ -562,7 +562,7 @@ class TaskCurator:
                         'title': title,
                         'description': description[:1000],
                         'files_to_modify': files,
-                        'priority': task.get('priority', ''),
+                        'priority': task.get('priority', '') or '',
                         'project_id': project_id,
                         'updated_at': datetime.now(UTC).isoformat(),
                     },

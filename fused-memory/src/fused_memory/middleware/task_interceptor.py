@@ -362,9 +362,6 @@ class TaskInterceptor:
         self._backfill_triggered = True
 
         try:
-            from fused_memory.middleware.task_curator import flatten_task_tree
-            from fused_memory.models.scope import resolve_project_id
-
             project_id = resolve_project_id(project_root)
 
             # Check whether the collection already has tasks via the public API.
