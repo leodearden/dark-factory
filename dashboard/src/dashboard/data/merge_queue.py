@@ -483,13 +483,24 @@ async def aggregate_outcome_distribution(
     dbs: list[aiosqlite.Connection | None],
     *,
     hours: int = 24,
+    now: datetime | None = None,
 ) -> ChartData:
     """Aggregate outcome distribution across multiple project DBs.
 
     Counts per outcome are summed; canonical ordering is preserved.
+
+    Args:
+        dbs: List of aiosqlite connections (None entries are tolerated).
+        hours: Look-back window in hours (default 24).
+        now: Reference timestamp captured **once** for the entire aggregation
+            call and threaded into every per-DB ``outcome_distribution`` query.
+            When None (the default), ``datetime.now(UTC)`` is resolved here so
+            that all concurrent per-DB coroutines share the same cutoff window.
+            Pass an explicit value in tests for full determinism.
     """
+    effective_now = now if now is not None else datetime.now(UTC)
     results = await asyncio.gather(
-        *[outcome_distribution(db, hours=hours) for db in dbs],
+        *[outcome_distribution(db, hours=hours, now=effective_now) for db in dbs],
         return_exceptions=True,
     )
 
