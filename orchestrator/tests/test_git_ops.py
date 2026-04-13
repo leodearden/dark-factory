@@ -89,6 +89,67 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
     return GitOps(git_config, git_repo)
 
 
+async def _setup_repo_with_remote(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a bare origin repo and a local clone for remote-fetch tests."""
+    origin = tmp_path / 'origin.git'
+    origin.mkdir()
+    await _run(['git', 'init', '--bare', '-b', 'main'], cwd=origin)
+
+    # Seed origin via a temp non-bare repo
+    seed = tmp_path / 'seed'
+    seed.mkdir()
+    await _run(['git', 'init', '-b', 'main'], cwd=seed)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=seed)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=seed)
+    (seed / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=seed)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=seed)
+    await _run(['git', 'remote', 'add', 'origin', str(origin)], cwd=seed)
+    await _run(['git', 'push', 'origin', 'main'], cwd=seed)
+
+    # Clone origin to local
+    local = tmp_path / 'local'
+    await _run(['git', 'clone', str(origin), str(local)])
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=local)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=local)
+
+    return origin, local
+
+
+@pytest.fixture
+def git_repo_with_remote(tmp_path: Path) -> tuple[Path, Path]:
+    """Bare origin repo and a local clone with configured user (origin_path, local_path)."""
+    return asyncio.run(_setup_repo_with_remote(tmp_path))
+
+
+@pytest.fixture
+def git_ops_with_remote(
+    git_config: GitConfig,
+    git_repo_with_remote: tuple[Path, Path],
+) -> tuple[GitOps, Path]:
+    """GitOps against a local clone that has a configured remote (origin)."""
+    origin, local = git_repo_with_remote
+    return GitOps(git_config, local), origin
+
+
+async def _push_n_commits_to_origin(
+    origin: Path,
+    n: int,
+    prefix: str = 'remote',
+) -> None:
+    """Push n new commits to the bare origin repo via a temporary clone."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        temp = Path(td) / 'temp_push'
+        await _run(['git', 'clone', str(origin), str(temp)])
+        await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=temp)
+        await _run(['git', 'config', 'user.name', 'Test'], cwd=temp)
+        for i in range(n):
+            (temp / f'{prefix}_{i}.txt').write_text(f'{prefix} content {i}\n')
+            await _run(['git', 'add', '-A'], cwd=temp)
+            await _run(['git', 'commit', '-m', f'{prefix} commit {i}'], cwd=temp)
+        await _run(['git', 'push', 'origin', 'main'], cwd=temp)
+
 
 @pytest.mark.asyncio
 class TestWorktreeLifecycle:
