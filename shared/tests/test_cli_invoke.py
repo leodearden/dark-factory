@@ -1258,6 +1258,33 @@ class TestParseClaudeOutputThreadsTimedOut:
         assert agent.timed_out is False
 
 
+def _make_gate(
+    *,
+    account_count: int = 2,
+    before_invoke_tokens: str | list[str] = 'token-a',
+    handle_cap_detected: bool = False,
+    active_account_name: str = 'acct-a',
+) -> MagicMock:
+    """Factory for a MagicMock gate used in TestHeuristicCapGating.
+
+    Exposes the four attributes that vary across the six test cases; the three
+    constant attributes (detect_cap_hit, confirm_account_ok, on_agent_complete)
+    are set unconditionally.
+    """
+    gate = MagicMock()
+    gate.account_count = account_count
+    if isinstance(before_invoke_tokens, list):
+        gate.before_invoke = AsyncMock(side_effect=before_invoke_tokens)
+    else:
+        gate.before_invoke = AsyncMock(return_value=before_invoke_tokens)
+    gate.detect_cap_hit = MagicMock(return_value=False)
+    gate._handle_cap_detected = MagicMock(return_value=handle_cap_detected)
+    gate.confirm_account_ok = MagicMock()
+    gate.active_account_name = active_account_name
+    gate.on_agent_complete = MagicMock()
+    return gate
+
+
 @pytest.mark.asyncio
 class TestHeuristicCapGating:
     """Tests that the heuristic cap-detection path gates retry on
@@ -1265,14 +1292,7 @@ class TestHeuristicCapGating:
 
     async def test_heuristic_cap_no_retry_when_handle_returns_false(self):
         """Heuristic fires but _handle_cap_detected returns False → no retry."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate._handle_cap_detected = MagicMock(return_value=False)
-        gate.confirm_account_ok = MagicMock()
-        gate.active_account_name = 'acct-a'
-        gate.on_agent_complete = MagicMock()
+        gate = _make_gate()
 
         # Craft a result that triggers the heuristic: error, zero cost, instant
         heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
@@ -1302,14 +1322,11 @@ class TestHeuristicCapGating:
 
     async def test_heuristic_cap_retries_when_handle_returns_true(self):
         """Heuristic fires and _handle_cap_detected returns True → retry happens."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate._handle_cap_detected = MagicMock(return_value=True)
-        gate.confirm_account_ok = MagicMock()
-        gate.active_account_name = 'acct-b'
-        gate.on_agent_complete = MagicMock()
+        gate = _make_gate(
+            before_invoke_tokens=['token-a', 'token-b'],
+            handle_cap_detected=True,
+            active_account_name='acct-b',
+        )
 
         heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
         ok_result = _make_result(success=True, cost_usd=0.5)
@@ -1331,15 +1348,7 @@ class TestHeuristicCapGating:
 
     async def test_heuristic_cap_unresolved_token_logs_warning(self, caplog):
         """When _handle_cap_detected returns False, warning is logged."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate._handle_cap_detected = MagicMock(return_value=False)
-        gate.confirm_account_ok = MagicMock()
-        gate.active_account_name = 'acct-a'
-        gate.on_agent_complete = MagicMock()
-
+        gate = _make_gate()
         heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
 
         with (
@@ -1360,15 +1369,7 @@ class TestHeuristicCapGating:
 
     async def test_heuristic_cap_false_does_not_increment_consecutive_hits(self):
         """_handle_cap_detected returning False never increments consecutive_cap_hits."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate._handle_cap_detected = MagicMock(return_value=False)
-        gate.confirm_account_ok = MagicMock()
-        gate.active_account_name = 'acct-a'
-        gate.on_agent_complete = MagicMock()
-
+        gate = _make_gate()
         heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
 
         with (
@@ -1403,14 +1404,7 @@ class TestHeuristicCapGating:
         resume-session fallback (line ~372) which pops resume_session_id and
         retries from scratch — exactly one fresh retry, zero sleeps.
         """
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate._handle_cap_detected = MagicMock(return_value=False)
-        gate.confirm_account_ok = MagicMock()
-        gate.active_account_name = 'acct-a'
-        gate.on_agent_complete = MagicMock()
+        gate = _make_gate(before_invoke_tokens=['token-a', 'token-b'])
 
         # First call: heuristic-triggering failure with a prior resume_session_id
         heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
@@ -1445,14 +1439,7 @@ class TestHeuristicCapGating:
           hit 2 → full_cycles=1 → cooldown = _CAP_HIT_COOLDOWN_SECS * 2^1
         This pins the counter-increment and backoff formula for the heuristic path.
         """
-        gate = MagicMock()
-        gate.account_count = 1  # single account → full_cycles increments every hit
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate._handle_cap_detected = MagicMock(return_value=True)
-        gate.confirm_account_ok = MagicMock()
-        gate.active_account_name = 'acct-a'
-        gate.on_agent_complete = MagicMock()
+        gate = _make_gate(account_count=1, handle_cap_detected=True)
 
         heuristic_result = _make_result(success=False, cost_usd=0, turns=1, duration_ms=100)
         ok_result = _make_result(success=True, cost_usd=0.5)
