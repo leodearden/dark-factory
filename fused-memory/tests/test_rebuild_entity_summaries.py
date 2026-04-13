@@ -18,8 +18,8 @@ from collections.abc import Callable
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
-
 from conftest import make_rebuild_detail
+
 from fused_memory.backends.graphiti_client import GraphitiBackend, StaleSummaryResult
 
 
