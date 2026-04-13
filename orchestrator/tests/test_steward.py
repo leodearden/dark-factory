@@ -42,7 +42,7 @@ def mock_config():
     config.fused_memory.url = 'http://localhost:8002'
     config.fused_memory.project_id = 'dark_factory'
     config.steward_lifetime_budget = 12.0
-    config.steward_max_attempts = 3
+    config.steward_max_attempts = 1
     config.steward_completion_timeout = 300.0
     config.steward_max_timeouts_per_escalation = 3
     config.timeouts.steward = 1800.0
