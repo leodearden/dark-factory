@@ -1447,7 +1447,7 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
     ):
         """filter_task_tree caps done_tasks at MAX_DONE_TASKS_RETAINED; overflow tasks are dropped."""
         # Derive task count and boundary ids symbolically so the test fails loudly
-        # if MAX_DONE_TASKS_RETAINED is ever changed or the stage's [:30] slice drifts.
+        # if MAX_DONE_TASKS_RETAINED is ever changed.
         n_tasks = MAX_DONE_TASKS_RETAINED + 5
         lowest_retained = n_tasks - MAX_DONE_TASKS_RETAINED + 1  # = 6 when cap=30
         highest_dropped = n_tasks - MAX_DONE_TASKS_RETAINED       # = 5 when cap=30
