@@ -396,7 +396,7 @@ async def invoke_with_cap_retry(
 
         if usage_gate and not skip_confirm:
             usage_gate.confirm_account_ok(oauth_token)
-        if usage_gate:
+        if usage_gate and not skip_confirm:
             usage_gate.on_agent_complete(result.cost_usd)
         break
 
@@ -416,7 +416,7 @@ async def invoke_with_cap_retry(
                 cache_read_tokens=result.cache_read_tokens,
                 cache_create_tokens=result.cache_create_tokens,
                 duration_ms=result.duration_ms,
-                capped=False,
+                capped=skip_confirm,
                 started_at=started_at,
                 completed_at=completed_at,
             )
