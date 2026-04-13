@@ -222,6 +222,10 @@ class TestCollectSnapshot:
                 assert row is not None
                 assert row[0] == 1  # Only 1 row — symlink and real path should deduplicate
 
+            async with conn.execute('SELECT project_id FROM snapshots') as cur:
+                rows = list(await cur.fetchall())
+            assert rows[0][0] == str(real_dir.resolve())
+
     @pytest.mark.asyncio
     async def test_deduplicates_main_project_from_orchestrators(self, burndown_env):
         """If an orchestrator targets the same root, only one row is inserted."""
