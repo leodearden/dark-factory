@@ -1851,3 +1851,16 @@ class TestPreTriageUsageGateCleanup:
         assert steward.metrics.invocations == 1
         assert steward.metrics.total_cost_usd == pytest.approx(0.77)
         assert steward.metrics.total_duration_ms == 3500
+
+    async def test_no_usage_gate_works(self, steward: TaskSteward):
+        """_pre_triage_suggestions completes normally when usage_gate is None."""
+        steward.usage_gate = None
+        mock_result = _make_result(cost=0.1, session_id='sess-triage')
+
+        with patch('orchestrator.agents.invoke.invoke_agent',
+                   new_callable=AsyncMock, return_value=mock_result):
+            result = await steward._pre_triage_suggestions(self._esc())
+
+        # parse_triage_result returns non-None so a new Escalation is returned
+        assert result is not None
+        assert isinstance(result, Escalation)
