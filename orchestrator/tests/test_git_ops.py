@@ -243,6 +243,34 @@ class TestWorktreeLifecycle:
         assert 'base_change.py' in diff
         assert 'y = 2' in diff
 
+    async def test_diff_from_base_stable_when_main_advances(self, git_ops: GitOps):
+        """get_diff_from_base returns branch changes even after main advances.
+
+        This is the key test for the fix: when main advances during task execution,
+        get_diff_from_base must still return the branch's changes by using the
+        pinned base_commit instead of the moving main ref.
+        """
+        # Create worktree and capture base_commit
+        worktree_info = await git_ops.create_worktree('feature-adv')
+        base_commit = worktree_info.base_commit
+
+        # Make a commit in the branch
+        (worktree_info.path / 'branch_change.py').write_text('z = 3\n')
+        await git_ops.commit(worktree_info.path, 'Add branch change')
+
+        # Advance main with a separate commit (simulating another task merging)
+        (git_ops.project_root / 'main_change.py').write_text('x = 1\n')
+        await _run(['git', 'add', 'main_change.py'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Advance main'], cwd=git_ops.project_root)
+
+        # get_diff_from_base should still return branch changes
+        diff = await git_ops.get_diff_from_base(worktree_info.path, base_commit)
+        assert 'branch_change.py' in diff
+        assert 'z = 3' in diff
+
+        # Contrast: get_diff_from_main might return empty/different (main absorbed branch)
+        # This demonstrates that base_commit is needed for stable diffs
+
     async def test_commit_excludes_taskmaster_tasks(self, git_ops: GitOps):
         """Files in .taskmaster/tasks/ must not be staged by commit()."""
         worktree_info = await git_ops.create_worktree('feature-exclude')

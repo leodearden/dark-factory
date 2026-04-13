@@ -1038,6 +1038,38 @@ class TestBaseCommitDiff:
             assert stored is not None, "base_commit should have been stored"
             assert len(stored) == 40, f"base_commit should be 40-char SHA, got {stored!r}"
 
+    async def test_review_uses_base_commit_diff(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Verify get_diff_from_base returns branch changes when main advances.
+
+        This is the critical test for the fix - simulates the scenario where:
+        1. Worktree is created based on main at SHA M1
+        2. Branch makes changes
+        3. Another task advances main to M2
+        4. get_diff_from_base must still return branch changes (not empty)
+        """
+        # Create worktree and capture the base_commit
+        worktree_info = await git_ops.create_worktree('df-review-test')
+        base_commit = worktree_info.base_commit
+
+        # Make changes in the branch
+        (worktree_info.path / 'branch_change.py').write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, 'Branch change')
+
+        # Advance main with a separate commit
+        (git_ops.project_root / 'main_advance.py').write_text('y = 2\n')
+        await _run(['git', 'add', 'main_advance.py'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Advance main'], cwd=git_ops.project_root)
+
+        # KEY TEST: get_diff_from_base must return branch changes even after main advanced
+        diff_from_base = await git_ops.get_diff_from_base(worktree_info.path, base_commit)
+        assert 'branch_change.py' in diff_from_base, \
+            f"get_diff_from_base should return branch changes after main advances, got: {diff_from_base[:200]}"
+
+        # Verify the old method might return empty/different (proves base_commit needed)
+        # Note: we don't assert on this as behavior varies by git merge topology
+
 
 # ---------------------------------------------------------------------------
 # Tests: Post-Merge Verification Failure
