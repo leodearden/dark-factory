@@ -12,8 +12,8 @@ from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
     TaskCurator,
-    _flatten_task_tree,
     _to_pool_entry,
+    flatten_task_tree,
 )
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -362,9 +362,6 @@ class TaskInterceptor:
         self._backfill_triggered = True
 
         try:
-            from fused_memory.middleware.task_curator import _flatten_task_tree
-            from fused_memory.models.scope import resolve_project_id
-
             project_id = resolve_project_id(project_root)
 
             # Check whether the collection already has tasks via the public API.
@@ -382,7 +379,7 @@ class TaskInterceptor:
                 return
             try:
                 tasks_result = await self.taskmaster.get_tasks(project_root)
-                flat_tasks = _flatten_task_tree(tasks_result)
+                flat_tasks = flatten_task_tree(tasks_result)
             except Exception:
                 logger.warning(
                     'task_curator: auto-backfill: get_tasks failed', exc_info=True,
@@ -521,12 +518,12 @@ class TaskInterceptor:
         project_id = resolve_project_id(project_root)
 
         pre_ids = {
-            str(t.get('id', '')) for t in _flatten_task_tree(pre_snapshot)
+            str(t.get('id', '')) for t in flatten_task_tree(pre_snapshot)
             if t.get('id')
         }
         post_snapshot = await tm.get_tasks(project_root)
         new_task_dicts = [
-            t for t in _flatten_task_tree(post_snapshot)
+            t for t in flatten_task_tree(post_snapshot)
             if str(t.get('id', '')) and str(t.get('id', '')) not in pre_ids
         ]
         if not new_task_dicts:

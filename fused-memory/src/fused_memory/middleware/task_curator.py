@@ -447,8 +447,8 @@ class TaskCurator:
                             'task_id': task_id,
                             'title': candidate.title,
                             'description': candidate.description[:1000],
-                            'files_to_modify': candidate.files_to_modify,
-                            'priority': candidate.priority,
+                            'files_to_modify': candidate.files_to_modify or [],
+                            'priority': candidate.priority or '',
                             'project_id': project_id,
                             'updated_at': datetime.now(UTC).isoformat(),
                         },
@@ -511,7 +511,7 @@ class TaskCurator:
         record_task(). Re-running just re-upserts the same points.
 
         Args:
-            tasks: Flat list of task dicts (as returned by _flatten_task_tree).
+            tasks: Flat list of task dicts (as returned by flatten_task_tree).
             project_id: Project identifier used for the collection name and point IDs.
 
         Returns:
@@ -562,7 +562,7 @@ class TaskCurator:
                         'title': title,
                         'description': description[:1000],
                         'files_to_modify': files,
-                        'priority': task.get('priority', ''),
+                        'priority': task.get('priority', '') or '',
                         'project_id': project_id,
                         'updated_at': datetime.now(UTC).isoformat(),
                     },
@@ -656,7 +656,7 @@ class TaskCurator:
         if self._taskmaster is not None and candidate_modules:
             try:
                 tasks_result = await self._taskmaster.get_tasks(project_root)
-                all_tasks_flat = _flatten_task_tree(tasks_result)
+                all_tasks_flat = flatten_task_tree(tasks_result)
             except Exception as exc:
                 logger.debug('task_curator: get_tasks failed: %s', exc)
 
@@ -945,7 +945,7 @@ def _to_pool_entry(
     )
 
 
-def _flatten_task_tree(tasks_result: dict) -> list[dict]:
+def flatten_task_tree(tasks_result: dict) -> list[dict]:
     """Walk a get_tasks response and return a flat list of task dicts."""
     out: list[dict] = []
 

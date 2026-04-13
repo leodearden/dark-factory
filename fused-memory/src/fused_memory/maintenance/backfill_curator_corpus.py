@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.maintenance._utils import maintenance_service
-from fused_memory.middleware.task_curator import BackfillResult, TaskCurator, _flatten_task_tree
+from fused_memory.middleware.task_curator import BackfillResult, TaskCurator, flatten_task_tree
 from fused_memory.models.scope import resolve_project_id
 
 logger = logging.getLogger(__name__)
@@ -77,7 +77,7 @@ class BackfillManager:
 
         logger.info('backfill_curator_corpus: fetching task tree for %s', project_root)
         tasks_result = await self.taskmaster.get_tasks(project_root)
-        flat_tasks = _flatten_task_tree(tasks_result)
+        flat_tasks = flatten_task_tree(tasks_result)
         report.tasks_found = len(flat_tasks)
 
         logger.info(
