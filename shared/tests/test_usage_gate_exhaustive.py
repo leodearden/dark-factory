@@ -449,22 +449,10 @@ class TestNearCapStateDistinction:
         assert acct.near_cap is True
         assert acct.capped is True
 
-        # (3) Run the probe loop — it should detect resets_at in the past, fire probe, succeed.
-        #     asyncio.sleep is patched to a no-op so the test is robust against a future change
-        #     that adds a minimum-interval floor.
-        #
-        #     NOTE on patch scope: `patch('shared.usage_gate.asyncio.sleep', ...)` replaces the
-        #     module-level attribute in shared.usage_gate for the duration of this block — it is
-        #     technically a process-wide change, not a local one.  This is safe here because:
-        #       1. pytest runs tests single-threaded, so no concurrent task is affected.
-        #       2. The scope is tightly bounded to the probe-loop call itself.
-        #       3. asyncio.wait_for uses event-loop timer handles internally (not asyncio.sleep),
-        #          so the 5 s timeout guard is unaffected by the patch.
-        #     If _account_resume_probe_loop is ever refactored to spawn concurrent subtasks that
-        #     also call asyncio.sleep, this patch would silently no-op those calls too — at that
-        #     point consider injecting a sleep callable (e.g. gate._sleep) via config instead.
-        with patch('shared.usage_gate.asyncio.sleep', new_callable=AsyncMock):
+        # (3) Run probe loop; assert_not_awaited enforces resets_at-in-the-past → sleep_for=0 invariant.
+        with patch('shared.usage_gate.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
             await asyncio.wait_for(gate._account_resume_probe_loop(acct), timeout=5)
+            mock_sleep.assert_not_awaited()
 
         # (4) Account must be uncapped AND near_cap must be cleared — FAIL-BEFORE-FIX assertion
         assert acct.capped is False
