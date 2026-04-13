@@ -214,7 +214,9 @@ async def invoke_with_cap_retry(
     while True:
         oauth_token = None
         account_name = ''
-        skip_confirm = False  # set True when heuristic fires but account unresolvable
+        unattributed_cap = False  # True when heuristic fires but token is unresolvable;
+        # controls: (1) skip confirm_account_ok, (2) skip on_agent_complete,
+        # (3) mark capped=True in cost_store
         if usage_gate:
             oauth_token = await usage_gate.before_invoke()
             account_name = usage_gate.active_account_name or ''
@@ -341,8 +343,9 @@ async def invoke_with_cap_retry(
                 )
                 # Calling confirm_account_ok with an unresolvable token would be
                 # semantically misleading (we never confirmed the account is ok —
-                # we simply couldn't identify it).  Skip it for this iteration.
-                skip_confirm = True
+                # we simply couldn't identify it).  Skip confirm, on_agent_complete,
+                # and mark the persistent record as capped for this iteration.
+                unattributed_cap = True
             else:
                 consecutive_cap_hits += 1
                 full_cycles = (consecutive_cap_hits - 1) // num_accounts
@@ -394,9 +397,8 @@ async def invoke_with_cap_retry(
             invoke_kwargs['prompt'] = original_prompt
             continue
 
-        if usage_gate and not skip_confirm:
+        if usage_gate and not unattributed_cap:
             usage_gate.confirm_account_ok(oauth_token)
-        if usage_gate:
             usage_gate.on_agent_complete(result.cost_usd)
         break
 
@@ -416,7 +418,7 @@ async def invoke_with_cap_retry(
                 cache_read_tokens=result.cache_read_tokens,
                 cache_create_tokens=result.cache_create_tokens,
                 duration_ms=result.duration_ms,
-                capped=False,
+                capped=unattributed_cap,
                 started_at=started_at,
                 completed_at=completed_at,
             )
