@@ -624,3 +624,21 @@ async def test_call_judge_cli_empty_stdout_confirms_gate(mock_journal):
     gate.confirm_account_ok.assert_called_once_with('token-je')
     gate.on_agent_complete.assert_called_once_with(0.0)
     gate.release_probe_slot.assert_not_called()
+    mock_journal.write.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_empty_stdout_with_stderr_confirms_gate(mock_journal):
+    """Empty stdout (exit 0) still confirms gate even when stderr contains warnings."""
+    judge, gate = _make_gated_judge(mock_journal, token='token-jw')
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = AsyncMock(return_value=(b'', b'some warning'))
+
+    with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
+        result = await judge._call_judge_cli('Evaluate this.')
+
+    assert result == ''
+    gate.confirm_account_ok.assert_called_once_with('token-jw')
+    gate.on_agent_complete.assert_called_once_with(0.0)
+    gate.release_probe_slot.assert_not_called()
