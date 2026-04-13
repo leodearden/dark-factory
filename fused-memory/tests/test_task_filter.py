@@ -1199,3 +1199,11 @@ class TestIdKey:
     def test_float_id_is_truncated_to_int(self):
         """_id_key returns the int truncation of a float (int(3.9) == 3)."""
         assert _id_key({'id': 3.9}) == 3
+
+    def test_dotted_subtask_id_returns_parent_component(self):
+        """_id_key returns the parent (first dot-segment) as int for '450.2'."""
+        assert _id_key({'id': '450.2'}) == 450
+
+    def test_deep_dotted_id_returns_parent_component(self):
+        """_id_key returns the parent (first dot-segment) as int for '450.2.1'."""
+        assert _id_key({'id': '450.2.1'}) == 450
