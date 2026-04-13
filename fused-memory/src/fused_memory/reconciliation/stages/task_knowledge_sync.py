@@ -145,22 +145,59 @@ Use project_root="{self.project_root}" for all task operations.
 """
 
     @staticmethod
+    def _warn_if_count_tasks_mismatch(
+        count: int,
+        tasks: list,
+        count_label: str,
+        tasks_label: str,
+        section_label: str,
+        task_ref: str,
+    ) -> None:
+        """Emit a WARNING when a count>0/tasks-empty invariant is violated.
+
+        Extracted to avoid repeating the same guard pattern for each
+        count↔tasks pair (done, cancelled, and any future additions).
+        """
+        if count > 0 and not tasks:
+            logger.warning(
+                'FilteredTaskTree invariant violation: %s=%d but %s is '
+                'empty. Externally-constructed tree bypassed filter_task_tree() guarantee. '
+                '%s section will render as empty. (%s defensive check)',
+                count_label,
+                count,
+                tasks_label,
+                section_label,
+                task_ref,
+            )
+
+    @staticmethod
     def _check_filtered_tree_invariant(filtered: FilteredTaskTree) -> None:
-        """Emit a WARNING if done_count > 0 but done_tasks is empty (task-782 defensive check).
+        """Emit a WARNING for each violated done/cancelled count↔tasks invariant.
 
         filter_task_tree() always appends to done_tasks when it increments done_count
-        (capped at MAX_DONE_TASKS_RETAINED=30), so this invariant is impossible to violate
-        via the normal code path.  Externally-constructed FilteredTaskTree instances that
-        bypass filter_task_tree() could violate it; this check catches them at the callsite
-        rather than silently dropping data from the "Recently Completed" section.
+        (capped at MAX_DONE_TASKS_RETAINED=30), and always appends to cancelled_tasks
+        when it increments cancelled_count (capped at MAX_CANCELLED_TASKS_RETAINED=15),
+        so both invariants are impossible to violate via the normal code path.
+        Externally-constructed FilteredTaskTree instances that bypass filter_task_tree()
+        could violate either; these checks catch them at the callsite rather than silently
+        dropping data from the "Recently Completed" or "Recently Cancelled" sections.
         """
-        if filtered.done_count > 0 and not filtered.done_tasks:
-            logger.warning(
-                'FilteredTaskTree invariant violation: done_count=%d but done_tasks is '
-                'empty. Externally-constructed tree bypassed filter_task_tree() guarantee. '
-                'Recently Completed section will render as empty. (task-782 defensive check)',
-                filtered.done_count,
-            )
+        TaskKnowledgeSync._warn_if_count_tasks_mismatch(
+            filtered.done_count,
+            filtered.done_tasks,
+            'done_count',
+            'done_tasks',
+            'Recently Completed',
+            'task-782',
+        )
+        TaskKnowledgeSync._warn_if_count_tasks_mismatch(
+            filtered.cancelled_count,
+            filtered.cancelled_tasks,
+            'cancelled_count',
+            'cancelled_tasks',
+            'Recently Cancelled',
+            'task-828',
+        )
 
 
 class IntegrityCheck(BaseStage):

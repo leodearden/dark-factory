@@ -33,6 +33,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _select_proactive_sample,
 )
 from fused_memory.reconciliation.task_filter import (
+    MAX_CANCELLED_TASKS_RETAINED,
     MAX_DONE_TASKS_RETAINED,
     FilteredTaskTree,
     _id_key,
@@ -2106,6 +2107,62 @@ class TestInvariantAfterTask643:
         return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': []}
 
     @pytest.mark.asyncio
+    async def test_warns_when_filtered_task_tree_violates_cancelled_invariant(
+        self, mock_deps, watermark, caplog
+    ):
+        """Integration guard: a FilteredTaskTree with cancelled_count>0 but empty cancelled_tasks triggers a WARNING.
+
+        This test exercises the full ``assemble_payload`` method intentionally — it
+        verifies that ``_check_filtered_tree_invariant`` is correctly wired into the
+        ``assemble_payload`` call chain for the cancelled pair, not just that the helper
+        itself works.  For isolated testing of the helper, see
+        ``test_check_filtered_tree_invariant_warns_on_cancelled_violation``.
+
+        The invariant-violating state can only be reached by external callers that
+        construct a ``FilteredTaskTree`` directly (bypassing ``filter_task_tree``).
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        # Construct invariant-violating tree: cancelled_count > 0 but cancelled_tasks is empty.
+        # This state is impossible via filter_task_tree() but can arise from external
+        # construction — exactly the case the task-828 defensive check guards against.
+        # total_count = 1 active + 0 done + 4 cancelled + 0 other = 5
+        stage.filtered_task_tree = FilteredTaskTree(
+            active_tasks=[self._make_task(1, 'in-progress')],
+            done_tasks=[],
+            done_count=0,
+            cancelled_tasks=[],
+            cancelled_count=4,
+            other_count=0,
+            total_count=5,
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            payload = await stage.assemble_payload([], watermark, [])
+
+        # The warning must be emitted…
+        assert any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'cancelled_count' in rec.message
+            and 'cancelled_tasks' in rec.message
+            for rec in caplog.records
+        ), (
+            'Expected a WARNING about cancelled_count/cancelled_tasks invariant from '
+            'fused_memory.reconciliation.stages.task_knowledge_sync, '
+            f'got records: {[(r.name, r.levelno, r.message) for r in caplog.records]}'
+        )
+        # …but the warning must be non-fatal: assemble_payload still returns a valid payload.
+        assert payload and 'Stage 2' in payload, (
+            f'assemble_payload should complete and return a Stage 2 payload even when '
+            f'the cancelled invariant is violated; got: {payload!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_warns_when_filtered_task_tree_violates_invariant(
         self, mock_deps, watermark, caplog
     ):
@@ -2154,6 +2211,39 @@ class TestInvariantAfterTask643:
             f'got records: {[(r.name, r.levelno, r.message) for r in caplog.records]}'
         )
 
+    def test_check_filtered_tree_invariant_warns_on_cancelled_violation(self, mock_deps, caplog):
+        """Unit test for _check_filtered_tree_invariant: warns when cancelled invariant is violated.
+
+        Calls the private helper directly with a FilteredTaskTree that has
+        cancelled_count=3 but cancelled_tasks=[] — an impossible state from
+        filter_task_tree() but reachable via external construction.  Asserts
+        that a WARNING containing 'cancelled_count' and 'cancelled_tasks' is
+        emitted.  Mirrors test_check_filtered_tree_invariant_warns_on_violation
+        for the done pair.
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        violating_tree = FilteredTaskTree(
+            active_tasks=[],
+            done_tasks=[],
+            done_count=0,
+            cancelled_tasks=[],
+            cancelled_count=3,
+            other_count=0,
+            total_count=3,
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            stage._check_filtered_tree_invariant(violating_tree)
+
+        assert any(
+            rec.levelno == logging.WARNING
+            and 'cancelled_count' in rec.message
+            and 'cancelled_tasks' in rec.message
+            for rec in caplog.records
+        )
+
     def test_check_filtered_tree_invariant_warns_on_violation(self, mock_deps, caplog):
         """Unit test for _check_filtered_tree_invariant: warns when invariant is violated.
 
@@ -2184,6 +2274,32 @@ class TestInvariantAfterTask643:
             for rec in caplog.records
         )
 
+    def test_check_filtered_tree_invariant_no_warning_when_cancelled_ok(self, mock_deps, caplog):
+        """Unit test for _check_filtered_tree_invariant: no warning when cancelled invariant holds.
+
+        Constructs a FilteredTaskTree with cancelled_count=2 and cancelled_tasks populated
+        with 2 tasks — the invariant holds.  Asserts no WARNING records are emitted.
+        Verifies the new check does not false-positive on valid trees.  Mirrors
+        test_check_filtered_tree_invariant_no_warning_when_ok for the done pair.
+        """
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        ok_tree = FilteredTaskTree(
+            active_tasks=[],
+            done_tasks=[],
+            done_count=0,
+            cancelled_tasks=[self._make_task(1, 'cancelled'), self._make_task(2, 'cancelled')],
+            cancelled_count=2,
+            other_count=0,
+            total_count=2,
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            stage._check_filtered_tree_invariant(ok_tree)
+
+        assert not any(rec.levelno == logging.WARNING for rec in caplog.records)
+
     def test_check_filtered_tree_invariant_no_warning_when_ok(self, mock_deps, caplog):
         """Unit test for _check_filtered_tree_invariant: no warning when invariant holds."""
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
@@ -2203,6 +2319,30 @@ class TestInvariantAfterTask643:
             stage._check_filtered_tree_invariant(ok_tree)
 
         assert not any(rec.levelno == logging.WARNING for rec in caplog.records)
+
+    def test_filter_task_tree_invariant_cancelled_count_and_cancelled_tasks_populated_together(self):
+        """Regression guard: filter_task_tree() sets cancelled_count>0 ↔ cancelled_tasks non-empty.
+
+        Mirrors the done-pair regression guard.  Verifies that any future refactor of
+        filter_task_tree that breaks the cancelled_count↔cancelled_tasks invariant trips
+        this test in addition to guards in test_task_filter.py.
+        """
+        tasks_data = {
+            'tasks': [
+                self._make_task(1, 'cancelled'),
+                self._make_task(2, 'cancelled'),
+                self._make_task(3, 'cancelled'),
+            ]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert result.cancelled_count > 0, (
+            f'Expected cancelled_count > 0 for 3 cancelled tasks, got {result.cancelled_count}'
+        )
+        assert len(result.cancelled_tasks) > 0, (
+            f'Expected non-empty cancelled_tasks for cancelled_count={result.cancelled_count}, '
+            f'got cancelled_tasks={result.cancelled_tasks!r}'
+        )
 
     def test_filter_task_tree_invariant_done_count_and_done_tasks_populated_together(self):
         """Regression guard: filter_task_tree() sets done_count>0 ↔ done_tasks non-empty.
@@ -2229,6 +2369,30 @@ class TestInvariantAfterTask643:
             f'Expected non-empty done_tasks for done_count={result.done_count}, '
             f'got done_tasks={result.done_tasks!r}'
         )
+
+    def test_filter_task_tree_invariant_holds_with_over_cap_cancelled_tasks(self):
+        """Regression guard: at the >MAX_CANCELLED_TASKS_RETAINED boundary the invariant still holds.
+
+        Even when cancelled_count exceeds MAX_CANCELLED_TASKS_RETAINED=15 (tasks are capped
+        in cancelled_tasks), cancelled_tasks must remain non-empty.  Mirrors the done-pair
+        over-cap test placed by task-782 and guards against future refactors of
+        filter_task_tree that might inadvertently empty the cancelled list under the cap.
+        """
+        n_tasks = MAX_CANCELLED_TASKS_RETAINED + 5
+        tasks_data = {
+            'tasks': [self._make_task(i, 'cancelled') for i in range(1, n_tasks + 1)]
+        }
+        result = filter_task_tree(tasks_data)
+
+        assert result.cancelled_count > MAX_CANCELLED_TASKS_RETAINED, (
+            f'Expected cancelled_count > {MAX_CANCELLED_TASKS_RETAINED}, got {result.cancelled_count}'
+        )
+        assert len(result.cancelled_tasks) == MAX_CANCELLED_TASKS_RETAINED, (
+            f'Expected cancelled_tasks capped at {MAX_CANCELLED_TASKS_RETAINED}, '
+            f'got {len(result.cancelled_tasks)}'
+        )
+        # Invariant holds implicitly: the assertion above already proves cancelled_tasks
+        # is non-empty (MAX_CANCELLED_TASKS_RETAINED == 15).
 
     def test_filter_task_tree_invariant_holds_with_over_cap_done_tasks(self):
         """Regression guard: at the >MAX_DONE_TASKS_RETAINED boundary the invariant still holds.
