@@ -550,8 +550,6 @@ async def test_call_judge_cli_releases_probe_on_file_not_found(mock_journal):
 @pytest.mark.asyncio
 async def test_call_judge_cli_releases_probe_on_timeout(mock_journal):
     """release_probe_slot is called when wait_for raises TimeoutError."""
-    import asyncio
-
     config = _make_judge_config(judge_llm_provider='claude-cli', judge_llm_model='sonnet')
     judge = Judge(config=config, journal=mock_journal)
 
@@ -562,7 +560,7 @@ async def test_call_judge_cli_releases_probe_on_timeout(mock_journal):
 
     mock_proc = AsyncMock()
     mock_proc.returncode = 0
-    mock_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+    mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
 
     with (
         patch('asyncio.create_subprocess_exec', new_callable=AsyncMock, return_value=mock_proc),

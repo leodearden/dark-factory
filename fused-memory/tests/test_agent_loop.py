@@ -1330,8 +1330,6 @@ async def test_call_claude_cli_no_confirm_on_cap_hit():
     """confirm_account_ok is NOT called on the cap-hit iteration, only on success."""
     from unittest.mock import AsyncMock
 
-    from fused_memory.reconciliation.agent_loop import _CAP_HIT_COOLDOWN_SECS
-
     config = _make_config(agent_llm_provider='claude-cli', agent_llm_model='opus')
 
     tools = {
@@ -1397,7 +1395,6 @@ async def test_call_claude_cli_no_confirm_on_cap_hit():
 @pytest.mark.asyncio
 async def test_call_claude_cli_releases_probe_on_file_not_found():
     """release_probe_slot is called when create_subprocess_exec raises FileNotFoundError."""
-    import asyncio
     from unittest.mock import AsyncMock
 
     config = _make_config(agent_llm_provider='claude-cli', agent_llm_model='opus')
@@ -1438,7 +1435,6 @@ async def test_call_claude_cli_releases_probe_on_file_not_found():
 @pytest.mark.asyncio
 async def test_call_claude_cli_releases_probe_on_timeout():
     """release_probe_slot is called when wait_for raises TimeoutError."""
-    import asyncio
     from unittest.mock import AsyncMock
 
     config = _make_config(agent_llm_provider='claude-cli', agent_llm_model='opus')
@@ -1466,7 +1462,7 @@ async def test_call_claude_cli_releases_probe_on_timeout():
 
     mock_proc = AsyncMock()
     mock_proc.returncode = 0
-    mock_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+    mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
 
     messages = [{'role': 'user', 'content': 'test prompt'}]
     tool_schemas: list = []
