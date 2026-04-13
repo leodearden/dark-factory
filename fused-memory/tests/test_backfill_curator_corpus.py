@@ -808,6 +808,51 @@ class TestAutoBackfill:
             await asyncio.sleep(0.05)  # let background task settle
 
     @pytest.mark.asyncio
+    async def test_maybe_backfill_awaits_inline_no_nested_task(self):
+        """_maybe_backfill_corpus() awaits backfill_corpus() inline — no nested background task.
+
+        After the call returns (no sleep), backfill_corpus must have been called and
+        interceptor._background_tasks must be empty (no curator-auto-backfill task was spawned).
+        """
+        canned_task_tree = {
+            'tasks': [
+                {'id': '1', 'title': 'Task A', 'description': 'Desc A', 'status': 'done'},
+            ],
+        }
+        mock_taskmaster = AsyncMock()
+        mock_taskmaster.get_tasks = AsyncMock(return_value=canned_task_tree)
+
+        interceptor = self._make_interceptor(mock_taskmaster)
+
+        config = _make_interceptor_config()
+        curator = TaskCurator(config=config, taskmaster=mock_taskmaster)
+
+        from qdrant_client.http.models import CountResult
+        mock_qdrant = AsyncMock()
+        mock_qdrant.collection_exists = AsyncMock(return_value=True)
+        mock_qdrant.count = AsyncMock(return_value=CountResult(count=0))
+
+        backfill_called_with: list[tuple] = []
+
+        async def mock_backfill_corpus(tasks, project_id):
+            backfill_called_with.append((tasks, project_id))
+            return BackfillResult(upserted=len(tasks))
+
+        with patch.object(curator, '_get_qdrant', AsyncMock(return_value=mock_qdrant)), \
+             patch.object(curator, 'backfill_corpus', side_effect=mock_backfill_corpus):
+
+            await interceptor._maybe_backfill_corpus(curator, project_root='/fake/project')
+            # No sleep — backfill must complete inline (direct await, not nested create_task)
+
+        # backfill_corpus was called immediately (inline await, not deferred)
+        assert len(backfill_called_with) == 1
+        tasks_arg, project_id_arg = backfill_called_with[0]
+        assert len(tasks_arg) == 1
+        assert project_id_arg == 'project'
+        # No nested background tasks were spawned
+        assert len(interceptor._background_tasks) == 0
+
+    @pytest.mark.asyncio
     async def test_get_curator_triggers_backfill_on_first_call(self):
         """_get_curator() fires _maybe_backfill_corpus() as a background task on first construction.
 
