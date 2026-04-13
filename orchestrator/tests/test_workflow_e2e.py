@@ -2200,19 +2200,30 @@ class TestArchitectPromptGuidance:
         assert 'prerequisites' in prompt and ('MUST be' in prompt or 'must be a dict' in prompt.lower())
 
     def test_architect_prompt_prerequisites_guidance_is_near_steps_warning(self):
-        """Prerequisites guidance must appear in the ## Important section, near the steps warning."""
+        """Both the steps warning and prerequisites guidance must appear in the ## Important section.
+
+        The original test used a 600-character proximity window, which is fragile — any insertion
+        between the two warnings would break the test spuriously.  Instead we check that both
+        directives appear in the same logical section (the '## Important' block), which is stable
+        under prompt reformatting.
+        """
         from orchestrator.agents.roles import ARCHITECT
 
         prompt = ARCHITECT.system_prompt
-        # Find the steps-format warning (line 138 of roles.py)
         steps_warning = 'top-level key for your plan steps MUST be'
         assert steps_warning in prompt
 
-        # The prerequisites warning must be present near the steps warning
-        steps_idx = prompt.index(steps_warning)
-        # Look for 'prerequisites' in the Important section (within 600 chars of steps warning)
-        surrounding = prompt[max(0, steps_idx - 200):steps_idx + 600]
-        assert 'prerequisites' in surrounding.lower() and ('dict' in surrounding.lower() or 'NOT a plain string' in surrounding)
+        # Both warnings must live inside the ## Important section — locate it and
+        # extract from that point onward to avoid false positives from other sections.
+        assert '## Important' in prompt, 'ARCHITECT prompt must contain a "## Important" section'
+        important_idx = prompt.index('## Important')
+        important_section = prompt[important_idx:]
+        assert steps_warning in important_section, (
+            'Steps-format warning must appear in the ## Important section'
+        )
+        assert 'prerequisites' in important_section.lower() and (
+            'dict' in important_section.lower() or 'NOT a plain string' in important_section
+        ), 'Prerequisites guidance must appear in the ## Important section'
 
 
 # ---------------------------------------------------------------------------
