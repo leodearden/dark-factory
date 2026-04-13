@@ -939,6 +939,63 @@ class TestProactiveSampling:
             "The 'Your Task' instruction section should reference the Proactive Task Sample"
         )
 
+    # --- Step: lazy iterable acceptance (task-709) ---
+
+    def test_select_proactive_sample_accepts_lazy_iterable(self):
+        """_select_proactive_sample works with a generator (lazy Iterable[dict]), not a list.
+
+        Verifies the Iterable[dict] type hint is accurate: heapq.nsmallest accepts any
+        iterable, so a generator can be passed directly without first materialising a list.
+        Priority ordering (in-progress/blocked before pending/done) is preserved.
+        """
+
+        def task_generator():
+            yield self._make_task(1, 'done')
+            yield self._make_task(2, 'pending')
+            yield self._make_task(3, 'in-progress')
+            yield self._make_task(4, 'done')
+            yield self._make_task(5, 'blocked')
+            yield self._make_task(6, 'pending')
+
+        result = _select_proactive_sample(task_generator(), 3)
+
+        assert len(result) == 3
+
+        # Verify the correct 3 tasks were selected (highest-priority ones)
+        # Generator: done, pending, in-progress, done, blocked, pending
+        # Top-3 by priority: in-progress(0) > blocked(1) > pending(3)
+        assert {t['status'] for t in result} == {'in-progress', 'blocked', 'pending'}, (
+            f'Expected top-priority tasks {{in-progress, blocked, pending}}, got: '
+            f'{[t["status"] for t in result]}'
+        )
+
+        high_priority = {'in-progress', 'blocked'}
+        low_priority = {'pending', 'done'}
+        statuses = [t['status'] for t in result]
+        last_high = max(
+            (i for i, t in enumerate(result) if t['status'] in high_priority),
+            default=-1,
+        )
+        first_low = min(
+            (i for i, t in enumerate(result) if t['status'] in low_priority),
+            default=len(result),
+        )
+        assert last_high < first_low, (
+            f'In-progress/blocked tasks must appear before pending/done. Got: {statuses}'
+        )
+
+    # --- Step: empty iterable (task-709 amendment) ---
+
+    def test_select_proactive_sample_empty_iterable_returns_empty_list(self):
+        """_select_proactive_sample with an empty iterable returns [] without error.
+
+        Explicit edge-case guard: heapq.nsmallest handles empty input correctly, and
+        this test ensures the Iterable[dict] signature doesn't introduce any early
+        access that would fail on empty generators.
+        """
+        assert _select_proactive_sample(iter([]), 5) == []
+        assert _select_proactive_sample(iter([]), 0) == []
+
 
 class TestRunIdValidation(BaseStageValidationTest):
     """BaseStage.run() validates run_id before prompt interpolation."""
@@ -1545,6 +1602,43 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
             f"The stage may be applying a redundant slice that trims "
             f"filter_task_tree's already-capped output.\n"
             f"Section content:\n{section}"
+        )
+
+    # --- Step: other-status exclusion from proactive pool (task-709) ---
+
+    @pytest.mark.asyncio
+    async def test_proactive_sample_pool_excludes_other_status_tasks(self, mock_deps, watermark):
+        """filter_task_tree drops unknown-status tasks before they reach the proactive sample
+        pool; such tasks must not appear in '### Proactive Task Sample'.
+
+        The inline comment at task_knowledge_sync.py:94-95 documents this narrowing:
+        filter_task_tree increments other_count for unknown statuses without appending to
+        any list, so they never enter the itertools.chain pool.
+        """
+        mystery_title = 'Mystery Status Task'
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'test_project'
+        stage.project_root = '/tmp/test_project'
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_task(1, 'in-progress', 'Active Task'),
+                self._make_task(2, 'pending', 'Pending Task'),
+                self._make_task(3, 'done', 'Done Task'),
+                self._make_task(4, 'mystery', mystery_title),  # unknown status -> other_count only
+            ]
+        }
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        proactive_section = _extract_section(payload, '### Proactive Task Sample')
+        assert proactive_section, "Payload must contain '### Proactive Task Sample' section"
+        assert mystery_title not in proactive_section, (
+            f"Other-status task '{mystery_title}' must not appear in proactive sample pool; "
+            f"filter_task_tree drops unknown-status tasks before the pool is built."
+        )
+        # Sanity: at least one known-status task must be in the pool
+        assert 'Active Task' in proactive_section or 'Pending Task' in proactive_section, (
+            "At least one known-status task must appear in the proactive sample section"
         )
 
 

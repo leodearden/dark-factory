@@ -4,7 +4,9 @@ Stage 3: Cross-System Integrity Check — read-only verification."""
 from __future__ import annotations
 
 import heapq
+import itertools
 import json
+from collections.abc import Iterable
 
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -89,8 +91,10 @@ class TaskKnowledgeSync(BaseStage):
 
         proactive_sample_section = ''
         if not self.remediation_mode:
+            # Pool intentionally excludes unknown-status tasks (dropped by
+            # filter_task_tree) and caps done_tasks at MAX_DONE_TASKS_RETAINED.
             sample = _select_proactive_sample(
-                filtered.active_tasks + filtered.done_tasks + filtered.cancelled_tasks,
+                itertools.chain(filtered.active_tasks, filtered.done_tasks, filtered.cancelled_tasks),
                 self.MIN_TASK_SAMPLE,
             )
             proactive_sample_section = (
@@ -210,7 +214,7 @@ def _format_flagged(items: list[dict]) -> str:
     return '\n'.join(lines)
 
 
-def _select_proactive_sample(tasks: list[dict], n: int) -> list[dict]:
+def _select_proactive_sample(tasks: Iterable[dict], n: int) -> list[dict]:
     """Select the top-N tasks for proactive spot-checking.
 
     Sorted by status priority (in-progress > blocked > review > pending > done),

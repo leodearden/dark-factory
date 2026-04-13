@@ -80,7 +80,13 @@ def _id_key(t: dict) -> int:
 
 @dataclass
 class FilteredTaskTree:
-    """Result of filter_task_tree(): active tasks plus aggregate counts."""
+    """Result of filter_task_tree(): active tasks plus aggregate counts.
+
+    All list fields (active_tasks, done_tasks, cancelled_tasks) are expected to
+    contain only ``dict`` elements.  ``filter_task_tree`` enforces this via
+    ``isinstance`` checks; direct constructors (e.g. in tests) must honour the
+    same invariant — downstream consumers omit per-element type guards.
+    """
 
     active_tasks: list[dict] = field(default_factory=list)
     done_tasks: list[dict] = field(default_factory=list)
