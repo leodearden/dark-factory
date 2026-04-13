@@ -19,6 +19,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
+from conftest import make_rebuild_detail
 from fused_memory.backends.graphiti_client import GraphitiBackend, StaleSummaryResult
 
 
@@ -649,16 +650,8 @@ class TestMemoryServiceRebuildEntitySummaries:
             'skipped': 1,
             'errors': 0,
             'details': [
-                {
-                    'uuid': 'u1', 'name': 'Alice', 'status': 'rebuilt',
-                    'old_summary': 'old text', 'new_summary': 'new text',
-                    'edge_count': 5, 'error': None,
-                },
-                {
-                    'uuid': 'u2', 'name': 'Bob', 'status': 'rebuilt',
-                    'old_summary': 'old bob', 'new_summary': 'new bob',
-                    'edge_count': 3, 'error': None,
-                },
+                {**make_rebuild_detail('u1', 'Alice', old_summary='old text', new_summary='new text', edge_count=5), 'error': None},
+                {**make_rebuild_detail('u2', 'Bob', old_summary='old bob', new_summary='new bob', edge_count=3), 'error': None},
             ],
         })
         svc.mem0 = MagicMock()
@@ -879,8 +872,7 @@ class TestRebuildSummariesManager:
             'rebuilt': 3,
             'skipped': 0,
             'errors': 0,
-            'details': [{'uuid': 'u1', 'name': 'Alice', 'status': 'rebuilt',
-                         'old_summary': 'old', 'new_summary': 'new', 'edge_count': 2}],
+            'details': [make_rebuild_detail('u1', 'Alice', old_summary='old', new_summary='new', edge_count=2)],
         })
         fake_ctx = make_fake_maintenance_service(mock_cfg, mock_service)
         with patch(
