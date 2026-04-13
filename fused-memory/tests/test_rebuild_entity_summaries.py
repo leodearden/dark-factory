@@ -915,15 +915,17 @@ class TestRebuildEntitySummaries:
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
         })
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_uuid_dispatch({
+        dispatch = _uuid_dispatch({
             'uuid-1': {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'ok', 'new_summary': 'fact1', 'edge_count': 1},
             'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'also ok', 'new_summary': 'fact2', 'edge_count': 1},
-        }))
+        })
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=dispatch)
         result = await svc.rebuild_entity_summaries(project_id='test', force=True)
         assert result['total_entities'] == 2
         assert result['stale_entities'] == 2
         assert result['rebuilt'] == 2
         assert svc.graphiti.rebuild_entity_from_edges.await_count == 2
+        dispatch.assert_all_dispatched()
 
     @pytest.mark.asyncio
     async def test_returns_aggregate_result(self, mock_config):
@@ -1032,10 +1034,11 @@ class TestMemoryServiceRebuildEntitySummaries:
                 total_count=5,
             )
         )
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_uuid_dispatch({
+        dispatch = _uuid_dispatch({
             'u1': {'uuid': 'u1', 'name': 'Alice', 'old_summary': 'old A', 'new_summary': 'new A', 'edge_count': 1},
             'u2': {'uuid': 'u2', 'name': 'Bob', 'old_summary': 'old B', 'new_summary': 'new B', 'edge_count': 1},
-        }))
+        })
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=dispatch)
         svc.mem0 = MagicMock()
         svc.durable_queue = MagicMock()
         svc.durable_queue.enqueue = AsyncMock(return_value=1)
@@ -1053,6 +1056,7 @@ class TestMemoryServiceRebuildEntitySummaries:
             group_id='dark_factory'
         )
         assert result['total_entities'] == 5
+        service.graphiti.rebuild_entity_from_edges.side_effect.assert_all_dispatched()
 
     @pytest.mark.asyncio
     async def test_journal_logs_on_success(self, service):
@@ -2165,24 +2169,28 @@ class TestDocstringCrossReferenceAccuracy716:
 
         Uses ast.parse + ast.walk rather than substring matching so that trivial
         reformatting (multi-line raise, whitespace changes) cannot produce a false
-        negative.  Checks only the positive invariant — that RuntimeError is raised —
+        negative.  Checks only the positive invariant — that RuntimeError is referenced —
         without the overly-broad negative assertion that no ValueError appears anywhere
         in the test body (which would break if a legitimate second scenario were added).
+
+        RuntimeError may be referenced as a direct raise statement OR as an exception
+        instance passed to _uuid_dispatch() — both patterns exercise the same production
+        code path.
         """
         src = inspect.getsource(TestRebuildEntitySummaries.test_partial_failure_continues)
         tree = ast.parse(textwrap.dedent(src))
-        raised_names = {
-            node.exc.func.id
+        # Detect RuntimeError as a raised exception or as an instantiated Call node
+        # (e.g. passed to _uuid_dispatch as a mapping value).
+        error_names = {
+            node.func.id
             for node in ast.walk(tree)
             if (
-                isinstance(node, ast.Raise)
-                and node.exc is not None
-                and isinstance(node.exc, ast.Call)
-                and isinstance(node.exc.func, ast.Name)
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
             )
         }
-        assert 'RuntimeError' in raised_names, (
-            "test_partial_failure_continues must raise RuntimeError — "
+        assert 'RuntimeError' in error_names, (
+            "test_partial_failure_continues must reference RuntimeError — "
             "the cross-reference in test_runtime_error_still_accumulates_in_errors "
             "docstring claims it 'exercises RuntimeError'"
         )
