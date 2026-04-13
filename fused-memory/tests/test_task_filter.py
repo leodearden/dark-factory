@@ -908,3 +908,32 @@ class TestFormatCancelledSection:
             f'Old summary line "3 done, 2 cancelled \u2014 omitted" must not appear when '
             f'cancelled section is rendered, got:\n{output!r}'
         )
+
+    def test_format_cancelled_section_omitted_when_empty(self):
+        """When cancelled_tasks=[] (empty), no cancelled section is rendered and
+        the summary line retains the original 'N done, N cancelled — omitted' format.
+
+        This guards backward compatibility: all existing budget tests have
+        cancelled_tasks=[] and must not be affected by the conditional rendering.
+        """
+        tree = FilteredTaskTree(
+            active_tasks=[_make_task(1, 'pending'), _make_task(2, 'in-progress')],
+            # cancelled_tasks left as default empty list
+            done_count=3,
+            cancelled_count=5,
+            other_count=0,
+            total_count=10,
+        )
+        output = format_filtered_task_tree(tree)
+
+        # (a) Section must be absent when cancelled_tasks is empty
+        assert '### Recently Cancelled Tasks' not in output, (
+            f'Section "### Recently Cancelled Tasks" must not appear when '
+            f'cancelled_tasks=[], got:\n{output!r}'
+        )
+
+        # (b) Summary line retains original format (backward compatibility)
+        assert '3 done, 5 cancelled \u2014 omitted' in output, (
+            f'Expected original summary "3 done, 5 cancelled \u2014 omitted" '
+            f'when cancelled_tasks=[], got:\n{output!r}'
+        )
