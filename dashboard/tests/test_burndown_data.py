@@ -273,8 +273,8 @@ class TestCollectSnapshot:
         """Known roots are snapshotted even when no orchestrators are running."""
         _, base_config, conn = burndown_env
 
-        reify_root = Path('/home/leo/src/reify')
-        autopilot_root = Path('/home/leo/src/autopilot-video')
+        reify_root = Path('/nonexistent/known/reify')
+        autopilot_root = Path('/nonexistent/known/autopilot')
 
         config = DashboardConfig(
             project_root=base_config.project_root,
@@ -392,7 +392,7 @@ class TestCollectSnapshot:
         """If known_project_roots includes a root already discovered via orchestrator, no duplicate."""
         _, base_config, conn = burndown_env
 
-        reify_root = Path('/home/leo/src/reify')
+        reify_root = Path('/nonexistent/known/reify')
 
         config = DashboardConfig(
             project_root=base_config.project_root,
@@ -401,7 +401,7 @@ class TestCollectSnapshot:
 
         # Orchestrator also points to reify via config_path
         fake_orchestrators = [
-            {'prd': None, 'config_path': '/home/leo/src/reify/orchestrator.yaml'},
+            {'prd': None, 'config_path': '/nonexistent/known/reify/orchestrator.yaml'},
         ]
 
         # Orchestrator discovery returns reify_root (un-resolved); dedup prevents a second
@@ -465,9 +465,9 @@ class TestCollectSnapshot:
         """Orchestrators launched with --config (no --prd) are snapshotted."""
         _, config, conn = burndown_env
 
-        reify_root = Path('/home/leo/src/reify')
+        reify_root = Path('/nonexistent/known/reify')
         fake_orchestrators = [
-            {'prd': None, 'config_path': '/home/leo/src/reify/orchestrator.yaml'},
+            {'prd': None, 'config_path': '/nonexistent/known/reify/orchestrator.yaml'},
         ]
         reify_tasks = [{'status': 'done'}, {'status': 'pending'}]
 
@@ -756,8 +756,8 @@ class TestCollectSnapshot:
         db_path = tmp_path / 'burndown.db'
         _create_burndown_db(db_path)
 
-        reify_root = Path('/home/leo/src/reify')
-        autopilot_root = Path('/home/leo/src/autopilot-video')
+        reify_root = Path('/nonexistent/known/reify')
+        autopilot_root = Path('/nonexistent/known/autopilot')
 
         config = DashboardConfig(
             project_root=tmp_path,
