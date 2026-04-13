@@ -818,3 +818,72 @@ async def test_ctx_tasks_bulk_created_uses_parent_id_as_display_id(
     item = result.context_items['task:7']
     assert '[task:7]' in item.formatted
     assert '[task:None]' not in item.formatted
+
+
+# ── Integration: full assemble() with subtask status-change event ────
+
+
+@pytest.mark.asyncio
+async def test_assemble_subtask_event_qualified_id_end_to_end(
+    mock_memory, mock_taskmaster
+):
+    """End-to-end: assemble() with subtask status-change event emits qualified ID.
+
+    Validates the complete pipeline from event ingestion through payload assembly:
+    - Event payload has task_id='450.2'
+    - get_task returns a dict with bare id=2
+    - Assembled context_items must have key 'task:450.2'
+    - That item's formatted text must contain '[task:450.2]', not '[task:2]'
+
+    This is the regression test for the Stage 1 cross-reference gap: Stage 1
+    sees '[450.2]' in the Active Task Tree but was seeing '[task:2]' in Related
+    Context before this fix.
+    """
+    mock_taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': 2,
+            'title': 'Wire up auth endpoint',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {
+                'memory_hints': {},
+            },
+        }
+    )
+    mock_memory.search = AsyncMock(return_value=[])
+
+    assembler = _make_assembler(
+        memory_service=mock_memory,
+        taskmaster=mock_taskmaster,
+    )
+
+    events = [
+        _make_event(
+            event_type=EventType.task_status_changed,
+            payload={
+                'task_id': '450.2',
+                'old_status': 'in-progress',
+                'new_status': 'done',
+            },
+        ),
+    ]
+    watermark = _make_watermark()
+
+    result = await assembler.assemble(events, watermark, 'test-project')
+
+    # The assembled payload must include the event
+    assert len(result.events) == 1
+
+    # The context item key must be the qualified ID from the event payload
+    assert 'task:450.2' in result.context_items, (
+        f"Expected 'task:450.2' key in context_items, got: {list(result.context_items.keys())}"
+    )
+
+    # The formatted text must use the qualified ID, not the bare int from task dict
+    item = result.context_items['task:450.2']
+    assert '[task:450.2]' in item.formatted, (
+        f"Expected '[task:450.2]' in formatted text, got: {item.formatted!r}"
+    )
+    assert '[task:2]' not in item.formatted, (
+        f"Must not contain bare '[task:2]', got: {item.formatted!r}"
+    )
