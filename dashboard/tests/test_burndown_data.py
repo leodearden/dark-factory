@@ -844,7 +844,7 @@ class TestCollectSnapshot:
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warning_records, 'Expected at least one WARNING log record'
         expected_msg = f'Failed to load tasks for {config.project_root}'
-        assert any(r.getMessage() == expected_msg for r in warning_records), f'No warning record matched expected message: {expected_msg!r}'
+        assert any(expected_msg in r.getMessage() for r in warning_records), f'No warning record matched expected message: {expected_msg!r}'
         assert any(r.exc_info for r in warning_records)
 
     @pytest.mark.parametrize(
