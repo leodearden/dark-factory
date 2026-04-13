@@ -126,7 +126,7 @@ def timeago(value: str | None) -> str:
     if value is None:
         return 'never'
     try:
-        parsed = parse_utc(value)
+        parsed = parse_utc(value).astimezone(UTC)
     except (ValueError, TypeError):
         return 'never'
     delta = datetime.now(UTC) - parsed
