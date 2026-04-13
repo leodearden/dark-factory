@@ -98,6 +98,38 @@ def _fake_load(tasks_map):
 
 
 @pytest.fixture
+def burndown_conn_with_config(tmp_path):
+    """Factory fixture: returns a callable that produces an async context manager.
+
+    Each call accepts an optional *project_root* keyword argument plus any
+    **config_kwargs forwarded verbatim to DashboardConfig.  The context manager
+    yields a ``(db_path, config, conn)`` triple — identical contract to
+    ``burndown_env`` — but supports custom known_project_roots and
+    project_root overrides that ``burndown_env`` cannot accommodate.
+
+    Usage::
+
+        async with burndown_conn_with_config(known_project_roots=[...]) as (db_path, config, conn):
+            ...
+    """
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _factory(project_root=None, **config_kwargs):
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+        config = DashboardConfig(
+            project_root=project_root if project_root is not None else tmp_path,
+            **config_kwargs,
+        )
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            yield db_path, config, conn
+
+    return _factory
+
+
+@pytest.fixture
 async def burndown_env(tmp_path):
     """Yield (db_path, config, conn) with a fresh burndown DB and open connection."""
     db_path = tmp_path / 'burndown.db'
