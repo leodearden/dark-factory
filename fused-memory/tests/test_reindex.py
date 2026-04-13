@@ -1016,13 +1016,23 @@ class TestListGraphs:
 
     @pytest.mark.asyncio
     async def test_returns_filtered(self, mock_config, make_backend):
-        """Filters out 'default_db' and names ending in '_db' via _driver.client.list_graphs."""
+        """Filters out 'default_db' and names ending in '_db' via _require_falkor_client."""
         backend = make_backend(mock_config)
-        backend._driver.client.list_graphs = AsyncMock(
-            return_value=['proj_a', 'default_db', 'proj_b', 'internal_db']
-        )
-        result = await backend.list_graphs()
+        with patch.object(backend, '_require_falkor_client') as mock_client_accessor:
+            mock_client_accessor.return_value.list_graphs = AsyncMock(
+                return_value=['proj_a', 'default_db', 'proj_b', 'internal_db']
+            )
+            result = await backend.list_graphs()
         assert result == ['proj_a', 'proj_b']
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_require_falkor_client(self, mock_config, make_backend):
+        """list_graphs delegates client access to _require_falkor_client, not _driver.client directly."""
+        backend = make_backend(mock_config)
+        with patch.object(backend, '_require_falkor_client') as mock_client_accessor:
+            mock_client_accessor.return_value.list_graphs = AsyncMock(return_value=['a', 'b'])
+            await backend.list_graphs()
+        mock_client_accessor.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
