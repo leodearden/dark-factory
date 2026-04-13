@@ -1777,11 +1777,13 @@ class TestScrubTaskDirFromTree:
         task_dir = worktree_info.path / '.task'
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text('{"contamination": true}\n')
-        await _run(['git', 'add', '-f', '.task/plan.json'], cwd=worktree_info.path)
-        await _run(
+        rc, _, _ = await _run(['git', 'add', '-f', '.task/plan.json'], cwd=worktree_info.path)
+        assert rc == 0, 'setup: git add -f .task/plan.json failed'
+        rc, _, _ = await _run(
             ['git', 'commit', '-m', 'Simulated .task/ contamination'],
             cwd=worktree_info.path,
         )
+        assert rc == 0, 'setup: git commit of contamination failed'
 
         # Record HEAD before scrub.
         _, old_head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree_info.path)
