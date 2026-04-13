@@ -308,6 +308,8 @@ class TestDetectStaleSummariesDryRun:
         assert total_count == 3
         assert len(stale_list) == 1
         assert stale_list[0]['uuid'] == 'uuid-alice'
+        # Charlie's empty summary is cheap-skipped: only Alice and Bob trigger edge queries.
+        assert backend.get_valid_edges_for_node.await_count == 2
 
     @pytest.mark.asyncio
     async def test_flags_stale_entity_with_diagnostic_counts(self, mock_config, make_backend):
