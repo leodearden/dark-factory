@@ -430,6 +430,12 @@ class TestBackfillPointIdConsistency:
             f"backfill priority type: {type(backfill_payload['priority'])}"
         )
 
+        # Key-set equality excluding updated_at (documents intent: updated_at may legitimately differ)
+        assert set(record_payload.keys()) - {'updated_at'} == set(backfill_payload.keys()) - {'updated_at'}, (
+            f"Key-set mismatch (excluding updated_at): "
+            f"record={set(record_payload) - {'updated_at'}}, backfill={set(backfill_payload) - {'updated_at'}}"
+        )
+
         # Value equality for all shared keys except 'updated_at' (may differ by milliseconds)
         shared_keys = set(record_payload.keys()) - {'updated_at'}
         for key in shared_keys:
