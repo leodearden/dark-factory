@@ -77,6 +77,11 @@ class ScrubResult:
                 f'ScrubResult.error must only be set when outcome is FAILED, '
                 f'got outcome={self.outcome!r} with error={self.error!r}'
             )
+        if isinstance(self.error, str) and not self.error.strip():
+            raise ValueError(
+                'ScrubResult.error must not be an empty or whitespace-only string; '
+                'use None instead'
+            )
 
     def format_error(self, prefix: str = '') -> str:
         """Return prefix+error when error is set, otherwise empty string.

@@ -2249,22 +2249,19 @@ class TestScrubResultFormatError:
             f'Expected empty string for SCRUBBED outcome, got {result.format_error()!r}'
         )
 
-    def test_failed_with_empty_string_error_returns_prefix(self):
-        """FAILED with error='' still emits prefix because error is not None.
+    def test_failed_with_empty_string_error_raises_value_error(self):
+        """FAILED with error='' is rejected at construction time.
 
-        Empty string is a valid (if unusual) error value — it is not None.
-        format_error() must use identity semantics (``is not None``) so that:
-        - format_error()             → '' (prefix '' + error '' = '')
-        - format_error(prefix='...')→ '...' (prefix emitted; error appended as '')
-
-        The truthiness check ``if self.error:`` silently swallows the prefix for
-        empty-string errors, which is the bug this test documents.
+        All production call-sites normalise empty/whitespace stderr to None via
+        ``err.strip() or None`` before constructing ScrubResult.  Permitting an
+        empty-string error would create an ambiguous state (``error is not None``
+        but ``not error``).  The __post_init__ guard makes the invariant explicit:
+        ``error`` is either None or a non-empty, non-whitespace-only string.
         """
-        result = ScrubResult(outcome=ScrubOutcome.FAILED, error='')
-        assert result.format_error() == '', (
-            f'Expected empty string with default prefix, got {result.format_error()!r}'
-        )
-        assert result.format_error(prefix=' Error: ') == ' Error: ', (
-            f'Expected prefix to be emitted for non-None error, '
-            f'got {result.format_error(prefix=" Error: ")!r}'
-        )
+        with pytest.raises(ValueError, match='empty or whitespace-only'):
+            ScrubResult(outcome=ScrubOutcome.FAILED, error='')
+
+    def test_failed_with_whitespace_only_error_raises_value_error(self):
+        """FAILED with error='   ' (whitespace only) is also rejected."""
+        with pytest.raises(ValueError, match='empty or whitespace-only'):
+            ScrubResult(outcome=ScrubOutcome.FAILED, error='   ')
