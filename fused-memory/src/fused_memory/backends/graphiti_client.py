@@ -21,7 +21,6 @@ from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.utils.async_utils import propagate_cancellations
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +29,7 @@ class EdgeDict(TypedDict):
     """Normalised edge dict returned by GraphitiBackend._edge_dict.
 
     Consumed by get_valid_edges_for_node, get_all_valid_edges,
-    _canonical_facts, and _rebuild_entity_from_edges.
+    _canonical_facts, and rebuild_entity_from_edges.
     """
 
     uuid: str
@@ -39,7 +38,7 @@ class EdgeDict(TypedDict):
 
 
 class StaleSummaryResult(NamedTuple):
-    """Structured return type for _detect_stale_summaries_with_edges.
+    """Structured return type for detect_stale_with_edges.
 
     Use named attribute access — the canonical idiom after Task 438/465:
 
@@ -842,8 +841,8 @@ class GraphitiBackend:
         """Compute a stale-entry diagnostic dict for *entity*, or None if up-to-date.
 
         Encapsulates the repeated logic shared between
-        ``_detect_stale_summaries_with_edges`` and
-        ``_detect_stale_summaries_dry_run``:
+        ``detect_stale_with_edges`` and
+        ``detect_stale_dry_run``:
 
         1. Return None if entity summary is empty (not stale by definition).
         2. Compute canonical facts via ``_canonical_facts`` and join with newlines.
@@ -904,20 +903,20 @@ class GraphitiBackend:
         Summary regeneration uses simple fact concatenation (deduped), consistent
         with Graphiti's own _extract_entity_summaries_batch pattern — no LLM call.
 
-        For bulk use see ``_rebuild_entity_from_edges``, which accepts
+        For bulk use see ``rebuild_entity_from_edges``, which accepts
         caller-supplied edges, name, and old_summary to avoid per-entity
         ``get_node_text`` and ``get_valid_edges_for_node`` round-trips when
         rebuilding many entities at once.  The two methods are an intentional
         fork: ``refresh_entity_summary`` is self-contained for single-entity
-        callers; ``_rebuild_entity_from_edges`` is batch-internal and consumes
-        pre-fetched data from the ``rebuild_entity_summaries`` pipeline.
+        callers; ``rebuild_entity_from_edges`` is batch-internal and consumes
+        pre-fetched data from the ``MemoryService.rebuild_entity_summaries`` pipeline.
 
         Args:
             node_uuid: UUID of the Entity node to refresh.
             group_id: Project graph to target.
             name: Optional entity name (must be paired with old_summary). When
                 both are supplied, get_node_text is skipped — useful when the
-                caller already has this data (e.g. _rebuild_entity_from_edges).
+                caller already has this data (e.g. rebuild_entity_from_edges).
             old_summary: Optional current summary text (must be paired with name).
 
         Returns:
@@ -972,12 +971,12 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
-    async def _detect_stale_summaries_with_edges(
+    async def detect_stale_with_edges(
         self, *, group_id: str
     ) -> StaleSummaryResult:
-        """Internal: detect stale summaries and return a StaleSummaryResult.
+        """Detect stale summaries and return a StaleSummaryResult.
 
-        Shared by detect_stale_summaries (public API) and rebuild_entity_summaries
+        Shared by detect_stale_summaries (public API) and MemoryService.rebuild_entity_summaries
         to avoid a duplicate bulk edge fetch when both are needed.
 
         Args:
@@ -999,22 +998,22 @@ class GraphitiBackend:
                 stale.append(entry)
         return StaleSummaryResult(stale=stale, all_edges=all_edges, total_count=len(entities))
 
-    async def _detect_stale_summaries_dry_run(
+    async def detect_stale_dry_run(
         self, *, group_id: str
     ) -> tuple[list[dict], int]:
-        """Internal: detect stale summaries using per-entity edge fetching (dry_run variant).
+        """Detect stale summaries using per-entity edge fetching (dry_run variant).
 
-        Memory-cheaper alternative to ``_detect_stale_summaries_with_edges`` for use
+        Memory-cheaper alternative to ``detect_stale_with_edges`` for use
         in the ``force=False, dry_run=True`` code path.  Unlike the bulk variant, this
         method never materialises the O(E) all-edges dict because:
 
-        - The dry_run path short-circuits before ``_rebuild_entity_from_edges``, so
+        - The dry_run path short-circuits before ``rebuild_entity_from_edges``, so
           the edges dict is only needed for staleness comparison, not for writing.
         - Fetching edges per-entity (only for non-empty-summary entities) avoids
           holding the full graph's edge data in Python memory when none of it will
           be used to write.
 
-        Trade-off vs ``_detect_stale_summaries_with_edges``:
+        Trade-off vs ``detect_stale_with_edges``:
         - Issues up-to-N targeted ``get_valid_edges_for_node`` queries rather than a
           single bulk ``get_all_valid_edges`` query.
         - Entities with empty summaries are skipped without any edge query (matching
@@ -1026,7 +1025,7 @@ class GraphitiBackend:
 
         Returns:
             Tuple of (stale_list, total_count) where stale_list contains the same
-            per-entity dict schema as ``_detect_stale_summaries_with_edges``
+            per-entity dict schema as ``detect_stale_with_edges``
             (uuid, name, summary, duplicate_count, stale_line_count, valid_fact_count,
             summary_line_count) and total_count is len(all entities).
         """
@@ -1071,10 +1070,10 @@ class GraphitiBackend:
             (pre-rebuild) entity summary text so callers can diff it against
             the canonical fact set without a second DB query.
         """
-        result = await self._detect_stale_summaries_with_edges(group_id=group_id)
+        result = await self.detect_stale_with_edges(group_id=group_id)
         return result.stale
 
-    async def _rebuild_entity_from_edges(
+    async def rebuild_entity_from_edges(
         self, uuid: str, name: str, edges: list[EdgeDict], *, group_id: str,
         old_summary: str,
     ) -> dict[str, Any]:
@@ -1114,7 +1113,7 @@ class GraphitiBackend:
         new_summary = '\n'.join(facts)
         await self.update_node_summary(uuid, new_summary, group_id=group_id)
         logger.info(
-            '_rebuild_entity_from_edges: node=%s name=%r edges=%d new_len=%d',
+            'rebuild_entity_from_edges: node=%s name=%r edges=%d new_len=%d',
             uuid, name, len(edges), len(new_summary),
         )
         return {
@@ -1123,164 +1122,6 @@ class GraphitiBackend:
             'old_summary': old_summary,
             'new_summary': new_summary,
             'edge_count': len(edges),
-        }
-
-    async def rebuild_entity_summaries(
-        self,
-        *,
-        group_id: str,
-        force: bool = False,
-        dry_run: bool = False,
-    ) -> dict[str, Any]:
-        """Batch-rebuild Entity node summaries from their current valid edges.
-
-        When ``force=False`` (default), only entities identified by
-        ``detect_stale_summaries`` are rebuilt.  When ``force=True``, all
-        entities are rebuilt regardless of staleness.
-
-        When ``dry_run=True``, stale detection is performed but
-        ``refresh_entity_summary`` is never called — useful for inspecting
-        what *would* be rebuilt without making any changes.
-
-        Args:
-            group_id: Project graph to target.
-            force: Rebuild every entity even if its summary appears clean.
-            dry_run: Detect but do not actually rebuild.
-
-        Returns:
-            Dict with keys:
-            - ``total_entities``: total Entity nodes in the graph.
-            - ``stale_entities``: number of entities identified as stale (or
-              total when force=True).
-            - ``rebuilt``: number of entities whose summary was written.
-            - ``skipped``: number of entities skipped (dry_run or up-to-date).
-            - ``errors``: number of per-entity refresh failures.
-            - ``details``: list of per-entity result dicts.
-        """
-        # Declare before if/else — targets and total_entities are assigned by all branches;
-        # all_edges is only populated by branches that consume it (the force=False,
-        # dry_run=True path intentionally leaves it empty).
-        targets: list[dict] = []
-        all_edges: dict[str, list[EdgeDict]] = {}
-        total_entities: int = 0
-
-        if force:
-            all_entities = await self.list_entity_nodes(group_id=group_id)
-            targets = [{'uuid': e['uuid'], 'name': e['name'], 'old_summary': e['summary']} for e in all_entities]
-            total_entities = len(all_entities)
-            # Only fetch edges when we will actually use them (not in dry_run)
-            if not dry_run:
-                all_edges = await self.get_all_valid_edges(group_id=group_id)
-        else:
-            if dry_run:
-                # dry_run=True: use the memory-cheaper per-entity probe.
-                # The bulk all_edges dict is never needed because the dry_run block
-                # below short-circuits before _rebuild_entity_from_edges consumes it.
-                stale, total_entities = await self._detect_stale_summaries_dry_run(group_id=group_id)
-                # all_edges stays as the empty dict declared above (never materialised)
-            else:
-                result = await self._detect_stale_summaries_with_edges(group_id=group_id)
-                stale = result.stale
-                all_edges = result.all_edges
-                total_entities = result.total_count
-            targets = [{'uuid': s['uuid'], 'name': s['name'], 'old_summary': s['summary']} for s in stale]
-
-        stale_entities = len(targets)
-        rebuilt = 0
-        skipped = 0
-        errors = 0
-        details: list[dict] = []
-
-        if dry_run:
-            skipped = stale_entities
-            for t in targets:
-                details.append({'uuid': t['uuid'], 'name': t['name'], 'status': 'skipped_dry_run'})
-        else:
-            sem = asyncio.Semaphore(20)
-
-            async def _rebuild_one(t: dict) -> dict:
-                async with sem:
-                    edges = all_edges.get(t['uuid'], [])
-                    return await self._rebuild_entity_from_edges(
-                        t['uuid'], t['name'], edges, group_id=group_id,
-                        old_summary=t['old_summary'],
-                    )
-
-            results = await asyncio.gather(
-                *(_rebuild_one(t) for t in targets), return_exceptions=True
-            )
-
-            # Two-tier check for asyncio.gather(return_exceptions=True) results.
-            # Pass 1: delegates to propagate_cancellations (fused_memory.utils.async_utils)
-            # — the shared Pass 1 guard used by all gather(return_exceptions=True) callsites.
-            # The try/except wrapper preserves the per-batch warning log (which needs
-            # group_id and per-batch counters that are local to this callsite).
-            # See fused_memory.utils.async_utils.propagate_cancellations for the shared
-            # Pass 1 guard contract.
-            try:
-                propagate_cancellations(results)
-            except BaseException as e:
-                # Gate the warning on the helper's documented raise contract:
-                # propagate_cancellations only raises bare BaseExceptions (not
-                # Exception subclasses).  If that contract ever widens (e.g. a
-                # validation error on the input sequence), we re-raise silently
-                # rather than mislabelling a regular Exception as a
-                # "cancellation signal".
-                if not isinstance(e, Exception):
-                    logger.warning(
-                        'rebuild_entity_summaries: cancellation signal received '
-                        'group=%s rebuilt_so_far=%d errors_so_far=%d; propagating',
-                        group_id, rebuilt, errors,
-                    )
-                raise
-
-            # Pass 2: per-entity accumulation.  Using isinstance(r, Exception) instead
-            # of BaseException ensures that only application-level failures (RuntimeError,
-            # etc.) are recorded as error detail entries.  CancelledError is already
-            # handled above.
-            for t, r in zip(targets, results, strict=True):
-                if isinstance(r, Exception):
-                    errors += 1
-                    logger.error(
-                        'rebuild_entity_summaries: failed to rebuild node=%s name=%r: %s',
-                        t['uuid'], t['name'], r,
-                    )
-                    details.append({
-                        'uuid': t['uuid'],
-                        'name': t['name'],
-                        'status': 'error',
-                        'error': str(r),
-                    })
-                else:
-                    if not isinstance(r, dict):
-                        raise TypeError(
-                            f'rebuild_entity_summaries: _rebuild_entity_from_edges returned '
-                            f'unexpected type {type(r).__name__!r} for node={t["uuid"]} '
-                            f'name={t["name"]!r}'
-                        )
-                    rebuilt += 1
-                    details.append({
-                        'uuid': t['uuid'],
-                        'name': t['name'],
-                        'status': 'rebuilt',
-                        'old_summary': r.get('old_summary', ''),
-                        'new_summary': r.get('new_summary', ''),
-                        'edge_count': r.get('edge_count', 0),
-                    })
-
-        logger.info(
-            'rebuild_entity_summaries: group=%s total=%d stale=%d rebuilt=%d '
-            'skipped=%d errors=%d dry_run=%s force=%s',
-            group_id, total_entities, stale_entities, rebuilt, skipped, errors,
-            dry_run, force,
-        )
-        return {
-            'total_entities': total_entities,
-            'stale_entities': stale_entities,
-            'rebuilt': rebuilt,
-            'skipped': skipped,
-            'errors': errors,
-            'details': details,
         }
 
     async def update_node_summary(self, uuid: str, summary: str, *, group_id: str) -> None:

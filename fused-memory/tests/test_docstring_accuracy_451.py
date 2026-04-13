@@ -73,28 +73,28 @@ class TestKeywordsInProximityHelper:
         """Keywords within 200 chars around an 'e.g.' boundary are found.
 
         This is the regression case: re.split(r'\\.\\s+|\\.\\$') splits
-        'e.g. _rebuild_entity_from_edges' at the period, destroying co-occurrence.
+        'e.g. rebuild_entity_from_edges' at the period, destroying co-occurrence.
         The proximity approach is immune because it never tokenises into sentences.
         """
-        doc = 'For bulk use (e.g. _rebuild_entity_from_edges) supply edges'
-        assert _keywords_in_proximity(doc, 'bulk', '_rebuild_entity_from_edges') is True
+        doc = 'For bulk use (e.g. rebuild_entity_from_edges) supply edges'
+        assert _keywords_in_proximity(doc, 'bulk', 'rebuild_entity_from_edges') is True
 
     def test_far_keywords_return_false(self) -> None:
         """Keywords separated by more than 200 chars return False."""
-        doc = 'bulk ' + 'x' * 300 + ' _rebuild_entity_from_edges'
-        assert _keywords_in_proximity(doc, 'bulk', '_rebuild_entity_from_edges') is False
+        doc = 'bulk ' + 'x' * 300 + ' rebuild_entity_from_edges'
+        assert _keywords_in_proximity(doc, 'bulk', 'rebuild_entity_from_edges') is False
 
     def test_missing_keyword_returns_false(self) -> None:
         """Returns False when one keyword is not present in the doc."""
         assert _keywords_in_proximity('foo bar baz', 'foo', 'qux') is False
 
     def test_regression_baseline_refresh_docstring(self) -> None:
-        """Regression baseline: 'bulk' and '_rebuild_entity_from_edges' co-occur
+        """Regression baseline: 'bulk' and 'rebuild_entity_from_edges' co-occur
         within 200 chars in the actual refresh_entity_summary docstring."""
         doc = GraphitiBackend.refresh_entity_summary.__doc__
         assert doc is not None, 'refresh_entity_summary must have a docstring'
-        assert _keywords_in_proximity(doc, 'bulk', '_rebuild_entity_from_edges'), (
-            "'bulk' and '_rebuild_entity_from_edges' must be within 200 chars in "
+        assert _keywords_in_proximity(doc, 'bulk', 'rebuild_entity_from_edges'), (
+            "'bulk' and 'rebuild_entity_from_edges' must be within 200 chars in "
             "refresh_entity_summary docstring"
         )
 
@@ -180,10 +180,10 @@ class TestReturnsSectionTextHelper:
 class TestDetectStaleSummariesReturnsIncludesSummaryKey:
     """detect_stale_summaries docstring Returns section must list 'summary'.
 
-    The underlying _detect_stale_summaries_with_edges builds stale dicts that
+    The underlying detect_stale_with_edges builds stale dicts that
     include a 'summary' key (the current entity summary text).  The public API
     docstring omitted it, leaving callers unaware they can diff summary text
-    without a second DB query.  The sibling _detect_stale_summaries_dry_run
+    without a second DB query.  The sibling detect_stale_dry_run
     already lists 'summary' correctly.
 
     Asserts:
@@ -236,7 +236,7 @@ class TestDetectStaleSummariesReturnsIncludesSummaryKey:
 
 
 class TestRebuildEntityFromEdgesCrossReferencesRefresh:
-    """_rebuild_entity_from_edges docstring must have a routing note for single-entity use.
+    """rebuild_entity_from_edges docstring must have a routing note for single-entity use.
 
     The two methods are an intentional fork.  The existing TOCTOU note already
     mentions refresh_entity_summary for consistency reasons; this class checks
@@ -250,9 +250,9 @@ class TestRebuildEntityFromEdgesCrossReferencesRefresh:
     """
 
     def _doc(self) -> str:
-        doc = GraphitiBackend._rebuild_entity_from_edges.__doc__
-        assert doc is not None, '_rebuild_entity_from_edges must have a docstring'
-        assert doc.strip(), '_rebuild_entity_from_edges docstring must not be blank'
+        doc = GraphitiBackend.rebuild_entity_from_edges.__doc__
+        assert doc is not None, 'rebuild_entity_from_edges must have a docstring'
+        assert doc.strip(), 'rebuild_entity_from_edges docstring must not be blank'
         return doc
 
     def test_docstring_not_none(self) -> None:
@@ -285,11 +285,11 @@ class TestRebuildEntityFromEdgesCrossReferencesRefresh:
 class TestRefreshEntitySummaryCrossReferencesRebuild:
     """refresh_entity_summary docstring must have a routing note for bulk use.
 
-    The method already mentions _rebuild_entity_from_edges once (in the name
+    The method already mentions rebuild_entity_from_edges once (in the name
     parameter doc as an example caller that supplies name/old_summary).  That
     existing mention is not in a sentence containing 'bulk', so this class
     specifically tests for a USE-CASE routing note that pairs 'bulk' with
-    '_rebuild_entity_from_edges'.
+    'rebuild_entity_from_edges'.
 
     Asserts:
       (a) docstring is not None and non-empty
@@ -308,18 +308,18 @@ class TestRefreshEntitySummaryCrossReferencesRebuild:
         self._doc()
 
     def test_rebuild_reference_present(self) -> None:
-        """Docstring must reference '_rebuild_entity_from_edges'."""
+        """Docstring must reference 'rebuild_entity_from_edges'."""
         doc = self._doc()
-        assert '_rebuild_entity_from_edges' in doc, (
-            "Docstring must mention '_rebuild_entity_from_edges' to cross-reference "
+        assert 'rebuild_entity_from_edges' in doc, (
+            "Docstring must mention 'rebuild_entity_from_edges' to cross-reference "
             "the bulk-optimised counterpart"
         )
 
     def test_bulk_and_rebuild_in_same_sentence(self) -> None:
-        """'bulk' and '_rebuild_entity_from_edges' must appear within 200 characters."""
+        """'bulk' and 'rebuild_entity_from_edges' must appear within 200 characters."""
         doc = self._doc()
-        assert _keywords_in_proximity(doc, 'bulk', '_rebuild_entity_from_edges'), (
-            "Docstring must contain 'bulk' and '_rebuild_entity_from_edges' within "
+        assert _keywords_in_proximity(doc, 'bulk', 'rebuild_entity_from_edges'), (
+            "Docstring must contain 'bulk' and 'rebuild_entity_from_edges' within "
             "200 characters of each other to provide a use-case routing note for "
             "callers rebuilding many entities at once"
         )
