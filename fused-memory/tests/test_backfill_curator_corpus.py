@@ -10,8 +10,8 @@ import pytest
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.task_curator import (
-    DEFAULT_PRIORITY,
     _PRIORITY_RANK,
+    DEFAULT_PRIORITY,
     BackfillResult,
     TaskCurator,
 )
