@@ -458,6 +458,40 @@ class TestDetectStaleSummariesDryRun:
         stale_list2, total_count2 = await backend.detect_stale_dry_run(group_id='test')
         assert total_count2 == 1
 
+    @pytest.mark.asyncio
+    async def test_edge_fetches_run_concurrently(self, mock_config, make_backend):
+        """Edge fetches overlap rather than running sequentially (peak_concurrent > 1).
+
+        Uses an asyncio counter to track in-flight calls. With 5 entities and
+        max_concurrency=5 the semaphore should allow all 5 to run at once —
+        peak concurrent calls must be > 1.
+        """
+        backend = make_backend(mock_config)
+        entities = [
+            {'uuid': f'uuid-{i}', 'name': f'Entity{i}', 'summary': 'fact'}
+            for i in range(5)
+        ]
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+
+        in_flight = 0
+        peak_concurrent = 0
+
+        async def tracking_edges(node_uuid, *, group_id):
+            nonlocal in_flight, peak_concurrent
+            in_flight += 1
+            peak_concurrent = max(peak_concurrent, in_flight)
+            await asyncio.sleep(0)  # yield to event loop so others can start
+            in_flight -= 1
+            return [{'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'}]
+
+        backend.get_valid_edges_for_node = AsyncMock(side_effect=tracking_edges)
+
+        await backend.detect_stale_dry_run(group_id='test', max_concurrency=5)
+
+        assert peak_concurrent > 1, (
+            f"Expected peak concurrent calls > 1 (parallel), got {peak_concurrent} (sequential)"
+        )
+
 
 # ---------------------------------------------------------------------------
 # task-656: GraphitiBackend._build_stale_entry (static helper)
