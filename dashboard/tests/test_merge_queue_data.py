@@ -1002,3 +1002,36 @@ class TestMultiDbAggregation:
 
         assert len(result['labels']) >= 3650
         assert len(result['labels']) <= 4000
+
+    @pytest.mark.asyncio
+    async def test_aggregate_recent_merges_hours_window(self, tmp_path):
+        """aggregate_recent_merges with hours=1 excludes events older than 1 hour."""
+        now = datetime.now(UTC)
+        db1 = self._make_db(tmp_path, 'runs1.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': now - timedelta(minutes=30), 'task_id': 'recent-a',
+             'data': {'outcome': 'done'}},
+            {'event_type': 'merge_attempt',
+             'timestamp': now - timedelta(hours=3), 'task_id': 'old-a',
+             'data': {'outcome': 'done'}},
+        ])
+        db2 = self._make_db(tmp_path, 'runs2.db', [
+            {'event_type': 'merge_attempt',
+             'timestamp': now - timedelta(minutes=45), 'task_id': 'recent-b',
+             'data': {'outcome': 'done'}},
+            {'event_type': 'merge_attempt',
+             'timestamp': now - timedelta(hours=4), 'task_id': 'old-b',
+             'data': {'outcome': 'done'}},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1)) as conn1,
+            aiosqlite.connect(str(db2)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            result = await aggregate_recent_merges([conn1, conn2], limit=20, hours=1)
+
+        assert len(result) == 2
+        task_ids = {r['task_id'] for r in result}
+        assert task_ids == {'recent-a', 'recent-b'}
