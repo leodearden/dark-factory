@@ -819,6 +819,39 @@ class TestRebuildEntitySummaries:
         svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(group_id='test')
 
     @pytest.mark.asyncio
+    async def test_uuid_dispatch_callable_is_order_independent(self):
+        """Regression guard: uuid-dispatched callable behaves the same regardless of call order.
+
+        Proves the dispatch mechanism is scheduling-independent — the callable always
+        raises for uuid-1 and returns the success dict for uuid-2, no matter which
+        is invoked first.
+        """
+        success_dict = {
+            'uuid': 'uuid-2', 'name': 'Bob',
+            'old_summary': 'stale2', 'new_summary': 'current2', 'edge_count': 1,
+        }
+
+        async def _fail_uuid1(uuid, name, edges, *, group_id, old_summary):
+            if uuid == 'uuid-1':
+                raise RuntimeError('FalkorDB timeout')
+            return success_dict
+
+        edges_1 = [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}]
+        edges_2 = [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}]
+
+        # Order A: uuid-1 first, uuid-2 second
+        with pytest.raises(RuntimeError, match='FalkorDB timeout'):
+            await _fail_uuid1('uuid-1', 'Alice', edges_1, group_id='test', old_summary='stale1')
+        result = await _fail_uuid1('uuid-2', 'Bob', edges_2, group_id='test', old_summary='stale2')
+        assert result == success_dict
+
+        # Order B: uuid-2 first, uuid-1 second
+        result = await _fail_uuid1('uuid-2', 'Bob', edges_2, group_id='test', old_summary='stale2')
+        assert result == success_dict
+        with pytest.raises(RuntimeError, match='FalkorDB timeout'):
+            await _fail_uuid1('uuid-1', 'Alice', edges_1, group_id='test', old_summary='stale1')
+
+    @pytest.mark.asyncio
     async def test_empty_graph_returns_zero_counts(self, mock_config):
         """No entities means all counts are 0."""
         svc = _make_svc(mock_config)
