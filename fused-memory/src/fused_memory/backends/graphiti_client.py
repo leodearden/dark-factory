@@ -1034,7 +1034,8 @@ class GraphitiBackend:
         stale: list[dict] = []
         for entity in entities:
             if not entity['summary']:
-                # Empty summary — not stale by definition; skip without an edge query.
+                # Empty summary — not stale by definition; skip the async edge fetch.
+                # (_build_stale_entry would also return None, but we avoid the I/O.)
                 continue
             edges = await self.get_valid_edges_for_node(entity['uuid'], group_id=group_id)
             entry = self._build_stale_entry(entity, edges)

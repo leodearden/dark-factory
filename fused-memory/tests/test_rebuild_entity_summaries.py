@@ -438,14 +438,14 @@ class TestBuildStaleEntry:
       stale_line_count, valid_fact_count, summary_line_count.
     """
 
-    def test_returns_none_for_empty_summary(self, mock_config, make_backend):
+    def test_returns_none_for_empty_summary(self):
         """Returns None when the entity summary is empty."""
         entity = {'uuid': 'uuid-1', 'name': 'Alice', 'summary': ''}
         edges = [{'uuid': 'e1', 'fact': 'some fact', 'name': 'edge1'}]
         result = GraphitiBackend._build_stale_entry(entity, edges)
         assert result is None
 
-    def test_returns_none_when_summary_matches_canonical(self, mock_config, make_backend):
+    def test_returns_none_when_summary_matches_canonical(self):
         """Returns None when summary exactly matches the canonical facts join."""
         entity = {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA\nfactB'}
         edges = [
@@ -455,7 +455,7 @@ class TestBuildStaleEntry:
         result = GraphitiBackend._build_stale_entry(entity, edges)
         assert result is None
 
-    def test_returns_stale_dict_when_entity_is_stale(self, mock_config, make_backend):
+    def test_returns_stale_dict_when_entity_is_stale(self):
         """Returns a dict with correct schema when entity summary differs from canonical."""
         entity = {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old fact'}
         edges = [{'uuid': 'e1', 'fact': 'new fact', 'name': 'edge1'}]
@@ -474,7 +474,7 @@ class TestBuildStaleEntry:
         assert result['stale_line_count'] == 1   # 'old fact' not in valid facts
         assert result['duplicate_count'] == 0
 
-    def test_handles_duplicate_lines(self, mock_config, make_backend):
+    def test_handles_duplicate_lines(self):
         """duplicate_count counts extra occurrences of duplicated summary lines."""
         # summary: 'factA\nfactA\nold' — 'factA' appears twice → duplicate_count=1
         entity = {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA\nfactA\nold'}
@@ -486,7 +486,7 @@ class TestBuildStaleEntry:
         assert result['valid_fact_count'] == 1  # deduped: only 'factA'
         assert result['summary_line_count'] == 3
 
-    def test_handles_zero_valid_edges(self, mock_config, make_backend):
+    def test_handles_zero_valid_edges(self):
         """Entity with non-empty summary but zero valid edges is reported as stale."""
         entity = {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA\nfactB'}
         edges: list = []
