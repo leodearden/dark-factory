@@ -78,6 +78,20 @@ class ScrubResult:
                 f'got outcome={self.outcome!r} with error={self.error!r}'
             )
 
+    def format_error(self, prefix: str = '') -> str:
+        """Return prefix+error when error is set, otherwise empty string.
+
+        Designed for safe interpolation into log messages and f-strings:
+        - When error is set: returns ``f'{prefix}{self.error}'``
+        - When error is None: returns ``''`` (nothing to show)
+
+        Args:
+            prefix: Optional string prepended to the error (e.g. ' Error: ', ': ').
+        """
+        if self.error is not None:
+            return f'{prefix}{self.error}'
+        return ''
+
 
 # ---------------------------------------------------------------------------
 # .task/ contamination helpers
