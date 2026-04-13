@@ -380,6 +380,16 @@ class TestFreshenMain:
         assert ref == git_ops.config.main_branch
         assert stale is None
 
+    async def test_freshen_main_remote_ahead(
+        self, git_ops_with_remote: tuple[GitOps, Path],
+    ):
+        """When origin/main is 3 commits ahead, returns ('origin/main', 3)."""
+        git_ops, origin = git_ops_with_remote
+        await _push_n_commits_to_origin(origin, 3)
+        ref, stale = await git_ops._freshen_main()
+        assert ref == f'{git_ops.config.remote}/{git_ops.config.main_branch}'
+        assert stale == 3
+
 
 @pytest.mark.asyncio
 class TestCommitTaskStatuses:
