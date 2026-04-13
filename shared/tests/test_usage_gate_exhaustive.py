@@ -1059,21 +1059,31 @@ class TestResolveAccount:
         acct = gate._resolve_account(token_b)
         assert acct is gate._accounts[1]
 
-    def test_unknown_token_falls_back_to_first_uncapped(self):
+    def test_unknown_token_returns_none(self):
+        """Explicit unknown token returns None (no best-guess fallback)."""
         gate = make_gate(['a', 'b'])
         acct = gate._resolve_account('unknown-token')
-        assert acct is gate._accounts[0]
+        assert acct is None
 
     def test_none_token_falls_back_to_first_uncapped(self):
         gate = make_gate(['a', 'b'])
         acct = gate._resolve_account(None)
         assert acct is gate._accounts[0]
 
-    def test_fallback_skips_capped(self):
+    def test_none_token_fallback_skips_capped(self):
+        """None token (no identity) skips capped accounts in first-uncapped fallback."""
         gate = make_gate(['a', 'b'])
         gate._accounts[0].capped = True
-        acct = gate._resolve_account('unknown-token')
+        acct = gate._resolve_account(None)
         assert acct is gate._accounts[1]
+
+    def test_unknown_token_logs_config_drift_warning(self, caplog):
+        """Explicit unknown token logs a config-drift warning at WARNING level."""
+        gate = make_gate(['a', 'b'])
+        with caplog.at_level(logging.WARNING, logger='shared.usage_gate'):
+            acct = gate._resolve_account('unknown-token')
+        assert acct is None
+        assert any('config drift' in r.message.lower() for r in caplog.records)
 
     def test_all_capped_unknown_token_returns_none(self):
         gate = make_gate(['a', 'b'])
