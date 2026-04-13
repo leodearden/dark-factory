@@ -312,3 +312,75 @@ class TestParseGeminiOutputThreadsTimedOut:
                                 duration_ms=100, timed_out=False)
         agent = _parse_gemini_output(sub, 'gemini-3.1-pro-preview')
         assert agent.timed_out is False
+
+
+# ===================================================================
+# TestReleaseProbeSlotOnException (orchestrator invoke_with_cap_retry)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestReleaseProbeSlotOnException:
+    """invoke_with_cap_retry (orchestrator) calls release_probe_slot() when invoke raises."""
+
+    async def test_release_probe_slot_called_on_runtime_error(self):
+        """release_probe_slot is called with oauth_token when invoke_agent raises."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='tok-a')
+        gate.detect_cap_hit = MagicMock(return_value=False)
+        gate.active_account_name = 'acct-a'
+        gate.on_agent_complete = MagicMock()
+        gate.confirm_account_ok = MagicMock()
+        gate.release_probe_slot = MagicMock()
+
+        with (
+            patch(
+                'orchestrator.agents.invoke.invoke_agent',
+                new_callable=AsyncMock,
+                side_effect=RuntimeError('subprocess failed'),
+            ),
+            pytest.raises(RuntimeError, match='subprocess failed'),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi',
+                                        system_prompt='sys', cwd='/tmp')
+
+        gate.release_probe_slot.assert_called_once_with('tok-a')
+
+    async def test_runtime_error_propagates(self):
+        """RuntimeError raised by invoke_agent propagates to the caller."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='tok-a')
+        gate.active_account_name = 'acct-a'
+        gate.release_probe_slot = MagicMock()
+
+        with (
+            patch(
+                'orchestrator.agents.invoke.invoke_agent',
+                new_callable=AsyncMock,
+                side_effect=RuntimeError('crash'),
+            ),
+            pytest.raises(RuntimeError, match='crash'),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi',
+                                        system_prompt='sys', cwd='/tmp')
+
+    async def test_confirm_account_ok_not_called_when_invoke_raises(self):
+        """confirm_account_ok is NOT called when invoke_agent raises."""
+        gate = MagicMock()
+        gate.before_invoke = AsyncMock(return_value='tok-a')
+        gate.active_account_name = 'acct-a'
+        gate.confirm_account_ok = MagicMock()
+        gate.release_probe_slot = MagicMock()
+
+        with (
+            patch(
+                'orchestrator.agents.invoke.invoke_agent',
+                new_callable=AsyncMock,
+                side_effect=RuntimeError('crash'),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi',
+                                        system_prompt='sys', cwd='/tmp')
+
+        gate.confirm_account_ok.assert_not_called()
