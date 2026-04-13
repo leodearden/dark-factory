@@ -1818,3 +1818,18 @@ class TestPreTriageUsageGateCleanup:
             await steward._pre_triage_suggestions(self._esc())
 
         gate.confirm_account_ok.assert_not_called()
+
+    async def test_on_agent_complete_called(self, steward: TaskSteward):
+        """gate.on_agent_complete(cost) is called after successful pre-triage.
+
+        Previously called explicitly; now delegated to invoke_with_cap_retry.
+        """
+        gate = self._gate()
+        steward.usage_gate = gate
+        mock_result = _make_result(cost=0.42, session_id='sess-triage')
+
+        with patch('orchestrator.agents.invoke.invoke_agent',
+                   new_callable=AsyncMock, return_value=mock_result):
+            await steward._pre_triage_suggestions(self._esc())
+
+        gate.on_agent_complete.assert_called_once_with(0.42)
