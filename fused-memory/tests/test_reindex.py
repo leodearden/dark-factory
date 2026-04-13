@@ -993,6 +993,24 @@ class TestNodeCount:
         assert result == 42
 
 
+class TestRequireFalkorClient:
+    """GraphitiBackend._require_falkor_client() returns the FalkorDB client or raises."""
+
+    def test_returns_driver_client(self, mock_config, make_backend):
+        """Returns the .client attribute of the underlying FalkorDriver."""
+        backend = make_backend(mock_config)
+        sentinel = object()
+        backend._driver.client = sentinel
+        result = backend._require_falkor_client()
+        assert result is sentinel
+
+    def test_raises_when_not_initialized(self, mock_config):
+        """Raises RuntimeError when backend is not initialized (_driver is None)."""
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            backend._require_falkor_client()
+
+
 class TestListGraphs:
     """GraphitiBackend.list_graphs() returns non-system FalkorDB graph names."""
 
