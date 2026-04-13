@@ -1430,15 +1430,16 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
         assert len(rows) == 2, f'Expected 2 rows, got {len(rows)}: {project_ids}'
         assert str(base_config.project_root) in project_ids
         assert str(good_orch_root.resolve()) in project_ids
-        assert str(bad_orch_root.resolve()) not in project_ids
+        assert bad_prefix not in project_ids
 
-        # Warning contract: message must specifically mention 'resolve'
+        # Warning contract: message must specifically mention path resolution
         # (NOT the generic 'processing failed' message), with exc_info set.
+        # Check for 'resolv' to match both 'resolve' and 'resolving'.
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warning_records, 'Expected at least one WARNING for post-helper resolve failure'
         combined = ' '.join(r.getMessage() for r in warning_records)
-        assert 'resolve' in combined.lower(), (
-            f'Expected "resolve" in warning message, got: {combined!r}'
+        assert 'resolv' in combined.lower(), (
+            f'Expected "resolv" (resolve/resolving) in warning message, got: {combined!r}'
         )
         assert any(r.exc_info for r in warning_records)
 
