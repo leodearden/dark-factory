@@ -31,6 +31,30 @@ def _read_sibling(name: str) -> str:
     return (pathlib.Path(__file__).parent / name).read_text(encoding='utf-8')
 
 
+def test_extract_module_docstring_returns_only_the_docstring() -> None:
+    """_extract_module_docstring must return only the module docstring, not comments.
+
+    Constructs a synthetic source string where 'in_docstring_marker' appears
+    in the module docstring and 'in_comment_marker' appears in a line comment
+    (but NOT in the docstring).  Proves that the helper scopes substring checks
+    to the docstring alone, excluding comment text and other string literals.
+    """
+    synthetic_src = (
+        '"""Module docstring containing in_docstring_marker here."""\n'
+        '# in_comment_marker appears only in this comment, not the docstring\n'
+        'x = 1\n'
+    )
+    result = _extract_module_docstring(synthetic_src)
+    assert 'in_docstring_marker' in result, (
+        "_extract_module_docstring must return the module docstring text, "
+        "which contains 'in_docstring_marker'"
+    )
+    assert 'in_comment_marker' not in result, (
+        "_extract_module_docstring must NOT include comment text — "
+        "'in_comment_marker' appears only in a comment, not in the docstring"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Item 1 — module docstring in test_rebuild_entity_summaries.py
 # ---------------------------------------------------------------------------
