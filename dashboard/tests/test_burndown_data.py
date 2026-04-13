@@ -1236,6 +1236,8 @@ class TestBurndownEnvFixture:
 # _assert_snapshot_counts helper
 # ---------------------------------------------------------------------------
 
+_COUNT_COLUMNS = ('pending', 'in_progress', 'blocked', 'deferred', 'cancelled', 'done')
+
 
 class TestAssertSnapshotCounts:
     @pytest.mark.asyncio
@@ -1249,7 +1251,6 @@ class TestAssertSnapshotCounts:
         )
         await conn.commit()
 
-        conn.row_factory = aiosqlite.Row
         async with conn.execute('SELECT * FROM snapshots') as cur:
             rows = list(await cur.fetchall())
 
@@ -1257,23 +1258,28 @@ class TestAssertSnapshotCounts:
         result = _assert_snapshot_counts(rows[0], pending=1, done=2)
         assert result is None
 
+    @pytest.mark.parametrize('column', _COUNT_COLUMNS)
     @pytest.mark.asyncio
-    async def test_raises_on_mismatched_count(self, burndown_env):
-        """Helper raises AssertionError when a count column doesn't match the expected value."""
+    async def test_raises_on_mismatched_count(self, burndown_env, column):
+        """Helper raises AssertionError with per-column message when count doesn't match."""
         db_path, config, conn = burndown_env
+        values = {col: (2 if col == column else 0) for col in _COUNT_COLUMNS}
         await conn.execute(
             'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            ('test_proj', '2024-01-01T00:00:00', 0, 0, 0, 0, 0, 2),
+            (
+                'test_proj', '2024-01-01T00:00:00',
+                values['pending'], values['in_progress'], values['blocked'],
+                values['deferred'], values['cancelled'], values['done'],
+            ),
         )
         await conn.commit()
 
-        conn.row_factory = aiosqlite.Row
         async with conn.execute('SELECT * FROM snapshots') as cur:
             row = await cur.fetchone()
 
-        with pytest.raises(AssertionError):
-            _assert_snapshot_counts(row, done=3)  # actual done=2, expected 3
+        with pytest.raises(AssertionError, match=rf'{column}: expected 3, got 2'):
+            _assert_snapshot_counts(row, **{column: 3})  # actual=2, expected=3
 
     @pytest.mark.asyncio
     async def test_default_zeros_match_all_zero_row(self, burndown_env):
@@ -1286,7 +1292,6 @@ class TestAssertSnapshotCounts:
         )
         await conn.commit()
 
-        conn.row_factory = aiosqlite.Row
         async with conn.execute('SELECT * FROM snapshots') as cur:
             row = await cur.fetchone()
 
