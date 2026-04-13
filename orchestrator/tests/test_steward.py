@@ -1184,6 +1184,32 @@ class TestStewardTimeoutCap:
         # No re-escalation was submitted — neither guard fired
         steward.escalation_queue.submit.assert_not_called()
 
+    async def test_both_counters_at_max_triggers_retry_guard_first(
+        self, steward, mock_config,
+    ):
+        """Retry guard fires first when both retry and timeout counters are simultaneously at max.
+
+        steward.py checks the retry-limit guard (line 222) before the timeout-cap guard
+        (line 232).  When both _retry_counts[id] >= max_attempts AND
+        _timeout_counts[id] >= max_timeouts, only the retry guard should fire.
+        The summary 'Failed after 3 attempts' (retry message, not 'repeatedly timed out')
+        proves the order-of-evaluation contract.
+        """
+        mock_config.steward_max_attempts = 3
+        mock_config.steward_max_timeouts_per_escalation = 3
+        esc = _make_escalation(id='esc-42-1')
+        # Both counters at max — retry guard (line 222) is checked first and should win
+        steward._retry_counts['esc-42-1'] = 3    # == max_attempts → retry guard fires
+        steward._timeout_counts['esc-42-1'] = 3  # == max_timeouts — checked second, never reached
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        submitted = _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
+        # Guard-specific assertion: message proves the retry guard (not timeout guard) fired
+        assert 'Failed after 3 attempt' in submitted.summary
+        assert 'repeatedly timed out' not in submitted.summary.lower()
+
     async def test_repeated_timeout_kills_eventually_terminate(
         self, steward, mock_config,
     ):
