@@ -236,6 +236,22 @@ class TestCanonicalFacts:
         result = GraphitiBackend._canonical_facts(edges)
         assert result == []
 
+    def test_non_string_truthy_fact_is_skipped(self):
+        """Non-string truthy fact values are silently filtered, no AttributeError raised.
+
+        The isinstance type guard must reject int, list, dict, and bool values
+        even though they are truthy.  Before the fix, ``(42 or '').strip()``
+        would raise AttributeError; the new filter silently skips them.
+        """
+        edges = [
+            {'fact': 42},          # int — truthy but not a string
+            {'fact': ['a']},       # list — truthy but not a string
+            {'fact': {'k': 'v'}},  # dict — truthy but not a string
+            {'fact': True},        # bool — truthy but not a string
+        ]
+        result = GraphitiBackend._canonical_facts(edges)
+        assert result == []
+
 
 # ---------------------------------------------------------------------------
 # step-5: refresh_entity_summary optional name/old_summary params
