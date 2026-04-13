@@ -733,6 +733,40 @@ class UsageGate:
             logger.info(f'Account {acct.name}: probe confirmed OK — opening to all tasks')
             self._open.set()
 
+    def release_probe_slot(self, oauth_token: str | None) -> None:
+        """Release a probe slot claimed by before_invoke() when invoke raises an exception.
+
+        Called in the except handler of invoke_with_cap_retry / _invoke_with_session
+        to clean up probe state when the invoke call raises (subprocess failure,
+        CancelledError, etc.) before confirm_account_ok() or detect_cap_hit() can run.
+
+        Effects (only when probe_in_flight is True on the matched account):
+        - Clears probe_in_flight
+        - Resets probe_count to 0
+        - Re-opens the shared _open event so other tasks may proceed
+
+        Is a no-op when:
+        - oauth_token is None (no-op; we cannot identify the account)
+        - oauth_token is unknown (account not found)
+        - probe_in_flight is False on the matched account (nothing to release)
+
+        Does NOT touch near_cap or capped — those flags track cap status, which
+        is orthogonal to whether an exception occurred during invocation.
+        """
+        if not oauth_token:
+            return
+        acct = self._find_account_by_token(oauth_token)
+        if acct is None:
+            return
+        if acct.probe_in_flight:
+            acct.probe_in_flight = False
+            acct.probe_count = 0
+            logger.info(
+                f'Account {acct.name}: probe slot released after exception — '
+                f'opening to all tasks',
+            )
+            self._open.set()
+
     @property
     def project_id(self) -> str | None:
         """Project identifier set by the harness at run start."""
