@@ -962,6 +962,34 @@ class TestOutcomeDistributionNow:
 
 
 # ---------------------------------------------------------------------------
+# TestSpeculativeStatsNow (step-7)
+# ---------------------------------------------------------------------------
+
+class TestSpeculativeStatsNow:
+    @pytest.mark.asyncio
+    async def test_speculative_stats_threads_now_to_cutoff_iso(self, merge_events_db):
+        """speculative_stats accepts now and passes it to _cutoff_iso.
+
+        Will fail before step-8 impl because speculative_stats has no `now` param.
+        """
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        captured_nows: list = []
+
+        def mock_cutoff_iso(hours: int, *, now=None) -> str:
+            captured_nows.append(now)
+            return '2020-01-01T00:00:00+00:00'  # far-past cutoff → no rows matched
+
+        async with aiosqlite.connect(str(merge_events_db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with patch('dashboard.data.merge_queue._cutoff_iso', side_effect=mock_cutoff_iso):
+                await speculative_stats(conn, hours=24, now=fixed_now)
+
+        assert captured_nows == [fixed_now], (
+            f"Expected _cutoff_iso called once with now={fixed_now!r}, got {captured_nows!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestLatencyStatsNow (step-5)
 # ---------------------------------------------------------------------------
 
