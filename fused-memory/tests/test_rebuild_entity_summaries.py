@@ -459,37 +459,55 @@ class TestDetectStaleSummariesDryRun:
         assert total_count2 == 1
 
     @pytest.mark.asyncio
-    async def test_edge_fetches_run_concurrently(self, mock_config, make_backend):
-        """Edge fetches overlap rather than running sequentially (peak_concurrent > 1).
+    async def test_raises_when_max_concurrency_invalid(self, mock_config, make_backend):
+        """detect_stale_dry_run raises ValueError for max_concurrency < 1.
 
-        Uses an asyncio counter to track in-flight calls. With 5 entities and
-        max_concurrency=5 the semaphore should allow all 5 to run at once —
-        peak concurrent calls must be > 1.
+        Semaphore(0) would deadlock; Semaphore(-1) raises ValueError from stdlib.
+        A clear ValueError with a descriptive message is better than either.
         """
+        backend = make_backend(mock_config)
+        backend.list_entity_nodes = AsyncMock(return_value=[])
+
+        with pytest.raises(ValueError, match='max_concurrency must be >= 1'):
+            await backend.detect_stale_dry_run(group_id='test', max_concurrency=0)
+
+        with pytest.raises(ValueError, match='max_concurrency must be >= 1'):
+            await backend.detect_stale_dry_run(group_id='test', max_concurrency=-5)
+
+    @pytest.mark.asyncio
+    async def test_edge_fetches_run_concurrently(self, mock_config, make_backend):
+        """Edge fetches overlap rather than running sequentially (peak_concurrent == 5).
+
+        Uses asyncio.Barrier(5) so all 5 coroutines must be in-flight simultaneously
+        before any of them can complete — this provides a deterministic proof of
+        concurrency (not just a scheduler hint via sleep(0)).
+        """
+        n = 5
         backend = make_backend(mock_config)
         entities = [
             {'uuid': f'uuid-{i}', 'name': f'Entity{i}', 'summary': 'fact'}
-            for i in range(5)
+            for i in range(n)
         ]
         backend.list_entity_nodes = AsyncMock(return_value=entities)
 
         in_flight = 0
         peak_concurrent = 0
+        barrier = asyncio.Barrier(n)
 
         async def tracking_edges(node_uuid, *, group_id):
             nonlocal in_flight, peak_concurrent
             in_flight += 1
             peak_concurrent = max(peak_concurrent, in_flight)
-            await asyncio.sleep(0)  # yield to event loop so others can start
+            await barrier.wait()  # all n must arrive before any can continue
             in_flight -= 1
             return [{'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'}]
 
         backend.get_valid_edges_for_node = AsyncMock(side_effect=tracking_edges)
 
-        await backend.detect_stale_dry_run(group_id='test', max_concurrency=5)
+        await backend.detect_stale_dry_run(group_id='test', max_concurrency=n)
 
-        assert peak_concurrent > 1, (
-            f"Expected peak concurrent calls > 1 (parallel), got {peak_concurrent} (sequential)"
+        assert peak_concurrent == n, (
+            f"Expected all {n} fetches in-flight simultaneously, got peak={peak_concurrent}"
         )
 
     @pytest.mark.asyncio
@@ -608,7 +626,8 @@ class TestDetectStaleSummariesDryRun:
 
         backend.get_valid_edges_for_node = AsyncMock(side_effect=edges_by_uuid)
 
-        stale_list, total_count = await backend.detect_stale_dry_run(group_id='test')
+        # max_concurrency=2 with 10 entities exercises bounding alongside correctness
+        stale_list, total_count = await backend.detect_stale_dry_run(group_id='test', max_concurrency=2)
 
         assert total_count == 10
         returned_uuids = {e['uuid'] for e in stale_list}

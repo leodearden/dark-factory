@@ -1039,6 +1039,9 @@ class GraphitiBackend:
             summary_line_count) and total_count is len(all entities).  Order of entries
             in stale_list matches the order returned by ``list_entity_nodes``.
         """
+        if max_concurrency < 1:
+            raise ValueError(f'max_concurrency must be >= 1, got {max_concurrency}')
+
         entities = await self.list_entity_nodes(group_id=group_id)
 
         # Separate entities: empty-summary ones are cheap-skipped without any I/O.
