@@ -214,45 +214,61 @@ Review this run and provide your verdict as JSON.
                 env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
 
             try:
-                proc = await _asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=_asyncio.subprocess.DEVNULL,
-                    stdout=_asyncio.subprocess.PIPE,
-                    stderr=_asyncio.subprocess.PIPE,
-                    env=env,
-                )
-            except FileNotFoundError as exc:
-                raise RuntimeError(
-                    'Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code'
-                ) from exc
+                try:
+                    proc = await _asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdin=_asyncio.subprocess.DEVNULL,
+                        stdout=_asyncio.subprocess.PIPE,
+                        stderr=_asyncio.subprocess.PIPE,
+                        env=env,
+                    )
+                except FileNotFoundError as exc:
+                    raise RuntimeError(
+                        'Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code'
+                    ) from exc
 
-            try:
-                stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=600)
-            except TimeoutError as exc:
-                proc.kill()
-                raise RuntimeError('Claude CLI timed out after 600 seconds') from exc
+                try:
+                    stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=600)
+                except TimeoutError as exc:
+                    proc.kill()
+                    raise RuntimeError('Claude CLI timed out after 600 seconds') from exc
 
-            stdout_text = stdout.decode()
-            stderr_text = stderr.decode()
+                stdout_text = stdout.decode()
+                stderr_text = stderr.decode()
 
-            # Check for cap hit before processing results
-            if self._usage_gate and self._usage_gate.detect_cap_hit(
-                stderr_text, stdout_text, 'claude', oauth_token=oauth_token,
-            ):
-                logger.warning('Usage cap hit during judge CLI call, retrying')
-                continue
+                # Check for cap hit before processing results
+                if self._usage_gate and self._usage_gate.detect_cap_hit(
+                    stderr_text, stdout_text, 'claude', oauth_token=oauth_token,
+                ):
+                    logger.warning('Usage cap hit during judge CLI call, retrying')
+                    continue
 
-            if proc.returncode != 0:
-                error_detail = stderr_text[-500:] if stderr_text.strip() else stdout_text[-500:]
-                raise RuntimeError(
-                    f'Claude CLI exited with code {proc.returncode}: {error_detail}'
-                )
+                if proc.returncode != 0:
+                    error_detail = stderr_text[-500:] if stderr_text.strip() else stdout_text[-500:]
+                    raise RuntimeError(
+                        f'Claude CLI exited with code {proc.returncode}: {error_detail}'
+                    )
 
-            if not stdout_text.strip():
-                return ''
+                if not stdout_text.strip():
+                    if self._usage_gate:
+                        self._usage_gate.confirm_account_ok(oauth_token)
+                        self._usage_gate.on_agent_complete(0.0)
+                    return ''
 
-            result = json.loads(stdout_text)
-            return result.get('result', '')
+                result = json.loads(stdout_text)
+                if self._usage_gate:
+                    cost_usd = float(result.get('cost_usd', result.get('total_cost_usd', 0.0)))
+                    self._usage_gate.confirm_account_ok(oauth_token)
+                    self._usage_gate.on_agent_complete(cost_usd)
+                return result.get('result', '')
+
+            except BaseException:
+                if self._usage_gate is not None:
+                    try:
+                        self._usage_gate.release_probe_slot(oauth_token)
+                    except Exception:
+                        logger.warning('release_probe_slot failed', exc_info=True)
+                raise
 
     def _parse_verdict(self, response_text: str, run_id: str) -> JudgeVerdict:
         """Parse judge response into JudgeVerdict."""

@@ -272,7 +272,7 @@ class TestGetAllValidEdges:
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_all_valid_edges(group_id='test')
         call_args = graph.ro_query.call_args
-        cypher = call_args[0][0] if call_args[0] else call_args[1].get('q', '')
+        cypher = extract_cypher(call_args)
         assert 'invalid_at IS NULL' in cypher
 
     @pytest.mark.asyncio

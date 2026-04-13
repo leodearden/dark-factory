@@ -100,6 +100,15 @@ class TestExtractCypher:
         call_args = call(query='MATCH (n) RETURN n', params={'uuid': 'x'})
         assert extract_cypher(call_args) == 'MATCH (n) RETURN n'
 
+    def test_keyword_query_returns_query_regardless_of_insertion_order(self):
+        """When 'query' kwarg is passed after other kwargs, still returns 'query' value.
+
+        Regression guard: proves the helper looks up by key name, not dict iteration order.
+        (params= inserted first, query= inserted second — reversed from test_keyword_query_returns_query_among_other_kwargs)
+        """
+        call_args = call(params={'uuid': 'x'}, query='MATCH (n) RETURN n')
+        assert extract_cypher(call_args) == 'MATCH (n) RETURN n'
+
     def test_empty_call_returns_empty_string(self):
         """When neither positional nor keyword query is present, returns empty string."""
         call_args = call()

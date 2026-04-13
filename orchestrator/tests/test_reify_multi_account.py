@@ -418,16 +418,16 @@ class TestAllCappedBlockResume:
 
 
 class TestCapDetectedUnknownToken:
-    """Characterizes the best-guess fallback in _handle_cap_detected.
+    """Verifies that _handle_cap_detected is a no-op for explicit unknown tokens.
 
-    When oauth_token does not match any configured account,
-    _handle_cap_detected walks _accounts and picks the first non-capped
-    account as the victim (usage_gate.py ~line 283).  If all accounts are
-    already capped it logs a warning and returns without mutating state.
+    When oauth_token does not match any configured account, _resolve_account logs a
+    config-drift warning and returns None — no best-guess fallback applies.
+    _handle_cap_detected then logs 'no matching account' and returns without mutating state.
+    If all accounts are already capped the same no-op behaviour applies.
     """
 
-    def test_unknown_token_falls_back_to_first_uncapped_account(self):
-        """Unknown token causes _handle_cap_detected to cap the first uncapped account."""
+    def test_unknown_token_does_not_cap_any_account(self):
+        """Unknown token: no account is capped and gate is not paused."""
         gate = _make_reify_gate()  # all 5 accounts uncapped
 
         gate._handle_cap_detected(
@@ -436,16 +436,14 @@ class TestCapDetectedUnknownToken:
             oauth_token='not-a-real-token',
         )
 
-        # max-f (index 0) is the first uncapped account — it becomes the victim
-        assert gate._accounts[0].capped, "max-f should be capped (best-guess fallback victim)"
-        # The remaining 4 accounts should be untouched
-        for acct in gate._accounts[1:]:
+        # No account should be capped — unknown token is now a no-op
+        for acct in gate._accounts:
             assert not acct.capped, (
-                f"{acct.name} should still be uncapped after unknown-token fallback"
+                f"{acct.name} should remain uncapped after unknown-token call"
             )
-        # Gate is not paused because 4 accounts remain available
+        # Gate is not paused because all 5 accounts remain available
         assert not gate.is_paused, (
-            "Gate should not be paused: 4 of 5 accounts are still available"
+            "Gate should not be paused: all 5 accounts are still available"
         )
 
     def test_unknown_token_when_all_capped_is_noop(self):

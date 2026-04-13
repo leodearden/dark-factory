@@ -1261,3 +1261,169 @@ async def test_call_claude_cli_sleeps_on_cap_hit():
 
         mock_sleep.assert_called_once_with(_CAP_HIT_COOLDOWN_SECS)
         assert gate.before_invoke.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# UsageGate lifecycle: confirm_account_ok / on_agent_complete / release_probe_slot
+# ---------------------------------------------------------------------------
+
+
+def _make_gated_agent_loop(token: str = 'token-a'):
+    """Return (agent, gate) with a mock usage gate pre-wired into the agent."""
+    from unittest.mock import AsyncMock as _AsyncMock
+    config = _make_config(agent_llm_provider='claude-cli', agent_llm_model='opus')
+    tools = {
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Complete',
+            parameters={'type': 'object', 'properties': {}},
+            function=lambda **kw: kw,
+        ),
+    }
+    agent = AgentLoop(
+        config=config,
+        system_prompt='Test',
+        tools=tools,
+        terminal_tool='stage_complete',
+    )
+    gate = MagicMock()
+    gate.before_invoke = _AsyncMock(return_value=token)
+    gate.detect_cap_hit = MagicMock(return_value=False)
+    agent._usage_gate = gate
+    return agent, gate
+
+
+def _make_success_proc(cost_usd: float = 0.0042):
+    """Return a mock subprocess that exits 0 with a valid CLI JSON response."""
+    from unittest.mock import AsyncMock as _AsyncMock
+    cli_result = json.dumps({
+        'result': '',
+        'session_id': 'sess-1',
+        'num_input_tokens': 100,
+        'num_output_tokens': 50,
+        'cost_usd': cost_usd,
+        'structured_output': json.dumps({
+            'thinking': 'done',
+            'tool_calls': [{'name': 'stage_complete', 'arguments': {}}],
+        }),
+    })
+    mock_proc = _AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = _AsyncMock(return_value=(cli_result.encode(), b''))
+    return mock_proc
+
+
+_MESSAGES = [{'role': 'user', 'content': 'test prompt'}]
+_TOOL_SCHEMAS: list = []
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_confirms_account_ok_on_success():
+    """_call_claude_cli calls confirm_account_ok and on_agent_complete on success."""
+    agent, gate = _make_gated_agent_loop(token='token-a')
+    mock_proc = _make_success_proc(cost_usd=0.0042)
+
+    with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
+        await agent._call_claude_cli(_MESSAGES, _TOOL_SCHEMAS)
+
+    gate.confirm_account_ok.assert_called_once_with('token-a')
+    gate.on_agent_complete.assert_called_once_with(0.0042)
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_no_confirm_on_cap_hit():
+    """confirm_account_ok is NOT called on the cap-hit iteration, only on success."""
+    from unittest.mock import AsyncMock
+    agent, gate = _make_gated_agent_loop()
+    gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
+
+    cap_call_count = 0
+
+    def detect_side_effect(*args, **kwargs):
+        nonlocal cap_call_count
+        cap_call_count += 1
+        return cap_call_count == 1  # cap hit first time only
+
+    gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
+    mock_proc = _make_success_proc(cost_usd=0.0077)
+
+    with (
+        patch('asyncio.create_subprocess_exec', return_value=mock_proc),
+        patch('asyncio.sleep'),
+    ):
+        await agent._call_claude_cli(_MESSAGES, _TOOL_SCHEMAS)
+
+    # Exactly once — for the success iteration, NOT for the cap-hit iteration
+    gate.confirm_account_ok.assert_called_once_with('token-b')
+    gate.on_agent_complete.assert_called_once_with(0.0077)
+    gate.release_probe_slot.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_releases_probe_on_file_not_found():
+    """release_probe_slot is called when create_subprocess_exec raises FileNotFoundError."""
+    agent, gate = _make_gated_agent_loop(token='token-x')
+
+    with (
+        patch('asyncio.create_subprocess_exec', side_effect=FileNotFoundError),
+        pytest.raises(RuntimeError, match='Claude CLI not found'),
+    ):
+        await agent._call_claude_cli(_MESSAGES, _TOOL_SCHEMAS)
+
+    gate.release_probe_slot.assert_called_once_with('token-x')
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_releases_probe_on_timeout():
+    """release_probe_slot is called when wait_for raises TimeoutError."""
+    from unittest.mock import AsyncMock
+    agent, gate = _make_gated_agent_loop(token='token-y')
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
+
+    with (
+        patch('asyncio.create_subprocess_exec', return_value=mock_proc),
+        pytest.raises(RuntimeError, match='timed out'),
+    ):
+        await agent._call_claude_cli(_MESSAGES, _TOOL_SCHEMAS)
+
+    gate.release_probe_slot.assert_called_once_with('token-y')
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_releases_probe_on_nonzero_exit():
+    """release_probe_slot is called when the CLI exits with a non-zero return code."""
+    from unittest.mock import AsyncMock
+    agent, gate = _make_gated_agent_loop(token='token-z')
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 1
+    mock_proc.communicate = AsyncMock(return_value=(b'', b'some error output'))
+
+    with (
+        patch('asyncio.create_subprocess_exec', return_value=mock_proc),
+        pytest.raises(RuntimeError, match='exited with code 1'),
+    ):
+        await agent._call_claude_cli(_MESSAGES, _TOOL_SCHEMAS)
+
+    gate.release_probe_slot.assert_called_once_with('token-z')
+    gate.confirm_account_ok.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_empty_stdout_releases_probe():
+    """release_probe_slot is called (not confirm_account_ok) when stdout is empty."""
+    from unittest.mock import AsyncMock as _AsyncMock
+    agent, gate = _make_gated_agent_loop(token='token-empty')
+    mock_proc = _AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = _AsyncMock(return_value=(b'', b''))
+
+    with (
+        patch('asyncio.create_subprocess_exec', return_value=mock_proc),
+        pytest.raises(RuntimeError, match='Claude CLI produced no output'),
+    ):
+        await agent._call_claude_cli(_MESSAGES, _TOOL_SCHEMAS)
+
+    gate.release_probe_slot.assert_called_once_with('token-empty')
+    gate.confirm_account_ok.assert_not_called()

@@ -19,6 +19,9 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.reconciliation.context_assembler import (
     ContextAssembler,
+    _format_task,  # Intentional private-API coupling: targeted unit coverage of
+    #                the display_id parameter that the integration tests alone
+    #                cannot isolate as cleanly.
     estimate_tokens,
     format_event,
 )
@@ -480,7 +483,7 @@ class TestContextAssemblerCancellation:
     Two passes:
       - Pass 1 (propagate_cancellations): re-raise any value that is a BaseException
         but NOT an Exception (CancelledError, KeyboardInterrupt, SystemExit).
-      - Pass 2 (accumulation): the per-event zip loop uses ``isinstance(ctx_result, BaseException)``
+      - Pass 2 (accumulation): the per-event zip loop uses ``isinstance(ctx_result, Exception)``
         so only application-level failures degrade to empty context.
     """
 
@@ -655,3 +658,234 @@ class TestContextAssemblerCancellation:
             'first batch (calls 1-10) must complete before the second batch '
             'dispatches and triggers the CancelledError on call 11'
         )
+
+    @pytest.mark.asyncio
+    async def test_pass2_guard_narrowed_to_exception(self, mock_memory):
+        """Pass 2 guard must use isinstance(ctx_result, Exception), not BaseException.
+
+        Defense-in-depth test: injects a KeyboardInterrupt() instance directly into
+        batch_contexts by patching asyncio.gather to return it as a value (avoiding the
+        asyncio task re-raise that would occur if a coroutine actually raised it).
+        Pass 1 is bypassed by patching propagate_cancellations to a no-op, so Pass 2
+        sees the bare BaseException value directly.
+
+        With the current ``isinstance(ctx_result, BaseException)`` guard,
+        KeyboardInterrupt() IS caught and degraded to [] — assemble() returns normally.
+        With the narrowed ``isinstance(ctx_result, Exception)`` guard, KeyboardInterrupt()
+        is NOT caught and falls through to the list comprehension
+        ``[item for item in ctx_result ...]``, causing
+        ``TypeError: 'KeyboardInterrupt' object is not iterable``.
+
+        This test would FAIL with the old ``isinstance(ctx_result, BaseException)`` guard
+        (assemble() would return normally) and PASSES with the narrowed
+        ``isinstance(ctx_result, Exception)`` guard.
+
+        Sister test: test_exception_only_batch_does_not_propagate — verifies that real
+        Exception subclasses ARE caught by Pass 2 and degraded gracefully.
+        """
+        assembler = _make_assembler(memory_service=mock_memory)
+        events = [
+            _make_event(
+                event_type=EventType.memory_added,
+                payload={'content_preview': 'some content'},
+            ),
+        ]
+        watermark = _make_watermark()
+
+        async def _mock_gather(*args, **kwargs):
+            # Return KeyboardInterrupt() as a value — bypasses asyncio task re-raise
+            return [KeyboardInterrupt()]
+
+        with (
+            patch('fused_memory.reconciliation.context_assembler.asyncio.gather', new=_mock_gather),
+            patch(
+                'fused_memory.reconciliation.context_assembler.propagate_cancellations',
+                new=lambda results: None,
+            ),
+            pytest.raises(TypeError),
+        ):
+            await assembler.assemble(events, watermark, 'test-project')
+
+
+# ── _format_task display_id ──────────────────────────────────────────
+
+
+def test_format_task_display_id_overrides_bare_int_id():
+    """When display_id='450.2' is passed, output uses qualified ID not bare int."""
+    task = {
+        'id': 2,
+        'title': 'Fix subtask',
+        'status': 'in-progress',
+        'dependencies': [],
+    }
+    result = _format_task(task, display_id='450.2')
+    assert '[task:450.2]' in result
+    assert '[task:2]' not in result
+
+
+def test_format_task_no_display_id_uses_task_id_field():
+    """Without display_id, output uses task.get('id') — backward-compatible."""
+    task = {
+        'id': '42',
+        'title': 'Top-level task',
+        'status': 'done',
+        'dependencies': [1, 3],
+    }
+    result = _format_task(task)
+    assert '[task:42]' in result
+
+
+# ── _ctx_task_event subtask qualification ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_ctx_task_event_subtask_uses_qualified_id(mock_memory, mock_taskmaster):
+    """_ctx_task_event for subtask event uses qualified task_id as display ID.
+
+    When the event payload carries task_id='450.2' and get_task returns a dict
+    with bare id=2, the ContextItem's formatted text must contain '[task:450.2]'
+    — not '[task:2]' — so Stage 1 can cross-reference with the Active Task Tree.
+    """
+    mock_taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': 2,
+            'title': 'Subtask fix',
+            'status': 'in-progress',
+            'dependencies': [],
+            'metadata': {},
+        }
+    )
+
+    assembler = _make_assembler(
+        memory_service=mock_memory,
+        taskmaster=mock_taskmaster,
+    )
+    events = [
+        _make_event(
+            event_type=EventType.task_status_changed,
+            payload={'task_id': '450.2', 'old_status': 'pending', 'new_status': 'in-progress'},
+        ),
+    ]
+    watermark = _make_watermark()
+
+    result = await assembler.assemble(events, watermark, 'test-project')
+
+    # ContextItem key must be the qualified ID
+    assert 'task:450.2' in result.context_items
+    # Formatted text must show qualified ID, not bare int
+    item = result.context_items['task:450.2']
+    assert '[task:450.2]' in item.formatted
+    assert '[task:2]' not in item.formatted
+
+
+# ── _ctx_tasks_bulk_created parent_id qualification ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_ctx_tasks_bulk_created_uses_parent_id_as_display_id(
+    mock_memory, mock_taskmaster
+):
+    """_ctx_tasks_bulk_created passes parent_id as display_id to _format_task.
+
+    When the event payload carries parent_task_id='7' but get_task returns a
+    dict where id is None (e.g., a Taskmaster quirk), the ContextItem's
+    formatted text must still contain '[task:7]' — taken from the event's
+    parent_task_id — rather than '[task:None]' from the bare task dict.
+    """
+    mock_taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': None,   # id missing/null from Taskmaster response
+            'title': 'Parent task',
+            'status': 'in-progress',
+            'dependencies': [],
+            'metadata': {},
+        }
+    )
+
+    assembler = _make_assembler(
+        memory_service=mock_memory,
+        taskmaster=mock_taskmaster,
+    )
+    events = [
+        _make_event(
+            event_type=EventType.tasks_bulk_created,
+            payload={'parent_task_id': '7', 'count': 3},
+        ),
+    ]
+    watermark = _make_watermark()
+
+    result = await assembler.assemble(events, watermark, 'test-project')
+
+    assert 'task:7' in result.context_items
+    item = result.context_items['task:7']
+    assert '[task:7]' in item.formatted
+    assert '[task:None]' not in item.formatted
+
+
+# ── Integration: full assemble() with subtask status-change event ────
+
+
+@pytest.mark.asyncio
+async def test_assemble_subtask_event_qualified_id_end_to_end(
+    mock_memory, mock_taskmaster
+):
+    """End-to-end: assemble() with subtask status-change event emits qualified ID.
+
+    Validates the complete pipeline from event ingestion through payload assembly:
+    - Event payload has task_id='450.2'
+    - get_task returns a dict with bare id=2
+    - Assembled context_items must have key 'task:450.2'
+    - That item's formatted text must contain '[task:450.2]', not '[task:2]'
+
+    This is the regression test for the Stage 1 cross-reference gap: Stage 1
+    sees '[450.2]' in the Active Task Tree but was seeing '[task:2]' in Related
+    Context before this fix.
+    """
+    mock_taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': 2,
+            'title': 'Wire up auth endpoint',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {
+                'memory_hints': {},
+            },
+        }
+    )
+    mock_memory.search = AsyncMock(return_value=[])
+
+    assembler = _make_assembler(
+        memory_service=mock_memory,
+        taskmaster=mock_taskmaster,
+    )
+
+    events = [
+        _make_event(
+            event_type=EventType.task_status_changed,
+            payload={
+                'task_id': '450.2',
+                'old_status': 'in-progress',
+                'new_status': 'done',
+            },
+        ),
+    ]
+    watermark = _make_watermark()
+
+    result = await assembler.assemble(events, watermark, 'test-project')
+
+    # The assembled payload must include the event
+    assert len(result.events) == 1
+
+    # The context item key must be the qualified ID from the event payload
+    assert 'task:450.2' in result.context_items, (
+        f"Expected 'task:450.2' key in context_items, got: {list(result.context_items.keys())}"
+    )
+
+    # The formatted text must use the qualified ID, not the bare int from task dict
+    item = result.context_items['task:450.2']
+    assert '[task:450.2]' in item.formatted, (
+        f"Expected '[task:450.2]' in formatted text, got: {item.formatted!r}"
+    )
+    assert '[task:2]' not in item.formatted, (
+        f"Must not contain bare '[task:2]', got: {item.formatted!r}"
+    )

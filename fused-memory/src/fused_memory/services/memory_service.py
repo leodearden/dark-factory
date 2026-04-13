@@ -1270,10 +1270,15 @@ class MemoryService:
     ) -> dict:
         """Batch-rebuild Entity node summaries from their current valid edges.
 
-        Delegates to GraphitiBackend.rebuild_entity_summaries(), which detects
-        stale entities (or iterates all when force=True) and calls
-        refresh_entity_summary for each.  Logs the operation via write journal
-        if available.
+        Orchestrates the rebuild pipeline:
+        1. Target selection — detect_stale_with_edges (force=False) or
+           list_entity_nodes (force=True).
+        2. Fan-out — asyncio.Semaphore(20) + asyncio.gather(return_exceptions=True)
+           calling graphiti.rebuild_entity_from_edges for each target.
+        3. Error accumulation — two-tier: propagate_cancellations (Pass 1) then
+           per-entity dict accumulation (Pass 2).
+
+        Logs the operation via write journal if available.
 
         Args:
             project_id: Project scope (determines FalkorDB graph).
@@ -1285,17 +1290,132 @@ class MemoryService:
             _source: Source label for journal entry.
 
         Returns:
-            Dict from backend: {total_entities, stale_entities, rebuilt,
-            skipped, errors, details}.
+            Dict with keys: total_entities, stale_entities, rebuilt, skipped,
+            errors, details.
         """
         write_op_id = str(uuid_mod.uuid4())
         success = True
         error_msg = None
         result: dict = {}
         try:
-            result = await self.graphiti.rebuild_entity_summaries(
-                group_id=project_id, force=force, dry_run=dry_run
+            # --- Target selection ---
+            targets: list[dict] = []
+            all_edges: dict[str, list] = {}
+            total_entities: int = 0
+
+            if force:
+                all_entities = await self.graphiti.list_entity_nodes(group_id=project_id)
+                targets = [
+                    {'uuid': e['uuid'], 'name': e['name'], 'old_summary': e['summary']}
+                    for e in all_entities
+                ]
+                total_entities = len(all_entities)
+                if not dry_run:
+                    all_edges = await self.graphiti.get_all_valid_edges(group_id=project_id)
+            else:
+                if dry_run:
+                    stale, total_entities = await self.graphiti.detect_stale_dry_run(
+                        group_id=project_id
+                    )
+                else:
+                    detect_result = await self.graphiti.detect_stale_with_edges(
+                        group_id=project_id
+                    )
+                    stale = detect_result.stale
+                    all_edges = detect_result.all_edges
+                    total_entities = detect_result.total_count
+                targets = [
+                    {'uuid': s['uuid'], 'name': s['name'], 'old_summary': s['summary']}
+                    for s in stale
+                ]
+
+            stale_entities = len(targets)
+            rebuilt = 0
+            skipped = 0
+            errors = 0
+            details: list[dict] = []
+
+            if dry_run:
+                skipped = stale_entities
+                for t in targets:
+                    details.append({
+                        'uuid': t['uuid'],
+                        'name': t['name'],
+                        'status': 'skipped_dry_run',
+                    })
+            else:
+                sem = asyncio.Semaphore(20)
+
+                async def _rebuild_one(t: dict) -> dict:
+                    async with sem:
+                        edges = all_edges.get(t['uuid'], [])
+                        return await self.graphiti.rebuild_entity_from_edges(
+                            t['uuid'], t['name'], edges,
+                            group_id=project_id,
+                            old_summary=t['old_summary'],
+                        )
+
+                gather_results = await asyncio.gather(
+                    *(_rebuild_one(t) for t in targets), return_exceptions=True
+                )
+
+                # Pass 1: propagate CancelledError before per-entity accumulation.
+                try:
+                    propagate_cancellations(gather_results)
+                except BaseException as e:
+                    if not isinstance(e, Exception):
+                        logger.warning(
+                            'rebuild_entity_summaries: cancellation signal received '
+                            'group=%s rebuilt_so_far=%d errors_so_far=%d; propagating',
+                            project_id, rebuilt, errors,
+                        )
+                    raise
+
+                # Pass 2: per-entity accumulation.
+                for t, r in zip(targets, gather_results, strict=True):
+                    if isinstance(r, Exception):
+                        errors += 1
+                        logger.error(
+                            'rebuild_entity_summaries: failed to rebuild node=%s name=%r: %s',
+                            t['uuid'], t['name'], r,
+                        )
+                        details.append({
+                            'uuid': t['uuid'],
+                            'name': t['name'],
+                            'status': 'error',
+                            'error': str(r),
+                        })
+                    else:
+                        if not isinstance(r, dict):
+                            raise TypeError(
+                                f'rebuild_entity_summaries: rebuild_entity_from_edges returned '
+                                f'unexpected type {type(r).__name__!r} for node={t["uuid"]} '
+                                f'name={t["name"]!r}'
+                            )
+                        rebuilt += 1
+                        details.append({
+                            'uuid': t['uuid'],
+                            'name': t['name'],
+                            'status': 'rebuilt',
+                            'old_summary': r.get('old_summary', ''),
+                            'new_summary': r.get('new_summary', ''),
+                            'edge_count': r.get('edge_count', 0),
+                        })
+
+            logger.info(
+                'rebuild_entity_summaries: group=%s total=%d stale=%d rebuilt=%d '
+                'skipped=%d errors=%d dry_run=%s force=%s',
+                project_id, total_entities, stale_entities, rebuilt, skipped, errors,
+                dry_run, force,
             )
+            result = {
+                'total_entities': total_entities,
+                'stale_entities': stale_entities,
+                'rebuilt': rebuilt,
+                'skipped': skipped,
+                'errors': errors,
+                'details': details,
+            }
         except Exception as e:
             success = False
             error_msg = str(e)
@@ -1316,6 +1436,7 @@ class MemoryService:
                             'total_entities': result.get('total_entities', 0),
                             'stale_entities': result.get('stale_entities', 0),
                             'rebuilt': result.get('rebuilt', 0),
+                            'skipped': result.get('skipped', 0),
                             'errors': result.get('errors', 0),
                         } if success else None,
                         success=success,

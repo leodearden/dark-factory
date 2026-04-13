@@ -1,5 +1,6 @@
 """Tests for the LLM-as-judge module (judge.py)."""
 
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -486,3 +487,158 @@ async def test_error_trend_disabled_config_no_halt(mock_journal):
     await judge._check_error_trends('proj', verdicts)
 
     assert not judge.is_halted('proj')
+
+
+# ---------------------------------------------------------------------------
+# UsageGate lifecycle: confirm_account_ok / on_agent_complete / release_probe_slot
+# ---------------------------------------------------------------------------
+
+
+def _make_gated_judge(mock_journal, token: str = 'token-j'):
+    """Return (judge, gate) with a mock usage gate pre-wired."""
+    config = _make_judge_config(judge_llm_provider='claude-cli', judge_llm_model='sonnet')
+    judge = Judge(config=config, journal=mock_journal)
+    gate = MagicMock()
+    gate.before_invoke = AsyncMock(return_value=token)
+    gate.detect_cap_hit = MagicMock(return_value=False)
+    judge._usage_gate = gate
+    return judge, gate
+
+
+def _make_judge_success_proc(result_text: str = 'The verdict is ok.', cost_usd: float = 0.0055):
+    """Return a mock subprocess that exits 0 with a valid judge CLI JSON response."""
+    cli_result = json.dumps({
+        'result': result_text,
+        'session_id': 'sess-j1',
+        'num_input_tokens': 80,
+        'num_output_tokens': 40,
+        'cost_usd': cost_usd,
+    })
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = AsyncMock(return_value=(cli_result.encode(), b''))
+    return mock_proc
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_confirms_account_ok_on_success(mock_journal):
+    """_call_judge_cli calls confirm_account_ok and on_agent_complete on success."""
+    judge, gate = _make_gated_judge(mock_journal, token='token-j')
+    mock_proc = _make_judge_success_proc(result_text='The verdict is ok.', cost_usd=0.0055)
+
+    with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
+        result = await judge._call_judge_cli('Evaluate this.')
+
+    assert result == 'The verdict is ok.'
+    gate.confirm_account_ok.assert_called_once_with('token-j')
+    gate.on_agent_complete.assert_called_once_with(0.0055)
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_releases_probe_on_file_not_found(mock_journal):
+    """release_probe_slot is called when create_subprocess_exec raises FileNotFoundError."""
+    judge, gate = _make_gated_judge(mock_journal, token='token-jx')
+
+    with (
+        patch('asyncio.create_subprocess_exec', side_effect=FileNotFoundError),
+        pytest.raises(RuntimeError, match='Claude CLI not found'),
+    ):
+        await judge._call_judge_cli('Evaluate this.')
+
+    gate.release_probe_slot.assert_called_once_with('token-jx')
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_releases_probe_on_timeout(mock_journal):
+    """release_probe_slot is called when wait_for raises TimeoutError."""
+    judge, gate = _make_gated_judge(mock_journal, token='token-jy')
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
+
+    with (
+        patch('asyncio.create_subprocess_exec', return_value=mock_proc),
+        pytest.raises(RuntimeError, match='timed out'),
+    ):
+        await judge._call_judge_cli('Evaluate this.')
+
+    gate.release_probe_slot.assert_called_once_with('token-jy')
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_no_confirm_on_cap_hit(mock_journal):
+    """confirm_account_ok is NOT called on the cap-hit iteration, only on success."""
+    judge, gate = _make_gated_judge(mock_journal)
+    gate.before_invoke = AsyncMock(side_effect=['token-ja', 'token-jb'])
+
+    cap_call_count = 0
+
+    def detect_side_effect(*args, **kwargs):
+        nonlocal cap_call_count
+        cap_call_count += 1
+        return cap_call_count == 1  # cap hit first time only
+
+    gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
+    mock_proc = _make_judge_success_proc(result_text='Judge output.', cost_usd=0.0099)
+
+    with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
+        result = await judge._call_judge_cli('Evaluate this.')
+
+    assert result == 'Judge output.'
+    # Exactly once — for the success iteration, NOT for the cap-hit iteration
+    gate.confirm_account_ok.assert_called_once_with('token-jb')
+    gate.on_agent_complete.assert_called_once_with(0.0099)
+    gate.release_probe_slot.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_releases_probe_on_nonzero_exit(mock_journal):
+    """release_probe_slot is called when the CLI exits with a non-zero return code."""
+    judge, gate = _make_gated_judge(mock_journal, token='token-jz')
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 2
+    mock_proc.communicate = AsyncMock(return_value=(b'', b'judge error output'))
+
+    with (
+        patch('asyncio.create_subprocess_exec', return_value=mock_proc),
+        pytest.raises(RuntimeError, match='exited with code 2'),
+    ):
+        await judge._call_judge_cli('Evaluate this.')
+
+    gate.release_probe_slot.assert_called_once_with('token-jz')
+    gate.confirm_account_ok.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_empty_stdout_confirms_gate(mock_journal):
+    """Empty stdout (exit 0) calls confirm_account_ok and on_agent_complete but not release_probe_slot."""
+    judge, gate = _make_gated_judge(mock_journal, token='token-je')
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = AsyncMock(return_value=(b'', b''))
+
+    with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
+        result = await judge._call_judge_cli('Evaluate this.')
+
+    assert result == ''
+    gate.confirm_account_ok.assert_called_once_with('token-je')
+    gate.on_agent_complete.assert_called_once_with(0.0)
+    gate.release_probe_slot.assert_not_called()
+    mock_journal.write.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_empty_stdout_with_stderr_confirms_gate(mock_journal):
+    """Empty stdout (exit 0) still confirms gate even when stderr contains warnings."""
+    judge, gate = _make_gated_judge(mock_journal, token='token-jw')
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = AsyncMock(return_value=(b'', b'some warning'))
+
+    with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
+        result = await judge._call_judge_cli('Evaluate this.')
+
+    assert result == ''
+    gate.confirm_account_ok.assert_called_once_with('token-jw')
+    gate.on_agent_complete.assert_called_once_with(0.0)
+    gate.release_probe_slot.assert_not_called()

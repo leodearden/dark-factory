@@ -13,7 +13,7 @@ integration behaviour of detect_stale_summaries and rebuild_entity_summaries.
 """
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from conftest import make_rebuild_detail
@@ -22,6 +22,17 @@ from fused_memory.backends.graphiti_client import (
     EdgeDict,
     StaleSummaryResult,
 )
+
+
+def _make_svc(mock_config):
+    """Service with mocked graphiti backend — mirrors helper in test_rebuild_entity_summaries.py."""
+    from fused_memory.services.memory_service import MemoryService
+    svc = MemoryService(mock_config)
+    svc.graphiti = MagicMock()
+    svc.mem0 = MagicMock()
+    svc.durable_queue = MagicMock()
+    svc.durable_queue.enqueue = AsyncMock(return_value=1)
+    return svc
 
 
 class TestDetectStaleSummariesNamedAccess:
@@ -37,12 +48,12 @@ class TestDetectStaleSummariesNamedAccess:
             all_edges={},
             total_count=3,
         )
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
+        backend.detect_stale_with_edges = AsyncMock(return_value=detect_result)
 
         returned = await backend.detect_stale_summaries(group_id='t')
 
         assert returned is stale_list
-        backend._detect_stale_summaries_with_edges.assert_awaited_once_with(group_id='t')
+        backend.detect_stale_with_edges.assert_awaited_once_with(group_id='t')
 
     @pytest.mark.asyncio
     async def test_detect_stale_summaries_empty_stale_list(self, mock_config, make_backend):
@@ -54,17 +65,17 @@ class TestDetectStaleSummariesNamedAccess:
         """
         backend = make_backend(mock_config)
         detect_result = StaleSummaryResult(stale=[], all_edges={}, total_count=0)
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
+        backend.detect_stale_with_edges = AsyncMock(return_value=detect_result)
 
         returned = await backend.detect_stale_summaries(group_id='t')
 
         assert returned is detect_result.stale
-        backend._detect_stale_summaries_with_edges.assert_awaited_once_with(group_id='t')
+        backend.detect_stale_with_edges.assert_awaited_once_with(group_id='t')
 
 
 
 class TestDetectStaleSummariesWithEdgesNamedAccess:
-    """_detect_stale_summaries_with_edges returns a fully-populated StaleSummaryResult with named access."""
+    """detect_stale_with_edges returns a fully-populated StaleSummaryResult with named access."""
 
     @pytest.mark.asyncio
     async def test_detect_stale_summaries_includes_summary_field_named_access(
@@ -82,7 +93,7 @@ class TestDetectStaleSummariesWithEdgesNamedAccess:
             'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}],
         })
 
-        result = await backend._detect_stale_summaries_with_edges(group_id='test')
+        result = await backend.detect_stale_with_edges(group_id='test')
 
         assert len(result.stale) == 1
         assert 'summary' in result.stale[0]
@@ -92,12 +103,12 @@ class TestDetectStaleSummariesWithEdgesNamedAccess:
 
 
 class TestRebuildEntitySummariesNamedAccess:
-    """rebuild_entity_summaries uses named attribute access on StaleSummaryResult."""
+    """MemoryService.rebuild_entity_summaries uses named attribute access on StaleSummaryResult."""
 
     @pytest.mark.asyncio
-    async def test_rebuild_entity_summaries_named_access(self, mock_config, make_backend):
+    async def test_rebuild_entity_summaries_named_access(self, mock_config):
         """rebuild_entity_summaries routes per-entity edges from result.all_edges correctly."""
-        backend = make_backend(mock_config)
+        svc = _make_svc(mock_config)
         stale_list = [{'uuid': 'u1', 'name': 'A', 'summary': 'old', 'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 1, 'summary_line_count': 1}]
         per_entity_edges: list[EdgeDict] = [{'uuid': 'e-1', 'fact': 'new', 'name': 'knows'}]
         all_edges: dict[str, list[EdgeDict]] = {'u1': per_entity_edges}
@@ -107,12 +118,12 @@ class TestRebuildEntitySummariesNamedAccess:
             all_edges=all_edges,
             total_count=5,
         )
-        backend._detect_stale_summaries_with_edges = AsyncMock(return_value=detect_result)
-        backend._rebuild_entity_from_edges = AsyncMock(
+        svc.graphiti.detect_stale_with_edges = AsyncMock(return_value=detect_result)
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(
             return_value=make_rebuild_detail('u1', 'A', old_summary='old', new_summary='A: new', edge_count=1)
         )
 
-        result = await backend.rebuild_entity_summaries(group_id='test', force=False)
+        result = await svc.rebuild_entity_summaries(project_id='test')
 
         # total_entities flows from total_count (named access on result)
         assert result['total_entities'] == 5
@@ -121,7 +132,7 @@ class TestRebuildEntitySummariesNamedAccess:
         assert result['errors'] == 0
 
         # per-entity edge list comes from all_edges['u1']
-        backend._rebuild_entity_from_edges.assert_awaited_once_with(
+        svc.graphiti.rebuild_entity_from_edges.assert_awaited_once_with(
             'u1', 'A', per_entity_edges,
             group_id='test',
             old_summary='old',
