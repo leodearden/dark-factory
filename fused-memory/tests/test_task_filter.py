@@ -1390,3 +1390,25 @@ class TestSortOrderWithSubtasks:
         assert ids.index('451') < ids.index('450.2')
         assert ids.index('451') < ids.index('450.1')
         assert len(ids) == 4
+
+
+class TestFormatFilteredTaskTreeWithSubtasks:
+    """Tests for format_filtered_task_tree() when active_tasks contains subtasks."""
+
+    def test_format_renders_qualified_subtask_ids(self):
+        """format_filtered_task_tree renders lines for both parent and qualified subtask IDs."""
+        tree = FilteredTaskTree(
+            active_tasks=[
+                {'id': '450', 'title': 'Parent Task', 'status': 'in-progress', 'dependencies': []},
+                {'id': '450.1', 'title': 'Subtask One', 'status': 'pending', 'dependencies': []},
+            ],
+            done_tasks=[],
+            cancelled_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=2,
+        )
+        output = format_filtered_task_tree(tree)
+        assert '- [450] (in-progress) Parent Task deps=[]' in output
+        assert '- [450.1] (pending) Subtask One deps=[]' in output
