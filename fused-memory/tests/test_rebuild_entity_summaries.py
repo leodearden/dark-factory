@@ -59,18 +59,66 @@ def _make_rebuild_spy(backend) -> tuple[list[dict], Callable]:
     return captured_calls, original_rebuild
 
 
-def _uuid_dispatch(mapping: dict) -> Callable:
-    """Return a uuid-dispatched async callable for rebuild_entity_from_edges mocks.
+class _UuidDispatcher:
+    """Callable class that dispatches rebuild_entity_from_edges mocks by uuid.
 
-    Calls with uuids in ``mapping`` return the mapped value; any other uuid raises
-    AssertionError immediately so unexpected invocations surface during the test
-    rather than silently succeeding.
+    Tracks which uuids were dispatched in ``self.dispatched`` so callers can
+    verify completeness with ``assert_all_dispatched()``.
+
+    Mapping values may be:
+    - A dict — returned directly as the async result.
+    - A BaseException instance — raised instead of returned, so
+      ``_uuid_dispatch({'uuid-1': RuntimeError('boom'), ...})`` works.
+
+    Any uuid not in the mapping raises AssertionError immediately so unexpected
+    invocations surface during the test rather than silently succeeding.
     """
-    async def _side_effect(uuid, name, edges, *, group_id, old_summary):
-        if uuid in mapping:
-            return mapping[uuid]
-        raise AssertionError(f'unexpected uuid: {uuid!r}')
-    return _side_effect
+
+    def __init__(self, mapping: dict) -> None:
+        self._mapping = mapping
+        self.dispatched: set[str] = set()
+        # Ensure inspect.iscoroutinefunction(self) returns True so that
+        # AsyncMock.side_effect awaits __call__ rather than returning the coroutine.
+        inspect.markcoroutinefunction(self)
+
+    async def __call__(self, uuid, name, edges, *, group_id, old_summary):
+        self.dispatched.add(uuid)
+        if uuid not in self._mapping:
+            raise AssertionError(f'unexpected uuid: {uuid!r}')
+        value = self._mapping[uuid]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def assert_all_dispatched(self) -> None:
+        """Raise AssertionError if any mapped uuid was never called."""
+        expected = set(self._mapping)
+        missing = expected - self.dispatched
+        if missing:
+            raise AssertionError(f'uuids never dispatched: {missing!r}')
+
+
+def _uuid_dispatch(mapping: dict) -> '_UuidDispatcher':
+    """Return a _UuidDispatcher for rebuild_entity_from_edges mocks.
+
+    The returned object is callable (async) and also tracks dispatch state:
+    - ``.dispatched`` — set of uuids that were actually called
+    - ``.assert_all_dispatched()`` — raises if any mapped uuid was skipped
+
+    Mapping values may be dicts (returned) or BaseException instances (raised).
+    Any uuid not in the mapping raises AssertionError immediately.
+
+    Example::
+
+        dispatch = _uuid_dispatch({
+            'uuid-1': RuntimeError('FalkorDB timeout'),
+            'uuid-2': {'uuid': 'uuid-2', ...},
+        })
+        mock.side_effect = dispatch
+        ...
+        dispatch.assert_all_dispatched()
+    """
+    return _UuidDispatcher(mapping)
 
 
 # ---------------------------------------------------------------------------
