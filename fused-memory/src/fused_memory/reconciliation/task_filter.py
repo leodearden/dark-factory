@@ -13,6 +13,8 @@ intent without regressions. (ref: task 455)
 
 from __future__ import annotations
 
+from typing import Any
+
 from dataclasses import dataclass, field
 
 # --------------------------------------------------------------------------- #
@@ -177,7 +179,7 @@ def _render_task_line(task: dict) -> str:
     return f'- [{tid}] ({status}) {title} deps={deps_str}'
 
 
-def format_task_list(tasks: list[dict]) -> str:
+def format_task_list(tasks: list[Any]) -> str:
     """Render a list of task dicts as a newline-joined string.
 
     Returns 'No tasks.' for an empty list; otherwise joins
