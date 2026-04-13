@@ -369,6 +369,8 @@ class TestNearCapStateDistinction:
         assert gate._accounts[1].near_cap is False
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is False
+        assert gate._open.is_set() is True
+        assert all(a.resume_task is None for a in gate._accounts)
 
     def test_near_cap_no_oauth_token_falls_back_to_first_uncapped(self):
         """NEAR_CAP with oauth_token=None falls back to the first uncapped account."""
