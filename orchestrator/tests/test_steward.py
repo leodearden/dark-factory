@@ -1978,3 +1978,29 @@ class TestPreTriageSuggestionsPath:
 
         mock_pre_triage.assert_not_called()
         mock_invoke.assert_called_once()
+
+    async def test_pre_triaged_detail_injected_into_steward_session(
+        self, steward,
+    ):
+        """Pre-triaged escalation (not original) is passed to briefing builder."""
+        esc = self._esc_with_suggestions(12)
+        pre_triaged_esc = _make_escalation(
+            detail='## Pre-Triaged Results\n8 accepted, 4 skipped',
+            summary='12 suggestions pre-triaged: 8 accepted, 4 skipped',
+            category='review_suggestions',
+        )
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+        with (
+            patch.object(
+                steward, '_pre_triage_suggestions',
+                new_callable=AsyncMock, return_value=pre_triaged_esc,
+            ),
+            patch('orchestrator.steward.invoke_agent',
+                  new_callable=AsyncMock, return_value=_make_result()),
+        ):
+            await steward._handle_escalation(esc)
+
+        call_kwargs = steward.briefing.build_steward_initial_prompt.call_args.kwargs
+        assert '## Pre-Triaged Results' in call_kwargs['escalation']['detail']
