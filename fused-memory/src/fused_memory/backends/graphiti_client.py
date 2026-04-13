@@ -1156,7 +1156,9 @@ class GraphitiBackend:
             - ``errors``: number of per-entity refresh failures.
             - ``details``: list of per-entity result dicts.
         """
-        # Declare before if/else for explicit scoping — all branches assign these.
+        # Declare before if/else — targets and total_entities are assigned by all branches;
+        # all_edges is only populated by branches that consume it (the force=False,
+        # dry_run=True path intentionally leaves it empty).
         targets: list[dict] = []
         all_edges: dict[str, list[EdgeDict]] = {}
         total_entities: int = 0
