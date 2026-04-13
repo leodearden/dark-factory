@@ -1913,27 +1913,26 @@ class TestPreTriageSuggestionsPath:
             yield triage_mod
 
     @staticmethod
-    def _esc_with_suggestions(n: int) -> Escalation:
-        """Escalation with *n* JSON suggestions in detail field."""
-        suggestions = [
+    def _make_suggestions(n: int) -> list:
+        """Build a list of *n* suggestion dicts (shared by factory methods below)."""
+        return [
             {
                 'description': f'suggestion {i}', 'location': f'file_{i}.py',
                 'reviewer': 'bot', 'category': 'style',
             }
             for i in range(n)
         ]
+
+    @staticmethod
+    def _esc_with_suggestions(n: int) -> Escalation:
+        """Escalation with *n* JSON suggestions in detail field."""
+        suggestions = TestPreTriageSuggestionsPath._make_suggestions(n)
         return _make_escalation(detail=json.dumps(suggestions), category='review_suggestions')
 
     @staticmethod
     def _hash_esc(n: int) -> Escalation:
         """Escalation with hash-prefixed detail containing *n* JSON suggestions."""
-        suggestions = [
-            {
-                'description': f'suggestion {i}', 'location': f'file_{i}.py',
-                'reviewer': 'bot', 'category': 'style',
-            }
-            for i in range(n)
-        ]
+        suggestions = TestPreTriageSuggestionsPath._make_suggestions(n)
         detail = f'#hash:abcdef0123456789#{json.dumps(suggestions)}'
         return _make_escalation(detail=detail, category='review_suggestions')
 
@@ -1958,11 +1957,12 @@ class TestPreTriageSuggestionsPath:
 
         mock_pre_triage.assert_called_once_with(esc)
 
+    @pytest.mark.parametrize('n', [0, 1, 9])
     async def test_handle_escalation_skips_pre_triage_below_threshold(
-        self, steward,
+        self, steward, n,
     ):
-        """_handle_escalation does NOT call _pre_triage_suggestions below threshold (n=9)."""
-        esc = self._esc_with_suggestions(9)
+        """_handle_escalation does NOT call _pre_triage_suggestions below threshold (n=0, 1, 9)."""
+        esc = self._esc_with_suggestions(n)
         steward.escalation_queue.get.return_value = _make_escalation(
             status='resolved', resolution='fixed',
         )
@@ -2031,6 +2031,8 @@ class TestPreTriageSuggestionsPath:
     async def test_pre_triage_passes_correct_allowed_tools(self, steward):
         """_pre_triage_suggestions passes the exact allowed_tools list to invoke_agent."""
         esc = self._esc_with_suggestions(12)
+        # Patches invoke_agent at definition site — invoke_with_cap_retry delegates to it
+        # via module-level reference, so patching here intercepts calls through the wrapper.
         with patch('orchestrator.agents.invoke.invoke_agent',
                    new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
             await steward._pre_triage_suggestions(esc)
@@ -2045,6 +2047,8 @@ class TestPreTriageSuggestionsPath:
     async def test_pre_triage_uses_project_root_as_cwd(self, steward):
         """_pre_triage_suggestions passes config.project_root (not worktree) as cwd."""
         esc = self._esc_with_suggestions(12)
+        # Patches invoke_agent at definition site — invoke_with_cap_retry delegates to it
+        # via module-level reference, so patching here intercepts calls through the wrapper.
         with patch('orchestrator.agents.invoke.invoke_agent',
                    new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
             await steward._pre_triage_suggestions(esc)
