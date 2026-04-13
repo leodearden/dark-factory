@@ -731,3 +731,46 @@ def test_format_task_no_display_id_uses_task_id_field():
     }
     result = _format_task(task)
     assert '[task:42]' in result
+
+
+# ── _ctx_task_event subtask qualification ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_ctx_task_event_subtask_uses_qualified_id(mock_memory, mock_taskmaster):
+    """_ctx_task_event for subtask event uses qualified task_id as display ID.
+
+    When the event payload carries task_id='450.2' and get_task returns a dict
+    with bare id=2, the ContextItem's formatted text must contain '[task:450.2]'
+    — not '[task:2]' — so Stage 1 can cross-reference with the Active Task Tree.
+    """
+    mock_taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': 2,
+            'title': 'Subtask fix',
+            'status': 'in-progress',
+            'dependencies': [],
+            'metadata': {},
+        }
+    )
+
+    assembler = _make_assembler(
+        memory_service=mock_memory,
+        taskmaster=mock_taskmaster,
+    )
+    events = [
+        _make_event(
+            event_type=EventType.task_status_changed,
+            payload={'task_id': '450.2', 'old_status': 'pending', 'new_status': 'in-progress'},
+        ),
+    ]
+    watermark = _make_watermark()
+
+    result = await assembler.assemble(events, watermark, 'test-project')
+
+    # ContextItem key must be the qualified ID
+    assert 'task:450.2' in result.context_items
+    # Formatted text must show qualified ID, not bare int
+    item = result.context_items['task:450.2']
+    assert '[task:450.2]' in item.formatted
+    assert '[task:2]' not in item.formatted
