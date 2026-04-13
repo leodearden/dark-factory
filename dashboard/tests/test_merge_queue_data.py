@@ -231,6 +231,19 @@ class TestTsSortKey:
         assert result.utcoffset() == timedelta(0)
         assert result == datetime(2026, 4, 1, 10, 0, 0, tzinfo=UTC)
 
+    def test_naive_timestamp_gets_utc(self):
+        """A naive timestamp (no tzinfo) gets UTC attached and normalized.
+
+        parse_utc attaches UTC to naive datetimes via replace(tzinfo=UTC).
+        .astimezone(UTC) on a UTC datetime is a no-op, so the result should
+        be UTC-aware and equal to the naive value interpreted as UTC.
+        """
+        entry = {'timestamp': '2026-04-01T10:00:00'}
+        result = _ts_sort_key(entry)
+        assert result.tzinfo is not None
+        assert result.utcoffset() == timedelta(0)
+        assert result == datetime(2026, 4, 1, 10, 0, 0, tzinfo=UTC)
+
 
 # ---------------------------------------------------------------------------
 # TestQueueDepthTimeseries
