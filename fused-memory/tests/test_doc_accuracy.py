@@ -99,8 +99,8 @@ class TestAssembleCrossReferenceComment:
             "'graphiti_client.rebuild_entity_summaries' as a supplementary "
             "two-pass example (task 773: demote to supplementary, do not remove)."
         )
-        pc_pos = source.index("propagate_cancellations")
-        gc_comment_phrase = "graphiti_client.rebuild_entity_summaries"
+        pc_pos = source.index("See propagate_cancellations")
+        gc_comment_phrase = "graphiti_client.rebuild_entity_summaries for"
         gc_pos = source.index(gc_comment_phrase)
         assert pc_pos < gc_pos, (
             f"Expected 'propagate_cancellations' (pos {pc_pos}) to appear before "
