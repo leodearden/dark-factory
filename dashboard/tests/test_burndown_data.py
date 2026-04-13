@@ -17,6 +17,7 @@ from dashboard.data.burndown import (
     _INSERT_SNAPSHOT_SQL,
     BURNDOWN_SCHEMA,
     _count_statuses,
+    _tasks_json_for,
     collect_snapshot,
     downsample,
     get_burndown_projects,
@@ -180,6 +181,25 @@ class TestCountStatuses:
         tasks = [{'title': 'no status field'}]
         result = _count_statuses(tasks)
         assert result['pending'] == 1
+
+
+# ---------------------------------------------------------------------------
+# _tasks_json_for
+# ---------------------------------------------------------------------------
+
+
+class TestTasksJsonFor:
+    def test_constructs_expected_path(self, tmp_path):
+        result = _tasks_json_for(tmp_path)
+        assert result == tmp_path / '.taskmaster' / 'tasks' / 'tasks.json'
+
+    def test_returns_path_type(self, tmp_path):
+        result = _tasks_json_for(tmp_path)
+        assert isinstance(result, Path)
+
+    def test_arbitrary_root(self):
+        root = Path('/some/project/root')
+        assert _tasks_json_for(root) == Path('/some/project/root/.taskmaster/tasks/tasks.json')
 
 
 # ---------------------------------------------------------------------------
