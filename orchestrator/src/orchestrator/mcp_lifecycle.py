@@ -13,6 +13,10 @@ from orchestrator.config import OrchestratorConfig
 
 logger = logging.getLogger(__name__)
 
+# Retry settings for transient MCP failures (e.g. server restarting)
+_RETRYABLE_STATUS = frozenset({502, 503, 504})
+_MCP_MAX_RETRIES = 3
+_MCP_BACKOFF_BASE = 1.0  # seconds; exponential: 1s, 2s, 4s
 
 MCP_HEADERS = {
     'Content-Type': 'application/json',
@@ -79,41 +83,70 @@ class McpSession:
         params: dict[str, Any] | None = None,
         timeout: float = 30,
     ) -> dict:
-        """Send a JSON-RPC request and parse the response."""
+        """Send a JSON-RPC request with retry on transient failures."""
+        request_id = self._next_id()
         payload: dict[str, Any] = {
             'jsonrpc': '2.0',
-            'id': self._next_id(),
+            'id': request_id,
             'method': method,
         }
         if params is not None:
             payload['params'] = params
 
-        headers = dict(MCP_HEADERS)
-        if self._session_id:
-            headers['Mcp-Session-Id'] = self._session_id
+        last_exc: Exception | None = None
+        for attempt in range(_MCP_MAX_RETRIES):
+            headers = dict(MCP_HEADERS)
+            if self._session_id:
+                headers['Mcp-Session-Id'] = self._session_id
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            resp = await client.post(
-                self.mcp_endpoint,
-                json=payload,
-                headers=headers,
-                timeout=timeout,
-            )
-            resp.raise_for_status()
+            try:
+                async with httpx.AsyncClient(follow_redirects=True) as client:
+                    resp = await client.post(
+                        self.mcp_endpoint,
+                        json=payload,
+                        headers=headers,
+                        timeout=timeout,
+                    )
+                    if resp.status_code in _RETRYABLE_STATUS:
+                        logger.warning(
+                            'MCP %s returned %d (attempt %d/%d)',
+                            method, resp.status_code, attempt + 1, _MCP_MAX_RETRIES,
+                        )
+                        self._session_id = None
+                        self._initialized = False
+                        last_exc = httpx.HTTPStatusError(
+                            f'{resp.status_code}', request=resp.request, response=resp,
+                        )
+                        await asyncio.sleep(_MCP_BACKOFF_BASE * (2 ** attempt))
+                        continue
 
-            # Track session ID
-            resp_session_id = resp.headers.get('mcp-session-id')
-            if resp_session_id:
-                self._session_id = resp_session_id
+                    resp.raise_for_status()
 
-            return self._parse_response(resp)
+                    # Track session ID
+                    resp_session_id = resp.headers.get('mcp-session-id')
+                    if resp_session_id:
+                        self._session_id = resp_session_id
+
+                    return self._parse_response(resp)
+
+            except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+                logger.warning(
+                    'MCP %s connection error (attempt %d/%d): %s',
+                    method, attempt + 1, _MCP_MAX_RETRIES, exc,
+                )
+                self._session_id = None
+                self._initialized = False
+                last_exc = exc
+                await asyncio.sleep(_MCP_BACKOFF_BASE * (2 ** attempt))
+
+        raise last_exc or RuntimeError('_raw_call exhausted retries')
 
     async def _raw_notify(
         self,
         method: str,
         params: dict[str, Any] | None = None,
     ) -> None:
-        """Send a JSON-RPC notification (no id, no response expected)."""
+        """Send a JSON-RPC notification with retry on transient failures."""
         payload: dict[str, Any] = {
             'jsonrpc': '2.0',
             'method': method,
@@ -121,20 +154,38 @@ class McpSession:
         if params is not None:
             payload['params'] = params
 
-        headers = dict(MCP_HEADERS)
-        if self._session_id:
-            headers['Mcp-Session-Id'] = self._session_id
+        last_exc: Exception | None = None
+        for attempt in range(_MCP_MAX_RETRIES):
+            headers = dict(MCP_HEADERS)
+            if self._session_id:
+                headers['Mcp-Session-Id'] = self._session_id
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            resp = await client.post(
-                self.mcp_endpoint,
-                json=payload,
-                headers=headers,
-                timeout=10,
-            )
-            # Notifications may return 200 or 202
-            if resp.status_code not in (200, 202, 204):
-                logger.warning(f'Notification {method} returned {resp.status_code}: {resp.text[:200]}')
+            try:
+                async with httpx.AsyncClient(follow_redirects=True) as client:
+                    resp = await client.post(
+                        self.mcp_endpoint,
+                        json=payload,
+                        headers=headers,
+                        timeout=10,
+                    )
+                    # Notifications may return 200 or 202
+                    if resp.status_code not in (200, 202, 204):
+                        logger.warning(
+                            f'Notification {method} returned {resp.status_code}: {resp.text[:200]}'
+                        )
+                    return
+
+            except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+                logger.warning(
+                    'MCP notify %s connection error (attempt %d/%d): %s',
+                    method, attempt + 1, _MCP_MAX_RETRIES, exc,
+                )
+                self._session_id = None
+                self._initialized = False
+                last_exc = exc
+                await asyncio.sleep(_MCP_BACKOFF_BASE * (2 ** attempt))
+
+        raise last_exc or RuntimeError('_raw_notify exhausted retries')
 
     @staticmethod
     def _parse_response(resp: httpx.Response) -> dict:
