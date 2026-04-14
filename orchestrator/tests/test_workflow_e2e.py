@@ -1343,15 +1343,12 @@ class TestPlanLockAndProvenance:
         assert '_created_at' in workflow.plan
         assert workflow.plan['_session_id'] == workflow.session_id
 
-    async def test_execute_detects_plan_overwrite_and_blocks(
+    async def test_execute_restamps_after_plan_overwrite(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path
     ):
         """Simulate plan overwrite: implementer stub overwrites plan.json with
-        a different _session_id mid-execution. Workflow should return BLOCKED
-        and create an escalation with category 'infra_issue'."""
-        queue_dir = tmp_path / 'escalation_queue'
-        from escalation.queue import EscalationQueue
-        queue = EscalationQueue(queue_dir)
+        a different _session_id mid-execution. Workflow should re-stamp
+        _session_id (defense-in-depth) and continue rather than blocking."""
 
         class OverwritingImplementerStub(AgentStub):
             async def _implementer(self, cwd: Path) -> AgentResult:
@@ -1368,16 +1365,7 @@ class TestPlanLockAndProvenance:
                 return result
 
         stub = OverwritingImplementerStub()
-        scheduler = FakeScheduler()
-        workflow = TaskWorkflow(
-            assignment=task_assignment,
-            config=config,
-            git_ops=git_ops,
-            scheduler=scheduler,  # type: ignore[arg-type]
-            briefing=FakeBriefing(),  # type: ignore[arg-type]
-            mcp=FakeMcp(),  # type: ignore[arg-type]
-            escalation_queue=queue,
-        )
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
         monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
@@ -1390,14 +1378,8 @@ class TestPlanLockAndProvenance:
 
         outcome = await workflow.run()
 
-        assert outcome == WorkflowOutcome.BLOCKED
-
-        # Check escalation was created with infra_issue category
-        escalations = queue.get_by_task('42')
-        infra_escs = [e for e in escalations if e.category == 'infra_issue']
-        assert len(infra_escs) >= 1
-        esc = infra_escs[0]
-        assert 'overwrite' in esc.summary.lower() or 'plan' in esc.summary.lower()
+        # Workflow continues past the overwrite (re-stamps instead of blocking)
+        assert outcome == WorkflowOutcome.DONE
 
     async def test_plan_phase_skips_architect_when_plan_locked(
         self, config, git_ops, task_assignment, monkeypatch

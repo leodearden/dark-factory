@@ -70,9 +70,6 @@ class BriefingAssembler:
         task_block = self._format_task(task)
         identity = self._agent_identity(task.get('id'), 'architect')
 
-        # Use absolute path so the agent's Write tool targets the correct location
-        plan_path = str(worktree / '.task' / 'plan.json') if worktree else '.task/plan.json'
-
         return f"""\
 {context}
 
@@ -85,10 +82,14 @@ class BriefingAssembler:
 # Action
 
 1. Explore the codebase thoroughly — read relevant files, understand existing patterns and utilities.
-2. Produce a TDD implementation plan.
-3. List ALL files you expect to create or modify in the `files` field — this drives concurrency locks, so be exhaustive and precise.
-4. Ensure the `modules` field accurately lists ALL code directories this task will touch.
-5. Write the plan using the Write tool to `{plan_path}`.
+2. Produce a TDD implementation plan using the plan-tools MCP tools:
+   a. Call `create_plan(task_id, title, analysis, modules, files)` with your analysis.
+   b. Call `add_prerequisite(prereq_id, description)` for any setup work needed before TDD steps.
+   c. Call `add_plan_step(step_id, step_type, description)` for each TDD step, in order. Alternate test/impl.
+   d. Call `add_design_decision(decision, rationale)` for non-obvious choices.
+   e. Call `add_reuse_item(what, where, how)` for existing code/patterns being reused.
+3. List ALL files you expect to create or modify in the `files` parameter of `create_plan` — this drives concurrency locks, so be exhaustive and precise.
+4. Ensure the `modules` parameter accurately lists ALL code directories this task will touch.
 """
 
     async def build_implementer_prompt(
@@ -168,7 +169,7 @@ Review any overlap with your plan steps before continuing — file contents may 
 
 # Action
 
-Execute the next pending steps in TDD order. Commit after each step. Update plan.json status fields. Stop at a logical boundary.
+Execute the next pending steps in TDD order. Commit after each step. Call `mark_step_done(step_id, commit_sha)` to record progress. Stop at a logical boundary.
 """
 
     async def build_amender_prompt(
