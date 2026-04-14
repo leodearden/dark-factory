@@ -169,6 +169,7 @@ class TaskSteward:
             '--level', '0',
         ]
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -178,6 +179,14 @@ class TaskSteward:
             )
             stdout, stderr = await proc.communicate()
         except asyncio.CancelledError:
+            if proc is not None and proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except (TimeoutError, asyncio.CancelledError):
+                    proc.kill()
+                    with contextlib.suppress(Exception):
+                        await proc.wait()
             raise
         except Exception as e:
             logger.warning(f'Steward watcher failed for task {self.task_id}: {e}')

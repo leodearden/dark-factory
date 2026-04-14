@@ -1530,6 +1530,23 @@ class TestNextEscalation:
             level_idx = cmd.index('--level')
             assert cmd[level_idx + 1] == '0'
 
+    async def test_cancellation_terminates_watcher_subprocess(self, steward):
+        """SIGTERM/cancellation must kill the watcher subprocess."""
+        steward.escalation_queue.get_by_task.return_value = []
+        with patch('asyncio.create_subprocess_exec', new_callable=AsyncMock) as mock_exec:
+            proc = AsyncMock()
+            proc.returncode = None  # still running
+            proc.communicate.side_effect = asyncio.CancelledError()
+            proc.wait = AsyncMock()
+            proc.terminate = MagicMock()  # sync method on asyncio.subprocess.Process
+            proc.kill = MagicMock()
+            mock_exec.return_value = proc
+
+            with pytest.raises(asyncio.CancelledError):
+                await steward._watch_for_escalation()
+
+            proc.terminate.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Config Defaults
