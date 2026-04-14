@@ -89,6 +89,47 @@ _CARGO_WORKSPACE_RE = re.compile(
 )
 
 
+async def _derive_task_files_from_git(
+    worktree: Path, config: OrchestratorConfig,
+) -> list[str] | None:
+    """Derive task file list from ``git diff main...HEAD`` in the worktree.
+
+    Returns ``None`` when:
+    - the worktree is on main (no diff to derive)
+    - ``git diff`` fails for any reason
+    - no files changed
+    """
+    from orchestrator.git_ops import _run
+    try:
+        rc, main_sha, _ = await _run(
+            ['git', 'rev-parse', '--verify', config.git.main_branch],
+            cwd=worktree,
+        )
+        if rc != 0:
+            return None
+        rc, head_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
+        )
+        if rc != 0 or head_sha == main_sha:
+            return None
+        rc, output, _ = await _run(
+            ['git', 'diff', '--name-only',
+             f'{config.git.main_branch}...HEAD'],
+            cwd=worktree,
+        )
+        if rc != 0:
+            return None
+        files = [f for f in output.strip().splitlines() if f.strip()]
+        if files:
+            logger.info('Derived %d task files from git diff', len(files))
+            return files
+    except Exception:
+        logger.debug(
+            'Failed to derive task files from git diff', exc_info=True,
+        )
+    return None
+
+
 def _scope_cargo_workspace(cmd: str | None, crates: list[str]) -> str | None:
     """Rewrite ``cargo ... --workspace`` → ``cargo ... -p c1 -p c2 ...``.
 
@@ -141,13 +182,17 @@ def _apply_cargo_scope(
         return mc
     if not task_files:
         return mc
-    if not all(f.endswith('.rs') for f in task_files):
+    # Filter to .rs files for crate mapping — non-Rust files (e.g. .ri, .toml,
+    # .js) don't affect which cargo crates need testing.  Non-cargo commands
+    # chained with && (cd gui && npm test) are left untouched by the regex.
+    rs_files = [f for f in task_files if f.endswith('.rs')]
+    if not rs_files:
         return mc
 
     crates_map = discover_workspace_crates(project_root)
     if not crates_map:
         return mc
-    matched = files_to_crates(task_files, crates_map)
+    matched = files_to_crates(rs_files, crates_map)
     if not matched:
         return mc
 
@@ -585,6 +630,10 @@ async def run_scoped_verification(
        module_configs, or when fallback returns ``None`` (no .py files).
     """
     scope_cargo_enabled = config.scope_cargo
+
+    # When the plan didn't provide a file list, try to derive one from git.
+    if task_files is None:
+        task_files = await _derive_task_files_from_git(worktree, config)
 
     if module_configs:
         # Apply file-level scoping within each subproject when task_files given
