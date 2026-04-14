@@ -13,6 +13,7 @@ class EventType(StrEnum):
     episode_added = 'episode_added'
     memory_added = 'memory_added'
     memory_deleted = 'memory_deleted'
+    memory_updated = 'memory_updated'
     task_status_changed = 'task_status_changed'
     task_created = 'task_created'
     task_modified = 'task_modified'

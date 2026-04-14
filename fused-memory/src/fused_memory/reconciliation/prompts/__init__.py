@@ -10,14 +10,15 @@ _PROJECT_ID_GUIDELINE = (
 # Stage 1: Memory Consolidator — memory read/write, no task tools
 _STAGE1_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
     tools=(
-        'search, get_entity, get_episodes, get_status, add_memory, delete_memory'
+        'search, get_entity, get_episodes, get_status, add_memory, delete_memory, '
+        'update_edge'
     )
 )
 
 # Stage 2: Task-Knowledge Sync — full memory + task access including expand_task/parse_prd
 _STAGE2_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
     tools=(
-        'search, get_entity, get_episodes, add_memory, delete_memory, '
+        'search, get_entity, get_episodes, add_memory, delete_memory, update_edge, '
         'get_tasks, get_task, set_task_status, add_task, update_task, add_subtask, '
         'remove_task, add_dependency, remove_dependency, expand_task, parse_prd'
     )

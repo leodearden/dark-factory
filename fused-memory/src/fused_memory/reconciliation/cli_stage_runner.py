@@ -47,6 +47,7 @@ DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__refresh_entity_summary',
     'mcp__fused-memory__merge_entities',
     'mcp__fused-memory__rebuild_entity_summaries',
+    'mcp__fused-memory__update_edge',
 ]
 
 # Per-stage disallowed lists

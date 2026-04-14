@@ -367,6 +367,41 @@ class GraphitiBackend:
             timeout=self._write_timeout,
         )
 
+    async def update_edge(
+        self, edge_uuid: str, fact: str, *, group_id: str
+    ) -> dict[str, Any]:
+        """Update an existing edge's fact text, re-embed, and refresh endpoint summaries.
+
+        No LLM extraction or edge resolution — the fact is written directly.
+        After saving, both source and target entity node summaries are rebuilt
+        from their current valid edges so they stay consistent.
+        """
+        driver = self._driver_for(group_id)
+        edge = await EntityEdge.get_by_uuid(driver, edge_uuid)
+        edge.fact = fact
+        embedder = self._require_client().embedder
+        await edge.generate_embedding(embedder)
+        await asyncio.wait_for(edge.save(driver), timeout=self._write_timeout)
+
+        # Deterministically refresh both endpoint entity summaries so they
+        # reflect the updated fact text (no LLM — just fact concatenation).
+        refreshed: list[str] = []
+        for node_uuid in (edge.source_node_uuid, edge.target_node_uuid):
+            try:
+                await self.refresh_entity_summary(node_uuid, group_id=group_id)
+                refreshed.append(node_uuid)
+            except Exception as exc:
+                logger.warning(
+                    'update_edge: failed to refresh summary for node %s: %s',
+                    node_uuid, exc,
+                )
+
+        return {
+            'uuid': edge.uuid,
+            'fact': edge.fact,
+            'refreshed_nodes': refreshed,
+        }
+
     async def build_communities(self, group_ids: list[str] | None = None) -> None:
         """Build community summaries."""
         client = self._require_client()

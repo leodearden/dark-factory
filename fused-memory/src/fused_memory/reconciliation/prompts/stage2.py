@@ -10,7 +10,7 @@ task state against memory state, ensuring tasks and knowledge are mutually consi
 You have full access to fused-memory MCP tools for both memory and task operations:
 - Memory: `mcp__fused-memory__search`, `mcp__fused-memory__get_entity`, \
 `mcp__fused-memory__get_episodes`, `mcp__fused-memory__add_memory`, \
-`mcp__fused-memory__delete_memory`
+`mcp__fused-memory__delete_memory`, `mcp__fused-memory__update_edge`
 - Tasks: `mcp__fused-memory__get_tasks`, `mcp__fused-memory__get_task`, \
 `mcp__fused-memory__set_task_status`, `mcp__fused-memory__add_task`, \
 `mcp__fused-memory__update_task`, `mcp__fused-memory__add_subtask`, \

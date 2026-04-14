@@ -24,6 +24,9 @@ def service(mock_config):
     svc.graphiti.add_episode = AsyncMock(return_value=None)
     svc.graphiti.remove_episode = AsyncMock()
     svc.graphiti.remove_edge = AsyncMock()
+    svc.graphiti.update_edge = AsyncMock(
+        return_value={'uuid': 'test-uuid', 'fact': 'updated', 'refreshed_nodes': []}
+    )
     svc.graphiti._require_client = MagicMock()
 
     svc.mem0 = MagicMock()
@@ -786,6 +789,48 @@ class TestDeleteMemory:
         )
         service.graphiti.remove_edge.assert_called_once_with('edge-uuid-123', group_id='test')
         service.graphiti.remove_episode.assert_not_called()
+
+
+class TestUpdateEdge:
+    @pytest.mark.asyncio
+    async def test_update_edge_success(self, service):
+        result = await service.update_edge(
+            edge_uuid='edge-1', fact='new fact', project_id='test'
+        )
+        assert result['status'] == 'updated'
+        assert result['store'] == 'graphiti'
+
+    @pytest.mark.asyncio
+    async def test_update_edge_calls_backend(self, service):
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'new fact', 'refreshed_nodes': []}
+        )
+        await service.update_edge(edge_uuid='e-1', fact='new fact', project_id='proj')
+        service.graphiti.update_edge.assert_called_once_with(
+            'e-1', 'new fact', group_id='proj'
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_edge_not_found_propagates(self, service):
+        from graphiti_core.errors import EdgeNotFoundError
+
+        service.graphiti.update_edge = AsyncMock(
+            side_effect=EdgeNotFoundError('e-missing')
+        )
+        with pytest.raises(EdgeNotFoundError):
+            await service.update_edge(
+                edge_uuid='e-missing', fact='x', project_id='test'
+            )
+
+    @pytest.mark.asyncio
+    async def test_update_edge_returns_refreshed_nodes(self, service):
+        service.graphiti.update_edge = AsyncMock(return_value={
+            'uuid': 'e-1', 'fact': 'new', 'refreshed_nodes': ['n-src', 'n-tgt'],
+        })
+        result = await service.update_edge(
+            edge_uuid='e-1', fact='new', project_id='test'
+        )
+        assert result['refreshed_nodes'] == ['n-src', 'n-tgt']
 
 
 class TestSearchDeleteRoundtrip:
