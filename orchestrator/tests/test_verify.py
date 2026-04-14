@@ -9,6 +9,7 @@ from orchestrator.config import ModuleConfig
 from orchestrator.verify import (
     _apply_cargo_scope,
     _build_fallback_config,
+    _derive_task_files_from_git,
     _run_cmd,
     _scope_cargo_workspace,
     _scope_command,
@@ -1054,7 +1055,8 @@ class TestApplyCargoScope:
         result = _apply_cargo_scope(mc, files, tmp_path, True)
         assert result.test_command == 'cargo test -p reify-eval -p reify-lsp'
 
-    def test_mixed_language_falls_through(self, tmp_path: Path):
+    def test_mixed_language_scopes_to_rs_crates(self, tmp_path: Path):
+        """Non-.rs files are ignored for crate mapping; cargo is scoped to the .rs file's crate."""
         self._reset_cache()
         self._write_workspace(tmp_path, {
             'crates/reify-eval': 'reify-eval',
@@ -1065,10 +1067,46 @@ class TestApplyCargoScope:
         )
         files = [
             'crates/reify-eval/src/a.rs',
-            'gui/src/editor/baz.ts',  # non-.rs
+            'gui/src/editor/baz.ts',  # non-.rs — ignored for scoping
         ]
         result = _apply_cargo_scope(mc, files, tmp_path, True)
-        assert result is mc  # unchanged — mixed language fallthrough
+        assert result is not mc
+        assert result.test_command == 'cargo test -p reify-eval'
+
+    def test_non_rs_only_falls_through(self, tmp_path: Path):
+        """When ALL files are non-.rs, no crate mapping is possible — fall through."""
+        self._reset_cache()
+        self._write_workspace(tmp_path, {
+            'crates/reify-eval': 'reify-eval',
+        })
+        mc = ModuleConfig(
+            prefix='__synthetic__',
+            test_command='cargo test --workspace',
+        )
+        files = [
+            'gui/src/editor/baz.ts',
+            'examples/demo.ri',
+        ]
+        result = _apply_cargo_scope(mc, files, tmp_path, True)
+        assert result is mc
+
+    def test_rs_plus_ri_files_scopes(self, tmp_path: Path):
+        """.ri files (Reify source) don't prevent cargo scoping."""
+        self._reset_cache()
+        self._write_workspace(tmp_path, {
+            'crates/reify-eval': 'reify-eval',
+        })
+        mc = ModuleConfig(
+            prefix='__synthetic__',
+            test_command='cargo test --workspace',
+        )
+        files = [
+            'crates/reify-eval/src/a.rs',
+            'examples/bracket.ri',
+        ]
+        result = _apply_cargo_scope(mc, files, tmp_path, True)
+        assert result is not mc
+        assert result.test_command == 'cargo test -p reify-eval'
 
     def test_file_outside_crates_falls_through(self, tmp_path: Path):
         self._reset_cache()
@@ -1209,8 +1247,8 @@ class TestRunScopedVerificationCargoScope:
         assert 'cargo test --workspace' not in captured
         assert 'cargo clippy --workspace -- -D warnings' not in captured
 
-    def test_mixed_language_task_keeps_workspace(self, tmp_path: Path):
-        """A task with .rs + .ts files must NOT be cargo-scoped."""
+    def test_mixed_language_task_scopes_cargo_keeps_npm(self, tmp_path: Path):
+        """A task with .rs + .ts files scopes cargo to the .rs crate; npm commands are untouched."""
         from orchestrator.cargo_scope import _clear_cache
         _clear_cache()
 
@@ -1243,9 +1281,11 @@ class TestRunScopedVerificationCargoScope:
                     ],
                 )
             )
-        # All captured commands should retain --workspace (no rewrite)
-        assert any('cargo test --workspace' in c for c in captured)
-        assert not any(' -p reify-eval' in c for c in captured)
+        # Cargo commands should be scoped to the .rs file's crate
+        assert any('cargo test -p reify-eval' in c for c in captured)
+        assert any('cargo clippy -p reify-eval' in c for c in captured)
+        # Non-cargo commands (npm) should be preserved
+        assert any('cd gui && npm test' in c for c in captured)
 
     def test_scope_cargo_disabled_globally(self, tmp_path: Path):
         from orchestrator.cargo_scope import _clear_cache
@@ -1277,3 +1317,86 @@ class TestRunScopedVerificationCargoScope:
             )
         assert 'cargo test --workspace' in captured
         assert not any(' -p reify-eval' in c for c in captured)
+
+
+# ---------------------------------------------------------------------------
+# _derive_task_files_from_git
+# ---------------------------------------------------------------------------
+
+
+class TestDeriveTaskFilesFromGit:
+    """Test the git-diff fallback for deriving task files when plan.json is missing."""
+
+    def test_derives_files_from_diff(self, tmp_path: Path):
+        """When HEAD differs from main, returns the changed files."""
+        config = _make_config()
+        config.git.main_branch = 'main'
+
+        async def fake_run(cmd, cwd=None):
+            joined = ' '.join(cmd)
+            if 'rev-parse --verify main' in joined:
+                return (0, 'aaa111', '')
+            if 'rev-parse HEAD' in joined:
+                return (0, 'bbb222', '')
+            if 'diff --name-only' in joined:
+                return (0, 'crates/reify-eval/src/lib.rs\ntests/foo.rs\n', '')
+            return (1, '', 'unknown')
+
+        with patch('orchestrator.verify._derive_task_files_from_git.__module__', 'orchestrator.verify'):
+            with patch('orchestrator.git_ops._run', side_effect=fake_run):
+                result = asyncio.run(
+                    _derive_task_files_from_git(tmp_path, config)
+                )
+        assert result == ['crates/reify-eval/src/lib.rs', 'tests/foo.rs']
+
+    def test_returns_none_on_main(self, tmp_path: Path):
+        """When HEAD == main SHA, returns None (no diff to derive)."""
+        config = _make_config()
+        config.git.main_branch = 'main'
+
+        async def fake_run(cmd, cwd=None):
+            joined = ' '.join(cmd)
+            if 'rev-parse' in joined:
+                return (0, 'same_sha', '')
+            return (1, '', '')
+
+        with patch('orchestrator.git_ops._run', side_effect=fake_run):
+            result = asyncio.run(
+                _derive_task_files_from_git(tmp_path, config)
+            )
+        assert result is None
+
+    def test_returns_none_on_git_failure(self, tmp_path: Path):
+        """When git commands fail, returns None gracefully."""
+        config = _make_config()
+        config.git.main_branch = 'main'
+
+        async def fake_run(cmd, cwd=None):
+            return (128, '', 'fatal: not a git repository')
+
+        with patch('orchestrator.git_ops._run', side_effect=fake_run):
+            result = asyncio.run(
+                _derive_task_files_from_git(tmp_path, config)
+            )
+        assert result is None
+
+    def test_returns_none_on_empty_diff(self, tmp_path: Path):
+        """When diff is empty, returns None."""
+        config = _make_config()
+        config.git.main_branch = 'main'
+
+        async def fake_run(cmd, cwd=None):
+            joined = ' '.join(cmd)
+            if 'rev-parse --verify main' in joined:
+                return (0, 'aaa111', '')
+            if 'rev-parse HEAD' in joined:
+                return (0, 'bbb222', '')
+            if 'diff --name-only' in joined:
+                return (0, '', '')
+            return (1, '', '')
+
+        with patch('orchestrator.git_ops._run', side_effect=fake_run):
+            result = asyncio.run(
+                _derive_task_files_from_git(tmp_path, config)
+            )
+        assert result is None
