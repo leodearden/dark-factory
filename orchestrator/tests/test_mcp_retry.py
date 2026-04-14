@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
 from orchestrator.mcp_lifecycle import (
-    McpSession,
     _MCP_BACKOFF_BASE,
     _MCP_MAX_RETRIES,
+    McpSession,
 )
 
 

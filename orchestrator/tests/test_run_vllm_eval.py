@@ -819,7 +819,7 @@ class TestPerTaskLogFiles:
         assert len(log_files) == 1, f"expected 1 log file, got {log_files}"
         assert "hello from fake subprocess" in log_files[0].read_text()
 
-    def test_no_log_file_in_sequential_mode(self, monkeypatch, tmp_path):
+    def test_log_file_in_sequential_mode(self, monkeypatch, tmp_path):
         results, log_dir = self._setup_one_task(monkeypatch, tmp_path)
         fake_client = _patch_pod_infra(monkeypatch)
 
@@ -856,11 +856,8 @@ class TestPerTaskLogFiles:
         )
         assert rc == 0
         assert fake_client.terminate_calls == ["pod-fake-1"]
-        # Sequential path: no redirect, so stdout/stderr kwargs should be None
+        # Sequential mode (concurrency=1) streams to the terminal — no log redirect
         assert captured_kwargs and captured_kwargs[0].get("stdout") is None
-        assert captured_kwargs[0].get("stderr") is None
-        # No log files created
-        assert not log_dir.exists() or not any(log_dir.glob("eval-*.log"))
 
     def test_log_file_path_in_summary(self, monkeypatch, tmp_path):
         results, log_dir = self._setup_one_task(monkeypatch, tmp_path)
@@ -893,7 +890,7 @@ class TestPerTaskLogFiles:
         assert captured["summaries"][0].log_path is not None
         assert captured["summaries"][0].log_path.parent == log_dir
 
-        # Sequential mode: log_path is None.
+        # Sequential mode (concurrency=1) streams to terminal — no per-task log file.
         captured.clear()
         launcher.main(
             [
