@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 import urllib.request
 from pathlib import Path
@@ -39,6 +40,8 @@ def _send_ntfy(url: str, escalation: Escalation) -> None:
 
 
 def main() -> None:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
     parser = argparse.ArgumentParser(description='Watch for escalation events')
     parser.add_argument('--queue-dir', required=True, help='Escalation queue directory')
     parser.add_argument('--task-id', default=None, help='Filter to a specific task ID')
