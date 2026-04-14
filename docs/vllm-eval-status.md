@@ -1,7 +1,73 @@
 # vLLM Local Model Evaluation — Status Report
 
-**Last updated:** 2026-04-13 PM
-**Status:** OAuth blocker resolved. Sonnet baseline done. Qwen3-Coder-Next completed df_task_12 (4 timeouts). REAP-139B FP8 and M2.5 NVFP4 running. M2.7 parked (CUDA graph hang on SM120, SSH tunnel crash with enforce_eager). Multiple infra fixes landed.
+**Last updated:** 2026-04-14 AM
+**Status:** All 8 final-run configs complete. Opus best overall (2 done), Sonnet second (1 done), M25-FP8/NVFP4 best open models. Widespread cap starvation corrupted many results — reify tasks and several vLLM results need rerunning. Dedicated eval account injection deployed (d33db0c).
+
+## Update 2026-04-14: Full final-run results, cap starvation diagnosis, eval account fix
+
+### TL;DR
+
+- **All 8 final-run configs completed** — Opus, Sonnet, M25-FP8, M25-NVFP4, Qwen3-FP8, REAP-139B FP8, REAP-139B AWQ, M2.7 FP8.
+- **Opus best overall**: df_12 done (0.95), df_13 done (0.95), df_18 blocked but T/T/T with 8121 lines (0.68). Only model to complete 2 tasks.
+- **Sonnet second**: df_13 done (0.95), df_12 timed out with real work (266L), df_18 partially worked (11K lines in 5-min uncap window) but capped.
+- **M25-FP8/NVFP4 best open models**: NVFP4 scored 0.9 on df_12 (10 lines, T/T/T). FP8 reify_27 T/T/T but blocked. Both did real work.
+- **Widespread cap starvation**: REAP-139B FP8 run ($181 Sonnet-equiv) + Opus df_18 ($43) + Sonnet df_12 ($25) burned through all 6 automation accounts. All subsequent tasks across all configs hit cap-cycling — 20 "iterations" at $0/0L in seconds.
+- **Reify Claude baselines (Sonnet + Opus) completely tainted** — 0 cost, 0 lines, 2 min. Every iteration was a cap bounce, not real work.
+- **NVFP4 pod was idle for 2+ hours** at $5.49/h because reify's accounts file excluded A and G. Terminated, relaunched with all accounts. 3 remaining tasks completed.
+- **Dedicated eval account injection deployed** (d33db0cfaf): `run_vllm_eval.py` generates temp accounts YAML (shared pool + max-a) via `USAGE_ACCOUNTS_FILE` env var. Orchestrators see 6 accounts; eval runners see 7. Account A protected from orchestrator automation.
+- **plan.json concurrency bug found**: M25-FP8 df_task_13 blocked after successful implementer ($7.47, 31 turns) due to plan.json ownership mismatch — 5 concurrent tasks on same pod clobber each other's plan state.
+
+### Results matrix (all final-run configs)
+
+| Config | df_12 | df_13 | df_18 | reify_12 | reify_27 |
+|--------|-------|-------|-------|----------|----------|
+| **Opus Max** | **done** 0.95 | **done** 0.95 | blocked 0.68 T/T/T 8121L | CAP 0L | CAP 0L |
+| **Sonnet Max** | timeout 266L $25 | **done** 0.95 | CAP (partial: 11264L) | CAP 0L | CAP 0L |
+| **M25-FP8** (4×RTX PRO) | blocked F/PASS/PASS | blocked (plan.json bug) | timeout 150m | CAP blocked | blocked T/T/T |
+| **M25-NVFP4** (B200) | blocked 0.9 T/T/T 10L | blocked 0L | blocked 78m | blocked 18m | blocked T/T/T 12m |
+| **Qwen3-FP8** (H200) | blocked 0L $29 | timeout $11 | timeout $26 | timeout $12 | CAP timeout |
+| **REAP-139B FP8** (2×RTX PRO) | blocked $17 | timeout 150m | timeout 150m | timeout 150m | timeout 150m |
+| **REAP-139B AWQ** (H200) | CAP $0 timeout | CAP $0 timeout | CAP $0 timeout | CAP $0 timeout | CAP $0 timeout |
+| **M2.7 FP8** (4×RTX PRO) | CAP $0 timeout | CAP $0 timeout | CAP $0 timeout | CAP $0 timeout | CAP $0 timeout |
+
+**CAP** = result tainted by account cap starvation (unreliable).
+
+### Cap starvation root cause
+
+The eval pipeline uses Claude API for judge + reviewer calls even on vLLM configs. With 5 concurrent tasks × multiple configs running back-to-back, the 6 automation accounts (G/F/E/C/B/D) were exhausted. The UsageGate probe loop then cycles through all capped accounts every ~6 minutes, counting each cap-bounce as a "completed iteration" — burning through the 20-iteration limit in seconds with $0 cost and 0 work.
+
+**Specific failure modes:**
+1. **Reify tasks on Claude baselines** (Sonnet/Opus): all 7 accounts capped after df tasks consumed them. 20 iterations of instant cap-bounce.
+2. **NVFP4 pod idle 2+ hours**: reify's accounts file had only 5 accounts (F/E/C/B/D), excluding A and G which were uncapped. Fixed mid-session by adding A+G, then permanently fixed by the USAGE_ACCOUNTS_FILE mechanism.
+3. **REAP-139B AWQ all tasks**: $0 timeouts — pod likely healthy but judge/reviewer couldn't get through on any account.
+4. **Sonnet df_18**: partial — real work during a brief 5-min uncap window on account C (11,264 lines, 5 commits), then capped. Metrics show $0 because cap interrupted before cost finalization.
+
+### Bugs found
+
+| Bug | Status | Detail |
+|-----|--------|--------|
+| Cap bounce counts as iteration | Known | Each cap-hit + retry burns one iteration; 20 iterations = ~3 cycles through 7 accounts in seconds |
+| plan.json concurrency bug | **NEW** | 5 concurrent tasks on same pod: plan.json overwritten by sibling task after implementer succeeds |
+| Reify accounts file missing A/G | FIXED | Reify config excluded A/G; now both configs use ${USAGE_ACCOUNTS_FILE} override |
+| dark-factory config.yaml missing usage_cap | FIXED | No failover at all for df_task evals; added usage_cap section |
+| Cost tracking on cap-interrupted sessions | Known | CLI reports $0 when capped mid-session; real work done but cost not accumulated |
+
+### Commits this session
+
+| Commit | Description |
+|--------|-------------|
+| `d33db0cfaf` | Dedicated eval account injection via USAGE_ACCOUNTS_FILE |
+| (reify) `39db84fb7` | Reify config: USAGE_ACCOUNTS_FILE override support |
+
+### Next-session priorities
+
+1. **Investigate M2.7 crash** — CUDA graph hang on SM120 with enforce_eager; may need H200 or reduced max_model_len
+2. **Rerun cap-tainted tasks** — Sonnet/Opus reify_12+reify_27, Sonnet df_18, M25-FP8 reify tasks, Qwen3 reify_27, REAP-139B AWQ full set
+3. **Fix plan.json concurrency bug** — worktree-level plan isolation for concurrent eval tasks
+4. **Elo tournament** — enough clean data from Opus + Sonnet + M25-NVFP4 df tasks for initial ranking
+5. **Consider cap-bounce guard** — don't count cap-hit iterations toward the max_execute_iterations limit
+
+---
 
 ## Update 2026-04-13 PM: OAuth resolved, first results, infra fixes
 
