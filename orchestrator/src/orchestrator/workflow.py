@@ -36,6 +36,10 @@ from orchestrator.task_status import TERMINAL_STATUSES
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import run_scoped_verification
 
+# Orchestrator package directory — used to resolve ``uv run --project`` for
+# the plan-tools stdio MCP server.
+_ORCH_PROJECT_DIR = Path(__file__).resolve().parents[2]
+
 
 class _StewardReescalated(Exception):
     """Raised when the steward re-escalates to level-1 (human intervention)."""
@@ -1067,14 +1071,16 @@ class TaskWorkflow:
                 'source': 'orchestrator',
             })
 
-            # Validate plan ownership after implementer (detect post-write tamper)
+            # Defense-in-depth: re-stamp _session_id after each implementer
+            # iteration.  The plan-tools MCP server preserves it, but if the
+            # model also edited plan.json directly (dropping _session_id),
+            # this recovers gracefully instead of blocking.
             if not self.artifacts.validate_plan_owner(self.session_id):
-                logger.error(
-                    f'Task {self.task_id}: plan.json ownership mismatch after implementer — '
-                    f'expected session {self.session_id}'
+                logger.warning(
+                    'Task %s: _session_id mismatch after implementer — re-stamping',
+                    self.task_id,
                 )
-                self._escalate_plan_overwrite()
-                return WorkflowOutcome.BLOCKED
+            self.artifacts.stamp_plan_provenance(self.session_id)
 
             if not result.success:
                 logger.warning(
@@ -1885,6 +1891,21 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 esc = self.config.escalation
                 escalation_url = f'http://{esc.host}:{esc.port}/mcp'
             mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
+
+        # Plan-tools stdio MCP server — architect builds plans, implementer/
+        # debugger marks steps done.  Per-invocation isolation: each agent
+        # gets its own server bound to the worktree path.
+        if role.name in ('architect', 'implementer', 'debugger') and cwd:
+            if not mcp_config:
+                mcp_config = {'mcpServers': {}}
+            mcp_config.setdefault('mcpServers', {})['plan-tools'] = {
+                'command': 'uv',
+                'args': [
+                    'run', '--project', str(_ORCH_PROJECT_DIR),
+                    'python', '-m', 'orchestrator.mcp.plan_tools',
+                    '--worktree', str(cwd),
+                ],
+            }
 
         started_at = datetime.now(UTC).isoformat()
         result = await invoke_with_cap_retry(

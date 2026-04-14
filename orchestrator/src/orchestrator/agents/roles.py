@@ -52,6 +52,18 @@ _MEMORY_TOOLS = [
     'mcp__fused-memory__get_entity',
 ]
 
+_PLAN_CREATOR_TOOLS = [
+    'mcp__plan-tools__create_plan',
+    'mcp__plan-tools__add_plan_step',
+    'mcp__plan-tools__add_prerequisite',
+    'mcp__plan-tools__add_design_decision',
+    'mcp__plan-tools__add_reuse_item',
+]
+
+_PLAN_STATUS_TOOLS = [
+    'mcp__plan-tools__mark_step_done',
+]
+
 _MEMORY_INSTRUCTIONS = """
 ## Memory
 
@@ -94,52 +106,35 @@ You are a TDD architect. Your job is to analyze a task and produce a detailed, s
 
 ## Your Output
 
-You MUST produce a JSON plan written to the path specified in the prompt's Action section, using the Write tool. The plan must have this exact schema:
+Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 
-```json
-{
-  "task_id": "<task id>",
-  "title": "<task title>",
-  "files": ["path/to/file1.py", "path/to/file2.py"],
-  "modules": ["<module1>", "<module2>"],
-  "analysis": "<your analysis of the task, existing code, and approach>",
-  "prerequisites": [
-    {"id": "pre-1", "description": "...", "status": "pending", "commit": null, "tests": []}
-  ],
-  "steps": [
-    {"id": "step-1", "type": "test", "description": "Write failing test for X", "status": "pending", "commit": null},
-    {"id": "step-2", "type": "impl", "description": "Implement X to pass test", "status": "pending", "commit": null}
-  ],
-  "design_decisions": [
-    {"decision": "...", "rationale": "..."}
-  ],
-  "reuse": [
-    {"what": "...", "where": "...", "how": "..."}
-  ]
-}
-```
+1. Call `create_plan(task_id, title, analysis, modules, files)` to initialize the plan.
+2. Call `add_prerequisite(prereq_id, description)` for any setup work needed before TDD steps.
+3. Call `add_plan_step(step_id, step_type, description)` for each TDD step, in order.
+   - `step_type` must be `"test"` or `"impl"`.
+   - Steps alternate: write a failing test, then implement to make it pass.
+4. Call `add_design_decision(decision, rationale)` for non-obvious choices.
+5. Call `add_reuse_item(what, where, how)` for existing code/patterns being reused.
 
 ## Rules
 
 1. **Read before planning.** Thoroughly explore the codebase to understand existing patterns, utilities, and conventions before writing your plan.
 2. **TDD order.** Steps alternate: write a failing test, then implement to make it pass. Every behavior gets a test first.
-3. **Maximize reuse.** Identify existing utilities, patterns, and code that can be reused. Document in the `reuse` section.
-4. **Prerequisites first.** If setup work (config files, fixtures, etc.) is needed before TDD steps, put them in prerequisites.
+3. **Maximize reuse.** Identify existing utilities, patterns, and code that can be reused. Record with `add_reuse_item`.
+4. **Prerequisites first.** If setup work (config files, fixtures, etc.) is needed before TDD steps, add them with `add_prerequisite`.
 5. **Small steps.** Each step should be a single, atomic change that can be committed independently.
-6. **File listing.** List ALL files this task will create or modify in the `files` field. Use paths relative to the worktree root. Be exhaustive — this is used to derive concurrency locks. Include test files.
-7. **Module identification.** List all code modules/directories this task will touch in the `modules` field. These are derived from `files` but serve as a human-readable summary.
-8. **Design decisions.** Document non-obvious choices and their rationale.
+6. **File listing.** List ALL files this task will create or modify in the `files` parameter of `create_plan`. Use paths relative to the worktree root. Be exhaustive — this is used to derive concurrency locks. Include test files.
+7. **Module identification.** List all code modules/directories this task will touch in the `modules` parameter of `create_plan`.
+8. **Design decisions.** Document non-obvious choices with `add_design_decision`.
 
 ## Important
 
 - The plan structure is IMMUTABLE after creation. Only `status` and `commit` fields change during execution.
-- Write the plan to the path specified in the prompt using the Write tool. You MUST use the Write tool — do not just describe the plan in your response.
-- If the task requires touching modules beyond what was originally specified, list ALL needed modules in the `modules` field.
-- The top-level key for your plan steps MUST be `"steps"` — not `"tdd_plan"`, `"tdd_steps"`, or any other variant. Plans without a `"steps"` array are rejected.
-- Each item in `prerequisites` MUST be a dict with at least `{id, description, status}` keys (and ideally also `commit` and `tests`) — NOT a plain string. Plans with string prerequisites are rejected.
+- You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
+- If the task requires touching modules beyond what was originally specified, list ALL needed modules in the `modules` parameter.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', 'Write', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS],
-    disallowed_tools=['Edit'],
+    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_CREATOR_TOOLS],
+    disallowed_tools=['Edit', 'Write'],
     default_model='opus',
     default_budget=5.0,
     default_max_turns=50,
@@ -162,9 +157,9 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 
 1. **Follow the plan exactly.** Do not deviate from the plan structure. Do not add steps or skip steps.
 2. **TDD discipline.** For `test` steps: write the test, run it, confirm it fails. For `impl` steps: write implementation, run tests, confirm they pass.
-3. **Commit each step.** After completing a step, stage ONLY your code changes (not `.task/` files) and commit. Then update `.task/plan.json` status locally — it will NOT be committed.
-4. **Stop at logical boundaries.** Don't exhaust your context trying to complete everything. Complete a logical chunk of steps, commit, update plan status, and stop. The next iteration will continue from where you left off.
-5. **Only modify status/commit fields** in plan.json. Never change the plan structure, descriptions, or add new steps.
+3. **Commit each step.** After completing a step, stage ONLY your code changes (not `.task/` files) and commit. Then call `mark_step_done(step_id, commit_sha)` to record the step as complete.
+4. **Stop at logical boundaries.** Don't exhaust your context trying to complete everything. Complete a logical chunk of steps, commit, mark done, and stop. The next iteration will continue from where you left off.
+5. **Never edit plan.json directly.** Use the `mark_step_done` MCP tool to update step status. Never change the plan structure, descriptions, or add new steps.
 
 ## CRITICAL: Git Staging Rules
 
@@ -186,7 +181,7 @@ The workflow for each step is:
 1. Write code (implementation or tests)
 2. Run tests to verify
 3. Stage and commit ONLY the code: `git add -- . ':!.task'`
-4. Update `.task/plan.json` status fields (this stays local, never committed)
+4. Call `mark_step_done(step_id, commit_sha)` to record the step as complete
 
 ## Scope Boundary
 
@@ -204,7 +199,7 @@ expansion rather than trying to work around the restriction.
 - If you encounter an unexpected issue that the plan doesn't account for, note it and stop. Do NOT modify the plan.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
     default_model='opus',
     default_budget=10.0,
     default_max_turns=80,
@@ -261,7 +256,7 @@ expansion rather than trying to work around the restriction.
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
     default_model='opus',
     default_budget=5.0,
     default_max_turns=50,
