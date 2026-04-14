@@ -25,6 +25,7 @@ You have access to fused-memory MCP tools for reading and writing memories:
 - `mcp__fused-memory__get_status` — health check for backends
 - `mcp__fused-memory__add_memory` — write a classified memory
 - `mcp__fused-memory__delete_memory` — delete a specific memory
+- `mcp__fused-memory__update_edge` — update an existing edge's fact text directly (no LLM pipeline)
 - `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
 from its remaining valid edges (call after deleting edges from an entity)
 
@@ -51,6 +52,11 @@ invalidates task assumptions, completed work not reflected in tasks).
 its summary from the remaining valid edges. This prevents stale duplicate text \
 from persisting in entity summaries.
 - Use search broadly to find related memories before making changes.
+- When refining or restating an existing relationship fact found via search, use \
+`mcp__fused-memory__update_edge` with the edge UUID and new fact text. This avoids \
+triggering Graphiti's edge resolution pipeline which can falsely invalidate active edges. \
+Use `add_memory(category='entities_and_relations')` only for genuinely new relationships \
+that don't correspond to any existing edge.
 - {_STAGE1_PROJECT_ID_GUIDELINE}
 - When you have completed your work, produce your final structured report as your response.
 

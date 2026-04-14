@@ -53,6 +53,7 @@ Task operations (when Taskmaster is connected):
 Management:
 - delete_memory: Remove a specific memory (edges for Graphiti, vector entries for Mem0)
 - delete_episode: Remove a Graphiti episode (with optional cascade)
+- update_edge: Update an existing Graphiti edge's fact text directly (no LLM pipeline)
 - refresh_entity_summary: Rebuild an entity node's summary from its valid edges (accepts entity_uuid or entity_name)
 - merge_entities: Consolidate two duplicate entity nodes (redirects edges, deletes deprecated)
 - get_status: Health check for all backends
@@ -632,6 +633,53 @@ def create_mcp_server(
             )
         except Exception as e:
             logger.error(f'delete_episode error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def update_edge(
+        edge_uuid: str,
+        fact: str,
+        project_id: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Update an existing Graphiti edge's fact text directly.
+
+        Bypasses the LLM extraction and edge resolution pipeline — the new fact
+        text replaces the old one, the embedding is regenerated, and both endpoint
+        entity summaries are refreshed. All other edge properties (valid_at,
+        invalid_at, episodes, endpoints) are preserved.
+
+        Use this instead of add_memory when refining or restating an existing
+        relationship that was found via search. This prevents false invalidation
+        of active edges.
+
+        Args:
+            edge_uuid: UUID of the existing edge (from search results)
+            fact: New fact text for the edge
+            project_id: Project scope (required)
+            agent_id: Which agent is updating (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := validate_project_id(project_id):
+            return err
+        if not edge_uuid or not edge_uuid.strip():
+            return {'error': 'edge_uuid is required', 'error_type': 'ValidationError'}
+        if not fact or not fact.strip():
+            return {'error': 'fact text is required', 'error_type': 'ValidationError'}
+        try:
+            causation_id, source, _ = _extract_causation(metadata, agent_id)
+            return await memory_service.update_edge(
+                edge_uuid=edge_uuid, fact=fact, project_id=project_id,
+                agent_id=agent_id, session_id=session_id,
+                causation_id=causation_id, _source=source,
+            )
+        except Exception as e:
+            logger.error(f'update_edge error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()

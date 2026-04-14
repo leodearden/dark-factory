@@ -1138,6 +1138,54 @@ class MemoryService:
 
         return result
 
+    async def update_edge(
+        self,
+        edge_uuid: str,
+        fact: str,
+        project_id: str = 'main',
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
+    ) -> dict:
+        """Update an existing Graphiti edge's fact text directly (no LLM pipeline)."""
+        write_op_id = str(uuid_mod.uuid4())
+
+        result_data = await self._journaled_backend_call(
+            write_op_id=write_op_id,
+            causation_id=causation_id,
+            backend='graphiti',
+            operation='update_edge',
+            payload={'edge_uuid': edge_uuid, 'fact': fact[:200]},
+            coro=self.graphiti.update_edge(edge_uuid, fact, group_id=project_id),
+        )
+        result = {'status': 'updated', 'store': 'graphiti', **result_data}
+
+        if self._write_journal:
+            await self._write_journal.log_write_op(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                source=_source,
+                operation='update_edge',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'edge_uuid': edge_uuid, 'fact': fact[:200]},
+                result_summary=result,
+                success=True,
+            )
+
+        await self._emit_event(ReconciliationEvent(
+            id=str(uuid_mod.uuid4()),
+            type=EventType.memory_updated,
+            source=EventSource.agent,
+            project_id=project_id,
+            timestamp=datetime.now(UTC),
+            payload={'edge_uuid': edge_uuid, 'store': 'graphiti'},
+        ))
+
+        return result
+
     async def delete_episode(
         self,
         episode_id: str,
