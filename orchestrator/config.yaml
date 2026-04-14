@@ -21,5 +21,10 @@ escalation:
   queue_dir: "data/escalations"
   port: 8102
 
+# Usage cap / multi-account failover
+usage_cap:
+  enabled: true
+  accounts_file: "${USAGE_ACCOUNTS_FILE:/home/leo/src/dark-factory/config/usage-accounts.yaml}"
+
 # Project root (absolute path)
 project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"

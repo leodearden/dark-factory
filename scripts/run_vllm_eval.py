@@ -218,12 +218,42 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _build_eval_accounts_file() -> Path:
+    """Create a temp accounts YAML = shared accounts + eval-only account A.
+
+    Account A is reserved for interactive/eval use and excluded from the
+    shared ``config/usage-accounts.yaml`` so orchestrators don't cap it.
+    The eval launcher appends it here and injects the path via
+    ``USAGE_ACCOUNTS_FILE`` so both dark-factory and reify configs pick it up.
+    """
+    import tempfile
+    import yaml
+
+    base_path = PROJECT_ROOT / "config" / "usage-accounts.yaml"
+    base = yaml.safe_load(base_path.read_text()) if base_path.exists() else {}
+    accounts = list(base.get("accounts", []))
+
+    # Append A if not already present
+    if not any(a.get("name") == "max-a" for a in accounts):
+        accounts.append({
+            "name": "max-a",
+            "oauth_token_env": "CLAUDE_OAUTH_TOKEN_A",
+        })
+
+    fd, tmp_path = tempfile.mkstemp(prefix="eval-accounts-", suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        yaml.safe_dump({"accounts": accounts}, f)
+
+    log(f"Eval accounts file: {tmp_path} ({len(accounts)} accounts, +max-a)")
+    return Path(tmp_path)
+
+
 def build_eval_env() -> dict[str, str]:
     """Build the env dict passed to ``orchestrator eval`` subprocesses.
 
-    Loads ``.env`` for ``CLAUDE_OAUTH_TOKEN_G`` and exposes it as
-    ``CLAUDE_CODE_OAUTH_TOKEN``. Built once per launcher invocation; token
-    rotation mid-run is not supported.
+    Loads ``.env`` for OAuth tokens. Generates a temp accounts file that
+    includes the shared pool + eval-only account A, and sets
+    ``USAGE_ACCOUNTS_FILE`` so orchestrator configs pick it up.
     """
     env = os.environ.copy()
     dotenv_path = PROJECT_ROOT / ".env"
@@ -236,12 +266,15 @@ def build_eval_env() -> dict[str, str]:
                     env[k.strip()] = v.strip()
 
     # Prefer account A (interactive token, confirmed uncapped) over G.
-    # UsageGate still cycles through all accounts from usage-accounts.yaml,
-    # so this only affects the initial CLAUDE_CODE_OAUTH_TOKEN default.
     oauth_token = env.get("CLAUDE_OAUTH_TOKEN_A") or env.get("CLAUDE_OAUTH_TOKEN_G", "")
     if not oauth_token:
         log("WARNING: no CLAUDE_OAUTH_TOKEN found in .env")
     env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+
+    # Inject eval-specific accounts file (shared pool + account A)
+    eval_accounts = _build_eval_accounts_file()
+    env["USAGE_ACCOUNTS_FILE"] = str(eval_accounts)
+
     return env
 
 

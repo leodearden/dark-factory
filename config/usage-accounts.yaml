@@ -3,7 +3,8 @@
 # via usage_cap.accounts_file in their respective configs.
 #
 # Order matters: accounts are tried in list order during failover.
-# Account A is reserved for interactive sessions (commented out).
+# Account A is reserved for interactive + eval sessions (not here).
+# Eval runners inject A dynamically via USAGE_ACCOUNTS_FILE override.
 
 accounts:
   - name: max-g
@@ -18,5 +19,3 @@ accounts:
     oauth_token_env: CLAUDE_OAUTH_TOKEN_B
   - name: max-d
     oauth_token_env: CLAUDE_OAUTH_TOKEN_D
-  - name: max-a
-    oauth_token_env: CLAUDE_OAUTH_TOKEN_A
