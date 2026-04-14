@@ -130,6 +130,8 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 ## Important
 
 - The plan structure is IMMUTABLE after creation. Only `status` and `commit` fields change during execution.
+- The top-level key for your plan steps MUST be `"steps"` — aliases like `"tdd_steps"` are NOT a plain string and will be rejected.
+- Prerequisites (setup tasks) MUST be dicts — NOT a plain string. Each prerequisite must be a dict with `id`, `description`, and `status` fields.
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
 - If the task requires touching modules beyond what was originally specified, list ALL needed modules in the `modules` parameter.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
