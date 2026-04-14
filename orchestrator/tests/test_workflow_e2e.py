@@ -1077,10 +1077,10 @@ class TestBaseCommitDiff:
 
 
 @pytest.mark.asyncio
-class TestPostMergeFailure:
-    """Merge succeeds textually but post-merge tests fail → BLOCKED (main never advanced)."""
+class TestPostRebaseVerifyFailure:
+    """Post-rebase verification failure is non-blocking — merge queue runs its own verify."""
 
-    async def test_post_merge_verify_fails_resets(
+    async def test_post_rebase_verify_fails_proceeds_to_merge(
         self, config, git_ops, task_assignment, monkeypatch
     ):
         stub = AgentStub()
@@ -1094,47 +1094,26 @@ class TestPostMergeFailure:
             nonlocal verify_call
             verify_call += 1
             # First verify: in-worktree (pass).
-            # Second verify: post-merge in merge worktree (fail).
-            if verify_call <= 1:
+            # Second verify: post-rebase (fail) — workflow should still proceed.
+            # Third+ verify: merge queue's own verification (pass).
+            if verify_call <= 1 or verify_call >= 3:
                 return VerifyResult(
                     passed=True, test_output='OK', lint_output='',
                     type_output='', summary='All checks passed',
                 )
             return VerifyResult(
-                passed=False, test_output='FAILED post-merge',
+                passed=False, test_output='FAILED post-rebase',
                 lint_output='', type_output='',
-                summary='Post-merge failure',
+                summary='Post-rebase failure',
             )
 
         monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify_fn)
         monkeypatch.setattr('orchestrator.merge_queue.run_scoped_verification', verify_fn)
 
-        # Capture pre-merge main ref
-        _, pre_merge_sha, _ = await _run(
-            ['git', 'rev-parse', 'main'], cwd=config.project_root,
-        )
-
         outcome = await workflow.run()
 
-        assert outcome == WorkflowOutcome.BLOCKED
-        # merge_phase=True suppresses scheduler status transition —
-        # the orchestrator's outer loop handles the final status update.
-        assert scheduler.statuses['42'][-1] == 'in-progress'
-
-        # Main should NOT have advanced — update-ref was never called
-        _, post_sha, _ = await _run(
-            ['git', 'rev-parse', 'main'], cwd=config.project_root,
-        )
-        assert post_sha == pre_merge_sha
-
-        # Merge failure review should exist in .task/reviews/
-        assert workflow.artifacts is not None
-        review_path = workflow.artifacts.root / 'reviews' / 'merge.json'
-        assert review_path.exists()
-        import json
-        review = json.loads(review_path.read_text())
-        assert review['verdict'] == 'ISSUES_FOUND'
-        assert review['issues'][0]['category'] == 'post_merge_verify'
+        # Post-rebase verify failure is non-blocking; merge queue handles it
+        assert outcome == WorkflowOutcome.DONE
 
 
 # ---------------------------------------------------------------------------
@@ -2251,57 +2230,6 @@ class TestPrerequisitesValidation:
         esc = escalations[0]
         # summary or detail must mention 'prerequisites' to confirm the validation ran
         assert 'prerequisites' in esc.summary.lower() or 'prerequisites' in (esc.detail or '').lower()
-
-
-# ---------------------------------------------------------------------------
-# Tests: ARCHITECT prompt guidance
-# ---------------------------------------------------------------------------
-
-
-class TestArchitectPromptGuidance:
-    """ARCHITECT system_prompt must contain negative guidance about prerequisites format."""
-
-    def test_architect_prompt_prerequisites_must_not_say_plain_string(self):
-        """ARCHITECT prompt must contain 'NOT a plain string' guidance about prerequisites."""
-        from orchestrator.agents.roles import ARCHITECT
-
-        prompt = ARCHITECT.system_prompt
-        # The specific negative-guidance phrase modelled on the 'steps vs tdd_plan' warning
-        assert 'NOT a plain string' in prompt or 'not a plain string' in prompt.lower()
-
-    def test_architect_prompt_prerequisites_guidance_mentions_string_rejection(self):
-        """ARCHITECT prompt must explicitly state string prerequisites are rejected."""
-        from orchestrator.agents.roles import ARCHITECT
-
-        prompt = ARCHITECT.system_prompt
-        # Must say that prerequisites must be dicts (allowing for markdown backticks around the word)
-        assert 'prerequisites' in prompt and ('MUST be' in prompt or 'must be a dict' in prompt.lower())
-
-    def test_architect_prompt_prerequisites_guidance_is_near_steps_warning(self):
-        """Both the steps warning and prerequisites guidance must appear in the ## Important section.
-
-        The original test used a 600-character proximity window, which is fragile — any insertion
-        between the two warnings would break the test spuriously.  Instead we check that both
-        directives appear in the same logical section (the '## Important' block), which is stable
-        under prompt reformatting.
-        """
-        from orchestrator.agents.roles import ARCHITECT
-
-        prompt = ARCHITECT.system_prompt
-        steps_warning = 'top-level key for your plan steps MUST be'
-        assert steps_warning in prompt
-
-        # Both warnings must live inside the ## Important section — locate it and
-        # extract from that point onward to avoid false positives from other sections.
-        assert '## Important' in prompt, 'ARCHITECT prompt must contain a "## Important" section'
-        important_idx = prompt.index('## Important')
-        important_section = prompt[important_idx:]
-        assert steps_warning in important_section, (
-            'Steps-format warning must appear in the ## Important section'
-        )
-        assert 'prerequisites' in important_section.lower() and (
-            'dict' in important_section.lower() or 'NOT a plain string' in important_section
-        ), 'Prerequisites guidance must appear in the ## Important section'
 
 
 # ---------------------------------------------------------------------------

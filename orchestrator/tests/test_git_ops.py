@@ -152,6 +152,7 @@ async def _push_n_commits_to_origin(
         assert rc == 0, f'push to bare origin failed: {err}'
 
 
+
 @pytest.mark.asyncio
 class TestWorktreeLifecycle:
     async def test_worktree_info_stale_commits_field(self, git_ops: GitOps):
