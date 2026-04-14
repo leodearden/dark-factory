@@ -58,9 +58,9 @@ def test_health_post_not_allowed(health_app):
 class TestServerConfigDefaults:
     """ServerConfig defaults preserve backward compatibility."""
 
-    def test_stateless_http_defaults_false(self):
+    def test_stateless_http_defaults_true(self):
         cfg = ServerConfig()
-        assert cfg.stateless_http is False
+        assert cfg.stateless_http is True
 
     def test_json_response_defaults_false(self):
         cfg = ServerConfig()
@@ -84,10 +84,11 @@ class TestServerSettingsPropagation:
         assert server.settings.stateless_http is True
         assert server.settings.json_response is True
 
-    def test_default_mcp_settings_are_false(self):
-        """MCP server defaults to stateful SSE mode."""
+    def test_default_mcp_settings_before_config(self):
+        """FastMCP defaults before config propagation."""
         mock_service = AsyncMock()
         server = create_mcp_server(mock_service)
+        # FastMCP's own defaults — config propagation happens in run_server()
         assert server.settings.stateless_http is False
         assert server.settings.json_response is False
 
@@ -126,7 +127,8 @@ class TestServerSettingsPropagation:
         """Without json_response, POST /mcp with Accept: application/json is not 200."""
         mock_service = AsyncMock()
         server = create_mcp_server(mock_service)
-        # Leave defaults: stateless_http=False, json_response=False
+        server.settings.stateless_http = False
+        server.settings.json_response = False
         app = server.streamable_http_app()
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.post(
@@ -152,9 +154,10 @@ class TestServerSettingsPropagation:
         )
 
     def test_stateful_sse_app_accepts_both_content_types(self):
-        """Default SSE mode accepts Accept: application/json, text/event-stream."""
+        """Stateful SSE mode accepts Accept: application/json, text/event-stream."""
         mock_service = AsyncMock()
         server = create_mcp_server(mock_service)
+        server.settings.stateless_http = False
         app = server.streamable_http_app()
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.post(

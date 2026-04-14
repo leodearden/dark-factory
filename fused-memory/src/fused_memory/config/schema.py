@@ -81,7 +81,7 @@ class ServerConfig(BaseModel):
     transport: Literal['http', 'stdio', 'sse'] = Field(default='http', description='Transport: http, stdio, or sse')
     host: str = Field(default='0.0.0.0', description='Server host')
     port: int = Field(default=8002, description='Server port (canonical: 8002)')
-    stateless_http: bool = Field(default=False, description='Stateless HTTP mode (no sessions)')
+    stateless_http: bool = Field(default=True, description='Stateless HTTP mode (no sessions)')
     json_response: bool = Field(default=False, description='JSON responses instead of SSE')
     keepalive_timeout: int = Field(default=30, description='HTTP keep-alive timeout in seconds')
 
@@ -233,6 +233,10 @@ class ReconciliationConfig(BaseModel):
     tool_timeout_seconds: float = Field(default=120.0)
     stage_timeout_seconds: int = Field(default=3600)
     cycle_timeout_seconds: int = Field(default=21600)
+    stale_run_recovery_seconds: int = Field(
+        default=600,
+        description='Runs with started_at older than this are recovered on startup if their lock is stale',
+    )
 
     # Safety
     max_mutations_per_stage: int = Field(default=50)

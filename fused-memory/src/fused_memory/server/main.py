@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 import sys
 import threading
 from pathlib import Path
@@ -38,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 # Maximum seconds to wait for harness_loop_task to honour cancellation before
 # giving up and continuing with the rest of the shutdown sequence.
-_HARNESS_CANCEL_TIMEOUT = 5.0
+_HARNESS_CANCEL_TIMEOUT = 25.0
 
 
 def configure_uvicorn_logging():
@@ -176,6 +177,13 @@ async def run_server():
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
+
+        # SIGUSR1 triggers harness drain (stop new cycles, let current ones finish)
+        def _handle_drain_signal(signum: int, frame: object) -> None:
+            logger.info('SIGUSR1 received — triggering harness drain')
+            reconciliation_harness.drain()
+
+        signal.signal(signal.SIGUSR1, _handle_drain_signal)
     else:
         # Always create task_interceptor for tool registration
         from fused_memory.middleware.task_file_committer import TaskFileCommitter

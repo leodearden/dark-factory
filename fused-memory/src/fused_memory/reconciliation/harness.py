@@ -111,6 +111,28 @@ class ReconciliationHarness:
         # Per-project concurrent loops
         self._project_tasks: dict[str, asyncio.Task] = {}
 
+        # Drain mode: stop starting new cycles, let current ones finish
+        self._draining: bool = False
+
+    def drain(self) -> None:
+        """Signal the harness to stop starting new reconciliation cycles.
+
+        Currently-running project loops complete their current cycle.
+        The server continues serving reads/writes — only new cycles are suppressed.
+        """
+        if self._draining:
+            logger.info('Harness already draining')
+            return
+        self._draining = True
+        logger.info('Harness drain requested — will finish current cycles, no new ones')
+
+    @property
+    def is_drained(self) -> bool:
+        """True when draining and all project loops have completed."""
+        return self._draining and not any(
+            not t.done() for t in self._project_tasks.values()
+        )
+
     def _make_stages(self) -> list:
         """Create a fresh set of stage instances for one reconciliation cycle."""
         stage1 = MemoryConsolidator(
@@ -205,17 +227,26 @@ class ReconciliationHarness:
     # ── Stale-run recovery ─────────────────────────────────────────────
 
     async def _recover_stale_runs(self) -> None:
-        """Find runs stuck in 'running' state beyond 2x cycle_timeout and mark them failed."""
-        cutoff = self.config.cycle_timeout_seconds * 2
+        """Find runs stuck in 'running' state and mark them failed.
+
+        Uses stale_run_recovery_seconds as the age cutoff (default 600s),
+        then double-checks that the project's reconciliation lock is actually
+        stale before recovering — protecting legitimately long-running cycles.
+        """
+        cutoff = self.config.stale_run_recovery_seconds
         stale_runs = await self.journal.get_stale_runs(cutoff)
         for run in stale_runs:
+            # Skip if lock is still actively held (legitimate long-running cycle)
+            if await self.buffer._is_run_locked(run.project_id):
+                continue
+
             logger.warning(
                 f'Recovering stale run {run.id} for {run.project_id} '
-                f'(started {run.started_at.isoformat()})'
+                f'(started {run.started_at.isoformat()}, lock expired)'
             )
             run.stage_reports['_error'] = {
                 'error_type': 'StaleRunRecovery',
-                'error_message': f'Run stuck for >{cutoff}s, recovered by harness',
+                'error_message': f'Run stale (>{cutoff}s, lock expired), recovered by harness',
                 'failed_stage': None,
             }
             await self.journal.update_run_stage_reports(run.id, run.stage_reports)
@@ -225,7 +256,7 @@ class ReconciliationHarness:
                 logger.info(f'Restored {restored} drained events for stale run {run.id}')
             await self.buffer.mark_run_complete(run.project_id)
             await self._replay_deferred_writes(run.project_id)
-            self._escalate('recon_stale_run', run.id, f'Run stuck for >{cutoff}s, recovered')
+            self._escalate('recon_stale_run', run.id, f'Run stale (>{cutoff}s, lock expired), recovered')
 
     # ── Deferred write replay ─────────────────────────────────────────
 
@@ -350,14 +381,15 @@ class ReconciliationHarness:
                     await self._recover_stale_runs()
 
                     # Discover active projects, spawn loops for new ones
-                    for project_id in await self.buffer.get_active_projects():
-                        existing = self._project_tasks.get(project_id)
-                        if existing is None or existing.done():
-                            task = asyncio.create_task(
-                                self._project_loop(project_id),
-                                name=f'recon-{project_id}',
-                            )
-                            self._project_tasks[project_id] = task
+                    if not self._draining:
+                        for project_id in await self.buffer.get_active_projects():
+                            existing = self._project_tasks.get(project_id)
+                            if existing is None or existing.done():
+                                task = asyncio.create_task(
+                                    self._project_loop(project_id),
+                                    name=f'recon-{project_id}',
+                                )
+                                self._project_tasks[project_id] = task
 
                     # Reap completed tasks, log unexpected failures
                     for pid in list(self._project_tasks):
@@ -368,6 +400,14 @@ class ReconciliationHarness:
                                 logger.error(
                                     f'Project loop for {pid} crashed: {task.exception()}'
                                 )
+
+                    # Drain status logging
+                    if self._draining:
+                        active = sum(1 for t in self._project_tasks.values() if not t.done())
+                        if active == 0:
+                            logger.info('Harness fully drained — safe to restart')
+                        else:
+                            logger.info(f'Harness draining: {active} project loop(s) still running')
 
                     # Periodic cleanup of drained events (~every 50s / 10 iterations)
                     loop_count += 1
