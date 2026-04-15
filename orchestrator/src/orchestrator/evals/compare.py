@@ -102,19 +102,22 @@ def apply_combine_runs(
 # ---------------------------------------------------------------------------
 
 def pick_best_result(results: list[EvalResult]) -> EvalResult | None:
-    """Pick the best result from a list for the same (task, model group).
+    """Pick the most informative result for qualitative comparison.
 
-    Priority: outcome (done > blocked > timeout), then composite_score
-    (descending), then cost_usd (ascending as tiebreaker).
+    Priority: results with actual code changes first (gives the assessor
+    something to compare), then composite_score, then outcome priority,
+    then lines_changed (more work = more informative diff).
     """
     if not results:
         return None
 
-    def key(r: EvalResult) -> tuple[int, float, float]:
+    def key(r: EvalResult) -> tuple[int, float, int, int]:
+        has_changes = 1 if r.metrics.get('lines_changed', 0) > 0 else 0
         return (
-            OUTCOME_PRIORITY.get(r.outcome, 0),
+            has_changes,
             r.metrics.get('composite_score', 0.0),
-            -r.metrics.get('cost_usd', float('inf')),
+            OUTCOME_PRIORITY.get(r.outcome, 0),
+            r.metrics.get('lines_changed', 0),
         )
 
     return max(results, key=key)
