@@ -164,6 +164,13 @@ def status(config_path: Path | None):
 @click.option('--worktree', 'worktree_path', type=click.Path(exists=True, path_type=Path),
               default=None,
               help='Reuse an existing eval worktree (skip create + use its .task state)')
+@click.option('--compare', nargs=2, default=None,
+              help='Compare two model groups head-to-head via LLM assessment. '
+                   'Each arg is a config name (use canonical name from '
+                   '--combine-runs if merging).')
+@click.option('--combine-runs', multiple=True,
+              help='Merge config names as one model (comma-separated, first is '
+                   'canonical). Can be supplied multiple times.')
 def eval_cmd(
     task_path: Path | None,
     config_name: str | None,
@@ -181,6 +188,8 @@ def eval_cmd(
     report_only: bool,
     vllm_url: str | None,
     worktree_path: Path | None,
+    compare: tuple[str, str] | None,
+    combine_runs: tuple[str, ...],
 ):
     """Run multi-provider implementor evaluations."""
     try:
@@ -202,6 +211,10 @@ def eval_cmd(
 
     if report_only:
         _run_report_cmd()
+        return
+
+    if compare:
+        _run_compare_cmd(compare, combine_runs)
         return
 
     if judge:
@@ -426,6 +439,59 @@ def _run_report_cmd():
     report_path = save_report(report)
     click.echo(f'Report saved to {report_path}')
     click.echo('\n' + format_markdown(report))
+
+
+def _run_compare_cmd(
+    compare: tuple[str, str],
+    combine_runs: tuple[str, ...],
+):
+    """Compare two model groups via LLM-powered qualitative assessment."""
+    from orchestrator.evals.compare import (
+        apply_combine_runs,
+        compare_models,
+        format_comparison_markdown,
+    )
+    from orchestrator.evals.runner import load_results, load_task
+
+    results = load_results()
+    if not results:
+        click.echo('No existing results found in evals/results/', err=True)
+        sys.exit(1)
+
+    # Apply combine-runs aliasing
+    combine_groups = [g.split(',') for g in combine_runs]
+    if combine_groups:
+        results = apply_combine_runs(results, combine_groups)
+
+    group_a_configs = compare[0].split(',')
+    group_b_configs = compare[1].split(',')
+
+    # Load task definitions for descriptions
+    tasks_dir = Path(__file__).parent / 'evals' / 'tasks'
+    tasks: dict[str, dict] = {}
+    if tasks_dir.exists():
+        for tp in sorted(tasks_dir.glob('*.json')):
+            task = load_task(tp)
+            tasks[task['id']] = task
+
+    # Determine canonical group names
+    group_a_name = group_a_configs[0]
+    group_b_name = group_b_configs[0]
+
+    click.echo(
+        f'Comparing {group_a_name} vs {group_b_name} '
+        f'({len(results)} total results loaded)'
+    )
+
+    async def _run():
+        report = await compare_models(
+            results, group_a_configs, group_b_configs, tasks,
+            group_a_name=group_a_name,
+            group_b_name=group_b_name,
+        )
+        click.echo('\n' + format_comparison_markdown(report))
+
+    asyncio.run(_run())
 
 
 def _run_cleanup(base_config):
