@@ -1,7 +1,88 @@
 # vLLM Local Model Evaluation — Status Report
 
-**Last updated:** 2026-04-14 AM
-**Status:** All 8 final-run configs complete. Opus best overall (2 done), Sonnet second (1 done), M25-FP8/NVFP4 best open models. Widespread cap starvation corrupted many results — reify tasks and several vLLM results need rerunning. Dedicated eval account injection deployed (d33db0c).
+**Last updated:** 2026-04-15
+**Status:** Elo tournament complete (250 matches, 5 tasks). Three tiers: Claude (Opus/Sonnet) > MiniMax M2.5 > rest. M2.7 "crash" was misdiagnosed cap starvation — model works. Sonnet 7-0 vs M25-FP8, 7-1 vs M25-NVFP4 in direct H2H. Next: qualitative cross-model comparison tool.
+
+## Update 2026-04-15: M2.7 investigation, cap-tainted reruns, Elo tournament
+
+### TL;DR
+
+- **M2.7 "crash" was cap starvation, not a model crash.** Investigation found M2.7 booted fine in 94s on the Apr 13 matrix run. All final-run results were $0/0L cap-bounce artifacts. `enforce_eager` removed, `--reasoning-parser minimax_m2_append_think` added per official deploy guide. Baked image rebaked with updated entrypoint.
+- **Cap-tainted reruns completed** — 5 configs × relevant tasks. M2.7 produced first real results: df_18 8651L ($68.57), df_13 233L ($50.11). REAP-139B AWQ reify_12 scored 1.00 (T/T/T). Opus reify_12+27 both done (1.00). Sonnet reify_27 done (1.00).
+- **Elo tournament: 250 matches across 5 tasks.** Three clear tiers emerged, but within-tier rankings are noisy (32% noise/signal ratio from only ~2 matches per contender).
+- **Direct H2H is more reliable than Elo for close models.** Sonnet vs M25-FP8: 7-0-1. Sonnet vs M25-NVFP4: 7-1-0. M25-NVFP4 vs M25-FP8: 4-1-0. Ranking: **Sonnet > M25-NVFP4 > M25-FP8**.
+- **0L vLLM results diagnosed**: two causes. (1) REAP-AWQ: `ServerDisconnectedError` from KV cache contention at concurrency=5 — some tasks got lucky, others never served. (2) M2.7: model generates reasoning but doesn't call write/edit tools ("empty diff" problem).
+
+### Elo tournament results (250 matches)
+
+Three tiers (within-tier ordering unreliable at 50 rounds/task):
+
+**Tier 1 — Claude API (Elo ~1516-1564)**
+- Opus (all variants): 1516-1564 across tasks
+- Sonnet (all variants): 1468-1532 across tasks
+
+**Tier 2 — MiniMax M2.5 self-hosted (Elo ~1468-1516)**
+- M25-NVFP4: 1452-1516
+- M25-FP8: 1468-1516
+- REAP variants: 1468-1500
+
+**Tier 3 — Bottom (Elo ~1452-1484)**
+- Codex: 1452-1484
+- M2.7: 1468-1484 (hurt by empty-diff problem)
+- Devstral: 1484
+
+**Reliability caveat:** Same-model spread across configs averages 36 pts (max 80). Total scale is 112 pts. Rankings within ~48 pts of each other are indistinguishable. Direct H2H comparisons are far more reliable than the global Elo — see next section.
+
+### Direct head-to-head: Sonnet vs M25
+
+| Matchup | A wins | B wins | Ties | Total |
+|---------|--------|--------|------|-------|
+| Sonnet vs M25-FP8 | 7 | 0 | 1 | 8 |
+| Sonnet vs M25-NVFP4 | 7 | 1 | 0 | 8 |
+| M25-NVFP4 vs M25-FP8 | 4 | 1 | 0 | 5 |
+
+**Confirmed ranking: Sonnet > M25-NVFP4 > M25-FP8**
+
+### M2.7 investigation findings
+
+1. **No CUDA graph hang.** M2.7 booted in 94s on 4× RTX PRO 6000 without `enforce_eager` on the Apr 13 matrix run.
+2. **All final-run results were cap starvation** — $0 cost, 0 tokens, 141ms workflow duration (instant cap-bounce).
+3. **Config gaps vs official deploy guide fixed:**
+   - `enforce_eager=True` removed (unnecessary)
+   - `--reasoning-parser minimax_m2_append_think` added via `REASONING_PARSER` env var
+   - `SAFETENSORS_FAST_GPU=1` added for faster model loading
+   - Baked image (`final-minimax-m27-fp8`) rebaked with updated entrypoint and pushed to Hub
+4. **Entrypoint updated** in runpod-toolkit: `REASONING_PARSER` + `SAFETENSORS_FAST_GPU` support added, `:latest` rebuilt and pushed.
+
+### 0L result root causes
+
+**REAP-139B AWQ: ServerDisconnectedError (KV cache contention)**
+- 200+ disconnects per task across all 5 concurrent tasks
+- vLLM drops connections when KV cache is oversubscribed
+- df_12 got 3 successful iterations (142L); df_13 got 0/7 — luck of the draw
+- Fix: reduce concurrency from 5 to 2-3
+
+**M2.7: empty diff (model quality)**
+- Implementer reports `success=True` with real turns/cost but produces no code changes
+- Model reasons about what to do but doesn't call write/edit tools
+- df_18 was the exception (8651L) — capable but inconsistent on tool use
+
+### Bugs found this session
+
+| Bug | Status | Detail |
+|-----|--------|--------|
+| UsageGate haiku probe hits vLLM | Known (cosmetic) | Probe uses `--model haiku` which 404s on vLLM; noisy but harmless |
+| `.env` token A is stale setup-token | Known | Interactive token from `~/.claude/.credentials.json` works; stored token returns 401 |
+| verify.py merge conflict | FIXED (other session) | `<<<<<<< HEAD` markers broke cloud evals at 16:35; fixed 16:44 |
+
+### Next-session priorities
+
+1. **Build qualitative comparison tool** — cross-task summary of style/approach differences between two models (not just "who wins")
+2. **Deduplicate Elo contenders** — merge same-model configs to improve match density
+3. **Fix stale token A in .env** — replace with interactive token
+4. **Reduce REAP-AWQ concurrency** to 2-3 to fix KV cache contention
+
+---
 
 ## Update 2026-04-14: Full final-run results, cap starvation diagnosis, eval account fix
 
