@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     'UsageGate',
+    'InvokeSlot',
     'AccountState',
     'SessionBudgetExhausted',
 ]
@@ -113,6 +114,63 @@ class SessionBudgetExhausted(Exception):
     def __init__(self, cumulative_cost: float):
         self.cumulative_cost = cumulative_cost
         super().__init__(f'Session budget exhausted: ${cumulative_cost:.2f} spent')
+
+
+class InvokeSlot:
+    """Probe-slot guard for one iteration of a cap-retry loop.
+
+    Guarantees that ``release_probe_slot`` is called on any exit path
+    (``break``, ``continue``, ``return``, exception) unless the slot was
+    explicitly settled by :meth:`detect_cap_hit` (returning True) or
+    :meth:`confirm`.
+
+    Use via :meth:`UsageGate.invoke_slot`::
+
+        async with gate.invoke_slot() as slot:
+            result = await run_agent(oauth_token=slot.token)
+            if slot.detect_cap_hit(result.stderr, result.output):
+                continue  # probe slot released by detect_cap_hit
+            slot.confirm(result.cost_usd)
+            break  # probe slot released by confirm
+        # any other exit: __aexit__ calls release_probe_slot
+    """
+
+    __slots__ = ('_gate', 'token', 'account_name', '_settled')
+
+    def __init__(self, gate: 'UsageGate', token: str | None) -> None:
+        self._gate = gate
+        self.token = token
+        self.account_name = gate.active_account_name or ''
+        self._settled = False
+
+    def detect_cap_hit(
+        self,
+        stderr: str,
+        output: str,
+        backend: str = 'claude',
+    ) -> bool:
+        """Proxy to ``UsageGate.detect_cap_hit``; auto-settles on True."""
+        hit = self._gate.detect_cap_hit(
+            stderr, output, backend, oauth_token=self.token,
+        )
+        if hit:
+            self._settled = True
+        return hit
+
+    def confirm(self, cost_usd: float = 0.0) -> None:
+        """Mark invocation successful; clears probe state and accumulates cost."""
+        self._gate.confirm_account_ok(self.token)
+        self._gate.on_agent_complete(cost_usd)
+        self._settled = True
+
+    def settle(self) -> None:
+        """Mark probe state as externally handled.
+
+        Call this after manually invoking gate methods that clear
+        ``probe_in_flight`` (e.g. ``_handle_cap_detected`` in heuristic
+        cap detection).
+        """
+        self._settled = True
 
 
 class UsageGate:
@@ -246,6 +304,34 @@ class UsageGate:
             logger.info('All accounts capped — waiting for any to reopen')
             self._open.clear()
             await self._open.wait()
+
+    @contextlib.asynccontextmanager
+    async def invoke_slot(self):
+        """Acquire an account slot, releasing the probe lock on any exit path.
+
+        Yields an :class:`InvokeSlot` whose ``token`` and ``account_name``
+        are ready to use.  On exit, if neither :meth:`~InvokeSlot.detect_cap_hit`
+        (returning True) nor :meth:`~InvokeSlot.confirm` was called,
+        ``release_probe_slot`` runs as a safety net.
+
+        Usage::
+
+            while True:
+                async with gate.invoke_slot() as slot:
+                    result = await run_agent(oauth_token=slot.token)
+                    if slot.detect_cap_hit(result.stderr, result.output):
+                        continue   # probe settled by cap detection
+                    slot.confirm(result.cost_usd)
+                    break          # probe settled by confirm
+                # any other exit path (continue, exception): auto-released
+        """
+        token = await self.before_invoke()
+        slot = InvokeSlot(self, token)
+        try:
+            yield slot
+        finally:
+            if not slot._settled:
+                self.release_probe_slot(token)
 
     def detect_cap_hit(
         self,

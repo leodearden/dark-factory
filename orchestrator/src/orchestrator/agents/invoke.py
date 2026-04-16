@@ -71,73 +71,65 @@ async def invoke_with_cap_retry(
     original_prompt = invoke_kwargs.get('prompt', '')
     account_name = ''
 
+    # Fast path: no usage gate → single invocation, no cap retry
+    if not usage_gate:
+        result = await invoke_agent(
+            **invoke_kwargs,
+            config_dir=config_dir.path if config_dir else None,
+        )
+        result.account_name = ''
+        return result
+
     while True:
-        oauth_token = None
-        if usage_gate:
-            oauth_token = await usage_gate.before_invoke()
-            account_name = usage_gate.active_account_name or ''
+        async with usage_gate.invoke_slot() as slot:
+            account_name = slot.account_name
 
-        if config_dir and oauth_token:
-            config_dir.write_credentials(oauth_token)
+            if config_dir and slot.token:
+                config_dir.write_credentials(slot.token)
 
-        try:
             result = await invoke_agent(
                 **invoke_kwargs,
-                oauth_token=oauth_token,
+                oauth_token=slot.token,
                 config_dir=config_dir.path if config_dir else None,
             )
-        except BaseException:
-            # Safety net: release probe slot on any exception so probe_in_flight
-            # never leaks. See also: shared/cli_invoke.py:invoke_with_cap_retry,
-            # orchestrator/steward.py:_invoke_with_session
-            if usage_gate is not None:
-                try:
-                    usage_gate.release_probe_slot(oauth_token)
-                except Exception:
-                    logger.warning('release_probe_slot failed', exc_info=True)
-            raise
 
-        if usage_gate and usage_gate.detect_cap_hit(
-            result.stderr, result.output, backend, oauth_token=oauth_token,
-        ):
-            # Resume the capped session if Claude backend and session_id available
-            if backend == 'claude' and result.session_id:
-                invoke_kwargs['resume_session_id'] = result.session_id
-                invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
-                resume_or_fresh = 'resuming'
-            else:
+            if slot.detect_cap_hit(result.stderr, result.output, backend):
+                # Resume the capped session if Claude backend and session_id available
+                if backend == 'claude' and result.session_id:
+                    invoke_kwargs['resume_session_id'] = result.session_id
+                    invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
+                    resume_or_fresh = 'resuming'
+                else:
+                    invoke_kwargs.pop('resume_session_id', None)
+                    invoke_kwargs['prompt'] = original_prompt
+                    resume_or_fresh = 'fresh'
+
+                acct_name = usage_gate.active_account_name
+                if acct_name:
+                    logger.warning(
+                        f'{label}: cap hit, sleeping {_CAP_HIT_COOLDOWN_SECS}s '
+                        f'then {resume_or_fresh} on account {acct_name}',
+                    )
+                else:
+                    logger.warning(
+                        f'{label}: cap hit on all accounts, sleeping '
+                        f'{_CAP_HIT_COOLDOWN_SECS}s then waiting for reset ({resume_or_fresh})',
+                    )
+                await asyncio.sleep(_CAP_HIT_COOLDOWN_SECS)
+                continue
+
+            # Non-cap-hit failure while resuming → fall back to fresh invocation
+            if not result.success and invoke_kwargs.get('resume_session_id'):
+                logger.warning(
+                    f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
+                    f'retrying fresh',
+                )
                 invoke_kwargs.pop('resume_session_id', None)
                 invoke_kwargs['prompt'] = original_prompt
-                resume_or_fresh = 'fresh'
+                continue  # __aexit__ releases probe slot
 
-            acct_name = usage_gate.active_account_name
-            if acct_name:
-                logger.warning(
-                    f'{label}: cap hit, sleeping {_CAP_HIT_COOLDOWN_SECS}s '
-                    f'then {resume_or_fresh} on account {acct_name}',
-                )
-            else:
-                logger.warning(
-                    f'{label}: cap hit on all accounts, sleeping '
-                    f'{_CAP_HIT_COOLDOWN_SECS}s then waiting for reset ({resume_or_fresh})',
-                )
-            await asyncio.sleep(_CAP_HIT_COOLDOWN_SECS)
-            continue
-
-        # Non-cap-hit failure while resuming → fall back to fresh invocation
-        if not result.success and invoke_kwargs.get('resume_session_id'):
-            logger.warning(
-                f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
-                f'retrying fresh',
-            )
-            invoke_kwargs.pop('resume_session_id', None)
-            invoke_kwargs['prompt'] = original_prompt
-            continue
-
-        if usage_gate:
-            usage_gate.confirm_account_ok(oauth_token)
-            usage_gate.on_agent_complete(result.cost_usd)
-        break
+            slot.confirm(result.cost_usd)
+            break
 
     result.account_name = account_name
     return result

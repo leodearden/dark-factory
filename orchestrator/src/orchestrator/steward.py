@@ -382,16 +382,7 @@ class TaskSteward:
         """
         from shared.cli_invoke import AgentResult
 
-        while True:
-            oauth_token = None
-            account_name = ''
-            if self.usage_gate:
-                oauth_token = await self.usage_gate.before_invoke()
-                account_name = self.usage_gate.active_account_name or ''
-
-            if self._config_dir and oauth_token:
-                self._config_dir.write_credentials(oauth_token)
-
+        if not self.usage_gate:
             kwargs: dict = dict(
                 prompt=prompt,
                 system_prompt=STEWARD.system_prompt,
@@ -404,72 +395,82 @@ class TaskSteward:
                 mcp_config=mcp_config,
                 effort=self.config.effort.steward,
                 backend=self.config.backends.steward,
-                oauth_token=oauth_token,
                 config_dir=self._config_dir.path if self._config_dir else None,
             )
-
             if self._session_id is not None:
                 kwargs['resume_session_id'] = self._session_id
+            result: AgentResult = await invoke_agent(**kwargs)
+            if result.session_id:
+                self._session_id = result.session_id
+            result.account_name = ''
+            return result
 
-            try:
-                result: AgentResult = await invoke_agent(**kwargs)
-            except BaseException:
-                # Safety net: release probe slot on any exception so probe_in_flight
-                # never leaks. See also: shared/cli_invoke.py:invoke_with_cap_retry,
-                # orchestrator/agents/invoke.py:invoke_with_cap_retry
-                if self.usage_gate is not None:
-                    try:
-                        self.usage_gate.release_probe_slot(oauth_token)
-                    except Exception:
-                        logger.warning('release_probe_slot failed', exc_info=True)
-                raise
+        while True:
+            async with self.usage_gate.invoke_slot() as slot:
+                if self._config_dir and slot.token:
+                    self._config_dir.write_credentials(slot.token)
 
-            # Cap-hit: sleep, then resume session on next account if possible
-            if self.usage_gate and self.usage_gate.detect_cap_hit(
-                result.stderr, result.output, 'claude', oauth_token=oauth_token,
-            ):
-                await asyncio.sleep(_CAP_HIT_COOLDOWN_SECS)
-                if result.session_id:
-                    # Preserve session — resume on next account
-                    self._session_id = result.session_id
-                    prompt = (
-                        'Your previous run was interrupted by a usage limit. '
-                        'Continue where you left off and complete your task.'
-                    )
-                    logger.warning(
-                        f'Steward for task {self.task_id}: cap hit, '
-                        f'resuming session {result.session_id} on next account',
-                    )
-                else:
-                    # No session to resume — rebuild from scratch
-                    self._session_id = None
-                    pending_dicts = [
-                        e.to_dict()
-                        for e in self.escalation_queue.get_by_task(
-                            self.task_id, status='pending',
+                kwargs = dict(
+                    prompt=prompt,
+                    system_prompt=STEWARD.system_prompt,
+                    cwd=cwd,
+                    model=self.config.models.steward,
+                    max_turns=self.config.max_turns.steward,
+                    max_budget_usd=per_invocation_budget,
+                    timeout_seconds=self.config.timeouts.steward,
+                    allowed_tools=STEWARD.allowed_tools or None,
+                    mcp_config=mcp_config,
+                    effort=self.config.effort.steward,
+                    backend=self.config.backends.steward,
+                    oauth_token=slot.token,
+                    config_dir=self._config_dir.path if self._config_dir else None,
+                )
+
+                if self._session_id is not None:
+                    kwargs['resume_session_id'] = self._session_id
+
+                result = await invoke_agent(**kwargs)
+
+                # Cap-hit: sleep, then resume session on next account if possible
+                if slot.detect_cap_hit(result.stderr, result.output):
+                    await asyncio.sleep(_CAP_HIT_COOLDOWN_SECS)
+                    if result.session_id:
+                        self._session_id = result.session_id
+                        prompt = (
+                            'Your previous run was interrupted by a usage limit. '
+                            'Continue where you left off and complete your task.'
                         )
-                    ]
-                    prompt = await self.briefing.build_steward_initial_prompt(
-                        task=self.task,
-                        escalation=escalation.to_dict(),
-                        pending_escalations=pending_dicts,
-                        worktree=self.worktree,
-                    )
-                    logger.warning(
-                        f'Steward for task {self.task_id}: cap hit, '
-                        f'no session to resume — rebuilding prompt',
-                    )
-                continue
+                        logger.warning(
+                            f'Steward for task {self.task_id}: cap hit, '
+                            f'resuming session {result.session_id} on next account',
+                        )
+                    else:
+                        self._session_id = None
+                        pending_dicts = [
+                            e.to_dict()
+                            for e in self.escalation_queue.get_by_task(
+                                self.task_id, status='pending',
+                            )
+                        ]
+                        prompt = await self.briefing.build_steward_initial_prompt(
+                            task=self.task,
+                            escalation=escalation.to_dict(),
+                            pending_escalations=pending_dicts,
+                            worktree=self.worktree,
+                        )
+                        logger.warning(
+                            f'Steward for task {self.task_id}: cap hit, '
+                            f'no session to resume — rebuilding prompt',
+                        )
+                    continue
 
-            if self.usage_gate:
-                self.usage_gate.confirm_account_ok(oauth_token)
-                self.usage_gate.on_agent_complete(result.cost_usd)
+                slot.confirm(result.cost_usd)
 
             # Capture session ID for subsequent --resume calls
             if result.session_id:
                 self._session_id = result.session_id
 
-            result.account_name = account_name
+            result.account_name = slot.account_name
             return result
 
     # ------------------------------------------------------------------

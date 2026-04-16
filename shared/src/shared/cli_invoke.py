@@ -211,196 +211,187 @@ async def invoke_with_cap_retry(
     consecutive_cap_hits = 0
     num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
     retry_start = time.monotonic()
-    while True:
-        oauth_token = None
-        account_name = ''
-        unattributed_cap = False  # True when heuristic fires but token is unresolvable;
-        # controls: (1) skip confirm_account_ok, (2) skip on_agent_complete,
-        # (3) mark capped=True in cost_store
-        if usage_gate:
-            oauth_token = await usage_gate.before_invoke()
-            account_name = usage_gate.active_account_name or ''
+    account_name = ''
+    unattributed_cap = False  # True when heuristic fires but token is unresolvable;
+    # controls: (1) skip confirm, (2) mark capped=True in cost_store
+    started_at = ''
+    completed_at = ''
 
-        if config_dir and oauth_token:
-            config_dir.write_credentials(oauth_token)
-
+    # Fast path: no usage gate → single invocation, no cap retry
+    if not usage_gate:
         started_at = datetime.now(UTC).isoformat()
-        try:
-            result = await invoke_claude_agent(
-                **invoke_kwargs,
-                oauth_token=oauth_token,
-                config_dir=config_dir.path if config_dir else None,
-            )
-        except BaseException:
-            # Safety net: release probe slot on any exception so probe_in_flight
-            # never leaks. See also: orchestrator/agents/invoke.py:invoke_with_cap_retry,
-            # orchestrator/steward.py:_invoke_with_session
-            if usage_gate is not None:
-                try:
-                    usage_gate.release_probe_slot(oauth_token)
-                except Exception:
-                    logger.warning('release_probe_slot failed', exc_info=True)
-            raise
+        result = await invoke_claude_agent(
+            **invoke_kwargs,
+            config_dir=config_dir.path if config_dir else None,
+        )
         completed_at = datetime.now(UTC).isoformat()
+    else:
+        while True:
+            async with usage_gate.invoke_slot() as slot:
+                account_name = slot.account_name
 
-        if usage_gate and usage_gate.detect_cap_hit(
-            result.stderr, result.output, 'claude', oauth_token=oauth_token,
-        ):
-            consecutive_cap_hits += 1
-            full_cycles = (consecutive_cap_hits - 1) // num_accounts
-            cooldown = min(
-                _CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles),
-                _MAX_CAP_COOLDOWN_SECS,
-            )
+                if config_dir and slot.token:
+                    config_dir.write_credentials(slot.token)
 
-            acct_name = usage_gate.active_account_name
-            if cost_store:
-                try:
-                    await cost_store.save_account_event(
-                        account_name=account_name,
-                        event_type='cap_hit',
-                        project_id=project_id or None,
-                        run_id=run_id or None,
-                        details=label,
-                        created_at=datetime.now(UTC).isoformat(),
-                    )
-                except Exception:
-                    logger.warning('Failed to save cap_hit event', exc_info=True)
+                started_at = datetime.now(UTC).isoformat()
+                result = await invoke_claude_agent(
+                    **invoke_kwargs,
+                    oauth_token=slot.token,
+                    config_dir=config_dir.path if config_dir else None,
+                )
+                completed_at = datetime.now(UTC).isoformat()
 
-            # Resume the capped session on the next account if possible
-            if result.session_id:
-                invoke_kwargs['resume_session_id'] = result.session_id
-                invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
-                resume_or_fresh = 'resuming'
-            else:
-                invoke_kwargs.pop('resume_session_id', None)
-                invoke_kwargs['prompt'] = original_prompt
-                resume_or_fresh = 'fresh'
-
-            if acct_name:
-                logger.warning(
-                    f'{label}: cap hit ({consecutive_cap_hits} consecutive), '
-                    f'sleeping {cooldown:.0f}s then {resume_or_fresh} on account {acct_name}',
-                )
-            else:
-                logger.warning(
-                    f'{label}: cap hit on all accounts ({consecutive_cap_hits} consecutive), '
-                    f'sleeping {cooldown:.0f}s then waiting for reset ({resume_or_fresh})',
-                )
-
-            # Guard: raise before sleeping if retry limit or deadline exceeded
-            elapsed = time.monotonic() - retry_start
-            if max_cap_retries is not None and consecutive_cap_hits >= max_cap_retries:
-                logger.error(
-                    f'{label}: giving up after {consecutive_cap_hits} consecutive cap hits '
-                    f'({elapsed:.1f}s elapsed, {num_accounts} account(s))',
-                )
-                raise AllAccountsCappedException(
-                    retries=consecutive_cap_hits,
-                    elapsed_secs=elapsed,
-                    label=label,
-                )
-            if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
-                logger.error(
-                    f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
-                    f'({consecutive_cap_hits} retries, {num_accounts} account(s))',
-                )
-                raise AllAccountsCappedException(
-                    retries=consecutive_cap_hits,
-                    elapsed_secs=elapsed,
-                    label=label,
-                )
-
-            await asyncio.sleep(cooldown)
-            continue
-
-        # Heuristic safety net: a zero-cost, near-instant, ≤1-turn result
-        # that wasn't caught by pattern matching is almost certainly a cap
-        # hit with an unrecognised message format.  Treat it as a cap hit so
-        # the retry loop can wait / fail over instead of silently returning a
-        # useless "success" to the caller.
-        if (
-            usage_gate
-            and not result.success  # is_error=true → success=False after fix 2
-            and result.cost_usd == 0
-            and result.turns <= 1
-            and result.duration_ms < 5000
-        ):
-            logger.warning(
-                f'{label}: suspicious zero-cost instant exit (turns={result.turns}, '
-                f'duration={result.duration_ms}ms) — treating as cap hit. '
-                f'Output: {result.output[:200]!r}',
-            )
-            cap_marked = usage_gate._handle_cap_detected(
-                f'Heuristic cap: zero-cost instant exit — {result.output[:120]}',
-                None,
-                oauth_token,
-            )
-            if not cap_marked:
-                logger.warning(
-                    f'{label}: heuristic cap suspected but no account could be marked '
-                    f'(token unresolved) — treating as normal failure',
-                )
-                # Calling confirm_account_ok with an unresolvable token would be
-                # semantically misleading (we never confirmed the account is ok —
-                # we simply couldn't identify it).  Skip confirm, on_agent_complete,
-                # and mark the persistent record as capped for this iteration.
-                unattributed_cap = True
-            else:
-                consecutive_cap_hits += 1
-                full_cycles = (consecutive_cap_hits - 1) // num_accounts
-                cooldown = min(
-                    _CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles),
-                    _MAX_CAP_COOLDOWN_SECS,
-                )
-                # Cannot resume a session that never ran
-                invoke_kwargs.pop('resume_session_id', None)
-                invoke_kwargs['prompt'] = original_prompt
-                acct_name = usage_gate.active_account_name
-                logger.warning(
-                    f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
-                )
-
-                # Guard: raise before sleeping if retry limit or deadline exceeded
-                elapsed = time.monotonic() - retry_start
-                if max_cap_retries is not None and consecutive_cap_hits >= max_cap_retries:
-                    logger.error(
-                        f'{label}: giving up after {consecutive_cap_hits} consecutive heuristic cap hits '
-                        f'({elapsed:.1f}s elapsed, {num_accounts} account(s))',
-                    )
-                    raise AllAccountsCappedException(
-                        retries=consecutive_cap_hits,
-                        elapsed_secs=elapsed,
-                        label=label,
-                    )
-                if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
-                    logger.error(
-                        f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
-                        f'(heuristic branch, {consecutive_cap_hits} retries, {num_accounts} account(s))',
-                    )
-                    raise AllAccountsCappedException(
-                        retries=consecutive_cap_hits,
-                        elapsed_secs=elapsed,
-                        label=label,
+                if slot.detect_cap_hit(result.stderr, result.output):
+                    consecutive_cap_hits += 1
+                    full_cycles = (consecutive_cap_hits - 1) // num_accounts
+                    cooldown = min(
+                        _CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles),
+                        _MAX_CAP_COOLDOWN_SECS,
                     )
 
-                await asyncio.sleep(cooldown)
-                continue
+                    acct_name = usage_gate.active_account_name
+                    if cost_store:
+                        try:
+                            await cost_store.save_account_event(
+                                account_name=account_name,
+                                event_type='cap_hit',
+                                project_id=project_id or None,
+                                run_id=run_id or None,
+                                details=label,
+                                created_at=datetime.now(UTC).isoformat(),
+                            )
+                        except Exception:
+                            logger.warning('Failed to save cap_hit event', exc_info=True)
 
-        # Non-cap-hit failure while resuming → fall back to fresh invocation
-        if not result.success and invoke_kwargs.get('resume_session_id'):
-            logger.warning(
-                f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
-                f'retrying fresh',
-            )
-            invoke_kwargs.pop('resume_session_id', None)
-            invoke_kwargs['prompt'] = original_prompt
-            continue
+                    # Resume the capped session on the next account if possible
+                    if result.session_id:
+                        invoke_kwargs['resume_session_id'] = result.session_id
+                        invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
+                        resume_or_fresh = 'resuming'
+                    else:
+                        invoke_kwargs.pop('resume_session_id', None)
+                        invoke_kwargs['prompt'] = original_prompt
+                        resume_or_fresh = 'fresh'
 
-        if usage_gate and not unattributed_cap:
-            usage_gate.confirm_account_ok(oauth_token)
-            usage_gate.on_agent_complete(result.cost_usd)
-        break
+                    if acct_name:
+                        logger.warning(
+                            f'{label}: cap hit ({consecutive_cap_hits} consecutive), '
+                            f'sleeping {cooldown:.0f}s then {resume_or_fresh} on account {acct_name}',
+                        )
+                    else:
+                        logger.warning(
+                            f'{label}: cap hit on all accounts ({consecutive_cap_hits} consecutive), '
+                            f'sleeping {cooldown:.0f}s then waiting for reset ({resume_or_fresh})',
+                        )
+
+                    # Guard: raise before sleeping if retry limit or deadline exceeded
+                    elapsed = time.monotonic() - retry_start
+                    if max_cap_retries is not None and consecutive_cap_hits >= max_cap_retries:
+                        logger.error(
+                            f'{label}: giving up after {consecutive_cap_hits} consecutive cap hits '
+                            f'({elapsed:.1f}s elapsed, {num_accounts} account(s))',
+                        )
+                        raise AllAccountsCappedException(
+                            retries=consecutive_cap_hits,
+                            elapsed_secs=elapsed,
+                            label=label,
+                        )
+                    if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
+                        logger.error(
+                            f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
+                            f'({consecutive_cap_hits} retries, {num_accounts} account(s))',
+                        )
+                        raise AllAccountsCappedException(
+                            retries=consecutive_cap_hits,
+                            elapsed_secs=elapsed,
+                            label=label,
+                        )
+
+                    await asyncio.sleep(cooldown)
+                    continue
+
+                # Heuristic safety net: a zero-cost, near-instant, ≤1-turn result
+                # that wasn't caught by pattern matching is almost certainly a cap
+                # hit with an unrecognised message format.  Treat it as a cap hit so
+                # the retry loop can wait / fail over instead of silently returning a
+                # useless "success" to the caller.
+                if (
+                    not result.success  # is_error=true → success=False after fix 2
+                    and result.cost_usd == 0
+                    and result.turns <= 1
+                    and result.duration_ms < 5000
+                ):
+                    logger.warning(
+                        f'{label}: suspicious zero-cost instant exit (turns={result.turns}, '
+                        f'duration={result.duration_ms}ms) — treating as cap hit. '
+                        f'Output: {result.output[:200]!r}',
+                    )
+                    cap_marked = usage_gate._handle_cap_detected(
+                        f'Heuristic cap: zero-cost instant exit — {result.output[:120]}',
+                        None,
+                        slot.token,
+                    )
+                    if not cap_marked:
+                        logger.warning(
+                            f'{label}: heuristic cap suspected but no account could be marked '
+                            f'(token unresolved) — treating as normal failure',
+                        )
+                        unattributed_cap = True
+                    else:
+                        slot.settle()  # _handle_cap_detected already cleared probe_in_flight
+                        consecutive_cap_hits += 1
+                        full_cycles = (consecutive_cap_hits - 1) // num_accounts
+                        cooldown = min(
+                            _CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles),
+                            _MAX_CAP_COOLDOWN_SECS,
+                        )
+                        # Cannot resume a session that never ran
+                        invoke_kwargs.pop('resume_session_id', None)
+                        invoke_kwargs['prompt'] = original_prompt
+                        acct_name = usage_gate.active_account_name
+                        logger.warning(
+                            f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
+                        )
+
+                        # Guard: raise before sleeping if retry limit or deadline exceeded
+                        elapsed = time.monotonic() - retry_start
+                        if max_cap_retries is not None and consecutive_cap_hits >= max_cap_retries:
+                            logger.error(
+                                f'{label}: giving up after {consecutive_cap_hits} consecutive heuristic cap hits '
+                                f'({elapsed:.1f}s elapsed, {num_accounts} account(s))',
+                            )
+                            raise AllAccountsCappedException(
+                                retries=consecutive_cap_hits,
+                                elapsed_secs=elapsed,
+                                label=label,
+                            )
+                        if cap_retry_deadline_secs is not None and elapsed > cap_retry_deadline_secs:
+                            logger.error(
+                                f'{label}: cap retry deadline exceeded after {elapsed:.1f}s '
+                                f'(heuristic branch, {consecutive_cap_hits} retries, {num_accounts} account(s))',
+                            )
+                            raise AllAccountsCappedException(
+                                retries=consecutive_cap_hits,
+                                elapsed_secs=elapsed,
+                                label=label,
+                            )
+
+                        await asyncio.sleep(cooldown)
+                        continue
+
+                # Non-cap-hit failure while resuming → fall back to fresh invocation
+                if not result.success and invoke_kwargs.get('resume_session_id'):
+                    logger.warning(
+                        f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
+                        f'retrying fresh',
+                    )
+                    invoke_kwargs.pop('resume_session_id', None)
+                    invoke_kwargs['prompt'] = original_prompt
+                    continue  # __aexit__ releases probe slot
+
+                if not unattributed_cap:
+                    slot.confirm(result.cost_usd)
+                break
 
     result.account_name = account_name
     if cost_store:

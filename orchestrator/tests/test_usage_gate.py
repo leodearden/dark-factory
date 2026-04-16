@@ -1359,3 +1359,99 @@ class TestBuildUsageGateHelper:
         acct_cfgs = [AccountConfig(name='test-a', oauth_token_env='TEST_TOKEN_A')]
         gate = build_usage_gate(acct_cfgs, ['tok-a'])
         assert isinstance(gate._run_probe, AsyncMock)
+
+
+class TestInvokeSlot:
+    """Tests for the InvokeSlot context manager."""
+
+    @pytest.mark.asyncio
+    async def test_confirm_clears_probe_in_flight(self):
+        """Calling slot.confirm() clears probe_in_flight — normal success path."""
+        gate = _make_gate(num_accounts=1)
+        # Simulate freshly-probed account
+        gate._accounts[0].probing = True
+        gate._open.set()
+
+        async with gate.invoke_slot() as slot:
+            assert slot.token == 'token-a'
+            assert gate._accounts[0].probe_in_flight is True
+            slot.confirm(0.50)
+
+        assert gate._accounts[0].probe_in_flight is False
+
+    @pytest.mark.asyncio
+    async def test_detect_cap_hit_settles_slot(self):
+        """slot.detect_cap_hit() returning True settles the slot — no double release."""
+        gate = _make_gate(num_accounts=1)
+        gate._accounts[0].probing = True
+        gate._open.set()
+
+        async with gate.invoke_slot() as slot:
+            hit = slot.detect_cap_hit(
+                "You've hit your usage limit. Resets in 3h.", '', 'claude',
+            )
+            assert hit is True
+            assert gate._accounts[0].capped is True
+            assert gate._accounts[0].probe_in_flight is False
+
+        # __aexit__ should NOT re-release (idempotent, but verify no crash)
+        assert gate._accounts[0].probe_in_flight is False
+
+    @pytest.mark.asyncio
+    async def test_unsettled_exit_releases_probe_slot(self):
+        """Exiting without confirm or cap-hit releases the probe slot."""
+        gate = _make_gate(num_accounts=1)
+        gate._accounts[0].probing = True
+        gate._open.set()
+
+        async with gate.invoke_slot() as slot:
+            # Simulate resume-failed: just exit without settling
+            assert gate._accounts[0].probe_in_flight is True
+
+        # __aexit__ should have released
+        assert gate._accounts[0].probe_in_flight is False
+
+    @pytest.mark.asyncio
+    async def test_exception_releases_probe_slot(self):
+        """Exceptions release the probe slot via __aexit__."""
+        gate = _make_gate(num_accounts=1)
+        gate._accounts[0].probing = True
+        gate._open.set()
+
+        with pytest.raises(RuntimeError, match='boom'):
+            async with gate.invoke_slot() as slot:
+                assert gate._accounts[0].probe_in_flight is True
+                raise RuntimeError('boom')
+
+        assert gate._accounts[0].probe_in_flight is False
+
+    @pytest.mark.asyncio
+    async def test_settle_prevents_release(self):
+        """Calling slot.settle() prevents __aexit__ from releasing."""
+        gate = _make_gate(num_accounts=2)
+        # Simulate heuristic cap detection path: _handle_cap_detected is
+        # called directly, which clears probe_in_flight; slot.settle() marks
+        # the slot as handled so __aexit__ doesn't call release_probe_slot.
+        gate._accounts[0].probing = True
+        gate._open.set()
+
+        async with gate.invoke_slot() as slot:
+            assert gate._accounts[0].probe_in_flight is True
+            # Simulate _handle_cap_detected clearing probe_in_flight
+            gate._handle_cap_detected('heuristic cap', None, slot.token)
+            slot.settle()
+
+        assert gate._accounts[0].capped is True
+        assert gate._accounts[0].probe_in_flight is False
+
+    @pytest.mark.asyncio
+    async def test_normal_account_no_probe(self):
+        """Non-probing accounts: confirm works, no probe_in_flight involved."""
+        gate = _make_gate(num_accounts=1)
+
+        async with gate.invoke_slot() as slot:
+            assert slot.token == 'token-a'
+            assert gate._accounts[0].probe_in_flight is False
+            slot.confirm(1.0)
+
+        assert gate._accounts[0].probe_in_flight is False
