@@ -452,10 +452,37 @@ class GitOps:
         if worktree_path.exists():
             if await self._is_registered_worktree(worktree_path):
                 logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
+
+                # Save any uncommitted tracked work before rebasing
+                # (.task/ is gitignored so plan.json is unaffected)
+                await self.commit(
+                    worktree_path,
+                    'chore: save WIP before requeue rebase',
+                )
+
+                # Rebase onto freshened main so the worktree starts from
+                # the latest code — critical for plan revalidation, which
+                # needs the architect to see current file contents.
+                if await self.rebase_onto_main(worktree_path):
+                    actual_base = base_sha.strip()
+                else:
+                    # Rebase failed (conflict) — continue on old base.
+                    # Compute the actual merge-base so WorktreeInfo is truthful.
+                    _, mb_out, _ = await _run(
+                        ['git', 'merge-base', self.config.main_branch, 'HEAD'],
+                        cwd=worktree_path,
+                    )
+                    actual_base = mb_out.strip() or base_sha.strip()
+                    logger.warning(
+                        'Rebase failed for reused worktree %s — continuing '
+                        'on old base %s',
+                        worktree_path, actual_base[:8],
+                    )
+
                 _ensure_task_gitignore(worktree_path)
                 return WorktreeInfo(
                     path=worktree_path,
-                    base_commit=base_sha,
+                    base_commit=actual_base,
                     stale_commits=stale_commits,
                 )
             else:

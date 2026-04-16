@@ -74,6 +74,9 @@ class EventType(StrEnum):
     reservation_expired = 'reservation_expired'
     reservation_used = 'reservation_used'
 
+    # Plan revalidation
+    plan_revalidated = 'plan_revalidated'
+
 
 class EventStore:
     """Append-only SQLite event store.

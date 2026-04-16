@@ -92,6 +92,97 @@ class BriefingAssembler:
 4. Ensure the `modules` parameter accurately lists ALL code directories this task will touch.
 """
 
+    async def build_revalidation_prompt(
+        self,
+        task: dict,
+        existing_plan: dict,
+        changed_files: list[str],
+        worktree: Path | None = None,
+        context: str | None = None,
+    ) -> str:
+        """Build prompt for the architect to revalidate a plan after blast-radius requeue.
+
+        The task was planned in a prior session but requeued because module
+        locks were contended.  Main has since advanced (the contending task
+        merged).  The architect reviews the existing plan against the changes
+        and either confirms, updates, or recreates it.
+        """
+        if context is None:
+            context = await self._get_memory_context(task.get('id'))
+
+        task_block = self._format_task(task)
+        identity = self._agent_identity(task.get('id'), 'architect')
+
+        plan_files = set(existing_plan.get('files', []))
+        overlapping = [f for f in changed_files if f in plan_files]
+        non_overlapping = [f for f in changed_files if f not in plan_files]
+
+        overlap_section = ''
+        if overlapping:
+            overlap_list = '\n'.join(f'- `{f}`' for f in overlapping)
+            overlap_section = (
+                f'### Overlapping with your plan (REVIEW THESE):\n{overlap_list}'
+            )
+
+        other_section = ''
+        if non_overlapping:
+            other_list = '\n'.join(f'- `{f}`' for f in non_overlapping[:30])
+            suffix = ''
+            if len(non_overlapping) > 30:
+                suffix = f'\n- ... and {len(non_overlapping) - 30} more'
+            other_section = (
+                f'### Other changes on main:\n{other_list}{suffix}'
+            )
+
+        if not changed_files:
+            files_section = '_No files changed on main since your plan was created._'
+        else:
+            files_section = f'{overlap_section}\n\n{other_section}'.strip()
+
+        plan_json = json.dumps(existing_plan, indent=2)
+
+        return f"""\
+{context}
+
+{identity}
+
+# Task
+
+{task_block}
+
+# Plan Revalidation
+
+You created a plan for this task in a prior session, but the task was requeued
+because another task held locks on modules you need. That task has since merged
+to main, so the files it touched may have changed.
+
+Your job: review your previous plan against the current state of the codebase
+and either confirm it, update it, or recreate it from scratch.
+
+## Your Previous Plan
+
+```json
+{plan_json}
+```
+
+## Files Changed on Main Since Your Plan
+
+{files_section}
+
+## Action
+
+1. Read the overlapping files (if any) to understand what changed.
+2. Decide whether your plan is still valid.
+3. Take ONE of these actions:
+   a. **Plan still valid**: call `confirm_plan()`.
+   b. **Plan needs updates**: use `update_plan_metadata(files=..., modules=...)`,
+      `remove_plan_step(step_id)`, `replace_plan_step(step_id, step_type, description)`,
+      and/or `add_plan_step(step_id, step_type, description)` to adjust the plan in place.
+   c. **Plan is invalid**: call `create_plan(...)` to start fresh, then add steps as usual.
+4. Ensure the `files` list is exhaustive — it drives concurrency locks.
+5. Do NOT remove or replace steps with status "done".
+"""
+
     async def build_implementer_prompt(
         self,
         plan: dict,

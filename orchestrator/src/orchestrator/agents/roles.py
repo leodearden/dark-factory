@@ -58,6 +58,11 @@ _PLAN_CREATOR_TOOLS = [
     'mcp__plan-tools__add_prerequisite',
     'mcp__plan-tools__add_design_decision',
     'mcp__plan-tools__add_reuse_item',
+    # Revalidation tools (blast-radius requeue)
+    'mcp__plan-tools__update_plan_metadata',
+    'mcp__plan-tools__remove_plan_step',
+    'mcp__plan-tools__replace_plan_step',
+    'mcp__plan-tools__confirm_plan',
 ]
 
 _PLAN_STATUS_TOOLS = [

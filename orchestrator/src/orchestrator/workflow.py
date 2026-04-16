@@ -101,6 +101,11 @@ class _BriefingLike(Protocol):
     async def build_merger_prompt(
         self, conflicts: str, task_intent: str, context: str | None = ...
     ) -> str: ...
+    async def build_revalidation_prompt(
+        self, task: dict, existing_plan: dict,
+        changed_files: list[str], worktree: Path | None = ...,
+        context: str | None = ...,
+    ) -> str: ...
     async def build_completion_judge_prompt(
         self, plan: dict, iteration_log: list[dict], diff: str,
         task_id: str | None = ..., context: str | None = ...,
@@ -211,6 +216,7 @@ class TaskWorkflow:
         self._steward_factory = steward_factory
         self._steward: Any | None = None
         self._config_dir: TaskConfigDir | None = None
+        self._old_plan_base: str | None = None  # base commit from prior session (for revalidation diff)
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -267,6 +273,9 @@ class TaskWorkflow:
                 await self._sync_worktree_venvs()
 
             self.artifacts = TaskArtifacts(self.worktree)
+            # Capture old base_commit before init() overwrites metadata.json.
+            # Used by _plan() to compute the diff for plan revalidation.
+            self._old_plan_base = self.artifacts.read_base_commit()
             self.artifacts.init(
                 self.task_id,
                 self.task.get('title', ''),
@@ -637,8 +646,8 @@ class TaskWorkflow:
 
         # Defense-in-depth: if plan.lock already exists, check if it's stale.
         # If stale (self-lock from crashed session or age exceeds threshold),
-        # clear it and proceed with fresh planning. If held by an active session,
-        # requeue to avoid duplicate execution.
+        # clear it and proceed.  If held by an active session, requeue to
+        # avoid duplicate execution.
         if self.artifacts.is_plan_locked() and self.artifacts.read_plan():
             cleared = self.artifacts.clear_stale_plan_lock(self.task_id)
             if not cleared:
@@ -650,13 +659,48 @@ class TaskWorkflow:
                 )
                 await self.scheduler.set_task_status(self.task_id, 'pending')
                 return WorkflowOutcome.REQUEUED
-            # Lock was stale and cleared — remove the stale plan so architect
-            # creates a fresh one
-            plan_path = self.artifacts.root / 'plan.json'
-            if plan_path.exists():
-                plan_path.unlink()
+            # Lock was stale and cleared.  If the plan has provenance
+            # (complete plan from a prior session, e.g. blast-radius requeue),
+            # keep it for revalidation.  If not (crashed mid-planning), delete.
+            existing = self.artifacts.read_plan()
+            if existing and not existing.get('_session_id'):
+                plan_path = self.artifacts.root / 'plan.json'
+                if plan_path.exists():
+                    plan_path.unlink()
 
-        prompt = await self.briefing.build_architect_prompt(self.task, worktree=self.worktree)
+        # ── Revalidation vs. fresh planning ──────────────────────────
+        # If a provenance-stamped plan already exists (blast-radius requeue),
+        # build a revalidation prompt with the diff of what changed on main
+        # so the architect can confirm, update, or recreate the plan.
+        revalidation = False
+        revalidation_changed_files: list[str] = []
+        existing_plan = self.artifacts.read_plan()
+        if (
+            existing_plan
+            and existing_plan.get('steps')
+            and existing_plan.get('_session_id')
+            and self._old_plan_base
+        ):
+            current_main = await self.git_ops.get_main_sha()
+            revalidation_changed_files = await self.git_ops.get_changed_files(
+                self._old_plan_base, current_main,
+            )
+            plan_file_set = set(existing_plan.get('files', []))
+            overlap = [f for f in revalidation_changed_files if f in plan_file_set]
+            logger.info(
+                'Task %s: revalidating existing plan '
+                '(%d changed files, %d overlap with plan)',
+                self.task_id, len(revalidation_changed_files), len(overlap),
+            )
+            prompt = await self.briefing.build_revalidation_prompt(
+                self.task, existing_plan, revalidation_changed_files,
+                worktree=self.worktree,
+            )
+            revalidation = True
+        else:
+            prompt = await self.briefing.build_architect_prompt(
+                self.task, worktree=self.worktree,
+            )
 
         result: AgentResult | None = None
         for attempt in range(2):
@@ -732,6 +776,20 @@ class TaskWorkflow:
         self.artifacts.stamp_plan_provenance(self.session_id)
         self.artifacts.lock_plan(self.session_id)
         self.plan = self.artifacts.read_plan()
+
+        if revalidation and self.event_store:
+            plan_file_set = set(self.plan.get('files', []))
+            self.event_store.emit(
+                EventType.plan_revalidated,
+                task_id=self.task_id,
+                data={
+                    'changed_files_count': len(revalidation_changed_files),
+                    'overlap_count': len(
+                        [f for f in revalidation_changed_files
+                         if f in plan_file_set]
+                    ),
+                },
+            )
 
         # Derive modules from plan's file list (deterministic) or fall back to
         # the plan's module list (heuristic).

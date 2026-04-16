@@ -2,8 +2,11 @@
 
 Spawned per-agent invocation by the orchestrator.  The architect agent
 builds plans via ``create_plan`` / ``add_plan_step`` / etc., and the
-implementer marks steps done via ``mark_step_done``.  All writes go
-through ``TaskArtifacts`` methods, preserving ``_session_id`` and
+implementer marks steps done via ``mark_step_done``.  On revalidation
+(blast-radius requeue), the architect uses ``update_plan_metadata``,
+``remove_plan_step``, ``replace_plan_step``, and ``confirm_plan`` to
+update an existing plan without recreating it from scratch.  All writes
+go through ``TaskArtifacts`` methods, preserving ``_session_id`` and
 enforcing correct schema.
 
 Usage (stdio transport, spawned by orchestrator):
@@ -16,6 +19,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -170,6 +174,103 @@ def _mark_step_done(
 
 
 # ---------------------------------------------------------------------------
+# Revalidation helpers
+# ---------------------------------------------------------------------------
+
+
+def _update_plan_metadata(
+    artifacts: TaskArtifacts,
+    modules: list[str] | None = None,
+    files: list[str] | None = None,
+    analysis: str | None = None,
+) -> dict[str, Any]:
+    plan = artifacts.read_plan()
+    if not plan:
+        return {'status': 'error', 'message': 'No plan exists. Call create_plan first.'}
+
+    if modules is not None:
+        plan['modules'] = modules
+    if files is not None:
+        plan['files'] = files
+    if analysis is not None:
+        plan['analysis'] = analysis
+    artifacts.write_plan(plan)
+    return {
+        'status': 'ok',
+        'modules': len(plan.get('modules', [])),
+        'files': len(plan.get('files', [])),
+    }
+
+
+def _remove_plan_step(
+    artifacts: TaskArtifacts,
+    step_id: str,
+) -> dict[str, Any]:
+    plan = artifacts.read_plan()
+    if not plan:
+        return {'status': 'error', 'message': 'No plan exists.'}
+
+    for collection in ('prerequisites', 'steps'):
+        items = plan.get(collection, [])
+        for i, item in enumerate(items):
+            if isinstance(item, dict) and item.get('id') == step_id:
+                if item.get('status') == 'done':
+                    return {
+                        'status': 'error',
+                        'message': f'Step {step_id!r} has status "done" and cannot be removed.',
+                    }
+                items.pop(i)
+                artifacts.write_plan(plan)
+                return {'status': 'ok', 'removed': step_id, 'collection': collection}
+
+    return {'status': 'error', 'message': f'Step {step_id!r} not found in plan.'}
+
+
+def _replace_plan_step(
+    artifacts: TaskArtifacts,
+    step_id: str,
+    step_type: str,
+    description: str,
+) -> dict[str, Any]:
+    plan = artifacts.read_plan()
+    if not plan:
+        return {'status': 'error', 'message': 'No plan exists.'}
+
+    for collection in ('prerequisites', 'steps'):
+        for item in plan.get(collection, []):
+            if isinstance(item, dict) and item.get('id') == step_id:
+                if item.get('status') == 'done':
+                    return {
+                        'status': 'error',
+                        'message': f'Step {step_id!r} has status "done" and cannot be replaced.',
+                    }
+                item['type'] = step_type
+                item['description'] = description
+                artifacts.write_plan(plan)
+                return {'status': 'ok', 'replaced': step_id}
+
+    return {'status': 'error', 'message': f'Step {step_id!r} not found in plan.'}
+
+
+def _confirm_plan(
+    artifacts: TaskArtifacts,
+) -> dict[str, Any]:
+    plan = artifacts.read_plan()
+    if not plan:
+        return {'status': 'error', 'message': 'No plan exists.'}
+    if not plan.get('steps'):
+        return {'status': 'error', 'message': 'Plan has no steps — cannot confirm.'}
+
+    plan['_revalidated_at'] = datetime.now(UTC).isoformat()
+    artifacts.write_plan(plan)
+    return {
+        'status': 'ok',
+        'steps': len(plan['steps']),
+        'files': len(plan.get('files', [])),
+    }
+
+
+# ---------------------------------------------------------------------------
 # FastMCP server factory
 # ---------------------------------------------------------------------------
 
@@ -275,6 +376,70 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             commit_sha: The git commit SHA for this step's changes.
         """
         return _mark_step_done(artifacts, step_id, commit_sha)
+
+    # --- Revalidation tools ---
+
+    @mcp.tool()
+    def update_plan_metadata(
+        modules: list[str] | None = None,
+        files: list[str] | None = None,
+        analysis: str | None = None,
+    ) -> dict[str, Any]:
+        """Update the plan's top-level metadata without touching steps or prerequisites.
+
+        Use during plan revalidation to update the file list, module list,
+        or analysis after reviewing changes on main. All parameters are
+        optional — only non-None values are updated.
+
+        Args:
+            modules: Updated list of code directories this task will touch.
+            files: Updated list of ALL files expected to be created or modified.
+            analysis: Updated analysis text.
+        """
+        return _update_plan_metadata(artifacts, modules, files, analysis)
+
+    @mcp.tool()
+    def remove_plan_step(
+        step_id: str,
+    ) -> dict[str, Any]:
+        """Remove a pending step or prerequisite from the plan by ID.
+
+        Use during plan revalidation when a step is no longer needed
+        due to changes on main. Cannot remove steps with status "done".
+
+        Args:
+            step_id: The step or prerequisite ID to remove (e.g. "step-3").
+        """
+        return _remove_plan_step(artifacts, step_id)
+
+    @mcp.tool()
+    def replace_plan_step(
+        step_id: str,
+        step_type: str,
+        description: str,
+    ) -> dict[str, Any]:
+        """Replace a pending step's type and description in-place.
+
+        Preserves the step's position, status, and commit fields.
+        Use during plan revalidation when a step needs revision due
+        to changes on main. Cannot replace steps with status "done".
+
+        Args:
+            step_id: The step ID to replace (e.g. "step-2").
+            step_type: New step type — either "test" or "impl".
+            description: New description of what this step does.
+        """
+        return _replace_plan_step(artifacts, step_id, step_type, description)
+
+    @mcp.tool()
+    def confirm_plan() -> dict[str, Any]:
+        """Confirm the existing plan is still valid after revalidation.
+
+        Call this when you have reviewed the changes on main and
+        determined the plan requires no modifications. Stamps a
+        revalidation timestamp on the plan.
+        """
+        return _confirm_plan(artifacts)
 
     return mcp
 

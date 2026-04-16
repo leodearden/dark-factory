@@ -73,7 +73,7 @@ models:
 
 # Budget per invocation (USD)
 budgets:
-  architect: 8.0
+  architect: 12.0
   implementer: 10.0
   debugger: 5.0
   reviewer: 5.0

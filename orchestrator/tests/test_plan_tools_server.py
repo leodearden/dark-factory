@@ -10,8 +10,12 @@ from orchestrator.mcp.plan_tools import (
     _add_plan_step,
     _add_prerequisite,
     _add_reuse_item,
+    _confirm_plan,
     _create_plan,
     _mark_step_done,
+    _remove_plan_step,
+    _replace_plan_step,
+    _update_plan_metadata,
 )
 
 
@@ -200,3 +204,188 @@ class TestMarkStepDone:
         result = _mark_step_done(artifacts, 'nonexistent', 'abc123')
         assert result['status'] == 'error'
         assert 'not found' in result['message']
+
+
+# ---------------------------------------------------------------------------
+# Revalidation tool tests
+# ---------------------------------------------------------------------------
+
+
+def _setup_full_plan(artifacts):
+    """Create a plan with steps and prerequisites for revalidation tests."""
+    _create_plan(
+        artifacts, 'test-1', 'Test task', 'Analysis',
+        ['mod_a'], ['mod_a/foo.py', 'mod_a/bar.py'],
+    )
+    _add_prerequisite(artifacts, 'pre-1', 'Setup config')
+    _add_plan_step(artifacts, 'step-1', 'test', 'Write test for foo')
+    _add_plan_step(artifacts, 'step-2', 'impl', 'Implement foo')
+    _add_plan_step(artifacts, 'step-3', 'test', 'Write test for bar')
+
+
+class TestUpdatePlanMetadata:
+    def test_updates_files_only(self, artifacts):
+        _setup_full_plan(artifacts)
+        result = _update_plan_metadata(
+            artifacts, files=['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py'],
+        )
+        assert result['status'] == 'ok'
+        assert result['files'] == 3
+
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py']
+        # Modules and analysis unchanged
+        assert plan['modules'] == ['mod_a']
+        assert plan['analysis'] == 'Analysis'
+
+    def test_updates_modules_only(self, artifacts):
+        _setup_full_plan(artifacts)
+        result = _update_plan_metadata(artifacts, modules=['mod_a', 'mod_b'])
+        assert result['status'] == 'ok'
+        assert result['modules'] == 2
+
+        plan = artifacts.read_plan()
+        assert plan['modules'] == ['mod_a', 'mod_b']
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
+
+    def test_updates_analysis_only(self, artifacts):
+        _setup_full_plan(artifacts)
+        result = _update_plan_metadata(artifacts, analysis='Updated analysis')
+        assert result['status'] == 'ok'
+
+        plan = artifacts.read_plan()
+        assert plan['analysis'] == 'Updated analysis'
+
+    def test_updates_all_fields(self, artifacts):
+        _setup_full_plan(artifacts)
+        result = _update_plan_metadata(
+            artifacts,
+            modules=['mod_b'],
+            files=['mod_b/x.py'],
+            analysis='New approach',
+        )
+        assert result['status'] == 'ok'
+        plan = artifacts.read_plan()
+        assert plan['modules'] == ['mod_b']
+        assert plan['files'] == ['mod_b/x.py']
+        assert plan['analysis'] == 'New approach'
+
+    def test_preserves_steps(self, artifacts):
+        _setup_full_plan(artifacts)
+        _update_plan_metadata(artifacts, files=['mod_a/new.py'])
+        plan = artifacts.read_plan()
+        assert len(plan['steps']) == 3
+        assert len(plan['prerequisites']) == 1
+
+    def test_no_plan_returns_error(self, artifacts):
+        result = _update_plan_metadata(artifacts, files=['x.py'])
+        assert result['status'] == 'error'
+
+    def test_no_args_is_noop(self, artifacts):
+        _setup_full_plan(artifacts)
+        result = _update_plan_metadata(artifacts)
+        assert result['status'] == 'ok'
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
+
+
+class TestRemovePlanStep:
+    def test_removes_pending_step(self, artifacts):
+        _setup_full_plan(artifacts)
+        result = _remove_plan_step(artifacts, 'step-2')
+        assert result['status'] == 'ok'
+        assert result['removed'] == 'step-2'
+        assert result['collection'] == 'steps'
+
+        plan = artifacts.read_plan()
+        ids = [s['id'] for s in plan['steps']]
+        assert ids == ['step-1', 'step-3']
+
+    def test_removes_prerequisite(self, artifacts):
+        _setup_full_plan(artifacts)
+        result = _remove_plan_step(artifacts, 'pre-1')
+        assert result['status'] == 'ok'
+        assert result['collection'] == 'prerequisites'
+
+        plan = artifacts.read_plan()
+        assert plan['prerequisites'] == []
+
+    def test_refuses_done_step(self, artifacts):
+        _setup_full_plan(artifacts)
+        _mark_step_done(artifacts, 'step-1', 'abc123')
+        result = _remove_plan_step(artifacts, 'step-1')
+        assert result['status'] == 'error'
+        assert 'done' in result['message']
+
+    def test_unknown_step_returns_error(self, artifacts):
+        _setup_full_plan(artifacts)
+        result = _remove_plan_step(artifacts, 'nonexistent')
+        assert result['status'] == 'error'
+        assert 'not found' in result['message']
+
+    def test_no_plan_returns_error(self, artifacts):
+        result = _remove_plan_step(artifacts, 'step-1')
+        assert result['status'] == 'error'
+
+
+class TestReplacePlanStep:
+    def test_replaces_step_in_place(self, artifacts):
+        _setup_full_plan(artifacts)
+        result = _replace_plan_step(
+            artifacts, 'step-2', 'impl', 'Implement foo differently',
+        )
+        assert result['status'] == 'ok'
+        assert result['replaced'] == 'step-2'
+
+        plan = artifacts.read_plan()
+        step = plan['steps'][1]
+        assert step['id'] == 'step-2'
+        assert step['type'] == 'impl'
+        assert step['description'] == 'Implement foo differently'
+        assert step['status'] == 'pending'
+
+    def test_preserves_position(self, artifacts):
+        _setup_full_plan(artifacts)
+        _replace_plan_step(artifacts, 'step-2', 'test', 'Changed to test')
+        plan = artifacts.read_plan()
+        ids = [s['id'] for s in plan['steps']]
+        assert ids == ['step-1', 'step-2', 'step-3']
+
+    def test_refuses_done_step(self, artifacts):
+        _setup_full_plan(artifacts)
+        _mark_step_done(artifacts, 'step-1', 'abc123')
+        result = _replace_plan_step(artifacts, 'step-1', 'test', 'Nope')
+        assert result['status'] == 'error'
+        assert 'done' in result['message']
+
+    def test_unknown_step_returns_error(self, artifacts):
+        _setup_full_plan(artifacts)
+        result = _replace_plan_step(artifacts, 'nonexistent', 'test', 'X')
+        assert result['status'] == 'error'
+        assert 'not found' in result['message']
+
+    def test_no_plan_returns_error(self, artifacts):
+        result = _replace_plan_step(artifacts, 'step-1', 'test', 'X')
+        assert result['status'] == 'error'
+
+
+class TestConfirmPlan:
+    def test_stamps_revalidated_at(self, artifacts):
+        _setup_full_plan(artifacts)
+        result = _confirm_plan(artifacts)
+        assert result['status'] == 'ok'
+        assert result['steps'] == 3
+        assert result['files'] == 2
+
+        plan = artifacts.read_plan()
+        assert '_revalidated_at' in plan
+
+    def test_no_plan_returns_error(self, artifacts):
+        result = _confirm_plan(artifacts)
+        assert result['status'] == 'error'
+
+    def test_empty_steps_returns_error(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m'])
+        result = _confirm_plan(artifacts)
+        assert result['status'] == 'error'
+        assert 'no steps' in result['message'].lower()
