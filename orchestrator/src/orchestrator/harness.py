@@ -381,9 +381,12 @@ class Harness:
                 if assignment is None:
                     if not active:
                         break  # all done or all blocked
-                    # Wait for any active task to complete, then retry
+                    # Wait for any active task to complete, then retry.
+                    # Timeout ensures newly-added tasks are discovered
+                    # within 15s even when no running task completes.
                     done, active = await asyncio.wait(
-                        active, return_when=asyncio.FIRST_COMPLETED
+                        active, return_when=asyncio.FIRST_COMPLETED,
+                        timeout=15,
                     )
                     self._collect_done_reports(done, task_reports)
                     continue
