@@ -22,6 +22,11 @@ if str(_SHARED_SRC) not in sys.path:
 from shared.config_models import AccountConfig, UsageCapConfig  # noqa: E402
 from shared.usage_gate import AccountState, UsageGate  # noqa: E402
 
+# Cooperative jobserver: block at session start until a slot is free on the
+# system-wide FIFO (pytest-jobserver.service).  No-op when PYTEST_JOBSERVER_FIFO
+# is unset or the FIFO is absent.
+pytest_plugins = ('shared.pytest_jobserver',)
+
 
 class _SupportsSetCachedStatus(Protocol):
     """Structural type for objects that expose the _set_cached_status chokepoint."""

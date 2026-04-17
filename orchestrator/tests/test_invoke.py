@@ -34,17 +34,56 @@ def _make_result(
     )
 
 
+def _make_slot(*, token='token-a', account_name='acct-a', cap_hit=False):
+    """MagicMock shaped like shared.usage_gate.InvokeSlot.
+
+    Production in invoke_with_cap_retry reads slot.token / slot.account_name /
+    slot.detect_cap_hit / slot.confirm — all mockable via this helper.  Each
+    slot represents ONE iteration of the cap-retry loop.
+    """
+    slot = MagicMock()
+    slot.token = token
+    slot.account_name = account_name
+    slot.detect_cap_hit = MagicMock(return_value=cap_hit)
+    slot.confirm = MagicMock()
+    slot.settle = MagicMock()
+    return slot
+
+
+def _make_gate_yielding(slots, *, active_account_name=None):
+    """UsageGate mock whose successive invoke_slot() calls yield the given slots.
+
+    Without this helper, `gate = MagicMock()` yields an unconstrained slot whose
+    detect_cap_hit returns a truthy coroutine — production's `while` loop never
+    exits and the test hangs until pytest-timeout fires.
+    """
+    slot_iter = iter(slots)
+
+    def _new_cm(*args, **kwargs):
+        slot = next(slot_iter)
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=slot)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        return cm
+
+    gate = MagicMock()
+    gate.invoke_slot = MagicMock(side_effect=_new_cm)
+    gate.active_account_name = (
+        active_account_name if active_account_name is not None
+        else slots[0].account_name
+    )
+    gate.before_invoke = AsyncMock(return_value=slots[0].token)
+    gate.on_agent_complete = MagicMock()
+    gate.confirm_account_ok = MagicMock()
+    return gate
+
+
 @pytest.mark.asyncio
 class TestAccountNameThreading:
 
     async def test_account_name_set_from_usage_gate(self):
-        """account_name is stamped from usage_gate.active_account_name on success."""
-        gate = MagicMock()
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate.active_account_name = 'acct-a'
-        gate.on_agent_complete = MagicMock()
-
+        """account_name is stamped from slot.account_name on success."""
+        gate = _make_gate_yielding([_make_slot(account_name='acct-a', cap_hit=False)])
         result = _make_result()
 
         with patch(
@@ -58,13 +97,8 @@ class TestAccountNameThreading:
         assert got.account_name == 'acct-a'
 
     async def test_account_name_none_coerced_to_empty(self):
-        """When active_account_name is None, result.account_name is ''."""
-        gate = MagicMock()
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate.active_account_name = None
-        gate.on_agent_complete = MagicMock()
-
+        """When slot.account_name is '', result.account_name is ''."""
+        gate = _make_gate_yielding([_make_slot(account_name='', cap_hit=False)])
         result = _make_result()
 
         with patch(
@@ -78,19 +112,16 @@ class TestAccountNameThreading:
         assert got.account_name == ''
 
     async def test_account_name_reflects_failover_account(self):
-        """After cap hit + failover, account_name reflects the retry account."""
-        from unittest.mock import PropertyMock
+        """After cap hit + failover, account_name reflects the retry account.
 
-        gate = MagicMock()
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-        gate.detect_cap_hit = MagicMock(side_effect=[True, False])
-        # active_account_name is read 3 times:
-        #   loop 1 capture, loop 1 logging (cap hit), loop 2 capture
-        type(gate).active_account_name = PropertyMock(
-            side_effect=['acct-a', 'acct-b', 'acct-b'],
-        )
-        gate.on_agent_complete = MagicMock()
-
+        Production reads slot.account_name (per iteration) — not
+        gate.active_account_name — so per-iteration names come from the
+        per-slot configuration.
+        """
+        gate = _make_gate_yielding([
+            _make_slot(account_name='acct-a', cap_hit=True),
+            _make_slot(account_name='acct-b', cap_hit=False),
+        ])
         result = _make_result()
 
         with (
@@ -131,11 +162,10 @@ class TestCapHitResume:
 
     async def test_resume_on_cap_hit_claude_backend(self):
         """Claude backend cap hit with session_id → resume on retry."""
-        gate = MagicMock()
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-        gate.detect_cap_hit = MagicMock(side_effect=[True, False])
-        gate.active_account_name = 'acct-b'
-        gate.on_agent_complete = MagicMock()
+        gate = _make_gate_yielding([
+            _make_slot(token='token-a', account_name='acct-a', cap_hit=True),
+            _make_slot(token='token-b', account_name='acct-b', cap_hit=False),
+        ])
 
         capped_result = _make_result(session_id='sess-abc')
         ok_result = _make_result()
@@ -160,11 +190,10 @@ class TestCapHitResume:
 
     async def test_no_resume_on_cap_hit_codex_backend(self):
         """Codex backend cap hit → no resume_session_id (not supported)."""
-        gate = MagicMock()
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-        gate.detect_cap_hit = MagicMock(side_effect=[True, False])
-        gate.active_account_name = 'acct-b'
-        gate.on_agent_complete = MagicMock()
+        gate = _make_gate_yielding([
+            _make_slot(token='token-a', account_name='acct-a', cap_hit=True),
+            _make_slot(token='token-b', account_name='acct-b', cap_hit=False),
+        ])
 
         capped_result = _make_result(session_id='sess-abc')
         ok_result = _make_result()
@@ -189,11 +218,11 @@ class TestCapHitResume:
 
     async def test_resume_failure_falls_back_to_fresh(self):
         """Resume returns success=False → retry with original prompt."""
-        gate = MagicMock()
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b', 'token-c'])
-        gate.detect_cap_hit = MagicMock(side_effect=[True, False, False])
-        gate.active_account_name = 'acct-b'
-        gate.on_agent_complete = MagicMock()
+        gate = _make_gate_yielding([
+            _make_slot(token='token-a', account_name='acct-a', cap_hit=True),
+            _make_slot(token='token-b', account_name='acct-b', cap_hit=False),
+            _make_slot(token='token-c', account_name='acct-b', cap_hit=False),
+        ])
 
         capped_result = _make_result(session_id='sess-abc')
         failed_resume = _make_result(success=False)
