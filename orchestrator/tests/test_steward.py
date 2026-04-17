@@ -139,6 +139,50 @@ def _assert_cap_fire_pops_counters(steward, esc_id, mock_invoke):  # type: ignor
     return submitted
 
 
+def _make_slot(*, token='token-a', account_name='acct-a', cap_hit=False):
+    """Build a MagicMock shaped like shared.usage_gate.InvokeSlot.
+
+    Production calls slot.detect_cap_hit / slot.confirm / slot.token /
+    slot.account_name — all are mockable here.  Each slot represents ONE
+    iteration of the cap-retry loop in steward._invoke_with_session.
+    """
+    slot = MagicMock()
+    slot.token = token
+    slot.account_name = account_name
+    slot.detect_cap_hit = MagicMock(return_value=cap_hit)
+    slot.confirm = MagicMock()
+    slot.settle = MagicMock()
+    return slot
+
+
+def _make_gate_yielding(slots):
+    """Build a mock UsageGate whose successive invoke_slot() calls yield the
+    given slots in order (one per iteration of the while-loop in production).
+
+    The key subtlety this helper hides: production code reads slot.detect_cap_hit
+    (not gate.detect_cap_hit), and slot comes from entering the async context
+    manager returned by gate.invoke_slot(). Without wiring __aenter__ to return
+    the slot, a naive `gate = MagicMock()` yields an unconstrained slot whose
+    detect_cap_hit always returns truthy — infinite loop.
+    """
+    slot_iter = iter(slots)
+
+    def _new_cm(*args, **kwargs):
+        slot = next(slot_iter)
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=slot)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        return cm
+
+    gate = MagicMock()
+    gate.invoke_slot = MagicMock(side_effect=_new_cm)
+    gate.active_account_name = slots[0].account_name
+    gate.before_invoke = AsyncMock(return_value=slots[0].token)
+    gate.on_agent_complete = MagicMock()
+    gate.confirm_account_ok = MagicMock()
+    return gate
+
+
 # ---------------------------------------------------------------------------
 # Session Persistence
 # ---------------------------------------------------------------------------
@@ -206,18 +250,8 @@ class TestStewardCapHitBackoff:
             status='resolved', resolution='fixed',
         )
 
-        call_count = 0
-
-        def detect_side_effect(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            return call_count == 1  # cap hit on first call only
-
-        gate = MagicMock()
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
-        gate.on_agent_complete = MagicMock()
-        steward.usage_gate = gate
+        slots = [_make_slot(cap_hit=True), _make_slot(cap_hit=False)]
+        steward.usage_gate = _make_gate_yielding(slots)
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
@@ -239,18 +273,11 @@ class TestStewardCapHitBackoff:
             status='resolved', resolution='fixed',
         )
 
-        call_count = 0
-
-        def detect_side_effect(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            return call_count == 1
-
-        gate = MagicMock()
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-        gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
-        gate.on_agent_complete = MagicMock()
-        steward.usage_gate = gate
+        slots = [
+            _make_slot(token='token-a', cap_hit=True),
+            _make_slot(token='token-b', cap_hit=False),
+        ]
+        steward.usage_gate = _make_gate_yielding(slots)
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
@@ -272,18 +299,11 @@ class TestStewardCapHitBackoff:
             status='resolved', resolution='fixed',
         )
 
-        call_count = 0
-
-        def detect_side_effect(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            return call_count == 1
-
-        gate = MagicMock()
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-        gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
-        gate.on_agent_complete = MagicMock()
-        steward.usage_gate = gate
+        slots = [
+            _make_slot(token='token-a', cap_hit=True),
+            _make_slot(token='token-b', cap_hit=False),
+        ]
+        steward.usage_gate = _make_gate_yielding(slots)
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
@@ -310,11 +330,7 @@ class TestStewardCapHitBackoff:
             status='resolved', resolution='fixed',
         )
 
-        gate = MagicMock()
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate.on_agent_complete = MagicMock()
-        steward.usage_gate = gate
+        steward.usage_gate = _make_gate_yielding([_make_slot(cap_hit=False)])
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
@@ -335,13 +351,10 @@ class TestStewardCapHitBackoff:
 class TestStewardAccountName:
 
     async def test_account_name_set_on_result(self, steward, worktree, mock_mcp):
-        """_invoke_with_session stamps account_name from usage_gate on the result."""
-        gate = MagicMock()
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.active_account_name = 'max-d'
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate.on_agent_complete = MagicMock()
-        steward.usage_gate = gate
+        """_invoke_with_session stamps account_name from slot.account_name on the result."""
+        steward.usage_gate = _make_gate_yielding(
+            [_make_slot(account_name='max-d', cap_hit=False)],
+        )
 
         esc = _make_escalation()
         mcp_config = mock_mcp.mcp_config_json()
@@ -361,26 +374,18 @@ class TestStewardAccountName:
     async def test_account_name_reflects_failover_on_cap_hit(
         self, steward, worktree, mock_mcp, mock_briefing,
     ):
-        """After cap hit + session reset, account_name reflects the retry account."""
-        from unittest.mock import PropertyMock
+        """After cap hit + session reset, account_name reflects the retry account.
 
-        call_count = 0
-
-        def detect_side_effect(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            return call_count == 1  # cap hit on first call only
-
-        gate = MagicMock()
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
-        gate.on_agent_complete = MagicMock()
-        # active_account_name is read twice in cap-hit path: once for capture (loop 1),
-        # once inside continue path (loop 2 capture)
-        type(gate).active_account_name = PropertyMock(
-            side_effect=['max-d', 'max-c'],
-        )
-        steward.usage_gate = gate
+        Production code (_invoke_with_session) stamps result.account_name from
+        slot.account_name on the success path (not from gate.active_account_name).
+        Each async-with iteration yields a fresh slot, so per-iteration account
+        names come from per-slot configuration.
+        """
+        slots = [
+            _make_slot(account_name='max-d', cap_hit=True),
+            _make_slot(account_name='max-c', cap_hit=False),
+        ]
+        steward.usage_gate = _make_gate_yielding(slots)
 
         esc = _make_escalation()
         mcp_config = mock_mcp.mcp_config_json()
@@ -593,19 +598,8 @@ class TestStewardTimeoutPassthrough:
         """Both the initial and cap-hit-recovery invocations must carry timeout_seconds."""
         mock_config.timeouts.steward = 900.0
 
-        call_count = 0
-
-        def detect_side_effect(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            return call_count == 1  # cap hit on first call only
-
-        gate = MagicMock()
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
-        gate.on_agent_complete = MagicMock()
-        gate.confirm_account_ok = MagicMock()
-        steward.usage_gate = gate
+        slots = [_make_slot(cap_hit=True), _make_slot(cap_hit=False)]
+        steward.usage_gate = _make_gate_yielding(slots)
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,

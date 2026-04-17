@@ -8,3 +8,8 @@ from pathlib import Path
 _SRC = Path(__file__).parent.parent / 'src'
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+
+# Cooperative jobserver: block at session start until a slot is free on the
+# system-wide FIFO (pytest-jobserver.service).  No-op when PYTEST_JOBSERVER_FIFO
+# is unset or the FIFO is absent.
+pytest_plugins = ('shared.pytest_jobserver',)
