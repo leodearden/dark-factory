@@ -119,13 +119,17 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 ## Rules
 
 1. **Read before planning.** Thoroughly explore the codebase to understand existing patterns, utilities, and conventions before writing your plan.
-2. **TDD order.** Steps alternate: write a failing test, then implement to make it pass. Every behavior gets a test first.
-3. **Maximize reuse.** Identify existing utilities, patterns, and code that can be reused. Record with `add_reuse_item`.
-4. **Prerequisites first.** If setup work (config files, fixtures, etc.) is needed before TDD steps, add them with `add_prerequisite`.
-5. **Small steps.** Each step should be a single, atomic change that can be committed independently.
-6. **File listing.** List ALL files this task will create or modify in the `files` parameter of `create_plan`. Use paths relative to the worktree root. Be exhaustive — this is used to derive concurrency locks. Include test files.
-7. **Module identification.** List all code modules/directories this task will touch in the `modules` parameter of `create_plan`.
-8. **Design decisions.** Document non-obvious choices with `add_design_decision`.
+2. **Verify premises before planning.** For any file or symbol the task description claims already exists (files to MODIFY, functions to extend, types to reuse), confirm it is actually present on the base branch:
+   - Files: `Read` them or run `git ls-files -- <path>` in the worktree.
+   - Symbols/functions: use `mcp__jcodemunch__search_symbols` or grep.
+   If a referenced file or symbol is missing, do NOT silently create it from scratch. Escalate via `escalate_blocker` with `category='missing_premise'`, naming the missing artifact and why the task assumed it existed. Silent "create from scratch" of assumed-existing artifacts is how parallel-implementation mismatches grow.
+3. **TDD order.** Steps alternate: write a failing test, then implement to make it pass. Every behavior gets a test first.
+4. **Maximize reuse.** Identify existing utilities, patterns, and code that can be reused. Record with `add_reuse_item`.
+5. **Prerequisites first.** If setup work (config files, fixtures, etc.) is needed before TDD steps, add them with `add_prerequisite`.
+6. **Small steps.** Each step should be a single, atomic change that can be committed independently.
+7. **File listing.** List ALL files this task will create or modify in the `files` parameter of `create_plan`. Use paths relative to the worktree root. Be exhaustive — this is used to derive concurrency locks. Include test files.
+8. **Module identification.** List all code modules/directories this task will touch in the `modules` parameter of `create_plan`.
+9. **Design decisions.** Document non-obvious choices with `add_design_decision`.
 
 ## Important
 
@@ -422,6 +426,32 @@ You will be given:
 2. **Preserve both sides' intent.** Understand what each side was trying to do and combine them correctly.
 3. **Run tests after resolving.** Verify the resolution doesn't break anything.
 4. **Commit the resolution** with a message like "resolve: merge conflicts for task/X".
+
+## Drop-Aware Resolution (CRITICAL)
+
+Before you resolve a conflict by preferring one side (taking "ours", "theirs", or
+"accept origin"/"accept main"), you MUST explicitly inspect what will be DROPPED:
+
+1. Identify the merge base: `git merge-base HEAD <other-ref>`.
+2. Run `git diff <preferred-side>...<rejected-side> -- <conflicted-paths>` to see
+   exactly what the rejected side adds that the preferred side lacks.
+3. Run `git diff <merge-base>..<rejected-side> --stat --diff-filter=A` to list
+   files the rejected side creates that the preferred side never had.
+
+If the rejected side contains ANY of the following that the preferred side lacks,
+STOP and escalate via `escalate_blocker` with `category='merge_scope_mismatch'`:
+
+- New files (especially new source files, not just tests)
+- New non-trivial functions or classes
+- More than ~50 added lines of production code
+- A distinct module or subsystem the preferred side has no trace of
+
+"Parallel implementation" is NOT a license to silently drop a side — if both
+branches built different pieces of the same feature, combining them is the
+correct resolution, not picking one. If combining is unclear, BLOCK.
+
+Include in the escalation summary: the list of dropped files and a one-line
+description of what each dropped file contributes that the kept side lacks.
 
 ## CRITICAL: Git Staging Rules
 
