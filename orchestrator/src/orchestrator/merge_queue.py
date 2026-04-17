@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.verify import run_scoped_verification
@@ -27,6 +28,41 @@ if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 logger = logging.getLogger(__name__)
+
+
+async def _check_plan_targets_in_tree(
+    merge_commit_sha: str,
+    task_worktree: Path,
+    git_ops: GitOps,
+) -> list[str]:
+    """Return plan.json `files` entries missing from the merge commit tree.
+
+    Reads the plan from the task worktree (plan.json lives in gitignored
+    .task/, so it's only in the source worktree — not the merge worktree).
+    For each file in ``plan['files']``, checks whether the path exists at
+    the given commit.  Missing files mean conflict resolution dropped
+    planned content.
+
+    Returns an empty list when:
+    - no plan.json exists (architect never ran — nothing to check)
+    - plan['files'] is empty or missing
+    - all planned files are present in the merge commit
+    """
+    artifacts = TaskArtifacts(task_worktree)
+    plan = artifacts.read_plan()
+    files = plan.get('files') or []
+    if not files:
+        return []
+
+    missing: list[str] = []
+    for f in files:
+        rc, _, _ = await _run(
+            ['git', 'cat-file', '-e', f'{merge_commit_sha}:{f}'],
+            cwd=git_ops.project_root,
+        )
+        if rc != 0:
+            missing.append(f)
+    return missing
 
 
 @dataclass
@@ -233,6 +269,32 @@ class MergeWorker:
                     merge_result.merge_worktree,
                 )
             return MergeOutcome('blocked', reason=merge_result.details)
+
+        # 3b. Drop-guard: every file the task planned must survive the merge.
+        # Catches "accept origin" conflict resolutions that silently drop
+        # planned work from the task branch.
+        assert merge_result.merge_commit is not None
+        dropped = await _check_plan_targets_in_tree(
+            merge_result.merge_commit, req.worktree, self._git_ops,
+        )
+        if dropped:
+            if merge_result.merge_worktree:
+                await self._git_ops.cleanup_merge_worktree(
+                    merge_result.merge_worktree,
+                )
+            logger.warning(
+                f'Task {req.task_id}: merge dropped plan targets: {dropped}'
+            )
+            self._emit_merge(req.task_id, 'dropped_plan_targets')
+            return MergeOutcome(
+                'blocked',
+                reason=(
+                    f'Merge commit is missing plan target files: '
+                    f'{", ".join(dropped)}. '
+                    f'Conflict resolution likely dropped planned work. '
+                    f'Review the merge commit and restore missing files.'
+                ),
+            )
 
         # 4. Verify (skip if pre-rebased and main unchanged)
         merge_wt = merge_result.merge_worktree
@@ -667,6 +729,39 @@ class SpeculativeMergeWorker:
                     merge_commit = merge_result.merge_commit
                     assert merge_commit is not None
                     merge_commit = merge_commit.strip()
+
+                    # Drop-guard: every file the task planned must survive.
+                    dropped = await _check_plan_targets_in_tree(
+                        merge_commit, req.worktree, self._git_ops,
+                    )
+                    if dropped:
+                        if merge_result.merge_worktree:
+                            await self._git_ops.cleanup_merge_worktree(
+                                merge_result.merge_worktree,
+                            )
+                        logger.warning(
+                            f'Task {req.task_id}: merge dropped plan '
+                            f'targets: {dropped}'
+                        )
+                        self._emit_merge(req.task_id, 'dropped_plan_targets')
+                        await self._verifier_queue.put(SpeculativeItem(
+                            request=req, merge_result=None, merge_wt=None,
+                            base_sha=base_for_merge, speculative=speculative,
+                            skip_verify=False,
+                            immediate_outcome=MergeOutcome(
+                                'blocked',
+                                reason=(
+                                    f'Merge commit is missing plan target '
+                                    f'files: {", ".join(dropped)}. '
+                                    f'Conflict resolution likely dropped '
+                                    f'planned work. Review the merge commit '
+                                    f'and restore missing files.'
+                                ),
+                            ),
+                        ))
+                        spec_base = None
+                        self._inflight_req = None
+                        continue
 
                     skip_verify = (
                         req.pre_rebased
