@@ -193,6 +193,7 @@ class TaskmasterBackend:
         details: str | None = None,
         dependencies: str | None = None,
         priority: str | None = None,
+        metadata: str | None = None,
         tag: str | None = None,
     ) -> dict:
         args = self._base_args(project_root, tag)
@@ -208,6 +209,8 @@ class TaskmasterBackend:
             args['dependencies'] = dependencies
         if priority:
             args['priority'] = priority
+        if metadata:
+            args['metadata'] = metadata
         return await self.call_tool('add_task', args)
 
     async def update_task(

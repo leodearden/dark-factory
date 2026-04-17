@@ -25,6 +25,7 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 
 if TYPE_CHECKING:
     from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.middleware.curator_escalator import CuratorEscalator
     from fused_memory.middleware.task_file_committer import TaskFileCommitter
     from fused_memory.reconciliation.targeted import TargetedReconciler
 
@@ -44,6 +45,7 @@ class TaskInterceptor:
         event_buffer: EventBuffer,
         task_committer: 'TaskFileCommitter | None' = None,
         config: 'FusedMemoryConfig | None' = None,
+        escalator: 'CuratorEscalator | None' = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
@@ -55,6 +57,12 @@ class TaskInterceptor:
         # _get_curator() because it pulls in a Qdrant client + embedder.
         self._config = config
         self._curator: TaskCurator | None = None
+        self._escalator = escalator
+        # R3: per-project async lock serialises add_task / add_subtask
+        # calls. Concurrent triages of the same suggestion no longer race
+        # to create duplicate tasks — the second call waits, sees the
+        # first's ``note_created`` entry, and short-circuits to drop.
+        self._project_locks: dict[str, asyncio.Lock] = {}
         # One-shot flag: prevents redundant auto-backfill checks on subsequent calls.
         self._backfill_triggered: bool = False
         # Set by close(); prevents _get_curator() from re-creating a curator.
@@ -349,6 +357,7 @@ class TaskInterceptor:
                 config=self._config,
                 taskmaster=self.taskmaster,
                 cwd=cwd,
+                escalator=self._escalator,
             )
             # Trigger the one-shot backfill check as a background task so the
             # caller is not delayed by the Qdrant count() round-trip.
@@ -643,6 +652,86 @@ class TaskInterceptor:
 
     # ── Write pass-throughs (emit event, no targeted reconciliation) ───
 
+    def _project_lock(self, project_id: str) -> asyncio.Lock:
+        """Return (lazily) the per-project serialisation lock for adds."""
+        lock = self._project_locks.get(project_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._project_locks[project_id] = lock
+        return lock
+
+    @staticmethod
+    def _extract_metadata_dict(metadata) -> dict | None:
+        """Best-effort parse of ``metadata`` into a dict, or None."""
+        if metadata is None:
+            return None
+        if isinstance(metadata, dict):
+            return metadata
+        if isinstance(metadata, str):
+            try:
+                parsed = json.loads(metadata)
+            except (json.JSONDecodeError, ValueError):
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return None
+
+    async def _check_escalation_idempotency(
+        self, *, project_root: str, metadata,
+    ) -> dict | None:
+        """Return an existing task's identity if ``(escalation_id,
+        suggestion_hash)`` in ``metadata`` matches a non-cancelled task.
+
+        R4: authoritative and cheap — no LLM, no embedding lookup.
+        Works even when the curator is disabled or broken, which is
+        exactly the regime that triggered the duplicate Type::Error
+        tasks (esc-1912-179 → esc-1912-190).
+        """
+        meta = self._extract_metadata_dict(metadata)
+        if not meta:
+            return None
+        esc_id = meta.get('escalation_id')
+        sug_hash = meta.get('suggestion_hash')
+        if not isinstance(esc_id, str) or not isinstance(sug_hash, str):
+            return None
+        if not esc_id or not sug_hash:
+            return None
+
+        if self.taskmaster is None:
+            return None
+        try:
+            tasks_result = await self.taskmaster.get_tasks(project_root)
+        except Exception:
+            logger.debug(
+                'r4: get_tasks failed during idempotency check', exc_info=True,
+            )
+            return None
+        for task in flatten_task_tree(tasks_result):
+            tmeta = task.get('metadata')
+            if not isinstance(tmeta, dict):
+                continue
+            if tmeta.get('escalation_id') != esc_id:
+                continue
+            if tmeta.get('suggestion_hash') != sug_hash:
+                continue
+            if str(task.get('status', '')) == 'cancelled':
+                continue
+            tid = str(task.get('id', ''))
+            if not tid:
+                continue
+            logger.warning(
+                'r4: idempotency hit — returning existing task %s for '
+                'escalation_id=%s suggestion_hash=%s',
+                tid, esc_id, sug_hash,
+            )
+            return {
+                'id': tid,
+                'title': str(task.get('title', '')),
+                'deduplicated': True,
+                'action': 'idempotency_hit',
+                'reason': 'escalation+suggestion matched',
+            }
+        return None
+
     async def add_task(self, project_root: str, **kwargs: Any) -> dict:
         # Extract metadata before forwarding — taskmaster's add_task doesn't accept it
         metadata = kwargs.pop('metadata', None)
@@ -653,6 +742,36 @@ class TaskInterceptor:
             kwargs_for_candidate = kwargs
         candidate = self._build_candidate(kwargs_for_candidate)
         project_id = resolve_project_id(project_root)
+
+        async with self._project_lock(project_id):
+            return await self._add_task_locked(
+                project_root=project_root,
+                project_id=project_id,
+                candidate=candidate,
+                metadata=metadata,
+                kwargs=kwargs,
+            )
+
+    async def _add_task_locked(
+        self,
+        *,
+        project_root: str,
+        project_id: str,
+        candidate,
+        metadata,
+        kwargs: dict,
+    ) -> dict:
+        # ── R4: escalation-level idempotency ─────────────────────────
+        # When the caller stamps (escalation_id, suggestion_hash) into
+        # metadata, walk existing tasks and skip the curator entirely if
+        # a match is found. This covers the steward-timeout requeue case
+        # (esc-1912-179 → esc-1912-190 on Type::Error) without an LLM
+        # call or embedding lookup.
+        idempotency_hit = await self._check_escalation_idempotency(
+            project_root=project_root, metadata=metadata,
+        )
+        if idempotency_hit is not None:
+            return idempotency_hit
 
         # ── Curator gate: drop / combine / create ────────────────────
         curator = await self._get_curator()
@@ -716,30 +835,66 @@ class TaskInterceptor:
 
         # ── Create task ──────────────────────────────────────────────
         tm = await self._ensure_taskmaster()
-        result = await tm.add_task(project_root=project_root, **kwargs)
 
-        # Persist metadata via follow-up update_task if provided
+        # Normalise metadata to a JSON string for taskmaster. Serialising here
+        # keeps the MCP boundary (which demands a string) simple and preserves
+        # the plain-dict shape for the fallback update_task path.
+        metadata_json: str | None = None
+        if metadata:
+            metadata_json = (
+                metadata if isinstance(metadata, str) else json.dumps(metadata)
+            )
+
+        # Atomic path: pass metadata in the initial add_task so the task is
+        # never visible without its metadata (prevents the race that dropped
+        # files_to_modify under concurrent load — see task #1922).
+        try:
+            result = await tm.add_task(
+                project_root=project_root,
+                metadata=metadata_json,
+                **kwargs,
+            )
+            atomic_metadata_written = metadata_json is not None
+        except TypeError:
+            # Backwards-compat: pre-R5 taskmaster backends reject the new
+            # ``metadata`` kwarg. Fall through to the legacy two-step path.
+            result = await tm.add_task(project_root=project_root, **kwargs)
+            atomic_metadata_written = False
+
+        # Legacy fallback: follow-up update_task when the atomic write was
+        # unavailable. Racy by construction; kept only for rollout safety
+        # while both sides upgrade.
         task_id = None
         if isinstance(result, dict):
             task_id = str(result.get('id', ''))
-        if metadata and task_id:
+        if metadata_json and task_id and not atomic_metadata_written:
             try:
                 await tm.update_task(
-                    task_id=task_id, metadata=metadata, project_root=project_root,
+                    task_id=task_id,
+                    metadata=metadata_json,
+                    project_root=project_root,
                 )
             except Exception as e:
                 logger.warning(
                     f'add_task: metadata update for task {task_id} failed: {e}',
                 )
 
-        # Record survivor in the curator corpus so future checks see it.
+        # Record survivor in the curator. Two layers:
+        # 1. ``note_created`` — synchronous, in-memory exact-match cache.
+        #    MUST run inside the project lock so the *next* waiter on the
+        #    same lock sees the new entry on its pre-LLM check (R3).
+        # 2. ``record_task`` — awaited (not fire-and-forget) so the Qdrant
+        #    corpus has the point before the lock releases, letting a
+        #    near-miss follower's embedding lookup see it too.
         if curator is not None and candidate is not None and task_id:
-            bg = asyncio.create_task(
-                curator.record_task(task_id, candidate, project_id),
-                name=f'curator-record-{task_id}',
-            )
-            self._background_tasks.add(bg)
-            bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+            curator.note_created(project_id, candidate, task_id)
+            try:
+                await curator.record_task(task_id, candidate, project_id)
+            except Exception:
+                logger.warning(
+                    'add_task: curator.record_task awaited path failed for %s',
+                    task_id, exc_info=True,
+                )
 
         event = self._make_event(
             EventType.task_created,
@@ -814,7 +969,24 @@ class TaskInterceptor:
     ) -> dict:
         candidate = self._build_candidate(kwargs)
         project_id = resolve_project_id(project_root)
+        async with self._project_lock(project_id):
+            return await self._add_subtask_locked(
+                parent_id=parent_id,
+                project_root=project_root,
+                project_id=project_id,
+                candidate=candidate,
+                kwargs=kwargs,
+            )
 
+    async def _add_subtask_locked(
+        self,
+        *,
+        parent_id: str,
+        project_root: str,
+        project_id: str,
+        candidate,
+        kwargs: dict,
+    ) -> dict:
         # Curator gate for subtasks — previously bypassed entirely.
         curator = await self._get_curator()
         if curator is not None and candidate is not None:
@@ -864,16 +1036,19 @@ class TaskInterceptor:
         await self.buffer.push(event)
         self._schedule_commit(project_root, f'add_subtask({parent_id})')
 
-        # Record the new subtask in the curator corpus.
+        # Record the new subtask in the curator corpus (synchronous cache
+        # update + awaited Qdrant upsert — see add_task for the rationale).
         if curator is not None and candidate is not None and isinstance(result, dict):
             new_id = str(result.get('id', ''))
             if new_id:
-                bg = asyncio.create_task(
-                    curator.record_task(new_id, candidate, project_id),
-                    name=f'curator-record-{new_id}',
-                )
-                self._background_tasks.add(bg)
-                bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+                curator.note_created(project_id, candidate, new_id)
+                try:
+                    await curator.record_task(new_id, candidate, project_id)
+                except Exception:
+                    logger.warning(
+                        'add_subtask: curator.record_task awaited path failed for %s',
+                        new_id, exc_info=True,
+                    )
         return result
 
     async def remove_task(

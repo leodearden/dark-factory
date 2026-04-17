@@ -539,7 +539,9 @@ class TaskSteward:
             )
             return escalation
 
-        new_detail = format_pretriaged_detail(triage_result, suggestions)
+        new_detail = format_pretriaged_detail(
+            triage_result, suggestions, escalation_id=escalation.id,
+        )
 
         # Return a modified copy — don't mutate the queue's version
         from escalation.models import Escalation as EscModel

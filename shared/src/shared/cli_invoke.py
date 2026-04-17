@@ -82,6 +82,9 @@ class AgentResult:
     - ``stderr``: captured stderr from the CLI process
     - ``account_name``: the OAuth account used for this invocation
     - ``timed_out``: True when the subprocess was killed by a wall-clock timeout
+    - ``schema_salvaged``: True when the CLI reported is_error=True but a valid
+      ``structured_output`` was present — commonly ``error_max_turns`` paired
+      with a completed JSON schema tool-use turn. Callers treat this as success.
     """
 
     success: bool
@@ -99,6 +102,7 @@ class AgentResult:
     cache_read_tokens: int | None = None
     cache_create_tokens: int | None = None
     timed_out: bool = False
+    schema_salvaged: bool = False
 
 
 def _to_token_count(v: int | None) -> int | None:
@@ -576,6 +580,15 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     is_error = data.get('is_error', False)
     is_success = (subtype == 'success' or result.returncode == 0) and not is_error
 
+    # Schema salvage: when the CLI reports is_error=True but the schema tool
+    # already produced a valid structured payload (common with error_max_turns
+    # + --json-schema), trust the payload and report success. The raw error
+    # text stays in ``output`` for diagnostics.
+    schema_salvaged = False
+    if is_error and isinstance(structured, dict):
+        is_success = True
+        schema_salvaged = True
+
     return AgentResult(
         success=is_success,
         output=output_text,
@@ -591,6 +604,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         cache_read_tokens=cache_read_tokens,
         cache_create_tokens=cache_create_tokens,
         timed_out=result.timed_out,
+        schema_salvaged=schema_salvaged,
     )
 
 
