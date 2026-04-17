@@ -291,6 +291,46 @@ class TestWorktreeLifecycle:
         assert 'real_change.py' in files
         assert '.taskmaster/tasks/tasks.json' not in files
 
+    async def test_tasks_json_staged_directly_is_unstaged_by_commit(
+        self, git_ops: GitOps, caplog,
+    ):
+        """Direct ``git add .taskmaster/tasks/tasks.json`` is unstaged by commit().
+
+        The bulk-add pathspec excludes tasks.json, but an agent could bypass
+        that by staging the file directly.  The post-staging safety net inside
+        commit() must catch that and unstage it (mirror of the .task/ guard).
+        """
+        worktree_info = await git_ops.create_worktree('feature-direct-tasks')
+
+        tasks_dir = worktree_info.path / '.taskmaster' / 'tasks'
+        tasks_dir.mkdir(parents=True, exist_ok=True)
+        (tasks_dir / 'tasks.json').write_text('{"agent": "directly staged"}\n')
+        await _run(
+            ['git', 'add', '.taskmaster/tasks/tasks.json'],
+            cwd=worktree_info.path,
+        )
+
+        # Need an unrelated change so commit() still produces a sha
+        (worktree_info.path / 'real_change.py').write_text('x = 1\n')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            sha = await git_ops.commit(worktree_info.path, 'Add real change')
+
+        assert sha is not None
+
+        rc, files, _ = await _run(
+            ['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', sha],
+            cwd=worktree_info.path,
+        )
+        assert 'real_change.py' in files
+        assert '.taskmaster/tasks/tasks.json' not in files
+
+        assert any(
+            '.taskmaster/tasks/' in rec.getMessage()
+            and 'CONTAMINATION' in rec.getMessage()
+            for rec in caplog.records
+        )
+
     async def test_cleanup_worktree(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-5')
         assert worktree_info.path.exists()
@@ -811,6 +851,66 @@ class TestWorkingTreeSync:
 
         # Overlap detected before stash — staged README.md overlaps merge diff
         assert result == 'wip_overlap'
+
+    async def test_tasks_json_dirty_does_not_block_advance(self, git_ops: GitOps):
+        """Dirty .taskmaster/tasks/tasks.json overlapping merge diff does NOT block advance.
+
+        The fused-memory MCP commits tasks.json out-of-band on a fire-and-forget
+        schedule, racing with the overlap check.  Branches never legitimately
+        introduce tasks.json deltas (commit() excludes it from staging), so a
+        tasks.json-only overlap is always the MCP race — must not halt the queue.
+        """
+        # Seed tasks.json on main so it's a tracked file
+        tasks_dir = git_ops.project_root / '.taskmaster' / 'tasks'
+        tasks_dir.mkdir(parents=True)
+        (tasks_dir / 'tasks.json').write_text('{"v": 1}\n')
+        await _run(
+            ['git', 'add', '.taskmaster/tasks/tasks.json'],
+            cwd=git_ops.project_root,
+        )
+        await _run(
+            ['git', 'commit', '-m', 'seed tasks.json'],
+            cwd=git_ops.project_root,
+        )
+
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
+        # Simulate the MCP race: tasks.json dirty in project_root before overlap check
+        (tasks_dir / 'tasks.json').write_text('{"v": 2}\n')
+
+        # Build a branch whose merge diff includes tasks.json (bypass commit()'s
+        # pathspec by staging directly — this is what an out-of-band agent would do)
+        worktree_info = await git_ops.create_worktree('overlap-tasks-json')
+        branch_tasks = worktree_info.path / '.taskmaster' / 'tasks' / 'tasks.json'
+        branch_tasks.parent.mkdir(parents=True, exist_ok=True)
+        branch_tasks.write_text('{"v": 3}\n')
+        await _run(
+            ['git', 'add', '.taskmaster/tasks/tasks.json'],
+            cwd=worktree_info.path,
+        )
+        await _run(
+            ['git', 'commit', '-m', 'change tasks.json on branch'],
+            cwd=worktree_info.path,
+        )
+        merge_result = await git_ops.merge_to_main(
+            worktree_info.path, 'overlap-tasks-json',
+        )
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        # tasks.json overlap is filtered by pathspec → advance proceeds
+        assert result == 'advanced'
+
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() != main_after.strip()
 
     async def test_pop_conflict_recovery_via_mock(self, git_ops: GitOps):
         """When stash pop fails, advance_main creates recovery branch and returns 'pop_conflict'."""

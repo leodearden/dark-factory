@@ -581,6 +581,29 @@ class GitOps:
             )
             await _run(['git', 'reset', 'HEAD', '--', '.task/'], cwd=worktree)
 
+        # ── Post-staging .taskmaster/tasks/ safety net ────────────────
+        # Same belt-and-braces check for tasks.json: the pathspec excludes
+        # it during the bulk add, but agents can bypass that with
+        # `git add .taskmaster/tasks/tasks.json` directly.  Main is
+        # canonical for tasks.json; landing a stale branch copy could
+        # silently overwrite other tasks' status updates at merge time.
+        rc, staged_taskmaster, _ = await _run(
+            ['git', 'diff', '--cached', '--name-only', '--', '.taskmaster/tasks/'],
+            cwd=worktree,
+        )
+        if rc == 0 and staged_taskmaster.strip():
+            logger.warning(
+                '.taskmaster/tasks/ CONTAMINATION caught in commit() — %d file(s) '
+                'were staged despite :!.taskmaster/tasks pathspec (an agent likely '
+                'ran "git add .taskmaster/tasks/" directly). Unstaging now: %s',
+                len(staged_taskmaster.strip().splitlines()),
+                staged_taskmaster.strip()[:200],
+            )
+            await _run(
+                ['git', 'reset', 'HEAD', '--', '.taskmaster/tasks/'],
+                cwd=worktree,
+            )
+
         # Check for changes
         rc, _, _ = await _run(['git', 'diff', '--cached', '--quiet'], cwd=worktree)
         if rc == 0:
@@ -1071,14 +1094,22 @@ class GitOps:
                 # which eats the leading space from " M filename" status.
                 # Exclude .task/ (ephemeral) and the worktree dir (managed by git).
                 wt_dir = self.config.worktree_dir
+                # Also exclude .taskmaster/tasks/tasks.json: the fused-memory
+                # MCP commits this file out-of-band on a fire-and-forget
+                # schedule, racing with our overlap check.  Branches never
+                # legitimately introduce tasks.json deltas (commit() excludes
+                # it from staging), so a tasks.json-only overlap is always
+                # the MCP auto-commit race, never real WIP.
                 _, unstaged_files, _ = await _run(
                     ['git', 'diff', '--name-only', '--',
-                     '.', ':!.task', f':!{wt_dir}'],
+                     '.', ':!.task', f':!{wt_dir}',
+                     ':!.taskmaster/tasks/tasks.json'],
                     cwd=self.project_root,
                 )
                 _, staged_files, _ = await _run(
                     ['git', 'diff', '--name-only', '--cached', '--',
-                     '.', ':!.task', f':!{wt_dir}'],
+                     '.', ':!.task', f':!{wt_dir}',
+                     ':!.taskmaster/tasks/tasks.json'],
                     cwd=self.project_root,
                 )
                 dirty_tracked = {
