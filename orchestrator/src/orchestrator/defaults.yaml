@@ -134,12 +134,49 @@ review:
 # Scheduler fairness — anti-starvation for broad-footprint tasks.
 # Install a short-lived module reservation once a top-ranked candidate has
 # been skipped N times in a row; lease scales with observed task duration.
+#
+# Per-tier skip_threshold / lease_multiplier: high-value tiers park quickly
+# with a long lease; low-value tiers are effectively opted out of parking
+# (threshold 9999 == "never park").  Once a threshold reaches >= 1000, the
+# task_skipped event stream is rate-limited to geometric counts so the event
+# store is not flooded with perpetual-loser diagnostics.
 fairness:
-  skip_threshold: 4
-  lease_multiplier: 5.0
+  skip_threshold:
+    critical: 1
+    high: 2
+    medium: 6
+    low: 9999
+    polish: 9999
+  lease_multiplier:
+    critical: 8.0
+    high: 8.0
+    medium: 5.0
+    low: 2.0
+    polish: 2.0
   lease_min_secs: 60.0
   lease_max_secs: 3600.0
   median_window: 50
+
+# Value/h scheduler scoring knobs.
+#   score(t) = TIER_BASE[eff_priority(t)]
+#            + min(age_alpha * age + cpm_beta * log1p(transitive_dependents),
+#                  TIER_WIDTH - 1)
+# Age is proxied by (max_id - task_id): the number of newer tasks created
+# since this one first went pending.  Resurrected cancelled tasks reset
+# their age anchor — they do not inherit accumulated age.
+age_alpha: 10.0
+cpm_beta: 100.0
+
+# Gentle per-tier slot caps (fraction of max_concurrent_tasks reserved for
+# that tier or higher).  Missing entries default to 1.0 (no cap).  Parks
+# override tier caps — once a fairness reservation is installed, the owner
+# dispatches even if the cap would otherwise reject.
+tier_slot_caps:
+  critical: 1.0
+  high: 1.0
+  medium: 0.95
+  low: 0.9
+  polish: 0.9
 
 # Sandbox
 sandbox:

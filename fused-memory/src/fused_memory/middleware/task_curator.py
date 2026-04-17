@@ -51,7 +51,7 @@ _STATUS_RANK = {
     'deferred': 3,
     'done': 4,
 }
-_PRIORITY_RANK = {'high': 0, 'medium': 1, 'low': 2}
+_PRIORITY_RANK = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'polish': 4}
 DEFAULT_PRIORITY = 'medium'  # canonical fallback used by both record_task and backfill_corpus
 if DEFAULT_PRIORITY not in _PRIORITY_RANK:
     raise ValueError(f'{DEFAULT_PRIORITY!r} not in _PRIORITY_RANK')

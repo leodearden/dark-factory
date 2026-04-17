@@ -73,6 +73,7 @@ class EventType(StrEnum):
     reservation_installed = 'reservation_installed'
     reservation_expired = 'reservation_expired'
     reservation_used = 'reservation_used'
+    scheduler_tier_cap_idle = 'scheduler_tier_cap_idle'
 
     # Plan revalidation
     plan_revalidated = 'plan_revalidated'

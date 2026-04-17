@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import statistics
 import time
 from collections import deque
@@ -12,10 +13,24 @@ from dataclasses import dataclass
 
 from shared.locking import files_to_modules, normalize_lock
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import (
+    DEFAULT_TIER,
+    PRIORITY_RANK,
+    PRIORITY_TIERS,
+    TIER_BASE,
+    TIER_WIDTH,
+    OrchestratorConfig,
+    coerce_tier,
+)
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp_lifecycle import mcp_call
 from orchestrator.task_status import TERMINAL_STATUSES, is_valid_transition
+
+# task_skipped events for "effectively infinite" skip thresholds (>= this
+# value) are rate-limited to a geometric schedule so the event store is not
+# flooded with diagnostics for tasks that will perpetually lose the race.
+_INF_SKIP_THRESHOLD: int = 1000
+_GEOMETRIC_SKIP_EMIT_COUNTS: frozenset[int] = frozenset({1, 10, 100, 1000, 10000})
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +245,16 @@ class Scheduler:
         self._recent_durations: deque[float] = deque(
             maxlen=config.fairness.median_window
         )
+        # Per-tier cap bookkeeping: remember the effective priority of every
+        # currently-dispatched task so acquire_next can count slots at-or-below
+        # a candidate's tier without re-walking the full task graph.
+        self._dispatched_priority: dict[str, str] = {}
+        # Age-anchor bookkeeping for score(): first time we see a task as
+        # pending, we record its age baseline.  Cleared on transition to any
+        # non-pending status so a cancelled->pending resurrection starts
+        # fresh (no accumulated age).
+        self._pending_anchor: dict[str, int] = {}
+        self._was_non_pending: set[str] = set()
 
     async def get_tasks(self) -> list[dict]:
         """Fetch all tasks from fused-memory/taskmaster."""
@@ -374,41 +399,67 @@ class Scheduler:
                 return False
         return True
 
-    def _compute_lease(self) -> float:
+    def _compute_lease(self, tier: str = DEFAULT_TIER) -> float:
         """Compute a reservation lease from the rolling duration window.
 
         - Empty history → midpoint of ``[lease_min_secs, lease_max_secs]``
         - Otherwise → ``median * lease_multiplier``, clamped to bounds.
+
+        The multiplier is resolved per-*tier* (critical/high parks carry a
+        longer lease than low/polish) via
+        :meth:`FairnessConfig.lease_multiplier_for`.
         """
         f = self.config.fairness
         if not self._recent_durations:
             return (f.lease_min_secs + f.lease_max_secs) / 2
         median = statistics.median(self._recent_durations)
-        lease = median * f.lease_multiplier
+        lease = median * f.lease_multiplier_for(tier)
         return max(f.lease_min_secs, min(lease, f.lease_max_secs))
 
-    def _bump_skip_and_maybe_park(self, task_id: str, modules: list[str]) -> None:
+    def _bump_skip_and_maybe_park(
+        self,
+        task_id: str,
+        modules: list[str],
+        tier: str = DEFAULT_TIER,
+    ) -> None:
         """Increment *task_id*'s skip counter; install a reservation if it
         has just crossed ``skip_threshold`` and does not already hold parks.
+
+        *tier* is the task's effective priority — it selects a per-tier
+        threshold and lease multiplier.  When the per-tier threshold is
+        >= ``_INF_SKIP_THRESHOLD`` (e.g. ``9999`` for low/polish in the
+        default config) parking is effectively disabled and the
+        ``task_skipped`` event stream is rate-limited to geometric counts.
         """
         if not task_id:
             return
         count = self._skip_count.get(task_id, 0) + 1
         self._skip_count[task_id] = count
-        if self.event_store:
+        threshold = self.config.fairness.skip_threshold_for(tier)
+        # Rate-limit task_skipped for tiers that will never park: emit only
+        # at {1, 10, 100, 1000, 10000, ...} so the event store is not flooded.
+        should_emit = (
+            threshold < _INF_SKIP_THRESHOLD
+            or count in _GEOMETRIC_SKIP_EMIT_COUNTS
+        )
+        if self.event_store and should_emit:
             self.event_store.emit(
                 EventType.task_skipped,
                 task_id=task_id,
-                data={'skip_count': count, 'modules': modules},
+                data={
+                    'skip_count': count,
+                    'modules': modules,
+                    'priority': tier,
+                    'threshold': threshold,
+                },
             )
-        threshold = self.config.fairness.skip_threshold
         if count >= threshold and not self.lock_table.has_parks(task_id):
-            lease = self._compute_lease()
+            lease = self._compute_lease(tier)
             deadline = time.monotonic() + lease
             installed = self.lock_table.install_parks(task_id, modules, deadline)
             logger.info(
-                'Task %s reserved modules %s (skip_count=%d, lease=%.1fs)',
-                task_id, installed, count, lease,
+                'Task %s reserved modules %s (skip_count=%d, lease=%.1fs, tier=%s)',
+                task_id, installed, count, lease, tier,
             )
             if self.event_store:
                 self.event_store.emit(
@@ -418,13 +469,201 @@ class Scheduler:
                         'modules': installed,
                         'skip_count': count,
                         'lease_secs': lease,
+                        'priority': tier,
                     },
                 )
 
-    async def acquire_next(self) -> TaskAssignment | None:
-        """Find next eligible task: pending, deps done, module locks available.
+    # --- Value/h scoring helpers (P1/P2/P3) -----------------------------
 
-        Priority: explicit priority > dependency depth > task ID.
+    @staticmethod
+    def _build_reverse_index(tasks: list[dict]) -> dict[str, set[str]]:
+        """Build ``{dep_id -> {tasks_that_depend_on_dep_id}}`` in one pass.
+
+        Replaces the O(N^2) inline dependents scan the legacy sort key used.
+        """
+        rev: dict[str, set[str]] = {}
+        for t in tasks:
+            tid = str(t.get('id', ''))
+            if not tid:
+                continue
+            for d in t.get('dependencies', []):
+                dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
+                if dep_id:
+                    rev.setdefault(dep_id, set()).add(tid)
+        return rev
+
+    @staticmethod
+    def _compute_effective_priorities(
+        tasks_by_id: dict[str, dict],
+        reverse_index: dict[str, set[str]],
+        status_map: dict[str, str],
+    ) -> dict[str, str]:
+        """Priority inheritance (P1).
+
+        ``effective_priority(t) = min-rank(own, effective(d) for d in dependents(t))``
+        walking only undone dependents (``status not in {done, cancelled}``).
+
+        Tri-state DFS guards against dependency cycles: on a cycle the task
+        contributes only its own priority and a WARN is logged.
+        """
+        memo: dict[str, str] = {}
+        visiting: set[str] = set()
+        walked: set[str] = set()
+
+        def walk(tid: str) -> str:
+            if tid in memo:
+                return memo[tid]
+            if tid in visiting:
+                logger.warning(
+                    'Priority inheritance: cycle detected at task %s; using own priority only',
+                    tid,
+                )
+                task = tasks_by_id.get(tid, {})
+                return coerce_tier(task.get('priority'))
+            visiting.add(tid)
+            task = tasks_by_id.get(tid, {})
+            own = coerce_tier(task.get('priority'))
+            best_rank = PRIORITY_RANK[own]
+            for parent_id in reverse_index.get(tid, ()):
+                parent_status = status_map.get(parent_id, '')
+                if parent_status in ('done', 'cancelled'):
+                    continue
+                parent_eff = walk(parent_id)
+                parent_rank = PRIORITY_RANK[parent_eff]
+                if parent_rank < best_rank:
+                    best_rank = parent_rank
+            visiting.discard(tid)
+            walked.add(tid)
+            result = PRIORITY_TIERS[best_rank]
+            memo[tid] = result
+            return result
+
+        for tid in tasks_by_id:
+            if tid not in memo:
+                walk(tid)
+        return memo
+
+    @staticmethod
+    def _compute_transitive_counts(
+        tasks_by_id: dict[str, dict],
+        reverse_index: dict[str, set[str]],
+        status_map: dict[str, str],
+    ) -> dict[str, int]:
+        """CPM proxy (P3): BFS over the reverse-dependency graph per task,
+        counting undone descendants.  Memoized per cycle, O(N+E) overall.
+        """
+        memo: dict[str, int] = {}
+
+        def bfs(root: str) -> int:
+            seen: set[str] = set()
+            queue: deque[str] = deque([root])
+            count = 0
+            while queue:
+                current = queue.popleft()
+                for child in reverse_index.get(current, ()):
+                    if child in seen:
+                        continue
+                    seen.add(child)
+                    if status_map.get(child, '') in ('done', 'cancelled'):
+                        # Walk through to find further undone descendants (they
+                        # may themselves unlock work).
+                        queue.append(child)
+                        continue
+                    count += 1
+                    queue.append(child)
+            return count
+
+        for tid in tasks_by_id:
+            memo[tid] = bfs(tid)
+        return memo
+
+    def _compute_age(self, task_id: str, max_id: int) -> int:
+        """Return this task's age, in "newer-task-count" units.
+
+        Anchors are lazily initialized in :meth:`_update_age_anchors`; they
+        reset to the *current* max_id on resurrection so a cancelled→pending
+        task does not inherit accumulated age.
+        """
+        anchor = self._pending_anchor.get(task_id)
+        if anchor is None:
+            return 0
+        return max(0, max_id - anchor)
+
+    def _update_age_anchors(self, tasks: list[dict], max_id: int) -> None:
+        """Maintain per-task age anchors across ticks.
+
+        - First time we see a task as pending with no prior non-pending
+          history, anchor to its own numeric id (so genuinely-old pending
+          tasks carry accumulated age from the start).
+        - First time we see a task as pending after having seen it
+          non-pending, anchor to *current max_id* (resurrection resets age).
+        - On any non-pending observation, drop the anchor and mark the task
+          as ever-non-pending so the next pending appearance is a fresh start.
+        """
+        for t in tasks:
+            tid = str(t.get('id', ''))
+            if not tid:
+                continue
+            status = t.get('status', '')
+            if status != 'pending':
+                self._pending_anchor.pop(tid, None)
+                if status:
+                    self._was_non_pending.add(tid)
+                continue
+            if tid in self._pending_anchor:
+                continue
+            # First-seen pending for this tid.
+            if tid in self._was_non_pending:
+                # Resurrection — start fresh from now.
+                self._pending_anchor[tid] = max_id
+            elif tid.isdigit():
+                self._pending_anchor[tid] = int(tid)
+            else:
+                self._pending_anchor[tid] = max_id
+
+    def _compute_score(
+        self,
+        tier: str,
+        age: int,
+        transitive_count: int,
+    ) -> float:
+        """Compute the total dispatch score for a task.
+
+        ``score = TIER_BASE[tier] + min(α*age + β*log1p(trans), TIER_WIDTH - 1)``
+
+        The combined age+CPM bonus is capped below ``TIER_WIDTH`` so bonuses
+        can never bump a task across a tier boundary — priority always wins.
+        """
+        tier = coerce_tier(tier)
+        base = TIER_BASE[tier]
+        age_bonus = self.config.age_alpha * float(age)
+        cpm_bonus = self.config.cpm_beta * math.log1p(max(0, transitive_count))
+        bonus = min(age_bonus + cpm_bonus, float(TIER_WIDTH - 1))
+        return float(base) + bonus
+
+    def _count_dispatched_at_or_below(self, tier: str) -> int:
+        """Count currently-dispatched tasks whose effective priority is at
+        *tier* or lower (i.e. same rank or larger rank value)."""
+        tier = coerce_tier(tier)
+        rank = PRIORITY_RANK[tier]
+        return sum(
+            1
+            for p in self._dispatched_priority.values()
+            if PRIORITY_RANK.get(coerce_tier(p), PRIORITY_RANK[DEFAULT_TIER]) >= rank
+        )
+
+    def _allowed_by_tier_cap(self, tier: str) -> bool:
+        """Return False iff admitting a task at *tier* would exceed the
+        configured per-tier slot cap."""
+        limit = self.config.tier_slot_limit(tier)
+        return self._count_dispatched_at_or_below(tier) < limit
+
+    async def acquire_next(self) -> TaskAssignment | None:
+        """Find next eligible task under the value/h scoring model.
+
+        Dispatch order is determined by ``_compute_score()``: tier base is
+        dominant, age + CPM bonuses order tasks within a tier, and
+        per-tier slot caps reserve headroom for higher-value work.
         """
         # Fairness: evict expired reservations and reset their owners' skip
         # counts so they can re-accumulate instead of immediately re-parking.
@@ -444,20 +683,41 @@ class Scheduler:
         if not tasks:
             return None
 
-        # Build status map
-        status_map = {}
+        # Status + id indices, built once per tick.
+        status_map: dict[str, str] = {}
+        tasks_by_id: dict[str, dict] = {}
+        max_id = 0
         for t in tasks:
             tid = str(t.get('id', ''))
+            if not tid:
+                continue
             status_map[tid] = t.get('status', 'unknown')
+            tasks_by_id[tid] = t
+            if tid.isdigit():
+                max_id = max(max_id, int(tid))
 
-        # Filter to pending tasks whose deps are all done
-        candidates = []
+        # Maintain age anchors (resurrected tasks reset their anchor).
+        self._update_age_anchors(tasks, max_id)
+
+        # Build reverse index + compute effective priorities + CPM counts
+        # once per tick (O(N+E)).
+        reverse_index = self._build_reverse_index(tasks)
+        effective_priorities = self._compute_effective_priorities(
+            tasks_by_id, reverse_index, status_map
+        )
+        transitive_counts = self._compute_transitive_counts(
+            tasks_by_id, reverse_index, status_map
+        )
+
+        # Filter to pending tasks whose deps are all done and that aren't
+        # dispatched or in their post-requeue cooldown window.
+        candidates: list[dict] = []
         for t in tasks:
             if t.get('status') != 'pending':
                 continue
-            if str(t.get('id', '')) in self._dispatched:
-                continue
             tid_str = str(t.get('id', ''))
+            if tid_str in self._dispatched:
+                continue
             cooldown_deadline = self._requeue_until.get(tid_str)
             if cooldown_deadline is not None:
                 if time.monotonic() < cooldown_deadline:
@@ -470,41 +730,55 @@ class Scheduler:
         if not candidates:
             return None
 
-        # Sort by priority (high first), then dependency depth (deeper first), then ID
-        def sort_key(t):
-            priority_map = {'high': 0, 'medium': 1, 'low': 2}
-            p = priority_map.get(t.get('priority', 'medium'), 1)
-            # Count how many other tasks depend on this one
+        # Score each candidate.  Higher score wins; ties broken by task_id
+        # string order (stable, FIFO-ish for numeric ids).
+        scored: list[tuple[float, str, dict, str]] = []
+        for t in candidates:
             tid = str(t.get('id', ''))
-            dependents = sum(
-                1 for other in tasks
-                if any(
-                    str(d.get('id', d) if isinstance(d, dict) else d) == tid
-                    for d in other.get('dependencies', [])
-                )
+            pri = effective_priorities.get(tid, coerce_tier(t.get('priority')))
+            age = self._compute_age(tid, max_id)
+            transitive = transitive_counts.get(tid, 0)
+            score = self._compute_score(pri, age, transitive)
+            scored.append((score, tid, t, pri))
+
+        scored.sort(key=lambda entry: (-entry[0], entry[1]))
+
+        # DEBUG: log the top 3 so α/β tuning is post-hoc diagnosable.
+        if logger.isEnabledFor(logging.DEBUG):
+            top3 = scored[:3]
+            logger.debug(
+                'acquire_next top candidates: %s',
+                [
+                    {
+                        'id': e[1],
+                        'score': round(e[0], 2),
+                        'pri': e[3],
+                    }
+                    for e in top3
+                ],
             )
-            return (p, -dependents, str(t.get('id', '')))
 
-        candidates.sort(key=sort_key)
-
-        # Fairness bookkeeping: remember the strict top candidate so we can
-        # detect Mode-2 starvation (top was passed over in favor of a lower
-        # candidate) and install a reservation after repeated skips.
-        top_task = candidates[0]
-        top_id = str(top_task.get('id', ''))
+        # Strict top is the highest-scoring eligible candidate.  We track it
+        # for fairness bookkeeping (skip counter / park installation).
+        top_score, top_id, top_task, top_pri = scored[0]
         top_modules = self._get_modules(top_task)
         top_had_parks = self.lock_table.has_parks(top_id)
 
-        # Try to acquire module locks
-        for task in candidates:
+        cap_blocked = 0
+        for _score, task_id, task, pri in scored:
             modules = self._get_modules(task)
-            task_id = str(task.get('id', ''))
+            # Tier-cap filter: skip candidates that would exceed their tier's
+            # slot budget.  Parks override caps — once a fairness reservation
+            # is installed, the owner dispatches regardless.
+            has_park = self.lock_table.has_parks(task_id)
+            if not has_park and not self._allowed_by_tier_cap(pri):
+                cap_blocked += 1
+                continue
             if self.lock_table.try_acquire(task_id, modules):
                 self._dispatched.add(task_id)
+                self._dispatched_priority[task_id] = pri
                 self._task_start_times[task_id] = time.monotonic()
                 if task_id == top_id:
-                    # Top candidate got in — reset its skip counter and clear
-                    # any reservation it may have been holding.
                     self._skip_count.pop(task_id, None)
                     if top_had_parks:
                         self.lock_table.clear_parks_for(task_id)
@@ -512,21 +786,34 @@ class Scheduler:
                             self.event_store.emit(
                                 EventType.reservation_used,
                                 task_id=task_id,
-                                data={'modules': modules},
+                                data={'modules': modules, 'priority': pri},
                             )
                 else:
                     # A lower-ranked task won — top was passed over this tick.
-                    self._bump_skip_and_maybe_park(top_id, top_modules)
+                    self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
                 if self.event_store:
                     self.event_store.emit(
                         EventType.lock_acquired,
                         task_id=task_id,
-                        data={'modules': modules},
+                        data={'modules': modules, 'priority': pri},
                     )
                 return TaskAssignment(task_id=task_id, task=task, modules=modules)
 
+        # No candidate acquired.  If at least one was blocked by a tier cap,
+        # emit a single idle-diagnostic event so "why are slots idle" is
+        # visible in the event store.
+        if cap_blocked and self.event_store:
+            self.event_store.emit(
+                EventType.scheduler_tier_cap_idle,
+                data={
+                    'candidates_skipped_by_cap': cap_blocked,
+                    'top_id': top_id,
+                    'top_priority': top_pri,
+                },
+            )
+
         # Loop exhausted with no acquire — top candidate was also skipped.
-        self._bump_skip_and_maybe_park(top_id, top_modules)
+        self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
         return None
 
     async def handle_blast_radius_expansion(
@@ -571,6 +858,7 @@ class Scheduler:
     def release(self, task_id: str, *, requeued: bool = False) -> None:
         """Release all module locks for a task and clear dispatch guard."""
         self._dispatched.discard(task_id)
+        self._dispatched_priority.pop(task_id, None)
         if requeued:
             self._requeue_until[task_id] = (
                 time.monotonic() + self.config.requeue_cooldown_secs
