@@ -6,7 +6,13 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.config import (
+    TIER_BASE,
+    TIER_WIDTH,
+    ModuleConfig,
+    OrchestratorConfig,
+)
+from orchestrator.event_store import EventType
 from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules
 from tests.conftest import _spy_set_cached_status
 
@@ -1736,3 +1742,475 @@ class TestSpySetCachedStatus:
         assert ('t1', 's1') in recorded
         # original is also called (forwarding, not just capturing)
         assert ('t1', 's1') in d.calls
+
+
+# ---------------------------------------------------------------------------
+# Value/h scoring: priority inheritance (P1), age boost (P2), CPM weight (P3),
+# per-tier slot caps (Fix 3), per-tier skip thresholds (Fix 2).
+# ---------------------------------------------------------------------------
+
+
+def _pending_task(
+    task_id: str,
+    *,
+    priority: str = 'medium',
+    deps: list[str] | None = None,
+    modules: list[str] | None = None,
+    status: str = 'pending',
+) -> dict:
+    """Helper: build a task dict with all fields the scheduler reads."""
+    return {
+        'id': task_id,
+        'title': f'Task {task_id}',
+        'status': status,
+        'priority': priority,
+        'dependencies': [{'id': d} for d in (deps or [])],
+        'metadata': {'modules': modules or [f'mod{task_id}']},
+    }
+
+
+class _RecordingEventStore:
+    """Minimal EventStore stand-in capturing emit() calls in-memory."""
+
+    def __init__(self):
+        self.events: list[tuple[str, dict]] = []
+
+    def emit(self, event_type, *, task_id=None, phase=None, role=None,
+             data=None, cost_usd=None, duration_ms=None):
+        self.events.append((
+            str(event_type),
+            {
+                'task_id': task_id,
+                'data': dict(data or {}),
+            },
+        ))
+
+
+class TestPriorityInheritance:
+    """P1: effective_priority walks dependents and inherits the max rank."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        return Scheduler(OrchestratorConfig(max_per_module=1))
+
+    def test_effective_priority_inherits_from_dependent(self, scheduler: Scheduler):
+        """A medium task with a critical dependent scores as critical."""
+        base = _pending_task('10', priority='medium')
+        consumer = _pending_task('11', priority='critical', deps=['10'])
+        tasks = [base, consumer]
+        by_id = {t['id']: t for t in tasks}
+        rev = scheduler._build_reverse_index(tasks)
+        status_map = {t['id']: t['status'] for t in tasks}
+        eff = scheduler._compute_effective_priorities(by_id, rev, status_map)
+        assert eff['10'] == 'critical'
+        assert eff['11'] == 'critical'
+
+    def test_effective_priority_ignores_done_dependents(self, scheduler: Scheduler):
+        """A done descendant must not lift the ancestor's priority."""
+        base = _pending_task('10', priority='medium')
+        consumer = _pending_task('11', priority='critical', deps=['10'],
+                                 status='done')
+        tasks = [base, consumer]
+        by_id = {t['id']: t for t in tasks}
+        rev = scheduler._build_reverse_index(tasks)
+        status_map = {t['id']: t['status'] for t in tasks}
+        eff = scheduler._compute_effective_priorities(by_id, rev, status_map)
+        assert eff['10'] == 'medium'
+
+    def test_effective_priority_cycle_safe(self, scheduler: Scheduler, caplog):
+        """A self-cycle must not crash and must log a WARN."""
+        import logging
+
+        cyclic = _pending_task('10', priority='high', deps=['10'])
+        tasks = [cyclic]
+        by_id = {t['id']: t for t in tasks}
+        rev = scheduler._build_reverse_index(tasks)
+        status_map = {t['id']: t['status'] for t in tasks}
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            eff = scheduler._compute_effective_priorities(by_id, rev, status_map)
+        assert eff['10'] == 'high'
+        assert any('cycle' in rec.message for rec in caplog.records)
+
+    def test_unknown_priority_treated_as_medium(self, scheduler: Scheduler):
+        """A string we don't recognise coerces to the default tier."""
+        weird = _pending_task('10', priority='weird')
+        tasks = [weird]
+        by_id = {t['id']: t for t in tasks}
+        rev = scheduler._build_reverse_index(tasks)
+        status_map = {t['id']: t['status'] for t in tasks}
+        eff = scheduler._compute_effective_priorities(by_id, rev, status_map)
+        assert eff['10'] == 'medium'
+
+
+class TestTransitiveDependents:
+    """P3: BFS over the reverse-dependency graph, no double-count."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        return Scheduler(OrchestratorConfig(max_per_module=1))
+
+    def test_transitive_linear(self, scheduler: Scheduler):
+        """A -> B -> C: A has 2 undone descendants."""
+        tasks = [
+            _pending_task('A'),
+            _pending_task('B', deps=['A']),
+            _pending_task('C', deps=['B']),
+        ]
+        by_id = {t['id']: t for t in tasks}
+        rev = scheduler._build_reverse_index(tasks)
+        status_map = {t['id']: t['status'] for t in tasks}
+        counts = scheduler._compute_transitive_counts(by_id, rev, status_map)
+        assert counts['A'] == 2
+        assert counts['B'] == 1
+        assert counts['C'] == 0
+
+    def test_transitive_diamond_no_double_count(self, scheduler: Scheduler):
+        """Diamond A -> B, A -> C, B -> D, C -> D: A has 3 undone descendants."""
+        tasks = [
+            _pending_task('A'),
+            _pending_task('B', deps=['A']),
+            _pending_task('C', deps=['A']),
+            _pending_task('D', deps=['B', 'C']),
+        ]
+        by_id = {t['id']: t for t in tasks}
+        rev = scheduler._build_reverse_index(tasks)
+        status_map = {t['id']: t['status'] for t in tasks}
+        counts = scheduler._compute_transitive_counts(by_id, rev, status_map)
+        # B, C, D — each counted once.
+        assert counts['A'] == 3
+
+
+class TestScoreFunction:
+    """P2/P3: compute_score — tier base dominant, bonuses bounded."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        return Scheduler(OrchestratorConfig(max_per_module=1))
+
+    def test_tier_base_dominates(self, scheduler: Scheduler):
+        """A fresh medium task with no descendants scores = TIER_BASE[medium]."""
+        score = scheduler._compute_score('medium', age=0, transitive_count=0)
+        assert score == float(TIER_BASE['medium'])
+
+    def test_age_bonus_bounded_by_tier_width(self, scheduler: Scheduler):
+        """age=1e6 + medium tier must never outscore a fresh high tier."""
+        aged_medium = scheduler._compute_score('medium', age=1_000_000, transitive_count=0)
+        fresh_high = scheduler._compute_score('high', age=0, transitive_count=0)
+        assert aged_medium < fresh_high
+        # Verify the cap: score - base never exceeds TIER_WIDTH - 1.
+        bonus = aged_medium - TIER_BASE['medium']
+        assert bonus <= TIER_WIDTH - 1
+
+    def test_cpm_bonus_positive(self, scheduler: Scheduler):
+        """A task with many descendants scores higher than one without."""
+        alone = scheduler._compute_score('medium', age=0, transitive_count=0)
+        unlock_many = scheduler._compute_score('medium', age=0, transitive_count=1000)
+        assert unlock_many > alone
+        # Still bounded below the next tier.
+        assert unlock_many < TIER_BASE['high']
+
+    def test_combined_bonus_bounded(self, scheduler: Scheduler):
+        """Age + CPM together never cross a tier boundary."""
+        huge = scheduler._compute_score('low', age=10_000, transitive_count=10_000)
+        assert huge < TIER_BASE['medium']
+
+
+class TestAgeAnchor:
+    """Age anchor resets on cancellation → pending resurrection."""
+
+    def test_cancelled_resurrection_no_age_jump(self):
+        """A previously-cancelled task re-pended scores no higher than brand-new medium."""
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        # Tick 1: task 1 is cancelled, task 100 is pending.
+        tasks_tick1 = [
+            _pending_task('1', status='cancelled'),
+            _pending_task('100', status='pending'),
+        ]
+        scheduler._update_age_anchors(tasks_tick1, max_id=100)
+        age_100_t1 = scheduler._compute_age('100', max_id=100)
+        # Tick 2: task 1 is reinstated to pending, task 100 still pending.
+        tasks_tick2 = [
+            _pending_task('1', status='pending'),
+            _pending_task('100', status='pending'),
+        ]
+        scheduler._update_age_anchors(tasks_tick2, max_id=100)
+        age_1 = scheduler._compute_age('1', max_id=100)
+        age_100 = scheduler._compute_age('100', max_id=100)
+        # Resurrected 1 must not leapfrog brand-new 100.
+        assert age_1 <= age_100
+        # Brand-new-pending baseline is 0.
+        assert age_100_t1 == 0
+        assert age_100 == 0
+        assert age_1 == 0
+
+    def test_old_pending_accumulates_age(self):
+        """Continuously-pending old tasks accumulate age from their creation id."""
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        # First-ever tick sees task 5 as pending — anchor to task_id.
+        scheduler._update_age_anchors([_pending_task('5')], max_id=100)
+        age = scheduler._compute_age('5', max_id=100)
+        assert age == 95
+
+
+class TestTierSlotCaps:
+    """Fix 3: per-tier slot caps reserve headroom for higher-value work."""
+
+    def _config(self, caps: dict[str, float]) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            max_concurrent_tasks=10,
+            max_per_module=1,
+            tier_slot_caps=caps,
+        )
+
+    def test_allowed_by_cap_under_limit(self):
+        s = Scheduler(self._config({'low': 0.5}))
+        # 0 dispatched → low allowed (limit = 5).
+        assert s._allowed_by_tier_cap('low') is True
+
+    def test_blocked_at_limit(self):
+        s = Scheduler(self._config({'low': 0.5}))
+        for i in range(5):  # fill 5 low slots
+            s._dispatched_priority[f't{i}'] = 'low'
+        assert s._allowed_by_tier_cap('low') is False
+        # Higher-priority tier still has room (cap 1.0).
+        assert s._allowed_by_tier_cap('high') is True
+
+    def test_lower_counts_toward_higher_budget(self):
+        """A 'low' slot counts against medium's cap too (at-or-below semantics)."""
+        s = Scheduler(self._config({'medium': 0.3}))  # 3 medium-or-below slots
+        for i in range(3):
+            s._dispatched_priority[f't{i}'] = 'low'
+        # Medium is blocked because low slots exhaust the medium-or-below budget.
+        assert s._allowed_by_tier_cap('medium') is False
+        # Critical/high remain unaffected (cap 1.0).
+        assert s._allowed_by_tier_cap('high') is True
+        assert s._allowed_by_tier_cap('critical') is True
+
+    @pytest.mark.asyncio
+    async def test_cap_emits_idle_event(self):
+        """If all candidates are cap-rejected, emit exactly one idle event."""
+        # Cap medium-or-below at 0 so even one medium candidate is rejected.
+        config = OrchestratorConfig(
+            max_concurrent_tasks=4,
+            max_per_module=1,
+            tier_slot_caps={'medium': 0.0, 'low': 0.0, 'polish': 0.0},
+        )
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)
+        tasks = [_pending_task('1', priority='medium')]
+        scheduler.get_tasks = AsyncMock(return_value=tasks)
+        result = await scheduler.acquire_next()
+        assert result is None
+        idle_events = [e for e in event_store.events
+                       if e[0] == EventType.scheduler_tier_cap_idle.value]
+        assert len(idle_events) == 1
+        assert idle_events[0][1]['data']['candidates_skipped_by_cap'] == 1
+
+    @pytest.mark.asyncio
+    async def test_park_overrides_tier_cap(self):
+        """A parked task dispatches even when its tier cap would reject."""
+        config = OrchestratorConfig(
+            max_concurrent_tasks=4,
+            max_per_module=1,
+            tier_slot_caps={'low': 0.0, 'polish': 0.0},  # 0 low slots
+        )
+        scheduler = Scheduler(config)
+        low_task = _pending_task('1', priority='low')
+        # Install a park for task 1 — this should let it through the cap gate.
+        scheduler.lock_table.install_parks(
+            '1', ['mod1'], deadline=time.monotonic() + 300,
+        )
+        scheduler.get_tasks = AsyncMock(return_value=[low_task])
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == '1'
+
+
+class TestPerTierSkipThreshold:
+    """Fix 2: skip_threshold dict unlocks per-tier parking behaviour."""
+
+    def _config(self, thresholds: dict[str, int]) -> OrchestratorConfig:
+        config = OrchestratorConfig(max_per_module=1)
+        config.fairness.skip_threshold = thresholds
+        return config
+
+    def test_skip_threshold_for_lookup(self):
+        config = self._config({'critical': 1, 'high': 2, 'medium': 6,
+                               'low': 9999, 'polish': 9999})
+        assert config.fairness.skip_threshold_for('critical') == 1
+        assert config.fairness.skip_threshold_for('high') == 2
+        assert config.fairness.skip_threshold_for('medium') == 6
+        assert config.fairness.skip_threshold_for('low') == 9999
+
+    def test_skip_threshold_int_legacy(self):
+        """int skip_threshold still works — applies to every tier."""
+        config = OrchestratorConfig(max_per_module=1)
+        config.fairness.skip_threshold = 4
+        assert config.fairness.skip_threshold_for('critical') == 4
+        assert config.fairness.skip_threshold_for('polish') == 4
+
+    def test_critical_parks_after_one_skip(self):
+        """With threshold=1, a single skip is enough to install a park."""
+        config = self._config({'critical': 1, 'high': 2, 'medium': 6,
+                               'low': 9999, 'polish': 9999})
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)
+        scheduler._bump_skip_and_maybe_park('A', ['mod'], tier='critical')
+        assert scheduler.lock_table.has_parks('A')
+
+    def test_low_never_parks_even_after_many_skips(self):
+        """With low=9999, parking is effectively disabled."""
+        config = self._config({'critical': 1, 'high': 2, 'medium': 6,
+                               'low': 9999, 'polish': 9999})
+        scheduler = Scheduler(config)
+        for _ in range(50):
+            scheduler._bump_skip_and_maybe_park('A', ['mod'], tier='low')
+        assert not scheduler.lock_table.has_parks('A')
+
+    def test_task_skipped_rate_limit_for_inf_threshold(self):
+        """With threshold>=1000, task_skipped only emits at geometric counts."""
+        config = self._config({'critical': 1, 'high': 2, 'medium': 6,
+                               'low': 9999, 'polish': 9999})
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)
+        for _ in range(150):
+            scheduler._bump_skip_and_maybe_park('A', ['mod'], tier='low')
+        skip_events = [e for e in event_store.events
+                       if e[0] == EventType.task_skipped.value]
+        # Only counts 1, 10, 100 should have emitted.
+        counts = [e[1]['data']['skip_count'] for e in skip_events]
+        assert counts == [1, 10, 100]
+
+    def test_task_skipped_no_rate_limit_for_finite_threshold(self):
+        """With finite threshold, every skip emits an event."""
+        config = self._config({'critical': 1, 'high': 2, 'medium': 6,
+                               'low': 9999, 'polish': 9999})
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(config, event_store=event_store)
+        for _ in range(3):
+            scheduler._bump_skip_and_maybe_park('A', ['mod'], tier='medium')
+        skip_events = [e for e in event_store.events
+                       if e[0] == EventType.task_skipped.value]
+        assert len(skip_events) == 3
+
+
+class TestLeaseMultiplierPerTier:
+    """Fix 2: lease_multiplier dict unlocks per-tier lease duration."""
+
+    def test_lease_multiplier_for_lookup(self):
+        config = OrchestratorConfig(max_per_module=1)
+        config.fairness.lease_multiplier = {
+            'critical': 8.0, 'high': 8.0, 'medium': 5.0,
+            'low': 2.0, 'polish': 2.0,
+        }
+        assert config.fairness.lease_multiplier_for('critical') == 8.0
+        assert config.fairness.lease_multiplier_for('low') == 2.0
+
+    def test_compute_lease_uses_tier_multiplier(self):
+        config = OrchestratorConfig(max_per_module=1)
+        config.fairness.lease_multiplier = {
+            'critical': 8.0, 'high': 8.0, 'medium': 5.0,
+            'low': 2.0, 'polish': 2.0,
+        }
+        config.fairness.lease_min_secs = 0.0
+        config.fairness.lease_max_secs = 10_000.0
+        scheduler = Scheduler(config)
+        scheduler._recent_durations.extend([10.0])  # median = 10
+        assert scheduler._compute_lease(tier='critical') == 80.0
+        assert scheduler._compute_lease(tier='low') == 20.0
+
+
+class TestLegacyOrderingPreserved:
+    """With 3-tier data + default tier_slot_caps all 1.0 + no CPM + zero age,
+    the new scheduler must match the legacy high>medium>low dispatch order.
+    """
+
+    @pytest.mark.asyncio
+    async def test_legacy_three_tier_ordering_preserved(self):
+        config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
+        # Disable caps and fairness carve-outs for this test.
+        config.tier_slot_caps = {}
+        scheduler = Scheduler(config)
+        tasks = [
+            _pending_task('1', priority='low', modules=['modA']),
+            _pending_task('2', priority='high', modules=['modB']),
+            _pending_task('3', priority='medium', modules=['modC']),
+        ]
+        scheduler.get_tasks = AsyncMock(return_value=tasks)
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == '2', 'high wins'
+
+    @pytest.mark.asyncio
+    async def test_critical_beats_high(self):
+        """New 5-tier: critical outranks high."""
+        config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
+        config.tier_slot_caps = {}
+        scheduler = Scheduler(config)
+        tasks = [
+            _pending_task('1', priority='high', modules=['modA']),
+            _pending_task('2', priority='critical', modules=['modB']),
+        ]
+        scheduler.get_tasks = AsyncMock(return_value=tasks)
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == '2'
+
+    @pytest.mark.asyncio
+    async def test_polish_loses_to_low(self):
+        """New 5-tier: polish ranks below low."""
+        config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
+        config.tier_slot_caps = {}
+        scheduler = Scheduler(config)
+        tasks = [
+            _pending_task('1', priority='polish', modules=['modA']),
+            _pending_task('2', priority='low', modules=['modB']),
+        ]
+        scheduler.get_tasks = AsyncMock(return_value=tasks)
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == '2'
+
+    @pytest.mark.asyncio
+    async def test_inheritance_lifts_dependency(self):
+        """A medium task with a critical dependent is dispatched first."""
+        config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
+        config.tier_slot_caps = {}
+        scheduler = Scheduler(config)
+        # Task 1 (medium, available) is needed by task 2 (critical, blocked).
+        # Inheritance should lift task 1 above task 3 (high, available).
+        tasks = [
+            _pending_task('1', priority='medium', modules=['modA']),
+            _pending_task('2', priority='critical', deps=['1'], modules=['modB']),
+            _pending_task('3', priority='high', modules=['modC']),
+        ]
+        scheduler.get_tasks = AsyncMock(return_value=tasks)
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == '1'
+
+
+class TestDispatchPriorityBookkeeping:
+    """_dispatched_priority must be updated on acquire AND release."""
+
+    @pytest.mark.asyncio
+    async def test_release_clears_dispatched_priority(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = _pending_task('1', priority='high', modules=['modA'])
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+        result = await scheduler.acquire_next()
+        assert result is not None
+        assert scheduler._dispatched_priority['1'] == 'high'
+        scheduler.release('1')
+        assert '1' not in scheduler._dispatched_priority
+
+    @pytest.mark.asyncio
+    async def test_dispatched_priority_tracks_effective_not_own(self):
+        """dispatched_priority reflects effective (inherited) priority."""
+        config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
+        config.tier_slot_caps = {}
+        scheduler = Scheduler(config)
+        tasks = [
+            _pending_task('1', priority='medium', modules=['modA']),
+            _pending_task('2', priority='critical', deps=['1'], modules=['modB']),
+        ]
+        scheduler.get_tasks = AsyncMock(return_value=tasks)
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == '1'
+        # Task 1 was dispatched as critical (inherited from dependent).
+        assert scheduler._dispatched_priority['1'] == 'critical'

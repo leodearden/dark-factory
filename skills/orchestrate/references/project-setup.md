@@ -138,3 +138,48 @@ uv run --project orchestrator orchestrator status
 ```
 
 If the tasks shown belong to the wrong project, your `ORCH_CONFIG_PATH` is wrong — `cd` back into the right project directory and try again.
+
+## Per-subproject module overrides
+
+The orchestrator discovers per-subproject overrides by scanning `<project_root>/*/orchestrator.yaml` for any file that declares one of the overridable fields. These pin verification commands, lock depth, concurrency ceilings, and module-specific concurrency to the subproject they describe — without having to duplicate the knobs in the top-level config.
+
+Overridable fields (see `_OVERRIDABLE_FIELDS` in `orchestrator/src/orchestrator/config.py`):
+
+- `test_command`, `lint_command`, `type_check_command`
+- `lock_depth`, `max_per_module`, `module_overrides`
+- `verify_command_timeout_secs`, `concurrent_verify`, `verify_env`, `scope_cargo`
+
+Example — a Rust subproject with hot crates that should serialize:
+
+```yaml
+# /home/leo/src/reify/crates/orchestrator.yaml
+max_per_module: 1
+module_overrides:
+  crates/reify-core: 1           # always serialize — conflicts everywhere
+  crates/reify-core/tests: 2     # tests are mostly independent
+  crates/reify-util: 2           # medium activity
+```
+
+When the scheduler acquires a lock for a task touching `crates/reify-core/src/foo.rs`, it walks the first path component (`crates`), loads `crates/orchestrator.yaml`, looks for a matching `module_overrides` entry, and falls back to `max_per_module` if none matches.
+
+### Picking values: the `analyze_modules` helper
+
+Guessing the right `max_per_module` for each hot crate is hard and the best way to ground the numbers is measured conflict rates from `runs.db`. The helper reads recent `lock_acquired` / `lock_released` / `task_skipped` events and prints a table suggesting per-module overrides:
+
+```bash
+uv run --project orchestrator python -m orchestrator.analyze_modules \
+    --since 7d /home/leo/src/reify/data/orchestrator/runs.db
+```
+
+Output columns:
+
+- `module` — first-path-component grouping
+- `dispatches` — number of `lock_acquired` events
+- `skipped` — number of `task_skipped` events where this module appeared in the modules field
+- `conflict` — `skipped / dispatches` ratio (0 = idle, >1 = hot)
+- `avg_hold_s` — mean lock-held duration
+- `suggest` — heuristic suggested `max_per_module` (1 for `conflict >= 2.0`, 2 for `>= 0.5`, 3 for `>= 0.1`, 4 otherwise)
+
+Pass `--json` for machine-readable output, `--min-dispatches N` to drop quiet modules.
+
+The suggestions are a starting point for a hand-curated override file — they are deliberately coarse and should be reviewed before applying. After editing the subproject `orchestrator.yaml` and restarting, watch the `task_skipped` rate on the affected prefixes to confirm the change helped.

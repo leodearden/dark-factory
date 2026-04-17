@@ -1102,7 +1102,10 @@ def create_mcp_server(
             description: Manual task description
             details: Manual task details
             dependencies: Comma-separated dependency task IDs
-            priority: high, medium, or low
+            priority: critical, high, medium, low, or polish (default medium).
+                Tiers are strictly ordered: critical > high > medium > low > polish.
+                Scheduler uses priority inheritance — a medium task with a critical
+                dependent schedules as critical. Unknown values coerce to medium.
             metadata: Task metadata (e.g. {"source": "review-cycle", "modules": ["path/to/module"]}).
                 Persisted via a follow-up update_task call after creation.
             tag: Tag context (optional)
