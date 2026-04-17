@@ -18,6 +18,14 @@ cd "$ROOT"
 git config core.hooksPath hooks
 echo "hooks: core.hooksPath set to hooks/"
 
+# --- merge.ours.driver --------------------------------------------------
+# .gitattributes marks .taskmaster/tasks/tasks.json with `merge=ours` so
+# that 3-way merges keep the receiving side (main) — main is canonical
+# for tasks.json.  The attribute is inert until the driver is registered
+# in git config, so do it here.
+git config merge.ours.driver true
+echo "hooks: merge.ours.driver registered"
+
 # --- .task/ gitignore ---------------------------------------------------
 if ! grep -qxF '.task/' .gitignore 2>/dev/null; then
     echo '.task/' >> .gitignore
