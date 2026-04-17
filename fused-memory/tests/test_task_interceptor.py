@@ -113,14 +113,36 @@ async def test_add_task_emits_event(interceptor, event_buffer):
 
 
 @pytest.mark.asyncio
-async def test_add_task_persists_metadata(interceptor, taskmaster):
-    """add_task with metadata calls update_task to persist it."""
+async def test_add_task_persists_metadata_atomically(interceptor, taskmaster):
+    """R5: add_task with metadata forwards it to tm.add_task in one call.
+
+    The racy two-step pattern (add_task then update_task(metadata=...)) is
+    gone; metadata must be written atomically to prevent a concurrent
+    reader from observing a task without its files_to_modify — the bug
+    that left #1922/#1923/#1924 running in parallel.
+    """
+    import json
+
     metadata = {'source': 'review-cycle', 'modules': ['fused-memory/src']}
     result = await interceptor.add_task('/project', prompt='Test', metadata=metadata)
     assert result == {'id': '2', 'title': 'New Task'}
-    taskmaster.update_task.assert_called_once_with(
-        task_id='2', metadata=metadata, project_root='/project'
+    taskmaster.add_task.assert_called_once()
+    kwargs = taskmaster.add_task.call_args.kwargs
+    # Metadata forwarded as a JSON string (the MCP wire format).
+    assert kwargs.get('metadata') == json.dumps(metadata)
+    # No follow-up update_task for metadata — the atomic path wrote it.
+    taskmaster.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_add_task_metadata_string_passed_through(interceptor, taskmaster):
+    """Pre-serialised metadata JSON is forwarded unchanged."""
+    metadata_json = '{"escalation_id":"esc-1","suggestion_hash":"x"}'
+    await interceptor.add_task(
+        '/project', prompt='Test', metadata=metadata_json,
     )
+    kwargs = taskmaster.add_task.call_args.kwargs
+    assert kwargs.get('metadata') == metadata_json
 
 
 @pytest.mark.asyncio
@@ -128,6 +150,52 @@ async def test_add_task_without_metadata_skips_update(interceptor, taskmaster):
     """add_task without metadata does not call update_task."""
     await interceptor.add_task('/project', prompt='Test')
     taskmaster.update_task.assert_not_called()
+    # Backend still receives metadata=None kwarg but the value is falsy.
+    kwargs = taskmaster.add_task.call_args.kwargs
+    assert kwargs.get('metadata') in (None, '')
+
+
+@pytest.mark.asyncio
+async def test_add_task_falls_back_to_two_step_on_typeerror(event_buffer):
+    """Legacy fallback: a backend that rejects ``metadata=`` still works.
+
+    ``TaskmasterBackend.add_task`` on older installs may not accept the
+    new ``metadata`` kwarg (the taskmaster-ai MCP tool was extended in
+    R5). Keep the fallback during rollout so mixed versions don't break.
+    """
+    import json
+
+    tm = AsyncMock()
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+    tm.update_task = AsyncMock(return_value={'success': True})
+
+    call_log: list[dict] = []
+
+    async def add_task(**kwargs):
+        call_log.append(kwargs)
+        if 'metadata' in kwargs:
+            # First attempt: simulate old-signature backend rejecting
+            # the unknown kwarg.
+            raise TypeError(
+                "add_task() got an unexpected keyword argument 'metadata'"
+            )
+        return {'id': '7', 'title': 'Legacy'}
+
+    tm.add_task = add_task
+
+    interceptor = TaskInterceptor(tm, None, event_buffer)
+    metadata = {'escalation_id': 'esc-x', 'suggestion_hash': 'h'}
+    await interceptor.add_task('/project', prompt='Test', metadata=metadata)
+
+    # Two add_task attempts: atomic first (with metadata), retry without.
+    assert len(call_log) == 2
+    assert 'metadata' in call_log[0]
+    assert 'metadata' not in call_log[1]
+    # Legacy update_task follow-up ran because atomic write failed.
+    tm.update_task.assert_called_once()
+    kwargs = tm.update_task.call_args.kwargs
+    assert kwargs['task_id'] == '7'
+    assert kwargs['metadata'] == json.dumps(metadata)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -155,6 +223,8 @@ def _mock_curator(decision: CuratorDecision) -> MagicMock:
     curator.curate = AsyncMock(return_value=decision)
     curator.record_task = AsyncMock()
     curator.reembed_task = AsyncMock()
+    # note_created is a plain sync method on the real TaskCurator.
+    curator.note_created = MagicMock()
     return curator
 
 
@@ -276,6 +346,323 @@ async def test_curator_drop_short_circuits_add_subtask(
     assert result['id'] == '88'
     assert result['action'] == 'drop'
     taskmaster.add_subtask.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# R3: concurrency hardening — per-project lock + pre-LLM short-circuit
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_concurrent_add_task_produces_single_task(
+    taskmaster, reconciler, event_buffer, curator_enabled_config,
+):
+    """Two concurrent add_task calls for identical candidates produce
+    exactly one new task. The second is caught by the pre-LLM
+    exact-match short-circuit after the first's ``note_created`` fires
+    inside the project lock.
+
+    Regression: plans/floating-snuggling-pebble.md §R3. Before R3,
+    reviewers could create #1922/#1923 as twin tasks because Qdrant's
+    record_task was fire-and-forget and the second triage's embedding
+    lookup missed the first task's vector.
+    """
+    from fused_memory.middleware.task_curator import (
+        CandidateTask,
+        CuratorDecision,
+        TaskCurator,
+    )
+
+    # Use a real curator so the exact-match cache is exercised; stub
+    # corpus + LLM so we don't spin up Qdrant.
+    async def empty_corpus(*a, **k):
+        return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+    real_curator = TaskCurator(config=curator_enabled_config, taskmaster=taskmaster)
+    real_curator.record_task = AsyncMock()
+
+    llm_calls = 0
+
+    async def fake_call_llm(*a, **k):
+        nonlocal llm_calls
+        llm_calls += 1
+        return CuratorDecision(action='create', justification='novel')
+
+    real_curator._build_corpus = empty_corpus  # type: ignore[method-assign]
+    real_curator._call_llm = fake_call_llm  # type: ignore[method-assign]
+
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+    )
+    interceptor._curator = real_curator
+
+    # Give each add_task its own unique task_id. First call creates '100',
+    # second (if it ever reaches tm.add_task) would create '101'.
+    add_task_counter = {'n': 99}
+
+    async def fake_add_task(**kwargs):
+        add_task_counter['n'] += 1
+        return {'id': str(add_task_counter['n']), 'title': 'x'}
+
+    taskmaster.add_task = fake_add_task
+
+    candidate_kwargs = dict(
+        title='Log release-mode warning on duplicate template names',
+        description='...',
+    )
+
+    results = await asyncio.gather(
+        interceptor.add_task('/project', **candidate_kwargs),
+        interceptor.add_task('/project', **candidate_kwargs),
+    )
+
+    # Exactly one created; the second is a pre-LLM drop pointing at the first.
+    ids = {r['id'] for r in results}
+    assert ids == {'100'}
+    # Exactly one LLM call — the second never reached _call_llm because
+    # the pre-LLM exact-match cache caught it.
+    assert llm_calls == 1
+    # Only one survivor in taskmaster.
+    assert add_task_counter['n'] == 100
+
+
+@pytest.mark.asyncio
+async def test_note_created_is_called_inside_lock(curator_interceptor, taskmaster):
+    """Sanity check: note_created fires on a real create so the next
+    waiter's pre-LLM check can see it."""
+    decision = CuratorDecision(action='create', justification='novel')
+    curator_mock = _mock_curator(decision)
+    curator_interceptor._curator = curator_mock
+
+    await curator_interceptor.add_task('/project', title='Fresh work')
+
+    curator_mock.note_created.assert_called_once()
+    args, _ = curator_mock.note_created.call_args
+    assert args[0] == 'project'  # project_id
+    assert args[2] == '2'  # task_id from taskmaster fixture
+
+
+@pytest.mark.asyncio
+async def test_pre_llm_exact_match_via_note_created(curator_enabled_config, taskmaster):
+    """Directly exercise TaskCurator.note_created + _pre_llm_exact_match
+    without going through the interceptor.
+    """
+    from fused_memory.middleware.task_curator import (
+        CandidateTask,
+        TaskCurator,
+    )
+
+    curator = TaskCurator(config=curator_enabled_config, taskmaster=taskmaster)
+
+    candidate = CandidateTask(
+        title='Add Type::Error arm',
+        files_to_modify=['crates/reify-compiler/src/parser.rs'],
+    )
+    curator.note_created('proj', candidate, '1922')
+
+    # get_task returns a pending task — match valid → drop.
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1922', 'status': 'pending', 'title': 'x'},
+    )
+    decision = await curator._pre_llm_exact_match(
+        candidate, project_id='proj', project_root='/x',
+    )
+    assert decision is not None
+    assert decision.action == 'drop'
+    assert decision.target_id == '1922'
+    assert decision.justification == 'pre-llm-exact-match'
+
+    # If the cached task is cancelled, pre_llm should fall through.
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1922', 'status': 'cancelled', 'title': 'x'},
+    )
+    curator.note_created('proj', candidate, '1922')  # re-seed
+    decision2 = await curator._pre_llm_exact_match(
+        candidate, project_id='proj', project_root='/x',
+    )
+    assert decision2 is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# R4: escalation-level idempotency on (escalation_id, suggestion_hash)
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_idempotency_hit_skips_curator_and_returns_existing(
+    taskmaster, reconciler, event_buffer, curator_enabled_config,
+):
+    """R4: steward-requeue duplicate suggestion → existing task id.
+
+    Simulates `esc-1912-179 → esc-1912-190` from plan §R4: a re-queued
+    triage sends the same suggestion with a stamped
+    ``(escalation_id, suggestion_hash)`` tuple. The interceptor must
+    find the previously-created task and return its id without the
+    curator firing.
+    """
+    # Existing task carries metadata with the idempotency keys.
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {
+                'id': '555',
+                'title': 'Add Type::Error defensive arm(s)',
+                'status': 'pending',
+                'metadata': {
+                    'escalation_id': 'esc-1912-179',
+                    'suggestion_hash': 'abcd1234abcd1234',
+                },
+            },
+        ],
+    })
+
+    decision = CuratorDecision(action='create', justification='novel')
+    curator_mock = _mock_curator(decision)
+
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+    )
+    interceptor._curator = curator_mock
+
+    metadata = {
+        'escalation_id': 'esc-1912-179',
+        'suggestion_hash': 'abcd1234abcd1234',
+        'modules': ['crates/reify-compiler'],
+    }
+    result = await interceptor.add_task(
+        '/project',
+        title='Add Type::Error defensive arm(s)',
+        description='same suggestion from requeued triage',
+        metadata=metadata,
+    )
+
+    assert result['id'] == '555'
+    assert result['deduplicated'] is True
+    assert result['action'] == 'idempotency_hit'
+    # Curator must not have been consulted.
+    curator_mock.curate.assert_not_called()
+    # Taskmaster add_task never ran.
+    taskmaster.add_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_idempotency_accepts_metadata_as_json_string(
+    taskmaster, reconciler, event_buffer, curator_enabled_config,
+):
+    """Metadata that arrives as a pre-serialised JSON string also dedupes."""
+    import json
+
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {
+                'id': '555',
+                'status': 'pending',
+                'title': 'T',
+                'metadata': {
+                    'escalation_id': 'esc-x',
+                    'suggestion_hash': 'hash1',
+                },
+            },
+        ],
+    })
+
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+    )
+    interceptor._curator = _mock_curator(CuratorDecision(action='create'))
+
+    meta_str = json.dumps({'escalation_id': 'esc-x', 'suggestion_hash': 'hash1'})
+    result = await interceptor.add_task('/project', title='T', metadata=meta_str)
+    assert result['id'] == '555'
+    assert result['action'] == 'idempotency_hit'
+
+
+@pytest.mark.asyncio
+async def test_idempotency_miss_falls_through_to_curator(
+    taskmaster, reconciler, event_buffer, curator_enabled_config,
+):
+    """No matching (escalation_id, suggestion_hash) → curator runs normally."""
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {
+                'id': '500',
+                'status': 'pending',
+                'title': 'Unrelated',
+                'metadata': {
+                    'escalation_id': 'esc-zzz',
+                    'suggestion_hash': 'different',
+                },
+            },
+        ],
+    })
+
+    curator_mock = _mock_curator(CuratorDecision(action='create', justification='novel'))
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+    )
+    interceptor._curator = curator_mock
+
+    await interceptor.add_task(
+        '/project', title='New',
+        metadata={'escalation_id': 'esc-new', 'suggestion_hash': 'fresh'},
+    )
+    curator_mock.curate.assert_called_once()
+    taskmaster.add_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_idempotency_skips_cancelled_match(
+    taskmaster, reconciler, event_buffer, curator_enabled_config,
+):
+    """A cancelled task with matching metadata must not win the dedupe."""
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {
+                'id': '500',
+                'status': 'cancelled',
+                'title': 'Was the dupe',
+                'metadata': {
+                    'escalation_id': 'esc-y',
+                    'suggestion_hash': 'hash-y',
+                },
+            },
+        ],
+    })
+
+    curator_mock = _mock_curator(CuratorDecision(action='create', justification='novel'))
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+    )
+    interceptor._curator = curator_mock
+
+    await interceptor.add_task(
+        '/project', title='Retry',
+        metadata={'escalation_id': 'esc-y', 'suggestion_hash': 'hash-y'},
+    )
+    curator_mock.curate.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_idempotency_requires_both_keys(
+    taskmaster, reconciler, event_buffer, curator_enabled_config,
+):
+    """Metadata without escalation_id+suggestion_hash skips the R4 check."""
+    curator_mock = _mock_curator(CuratorDecision(action='create', justification='novel'))
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+    )
+    interceptor._curator = curator_mock
+
+    # Only escalation_id, no suggestion_hash → not eligible.
+    await interceptor.add_task(
+        '/project', title='T', metadata={'escalation_id': 'esc-x'},
+    )
+    curator_mock.curate.assert_called_once()
+    # get_tasks for the idempotency check should not have been invoked
+    # because we bail before the walk when a key is missing.
+    # (get_tasks may still be called by curator _build_corpus under some
+    # paths — our curator_mock stubs that; so the AsyncMock
+    # ``taskmaster.get_tasks`` call count must be zero.)
+    assert taskmaster.get_tasks.call_count == 0
 
 
 @pytest.mark.asyncio

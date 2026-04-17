@@ -5,9 +5,11 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from orchestrator.agents.triage import (
+    _combine_suggestion_hashes,
     build_triage_prompt,
     format_pretriaged_detail,
     parse_triage_result,
+    suggestion_hash,
 )
 
 # ---------------------------------------------------------------------------
@@ -146,6 +148,45 @@ class TestFormatPretriagedDetail:
         assert 'Original Suggestions' in detail
         assert 'foo.py:1' in detail
 
+    # ── R4: idempotency stamping ─────────────────────────────────────
+
+    def test_escalation_id_embeds_stamps_and_instructions(self):
+        triage_result = {
+            'accepted': [
+                {'index': 0, 'suggestion': 's0', 'reason': 'r',
+                 'files': ['x.py'], 'proposed_task_title': 't0'},
+            ],
+            'skipped': [],
+            'proposed_task_groups': [
+                {'title': 'Fix 0', 'description': 'd',
+                 'accepted_indices': [0]},
+            ],
+        }
+        originals = [{
+            'reviewer': 'arch_auditor', 'location': 'x.py:10',
+            'category': 'design', 'description': 'Fix the thing',
+        }]
+        detail = format_pretriaged_detail(
+            triage_result, originals, escalation_id='esc-1912-179',
+        )
+        assert 'Task Idempotency Stamps' in detail
+        assert 'esc-1912-179' in detail
+        # Per-group suggestion_hash rendered deterministically
+        expected_hash = suggestion_hash(originals[0])
+        assert expected_hash in detail
+        # Steward-facing instruction present
+        assert 'escalation_id' in detail
+        assert 'suggestion_hash' in detail
+        assert 'interceptor will' in detail
+
+    def test_escalation_id_absent_keeps_legacy_format(self):
+        triage_result = {
+            'accepted': [], 'skipped': [], 'proposed_task_groups': [],
+        }
+        detail = format_pretriaged_detail(triage_result, [])
+        assert 'Task Idempotency Stamps' not in detail
+        assert 'suggestion_hash' not in detail
+
     def test_summary_counts(self):
         triage_result = {
             'accepted': [
@@ -165,3 +206,50 @@ class TestFormatPretriagedDetail:
         assert '3 accepted' in detail
         assert '2 skipped' in detail
         assert '1 task group' in detail
+
+
+# ---------------------------------------------------------------------------
+# R4: suggestion_hash determinism
+# ---------------------------------------------------------------------------
+
+class TestSuggestionHash:
+    """R4 requires deterministic hashes so steward re-queues produce the
+    same ``(escalation_id, suggestion_hash)`` tuple across retries.
+    """
+
+    def test_same_suggestion_same_hash(self):
+        s = {
+            'reviewer': 'arch_auditor', 'location': 'x.py:10',
+            'category': 'design', 'description': 'Fix it',
+        }
+        assert suggestion_hash(s) == suggestion_hash(s)
+
+    def test_differs_on_description_change(self):
+        base = {
+            'reviewer': 'arch_auditor', 'location': 'x.py:10',
+            'category': 'design', 'description': 'Fix it',
+        }
+        variant = {**base, 'description': 'Something else'}
+        assert suggestion_hash(base) != suggestion_hash(variant)
+
+    def test_ignores_unrelated_fields(self):
+        base = {
+            'reviewer': 'arch_auditor', 'location': 'x.py:10',
+            'category': 'design', 'description': 'Fix it',
+            'suggested_fix': 'v1',
+        }
+        variant = {**base, 'suggested_fix': 'rephrased v2'}
+        # suggested_fix is not part of the identity tuple.
+        assert suggestion_hash(base) == suggestion_hash(variant)
+
+    def test_hash_length_is_16(self):
+        s = {'reviewer': 'r', 'location': 'l', 'category': 'c', 'description': 'd'}
+        assert len(suggestion_hash(s)) == 16
+
+    def test_combine_sorted_deterministically(self):
+        a = _combine_suggestion_hashes(['bbb', 'aaa', 'ccc'])
+        b = _combine_suggestion_hashes(['ccc', 'aaa', 'bbb'])
+        assert a == b
+
+    def test_combine_single_returns_self(self):
+        assert _combine_suggestion_hashes(['abcd1234abcd1234']) == 'abcd1234abcd1234'

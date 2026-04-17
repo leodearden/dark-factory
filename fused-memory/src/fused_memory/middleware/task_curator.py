@@ -38,8 +38,19 @@ if TYPE_CHECKING:
 
     from fused_memory.backends.taskmaster_client import TaskmasterBackend
     from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.middleware.curator_escalator import CuratorEscalator
 
 logger = logging.getLogger(__name__)
+
+
+class CuratorFailureError(RuntimeError):
+    """Raised when the curator's LLM call fails and cannot be salvaged.
+
+    The curator no longer degrades silently to ``action='create'`` on LLM
+    errors; instead the interceptor translates this into an L1 escalation or
+    a hard failure at the MCP boundary so operators notice breakage.
+    """
+
 
 Action = Literal['drop', 'combine', 'create']
 
@@ -267,16 +278,22 @@ class TaskCurator:
         taskmaster: TaskmasterBackend | None = None,
         usage_gate: UsageGate | None = None,
         cwd: Path | None = None,
+        escalator: 'CuratorEscalator | None' = None,
     ) -> None:
         self._config = config
         self._taskmaster = taskmaster
         self._usage_gate = usage_gate
         self._cwd = cwd
+        self._escalator = escalator
         self._qdrant_client = None  # AsyncQdrantClient, lazy
         self._embedder = None  # OpenAIEmbedder, lazy
         self._initialized_collections: set[str] = set()
         # Idempotency cache: payload_hash -> (decision, monotonic_time)
         self._decision_cache: dict[str, tuple[CuratorDecision, float]] = {}
+        # Pre-LLM exact-match cache: project_id -> {normalized_hash: (task_id, ts)}
+        # Catches the common "two triages race to create identical tasks"
+        # case cheaply — skips embedding + LLM entirely on the second call.
+        self._recent_creates: dict[str, dict[str, tuple[str, float]]] = {}
 
     # ------------------------------------------------------------------
     # Lazy init (mirrors task_dedup.py pattern)
@@ -353,6 +370,96 @@ class TaskCurator:
     # Public API
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Pre-LLM normalized-key cache (R3)
+    # ------------------------------------------------------------------
+
+    _RECENT_CREATES_TTL_SECS = 600.0  # 10 min — long enough to catch
+    # concurrent triages but short enough that stale entries don't pin
+    # memory after a task is removed.
+
+    @staticmethod
+    def _normalize_key(candidate: CandidateTask) -> str:
+        """Stable 16-char hash over normalised (title, files_to_modify).
+
+        Case + whitespace insensitive on the title, file-order insensitive.
+        Designed to catch "two reviewers raced with the same suggestion"
+        without depending on embeddings. See plan R3 — pre-LLM
+        short-circuit.
+        """
+        title = (candidate.title or '').strip().lower()
+        files = '\n'.join(sorted(candidate.files_to_modify or []))
+        h = hashlib.sha256()
+        h.update(title.encode())
+        h.update(b'|')
+        h.update(files.encode())
+        return h.hexdigest()[:16]
+
+    def _evict_stale_recent_creates(self, project_id: str, now: float) -> None:
+        bucket = self._recent_creates.get(project_id)
+        if not bucket:
+            return
+        stale = [
+            k for k, (_, ts) in bucket.items()
+            if now - ts > self._RECENT_CREATES_TTL_SECS
+        ]
+        for k in stale:
+            del bucket[k]
+
+    async def _pre_llm_exact_match(
+        self, candidate: CandidateTask, project_id: str, project_root: str,
+    ) -> CuratorDecision | None:
+        """Return a drop decision if a recently-created task matches
+        verbatim on normalised title + file list. Otherwise return None.
+
+        Verifies the cached task still exists (and isn't cancelled) so a
+        stale cache entry doesn't redirect to a gone task.
+        """
+        bucket = self._recent_creates.get(project_id)
+        if not bucket:
+            return None
+        now = time.monotonic()
+        self._evict_stale_recent_creates(project_id, now)
+        key = self._normalize_key(candidate)
+        entry = bucket.get(key)
+        if entry is None:
+            return None
+        cached_id, _ts = entry
+        if self._taskmaster is not None:
+            try:
+                task = await self._taskmaster.get_task(cached_id, project_root)
+            except Exception:
+                task = None
+            data = task.get('data') if isinstance(task, dict) else None
+            if isinstance(data, dict):
+                task = data
+            status = (
+                str(task.get('status', '')) if isinstance(task, dict) else ''
+            )
+            if not isinstance(task, dict) or status == 'cancelled':
+                # Stale entry — drop it and fall through to full curate.
+                bucket.pop(key, None)
+                return None
+        return CuratorDecision(
+            action='drop',
+            target_id=cached_id,
+            justification='pre-llm-exact-match',
+            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            latency_ms=0,
+        )
+
+    def note_created(
+        self, project_id: str, candidate: CandidateTask, task_id: str,
+    ) -> None:
+        """Record a just-created task so identical concurrent candidates
+        short-circuit on the pre-LLM exact-match cache.
+
+        Call this *after* ``tm.add_task`` returns and within the
+        project's add_task critical section so the next waiter sees it.
+        """
+        bucket = self._recent_creates.setdefault(project_id, {})
+        bucket[self._normalize_key(candidate)] = (task_id, time.monotonic())
+
     async def curate(
         self,
         candidate: CandidateTask,
@@ -366,6 +473,19 @@ class TaskCurator:
         """
         start = time.monotonic()
         payload_hash = candidate.payload_hash()
+
+        # Pre-LLM exact-match short-circuit comes FIRST. The payload_hash
+        # idempotency cache below can only return drop/combine safely — a
+        # cached 'create' decision is stale if the first caller has since
+        # landed the task and ``note_created`` it. Running the exact-match
+        # check first means the second concurrent creator sees the
+        # first's recorded task even when their payload_hashes collide.
+        exact = await self._pre_llm_exact_match(
+            candidate, project_id, project_root,
+        )
+        if exact is not None:
+            self._store_cache(payload_hash, exact)
+            return exact
 
         # Idempotency check — same payload within the TTL returns the cached decision.
         cached = self._check_cache(payload_hash)
@@ -391,10 +511,35 @@ class TaskCurator:
             self._store_cache(payload_hash, decision)
             return decision
 
-        # Render the LLM call. Failures default to create.
+        # Render the LLM call. A genuine LLM failure raises
+        # CuratorFailureError; route it through the escalator if one was
+        # configured (see curator_escalator.py). If the escalator re-raises
+        # (no orchestrator → interactive path) let it propagate so the MCP
+        # caller sees the outage loudly instead of silently falling back.
         try:
             decision = await self._call_llm(
                 candidate, pool, pool_sizes, start, project_id, project_root,
+            )
+        except CuratorFailureError as exc:
+            if self._escalator is not None:
+                # May re-raise CuratorFailureError on the interactive path.
+                await self._escalator.report_failure(
+                    project_root=project_root,
+                    project_id=project_id,
+                    justification=str(exc),
+                    candidate_title=candidate.title,
+                )
+            else:
+                logger.warning(
+                    'task_curator: LLM failure with no escalator wired — '
+                    'falling through to create: %s',
+                    exc,
+                )
+            decision = CuratorDecision(
+                action='create',
+                justification='llm-error-escalated',
+                pool_sizes=pool_sizes,
+                latency_ms=int((time.monotonic() - start) * 1000),
             )
         except Exception as exc:
             logger.warning(
@@ -823,7 +968,14 @@ class TaskCurator:
             system_prompt=_SYSTEM_PROMPT,
             cwd=cwd,
             model=self._config.curator.model,
-            max_turns=1,
+            # ``max_turns=1`` is incompatible with ``--json-schema`` because
+            # the schema mechanism burns a tool-use turn; the CLI returns
+            # ``error_max_turns`` after the schema turn, even when the
+            # structured payload is already attached. Three leaves room for
+            # an optional reasoning turn, the schema tool-use, and the final
+            # assistant response. Schema salvage in cli_invoke.py covers
+            # the boundary case.
+            max_turns=3,
             max_budget_usd=self._config.curator.max_budget_usd,
             disallowed_tools=['*'],  # no tool access — this is a pure classifier
             output_schema=CURATOR_OUTPUT_SCHEMA,
@@ -834,12 +986,9 @@ class TaskCurator:
 
         latency_ms = int((time.monotonic() - start) * 1000)
         if not agent_result.success:
-            return CuratorDecision(
-                action='create',
-                justification=f'llm-error: {agent_result.output[:200]}',
-                pool_sizes=pool_sizes,
-                latency_ms=latency_ms,
-                cost_usd=agent_result.cost_usd,
+            raise CuratorFailureError(
+                f'curator LLM call failed: output={agent_result.output[:200]!r} '
+                f'subtype={agent_result.subtype!r} turns={agent_result.turns}',
             )
 
         return _parse_decision(

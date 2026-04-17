@@ -126,6 +126,12 @@ async def run_server():
     harness_loop_task = None
     recon_journal = None
     reconciliation_harness = None
+    # Single curator escalator shared by both TaskInterceptor construction
+    # paths — lazy per-project queue handles live inside it.
+    from fused_memory.middleware.curator_escalator import CuratorEscalator
+
+    curator_escalator = CuratorEscalator()
+
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -168,7 +174,8 @@ async def run_server():
 
         task_committer = TaskFileCommitter()
         task_interceptor = TaskInterceptor(
-            taskmaster, targeted, event_buffer, task_committer, config=config,
+            taskmaster, targeted, event_buffer, task_committer,
+            config=config, escalator=curator_escalator,
         )
 
         # Full reconciliation harness (background loop)
@@ -194,7 +201,8 @@ async def run_server():
         await event_buffer.initialize()
         task_committer = TaskFileCommitter()
         task_interceptor = TaskInterceptor(
-            taskmaster, None, event_buffer, task_committer, config=config,
+            taskmaster, None, event_buffer, task_committer,
+            config=config, escalator=curator_escalator,
         )
 
     # Create MCP server with both memory and task tools

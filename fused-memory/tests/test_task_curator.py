@@ -12,6 +12,7 @@ from fused_memory.middleware.task_curator import (
     CURATOR_OUTPUT_SCHEMA,
     CandidateTask,
     CuratorDecision,
+    CuratorFailureError,
     TaskCurator,
     _parse_decision,
     _PoolEntry,
@@ -421,7 +422,15 @@ class TestCurateFallbacks:
         assert 'llm-failed' in result.justification
 
     @pytest.mark.asyncio
-    async def test_llm_non_success_returns_create_with_output(self):
+    async def test_llm_failure_without_escalator_degrades_loudly(self):
+        """R1+R2: CLI failure with no escalator → action='create' with
+        the ``llm-error-escalated`` sentinel justification.
+
+        Distinct from the old ``llm-error`` / ``llm-failed`` strings so
+        logs can be grepped to confirm R2's wiring (see plan verification
+        checklist step 2: journalctl should show zero ``llm-error``
+        entries unpaired with a ``curator_failure`` escalation).
+        """
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
 
@@ -438,7 +447,159 @@ class TestCurateFallbacks:
                 CandidateTask(title='T'), project_id='p', project_root='/x',
             )
         assert result.action == 'create'
-        assert 'llm-error' in result.justification
+        assert result.justification == 'llm-error-escalated'
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_with_escalator_calls_report_failure(self):
+        """R2: CuratorFailureError routes through escalator when wired."""
+        config = _make_config()
+
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+
+        curator = TaskCurator(
+            config=config, taskmaster=None, escalator=escalator,
+        )
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        failing_result = AgentResult(
+            success=False, output='auth error', structured_output=None,
+        )
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=failing_result)):
+            result = await curator.curate(
+                CandidateTask(title='T'), project_id='p', project_root='/x',
+            )
+        assert result.action == 'create'
+        assert result.justification == 'llm-error-escalated'
+        escalator.report_failure.assert_awaited_once()
+        kwargs = escalator.report_failure.await_args.kwargs
+        assert kwargs['project_id'] == 'p'
+        assert kwargs['project_root'] == '/x'
+        assert kwargs['candidate_title'] == 'T'
+
+    @pytest.mark.asyncio
+    async def test_escalator_raise_propagates_out_of_curate(self):
+        """R2: interactive path — escalator re-raise is not swallowed.
+
+        When no orchestrator is running, CuratorEscalator re-raises
+        CuratorFailureError. That must reach the MCP boundary so the
+        caller sees a loud failure instead of a silent
+        ``action='create'``.
+        """
+        config = _make_config()
+
+        async def escalator_raise(**kwargs):
+            raise CuratorFailureError('no orchestrator')
+
+        escalator = AsyncMock()
+        escalator.report_failure = escalator_raise
+        curator = TaskCurator(
+            config=config, taskmaster=None, escalator=escalator,
+        )
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        failing_result = AgentResult(
+            success=False, output='err', structured_output=None,
+        )
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=failing_result)):
+            with pytest.raises(CuratorFailureError):
+                await curator.curate(
+                    CandidateTask(title='T'), project_id='p', project_root='/x',
+                )
+
+    @pytest.mark.asyncio
+    async def test_call_llm_raises_curator_failure_error_directly(self):
+        """Direct _call_llm path raises CuratorFailureError when is_error."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        failing_result = AgentResult(
+            success=False, output='error_max_turns', structured_output=None,
+            subtype='error_max_turns', turns=2,
+        )
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=failing_result)):
+            with pytest.raises(CuratorFailureError):
+                await curator._call_llm(
+                    CandidateTask(title='T'),
+                    pool=[],
+                    pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                    start=0.0,
+                    project_id='p',
+                    project_root='/x',
+                )
+
+    @pytest.mark.asyncio
+    async def test_call_llm_salvages_schema_payload(self):
+        """R1: CLI is_error=True + valid structured_output → parsed decision.
+
+        With schema_salvage in cli_invoke, AgentResult arrives at _call_llm
+        with success=True even when the CLI reported error_max_turns. We
+        should parse the structured output as normal instead of raising.
+        """
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        salvaged_result = AgentResult(
+            success=True,  # salvage already flipped it
+            output='error_max_turns',  # raw error text preserved
+            structured_output={
+                'action': 'drop',
+                'target_id': '42',
+                'justification': 'already covered',
+            },
+            schema_salvaged=True,
+            subtype='error_max_turns',
+            turns=2,
+        )
+        pool = _pool_with_ids(('42', 'pending'))
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=salvaged_result)):
+            decision = await curator._call_llm(
+                CandidateTask(title='T'),
+                pool=pool,
+                pool_sizes={'anchor': 0, 'module': 1, 'embedding': 0, 'dependency': 0},
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+        assert decision.action == 'drop'
+        assert decision.target_id == '42'
+
+    @pytest.mark.asyncio
+    async def test_call_llm_passes_max_turns_three(self):
+        """R1: max_turns=1 was incompatible with --json-schema; must be >= 3."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        empty_result = AgentResult(
+            success=True,
+            output='',
+            structured_output={'action': 'create', 'justification': 'x'},
+        )
+        mock = AsyncMock(return_value=empty_result)
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await curator._call_llm(
+                CandidateTask(title='T'),
+                pool=[],
+                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+        _, kwargs = mock.call_args
+        assert kwargs['max_turns'] >= 3
 
 
 class TestCurateHappyPath:
