@@ -199,6 +199,57 @@ async def test_add_task_falls_back_to_two_step_on_typeerror(event_buffer):
 
 
 # ─────────────────────────────────────────────────────────────────────
+# WP-B: fire-and-forget event queue
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_add_task_hot_path_immunity_with_queue(taskmaster, tmp_path):
+    """WP-B: add_task must return fast even when the event buffer is locked.
+
+    Before WP-B, a locked ``reconciliation.db`` surfaced as an MCP error and
+    agents retried → duplicate tasks. With the EventQueue wired in, the
+    hot path enqueues non-blocking and returns immediately; journal
+    persistence becomes eventually consistent.
+    """
+    import time
+
+    import aiosqlite
+
+    from fused_memory.reconciliation.event_queue import EventQueue
+
+    # Buffer whose push always raises — simulates the 2026-04-17 lock state.
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=aiosqlite.OperationalError('database is locked'))
+
+    queue = EventQueue(
+        buf,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        maxsize=1000,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=0.1,
+    )
+    await queue.start()
+
+    interceptor = TaskInterceptor(taskmaster, None, buf, event_queue=queue)
+    try:
+        t0 = time.perf_counter()
+        result = await interceptor.add_task('/project', prompt='Test')
+        elapsed = time.perf_counter() - t0
+        # Canonical write returned successfully — no exception from lock.
+        assert result == {'id': '2', 'title': 'New Task'}
+        # Under 500ms budget even with SQLite pinned.
+        assert elapsed < 0.5, f'hot path took {elapsed:.3f}s under lock'
+        # The event is either queued for retry or already dead-lettered,
+        # but NOT raised to the caller.
+        stats = queue.stats()
+        assert stats['queue_depth'] + stats['dead_letters'] + stats['events_committed'] >= 1
+    finally:
+        await queue.close()
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Curator gate integration
 # ─────────────────────────────────────────────────────────────────────
 
