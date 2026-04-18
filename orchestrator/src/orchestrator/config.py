@@ -486,6 +486,15 @@ class OrchestratorConfig(BaseSettings):
     # Pre-triage threshold for review suggestions
     suggestion_triage_threshold: int = Field(default=10)
 
+    # Orphan L0 reaper — re-escalates level-0 escalations whose task has no
+    # active workflow/steward (e.g. escalations emitted by the deep reviewer
+    # against a synthetic ``review-*`` task_id).  Without this, such
+    # escalations sit pending until the next orchestrator restart dismisses
+    # them unread.  Set ``orphan_l0_reaper_enabled = False`` to disable.
+    orphan_l0_reaper_enabled: bool = Field(default=True)
+    orphan_l0_timeout_secs: float = Field(default=600.0)
+    orphan_l0_check_interval_secs: float = Field(default=60.0)
+
     # Legacy scalar — ignored if `timeouts` section is present in config.
     # Kept for backwards-compat with config files that haven't migrated.
     invocation_timeout: float = Field(default=1200.0)
