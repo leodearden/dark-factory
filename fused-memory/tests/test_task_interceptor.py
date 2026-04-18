@@ -266,6 +266,7 @@ async def test_curator_combine_updates_target_and_returns_id(
     decision = CuratorDecision(
         action='combine',
         target_id='50',
+        target_fingerprint='Test Task',  # matches taskmaster fixture's mocked title
         rewritten_task=rewritten,
         justification='same root cause as task 50',
     )
@@ -314,7 +315,9 @@ async def test_curator_combine_failure_falls_through_to_create(
         files_to_modify=[], priority='medium',
     )
     decision = CuratorDecision(
-        action='combine', target_id='50', rewritten_task=rewritten,
+        action='combine', target_id='50',
+        target_fingerprint='Test Task',  # matches fixture — guard passes
+        rewritten_task=rewritten,
         justification='...',
     )
     curator_interceptor._curator = _mock_curator(decision)
@@ -346,6 +349,244 @@ async def test_curator_drop_short_circuits_add_subtask(
     assert result['id'] == '88'
     assert result['action'] == 'drop'
     taskmaster.add_subtask.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# WP-F: combine-safety guard (fingerprint + status + audit log)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _combine_audit_lines(audit_dir):
+    """Read JSONL records written by _append_combine_audit."""
+    path = audit_dir / 'combine_audit.jsonl'
+    if not path.exists():
+        return []
+    lines = [
+        ln for ln in path.read_text(encoding='utf-8').splitlines() if ln.strip()
+    ]
+    import json as _json
+    return [_json.loads(ln) for ln in lines]
+
+
+@pytest.fixture
+def audit_dir(tmp_path, monkeypatch):
+    """Redirect combine_audit.jsonl writes to a per-test tmp dir."""
+    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path))
+    return tmp_path
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_fingerprint_match_proceeds(
+    curator_interceptor, taskmaster, audit_dir,
+):
+    """Fingerprint matches the live target → combine proceeds + audit written."""
+    # Taskmaster fixture returns title='Test Task' for any get_task.
+    rewritten = RewrittenTask(
+        title='Unified parser work',
+        description='Combined',
+        details='Do the thing at src/parser.py:42',
+        files_to_modify=['src/parser.py'],
+        priority='high',
+    )
+    decision = CuratorDecision(
+        action='combine', target_id='50',
+        target_fingerprint='Test Task',
+        rewritten_task=rewritten,
+        justification='same concern',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await curator_interceptor.add_task('/project', title='candidate')
+
+    assert result['action'] == 'combine'
+    assert result['id'] == '50'
+    taskmaster.update_task.assert_called_once()
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec['target_id'] == '50'
+    assert rec['old']['title'] == 'Test Task'
+    assert rec['old']['status'] == 'pending'
+    assert rec['new']['title'] == 'Unified parser work'
+    assert rec['justification_truncated'].startswith('same concern')
+    assert 'curator_decision_id' in rec and rec['curator_decision_id']
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_fingerprint_mismatch_aborts(
+    curator_interceptor, taskmaster, audit_dir,
+):
+    """Fingerprint doesn't match live target → abort, fall through to create."""
+    rewritten = RewrittenTask(
+        title='x', description='', details='d',
+        files_to_modify=[], priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine', target_id='50',
+        target_fingerprint='Wrong Title',  # fixture returns 'Test Task'
+        rewritten_task=rewritten, justification='...',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await curator_interceptor.add_task('/project', title='Fix x')
+
+    # Fell through to create path — combine rejected.
+    assert result == {'id': '2', 'title': 'New Task'}
+    taskmaster.update_task.assert_not_called()
+    taskmaster.add_task.assert_called_once()
+    assert _combine_audit_lines(audit_dir) == []
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_missing_fingerprint_aborts(
+    curator_interceptor, taskmaster, audit_dir,
+):
+    """Decision with no fingerprint (LLM skipped the field) → abort."""
+    rewritten = RewrittenTask(
+        title='x', description='', details='d',
+        files_to_modify=[], priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine', target_id='50',
+        target_fingerprint=None,
+        rewritten_task=rewritten, justification='...',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await curator_interceptor.add_task('/project', title='Fix x')
+
+    assert result == {'id': '2', 'title': 'New Task'}
+    taskmaster.update_task.assert_not_called()
+    assert _combine_audit_lines(audit_dir) == []
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_target_done_aborts(
+    curator_interceptor, taskmaster, audit_dir,
+):
+    """Target with status=done → abort (would silently drop candidate work)."""
+    taskmaster.get_task = AsyncMock(return_value={
+        'id': '50', 'status': 'done', 'title': 'Done Task',
+    })
+    rewritten = RewrittenTask(
+        title='x', description='', details='d',
+        files_to_modify=[], priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine', target_id='50',
+        target_fingerprint='Done Task',  # fingerprint matches
+        rewritten_task=rewritten, justification='...',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await curator_interceptor.add_task('/project', title='Fix x')
+
+    assert result == {'id': '2', 'title': 'New Task'}
+    taskmaster.update_task.assert_not_called()
+    assert _combine_audit_lines(audit_dir) == []
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_target_cancelled_aborts(
+    curator_interceptor, taskmaster, audit_dir,
+):
+    """Target with status=cancelled → abort, same reasoning as done."""
+    taskmaster.get_task = AsyncMock(return_value={
+        'id': '50', 'status': 'cancelled', 'title': 'Cancelled Task',
+    })
+    rewritten = RewrittenTask(
+        title='x', description='', details='d',
+        files_to_modify=[], priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine', target_id='50',
+        target_fingerprint='Cancelled Task',
+        rewritten_task=rewritten, justification='...',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await curator_interceptor.add_task('/project', title='Fix x')
+
+    assert result == {'id': '2', 'title': 'New Task'}
+    taskmaster.update_task.assert_not_called()
+    assert _combine_audit_lines(audit_dir) == []
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_fingerprint_normalization(
+    curator_interceptor, taskmaster, audit_dir,
+):
+    """Case / whitespace drift on the title is tolerated by the guard."""
+    taskmaster.get_task = AsyncMock(return_value={
+        'id': '50', 'status': 'pending',
+        'title': 'Harden Parser for Empty Input',
+    })
+    rewritten = RewrittenTask(
+        title='Harden parser', description='', details='d',
+        files_to_modify=[], priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine', target_id='50',
+        # extra whitespace + different case — should still match
+        target_fingerprint='   harden  parser   for empty INPUT   ',
+        rewritten_task=rewritten, justification='normalize',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await curator_interceptor.add_task('/project', title='c')
+
+    assert result['action'] == 'combine'
+    taskmaster.update_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_bulk_dedupe_respects_guard(
+    taskmaster, reconciler, event_buffer, curator_enabled_config, audit_dir,
+):
+    """_dedupe_bulk_created inherits the guard — a curator that picks a done
+    task as the combine target must not clobber it; the new task is kept.
+
+    Regression-style: exercises the bulk path to confirm WP-F's guard in
+    _execute_combine protects it without additional changes.
+    """
+    # Pre-existing: task '50' is done. New bulk-created: task '100'.
+    pre_snapshot = {'tasks': [{'id': '50', 'title': 'Done', 'status': 'done'}]}
+    post_snapshot = {'tasks': [
+        {'id': '50', 'title': 'Done', 'status': 'done'},
+        {'id': '100', 'title': 'Fresh work', 'status': 'pending'},
+    ]}
+
+    taskmaster.get_tasks = AsyncMock(return_value=post_snapshot)
+    # get_task for target '50' must look done so the guard aborts.
+    taskmaster.get_task = AsyncMock(return_value={
+        'id': '50', 'status': 'done', 'title': 'Done',
+    })
+
+    rewritten = RewrittenTask(
+        title='x', description='', details='d',
+        files_to_modify=[], priority='medium',
+    )
+    curator = _mock_curator(CuratorDecision(
+        action='combine', target_id='50',
+        target_fingerprint='Done',
+        rewritten_task=rewritten, justification='wrong pick',
+    ))
+
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+    )
+    interceptor._curator = curator
+
+    result = await interceptor._dedupe_bulk_created(
+        '/project', pre_snapshot=pre_snapshot,
+    )
+
+    # New task kept (guard refused the combine), NOT removed.
+    assert any(k['task_id'] == '100' for k in result['kept'])
+    assert all(r['task_id'] != '100' for r in result['removed'])
+    # Neither the target nor the new task was written.
+    taskmaster.update_task.assert_not_called()
+    assert _combine_audit_lines(audit_dir) == []
 
 
 # ─────────────────────────────────────────────────────────────────────
