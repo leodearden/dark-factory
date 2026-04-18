@@ -1,5 +1,6 @@
 """SQLite-backed event buffer with burst detection and quiescence triggers."""
 
+import contextlib
 import json
 import logging
 from collections.abc import Callable
@@ -101,6 +102,10 @@ class EventBuffer:
         self._db.row_factory = aiosqlite.Row
         await self._db.execute('PRAGMA journal_mode=WAL')
         await self._db.execute('PRAGMA busy_timeout=5000')
+        # synchronous=NORMAL is safe under WAL and shortens the writer-lock
+        # hold window — important because EventBuffer shares this DB file
+        # with ReconciliationJournal (separate aiosqlite.Connection).
+        await self._db.execute('PRAGMA synchronous=NORMAL')
         await self._db.executescript(_BUFFER_SCHEMA_SQL)
         await self._db.commit()
         logger.info(f'EventBuffer initialized (db={self._db_path}, instance={self.instance_id})')
@@ -110,26 +115,48 @@ class EventBuffer:
             raise RuntimeError('EventBuffer not initialized — call initialize() first')
         return self._db
 
+    async def _safe_rollback(self) -> None:
+        """Best-effort rollback — never raises."""
+        if self._db is None:
+            return
+        with contextlib.suppress(Exception):
+            await self._db.rollback()
+
+    @contextlib.asynccontextmanager
+    async def _txn(self):
+        """Explicit transaction wrapper — commit on success, rollback on any exception.
+
+        ``BaseException`` so cancellation also rolls back; otherwise aiosqlite's
+        implicit transaction would stay open and hold the writer lock until
+        the connection is closed.
+        """
+        db = self._require_db()
+        try:
+            yield db
+            await db.commit()
+        except BaseException:
+            await self._safe_rollback()
+            raise
+
     # ── Push ───────────────────────────────────────────────────────────
 
     async def push(self, event: ReconciliationEvent) -> None:
         """Insert event into the shared buffer."""
-        db = self._require_db()
-        await db.execute(
-            """INSERT INTO event_buffer
-               (id, project_id, event_type, event_source, agent_id, timestamp, payload, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'buffered')""",
-            (
-                event.id,
-                event.project_id,
-                event.type.value,
-                event.source.value,
-                event.agent_id,
-                event.timestamp.isoformat(),
-                json.dumps(event.payload),
-            ),
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                """INSERT INTO event_buffer
+                   (id, project_id, event_type, event_source, agent_id, timestamp, payload, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'buffered')""",
+                (
+                    event.id,
+                    event.project_id,
+                    event.type.value,
+                    event.source.value,
+                    event.agent_id,
+                    event.timestamp.isoformat(),
+                    json.dumps(event.payload),
+                ),
+            )
 
         if event.agent_id is not None:
             await self._update_burst_state(event.agent_id, event.timestamp)
@@ -160,25 +187,25 @@ class EventBuffer:
             row = await cursor.fetchone()
             recent_count = row['cnt'] if row else 0
 
-        if recent_count >= 2:
-            await db.execute(
-                """INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)
-                   VALUES (?, 'bursting', ?, ?)
-                   ON CONFLICT(agent_id) DO UPDATE SET
-                     state = 'bursting',
-                     last_write_at = excluded.last_write_at,
-                     burst_started_at = COALESCE(burst_state.burst_started_at, excluded.burst_started_at)""",
-                (agent_id, ts_iso, ts_iso),
-            )
-        else:
-            await db.execute(
-                """INSERT INTO burst_state (agent_id, state, last_write_at)
-                   VALUES (?, 'idle', ?)
-                   ON CONFLICT(agent_id) DO UPDATE SET
-                     last_write_at = excluded.last_write_at""",
-                (agent_id, ts_iso),
-            )
-        await db.commit()
+        async with self._txn() as db:
+            if recent_count >= 2:
+                await db.execute(
+                    """INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)
+                       VALUES (?, 'bursting', ?, ?)
+                       ON CONFLICT(agent_id) DO UPDATE SET
+                         state = 'bursting',
+                         last_write_at = excluded.last_write_at,
+                         burst_started_at = COALESCE(burst_state.burst_started_at, excluded.burst_started_at)""",
+                    (agent_id, ts_iso, ts_iso),
+                )
+            else:
+                await db.execute(
+                    """INSERT INTO burst_state (agent_id, state, last_write_at)
+                       VALUES (?, 'idle', ?)
+                       ON CONFLICT(agent_id) DO UPDATE SET
+                         last_write_at = excluded.last_write_at""",
+                    (agent_id, ts_iso),
+                )
 
     # ── Trigger logic ──────────────────────────────────────────────────
 
@@ -236,18 +263,18 @@ class EventBuffer:
 
     async def _is_run_locked(self, project_id: str) -> bool:
         """Check if another instance holds the reconciliation lock."""
-        db = self._require_db()
         # Expire stale locks first
         cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - self.stale_lock_seconds,
             tz=UTC,
         ).isoformat()
-        await db.execute(
-            'DELETE FROM reconciliation_locks WHERE heartbeat_at < ?',
-            (cutoff,),
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                'DELETE FROM reconciliation_locks WHERE heartbeat_at < ?',
+                (cutoff,),
+            )
 
+        db = self._require_db()
         async with db.execute(
             'SELECT 1 FROM reconciliation_locks WHERE project_id = ?',
             (project_id,),
@@ -256,18 +283,18 @@ class EventBuffer:
 
     async def expire_stale_bursts(self) -> int:
         """Transition 'bursting' agents to 'idle' when cooldown has elapsed."""
-        db = self._require_db()
         cooldown_cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - self.burst_cooldown_seconds,
             tz=UTC,
         ).isoformat()
-        cursor = await db.execute(
-            "UPDATE burst_state SET state = 'idle', burst_started_at = NULL "
-            "WHERE state = 'bursting' AND last_write_at < ?",
-            (cooldown_cutoff,),
-        )
-        await db.commit()
-        return cursor.rowcount
+        async with self._txn() as db:
+            cursor = await db.execute(
+                "UPDATE burst_state SET state = 'idle', burst_started_at = NULL "
+                "WHERE state = 'bursting' AND last_write_at < ?",
+                (cooldown_cutoff,),
+            )
+            rowcount = cursor.rowcount
+        return rowcount
 
     async def _is_quiescent(self) -> bool:
         """System is quiescent when no agent is bursting and durable queue is idle."""
@@ -316,11 +343,11 @@ class EventBuffer:
 
         ids = [row['id'] for row in rows]
         placeholders = ','.join('?' for _ in ids)
-        await db.execute(
-            f"UPDATE event_buffer SET status = 'drained' WHERE id IN ({placeholders})",
-            ids,
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                f"UPDATE event_buffer SET status = 'drained' WHERE id IN ({placeholders})",
+                ids,
+            )
 
         events = []
         for row in rows:
@@ -368,11 +395,11 @@ class EventBuffer:
 
         ids = [row['id'] for row in rows]
         placeholders = ','.join('?' for _ in ids)
-        await db.execute(
-            f"UPDATE event_buffer SET status = 'drained' WHERE id IN ({placeholders})",
-            ids,
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                f"UPDATE event_buffer SET status = 'drained' WHERE id IN ({placeholders})",
+                ids,
+            )
 
         events = []
         for row in rows:
@@ -437,27 +464,26 @@ class EventBuffer:
         """
         if not ids:
             return 0
-        db = self._require_db()
         placeholders = ','.join('?' for _ in ids)
-        cursor = await db.execute(
-            f"""UPDATE event_buffer SET status = 'drained'
-                WHERE project_id = ? AND id IN ({placeholders})
-                  AND status = 'buffered'""",
-            [project_id, *ids],
-        )
-        await db.commit()
-        return cursor.rowcount
+        async with self._txn() as db:
+            cursor = await db.execute(
+                f"""UPDATE event_buffer SET status = 'drained'
+                    WHERE project_id = ? AND id IN ({placeholders})
+                      AND status = 'buffered'""",
+                [project_id, *ids],
+            )
+            rowcount = cursor.rowcount
+        return rowcount
 
     async def restore_drained(self, project_id: str) -> int:
         """Restore drained events to 'buffered' after a failed run."""
-        db = self._require_db()
-        cursor = await db.execute(
-            "UPDATE event_buffer SET status = 'buffered' "
-            "WHERE project_id = ? AND status = 'drained'",
-            (project_id,),
-        )
-        await db.commit()
-        count = cursor.rowcount
+        async with self._txn() as db:
+            cursor = await db.execute(
+                "UPDATE event_buffer SET status = 'buffered' "
+                "WHERE project_id = ? AND status = 'drained'",
+                (project_id,),
+            )
+            count = cursor.rowcount
         if count:
             logger.info(f'Restored {count} drained events to buffered for {project_id}')
         return count
@@ -476,50 +502,47 @@ class EventBuffer:
 
     async def mark_run_active(self, project_id: str) -> bool:
         """Acquire cross-instance lock. Returns False if already held."""
-        db = self._require_db()
         # Expire stale locks
         cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - self.stale_lock_seconds,
             tz=UTC,
         ).isoformat()
-        await db.execute(
-            'DELETE FROM reconciliation_locks WHERE heartbeat_at < ?',
-            (cutoff,),
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                'DELETE FROM reconciliation_locks WHERE heartbeat_at < ?',
+                (cutoff,),
+            )
 
         now = datetime.now(UTC).isoformat()
         try:
-            await db.execute(
-                """INSERT INTO reconciliation_locks (project_id, instance_id, acquired_at, heartbeat_at)
-                   VALUES (?, ?, ?, ?)""",
-                (project_id, self.instance_id, now, now),
-            )
-            await db.commit()
+            async with self._txn() as db:
+                await db.execute(
+                    """INSERT INTO reconciliation_locks (project_id, instance_id, acquired_at, heartbeat_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (project_id, self.instance_id, now, now),
+                )
             return True
         except Exception:
-            # PK constraint violation — another instance holds the lock
-            await db.rollback()
+            # PK constraint violation — another instance holds the lock.
+            # _txn() already rolled back.
             return False
 
     async def mark_run_complete(self, project_id: str) -> None:
         """Release the reconciliation lock."""
-        db = self._require_db()
-        await db.execute(
-            'DELETE FROM reconciliation_locks WHERE project_id = ?',
-            (project_id,),
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                'DELETE FROM reconciliation_locks WHERE project_id = ?',
+                (project_id,),
+            )
 
     async def heartbeat(self, project_id: str) -> None:
         """Update lock heartbeat to prevent stale-lock recovery."""
-        db = self._require_db()
         now = datetime.now(UTC).isoformat()
-        await db.execute(
-            'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ? AND instance_id = ?',
-            (now, project_id, self.instance_id),
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ? AND instance_id = ?',
+                (now, project_id, self.instance_id),
+            )
 
     # ── Deferred writes (cycle fence) ─────────────────────────────────
 
@@ -536,23 +559,22 @@ class EventBuffer:
         agent_id: str | None = None,
     ) -> str:
         """Queue a memory write for replay after the current full cycle completes."""
-        db = self._require_db()
         write_id = str(uuid4())
-        await db.execute(
-            """INSERT INTO deferred_writes
-               (id, project_id, content, category, metadata, agent_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                write_id,
-                project_id,
-                content,
-                category,
-                json.dumps(metadata),
-                agent_id,
-                datetime.now(UTC).isoformat(),
-            ),
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                """INSERT INTO deferred_writes
+                   (id, project_id, content, category, metadata, agent_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    write_id,
+                    project_id,
+                    content,
+                    category,
+                    json.dumps(metadata),
+                    agent_id,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
         logger.info(
             'reconciliation.write_deferred',
             extra={'project_id': project_id, 'category': category, 'write_id': write_id},
@@ -576,11 +598,11 @@ class EventBuffer:
 
         ids = [row['id'] for row in rows]
         placeholders = ','.join('?' for _ in ids)
-        await db.execute(
-            f'DELETE FROM deferred_writes WHERE id IN ({placeholders})',
-            ids,
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                f'DELETE FROM deferred_writes WHERE id IN ({placeholders})',
+                ids,
+            )
 
         return [
             {
@@ -630,22 +652,22 @@ class EventBuffer:
 
     async def cleanup_drained(self, max_age_seconds: float = 3600.0) -> int:
         """Delete drained events older than cutoff, skipping locked projects."""
-        db = self._require_db()
         cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - max_age_seconds,
             tz=UTC,
         ).isoformat()
-        cursor = await db.execute(
-            """DELETE FROM event_buffer
-               WHERE status = 'drained'
-                 AND timestamp < ?
-                 AND project_id NOT IN (
-                     SELECT project_id FROM reconciliation_locks
-                 )""",
-            (cutoff,),
-        )
-        await db.commit()
-        return cursor.rowcount
+        async with self._txn() as db:
+            cursor = await db.execute(
+                """DELETE FROM event_buffer
+                   WHERE status = 'drained'
+                     AND timestamp < ?
+                     AND project_id NOT IN (
+                         SELECT project_id FROM reconciliation_locks
+                     )""",
+                (cutoff,),
+            )
+            rowcount = cursor.rowcount
+        return rowcount
 
     async def request_trigger(self, project_id: str) -> None:
         """Manually request a reconciliation trigger for a project.
