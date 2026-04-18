@@ -20,6 +20,7 @@ from fused_memory.services.memory_service import MemoryService  # noqa: E402
 
 if TYPE_CHECKING:
     from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.reconciliation.backlog_policy import BacklogPolicy
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
@@ -136,14 +137,19 @@ async def run_server():
 
     event_queue = None
     sqlite_watchdog = None
+    backlog_policy = None
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
+        from fused_memory.reconciliation.backlog_policy import BacklogPolicy
         from fused_memory.reconciliation.event_buffer import EventBuffer
         from fused_memory.reconciliation.event_queue import EventQueue
         from fused_memory.reconciliation.harness import ReconciliationHarness
         from fused_memory.reconciliation.journal import ReconciliationJournal
         from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
         from fused_memory.reconciliation.targeted import TargetedReconciler
+        from fused_memory.services.orchestrator_detector import (
+            is_orchestrator_live_for,
+        )
 
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await recon_journal.initialize()
@@ -178,6 +184,18 @@ async def run_server():
         )
         await event_queue.start()
 
+        # WP-D: bounded-backlog escalation/rejection policy. Constructed
+        # before the watchdog so the watchdog can call into it on wedge.
+        backlog_policy = BacklogPolicy(
+            event_buffer,
+            event_queue,
+            is_orchestrator_live_for,
+            hard_limit=config.reconciliation.backlog_hard_limit,
+            rate_limit_seconds=(
+                config.reconciliation.backlog_escalation_rate_limit_seconds
+            ),
+        )
+
         # WP-C: watchdog over the drainer — ERROR-logs structured diagnostics
         # if the drainer stalls (no commit in N seconds with non-empty queue).
         # Surfaces the SQLite-lock condition that previously rotted silently.
@@ -193,6 +211,7 @@ async def run_server():
                 rearm_after_seconds=(
                     config.reconciliation.event_queue_watchdog_rearm_after_seconds
                 ),
+                wedge_callback=backlog_policy.on_watchdog_wedge,
             )
             await sqlite_watchdog.start()
 
@@ -216,11 +235,13 @@ async def run_server():
             taskmaster, targeted, event_buffer, task_committer,
             config=config, escalator=curator_escalator,
             event_queue=event_queue,
+            backlog_policy=backlog_policy,
         )
 
         # Full reconciliation harness (background loop)
         reconciliation_harness = ReconciliationHarness(
-            memory_service, taskmaster, recon_journal, event_buffer, config
+            memory_service, taskmaster, recon_journal, event_buffer, config,
+            backlog_policy=backlog_policy,
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
@@ -249,6 +270,7 @@ async def run_server():
     mcp = create_mcp_server(
         memory_service, task_interceptor, write_journal,
         reconciliation_harness=reconciliation_harness,
+        backlog_policy=backlog_policy,
     )
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.port

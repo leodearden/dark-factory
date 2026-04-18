@@ -16,6 +16,7 @@ from fused_memory.utils.validation import validate_project_id, validate_project_
 
 if TYPE_CHECKING:
     from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.reconciliation.backlog_policy import BacklogPolicy
     from fused_memory.reconciliation.harness import ReconciliationHarness
     from fused_memory.services.write_journal import WriteJournal
 
@@ -140,11 +141,25 @@ def create_mcp_server(
     write_journal: WriteJournal | None = None,
     *,
     reconciliation_harness: ReconciliationHarness | None = None,
+    backlog_policy: BacklogPolicy | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
     _taskmaster_configured = task_interceptor is not None
+
+    async def _backlog_gate(project_id: str) -> dict | None:
+        """WP-D: reject memory writes when the per-project backlog is over the
+        hard limit. For memory tools we don't have ``project_root``; the
+        policy uses its internal cache (populated by task ops) to locate
+        the escalation directory. Reads are never gated.
+        """
+        if backlog_policy is None:
+            return None
+        verdict = await backlog_policy.check(project_id)
+        if verdict.is_rejection:
+            return verdict.to_error_dict()
+        return None
 
     async def _log_read(
         operation: str,
@@ -258,6 +273,8 @@ def create_mcp_server(
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         if err := validate_project_id(project_id):
             return err
+        if err := await _backlog_gate(project_id):
+            return err
         if temporal_context is not None and temporal_context not in _VALID_TEMPORAL_CONTEXTS:
             return {
                 'error': (
@@ -324,6 +341,8 @@ def create_mcp_server(
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         if err := validate_project_id(project_id):
+            return err
+        if err := await _backlog_gate(project_id):
             return err
         if category is not None and category not in _VALID_CATEGORIES:
             return {

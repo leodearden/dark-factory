@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.middleware.curator_escalator import CuratorEscalator
     from fused_memory.middleware.task_file_committer import TaskFileCommitter
+    from fused_memory.reconciliation.backlog_policy import BacklogPolicy
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.targeted import TargetedReconciler
 
@@ -50,6 +51,7 @@ class TaskInterceptor:
         config: 'FusedMemoryConfig | None' = None,
         escalator: 'CuratorEscalator | None' = None,
         event_queue: 'EventQueue | None' = None,
+        backlog_policy: 'BacklogPolicy | None' = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
@@ -60,6 +62,11 @@ class TaskInterceptor:
         # updated to construct a queue.
         self.event_queue = event_queue
         self.task_committer = task_committer
+        # WP-D: bounded-backlog enforcement. Each mutating public method calls
+        # ``_backlog_policy.check(project_id, project_root)`` before acquiring
+        # the project lock; a rejection verdict short-circuits to a structured
+        # error dict with no taskmaster mutation.
+        self._backlog_policy = backlog_policy
         self._background_tasks: set[asyncio.Task] = set()
 
         # Task curator: LLM-judged drop/combine/create gate. Lazy-initialized in
@@ -83,6 +90,18 @@ class TaskInterceptor:
             raise RuntimeError('Taskmaster is not configured.')
         await self.taskmaster.ensure_connected()
         return self.taskmaster
+
+    async def _backlog_gate(self, project_root: str) -> dict | None:
+        """WP-D guard. Returns a structured error dict if the policy rejects;
+        otherwise ``None`` and the caller proceeds.
+        """
+        if self._backlog_policy is None:
+            return None
+        project_id = resolve_project_id(project_root)
+        verdict = await self._backlog_policy.check(project_id, project_root)
+        if verdict.is_rejection:
+            return verdict.to_error_dict()
+        return None
 
     def _make_event(
         self, event_type: EventType, project_root: str, payload: dict
@@ -186,6 +205,8 @@ class TaskInterceptor:
         tag: str | None = None,
     ) -> dict:
         """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered."""
+        if err := await self._backlog_gate(project_root):
+            return err
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
         # WP-E: hold the per-project lock across the read + no-op check +
@@ -242,6 +263,8 @@ class TaskInterceptor:
         force: bool = False,
         tag: str | None = None,
     ) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
 
@@ -310,6 +333,8 @@ class TaskInterceptor:
         num_tasks: str | None = None,
         tag: str | None = None,
     ) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
 
@@ -837,6 +862,8 @@ class TaskInterceptor:
         return None
 
     async def add_task(self, project_root: str, **kwargs: Any) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         # Extract metadata before forwarding — taskmaster's add_task doesn't accept it
         metadata = kwargs.pop('metadata', None)
         if metadata is not None:
@@ -1012,6 +1039,8 @@ class TaskInterceptor:
     async def update_task(
         self, task_id: str, project_root: str, **kwargs: Any,
     ) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
         # WP-E: serialise the write; re-embed below reads only and stays
@@ -1075,6 +1104,8 @@ class TaskInterceptor:
     async def add_subtask(
         self, parent_id: str, project_root: str, **kwargs: Any,
     ) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         candidate = self._build_candidate(kwargs)
         project_id = resolve_project_id(project_root)
         async with self._project_lock(project_id):
@@ -1162,6 +1193,8 @@ class TaskInterceptor:
     async def remove_task(
         self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
         # WP-E: serialise against concurrent mutations on the same project.
@@ -1183,6 +1216,8 @@ class TaskInterceptor:
         project_root: str,
         tag: str | None = None,
     ) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
         # WP-E: serialise against concurrent mutations on the same project.
@@ -1206,6 +1241,8 @@ class TaskInterceptor:
         project_root: str,
         tag: str | None = None,
     ) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
         # WP-E: serialise against concurrent mutations on the same project.
