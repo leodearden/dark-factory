@@ -24,6 +24,7 @@ from fused_memory.models.reconciliation import (
     RunType,
     StageId,
 )
+from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.judge import Judge
@@ -67,12 +68,17 @@ class ReconciliationHarness:
         journal: ReconciliationJournal,
         event_buffer: EventBuffer,
         config: FusedMemoryConfig,
+        backlog_policy: BacklogPolicy | None = None,
     ):
         self.memory = memory_service
         self.taskmaster = taskmaster
         self.journal = journal
         self.buffer = event_buffer
         self.config = config.reconciliation
+        self._backlog_policy = backlog_policy
+        # WP-D: track which halted projects we've already escalated so we
+        # don't re-fire every harness tick.
+        self._halt_escalated: set[str] = set()
 
         # Usage gate (multi-account cap failover)
         self.usage_gate: UsageGate | None = None
@@ -113,6 +119,24 @@ class ReconciliationHarness:
 
         # Drain mode: stop starting new cycles, let current ones finish
         self._draining: bool = False
+
+    async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
+        """WP-D: forward judge halts to the backlog policy exactly once.
+
+        Routes to escalation when an orchestrator is live for this project;
+        otherwise the next mutating MCP call will surface the halt as a
+        structured rejection via :class:`BacklogPolicy`. Best-effort: a
+        failure here must not break the harness loop.
+        """
+        if self._backlog_policy is None or project_id in self._halt_escalated:
+            return
+        self._halt_escalated.add(project_id)
+        try:
+            await self._backlog_policy.on_judge_halt(project_id, reason)
+        except Exception:
+            logger.exception(
+                'harness: backlog_policy.on_judge_halt raised for %s', project_id,
+            )
 
     def drain(self) -> None:
         """Signal the harness to stop starting new reconciliation cycles.
@@ -457,6 +481,9 @@ class ReconciliationHarness:
                 # Halt check
                 if self.judge and self.judge.is_halted(project_id):
                     logger.warning(f'Skipping cycle for halted project {project_id}')
+                    await self._notify_judge_halt(
+                        project_id, reason='judge halted reconciliation',
+                    )
                     await self.buffer.mark_run_complete(project_id)
                     await self._replay_deferred_writes(project_id)
                     return  # Don't keep spinning on a halted project

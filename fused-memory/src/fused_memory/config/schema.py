@@ -227,6 +227,14 @@ class ReconciliationConfig(BaseModel):
     event_queue_watchdog_stall_threshold_seconds: float = Field(default=120.0)
     event_queue_watchdog_rearm_after_seconds: float = Field(default=600.0)
 
+    # WP-D: bounded-backlog escalation / rejection policy. Mutating MCP tools
+    # return a structured ReconciliationBacklogExceeded error once the per-
+    # project buffered count + queue depth exceeds the hard limit; when an
+    # orchestrator is live for the project, an L1 escalation JSON is written
+    # instead. Rate-limited per project to avoid spam.
+    backlog_hard_limit: int = Field(default=500)
+    backlog_escalation_rate_limit_seconds: float = Field(default=900.0)
+
     # Agent settings
     agent_llm_provider: str = Field(default='claude_cli')
     agent_llm_model: str = Field(default='sonnet')
