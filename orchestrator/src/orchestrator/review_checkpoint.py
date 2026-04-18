@@ -15,6 +15,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import VerifyResult, run_full_verification
 
 if TYPE_CHECKING:
+    from escalation.queue import EscalationQueue
     from shared.cost_store import CostStore
 
     from orchestrator.mcp_lifecycle import McpLifecycle
@@ -53,6 +54,7 @@ class ReviewCheckpoint:
         self.mcp = mcp
         self.usage_gate = usage_gate
         self.cost_store: CostStore | None = None
+        self.escalation_queue: EscalationQueue | None = None
         self.run_id: str = ''
 
         self._merge_count = 0
@@ -193,6 +195,13 @@ class ReviewCheckpoint:
                 1 for f in findings if f.get('triage') == 'escalate'
             )
 
+        # Promote any L0 escalations emitted by the reviewer to L1.  The
+        # reviewer runs outside a task workflow, so the synthetic
+        # ``review-<id>`` task_id it uses has no steward that could pick
+        # these up; left alone they sit pending until the next orchestrator
+        # restart auto-dismisses them unread.
+        self._promote_reviewer_escalations(review_id)
+
         report = ReviewReport(
             review_id=review_id,
             mode=mode,
@@ -215,6 +224,56 @@ class ReviewCheckpoint:
         )
 
         return report
+
+    def _promote_reviewer_escalations(self, review_id: str) -> int:
+        """Promote pending L0 escalations from this review run to level 1.
+
+        The deep reviewer runs outside a task workflow, so any escalations
+        it emits land against the synthetic ``review-<review_id>`` task_id
+        which has no steward.  Post-hoc, we promote them directly to L1
+        (human-visible) and dismiss the L0.  Returns the number promoted.
+        """
+        if self.escalation_queue is None:
+            return 0
+
+        from escalation.models import Escalation
+
+        synthetic_task_id = f'review-{review_id}'
+        pending = self.escalation_queue.get_by_task(
+            synthetic_task_id, status='pending', level=0,
+        )
+        if not pending:
+            return 0
+
+        promoted = 0
+        for esc in pending:
+            reesc = Escalation(
+                id=self.escalation_queue.make_id(synthetic_task_id),
+                task_id=synthetic_task_id,
+                agent_role='review-checkpoint',
+                severity=esc.severity,
+                category=esc.category,
+                summary=esc.summary,
+                detail=esc.detail,
+                suggested_action='manual_intervention',
+                worktree=esc.worktree,
+                workflow_state=esc.workflow_state,
+                level=1,
+            )
+            self.escalation_queue.submit(reesc)
+            self.escalation_queue.resolve(
+                esc.id,
+                'Auto-promoted to level 1 — review checkpoint has no steward',
+                dismiss=True,
+                resolved_by='review-checkpoint',
+            )
+            promoted += 1
+
+        logger.info(
+            'Review [%s]: promoted %d L0 escalation(s) to L1',
+            review_id, promoted,
+        )
+        return promoted
 
     def _load_briefing(self) -> str:
         """Read the review briefing file, or return a warning if absent."""
