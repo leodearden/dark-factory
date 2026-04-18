@@ -75,6 +75,10 @@ CURATOR_OUTPUT_SCHEMA: dict[str, Any] = {
     'properties': {
         'action': {'type': 'string', 'enum': ['drop', 'combine', 'create']},
         'target_id': {'type': ['string', 'null']},
+        # Verbatim echo of the target task's title (required for combine).
+        # Verified against the live target before rewriting to prevent
+        # silently clobbering an unrelated task when target_id is wrong.
+        'target_fingerprint': {'type': ['string', 'null']},
         'justification': {'type': 'string'},
         'rewritten_task': {
             'type': ['object', 'null'],
@@ -150,6 +154,7 @@ class CuratorDecision:
 
     action: Action
     target_id: str | None = None
+    target_fingerprint: str | None = None
     rewritten_task: RewrittenTask | None = None
     justification: str = ''
     pool_sizes: dict[str, int] = field(default_factory=dict)
@@ -160,6 +165,7 @@ class CuratorDecision:
         return {
             'action': self.action,
             'target_id': self.target_id,
+            'target_fingerprint': self.target_fingerprint,
             'justification': self.justification[:200],
             'pool_sizes': self.pool_sizes,
             'latency_ms': self.latency_ms,
@@ -266,6 +272,17 @@ should briefly explain which rule triggered the decision. For "drop" and "combin
 set `target_id` to the id of the matched pool task. For "combine", set \
 `rewritten_task` to the full rewritten task fields. For "create", leave `target_id` \
 and `rewritten_task` as null.
+
+## Combine safety: target_fingerprint (required for combine)
+
+When you choose "combine", you MUST also populate `target_fingerprint` with the \
+VERBATIM title of the pool task you are targeting — copy the exact string \
+immediately following `title:` from the pool entry whose id matches `target_id`. \
+This fingerprint is verified against the live task before the rewrite is applied; \
+if it does not match, the combine is refused and the candidate is created fresh \
+instead of silently clobbering an unrelated task. Copy the title character-for-\
+character — do not shorten, summarize, or reformat it. For "drop" and "create", \
+leave `target_fingerprint` null.
 """
 
 
@@ -1193,6 +1210,9 @@ def _parse_decision(
     target_id = raw.get('target_id')
     if target_id is not None:
         target_id = str(target_id)
+    target_fingerprint = raw.get('target_fingerprint')
+    if target_fingerprint is not None:
+        target_fingerprint = str(target_fingerprint)
 
     # Safety: drop/combine must reference a pool task id that actually exists.
     valid_ids = {e.task_id for e in pool}
@@ -1262,6 +1282,7 @@ def _parse_decision(
     return CuratorDecision(
         action=action,  # type: ignore[arg-type]
         target_id=target_id,
+        target_fingerprint=target_fingerprint,
         rewritten_task=rewritten,
         justification=justification,
         pool_sizes=pool_sizes,

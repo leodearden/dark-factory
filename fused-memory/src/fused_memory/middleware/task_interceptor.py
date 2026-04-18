@@ -3,8 +3,10 @@
 import asyncio
 import json
 import logging
+import os
 import uuid as uuid_mod
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
@@ -493,11 +495,58 @@ class TaskInterceptor:
         falls back to create). Combine is implemented via Taskmaster's
         ``update_task`` with a ``prompt`` that instructs a verbatim replacement
         plus metadata carrying the combine marker.
+
+        Before writing, verifies the target's fingerprint and status. A
+        mismatched fingerprint (curator targeted the wrong task) or terminal
+        status (done/cancelled) aborts the write and returns None so the
+        caller degrades to ``create`` instead of silently clobbering an
+        unrelated task.
         """
         if decision.rewritten_task is None or decision.target_id is None:
             return None
         rt = decision.rewritten_task
         tm = await self._ensure_taskmaster()
+        project_id = resolve_project_id(project_root)
+
+        # ── Guard: fetch live target and verify fingerprint + status ──
+        try:
+            raw_target = await tm.get_task(decision.target_id, project_root)
+        except Exception as exc:
+            logger.warning(
+                'combine-guard: get_task failed for target=%s: %s — aborting combine',
+                decision.target_id, exc,
+            )
+            return None
+
+        target = _extract_task_dict(raw_target)
+        if target is None:
+            logger.warning(
+                'combine-guard: target %s returned no task dict — aborting combine',
+                decision.target_id,
+            )
+            return None
+
+        target_status = str(target.get('status', '') or '')
+        if target_status in {'done', 'cancelled'}:
+            logger.warning(
+                'combine-guard: target %s has terminal status %r — aborting '
+                'combine to avoid silently losing candidate work',
+                decision.target_id, target_status,
+            )
+            return None
+
+        target_title = str(target.get('title', '') or '')
+        expected_fp = _normalize_title(target_title)
+        got_fp = _normalize_title(decision.target_fingerprint or '')
+        if not got_fp or expected_fp != got_fp:
+            logger.warning(
+                'combine-guard: fingerprint mismatch for target=%s: '
+                'expected=%r got=%r — aborting combine',
+                decision.target_id,
+                target_title[:80],
+                (decision.target_fingerprint or '')[:80],
+            )
+            return None
 
         files_block = '\n'.join(f'  - {f}' for f in rt.files_to_modify)
         combine_prompt = (
@@ -516,6 +565,19 @@ class TaskInterceptor:
             'curator_justification': decision.justification[:500],
             'combined_at': datetime.now(UTC).isoformat(),
         })
+
+        # ── Audit: persist old-vs-new BEFORE the mutation so we can
+        # recover if the write crashes mid-flight.
+        _append_combine_audit(
+            project_id=project_id,
+            target_id=decision.target_id,
+            old_title=target_title,
+            old_description=str(target.get('description', '') or ''),
+            old_status=target_status,
+            new_title=rt.title,
+            new_description=rt.description,
+            justification=decision.justification,
+        )
 
         try:
             return await tm.update_task(
@@ -1161,3 +1223,81 @@ def _extract_status(task_data: dict) -> str:
     if isinstance(data, dict):
         return data.get('status', 'unknown')
     return 'unknown'
+
+
+def _extract_task_dict(raw: Any) -> dict | None:
+    """Normalise a Taskmaster get_task response to the inner task dict.
+
+    Taskmaster's MCP responses are sometimes wrapped in ``{'data': {...}}``;
+    callers that care about the task's fields (title, description, status)
+    need the unwrapped shape.
+    """
+    if not isinstance(raw, dict):
+        return None
+    data = raw.get('data')
+    if isinstance(data, dict) and ('title' in data or 'status' in data):
+        return data
+    return raw
+
+
+def _normalize_title(title: str) -> str:
+    """Lowercase + collapse whitespace for forgiving title comparison.
+
+    Used by the combine-guard fingerprint check — the LLM echoes the target's
+    title verbatim, but accepting case/whitespace drift costs us nothing
+    while avoiding false-negative aborts on trivial formatting noise.
+    """
+    return ' '.join(title.strip().lower().split())
+
+
+def _combine_audit_path() -> Path:
+    """Resolve the combine-audit log path.
+
+    Honours ``DARK_FACTORY_DATA_DIR``; defaults to ``data/`` relative to the
+    process CWD (which for the shared systemd server is the repo root).
+    """
+    return Path(os.getenv('DARK_FACTORY_DATA_DIR', 'data')) / 'combine_audit.jsonl'
+
+
+def _append_combine_audit(
+    *,
+    project_id: str,
+    target_id: str,
+    old_title: str,
+    old_description: str,
+    old_status: str,
+    new_title: str,
+    new_description: str,
+    justification: str,
+) -> None:
+    """Append a one-line JSON record documenting an about-to-happen combine.
+
+    Append-only, best-effort. Failures log WARN but never propagate —
+    a flaky audit write should not block task-merge progress.
+    """
+    record = {
+        'ts': datetime.now(UTC).isoformat(),
+        'project_id': project_id,
+        'target_id': target_id,
+        'curator_decision_id': str(uuid_mod.uuid4()),
+        'old': {
+            'title': old_title,
+            'description_truncated': old_description[:500],
+            'status': old_status,
+        },
+        'new': {
+            'title': new_title,
+            'description_truncated': new_description[:500],
+        },
+        'justification_truncated': justification[:500],
+    }
+    path = _combine_audit_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a', encoding='utf-8') as fh:
+            fh.write(json.dumps(record) + '\n')
+    except Exception as exc:
+        logger.warning(
+            'combine-audit: failed to append audit record for target=%s: %s',
+            target_id, exc,
+        )
