@@ -218,6 +218,15 @@ class ReconciliationConfig(BaseModel):
     event_queue_retry_max_seconds: float = Field(default=30.0)
     event_queue_shutdown_flush_seconds: float = Field(default=10.0)
 
+    # WP-C: SQLite drainer watchdog. Logs ERROR with structured diagnostics
+    # when the drainer hasn't committed in `stall_threshold` and the queue
+    # is non-empty. Re-arms after `rearm_after` so a persistent wedge logs
+    # at most once per window.
+    event_queue_watchdog_enabled: bool = Field(default=True)
+    event_queue_watchdog_check_interval_seconds: float = Field(default=30.0)
+    event_queue_watchdog_stall_threshold_seconds: float = Field(default=120.0)
+    event_queue_watchdog_rearm_after_seconds: float = Field(default=600.0)
+
     # Agent settings
     agent_llm_provider: str = Field(default='claude_cli')
     agent_llm_model: str = Field(default='sonnet')
