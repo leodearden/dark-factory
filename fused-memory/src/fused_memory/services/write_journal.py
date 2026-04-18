@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import uuid as uuid_mod
@@ -64,6 +65,8 @@ class WriteJournal:
         self._db = await aiosqlite.connect(str(db_path))
         self._db.row_factory = aiosqlite.Row
         await self._db.execute('PRAGMA journal_mode=WAL')
+        await self._db.execute('PRAGMA busy_timeout=5000')
+        await self._db.execute('PRAGMA synchronous=NORMAL')
         await self._db.executescript(SCHEMA_SQL)
         await self._db.commit()
         await self._migrate()
@@ -78,33 +81,51 @@ class WriteJournal:
             raise RuntimeError('WriteJournal not initialized — call initialize() first')
         return self._db
 
+    async def _safe_rollback(self) -> None:
+        """Best-effort rollback — never raises."""
+        if self._db is None:
+            return
+        with contextlib.suppress(Exception):
+            await self._db.rollback()
+
+    @contextlib.asynccontextmanager
+    async def _txn(self):
+        """Explicit transaction wrapper — commit on success, rollback on any exception."""
+        db = self._require_db()
+        try:
+            yield db
+            await db.commit()
+        except BaseException:
+            await self._safe_rollback()
+            raise
+
     async def _migrate(self) -> None:
         """Add columns introduced after initial schema (idempotent)."""
         db = self._require_db()
         async with db.execute('PRAGMA table_info(write_ops)') as cursor:
             existing = {row[1] for row in await cursor.fetchall()}
 
-        if 'session_id' not in existing:
-            await db.execute('ALTER TABLE write_ops ADD COLUMN session_id TEXT')
-            logger.info('Migration: added session_id column to write_ops')
+        async with self._txn() as db:
+            if 'session_id' not in existing:
+                await db.execute('ALTER TABLE write_ops ADD COLUMN session_id TEXT')
+                logger.info('Migration: added session_id column to write_ops')
 
-        if 'kind' not in existing:
+            if 'kind' not in existing:
+                await db.execute(
+                    "ALTER TABLE write_ops ADD COLUMN kind TEXT NOT NULL DEFAULT 'write'"
+                )
+                await db.execute(
+                    "UPDATE write_ops SET kind = 'read' WHERE operation = 'search'"
+                )
+                logger.info('Migration: added kind column to write_ops, backfilled reads')
+
+            # Indexes on new columns (safe after migration ensures columns exist)
             await db.execute(
-                "ALTER TABLE write_ops ADD COLUMN kind TEXT NOT NULL DEFAULT 'write'"
+                'CREATE INDEX IF NOT EXISTS idx_wo_kind_time ON write_ops(kind, created_at)'
             )
             await db.execute(
-                "UPDATE write_ops SET kind = 'read' WHERE operation = 'search'"
+                'CREATE INDEX IF NOT EXISTS idx_wo_agent_time ON write_ops(agent_id, created_at)'
             )
-            logger.info('Migration: added kind column to write_ops, backfilled reads')
-
-        # Indexes on new columns (safe after migration ensures columns exist)
-        await db.execute(
-            'CREATE INDEX IF NOT EXISTS idx_wo_kind_time ON write_ops(kind, created_at)'
-        )
-        await db.execute(
-            'CREATE INDEX IF NOT EXISTS idx_wo_agent_time ON write_ops(agent_id, created_at)'
-        )
-        await db.commit()
 
     async def log_write_op(
         self,
@@ -125,31 +146,30 @@ class WriteJournal:
     ) -> None:
         """Log a Layer 1 operation. Fire-and-forget — never raises."""
         try:
-            db = self._require_db()
-            await db.execute(
-                """INSERT INTO write_ops
-                   (id, causation_id, source, provenance, operation,
-                    project_id, agent_id, session_id, kind,
-                    params, result_summary, success, error, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    write_op_id,
-                    causation_id,
-                    source,
-                    provenance,
-                    operation,
-                    project_id,
-                    agent_id,
-                    session_id,
-                    kind,
-                    json.dumps(params) if params else '{}',
-                    json.dumps(result_summary) if isinstance(result_summary, dict) else result_summary,
-                    1 if success else 0,
-                    error,
-                    datetime.now(UTC).isoformat(),
-                ),
-            )
-            await db.commit()
+            async with self._txn() as db:
+                await db.execute(
+                    """INSERT INTO write_ops
+                       (id, causation_id, source, provenance, operation,
+                        project_id, agent_id, session_id, kind,
+                        params, result_summary, success, error, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        write_op_id,
+                        causation_id,
+                        source,
+                        provenance,
+                        operation,
+                        project_id,
+                        agent_id,
+                        session_id,
+                        kind,
+                        json.dumps(params) if params else '{}',
+                        json.dumps(result_summary) if isinstance(result_summary, dict) else result_summary,
+                        1 if success else 0,
+                        error,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
         except Exception as e:
             logger.warning(f'Failed to log write_op: {e}')
 
@@ -167,26 +187,25 @@ class WriteJournal:
     ) -> None:
         """Log a Layer 2 backend dispatch. Fire-and-forget — never raises."""
         try:
-            db = self._require_db()
-            await db.execute(
-                """INSERT INTO backend_ops
-                   (id, write_op_id, causation_id, backend, operation,
-                    payload, result_summary, success, error, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    str(uuid_mod.uuid4()),
-                    write_op_id,
-                    causation_id,
-                    backend,
-                    operation,
-                    json.dumps(payload) if payload else '{}',
-                    json.dumps(result_summary) if isinstance(result_summary, dict) else result_summary,
-                    1 if success else 0,
-                    error,
-                    datetime.now(UTC).isoformat(),
-                ),
-            )
-            await db.commit()
+            async with self._txn() as db:
+                await db.execute(
+                    """INSERT INTO backend_ops
+                       (id, write_op_id, causation_id, backend, operation,
+                        payload, result_summary, success, error, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(uuid_mod.uuid4()),
+                        write_op_id,
+                        causation_id,
+                        backend,
+                        operation,
+                        json.dumps(payload) if payload else '{}',
+                        json.dumps(result_summary) if isinstance(result_summary, dict) else result_summary,
+                        1 if success else 0,
+                        error,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
         except Exception as e:
             logger.warning(f'Failed to log backend_op: {e}')
 

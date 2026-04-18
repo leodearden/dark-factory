@@ -1,8 +1,10 @@
 """Auto-commits .taskmaster/tasks/tasks.json after task write operations."""
 
 import asyncio
+import contextlib
 import json
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -49,14 +51,11 @@ class TaskFileCommitter:
         # than HEAD.  This catches stale working-tree snapshots after
         # advance_main() moves the ref without updating the working tree.
         try:
-            head_proc = await asyncio.create_subprocess_exec(
-                "git", "show", f"HEAD:{TASKS_REL_PATH}",
-                cwd=project_root,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            head_rc, head_stdout, _ = await _run_subprocess(
+                ["git", "show", f"HEAD:{TASKS_REL_PATH}"],
+                cwd=project_root, timeout=10,
             )
-            head_stdout, _ = await asyncio.wait_for(head_proc.communicate(), timeout=10)
-            if head_proc.returncode == 0:
+            if head_rc == 0:
                 head_data = json.loads(head_stdout)
                 disk_data = json.loads(tasks_file.read_text())
 
@@ -83,44 +82,96 @@ class TaskFileCommitter:
             )
 
         # Stage the tasks file
-        add_proc = await asyncio.create_subprocess_exec(
-            "git", "add", "--", TASKS_REL_PATH,
-            cwd=project_root,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        add_rc, _, add_stderr = await _run_subprocess(
+            ["git", "add", "--", TASKS_REL_PATH],
+            cwd=project_root, timeout=10,
         )
-        _, add_stderr = await asyncio.wait_for(add_proc.communicate(), timeout=10)
-        if add_proc.returncode != 0:
-            logger.warning("git add failed (rc=%d): %s", add_proc.returncode, add_stderr.decode())
+        if add_rc != 0:
+            logger.warning("git add failed (rc=%d): %s", add_rc, add_stderr.decode())
             return
 
         # Check if there are staged changes for this file
-        diff_proc = await asyncio.create_subprocess_exec(
-            "git", "diff", "--cached", "--quiet", "--", TASKS_REL_PATH,
-            cwd=project_root,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        diff_rc, _, _ = await _run_subprocess(
+            ["git", "diff", "--cached", "--quiet", "--", TASKS_REL_PATH],
+            cwd=project_root, timeout=10,
         )
-        await asyncio.wait_for(diff_proc.communicate(), timeout=10)
-        if diff_proc.returncode == 0:
+        if diff_rc == 0:
             # No staged changes — nothing to commit
             logger.debug("tasks.json unchanged, nothing to commit (op=%s)", operation)
             return
 
         # Commit only the tasks file
         msg = f"chore(tasks): auto-commit after {operation}"
-        commit_proc = await asyncio.create_subprocess_exec(
-            "git", "commit", "--no-verify", "-m", msg, "--", TASKS_REL_PATH,
-            cwd=project_root,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        commit_rc, _, commit_stderr = await _run_subprocess(
+            ["git", "commit", "--no-verify", "-m", msg, "--", TASKS_REL_PATH],
+            cwd=project_root, timeout=10,
         )
-        stdout, stderr = await asyncio.wait_for(commit_proc.communicate(), timeout=10)
-        if commit_proc.returncode != 0:
-            stderr_text = stderr.decode()
+        if commit_rc != 0:
+            stderr_text = commit_stderr.decode()
             if "nothing to commit" in stderr_text:
                 logger.debug("Nothing to commit for tasks.json (op=%s)", operation)
             else:
-                logger.warning("git commit failed (rc=%d): %s", commit_proc.returncode, stderr_text)
+                logger.warning("git commit failed (rc=%d): %s", commit_rc, stderr_text)
         else:
             logger.info("Auto-committed tasks.json (op=%s)", operation)
+
+
+async def _run_subprocess(
+    cmd: Sequence[str],
+    *,
+    cwd: str | None = None,
+    timeout: float,
+) -> tuple[int, bytes, bytes]:
+    """Spawn ``cmd``, await its output, and always reap the child process.
+
+    On TimeoutError or CancelledError, the subprocess is terminated (then killed
+    if it doesn't exit within 2 s) and reaped via ``proc.wait()`` before the
+    exception propagates. This prevents orphan processes from lingering inside
+    the fused-memory cgroup — the WP-A root cause for the 2026-04-17 16-hour
+    SQLite lock incident was a stuck ``git show`` child holding open fds for
+    4d6h, pinned to the systemd unit's cgroup.
+
+    Returns (returncode, stdout_bytes, stderr_bytes).
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except (TimeoutError, asyncio.CancelledError):
+            await _terminate_and_reap(proc)
+            raise
+        return proc.returncode or 0, stdout, stderr
+    except BaseException:
+        # Last-ditch reap for any other exception path.
+        if proc.returncode is None:
+            await _terminate_and_reap(proc)
+        raise
+
+
+async def _terminate_and_reap(proc: asyncio.subprocess.Process) -> None:
+    """Terminate, then kill if necessary, and always reap the child.
+
+    Uses ``asyncio.shield`` so a second cancellation cannot abandon the
+    waitpid call — that would leave the child as a zombie and the asyncio
+    child-watcher thread alive (per project memory
+    ``feedback_subprocess_cancel_pattern.md``).
+    """
+    if proc.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        proc.terminate()
+    try:
+        await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=2.0))
+        return
+    except (TimeoutError, asyncio.CancelledError):
+        pass
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    with contextlib.suppress(Exception):
+        await asyncio.shield(proc.wait())

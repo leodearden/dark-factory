@@ -24,6 +24,7 @@ import json
 import logging
 import random
 import time
+from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -74,6 +75,10 @@ class EventQueue:
         self._retry_in_flight = 0
         self._events_committed = 0
         self._last_overflow_warn_ts: float = 0.0
+        # Ring buffer of recent drainer attempts — feeds the watchdog's
+        # diagnostic payload so operators can see what wedged the writer.
+        # Each entry: (monotonic_ts, event_id, event_type, status, attempts)
+        self._recent_ops: deque[tuple[float, str, str, str, int]] = deque(maxlen=20)
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
@@ -187,6 +192,23 @@ class EventQueue:
             ),
         }
 
+    def recent_ops(self) -> list[dict]:
+        """Snapshot of the last ~20 drainer attempts (oldest first).
+
+        Feeds the watchdog's wedge-diagnostic payload. ``status`` is one of
+        ``committed``, ``retrying``, or ``dead_letter``.
+        """
+        return [
+            {
+                'monotonic_ts': ts,
+                'event_id': event_id,
+                'event_type': event_type,
+                'status': status,
+                'attempts': attempts,
+            }
+            for (ts, event_id, event_type, status, attempts) in self._recent_ops
+        ]
+
     # ── drainer loop ───────────────────────────────────────────────────
 
     async def _drain_loop(self) -> None:
@@ -213,6 +235,7 @@ class EventQueue:
         """
         delay = self._retry_initial
         attempts = 0
+        event_type = event.type.value if hasattr(event.type, 'value') else str(event.type)
         while True:
             attempts += 1
             try:
@@ -221,12 +244,18 @@ class EventQueue:
                 self._events_committed += 1
                 if self._retry_in_flight > 0 and attempts > 1:
                     self._retry_in_flight = max(0, self._retry_in_flight - 1)
+                self._recent_ops.append(
+                    (time.monotonic(), event.id, event_type, 'committed', attempts),
+                )
                 return
             except aiosqlite.OperationalError as exc:
                 # Retriable — the buffer's SQLite connection is locked or
                 # transiently unavailable. Keep trying.
                 if attempts == 1:
                     self._retry_in_flight += 1
+                self._recent_ops.append(
+                    (time.monotonic(), event.id, event_type, 'retrying', attempts),
+                )
                 logger.warning(
                     'EventQueue.drain: transient SQLite error (event=%s, '
                     'attempt=%d, sleep=%.2fs): %s',
@@ -247,6 +276,9 @@ class EventQueue:
                 self._write_dead_letter(event, reason='non_retriable', attempts=attempts)
                 if self._retry_in_flight > 0 and attempts > 1:
                     self._retry_in_flight = max(0, self._retry_in_flight - 1)
+                self._recent_ops.append(
+                    (time.monotonic(), event.id, event_type, 'dead_letter', attempts),
+                )
                 return
 
     # ── dead-letter ────────────────────────────────────────────────────
