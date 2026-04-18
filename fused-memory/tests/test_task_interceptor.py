@@ -1178,3 +1178,383 @@ async def test_drain_awaits_pending_commits(taskmaster, event_buffer):
     # drain should await them all
     await interceptor.drain()
     assert len(interceptor._background_tasks) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# WP-E: per-project serialisation of mutating taskmaster calls
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _OverlapTracker:
+    """Records peak in-flight concurrent entries to instrumented calls.
+
+    Wrap a mock's side_effect with ``tracker.wrap(project, return_value)``
+    to probe whether the interceptor's per-project lock serialises
+    mutations. If the lock is effective, per-project peak is 1. Across
+    distinct projects, peak can exceed 1 (the lock is per-project).
+    """
+
+    def __init__(self) -> None:
+        self.in_flight: dict[str, int] = {}
+        self.peak: dict[str, int] = {}
+        self.total_peak = 0
+        self._global_in_flight = 0
+
+    def wrap(self, project_key: str, return_value):
+        async def _side_effect(*args, **kwargs):
+            self.in_flight[project_key] = self.in_flight.get(project_key, 0) + 1
+            self._global_in_flight += 1
+            self.peak[project_key] = max(
+                self.peak.get(project_key, 0), self.in_flight[project_key],
+            )
+            self.total_peak = max(self.total_peak, self._global_in_flight)
+            try:
+                # Yield to the loop so concurrent tasks really do interleave
+                # — a zero-sleep await is enough to surface lock violations.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                return (
+                    return_value(*args, **kwargs)
+                    if callable(return_value) else return_value
+                )
+            finally:
+                self.in_flight[project_key] -= 1
+                self._global_in_flight -= 1
+
+        return _side_effect
+
+
+@pytest.fixture
+def overlap_tm():
+    """Taskmaster mock whose mutating methods all yield to the event loop.
+
+    Shared across the WP-E concurrency tests. Each test points the
+    ``side_effect`` at its own _OverlapTracker.
+    """
+    tm = AsyncMock()
+    tm.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'pending', 'title': 'T'},
+    )
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+    return tm
+
+
+@pytest.mark.asyncio
+async def test_concurrent_add_task_burst_all_distinct(
+    overlap_tm, reconciler, event_buffer,
+):
+    """WP-E: 20 concurrent add_task calls to the same project serialise
+    through the per-project lock — every task gets a distinct id and the
+    taskmaster backend never sees overlapping invocations."""
+    tracker = _OverlapTracker()
+    counter = {'n': 0}
+    id_lock = asyncio.Lock()
+
+    async def fake_add_task(**kwargs):
+        async with id_lock:
+            counter['n'] += 1
+            my_id = counter['n']
+        # Simulate I/O
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return {'id': str(my_id), 'title': kwargs.get('title', '')}
+
+    overlap_tm.add_task = AsyncMock(side_effect=fake_add_task)
+    # Instrument by also counting overlap via a wrapper.
+    original = overlap_tm.add_task
+
+    async def instrumented(**kwargs):
+        tracker.in_flight['p'] = tracker.in_flight.get('p', 0) + 1
+        tracker.peak['p'] = max(
+            tracker.peak.get('p', 0), tracker.in_flight['p'],
+        )
+        try:
+            return await original(**kwargs)
+        finally:
+            tracker.in_flight['p'] -= 1
+
+    overlap_tm.add_task = instrumented
+
+    interceptor = TaskInterceptor(overlap_tm, reconciler, event_buffer)
+
+    N = 20
+    results = await asyncio.gather(*[
+        interceptor.add_task('/project', title=f'Task {i}')
+        for i in range(N)
+    ])
+
+    assert len(results) == N
+    ids = {r['id'] for r in results}
+    assert len(ids) == N, f'duplicate ids produced: {results}'
+    assert tracker.peak.get('p', 0) == 1, (
+        f'per-project mutation overlap detected: peak={tracker.peak}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_mixed_op_concurrency_serialises_on_one_project(
+    overlap_tm, reconciler, event_buffer,
+):
+    """WP-E: add + set_task_status + update_task concurrent on the same
+    project all serialise through the per-project lock. The backend never
+    observes two mutating calls in flight simultaneously."""
+    tracker = _OverlapTracker()
+
+    async def _delay(_return):
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return _return
+
+    def instrument(method_name: str, return_value):
+        async def side_effect(*args, **kwargs):
+            tracker.in_flight['p'] = tracker.in_flight.get('p', 0) + 1
+            tracker.peak['p'] = max(
+                tracker.peak.get('p', 0), tracker.in_flight['p'],
+            )
+            try:
+                return await _delay(return_value)
+            finally:
+                tracker.in_flight['p'] -= 1
+        return side_effect
+
+    overlap_tm.add_task = AsyncMock(
+        side_effect=instrument('add_task', {'id': '99', 'title': 'x'}),
+    )
+    overlap_tm.update_task = AsyncMock(
+        side_effect=instrument('update_task', {'success': True}),
+    )
+    overlap_tm.set_task_status = AsyncMock(
+        side_effect=instrument('set_task_status', {'success': True}),
+    )
+    # get_task also counts — set_task_status holds the lock across it.
+    overlap_tm.get_task = AsyncMock(
+        side_effect=instrument(
+            'get_task', {'id': '1', 'status': 'pending', 'title': 'T'},
+        ),
+    )
+    overlap_tm.remove_task = AsyncMock(
+        side_effect=instrument('remove_task', {'success': True}),
+    )
+    overlap_tm.add_dependency = AsyncMock(
+        side_effect=instrument('add_dependency', {'success': True}),
+    )
+
+    interceptor = TaskInterceptor(overlap_tm, reconciler, event_buffer)
+
+    coros = []
+    # N adds
+    for i in range(5):
+        coros.append(interceptor.add_task('/project', title=f'A{i}'))
+    # M set_task_status (force an 'in-progress' transition — non-noop)
+    for i in range(5):
+        coros.append(interceptor.set_task_status(str(i), 'in-progress', '/project'))
+    # K update_task
+    for i in range(5):
+        coros.append(
+            interceptor.update_task(str(i), '/project', prompt=f'u{i}'),
+        )
+    # plus a couple of deps + removes
+    coros.append(interceptor.remove_task('7', '/project'))
+    coros.append(interceptor.add_dependency('3', '2', '/project'))
+
+    await asyncio.gather(*coros)
+
+    assert tracker.peak.get('p', 0) == 1, (
+        f'concurrent mutation observed on same project: peak={tracker.peak}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_projects_do_not_serialise(
+    overlap_tm, reconciler, event_buffer,
+):
+    """WP-E: the lock is per-project, so ops on distinct projects can
+    overlap. Fire concurrent add_task bursts on /projA and /projB and
+    observe total peak >= 2."""
+    from fused_memory.models.scope import resolve_project_id
+
+    tracker = _OverlapTracker()
+    assert resolve_project_id('/projA') != resolve_project_id('/projB')
+
+    async def side_effect(**kwargs):
+        pr = kwargs.get('project_root', '')
+        key = resolve_project_id(pr)
+        tracker.in_flight[key] = tracker.in_flight.get(key, 0) + 1
+        tracker._global_in_flight += 1
+        tracker.total_peak = max(tracker.total_peak, tracker._global_in_flight)
+        try:
+            # Enough ticks for the other project's task to enter
+            for _ in range(10):
+                await asyncio.sleep(0)
+            return {'id': '1', 'title': kwargs.get('title', '')}
+        finally:
+            tracker.in_flight[key] -= 1
+            tracker._global_in_flight -= 1
+
+    overlap_tm.add_task = AsyncMock(side_effect=side_effect)
+    interceptor = TaskInterceptor(overlap_tm, reconciler, event_buffer)
+
+    coros = []
+    for i in range(5):
+        coros.append(interceptor.add_task('/projA', title=f'a{i}'))
+        coros.append(interceptor.add_task('/projB', title=f'b{i}'))
+    await asyncio.gather(*coros)
+
+    # Per-project peak is 1 (lock held), cross-project overlap is allowed.
+    peak_a = tracker.peak.get(resolve_project_id('/projA'), 0)
+    peak_b = tracker.peak.get(resolve_project_id('/projB'), 0)
+    assert peak_a <= 1 and peak_b <= 1, (
+        f'same-project overlap: {tracker.peak}'
+    )
+    assert tracker.total_peak >= 2, (
+        f'two projects never ran concurrently: total_peak={tracker.total_peak}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_holds_lock_across_read_and_write(
+    overlap_tm, reconciler, event_buffer,
+):
+    """WP-E: two concurrent set_task_status calls on the same project see
+    a consistent before-state. Without the lock, both could read
+    'pending' and both call tm.set_task_status; with the lock, the second
+    reader observes the first's write and short-circuits.
+    """
+    # Simulate a stateful backend: get_task returns current status,
+    # set_task_status updates it.
+    state = {'status': 'pending'}
+    call_log: list[str] = []
+
+    async def get_task(task_id, project_root, tag=None):
+        await asyncio.sleep(0)
+        return {'id': task_id, 'status': state['status'], 'title': 'T'}
+
+    async def set_task_status(task_id, status, project_root, tag=None):
+        call_log.append(f'{task_id}:{state["status"]}->{status}')
+        # Yield between the read above and committing the new state so
+        # the race window is widened.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        state['status'] = status
+        return {'success': True}
+
+    overlap_tm.get_task = AsyncMock(side_effect=get_task)
+    overlap_tm.set_task_status = AsyncMock(side_effect=set_task_status)
+
+    interceptor = TaskInterceptor(overlap_tm, reconciler, event_buffer)
+
+    # Two concurrent transitions to different target statuses.
+    r1, r2 = await asyncio.gather(
+        interceptor.set_task_status('1', 'in-progress', '/project'),
+        interceptor.set_task_status('1', 'done', '/project'),
+    )
+
+    # Second caller must see the first's mutation — one of the two must
+    # be a no-op (idempotent against the already-applied status) OR the
+    # transitions must chain pending->in-progress->done (no stale read
+    # of 'pending' for the second call).
+    assert len(call_log) <= 2
+    statuses = [c.split('->')[1] for c in call_log]
+    # Both statuses recorded should be among the ones we asked for;
+    # crucially the `from` side of the second must NOT still say 'pending'
+    # if the first already mutated it.
+    if len(call_log) == 2:
+        first_from, first_to = call_log[0].split(':')[1].split('->')
+        second_from, second_to = call_log[1].split(':')[1].split('->')
+        assert first_from == 'pending'
+        # With the lock, second read sees the first write.
+        assert second_from == first_to, (
+            f'stale before-state observed: {call_log}'
+        )
+    assert r1.get('success') or r1.get('no_op')
+    assert r2.get('success') or r2.get('no_op')
+
+
+@pytest.mark.asyncio
+async def test_expand_task_dedup_mutations_are_locked(
+    reconciler, event_buffer,
+):
+    """WP-E: mutations inside _dedupe_bulk_created (tm.remove_task etc.)
+    also acquire the per-project lock. A concurrent add_task fired while
+    dedup is deciding which new tasks to drop must not observe a dedup
+    mid-mutation."""
+    tracker = _OverlapTracker()
+
+    # Minimal stateful backend. expand_task returns a subtasks payload;
+    # get_tasks reports pre-existing tasks that dedup would consult.
+    tm = AsyncMock()
+
+    async def _mut(kind, retval):
+        tracker.in_flight['p'] = tracker.in_flight.get('p', 0) + 1
+        tracker.peak['p'] = max(
+            tracker.peak.get('p', 0), tracker.in_flight['p'],
+        )
+        try:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return retval
+        finally:
+            tracker.in_flight['p'] -= 1
+
+    async def expand_side(*a, **k):
+        return await _mut('expand', {'subtasks': [{'id': '1.1'}]})
+
+    async def add_side(**k):
+        return await _mut('add', {'id': '99', 'title': 'x'})
+
+    async def remove_side(*a, **k):
+        return await _mut('remove', {'success': True})
+
+    async def get_task_side(*a, **k):
+        await asyncio.sleep(0)
+        return {'id': '1', 'status': 'pending', 'title': 'T'}
+
+    # get_tasks is a read — not tracked.
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+    tm.get_task = AsyncMock(side_effect=get_task_side)
+    tm.expand_task = AsyncMock(side_effect=expand_side)
+    tm.add_task = AsyncMock(side_effect=add_side)
+    tm.remove_task = AsyncMock(side_effect=remove_side)
+    tm.ensure_connected = AsyncMock()
+
+    interceptor = TaskInterceptor(tm, reconciler, event_buffer)
+
+    # Fire expand + a concurrent add_task on the same project. Both are
+    # mutating; the lock must prevent overlap.
+    results = await asyncio.gather(
+        interceptor.expand_task('1', '/project'),
+        interceptor.add_task('/project', title='concurrent add'),
+    )
+
+    assert results[0] is not None
+    assert results[1] is not None
+    assert tracker.peak.get('p', 0) == 1, (
+        f'overlap during expand + add: peak={tracker.peak}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_call_latency_not_regressed(
+    overlap_tm, reconciler, event_buffer,
+):
+    """WP-E: guardrail — a sequence of sequential mutating calls under
+    no contention finishes under a generous budget, so the lock itself
+    adds no meaningful per-call overhead.
+    """
+    import time
+
+    overlap_tm.set_task_status = AsyncMock(return_value={'success': True})
+    overlap_tm.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'pending', 'title': 'T'},
+    )
+    interceptor = TaskInterceptor(overlap_tm, None, event_buffer)
+
+    N = 200
+    start = time.perf_counter()
+    for i in range(N):
+        status = 'in-progress' if i % 2 == 0 else 'pending'
+        await interceptor.set_task_status('1', status, '/project')
+    elapsed = time.perf_counter() - start
+    # Very generous bound — on a mock this should complete in well under
+    # 2s; bumping for CI jitter.
+    assert elapsed < 2.0, f'{N} sequential calls took {elapsed:.3f}s'

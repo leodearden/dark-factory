@@ -163,16 +163,21 @@ class TaskInterceptor:
     ) -> dict:
         """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered."""
         tm = await self._ensure_taskmaster()
-        # 1. Get before-state
-        before = await tm.get_task(task_id, project_root, tag)
+        project_id = resolve_project_id(project_root)
+        # WP-E: hold the per-project lock across the read + no-op check +
+        # write so two concurrent status transitions can't observe the
+        # same before-state and both mutate tasks.json.
+        async with self._project_lock(project_id):
+            # 1. Get before-state
+            before = await tm.get_task(task_id, project_root, tag)
 
-        # 2. Same-status guard: no-op if nothing changed
-        old_status = _extract_status(before)
-        if status == old_status:
-            return {'success': True, 'no_op': True, 'task_id': task_id}
+            # 2. Same-status guard: no-op if nothing changed
+            old_status = _extract_status(before)
+            if status == old_status:
+                return {'success': True, 'no_op': True, 'task_id': task_id}
 
-        # 3. Execute status change
-        result = await tm.set_task_status(task_id, status, project_root, tag)
+            # 3. Execute status change
+            result = await tm.set_task_status(task_id, status, project_root, tag)
 
         # 5. Emit event
         event = self._make_event(
@@ -214,26 +219,31 @@ class TaskInterceptor:
         tag: str | None = None,
     ) -> dict:
         tm = await self._ensure_taskmaster()
+        project_id = resolve_project_id(project_root)
 
-        # Pre-snapshot: capture the task tree before Taskmaster generates subtasks
-        try:
-            pre_snapshot = await tm.get_tasks(project_root)
-        except Exception as pre_exc:
-            logger.warning(
-                'bulk_dedup: pre-snapshot failed for expand_task(%s): %s', task_id, pre_exc,
+        # WP-E: serialise the pre-snapshot + bulk mutation + commit so a
+        # concurrent add_task can't slip a task into the snapshot gap and
+        # get misclassified as newly-bulk-created.
+        async with self._project_lock(project_id):
+            # Pre-snapshot: capture the task tree before Taskmaster generates subtasks
+            try:
+                pre_snapshot = await tm.get_tasks(project_root)
+            except Exception as pre_exc:
+                logger.warning(
+                    'bulk_dedup: pre-snapshot failed for expand_task(%s): %s', task_id, pre_exc,
+                )
+                pre_snapshot = None
+
+            result = await tm.expand_task(
+                task_id, project_root, num=num, prompt=prompt, force=force, tag=tag
             )
-            pre_snapshot = None
-
-        result = await tm.expand_task(
-            task_id, project_root, num=num, prompt=prompt, force=force, tag=tag
-        )
+            await self._await_commit(project_root, f'expand_task({task_id})')
         event = self._make_event(
             EventType.tasks_bulk_created,
             project_root,
             {'parent_task_id': task_id, 'operation': 'expand_task'},
         )
         await self.buffer.push(event)
-        await self._await_commit(project_root, f'expand_task({task_id})')
 
         # Post-hoc dedup: remove newly-created tasks that duplicate pre-existing ones
         try:
@@ -277,24 +287,28 @@ class TaskInterceptor:
         tag: str | None = None,
     ) -> dict:
         tm = await self._ensure_taskmaster()
+        project_id = resolve_project_id(project_root)
 
-        # Pre-snapshot: capture the task tree before Taskmaster generates tasks
-        try:
-            pre_snapshot = await tm.get_tasks(project_root)
-        except Exception as pre_exc:
-            logger.warning('bulk_dedup: pre-snapshot failed for parse_prd: %s', pre_exc)
-            pre_snapshot = None
+        # WP-E: serialise pre-snapshot + bulk mutation + commit; see
+        # expand_task for the rationale.
+        async with self._project_lock(project_id):
+            # Pre-snapshot: capture the task tree before Taskmaster generates tasks
+            try:
+                pre_snapshot = await tm.get_tasks(project_root)
+            except Exception as pre_exc:
+                logger.warning('bulk_dedup: pre-snapshot failed for parse_prd: %s', pre_exc)
+                pre_snapshot = None
 
-        result = await tm.parse_prd(
-            input_path, project_root, num_tasks=num_tasks, tag=tag
-        )
+            result = await tm.parse_prd(
+                input_path, project_root, num_tasks=num_tasks, tag=tag
+            )
+            await self._await_commit(project_root, 'parse_prd')
         event = self._make_event(
             EventType.tasks_bulk_created,
             project_root,
             {'input_path': input_path, 'operation': 'parse_prd'},
         )
         await self.buffer.push(event)
-        await self._await_commit(project_root, 'parse_prd')
 
         # Post-hoc dedup: remove newly-created tasks that duplicate pre-existing ones
         try:
@@ -588,7 +602,9 @@ class TaskInterceptor:
 
             if decision.action == 'drop' and decision.target_id:
                 try:
-                    await tm.remove_task(tid, project_root)
+                    # WP-E: serialise the tasks.json mutation.
+                    async with self._project_lock(project_id):
+                        await tm.remove_task(tid, project_root)
                     removed.append({
                         'task_id': tid,
                         'title': title,
@@ -605,12 +621,16 @@ class TaskInterceptor:
                 continue
 
             if decision.action == 'combine' and decision.target_id:
-                combine_result = await self._execute_combine(project_root, decision)
-                if combine_result is None:
-                    kept.append({'task_id': tid, 'title': title})
-                    continue
+                # WP-E: combine writes to the target *and* removes the new
+                # task — hold the lock across both so no concurrent writer
+                # can observe the intermediate "new still present" state.
                 try:
-                    await tm.remove_task(tid, project_root)
+                    async with self._project_lock(project_id):
+                        combine_result = await self._execute_combine(project_root, decision)
+                        if combine_result is None:
+                            kept.append({'task_id': tid, 'title': title})
+                            continue
+                        await tm.remove_task(tid, project_root)
                 except Exception as exc:
                     errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
                     continue
@@ -909,9 +929,13 @@ class TaskInterceptor:
         self, task_id: str, project_root: str, **kwargs: Any,
     ) -> dict:
         tm = await self._ensure_taskmaster()
-        result = await tm.update_task(
-            task_id=task_id, project_root=project_root, **kwargs,
-        )
+        project_id = resolve_project_id(project_root)
+        # WP-E: serialise the write; re-embed below reads only and stays
+        # outside the lock.
+        async with self._project_lock(project_id):
+            result = await tm.update_task(
+                task_id=task_id, project_root=project_root, **kwargs,
+            )
         event = self._make_event(
             EventType.task_modified,
             project_root,
@@ -1055,7 +1079,10 @@ class TaskInterceptor:
         self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict:
         tm = await self._ensure_taskmaster()
-        result = await tm.remove_task(task_id, project_root, tag)
+        project_id = resolve_project_id(project_root)
+        # WP-E: serialise against concurrent mutations on the same project.
+        async with self._project_lock(project_id):
+            result = await tm.remove_task(task_id, project_root, tag)
         event = self._make_event(
             EventType.task_deleted,
             project_root,
@@ -1073,9 +1100,12 @@ class TaskInterceptor:
         tag: str | None = None,
     ) -> dict:
         tm = await self._ensure_taskmaster()
-        result = await tm.add_dependency(
-            task_id, depends_on, project_root, tag
-        )
+        project_id = resolve_project_id(project_root)
+        # WP-E: serialise against concurrent mutations on the same project.
+        async with self._project_lock(project_id):
+            result = await tm.add_dependency(
+                task_id, depends_on, project_root, tag
+            )
         event = self._make_event(
             EventType.task_modified,
             project_root,
@@ -1093,9 +1123,12 @@ class TaskInterceptor:
         tag: str | None = None,
     ) -> dict:
         tm = await self._ensure_taskmaster()
-        result = await tm.remove_dependency(
-            task_id, depends_on, project_root, tag
-        )
+        project_id = resolve_project_id(project_root)
+        # WP-E: serialise against concurrent mutations on the same project.
+        async with self._project_lock(project_id):
+            result = await tm.remove_dependency(
+                task_id, depends_on, project_root, tag
+            )
         event = self._make_event(
             EventType.task_modified,
             project_root,
