@@ -333,3 +333,92 @@ class TestGracefulShutdownFiveStepOrdering:
         )
 
         assert call_order == ['drain', 'interceptor_close', 'harness_cancel', 'memory_close', 'journal_close']
+
+
+class TestGracefulShutdownClosesEventQueue:
+    """WP-B: EventQueue must close after task_interceptor and BEFORE memory_service.
+
+    The drainer writes into the SQLite event buffer that memory_service owns,
+    so closing the memory_service first would race with the final flush.
+    """
+
+    @pytest.mark.asyncio
+    async def test_event_queue_closed_before_memory_service(self):
+        call_order: list[str] = []
+
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock(
+            side_effect=lambda: call_order.append('memory_close')
+        )
+
+        task_interceptor = MagicMock()
+        task_interceptor.drain = AsyncMock(
+            side_effect=lambda: call_order.append('drain')
+        )
+        task_interceptor.close = AsyncMock(
+            side_effect=lambda: call_order.append('interceptor_close')
+        )
+
+        event_queue = MagicMock()
+        event_queue.close = AsyncMock(
+            side_effect=lambda: call_order.append('event_queue_close')
+        )
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=task_interceptor,
+            harness_loop_task=None,
+            recon_journal=None,
+            event_queue=event_queue,
+        )
+
+        assert 'event_queue_close' in call_order
+        eq_idx = call_order.index('event_queue_close')
+        mem_idx = call_order.index('memory_close')
+        ic_idx = call_order.index('interceptor_close')
+        assert ic_idx < eq_idx < mem_idx, (
+            f'expected interceptor_close < event_queue_close < memory_close, '
+            f'got order: {call_order}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_event_queue_closed_even_when_interceptor_drain_raises(self):
+        """Independent try/except: drain failure must not skip event_queue.close."""
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock()
+
+        task_interceptor = MagicMock()
+        task_interceptor.drain = AsyncMock(side_effect=RuntimeError('drain failed'))
+        task_interceptor.close = AsyncMock()
+
+        event_queue = MagicMock()
+        event_queue.close = AsyncMock()
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=task_interceptor,
+            harness_loop_task=None,
+            recon_journal=None,
+            event_queue=event_queue,
+        )
+
+        event_queue.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_memory_service_closed_even_when_event_queue_close_raises(self):
+        """A broken event_queue.close must not block memory_service.close."""
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock()
+
+        event_queue = MagicMock()
+        event_queue.close = AsyncMock(side_effect=RuntimeError('queue close failed'))
+
+        await _graceful_shutdown(
+            memory_service=memory_service,
+            task_interceptor=None,
+            harness_loop_task=None,
+            recon_journal=None,
+            event_queue=event_queue,
+        )
+
+        memory_service.close.assert_awaited_once()

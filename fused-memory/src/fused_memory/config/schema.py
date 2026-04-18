@@ -209,6 +209,15 @@ class ReconciliationConfig(BaseModel):
     buffer_size_threshold: int = Field(default=10)
     max_staleness_seconds: int = Field(default=1800)
 
+    # WP-B: fire-and-forget in-memory event queue sits in front of the
+    # SQLite event buffer on the MCP write path. Capacity bounds how many
+    # events can sit in memory waiting for the drainer to catch up; overflow
+    # is dead-lettered to ``data/reconciliation/event_dead_letter.jsonl``.
+    event_queue_capacity: int = Field(default=10_000)
+    event_queue_retry_initial_seconds: float = Field(default=0.1)
+    event_queue_retry_max_seconds: float = Field(default=30.0)
+    event_queue_shutdown_flush_seconds: float = Field(default=10.0)
+
     # Agent settings
     agent_llm_provider: str = Field(default='claude_cli')
     agent_llm_model: str = Field(default='sonnet')
