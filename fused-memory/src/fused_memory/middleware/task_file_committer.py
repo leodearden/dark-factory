@@ -7,6 +7,8 @@ import logging
 from collections.abc import Sequence
 from pathlib import Path
 
+from fused_memory.models.scope import resolve_main_checkout
+
 logger = logging.getLogger(__name__)
 
 TASKS_REL_PATH = ".taskmaster/tasks/tasks.json"
@@ -42,6 +44,14 @@ class TaskFileCommitter:
                 )
 
     async def _do_commit(self, project_root: str, operation: str) -> None:
+        try:
+            project_root = resolve_main_checkout(project_root)
+        except ValueError:
+            logger.debug(
+                "resolve_main_checkout failed for %s; committing against caller path",
+                project_root,
+                exc_info=True,
+            )
         tasks_file = Path(project_root) / TASKS_REL_PATH
         if not tasks_file.exists():
             logger.debug("tasks.json does not exist at %s, skipping commit", tasks_file)
