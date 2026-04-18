@@ -53,6 +53,20 @@ review suggestions and classify each as ACCEPT or SKIP.
 - Refactors that would pessimize the design or impede planned work
 - Renames that don't actually improve semantic transparency
 - Pre-existing issues not introduced by the diff
+- **Documentation-only wording fixes.** Suggestions whose remedy is purely
+  editing a docstring, comment, or prose (e.g. "tighten the Returns section",
+  "the docstring should mention X", "comment could clarify Y", "align docstring
+  with named-access convention"). Documentation drift is not load-bearing in
+  this project and does not belong in the task tree — a follow-up task to pin
+  wording via `__doc__` assertions produces 100+ lines of fragile meta-tests
+  that reviewers then reject. If the underlying concern is behavioral (the
+  function is wrong AND the docstring hides it), accept the *behavioral* fix
+  and let the doc follow from it.
+- **Docstring-pin hardening suggestions.** Any suggestion that proposes
+  strengthening a regex / substring check / AST walk used to assert documentation
+  wording (e.g. "use `ast.get_docstring` instead of whole-file grep", "bound
+  the Returns-section slice"). Do not deepen the meta-test hole; the right
+  fix is to delete the meta-test, not to harden it.
 
 When in doubt, ACCEPT. The cost of a small unnecessary task is low;
 the cost of missing a real issue compounds.
