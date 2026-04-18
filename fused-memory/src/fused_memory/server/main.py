@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from fused_memory.middleware.task_interceptor import TaskInterceptor
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.journal import ReconciliationJournal
+    from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -134,12 +135,14 @@ async def run_server():
     curator_escalator = CuratorEscalator()
 
     event_queue = None
+    sqlite_watchdog = None
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.event_buffer import EventBuffer
         from fused_memory.reconciliation.event_queue import EventQueue
         from fused_memory.reconciliation.harness import ReconciliationHarness
         from fused_memory.reconciliation.journal import ReconciliationJournal
+        from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
         from fused_memory.reconciliation.targeted import TargetedReconciler
 
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
@@ -174,6 +177,24 @@ async def run_server():
             shutdown_flush_seconds=config.reconciliation.event_queue_shutdown_flush_seconds,
         )
         await event_queue.start()
+
+        # WP-C: watchdog over the drainer — ERROR-logs structured diagnostics
+        # if the drainer stalls (no commit in N seconds with non-empty queue).
+        # Surfaces the SQLite-lock condition that previously rotted silently.
+        if config.reconciliation.event_queue_watchdog_enabled:
+            sqlite_watchdog = SqliteWatchdog(
+                event_queue,
+                check_interval_seconds=(
+                    config.reconciliation.event_queue_watchdog_check_interval_seconds
+                ),
+                stall_threshold_seconds=(
+                    config.reconciliation.event_queue_watchdog_stall_threshold_seconds
+                ),
+                rearm_after_seconds=(
+                    config.reconciliation.event_queue_watchdog_rearm_after_seconds
+                ),
+            )
+            await sqlite_watchdog.start()
 
         # Wire event emission into memory_service
         memory_service.set_event_buffer(event_buffer)
@@ -294,6 +315,7 @@ async def run_server():
             harness_loop_task=harness_loop_task,
             recon_journal=recon_journal,
             event_queue=event_queue,
+            sqlite_watchdog=sqlite_watchdog,
         )
 
 
@@ -303,18 +325,21 @@ async def _graceful_shutdown(
     harness_loop_task: 'asyncio.Task[None] | None',
     recon_journal: 'ReconciliationJournal | None',
     event_queue: 'EventQueue | None' = None,
+    sqlite_watchdog: 'SqliteWatchdog | None' = None,
 ) -> None:
     """Perform an ordered, exception-resilient server shutdown.
 
     Shutdown order:
     1. Drain task_interceptor (flush pending commits / targeted reconciliation).
     2. Close task_interceptor (release curator's Qdrant client).
-    3. Close event_queue (WP-B: bounded flush to SQLite; residue → dead-letter).
+    3. Cancel SQLite watchdog (purely observational; close before drainer so
+       the wedge-detection logic doesn't trip during a legitimate shutdown drain).
+    4. Close event_queue (WP-B: bounded flush to SQLite; residue → dead-letter).
        Must happen BEFORE memory_service.close(), because the drainer writes
        into the SQLite event buffer that memory_service owns.
-    4. Cancel harness loop task (stops background reconciliation + escalation server).
-    5. Close memory_service (backends, durable queue, write journal, event buffer).
-    6. Close reconciliation journal (separate SQLite connection).
+    5. Cancel harness loop task (stops background reconciliation + escalation server).
+    6. Close memory_service (backends, durable queue, write journal, event buffer).
+    7. Close reconciliation journal (separate SQLite connection).
 
     Each step is independently guarded so a failure in one step does not
     prevent subsequent steps from running.
@@ -328,6 +353,12 @@ async def _graceful_shutdown(
             await task_interceptor.close()
         except Exception:
             logger.exception('_graceful_shutdown: error closing task_interceptor')
+
+    if sqlite_watchdog is not None:
+        try:
+            await sqlite_watchdog.close()
+        except Exception:
+            logger.exception('_graceful_shutdown: error closing sqlite_watchdog')
 
     if event_queue is not None:
         try:
