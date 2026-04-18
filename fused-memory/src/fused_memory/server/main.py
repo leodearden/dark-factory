@@ -20,6 +20,7 @@ from fused_memory.services.memory_service import MemoryService  # noqa: E402
 
 if TYPE_CHECKING:
     from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.journal import ReconciliationJournal
 
 # Logging
@@ -132,9 +133,11 @@ async def run_server():
 
     curator_escalator = CuratorEscalator()
 
+    event_queue = None
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.event_buffer import EventBuffer
+        from fused_memory.reconciliation.event_queue import EventQueue
         from fused_memory.reconciliation.harness import ReconciliationHarness
         from fused_memory.reconciliation.journal import ReconciliationJournal
         from fused_memory.reconciliation.targeted import TargetedReconciler
@@ -157,6 +160,21 @@ async def run_server():
         )
         await event_buffer.initialize()
 
+        # WP-B: in-memory fire-and-forget queue fronts the SQLite buffer so
+        # the MCP hot path never awaits aiosqlite. Drainer persists events in
+        # the background with retry on OperationalError.
+        event_queue = EventQueue(
+            event_buffer,
+            dead_letter_path=(
+                Path(config.reconciliation.data_dir) / 'event_dead_letter.jsonl'
+            ),
+            maxsize=config.reconciliation.event_queue_capacity,
+            retry_initial_seconds=config.reconciliation.event_queue_retry_initial_seconds,
+            retry_max_seconds=config.reconciliation.event_queue_retry_max_seconds,
+            shutdown_flush_seconds=config.reconciliation.event_queue_shutdown_flush_seconds,
+        )
+        await event_queue.start()
+
         # Wire event emission into memory_service
         memory_service.set_event_buffer(event_buffer)
 
@@ -176,6 +194,7 @@ async def run_server():
         task_interceptor = TaskInterceptor(
             taskmaster, targeted, event_buffer, task_committer,
             config=config, escalator=curator_escalator,
+            event_queue=event_queue,
         )
 
         # Full reconciliation harness (background loop)
@@ -274,6 +293,7 @@ async def run_server():
             task_interceptor=task_interceptor,
             harness_loop_task=harness_loop_task,
             recon_journal=recon_journal,
+            event_queue=event_queue,
         )
 
 
@@ -282,15 +302,19 @@ async def _graceful_shutdown(
     task_interceptor: 'TaskInterceptor | None',
     harness_loop_task: 'asyncio.Task[None] | None',
     recon_journal: 'ReconciliationJournal | None',
+    event_queue: 'EventQueue | None' = None,
 ) -> None:
     """Perform an ordered, exception-resilient server shutdown.
 
     Shutdown order:
     1. Drain task_interceptor (flush pending commits / targeted reconciliation).
     2. Close task_interceptor (release curator's Qdrant client).
-    3. Cancel harness loop task (stops background reconciliation + escalation server).
-    4. Close memory_service (backends, durable queue, write journal, event buffer).
-    5. Close reconciliation journal (separate SQLite connection).
+    3. Close event_queue (WP-B: bounded flush to SQLite; residue → dead-letter).
+       Must happen BEFORE memory_service.close(), because the drainer writes
+       into the SQLite event buffer that memory_service owns.
+    4. Cancel harness loop task (stops background reconciliation + escalation server).
+    5. Close memory_service (backends, durable queue, write journal, event buffer).
+    6. Close reconciliation journal (separate SQLite connection).
 
     Each step is independently guarded so a failure in one step does not
     prevent subsequent steps from running.
@@ -304,6 +328,12 @@ async def _graceful_shutdown(
             await task_interceptor.close()
         except Exception:
             logger.exception('_graceful_shutdown: error closing task_interceptor')
+
+    if event_queue is not None:
+        try:
+            await event_queue.close()
+        except Exception:
+            logger.exception('_graceful_shutdown: error closing event_queue')
 
     if harness_loop_task is not None:
         try:

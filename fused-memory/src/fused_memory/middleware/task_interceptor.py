@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.middleware.curator_escalator import CuratorEscalator
     from fused_memory.middleware.task_file_committer import TaskFileCommitter
+    from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.targeted import TargetedReconciler
 
 logger = logging.getLogger(__name__)
@@ -48,10 +49,16 @@ class TaskInterceptor:
         task_committer: 'TaskFileCommitter | None' = None,
         config: 'FusedMemoryConfig | None' = None,
         escalator: 'CuratorEscalator | None' = None,
+        event_queue: 'EventQueue | None' = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
         self.buffer = event_buffer
+        # WP-B: when an event queue is wired in, journalling is fire-and-forget
+        # via the background drainer. If None, fall back to inline buffer.push
+        # — preserves the legacy call pattern for tests that haven't yet been
+        # updated to construct a queue.
+        self.event_queue = event_queue
         self.task_committer = task_committer
         self._background_tasks: set[asyncio.Task] = set()
 
@@ -89,6 +96,21 @@ class TaskInterceptor:
             timestamp=datetime.now(UTC),
             payload=payload,
         )
+
+    async def _journal(self, event: ReconciliationEvent) -> None:
+        """Hand off an event for persistence.
+
+        WP-B: when a fire-and-forget ``EventQueue`` is configured, enqueue
+        synchronously and return immediately — the MCP hot path never
+        awaits SQLite. Without a queue (legacy / test setups), fall back
+        to an inline ``buffer.push``.
+        """
+        if self.event_queue is not None:
+            self.event_queue.enqueue(event)
+            return
+        # Legacy inline push (no queue wired) — tests and degraded setups.
+        buffer = self.buffer
+        await buffer.push(event)
 
     @staticmethod
     def _on_reconciliation_done(task: asyncio.Task) -> None:
@@ -187,7 +209,7 @@ class TaskInterceptor:
             project_root,
             {'task_id': task_id, 'old_status': old_status, 'new_status': status},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
         self._schedule_commit(project_root, f'set_task_status({task_id}={status})')
 
         # 6. Targeted reconciliation for trigger statuses (fire-and-forget)
@@ -245,7 +267,7 @@ class TaskInterceptor:
             project_root,
             {'parent_task_id': task_id, 'operation': 'expand_task'},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
 
         # Post-hoc dedup: remove newly-created tasks that duplicate pre-existing ones
         try:
@@ -310,7 +332,7 @@ class TaskInterceptor:
             project_root,
             {'input_path': input_path, 'operation': 'parse_prd'},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
 
         # Post-hoc dedup: remove newly-created tasks that duplicate pre-existing ones
         try:
@@ -983,7 +1005,7 @@ class TaskInterceptor:
             project_root,
             {'operation': 'add_task', 'task_id': task_id},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
         self._schedule_commit(project_root, 'add_task')
         return result
 
@@ -1003,7 +1025,7 @@ class TaskInterceptor:
             project_root,
             {'task_id': task_id, 'operation': 'update_task'},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
         self._schedule_commit(project_root, f'update_task({task_id})')
 
         # Re-embed if any corpus-relevant field changed. Taskmaster's update_task
@@ -1119,7 +1141,7 @@ class TaskInterceptor:
             project_root,
             {'parent_id': parent_id, 'operation': 'add_subtask'},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
         self._schedule_commit(project_root, f'add_subtask({parent_id})')
 
         # Record the new subtask in the curator corpus (synchronous cache
@@ -1150,7 +1172,7 @@ class TaskInterceptor:
             project_root,
             {'task_id': task_id, 'operation': 'remove_task'},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
         self._schedule_commit(project_root, f'remove_task({task_id})')
         return result
 
@@ -1173,7 +1195,7 @@ class TaskInterceptor:
             project_root,
             {'task_id': task_id, 'depends_on': depends_on, 'operation': 'add_dependency'},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
         self._schedule_commit(project_root, f'add_dependency({task_id}<-{depends_on})')
         return result
 
@@ -1196,7 +1218,7 @@ class TaskInterceptor:
             project_root,
             {'task_id': task_id, 'depends_on': depends_on, 'operation': 'remove_dependency'},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
         self._schedule_commit(project_root, f'remove_dependency({task_id}<-{depends_on})')
         return result
 
