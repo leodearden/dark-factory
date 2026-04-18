@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from mcp.server.fastmcp import Context, FastMCP
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.models.scope import resolve_main_checkout
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import validate_project_id, validate_project_root
 
@@ -1017,6 +1018,23 @@ def create_mcp_server(
         _fallback_buffer = EventBuffer(db_path=None)
         task_interceptor = TaskInterceptor(None, None, _fallback_buffer)
 
+    def _normalize_project_root(project_root: str) -> tuple[str | None, dict | None]:
+        """Validate then redirect project_root to the main git checkout.
+
+        Worktrees must never hold their own tasks.json — every task tool
+        funnels through this choke point so reads and writes see the same
+        canonical copy regardless of which path the caller passed in.
+
+        Returns (normalized_path, None) on success or (None, error_dict)
+        on failure.
+        """
+        if err := validate_project_root(project_root):
+            return None, err
+        try:
+            return resolve_main_checkout(project_root), None
+        except ValueError as e:
+            return None, {'error': str(e), 'error_type': 'ValidationError'}
+
     @mcp.tool()
     async def get_tasks(
         project_root: str,
@@ -1028,7 +1046,8 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        project_root, err = _normalize_project_root(project_root)
+        if err:
             return err
         try:
             return await task_interceptor.get_tasks(project_root=project_root, tag=tag)
@@ -1049,7 +1068,8 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        project_root, err = _normalize_project_root(project_root)
+        if err:
             return err
         try:
             return await task_interceptor.get_task(
@@ -1078,7 +1098,8 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        project_root, err = _normalize_project_root(project_root)
+        if err:
             return err
         if status not in _VALID_TASK_STATUSES:
             return {
@@ -1129,7 +1150,8 @@ def create_mcp_server(
                 Persisted via a follow-up update_task call after creation.
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        project_root, err = _normalize_project_root(project_root)
+        if err:
             return err
         try:
             return await task_interceptor.add_task(
@@ -1166,7 +1188,8 @@ def create_mcp_server(
             append: Append instead of full update
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        project_root, err = _normalize_project_root(project_root)
+        if err:
             return err
         try:
             if isinstance(metadata, dict):
@@ -1202,7 +1225,8 @@ def create_mcp_server(
             details: Subtask details
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        project_root, err = _normalize_project_root(project_root)
+        if err:
             return err
         try:
             return await task_interceptor.add_subtask(
@@ -1230,7 +1254,8 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        project_root, err = _normalize_project_root(project_root)
+        if err:
             return err
         try:
             return await task_interceptor.remove_task(
@@ -1255,7 +1280,8 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        project_root, err = _normalize_project_root(project_root)
+        if err:
             return err
         try:
             return await task_interceptor.add_dependency(
@@ -1283,7 +1309,8 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        project_root, err = _normalize_project_root(project_root)
+        if err:
             return err
         try:
             return await task_interceptor.remove_dependency(
@@ -1315,7 +1342,8 @@ def create_mcp_server(
             force: Force expansion even if subtasks exist
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        project_root, err = _normalize_project_root(project_root)
+        if err:
             return err
         try:
             return await task_interceptor.expand_task(
@@ -1345,7 +1373,8 @@ def create_mcp_server(
             num_tasks: Approximate number of tasks to generate
             tag: Tag context (optional)
         """
-        if err := validate_project_root(project_root):
+        project_root, err = _normalize_project_root(project_root)
+        if err:
             return err
         try:
             return await task_interceptor.parse_prd(
