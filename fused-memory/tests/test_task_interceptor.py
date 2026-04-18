@@ -204,6 +204,47 @@ async def test_add_task_falls_back_to_two_step_on_typeerror(event_buffer):
 
 
 @pytest.mark.asyncio
+async def test_add_task_with_queue_persists_to_real_sqlite(taskmaster, tmp_path):
+    """WP-B smoke: end-to-end through real EventQueue + real EventBuffer.
+
+    No mocks on the journal path — this catches wiring mistakes that
+    unit tests with AsyncMock(EventBuffer) would miss.
+    """
+    from fused_memory.reconciliation.event_queue import EventQueue
+
+    buf = EventBuffer(db_path=tmp_path / 'wpb_smoke.db', buffer_size_threshold=100)
+    await buf.initialize()
+    queue = EventQueue(
+        buf,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=2.0,
+    )
+    await queue.start()
+
+    interceptor = TaskInterceptor(taskmaster, None, buf, event_queue=queue)
+    try:
+        await interceptor.add_task('/project', prompt='Test 1')
+        await interceptor.set_task_status('1', 'in-progress', '/project')
+        await interceptor.remove_task('1', '/project')
+        # Let the drainer catch up.
+        await asyncio.wait_for(queue._queue.join(), timeout=1.0)
+
+        stats = await buf.get_buffer_stats('project')
+        # 3 events: task_created + task_status_changed + task_deleted
+        assert stats['size'] == 3
+        qs = queue.stats()
+        assert qs['events_committed'] == 3
+        assert qs['dead_letters'] == 0
+        assert qs['overflow_drops'] == 0
+    finally:
+        await queue.close()
+        await buf.close()
+
+
+@pytest.mark.asyncio
 async def test_add_task_hot_path_immunity_with_queue(taskmaster, tmp_path):
     """WP-B: add_task must return fast even when the event buffer is locked.
 
