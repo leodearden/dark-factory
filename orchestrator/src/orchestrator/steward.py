@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+
+from shared.proc_group import terminate_process_group
 import json
 import logging
 from dataclasses import dataclass
@@ -181,17 +183,12 @@ class TaskSteward:
                 cwd=str(self.config.project_root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
             stdout, stderr = await proc.communicate()
         except asyncio.CancelledError:
             if proc is not None and proc.returncode is None:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except (TimeoutError, asyncio.CancelledError):
-                    proc.kill()
-                    with contextlib.suppress(Exception):
-                        await proc.wait()
+                await terminate_process_group(proc, grace_secs=5.0)
             raise
         except Exception as e:
             logger.warning(f'Steward watcher failed for task {self.task_id}: {e}')
