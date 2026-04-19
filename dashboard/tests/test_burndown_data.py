@@ -1791,6 +1791,7 @@ class TestCollectSnapshotDocstringContract:
 def _make_burndown_db_with_projects(tmp_path: Path, name: str, project_ids: list[str]) -> Path:
     """Create a burndown DB at tmp_path/name with one snapshot row per project_id."""
     from datetime import UTC, datetime
+    tmp_path.mkdir(parents=True, exist_ok=True)
     db_path = tmp_path / name
     _create_burndown_db(db_path)
     conn = sqlite3.connect(str(db_path))

@@ -255,6 +255,27 @@ async def downsample(conn: aiosqlite.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def aggregate_burndown_projects(
+    dbs: list[aiosqlite.Connection | None],
+) -> list[str]:
+    """Return distinct project IDs across *all* burndown DBs, sorted.
+
+    Calls :func:`get_burndown_projects` for each DB in *dbs* concurrently via
+    ``asyncio.gather``, then unions the results and returns a sorted list.
+    ``None`` entries are tolerated (``get_burndown_projects`` returns ``[]``
+    for ``None``).
+    """
+    if not dbs:
+        return []
+    per_db: tuple[list[str], ...] = await asyncio.gather(
+        *(get_burndown_projects(db) for db in dbs)
+    )
+    seen: set[str] = set()
+    for project_list in per_db:
+        seen.update(project_list)
+    return sorted(seen)
+
+
 async def get_burndown_projects(db: aiosqlite.Connection | None) -> list[str]:
     """Return distinct project IDs that have snapshot data."""
     if db is None:
