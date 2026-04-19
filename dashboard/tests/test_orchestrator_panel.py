@@ -627,3 +627,49 @@ class TestOrchestratorTaskRowFiltering:
         assert cloak_count >= 5, (
             f'Expected at least 5 x-cloak attributes on rows, found {cloak_count}'
         )
+
+
+class TestOrchestratorKeyConsistency:
+    """Regression: x-init, checkboxes, and row x-show all reference the same orch_key."""
+
+    def test_all_store_references_use_same_key(self, client):
+        """Parse orch_key from the card id attribute, then verify x-init, all checkbox
+        bindings, and all row x-show expressions reference exactly that key.
+
+        Guards against future drift where orch_key is renamed in one template but
+        not the other (the role previously played by test_store_key_consistent_between_toggle_and_show,
+        now generalized to cover the full filter surface).
+        """
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+
+        # Derive expected orch_key from the card's id attribute: id="orch-<key>"
+        id_match = re.search(r'id="orch-([^"]+)"', html)
+        assert id_match is not None, 'Card id="orch-..." not found in HTML'
+        orch_key = id_match.group(1)
+
+        # x-init must reference the same key
+        assert f"$store.panels['{orch_key}']" in html, (
+            f"x-init does not reference key '{orch_key}'"
+        )
+
+        # All three x-model / @change bindings must use the same key
+        for attr in ['active', 'pending']:
+            assert f"$store.panels['{orch_key}'].{attr}" in html, (
+                f"No {attr} binding found for key '{orch_key}'"
+            )
+
+        # @change handler for All checkbox must reference the same key
+        assert f"$store.panels['{orch_key}'].all" in html, (
+            f"All @change handler does not reference key '{orch_key}'"
+        )
+
+        # All x-show expressions on rows must also use the same key
+        row_xshow_values = re.findall(r'x-show="([^"]+)"', html)
+        assert len(row_xshow_values) > 0, 'No x-show attributes found'
+        for expr in row_xshow_values:
+            assert orch_key in expr, (
+                f"x-show expression '{expr}' does not reference orch_key '{orch_key}'"
+            )
+
