@@ -24,11 +24,22 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal, Protocol
 
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
-    from fused_memory.reconciliation.event_queue import EventQueue
+
+
+class _QueueLike(Protocol):
+    """Structural interface for objects that expose queue statistics.
+
+    Accepted by :class:`BacklogPolicy` instead of the concrete
+    :class:`~fused_memory.reconciliation.event_queue.EventQueue` so that
+    lightweight test stubs (which implement only ``stats()``) satisfy the
+    type checker without inheriting from the full queue class.
+    """
+
+    def stats(self) -> dict: ...
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +103,7 @@ class BacklogPolicy:
     def __init__(
         self,
         event_buffer: 'EventBuffer',
-        event_queue: 'EventQueue | None',
+        event_queue: '_QueueLike | None',
         orchestrator_detector: OrchestratorDetector,
         *,
         hard_limit: int = 500,

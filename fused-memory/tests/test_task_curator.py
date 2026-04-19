@@ -509,11 +509,11 @@ class TestCurateFallbacks:
         )
         with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
              patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(return_value=failing_result)):
-            with pytest.raises(CuratorFailureError):
-                await curator.curate(
-                    CandidateTask(title='T'), project_id='p', project_root='/x',
-                )
+                   new=AsyncMock(return_value=failing_result)), \
+             pytest.raises(CuratorFailureError):
+            await curator.curate(
+                CandidateTask(title='T'), project_id='p', project_root='/x',
+            )
 
     @pytest.mark.asyncio
     async def test_call_llm_raises_curator_failure_error_directly(self):
@@ -526,16 +526,16 @@ class TestCurateFallbacks:
             subtype='error_max_turns', turns=2,
         )
         with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(return_value=failing_result)):
-            with pytest.raises(CuratorFailureError):
-                await curator._call_llm(
-                    CandidateTask(title='T'),
-                    pool=[],
-                    pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
-                    start=0.0,
-                    project_id='p',
-                    project_root='/x',
-                )
+                   new=AsyncMock(return_value=failing_result)), \
+             pytest.raises(CuratorFailureError):
+            await curator._call_llm(
+                CandidateTask(title='T'),
+                pool=[],
+                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
 
     @pytest.mark.asyncio
     async def test_call_llm_salvages_schema_payload(self):
