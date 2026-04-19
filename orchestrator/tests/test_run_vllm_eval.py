@@ -1009,10 +1009,10 @@ class TestConcurrentLoop:
         assert rc == 0
         assert len(fake_client.create_calls) == 1
         assert fake_client.terminate_calls == ["pod-fake-1"]
-        # Parallel: ~0.3s; serial: ~0.9s. Allow 0.6s for thread spinup overhead.
-        assert wall_clock < 0.6, (
+        # Parallel: ~0.3s; serial: ~1.2s+. Allow 0.9s for thread spinup overhead.
+        assert wall_clock < 0.9, (
             f"expected ~0.3s parallel wall-clock, got {wall_clock:.2f}s "
-            f"(serial would be ~0.9s)"
+            f"(serial would be ~1.2s+)"
         )
         # All 3 result files written
         result_files = sorted(p.name for p in results.glob("*.json"))

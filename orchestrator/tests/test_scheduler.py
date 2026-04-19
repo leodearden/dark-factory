@@ -1996,7 +1996,7 @@ class TestTierSlotCaps:
             tier_slot_caps={'medium': 0.0, 'low': 0.0, 'polish': 0.0},
         )
         event_store = _RecordingEventStore()
-        scheduler = Scheduler(config, event_store=event_store)
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
         tasks = [_pending_task('1', priority='medium')]
         scheduler.get_tasks = AsyncMock(return_value=tasks)
         result = await scheduler.acquire_next()
@@ -2053,7 +2053,7 @@ class TestPerTierSkipThreshold:
         config = self._config({'critical': 1, 'high': 2, 'medium': 6,
                                'low': 9999, 'polish': 9999})
         event_store = _RecordingEventStore()
-        scheduler = Scheduler(config, event_store=event_store)
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
         scheduler._bump_skip_and_maybe_park('A', ['mod'], tier='critical')
         assert scheduler.lock_table.has_parks('A')
 
@@ -2071,7 +2071,7 @@ class TestPerTierSkipThreshold:
         config = self._config({'critical': 1, 'high': 2, 'medium': 6,
                                'low': 9999, 'polish': 9999})
         event_store = _RecordingEventStore()
-        scheduler = Scheduler(config, event_store=event_store)
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
         for _ in range(150):
             scheduler._bump_skip_and_maybe_park('A', ['mod'], tier='low')
         skip_events = [e for e in event_store.events
@@ -2085,7 +2085,7 @@ class TestPerTierSkipThreshold:
         config = self._config({'critical': 1, 'high': 2, 'medium': 6,
                                'low': 9999, 'polish': 9999})
         event_store = _RecordingEventStore()
-        scheduler = Scheduler(config, event_store=event_store)
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
         for _ in range(3):
             scheduler._bump_skip_and_maybe_park('A', ['mod'], tier='medium')
         skip_events = [e for e in event_store.events
