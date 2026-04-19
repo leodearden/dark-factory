@@ -11,7 +11,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from dashboard.app import _safe_gather_result
+from unittest.mock import MagicMock
+
+from dashboard.app import _parse_window, _safe_gather_result
 
 PARTIAL_URLS = (
     "/partials/memory",
@@ -1129,4 +1131,59 @@ class TestPollingInputValidation:
         assert 'baseMs <= 0' in html, (
             "Expected 'baseMs <= 0' check in jitter script — "
             "scheduleNext must guard against zero or negative intervals."
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestParseWindowDefault
+# ---------------------------------------------------------------------------
+
+
+def _make_request(window: str | None) -> MagicMock:
+    """Build a minimal mock Request whose query_params.get behaves like a real request."""
+    req = MagicMock()
+    if window is None:
+        # Simulate no 'window' query param: .get('window', default) returns default.
+        req.query_params.get.side_effect = lambda key, default=None: default
+    else:
+        req.query_params.get.side_effect = lambda key, default=None: window if key == 'window' else default
+    return req
+
+
+class TestParseWindowDefault:
+    """Tests for _parse_window default-window UX fix (7d → 30d)."""
+
+    def test_no_window_param_returns_30(self):
+        """When the request has no 'window' query param, _parse_window must return 30.
+
+        This guards the UX fix: the old default was 7 (7d), the new default is 30 (30d).
+        Will fail until step-22 changes the default in _parse_window.
+        """
+        req = _make_request(None)
+        assert _parse_window(req) == 30, (
+            "_parse_window() returned something other than 30 for a request with no window param. "
+            "Did you forget to change the default from '7d' to '30d' (step-22)?"
+        )
+
+    @pytest.mark.parametrize("window_str,expected_days", [
+        ('24h', 1),
+        ('7d', 7),
+        ('30d', 30),
+        ('all', 3650),
+    ])
+    def test_explicit_window_values(self, window_str, expected_days):
+        """Explicit window query param values map to the correct day counts."""
+        req = _make_request(window_str)
+        assert _parse_window(req) == expected_days, (
+            f"_parse_window(window='{window_str}') should return {expected_days}"
+        )
+
+    def test_unknown_window_falls_back_to_30(self):
+        """An unrecognised window value falls back to the new default of 30.
+
+        Will fail until step-22 changes the fallback from 7 to 30.
+        """
+        req = _make_request('bogus')
+        assert _parse_window(req) == 30, (
+            "_parse_window() with an unknown value should fall back to 30 (new default)"
         )
