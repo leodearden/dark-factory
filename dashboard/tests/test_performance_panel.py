@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import sqlite3
 from contextlib import ExitStack
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
+from starlette.testclient import TestClient
 
 # --- Mock data ---
 
@@ -276,3 +281,125 @@ class TestFormatDurationMs:
     def test_filter_registered(self):
         from dashboard.app import format_duration_ms, templates
         assert templates.env.filters['format_duration_ms'] is format_duration_ms
+
+
+# ---------------------------------------------------------------------------
+# Helpers for multi-project route tests
+# ---------------------------------------------------------------------------
+
+_PERF_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS runs (
+    run_id         TEXT PRIMARY KEY,
+    project_id     TEXT NOT NULL,
+    prd_path       TEXT,
+    started_at     TEXT NOT NULL,
+    completed_at   TEXT,
+    total_tasks    INTEGER DEFAULT 0,
+    completed      INTEGER DEFAULT 0,
+    blocked        INTEGER DEFAULT 0,
+    escalated      INTEGER DEFAULT 0,
+    total_cost_usd REAL DEFAULT 0.0,
+    paused_for_cap INTEGER DEFAULT 0,
+    cap_pause_secs REAL DEFAULT 0.0
+);
+
+CREATE TABLE IF NOT EXISTS task_results (
+    run_id              TEXT NOT NULL REFERENCES runs(run_id),
+    task_id             TEXT NOT NULL,
+    project_id          TEXT NOT NULL,
+    title               TEXT,
+    outcome             TEXT NOT NULL,
+    cost_usd            REAL DEFAULT 0.0,
+    duration_ms         INTEGER DEFAULT 0,
+    agent_invocations   INTEGER DEFAULT 0,
+    execute_iterations  INTEGER DEFAULT 0,
+    verify_attempts     INTEGER DEFAULT 0,
+    review_cycles       INTEGER DEFAULT 0,
+    steward_cost_usd    REAL DEFAULT 0.0,
+    steward_invocations INTEGER DEFAULT 0,
+    completed_at        TEXT,
+    PRIMARY KEY (run_id, task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_results_project
+    ON task_results(project_id, completed_at);
+"""
+
+
+def _make_perf_db(db_path: Path, project_id: str) -> None:
+    """Create a minimal runs.db with two done tasks for project_id."""
+    now = datetime.now(UTC)
+    ts = (now - timedelta(minutes=30)).isoformat()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(_PERF_SCHEMA)
+    conn.execute(
+        'INSERT INTO runs (run_id, project_id, started_at, completed_at, total_tasks, completed)'
+        ' VALUES (?,?,?,?,?,?)',
+        (f'run-{project_id[:4]}', project_id, ts, ts, 2, 2),
+    )
+    for i in range(2):
+        conn.execute(
+            'INSERT INTO task_results'
+            ' (run_id, task_id, project_id, title, outcome, duration_ms, completed_at)'
+            ' VALUES (?,?,?,?,?,?,?)',
+            (f'run-{project_id[:4]}', f't{i}', project_id, f'Task {i}', 'done', 300_000, ts),
+        )
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tests: multi-project performance route
+# ---------------------------------------------------------------------------
+
+
+class TestPerformanceRouteMultiProject:
+    """Route-level tests for /partials/performance with multiple project roots.
+
+    These tests use real DB files rather than patching data functions.
+    They exercise the route end-to-end: before step-10, the route queries
+    only the main runs.db and misses the peer project; after step-10, it
+    calls the aggregate helpers and surfaces both project_ids.
+    """
+
+    @staticmethod
+    def _make_config(main_root: Path, peer_root: Path):
+        from dashboard.config import DashboardConfig
+        return DashboardConfig(project_root=main_root, known_project_roots=[peer_root])
+
+    @staticmethod
+    def _client_with_config(config):
+        from dashboard.app import app
+        return TestClient(app)
+
+    def test_both_project_ids_in_html(self, tmp_path):
+        """Both dark_factory and reify appear in HTML when two project roots exist.
+
+        FAILS before step-10 (route only queries main runs.db, returns dark_factory only).
+        PASSES after step-10 (route calls aggregate helpers across both DBs).
+        """
+        from dashboard.app import app
+        from dashboard.config import DashboardConfig
+
+        main_root = tmp_path / 'main'
+        peer_root = tmp_path / 'peer'
+
+        _make_perf_db(main_root / 'data' / 'orchestrator' / 'runs.db', 'dark_factory')
+        _make_perf_db(peer_root / 'data' / 'orchestrator' / 'runs.db', 'reify')
+
+        config = DashboardConfig(project_root=main_root, known_project_roots=[peer_root])
+
+        with patch('dashboard.app.DashboardConfig.from_env', return_value=config):
+            with TestClient(app) as c:
+                html = c.get('/partials/performance').text
+
+        assert 'dark_factory' in html
+        assert 'reify' in html
+
+    def test_single_project_unchanged(self, client):
+        """Existing single-project behavior is unchanged after adding multi-DB support."""
+        with _patch_perf_data():
+            html = client.get('/partials/performance').text
+        assert 'dark_factory' in html
+        assert 'No orchestrator run data yet' not in html
