@@ -561,16 +561,15 @@ class TestCurateFallbacks:
         with patch(
             'fused_memory.middleware.task_curator.invoke_with_cap_retry',
             new=AsyncMock(return_value=timed_out_result),
-        ):
-            with pytest.raises(CuratorFailureError) as exc_info:
-                await curator._call_llm(
-                    CandidateTask(title='T'),
-                    pool=[],
-                    pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
-                    start=0.0,
-                    project_id='p',
-                    project_root='/x',
-                )
+        ), pytest.raises(CuratorFailureError) as exc_info:
+            await curator._call_llm(
+                CandidateTask(title='T'),
+                pool=[],
+                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
         msg = str(exc_info.value)
         assert 'timed_out=True' in msg
         assert 'duration_ms=240003' in msg

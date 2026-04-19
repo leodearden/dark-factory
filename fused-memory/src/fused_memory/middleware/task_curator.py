@@ -311,7 +311,7 @@ class TaskCurator:
         taskmaster: TaskmasterBackend | None = None,
         usage_gate: UsageGate | None = None,
         cwd: Path | None = None,
-        escalator: 'CuratorEscalator | None' = None,
+        escalator: CuratorEscalator | None = None,
     ) -> None:
         self._config = config
         self._taskmaster = taskmaster
