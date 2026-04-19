@@ -50,7 +50,7 @@ class EventQueue:
 
     def __init__(
         self,
-        event_buffer: 'EventBuffer',
+        event_buffer: EventBuffer,
         *,
         dead_letter_path: Path | str,
         maxsize: int = 10_000,
@@ -61,7 +61,7 @@ class EventQueue:
     ):
         self._buffer = event_buffer
         self._dead_letter_path = Path(dead_letter_path)
-        self._queue: asyncio.Queue['ReconciliationEvent'] = asyncio.Queue(maxsize=maxsize)
+        self._queue: asyncio.Queue[ReconciliationEvent] = asyncio.Queue(maxsize=maxsize)
         self._retry_initial = retry_initial_seconds
         self._retry_max = retry_max_seconds
         self._shutdown_flush = shutdown_flush_seconds
@@ -129,7 +129,7 @@ class EventQueue:
 
         # Drain residue synchronously to the dead-letter file. Using
         # get_nowait avoids awaiting after cancellation.
-        residue: list['ReconciliationEvent'] = []
+        residue: list[ReconciliationEvent] = []
         while True:
             try:
                 event = self._queue.get_nowait()
@@ -148,7 +148,7 @@ class EventQueue:
 
     # ── enqueue (sync, non-blocking) ───────────────────────────────────
 
-    def enqueue(self, event: 'ReconciliationEvent') -> bool:
+    def enqueue(self, event: ReconciliationEvent) -> bool:
         """Try to enqueue an event. Returns True on accept, False on overflow.
 
         On overflow the event is written to the dead-letter file immediately
@@ -222,7 +222,7 @@ class EventQueue:
                 # drainer errors — otherwise shutdown hangs.
                 self._queue.task_done()
 
-    async def _commit_with_retry(self, event: 'ReconciliationEvent') -> None:
+    async def _commit_with_retry(self, event: ReconciliationEvent) -> None:
         """Attempt to persist ``event``, retrying transient SQLite failures.
 
         On retriable errors (``aiosqlite.OperationalError``): exponential
@@ -285,7 +285,7 @@ class EventQueue:
 
     def _write_dead_letter(
         self,
-        event: 'ReconciliationEvent',
+        event: ReconciliationEvent,
         *,
         reason: str,
         attempts: int,

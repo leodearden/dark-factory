@@ -45,7 +45,6 @@ import re
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger('invalidate_shipping_edges')
