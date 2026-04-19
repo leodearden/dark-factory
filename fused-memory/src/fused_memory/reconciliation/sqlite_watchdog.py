@@ -11,6 +11,7 @@ WP-D will subscribe to the optional callback to escalate at L1.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -90,10 +91,8 @@ class SqliteWatchdog:
         if self._task is None:
             return
         self._task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await self._task
-        except (asyncio.CancelledError, Exception):
-            pass
         self._task = None
 
     async def _loop(self) -> None:
