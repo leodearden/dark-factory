@@ -18,6 +18,7 @@ to that subproject's top-level conftest.py.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import os
 import signal
 
@@ -28,14 +29,10 @@ _tok: bytes | None = None
 def _release() -> None:
     global _fd, _tok
     if _tok is not None and _fd is not None:
-        try:
+        with contextlib.suppress(OSError):
             os.write(_fd, _tok)
-        except OSError:
-            pass
-        try:
+        with contextlib.suppress(OSError):
             os.close(_fd)
-        except OSError:
-            pass
     _fd = None
     _tok = None
 

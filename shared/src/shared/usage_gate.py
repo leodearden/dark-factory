@@ -137,7 +137,7 @@ class InvokeSlot:
 
     __slots__ = ('_gate', 'token', 'account_name', '_settled')
 
-    def __init__(self, gate: 'UsageGate', token: str | None) -> None:
+    def __init__(self, gate: UsageGate, token: str | None) -> None:
         self._gate = gate
         self.token = token
         self.account_name = gate.active_account_name or ''
@@ -662,7 +662,8 @@ class UsageGate:
         """
         _PROBE_TIMEOUT = 30
 
-        self._probe_config_dir.write_credentials(acct.token)
+        if acct.token is not None:
+            self._probe_config_dir.write_credentials(acct.token)
 
         cmd = [
             'claude', '--print', '--output-format', 'json',
@@ -674,7 +675,8 @@ class UsageGate:
         ]
 
         env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
-        env['CLAUDE_CODE_OAUTH_TOKEN'] = acct.token
+        if acct.token is not None:
+            env['CLAUDE_CODE_OAUTH_TOKEN'] = acct.token
         env['CLAUDE_CONFIG_DIR'] = str(self._probe_config_dir.path)
 
         proc: asyncio.subprocess.Process | None = None
