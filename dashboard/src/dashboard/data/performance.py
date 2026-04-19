@@ -8,6 +8,7 @@ performance statistics.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 from collections import defaultdict
@@ -233,6 +234,34 @@ async def aggregate_escalation_rates(
         m['interactive_rate'] = (
             round(m['interactive_count'] / total * 100, 1) if total else 0.0
         )
+    return merged
+
+
+async def aggregate_loop_histograms(
+    dbs: list[aiosqlite.Connection | None],
+    *,
+    days: int = 7,
+) -> dict[str, dict]:
+    """Merge :func:`get_loop_histograms` results from multiple databases.
+
+    For each project_id: element-wise sum the outer.values and inner.values
+    arrays across DBs (labels are always the canonical fixed lists).
+    """
+    if not dbs:
+        return {}
+
+    results = await asyncio.gather(*(get_loop_histograms(db, days=days) for db in dbs))
+
+    merged: dict[str, dict] = {}
+    for result in results:
+        for pid, info in result.items():
+            if pid not in merged:
+                merged[pid] = copy.deepcopy(info)
+            else:
+                m = merged[pid]
+                for key in ('outer', 'inner'):
+                    for i, val in enumerate(info[key]['values']):
+                        m[key]['values'][i] += val
     return merged
 
 
