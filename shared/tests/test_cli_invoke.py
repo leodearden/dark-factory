@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -40,8 +41,13 @@ class TestToTokenCount:
         assert _to_token_count(42) == 42
 
 
-def _make_result(**overrides) -> AgentResult:
-    defaults = dict(success=True, output='ok', cost_usd=0.5, stderr='')
+def _make_result(**overrides: Any) -> AgentResult:
+    # dict[str, Any] is intentional: AgentResult fields have heterogeneous
+    # types and spreading a concrete dict[str, <union>] defeats pyright's
+    # per-parameter type checking at the ** call site.
+    defaults: dict[str, Any] = {
+        'success': True, 'output': 'ok', 'cost_usd': 0.5, 'stderr': '',
+    }
     defaults.update(overrides)
     return AgentResult(**defaults)
 
