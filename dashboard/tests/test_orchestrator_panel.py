@@ -129,70 +129,25 @@ class TestOrchestratorRouteBasics:
         assert '1 pending' in html
 
     def test_alpine_toggle(self, client):
+        """Card uses x-data, x-show on rows, x-model checkboxes, $store.panels."""
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
         assert 'x-data' in html
         assert 'x-show' in html
-        assert '@click' in html
         assert '$store.panels' in html
 
-    def test_show_tasks_button(self, client):
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        assert 'Show tasks' in html
-
-    def test_table_wrapper_hidden_by_default(self, client):
-        """Task table wrapper must have style='display:none' so it is hidden
-        even before Alpine processes the element after an HTMX morph."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        assert 'style="display:none"' in html
-
     def test_table_wrapper_has_x_cloak(self, client):
-        """Wrapper retains x-cloak for initial page load (non-HTMX) scenarios."""
+        """x-cloak appears on task rows so they are hidden before Alpine mounts."""
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
         assert 'x-cloak' in html
 
     def test_table_wrapper_x_show_uses_store(self, client):
-        """x-show references $store.panels[key] so state persists across morphs."""
+        """x-show on rows still references $store.panels[key] for persistence."""
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
-        # The x-show must use $store.panels, not local x-data state
+        # x-show is now on rows rather than the wrapper, but the store reference is the same
         assert "x-show=\"$store.panels[" in html
-
-    def test_button_x_text_uses_store(self, client):
-        """Button x-text expression uses $store.panels[key] for label toggling."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        assert "x-text=\"$store.panels[" in html
-
-    def test_task_table_wrapper_has_x_cloak(self, client):
-        """x-show div must have x-cloak so it is hidden before Alpine initializes
-        after an innerHTML swap (MutationObserver detects new x-data elements)."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        assert 'x-cloak' in html
-
-    def test_store_key_consistent_between_toggle_and_show(self, client):
-        """The $store.panels key in @click toggle must match the x-show key.
-
-        Extracts both keys from the rendered HTML and asserts they are equal.
-        Guards against key drift between the button and the table wrapper.
-        """
-        import re
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        # Extract key from @click: $store.panels['<key>'] = !$store.panels['<key>']
-        click_match = re.search(r"\$store\.panels\['([^']+)'\]\s*=\s*!", html)
-        # Extract key from x-show: x-show="$store.panels['<key>']"
-        show_match = re.search(r'x-show="\$store\.panels\[\'([^\']+)\'\]"', html)
-        assert click_match is not None, '@click $store.panels key not found'
-        assert show_match is not None, 'x-show $store.panels key not found'
-        assert click_match.group(1) == show_match.group(1), (
-            f'Key mismatch: @click uses {click_match.group(1)!r} '
-            f'but x-show uses {show_match.group(1)!r}'
-        )
 
     def test_card_shows_single_pid_label(self, client):
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
@@ -457,3 +412,207 @@ class TestOrchestratorNoPrd:
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_NO_PRD]):
             html = client.get('/partials/orchestrators').text
         assert '$store.panels' in html
+
+
+class TestOrchestratorFilterCheckboxes:
+    """Tests for the three orthogonal filter checkboxes (Active / Pending / Done).
+
+    The three checkboxes are independent: Active shows in-progress+blocked rows,
+    Pending shows pending rows, Done shows done/deferred/cancelled rows.
+    Default state: Active=on, Pending=off, Done=off (only active tasks visible).
+
+    Note on default-visibility e2e testing: verifying that exactly 2 rows are
+    *visually* shown on first load requires Alpine.js to initialise and apply
+    x-cloak.  That is a browser/JS-level concern outside the scope of the
+    current server-render test suite.  The x-init default (active: true) is
+    asserted below; end-to-end row-count verification is deferred to a future
+    Playwright smoke test.
+    """
+
+    def test_three_checkbox_inputs_rendered(self, client):
+        """Three <input type="checkbox"> elements present inside the orchestrator card."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        count = html.count('type="checkbox"')
+        assert count >= 3, f'Expected at least 3 checkboxes, found {count}'
+
+    def test_done_label_with_count(self, client):
+        """'Done' checkbox label shows count of done/other tasks (total minus active/pending)."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # total=5, in_progress=1, blocked=1, pending=1 → done count = 5-1-1-1 = 2
+        assert 'Done (2)' in html
+
+    def test_active_label_with_count(self, client):
+        """Label for 'Active' checkbox shows in-progress + blocked count."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'Active (2)' in html
+
+    def test_pending_label_with_count(self, client):
+        """Label for 'Pending' checkbox shows pending count."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'Pending (1)' in html
+
+    def test_x_init_default_state(self, client):
+        """x-init seeds active:true so in-progress/blocked rows start visible by default."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # Use regex to tolerate whitespace variation around the colon (e.g. 'active:true' vs 'active: true')
+        assert re.search(r'active\s*:\s*true', html), (
+            "x-init does not contain active=true default (regex: r'active\\s*:\\s*true')"
+        )
+
+
+class TestOrchestratorTaskRowFiltering:
+    """Tests for per-row x-show filtering on task table rows."""
+
+    ORCH_KEY = '-home-leo-src-dark-factory-prd-dashboard-md'
+
+    def test_all_tbody_rows_have_x_show(self, client):
+        """Every data <tr> in <tbody> carries an x-show attribute."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # Find tbody content
+        tbody_match = re.search(r'<tbody>(.*?)</tbody>', html, re.DOTALL)
+        assert tbody_match is not None, 'No <tbody> found'
+        tbody = tbody_match.group(1)
+        # Count <tr> tags and x-show occurrences in tbody
+        tr_count = tbody.count('<tr ')
+        xshow_count = tbody.count('x-show=')
+        assert tr_count > 0, 'No <tr> rows found in tbody'
+        assert xshow_count == tr_count, (
+            f'Expected {tr_count} x-show attributes but found {xshow_count}'
+        )
+
+    def test_total_row_count_equals_task_count(self, client):
+        """All 5 tasks are server-rendered; client-side x-show controls visibility."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        tbody_match = re.search(r'<tbody>(.*?)</tbody>', html, re.DOTALL)
+        assert tbody_match is not None
+        tbody = tbody_match.group(1)
+        tr_count = tbody.count('<tr ')
+        assert tr_count == 5, f'Expected 5 rows, found {tr_count}'
+
+    def test_active_rows_reference_dot_active(self, client):
+        """Rows for in-progress/blocked tasks reference .active in x-show."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # Find x-show attributes referencing .active (for active bucket rows)
+        active_rows = re.findall(r'x-show="([^"]*\.active[^"]*)"', html)
+        assert len(active_rows) >= 2, (
+            f'Expected at least 2 rows with .active in x-show, found {len(active_rows)}'
+        )
+
+    def test_active_rows_gate_on_active_only(self, client):
+        """Active-bucket rows gate solely on .active (no .all dependency)."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        active_rows = re.findall(r'x-show="([^"]*\.active[^"]*)"', html)
+        assert len(active_rows) >= 2
+        for expr in active_rows:
+            assert '.done' not in expr, (
+                f'Active row x-show "{expr}" unexpectedly references .done'
+            )
+
+    def test_pending_row_references_dot_pending(self, client):
+        """Row for pending task references .pending in x-show."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        pending_rows = re.findall(r'x-show="([^"]*\.pending[^"]*)"', html)
+        assert len(pending_rows) >= 1, (
+            f'Expected at least 1 row with .pending in x-show, found {len(pending_rows)}'
+        )
+
+    def test_pending_rows_gate_on_pending_only(self, client):
+        """Pending-bucket rows gate solely on .pending (no .all or .done dependency)."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        pending_rows = re.findall(r'x-show="([^"]*\.pending[^"]*)"', html)
+        assert len(pending_rows) >= 1
+        for expr in pending_rows:
+            assert '.done' not in expr, (
+                f'Pending row x-show "{expr}" unexpectedly references .done'
+            )
+
+    def test_done_rows_gate_on_done_flag(self, client):
+        """Done/other-bucket rows gate solely on .done (NOT .active or .pending)."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        tbody_match = re.search(r'<tbody>(.*?)</tbody>', html, re.DOTALL)
+        assert tbody_match is not None
+        tbody = tbody_match.group(1)
+        all_xshow = re.findall(r'x-show="([^"]+)"', tbody)
+        # "other" rows: reference .done but NOT .active AND NOT .pending
+        done_rows = [
+            expr for expr in all_xshow
+            if '.done' in expr and '.active' not in expr and '.pending' not in expr
+        ]
+        # We have 2 done tasks (ids 1 and 2)
+        assert len(done_rows) >= 2, (
+            f'Expected at least 2 done/other rows gated only on .done, found {len(done_rows)}: {done_rows}'
+        )
+
+    def test_rows_have_x_cloak(self, client):
+        """Task rows carry x-cloak to avoid flash before Alpine mounts."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        tbody_match = re.search(r'<tbody>(.*?)</tbody>', html, re.DOTALL)
+        assert tbody_match is not None
+        tbody = tbody_match.group(1)
+        cloak_count = tbody.count('x-cloak')
+        assert cloak_count >= 5, (
+            f'Expected at least 5 x-cloak attributes on rows, found {cloak_count}'
+        )
+
+
+class TestOrchestratorKeyConsistency:
+    """Regression: x-init, checkboxes, and row x-show all reference the same orch_key."""
+
+    def test_all_store_references_use_same_key(self, client):
+        """Parse orch_key from the card id attribute, then verify x-init, all checkbox
+        bindings, and all row x-show expressions reference exactly that key.
+
+        Guards against future drift where orch_key is renamed in one template but
+        not the other (the role previously played by test_store_key_consistent_between_toggle_and_show,
+        now generalized to cover the full filter surface).
+        """
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+
+        # Derive expected orch_key from the card's id attribute: id="orch-<key>"
+        id_match = re.search(r'id="orch-([^"]+)"', html)
+        assert id_match is not None, 'Card id="orch-..." not found in HTML'
+        orch_key = id_match.group(1)
+
+        # x-init must reference the same key
+        assert f"$store.panels['{orch_key}']" in html, (
+            f"x-init does not reference key '{orch_key}'"
+        )
+
+        # All three x-model bindings must use the same key
+        for attr in ['active', 'pending', 'done']:
+            assert f"$store.panels['{orch_key}'].{attr}" in html, (
+                f"No {attr} binding found for key '{orch_key}'"
+            )
+
+        # All x-show expressions on rows must also use the same key
+        row_xshow_values = re.findall(r'x-show="([^"]+)"', html)
+        assert len(row_xshow_values) > 0, 'No x-show attributes found'
+        for expr in row_xshow_values:
+            assert orch_key in expr, (
+                f"x-show expression '{expr}' does not reference orch_key '{orch_key}'"
+            )
+
