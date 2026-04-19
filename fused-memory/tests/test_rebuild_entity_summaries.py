@@ -83,7 +83,7 @@ class _UuidDispatcher:
         # guard is omitted — AsyncMock still works because it checks
         # asyncio.iscoroutine(result) after calling the side_effect callable.
         if hasattr(inspect, 'markcoroutinefunction'):
-            inspect.markcoroutinefunction(self)
+            inspect.markcoroutinefunction(self)  # type: ignore[attr-defined]
 
     async def __call__(self, uuid, name, edges, *, group_id, old_summary):
         self.dispatched.add(uuid)
