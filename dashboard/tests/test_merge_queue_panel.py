@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from contextlib import ExitStack
@@ -648,3 +649,70 @@ class TestExtractInlineScript:
         """
         with pytest.raises(AssertionError):
             _extract_inline_script('<html><body></body></html>')
+
+
+# ---------------------------------------------------------------------------
+# TestDepthTrimLeadingZeros
+# ---------------------------------------------------------------------------
+
+
+def _extract_depth_data(html: str) -> dict:
+    """Extract the depthData JSON object from the merge-queue partial's script block.
+
+    The template embeds ``var depthData = {{ depth_timeseries | tojson }};`` so
+    we look for the JSON literal that follows the ``depthData =`` assignment.
+    """
+    script = _extract_inline_script(html)
+    m = re.search(r'var depthData\s*=\s*(\{.*?\});', script, re.DOTALL)
+    assert m is not None, "Could not find 'var depthData = {...};' in script block"
+    return json.loads(m.group(1))
+
+
+class TestDepthTrimLeadingZeros:
+    """Verify that /partials/merge-queue strips leading zero buckets from the depth series."""
+
+    def test_leading_zeros_stripped_from_rendered_depth(self, client):
+        """When aggregate_queue_depth_timeseries returns a long zero-prefix, the
+        rendered depthData must have the leading zeros removed.
+
+        Setup: mock returns 4 buckets — [0, 0, 0, 5] — only the last is non-zero.
+        After trim_leading_zero_buckets the rendered payload must have exactly
+        1 label/value pair with value 5.
+        """
+        raw_depth = {
+            'labels': ['2026-04-10T10:00', '2026-04-10T10:15', '2026-04-10T10:30', '2026-04-10T10:45'],
+            'values': [0, 0, 0, 5],
+        }
+        with _patch_merge_queue_data(depth=raw_depth):
+            resp = client.get('/partials/merge-queue')
+
+        assert resp.status_code == 200
+        depth_data = _extract_depth_data(resp.text)
+
+        # The rendered payload must be shorter than the raw aggregate.
+        assert len(depth_data['labels']) < len(raw_depth['labels']), (
+            "Rendered depth has same length as raw aggregate — leading zeros were NOT trimmed"
+        )
+        # The first rendered value must be non-zero.
+        assert depth_data['values'][0] != 0, (
+            f"First rendered depth value is {depth_data['values'][0]!r}, expected non-zero"
+        )
+        # Exactly the non-zero tail should be present.
+        assert depth_data['labels'] == ['2026-04-10T10:45']
+        assert depth_data['values'] == [5]
+
+    def test_depth_without_leading_zeros_unchanged(self, client):
+        """When the depth series has no leading zeros, the rendered payload is unchanged."""
+        raw_depth = {
+            'labels': ['2026-04-10T10:00', '2026-04-10T10:15', '2026-04-10T10:30'],
+            'values': [3, 0, 2],
+        }
+        with _patch_merge_queue_data(depth=raw_depth):
+            resp = client.get('/partials/merge-queue')
+
+        assert resp.status_code == 200
+        depth_data = _extract_depth_data(resp.text)
+
+        # Interior zero is preserved; no trimming happens.
+        assert depth_data['labels'] == raw_depth['labels']
+        assert depth_data['values'] == raw_depth['values']
