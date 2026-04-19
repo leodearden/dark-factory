@@ -19,6 +19,7 @@ from dashboard.data.burndown import (
     _count_statuses,
     _tasks_json_for,
     aggregate_burndown_projects,
+    aggregate_burndown_series,
     collect_snapshot,
     downsample,
     get_burndown_projects,
@@ -1845,3 +1846,147 @@ class TestAggregateBurndownProjects:
         result = await aggregate_burndown_projects([None, None])
         assert result == []
 
+
+# ---------------------------------------------------------------------------
+# Tests: aggregate_burndown_series
+# ---------------------------------------------------------------------------
+
+
+def _make_burndown_db_with_series(
+    tmp_path: Path,
+    name: str,
+    project_id: str,
+    rows: list[tuple],
+) -> Path:
+    """Create a burndown DB with the given (ts, done, cancelled, blocked,
+    deferred, in_progress, pending) rows for *project_id*.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    db_path = tmp_path / name
+    _create_burndown_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    for ts, done, cancelled, blocked, deferred, in_progress, pending in rows:
+        conn.execute(
+            _INSERT_SNAPSHOT_SQL,
+            (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done),
+        )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def _recent_ts(offset_seconds: int = 0) -> str:
+    """Return an ISO timestamp that falls within the last 30 days."""
+    return (datetime.now(UTC) - timedelta(seconds=offset_seconds)).isoformat()
+
+
+class TestAggregateBurndownSeries:
+    """Tests for aggregate_burndown_series across multiple DB connections."""
+
+    @pytest.mark.asyncio
+    async def test_union_timestamps_sorted(self, tmp_path):
+        """Timestamps from both DBs for the same project are unioned and sorted."""
+        ts1 = _recent_ts(offset_seconds=200)
+        ts2 = _recent_ts(offset_seconds=100)
+        db1_path = _make_burndown_db_with_series(
+            tmp_path / 'db1', 'b.db', 'proj_a', [(ts1, 1, 0, 0, 0, 0, 0)]
+        )
+        db2_path = _make_burndown_db_with_series(
+            tmp_path / 'db2', 'b.db', 'proj_a', [(ts2, 2, 0, 0, 0, 0, 0)]
+        )
+        async with (
+            aiosqlite.connect(str(db1_path)) as c1,
+            aiosqlite.connect(str(db2_path)) as c2,
+        ):
+            result = await aggregate_burndown_series([c1, c2], 'proj_a', days=30)
+        assert ts1 in result['labels']
+        assert ts2 in result['labels']
+        # labels are sorted
+        assert result['labels'] == sorted(result['labels'])
+
+    @pytest.mark.asyncio
+    async def test_unique_timestamp_uses_its_values(self, tmp_path):
+        """A timestamp present in only one DB uses values from that DB."""
+        ts = _recent_ts(offset_seconds=100)
+        db1_path = _make_burndown_db_with_series(
+            tmp_path / 'db1', 'b.db', 'proj_a', [(ts, 5, 1, 2, 3, 4, 6)]
+        )
+        db2_path = _make_burndown_db_with_series(
+            tmp_path / 'db2', 'b.db', 'proj_a', []
+        )
+        async with (
+            aiosqlite.connect(str(db1_path)) as c1,
+            aiosqlite.connect(str(db2_path)) as c2,
+        ):
+            result = await aggregate_burndown_series([c1, c2], 'proj_a', days=30)
+        idx = result['labels'].index(ts)
+        assert result['done'][idx] == 5
+        assert result['cancelled'][idx] == 1
+        assert result['blocked'][idx] == 2
+        assert result['deferred'][idx] == 3
+        assert result['in_progress'][idx] == 4
+        assert result['pending'][idx] == 6
+
+    @pytest.mark.asyncio
+    async def test_duplicate_timestamp_last_writer_wins(self, tmp_path):
+        """When both DBs have the same timestamp, the last DB in the list wins.
+
+        This documents the last-writer-wins contract: the aggregate function
+        iterates DBs in order, and later entries overwrite earlier ones for the
+        same timestamp key.
+        """
+        ts = _recent_ts(offset_seconds=100)
+        db1_path = _make_burndown_db_with_series(
+            tmp_path / 'db1', 'b.db', 'proj_a', [(ts, 10, 0, 0, 0, 0, 0)]
+        )
+        db2_path = _make_burndown_db_with_series(
+            tmp_path / 'db2', 'b.db', 'proj_a', [(ts, 99, 0, 0, 0, 0, 0)]
+        )
+        async with (
+            aiosqlite.connect(str(db1_path)) as c1,
+            aiosqlite.connect(str(db2_path)) as c2,
+        ):
+            # c2 is last; its done=99 should win over c1's done=10
+            result = await aggregate_burndown_series([c1, c2], 'proj_a', days=30)
+        idx = result['labels'].index(ts)
+        assert result['done'][idx] == 99
+
+    @pytest.mark.asyncio
+    async def test_no_data_returns_empty_default(self, tmp_path):
+        """project_id with no rows in any DB returns the empty-series default."""
+        db1_path = _make_burndown_db_with_series(
+            tmp_path / 'db1', 'b.db', 'other_project', [(_recent_ts(), 1, 0, 0, 0, 0, 0)]
+        )
+        async with aiosqlite.connect(str(db1_path)) as c1:
+            result = await aggregate_burndown_series([c1], 'proj_missing', days=30)
+        assert result['labels'] == []
+        assert result['done'] == []
+        assert result['pending'] == []
+
+    @pytest.mark.asyncio
+    async def test_days_window_filters(self, tmp_path):
+        """Only rows within the days window are included."""
+        ts_recent = _recent_ts(offset_seconds=100)
+        ts_old = (datetime.now(UTC) - timedelta(days=100)).isoformat()
+        db_path = _make_burndown_db_with_series(
+            tmp_path / 'db1', 'b.db', 'proj_a',
+            [(ts_recent, 3, 0, 0, 0, 0, 0), (ts_old, 99, 0, 0, 0, 0, 0)],
+        )
+        async with aiosqlite.connect(str(db_path)) as c1:
+            result = await aggregate_burndown_series([c1], 'proj_a', days=30)
+        assert ts_recent in result['labels']
+        assert ts_old not in result['labels']
+
+    @pytest.mark.asyncio
+    async def test_empty_dbs_list_returns_empty(self):
+        """`dbs=[]` returns the empty-series default."""
+        result = await aggregate_burndown_series([], 'proj_a', days=30)
+        assert result['labels'] == []
+        assert result['done'] == []
+
+    @pytest.mark.asyncio
+    async def test_none_dbs_returns_empty(self):
+        """`dbs=[None, None]` returns the empty-series default."""
+        result = await aggregate_burndown_series([None, None], 'proj_a', days=30)
+        assert result['labels'] == []
+        assert result['done'] == []
