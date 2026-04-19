@@ -2225,6 +2225,34 @@ class TestSpeculativeMergeWorker:
 
 
 # ---------------------------------------------------------------------------
+# TestSpeculativeItemDefaults — unit tests for SpeculativeItem field defaults
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSpeculativeItemDefaults:
+    async def test_started_monotonic_default_is_none(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """SpeculativeItem.started_monotonic defaults to None when not passed.
+
+        Ensures construction sites that omit started_monotonic produce NULL
+        duration_ms (via _elapsed_ms) rather than a bogus time-since-process-start
+        value derived from the 0.0 sentinel.
+        """
+        req = _make_request('t1', 'b1', git_ops.project_root, config)
+        item = SpeculativeItem(
+            request=req,
+            merge_result=None,
+            merge_wt=None,
+            base_sha='',
+            speculative=False,
+            skip_verify=False,
+        )
+        assert item.started_monotonic is None
+
+
+# ---------------------------------------------------------------------------
 # TestSpeculativeBackwardCompat — step-17
 # Run key MergeWorker scenarios through SpeculativeMergeWorker to confirm
 # they behave identically with queue depth 1.
