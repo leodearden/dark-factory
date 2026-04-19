@@ -18,6 +18,20 @@ from shared.vllm_bridge import (
 )
 
 
+def _site_port(site: web.TCPSite) -> int:
+    """Return the bound port of a TCPSite whose `_server.sockets` holds a listener.
+
+    aiohttp's ``TCPSite._server`` is typed ``AbstractServer | None`` (and
+    ``AbstractServer`` does not formally expose ``sockets``), so we narrow with
+    an assert and read the concrete ``asyncio.base_events.Server`` attribute.
+    """
+    server = site._server
+    assert server is not None, 'site._server is None — site.start() not awaited?'
+    sockets = getattr(server, 'sockets', None)
+    assert sockets, 'site._server has no bound sockets'
+    return sockets[0].getsockname()[1]
+
+
 class TestTranslateMessagesResponseConvertsOpenAIToolCalls:
 
     def test_converts_openai_tool_calls_to_anthropic_content_list(self):
@@ -401,7 +415,7 @@ async def mock_upstream_models():
     await runner.setup()
     site = web.TCPSite(runner, '127.0.0.1', 0)
     await site.start()
-    port = site._server.sockets[0].getsockname()[1]
+    port = _site_port(site)
     url = f'http://127.0.0.1:{port}'
     yield url
     await runner.cleanup()
@@ -435,7 +449,7 @@ async def mock_upstream_messages():
     await runner.setup()
     site = web.TCPSite(runner, '127.0.0.1', 0)
     await site.start()
-    port = site._server.sockets[0].getsockname()[1]
+    port = _site_port(site)
     url = f'http://127.0.0.1:{port}'
     yield url, received_bodies
     await runner.cleanup()
@@ -457,7 +471,7 @@ async def mock_upstream_stream_capture():
     await runner.setup()
     site = web.TCPSite(runner, '127.0.0.1', 0)
     await site.start()
-    port = site._server.sockets[0].getsockname()[1]
+    port = _site_port(site)
     url = f'http://127.0.0.1:{port}'
     yield url, received_bodies
     await runner.cleanup()
@@ -480,7 +494,7 @@ async def mock_upstream_error():
     await runner.setup()
     site = web.TCPSite(runner, '127.0.0.1', 0)
     await site.start()
-    port = site._server.sockets[0].getsockname()[1]
+    port = _site_port(site)
     url = f'http://127.0.0.1:{port}'
     yield url
     await runner.cleanup()
@@ -503,7 +517,7 @@ async def mock_upstream_text_error():
     await runner.setup()
     site = web.TCPSite(runner, '127.0.0.1', 0)
     await site.start()
-    port = site._server.sockets[0].getsockname()[1]
+    port = _site_port(site)
     url = f'http://127.0.0.1:{port}'
     yield url
     await runner.cleanup()
@@ -526,7 +540,7 @@ async def mock_upstream_truncated_json():
     await runner.setup()
     site = web.TCPSite(runner, '127.0.0.1', 0)
     await site.start()
-    port = site._server.sockets[0].getsockname()[1]
+    port = _site_port(site)
     url = f'http://127.0.0.1:{port}'
     yield url
     await runner.cleanup()
