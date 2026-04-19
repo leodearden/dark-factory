@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Any
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
 # that never set ANTHROPIC_BASE_URL can still import shared.cli_invoke.
+from shared.proc_group import terminate_process_group
+
 try:
     from shared.vllm_bridge import VllmBridge as _VllmBridgeRuntime
 except ImportError:  # pragma: no cover - exercised only when aiohttp absent
@@ -641,6 +643,7 @@ async def _run_subprocess(
         stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
 
     try:
@@ -654,16 +657,19 @@ async def _run_subprocess(
             # SIGTERM lets the Claude CLI flush its final JSON output to stdout
             # (including session_id and token counts) before exiting.
             _SIGTERM_GRACE_SECS = 5
-            proc.terminate()  # SIGTERM
+            # Try to capture final output — preserve existing stdout-capture
+            # optimisation before falling back to process-group kill.
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.terminate()  # SIGTERM to direct child for output flush
             try:
                 stdout, stderr = await asyncio.wait_for(
                     proc.communicate(),
                     timeout=_SIGTERM_GRACE_SECS,
                 )
             except TimeoutError:
-                # Still alive after grace period — force kill
-                proc.kill()
-                await proc.wait()
+                # Still alive after grace period — kill entire process group
+                # (bash → cargo → rustc grandchildren included).
+                await terminate_process_group(proc, grace_secs=_SIGTERM_GRACE_SECS)
                 stdout_text = ''
                 stderr_text = f'Process killed after {timeout_seconds}s timeout (SIGTERM+SIGKILL)'
             else:
@@ -687,29 +693,12 @@ async def _run_subprocess(
                 timed_out=True,
             )
     except asyncio.CancelledError:
-        # Orchestrator shutdown path: the awaiting task was cancelled. The
-        # subprocess itself is *not* automatically killed — we must reap it
-        # here or its asyncio child-watcher thread keeps the event loop
-        # alive after the main coroutine returns. Shield the final wait so
-        # a second cancel can't abandon the waitpid mid-flight.
+        # Orchestrator shutdown path: the awaiting task was cancelled. Kill the
+        # entire process group (not just the direct child) so cargo/rustc
+        # grandchildren are also reaped.
         if proc.returncode is None:
-            logger.warning(f'Subprocess cancelled — terminating pid {proc.pid}')
-            with contextlib.suppress(ProcessLookupError):
-                proc.terminate()
-            try:
-                await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5.0))
-            except TimeoutError:
-                logger.warning(
-                    f'pid {proc.pid} did not exit on SIGTERM — killing'
-                )
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                try:
-                    await asyncio.shield(
-                        asyncio.wait_for(proc.wait(), timeout=5.0)
-                    )
-                except TimeoutError:
-                    logger.error(f'pid {proc.pid} unresponsive to SIGKILL')
+            logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
+            await terminate_process_group(proc, grace_secs=5.0)
         raise
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
