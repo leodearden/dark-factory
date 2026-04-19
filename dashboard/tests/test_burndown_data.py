@@ -18,6 +18,7 @@ from dashboard.data.burndown import (
     BURNDOWN_SCHEMA,
     _count_statuses,
     _tasks_json_for,
+    aggregate_burndown_projects,
     collect_snapshot,
     downsample,
     get_burndown_projects,
@@ -1780,4 +1781,66 @@ class TestCollectSnapshotDocstringContract:
             f'Docstring should mention at least 2 robustness terms from {robustness_terms}; '
             f'matched: {matched}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: aggregate_burndown_projects
+# ---------------------------------------------------------------------------
+
+
+def _make_burndown_db_with_projects(tmp_path: Path, name: str, project_ids: list[str]) -> Path:
+    """Create a burndown DB at tmp_path/name with one snapshot row per project_id."""
+    from datetime import UTC, datetime
+    db_path = tmp_path / name
+    _create_burndown_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    ts = datetime.now(UTC).isoformat()
+    for pid in project_ids:
+        _insert_snapshot(conn, pid, ts, done=1)
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+class TestAggregateBurndownProjects:
+    """Tests for aggregate_burndown_projects across multiple DB connections."""
+
+    @pytest.mark.asyncio
+    async def test_union_across_two_dbs(self, tmp_path):
+        """project_ids from both DBs are unioned."""
+        db1_path = _make_burndown_db_with_projects(tmp_path / 'db1', 'b.db', ['proj_a'])
+        db2_path = _make_burndown_db_with_projects(tmp_path / 'db2', 'b.db', ['proj_b'])
+        async with (
+            aiosqlite.connect(str(db1_path)) as c1,
+            aiosqlite.connect(str(db2_path)) as c2,
+        ):
+            result = await aggregate_burndown_projects([c1, c2])
+        assert 'proj_a' in result
+        assert 'proj_b' in result
+
+    @pytest.mark.asyncio
+    async def test_dedup_same_project_in_both_dbs(self, tmp_path):
+        """A project_id that appears in both DBs is included only once."""
+        db1_path = _make_burndown_db_with_projects(tmp_path / 'db1', 'b.db', ['shared', 'only_1'])
+        db2_path = _make_burndown_db_with_projects(tmp_path / 'db2', 'b.db', ['shared', 'only_2'])
+        async with (
+            aiosqlite.connect(str(db1_path)) as c1,
+            aiosqlite.connect(str(db2_path)) as c2,
+        ):
+            result = await aggregate_burndown_projects([c1, c2])
+        assert result.count('shared') == 1
+        assert 'only_1' in result
+        assert 'only_2' in result
+
+    @pytest.mark.asyncio
+    async def test_empty_dbs_list_returns_empty(self):
+        """`dbs=[]` returns []."""
+        result = await aggregate_burndown_projects([])
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_none_dbs_returns_empty(self):
+        """`dbs=[None, None]` returns []."""
+        result = await aggregate_burndown_projects([None, None])
+        assert result == []
 
