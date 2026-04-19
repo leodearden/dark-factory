@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import uuid as uuid_mod
@@ -180,6 +181,13 @@ class ReconciliationJournal:
         db_path = self.data_dir / 'reconciliation.db'
         self._db = await aiosqlite.connect(str(db_path))
         self._db.row_factory = aiosqlite.Row
+        # PRAGMA parity with EventBuffer — both connections share this DB file.
+        # Without busy_timeout the journal connection failed immediately on any
+        # writer-lock contention from EventBuffer ("database is locked"), the
+        # primary intra-process contention vector before WP-C.
+        await self._db.execute('PRAGMA journal_mode=WAL')
+        await self._db.execute('PRAGMA busy_timeout=5000')
+        await self._db.execute('PRAGMA synchronous=NORMAL')
         await self._db.executescript(SCHEMA_SQL)
         await self._db.commit()
 
@@ -188,9 +196,33 @@ class ReconciliationJournal:
             await self._db.execute('ALTER TABLE runs ADD COLUMN triggered_by TEXT')
             await self._db.commit()
         except Exception:
-            pass  # Column already exists
+            await self._safe_rollback()  # Column already exists
 
         logger.info(f'Reconciliation journal initialized at {db_path}')
+
+    async def _safe_rollback(self) -> None:
+        """Best-effort rollback — never raises."""
+        if self._db is None:
+            return
+        with contextlib.suppress(Exception):
+            await self._db.rollback()
+
+    @contextlib.asynccontextmanager
+    async def _txn(self):
+        """Explicit transaction wrapper: commit on success, rollback on any exception.
+
+        Without this, an exception (including ``CancelledError``) between an
+        ``execute()`` and ``commit()`` would leave aiosqlite's implicit
+        transaction open, holding the writer lock until the connection is
+        closed. ``BaseException`` so cancellation also rolls back.
+        """
+        db = self._require_db()
+        try:
+            yield db
+            await db.commit()
+        except BaseException:
+            await self._safe_rollback()
+            raise
 
     async def close(self) -> None:
         if self._db:
@@ -221,73 +253,69 @@ class ReconciliationJournal:
         )
 
     async def update_watermark(self, watermark: Watermark) -> None:
-        db = self._require_db()
-        await db.execute(
-            """INSERT INTO watermarks
-               (project_id, last_full_run_id, last_full_run_completed,
-                last_episode_timestamp, last_memory_timestamp, last_task_change_timestamp)
-               VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(project_id) DO UPDATE SET
-                 last_full_run_id = excluded.last_full_run_id,
-                 last_full_run_completed = excluded.last_full_run_completed,
-                 last_episode_timestamp = excluded.last_episode_timestamp,
-                 last_memory_timestamp = excluded.last_memory_timestamp,
-                 last_task_change_timestamp = excluded.last_task_change_timestamp
-            """,
-            (
-                watermark.project_id,
-                watermark.last_full_run_id,
-                _fmt_dt(watermark.last_full_run_completed),
-                _fmt_dt(watermark.last_episode_timestamp),
-                _fmt_dt(watermark.last_memory_timestamp),
-                _fmt_dt(watermark.last_task_change_timestamp),
-            ),
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                """INSERT INTO watermarks
+                   (project_id, last_full_run_id, last_full_run_completed,
+                    last_episode_timestamp, last_memory_timestamp, last_task_change_timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(project_id) DO UPDATE SET
+                     last_full_run_id = excluded.last_full_run_id,
+                     last_full_run_completed = excluded.last_full_run_completed,
+                     last_episode_timestamp = excluded.last_episode_timestamp,
+                     last_memory_timestamp = excluded.last_memory_timestamp,
+                     last_task_change_timestamp = excluded.last_task_change_timestamp
+                """,
+                (
+                    watermark.project_id,
+                    watermark.last_full_run_id,
+                    _fmt_dt(watermark.last_full_run_completed),
+                    _fmt_dt(watermark.last_episode_timestamp),
+                    _fmt_dt(watermark.last_memory_timestamp),
+                    _fmt_dt(watermark.last_task_change_timestamp),
+                ),
+            )
 
     # ── Runs ───────────────────────────────────────────────────────────
 
     async def start_run(self, run: ReconciliationRun) -> None:
-        db = self._require_db()
-        await db.execute(
-            """INSERT INTO runs
-               (id, project_id, run_type, trigger_reason, started_at,
-                events_processed, stage_reports, status, triggered_by)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                run.id,
-                run.project_id,
-                run.run_type,
-                run.trigger_reason,
-                run.started_at.isoformat(),
-                run.events_processed,
-                json.dumps({}),
-                run.status,
-                run.triggered_by,
-            ),
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                """INSERT INTO runs
+                   (id, project_id, run_type, trigger_reason, started_at,
+                    events_processed, stage_reports, status, triggered_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run.id,
+                    run.project_id,
+                    run.run_type,
+                    run.trigger_reason,
+                    run.started_at.isoformat(),
+                    run.events_processed,
+                    json.dumps({}),
+                    run.status,
+                    run.triggered_by,
+                ),
+            )
 
     async def complete_run(self, run_id: str, status: str) -> None:
-        db = self._require_db()
-        await db.execute(
-            'UPDATE runs SET status = ?, completed_at = ? WHERE id = ?',
-            (status, datetime.now(UTC).isoformat(), run_id),
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                'UPDATE runs SET status = ?, completed_at = ? WHERE id = ?',
+                (status, datetime.now(UTC).isoformat(), run_id),
+            )
 
     async def update_run_stage_reports(
         self, run_id: str, stage_reports: dict[str, StageReport | dict]
     ) -> None:
-        db = self._require_db()
         serialized = {}
         for k, v in stage_reports.items():
             serialized[k] = v.model_dump(mode='json') if isinstance(v, StageReport) else v
-        await db.execute(
-            'UPDATE runs SET stage_reports = ? WHERE id = ?',
-            (json.dumps(serialized), run_id),
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                'UPDATE runs SET stage_reports = ? WHERE id = ?',
+                (json.dumps(serialized), run_id),
+            )
 
     async def get_run(self, run_id: str) -> ReconciliationRun | None:
         db = self._require_db()
@@ -360,26 +388,25 @@ class ReconciliationJournal:
     # ── Journal entries ────────────────────────────────────────────────
 
     async def add_entry(self, entry: JournalEntry) -> None:
-        db = self._require_db()
-        await db.execute(
-            """INSERT INTO journal_entries
-               (id, run_id, stage, timestamp, operation, target_system,
-                before_state, after_state, reasoning, evidence)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                entry.id,
-                entry.run_id,
-                entry.stage.value if entry.stage else None,
-                entry.timestamp.isoformat(),
-                entry.operation,
-                entry.target_system,
-                json.dumps(entry.before_state) if entry.before_state is not None else None,
-                json.dumps(entry.after_state) if entry.after_state is not None else None,
-                entry.reasoning,
-                json.dumps(entry.evidence),
-            ),
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                """INSERT INTO journal_entries
+                   (id, run_id, stage, timestamp, operation, target_system,
+                    before_state, after_state, reasoning, evidence)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    entry.id,
+                    entry.run_id,
+                    entry.stage.value if entry.stage else None,
+                    entry.timestamp.isoformat(),
+                    entry.operation,
+                    entry.target_system,
+                    json.dumps(entry.before_state) if entry.before_state is not None else None,
+                    json.dumps(entry.after_state) if entry.after_state is not None else None,
+                    entry.reasoning,
+                    json.dumps(entry.evidence),
+                ),
+            )
 
     async def get_entries(self, run_id: str) -> list[JournalEntry]:
         db = self._require_db()
@@ -413,20 +440,19 @@ class ReconciliationJournal:
     # ── Judge verdicts ─────────────────────────────────────────────────
 
     async def add_verdict(self, verdict: JudgeVerdict) -> None:
-        db = self._require_db()
-        await db.execute(
-            """INSERT INTO judge_verdicts
-               (run_id, reviewed_at, severity, findings, action_taken)
-               VALUES (?, ?, ?, ?, ?)""",
-            (
-                verdict.run_id,
-                verdict.reviewed_at.isoformat(),
-                verdict.severity,
-                json.dumps(verdict.findings),
-                verdict.action_taken,
-            ),
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                """INSERT INTO judge_verdicts
+                   (run_id, reviewed_at, severity, findings, action_taken)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    verdict.run_id,
+                    verdict.reviewed_at.isoformat(),
+                    verdict.severity,
+                    json.dumps(verdict.findings),
+                    verdict.action_taken,
+                ),
+            )
 
     async def get_recent_verdicts(
         self, project_id: str, limit: int = 10
@@ -500,20 +526,19 @@ class ReconciliationJournal:
         run_id: str | None = None,
     ) -> None:
         """Record a backlog chunk processing boundary."""
-        db = self._require_db()
-        await db.execute(
-            """INSERT INTO chunk_boundaries
-               (id, project_id, run_id, events_count, status, created_at)
-               VALUES (?, ?, ?, ?, 'processing', ?)""",
-            (
-                chunk_id,
-                project_id,
-                run_id,
-                events_count,
-                datetime.now(UTC).isoformat(),
-            ),
-        )
-        await db.commit()
+        async with self._txn() as db:
+            await db.execute(
+                """INSERT INTO chunk_boundaries
+                   (id, project_id, run_id, events_count, status, created_at)
+                   VALUES (?, ?, ?, ?, 'processing', ?)""",
+                (
+                    chunk_id,
+                    project_id,
+                    run_id,
+                    events_count,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
 
     async def get_last_completed_chunk(self, project_id: str) -> dict | None:
         """Get the most recently completed chunk for resume-on-failure."""
@@ -548,23 +573,22 @@ class ReconciliationJournal:
     ) -> None:
         """Record an action performed during a reconciliation run."""
         try:
-            db = self._require_db()
-            await db.execute(
-                """INSERT INTO run_actions
-                   (id, run_id, action_type, target, operation, detail, causation_id, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    str(uuid_mod.uuid4()),
-                    run_id,
-                    action_type,
-                    target,
-                    operation,
-                    json.dumps(detail) if detail else '{}',
-                    causation_id,
-                    datetime.now(UTC).isoformat(),
-                ),
-            )
-            await db.commit()
+            async with self._txn() as db:
+                await db.execute(
+                    """INSERT INTO run_actions
+                       (id, run_id, action_type, target, operation, detail, causation_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(uuid_mod.uuid4()),
+                        run_id,
+                        action_type,
+                        target,
+                        operation,
+                        json.dumps(detail) if detail else '{}',
+                        causation_id,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
         except Exception as e:
             logger.warning(f'Failed to record run_action: {e}')
 

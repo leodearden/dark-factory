@@ -7,11 +7,28 @@ exhausting its budget reading 15+ code locations and classifying each one.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def suggestion_hash(suggestion: dict) -> str:
+    """Stable 16-char hash over a review suggestion's identity fields.
+
+    Used (together with the originating ``escalation_id``) to dedupe
+    tasks spawned from re-queued steward triages — see plan R4. A
+    steward timeout that requeues an escalation produces the same
+    ordered list of suggestions, so recomputing the hash per
+    suggestion is deterministic across retries.
+    """
+    h = hashlib.sha256()
+    for field in ('reviewer', 'location', 'category', 'description'):
+        h.update(str(suggestion.get(field, '')).encode())
+        h.update(b'\x00')
+    return h.hexdigest()[:16]
 
 # ---------------------------------------------------------------------------
 # System prompt — classification only, no code edits
@@ -36,6 +53,20 @@ review suggestions and classify each as ACCEPT or SKIP.
 - Refactors that would pessimize the design or impede planned work
 - Renames that don't actually improve semantic transparency
 - Pre-existing issues not introduced by the diff
+- **Documentation-only wording fixes.** Suggestions whose remedy is purely
+  editing a docstring, comment, or prose (e.g. "tighten the Returns section",
+  "the docstring should mention X", "comment could clarify Y", "align docstring
+  with named-access convention"). Documentation drift is not load-bearing in
+  this project and does not belong in the task tree — a follow-up task to pin
+  wording via `__doc__` assertions produces 100+ lines of fragile meta-tests
+  that reviewers then reject. If the underlying concern is behavioral (the
+  function is wrong AND the docstring hides it), accept the *behavioral* fix
+  and let the doc follow from it.
+- **Docstring-pin hardening suggestions.** Any suggestion that proposes
+  strengthening a regex / substring check / AST walk used to assert documentation
+  wording (e.g. "use `ast.get_docstring` instead of whole-file grep", "bound
+  the Returns-section slice"). Do not deepen the meta-test hole; the right
+  fix is to delete the meta-test, not to harden it.
 
 When in doubt, ACCEPT. The cost of a small unnecessary task is low;
 the cost of missing a real issue compounds.
@@ -158,15 +189,31 @@ def parse_triage_result(result) -> dict | None:
     return None
 
 
-def format_pretriaged_detail(triage_result: dict, original_suggestions: list[dict]) -> str:
+def format_pretriaged_detail(
+    triage_result: dict,
+    original_suggestions: list[dict],
+    escalation_id: str | None = None,
+) -> str:
     """Format triage results as markdown for the steward's escalation detail.
 
     The ``## Pre-Triaged Results`` header signals to the steward that
     classification is already done and it should act on the groups directly.
+
+    When ``escalation_id`` is supplied (R4), the detail embeds the
+    escalation id plus per-group ``suggestion_hash`` lists and instructs
+    the steward to stamp those as task metadata. Combined with the
+    interceptor's ``(escalation_id, suggestion_hash)`` idempotency check,
+    this prevents steward-timeout re-queues from creating duplicate
+    tasks — see plans/floating-snuggling-pebble.md R4.
     """
     accepted = triage_result.get('accepted', [])
     skipped = triage_result.get('skipped', [])
     groups = triage_result.get('proposed_task_groups', [])
+
+    hashes_by_index: dict[int, str] = {}
+    if escalation_id is not None:
+        for i, sug in enumerate(original_suggestions):
+            hashes_by_index[i] = suggestion_hash(sug)
 
     lines = [
         '## Pre-Triaged Results',
@@ -175,6 +222,29 @@ def format_pretriaged_detail(triage_result: dict, original_suggestions: list[dic
         f'{len(groups)} task group(s) proposed.**',
         '',
     ]
+
+    if escalation_id is not None:
+        lines.extend([
+            '### Task Idempotency Stamps',
+            '',
+            f'ESCALATION_ID: `{escalation_id}`',
+            '',
+            'When you call `add_task` for a group below, include this '
+            'metadata JSON so the interceptor can dedupe re-queued '
+            'triages (see plan R4):',
+            '',
+            '```json',
+            '{"escalation_id": "' + escalation_id + '", '
+            '"suggestion_hash": "<hash from the group header>", '
+            '"modules": ["<file-or-module paths>"]}',
+            '```',
+            '',
+            'Before creating, the fused-memory interceptor will check '
+            '`(escalation_id, suggestion_hash)` against existing tasks '
+            'and return the existing task id if a match is found — you '
+            'do not need to search for duplicates yourself.',
+            '',
+        ])
 
     if groups:
         lines.append('### Task Groups')
@@ -189,6 +259,23 @@ def format_pretriaged_detail(triage_result: dict, original_suggestions: list[dic
                     group_files.extend(accepted[idx].get('files', []))
             if group_files:
                 lines.append(f'Files: {", ".join(sorted(set(group_files)))}')
+            # R4: emit the suggestion_hash set so the steward can stamp
+            # it into metadata. Multiple hashes in a group hash together
+            # with a sentinel so dedupe is still deterministic.
+            if hashes_by_index:
+                group_hashes: list[str] = []
+                for accepted_idx in g.get('accepted_indices', []):
+                    if 0 <= accepted_idx < len(accepted):
+                        orig_idx = accepted[accepted_idx].get('index')
+                        if isinstance(orig_idx, int) and orig_idx in hashes_by_index:
+                            group_hashes.append(hashes_by_index[orig_idx])
+                if group_hashes:
+                    combined = _combine_suggestion_hashes(group_hashes)
+                    lines.append(
+                        f'suggestion_hash: `{combined}` '
+                        f'(from {len(group_hashes)} suggestion(s): '
+                        f'{", ".join(group_hashes)})',
+                    )
             lines.append('')
 
     if skipped:
@@ -206,3 +293,18 @@ def format_pretriaged_detail(triage_result: dict, original_suggestions: list[dic
     lines.append('```')
 
     return '\n'.join(lines)
+
+
+def _combine_suggestion_hashes(hashes: list[str]) -> str:
+    """Fold multiple per-suggestion hashes into a single stable group hash.
+
+    Deterministic (sorted) so re-queued triages produce the same group
+    hash even if the steward re-orders suggestions between retries.
+    """
+    if len(hashes) == 1:
+        return hashes[0]
+    h = hashlib.sha256()
+    for s in sorted(hashes):
+        h.update(s.encode())
+        h.update(b'|')
+    return h.hexdigest()[:16]

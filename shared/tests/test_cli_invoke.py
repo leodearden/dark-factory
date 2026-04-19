@@ -1249,6 +1249,81 @@ class TestParseClaudeOutputPropagatesTimedOut:
         assert agent.timed_out is input_timed_out
 
 
+# ── schema salvage (R1) ────────────────────────────────────────────────────────
+
+
+class TestParseClaudeOutputSchemaSalvage:
+    """When the CLI reports is_error=True but a structured_output dict is
+    attached, the parser salvages it: success=True and schema_salvaged=True.
+
+    This covers the error_max_turns + valid --json-schema payload case that
+    previously blocked the curator's drop/combine decisions (see task #1922
+    investigation notes in plans/floating-snuggling-pebble.md).
+    """
+
+    def test_is_error_with_structured_output_is_salvaged(self):
+        stdout = json.dumps({
+            'subtype': 'error_max_turns',
+            'is_error': True,
+            'cost_usd': 0.01,
+            'duration_ms': 500,
+            'num_turns': 2,
+            'session_id': 'sess-x',
+            'structured_output': {'action': 'drop', 'justification': 'dup'},
+            'result': 'boom',
+        })
+        sub = _SubprocessResult(stdout=stdout, stderr='', returncode=1,
+                                duration_ms=500, timed_out=False)
+        agent = _parse_claude_output(sub)
+        assert agent.success is True
+        assert agent.schema_salvaged is True
+        assert agent.structured_output == {
+            'action': 'drop', 'justification': 'dup',
+        }
+        # Raw error text preserved for diagnostics
+        assert agent.output == 'boom'
+
+    def test_is_error_without_structured_output_not_salvaged(self):
+        stdout = json.dumps({
+            'subtype': 'error_max_turns',
+            'is_error': True,
+            'cost_usd': 0.0,
+            'duration_ms': 100,
+            'num_turns': 1,
+            'result': 'just an error',
+        })
+        sub = _SubprocessResult(stdout=stdout, stderr='', returncode=1,
+                                duration_ms=100, timed_out=False)
+        agent = _parse_claude_output(sub)
+        assert agent.success is False
+        assert agent.schema_salvaged is False
+
+    def test_clean_success_sets_schema_salvaged_false(self):
+        stdout = _CLAUDE_VALID_JSON_STDOUT
+        sub = _SubprocessResult(stdout=stdout, stderr='', returncode=0,
+                                duration_ms=100, timed_out=False)
+        agent = _parse_claude_output(sub)
+        assert agent.success is True
+        assert agent.schema_salvaged is False
+
+    def test_is_error_with_non_dict_structured_output_not_salvaged(self):
+        # structured_output is a string, not a dict — no salvage.
+        stdout = json.dumps({
+            'subtype': 'error_max_turns',
+            'is_error': True,
+            'cost_usd': 0.0,
+            'duration_ms': 100,
+            'num_turns': 1,
+            'structured_output': 'not-a-dict',
+            'result': 'err',
+        })
+        sub = _SubprocessResult(stdout=stdout, stderr='', returncode=1,
+                                duration_ms=100, timed_out=False)
+        agent = _parse_claude_output(sub)
+        assert agent.success is False
+        assert agent.schema_salvaged is False
+
+
 # ── caller-level timed_out propagation (characterization tests) ───────────────
 
 

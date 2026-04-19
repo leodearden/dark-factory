@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
@@ -20,6 +21,7 @@ from orchestrator.merge_queue import (
     MergeWorker,
     SpeculativeItem,
     SpeculativeMergeWorker,
+    _check_plan_targets_in_tree,
 )
 
 # ---------------------------------------------------------------------------
@@ -177,6 +179,117 @@ class TestCasUpdateRef:
 
 
 @pytest.mark.asyncio
+class TestCheckPlanTargetsInTree:
+    """Unit tests for the plan-target drop-guard helper."""
+
+    async def test_all_plan_targets_present(
+        self, git_ops: GitOps,
+    ):
+        """Plan targets that exist in the merge commit → empty missing list."""
+        worktree = (await git_ops.create_worktree('plan-all-present')).path
+        (worktree / 'alpha.py').write_text('alpha = 1\n')
+        (worktree / 'beta.py').write_text('beta = 2\n')
+        await git_ops.commit(worktree, 'Add files')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t1', 'T1', 'desc')
+        artifacts.write_plan({
+            'files': ['alpha.py', 'beta.py'],
+            'modules': [],
+            'steps': [],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'plan-all-present')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            assert missing == []
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_one_plan_target_missing(
+        self, git_ops: GitOps,
+    ):
+        """Plan lists a file the task never created → returned in missing."""
+        worktree = (await git_ops.create_worktree('plan-one-missing')).path
+        (worktree / 'present.py').write_text('present = 1\n')
+        await git_ops.commit(worktree, 'Add present only')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t2', 'T2', 'desc')
+        artifacts.write_plan({
+            'files': ['present.py', 'absent.py'],
+            'modules': [],
+            'steps': [],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'plan-one-missing')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            assert missing == ['absent.py']
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_no_plan_json_returns_empty(
+        self, git_ops: GitOps,
+    ):
+        """No plan.json (architect never ran) → empty missing list."""
+        worktree = (await git_ops.create_worktree('no-plan')).path
+        (worktree / 'file.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add file')
+
+        # Deliberately NOT creating .task/plan.json
+        merge_result = await git_ops.merge_to_main(worktree, 'no-plan')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            assert missing == []
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_empty_files_list_returns_empty(
+        self, git_ops: GitOps,
+    ):
+        """Plan exists but files=[] → empty missing list."""
+        worktree = (await git_ops.create_worktree('plan-empty-files')).path
+        (worktree / 'some.py').write_text('some = 1\n')
+        await git_ops.commit(worktree, 'Add some')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t3', 'T3', 'desc')
+        artifacts.write_plan({
+            'files': [],
+            'modules': [],
+            'steps': [],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'plan-empty-files')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            assert missing == []
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+
+@pytest.mark.asyncio
 class TestMergeWorker:
     async def test_basic_merge_through_queue(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -205,6 +318,50 @@ class TestMergeWorker:
 
         # File should also be in the working tree (working tree synced)
         assert (git_ops.project_root / 'queued.py').exists()
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_blocks_when_merge_drops_plan_target(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Plan lists a file absent from merge commit → MergeWorker blocks."""
+        worktree = (await git_ops.create_worktree('drop-guard-task')).path
+        (worktree / 'kept.py').write_text('kept = True\n')
+        await git_ops.commit(worktree, 'Add kept file')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('drop-guard', 'Drop guard', 'desc')
+        # Plan claims two files but the task branch only created one.
+        artifacts.write_plan({
+            'files': ['kept.py', 'dropped.py'],
+            'modules': [],
+            'steps': [],
+        })
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass(),
+        ):
+            req = _make_request('drop-guard', 'drop-guard-task', worktree, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked'
+        assert 'dropped.py' in outcome.reason
+        assert 'plan target' in outcome.reason.lower()
+
+        # Main must NOT have advanced — drop-guard fires before advance_main
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'kept.py' not in main_files
 
         await worker.stop()
         worker_task.cancel()

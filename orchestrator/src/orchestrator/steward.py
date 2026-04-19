@@ -40,6 +40,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
+# Hard cap on consecutive cap-hit retries in _invoke_with_session.  Legitimate
+# retries are bounded by the failover-account count plus a few same-account
+# resumes; anything past this indicates a misconfigured gate or a loop bug
+# (e.g. a mock that never settles), so we raise instead of spinning.
+_MAX_CAP_RETRIES = 16
 
 
 @dataclass
@@ -405,7 +410,7 @@ class TaskSteward:
             result.account_name = ''
             return result
 
-        while True:
+        for _ in range(_MAX_CAP_RETRIES):
             async with self.usage_gate.invoke_slot() as slot:
                 if self._config_dir and slot.token:
                     self._config_dir.write_credentials(slot.token)
@@ -473,6 +478,11 @@ class TaskSteward:
             result.account_name = slot.account_name
             return result
 
+        raise RuntimeError(
+            f'Steward for task {self.task_id}: cap-retry loop exceeded '
+            f'{_MAX_CAP_RETRIES} attempts — usage_gate may be misconfigured',
+        )
+
     # ------------------------------------------------------------------
     # Pre-triage for large suggestion sets
     # ------------------------------------------------------------------
@@ -529,7 +539,9 @@ class TaskSteward:
             )
             return escalation
 
-        new_detail = format_pretriaged_detail(triage_result, suggestions)
+        new_detail = format_pretriaged_detail(
+            triage_result, suggestions, escalation_id=escalation.id,
+        )
 
         # Return a modified copy — don't mutate the queue's version
         from escalation.models import Escalation as EscModel

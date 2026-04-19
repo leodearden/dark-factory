@@ -7,6 +7,20 @@ import pytest
 from fused_memory.server.tools import create_mcp_server
 
 
+@pytest.fixture(autouse=True)
+def passthrough_main_checkout(monkeypatch):
+    """Stub resolve_main_checkout to pass its argument through unchanged.
+
+    These tests use synthetic project_root values like ``/project`` that
+    aren't real git working trees; the real resolver would reject them.
+    End-to-end resolver behavior is exercised in
+    test_main_checkout_resolver.py and test_canonical_tasks_json.py.
+    """
+    monkeypatch.setattr(
+        'fused_memory.server.tools.resolve_main_checkout', lambda p: str(p),
+    )
+
+
 @pytest.fixture
 def task_interceptor():
     ti = AsyncMock()

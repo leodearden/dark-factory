@@ -33,6 +33,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
+# Hard cap on consecutive cap-hit retries inside invoke_with_cap_retry.  Legitimate
+# retries are bounded by the failover-account count plus a few same-account
+# resumes; anything past this indicates a misconfigured gate or a loop bug
+# (e.g. a test mock whose slot.detect_cap_hit never returns False), so we
+# raise instead of spinning.
+_MAX_CAP_RETRIES = 16
 
 # Approximate cost per million tokens by model (for backends without native cost reporting)
 _MODEL_COSTS: dict[str, dict[str, float]] = {
@@ -80,7 +86,7 @@ async def invoke_with_cap_retry(
         result.account_name = ''
         return result
 
-    while True:
+    for _ in range(_MAX_CAP_RETRIES):
         async with usage_gate.invoke_slot() as slot:
             account_name = slot.account_name
 
@@ -130,6 +136,11 @@ async def invoke_with_cap_retry(
 
             slot.confirm(result.cost_usd)
             break
+    else:
+        raise RuntimeError(
+            f'{label}: cap-retry loop exceeded {_MAX_CAP_RETRIES} attempts '
+            '— usage_gate may be misconfigured',
+        )
 
     result.account_name = account_name
     return result

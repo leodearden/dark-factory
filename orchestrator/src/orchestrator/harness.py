@@ -175,6 +175,7 @@ class Harness:
         self._escalation_queue: EscalationQueue | None = None
         self._escalation_events: dict[str, asyncio.Event] = {}
         self._escalation_task: asyncio.Task | None = None
+        self._orphan_reaper_task: asyncio.Task | None = None
 
         # Merge queue — single worker owns all main-branch advancement
         self._merge_queue: asyncio.Queue = asyncio.Queue()
@@ -291,6 +292,12 @@ class Harness:
                 await self._dismiss_stale_escalations()
             except Exception as e:
                 logger.warning(f'Failed to dismiss stale escalations: {e}')
+
+            # 1c1. Start orphan L0 reaper (non-fatal) — catches escalations
+            # whose task_id has no active workflow/steward (e.g. reviewer
+            # emits against a synthetic task_id, or a workflow crashed
+            # before its steward could claim them).
+            self._start_orphan_l0_reaper()
 
             # 1c2. Delay before task execution (escalation server already running)
             if delay_secs > 0:
@@ -500,6 +507,10 @@ class Harness:
                 await self._stop_merge_worker()
             except Exception as e:
                 logger.warning(f'_stop_merge_worker() failed: {e}')
+            try:
+                await self._stop_orphan_l0_reaper()
+            except Exception as e:
+                logger.warning(f'_stop_orphan_l0_reaper() failed: {e}')
             try:
                 await self._stop_escalation_server()
             except Exception as e:
@@ -1124,6 +1135,12 @@ Output JSON matching the schema. Every task must appear in the output.
         self._escalation_queue.set_notify_callback(self._on_escalation)
         self._escalation_queue.set_resolve_callback(self._on_escalation_resolved)
 
+        # Wire escalation queue into review checkpoint so it can triage
+        # escalations the deep reviewer emits against the synthetic review
+        # task_id (which has no workflow/steward to handle them).
+        if self.review_checkpoint is not None:
+            self.review_checkpoint.escalation_queue = self._escalation_queue
+
         mcp_server = create_server(self._escalation_queue, merge_queue=self._merge_queue, orch_config=self.config)  # type: ignore[possibly-undefined]
         host = self.config.escalation.host
         port = self.config.escalation.port
@@ -1175,6 +1192,116 @@ Output JSON matching the schema. Every task must appear in the output.
                 await self._escalation_task
             self._escalation_task = None
             logger.info('Escalation server stopped')
+
+    def _start_orphan_l0_reaper(self) -> None:
+        """Start the orphan L0 reaper as a background asyncio task.
+
+        The reaper periodically scans pending level-0 escalations; any whose
+        ``task_id`` has no active workflow (not in ``_escalation_events``)
+        and whose age exceeds ``orphan_l0_timeout_secs`` is promoted to
+        level 1 so the escalation-watcher can pick it up.  Without this,
+        orphan L0s (e.g. emitted by the deep reviewer, or left behind by a
+        crashed workflow) sit pending until the next orchestrator restart
+        auto-dismisses them unread.
+        """
+        if not self.config.orphan_l0_reaper_enabled:
+            return
+        if self._escalation_queue is None:
+            return
+        if self._orphan_reaper_task is not None and not self._orphan_reaper_task.done():
+            return
+        self._orphan_reaper_task = asyncio.create_task(
+            self._orphan_l0_reaper_loop(), name='orphan-l0-reaper',
+        )
+        logger.info(
+            'Orphan L0 reaper started (timeout=%.0fs, interval=%.0fs)',
+            self.config.orphan_l0_timeout_secs,
+            self.config.orphan_l0_check_interval_secs,
+        )
+
+    async def _stop_orphan_l0_reaper(self) -> None:
+        """Cancel the orphan L0 reaper loop."""
+        if self._orphan_reaper_task is not None:
+            self._orphan_reaper_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._orphan_reaper_task
+            self._orphan_reaper_task = None
+            logger.info('Orphan L0 reaper stopped')
+
+    async def _orphan_l0_reaper_loop(self) -> None:
+        """Wake periodically and promote orphan L0 escalations to L1."""
+        interval = self.config.orphan_l0_check_interval_secs
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                self._reap_orphan_l0_escalations()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception('Orphan L0 reaper pass failed')
+
+    def _reap_orphan_l0_escalations(self) -> int:
+        """Single pass: promote any overdue orphan L0 to L1.  Returns count.
+
+        Extracted from the loop so tests can drive it deterministically.
+        An escalation is an orphan when its ``task_id`` is not in
+        ``_escalation_events`` (no running workflow) and it is older than
+        ``orphan_l0_timeout_secs``.
+        """
+        if self._escalation_queue is None:
+            return 0
+
+        from escalation.models import Escalation
+
+        timeout = self.config.orphan_l0_timeout_secs
+        now = datetime.now(UTC)
+        promoted = 0
+
+        for esc in self._escalation_queue.get_pending():
+            if esc.level != 0:
+                continue
+            if esc.task_id in self._escalation_events:
+                continue  # active workflow will handle it
+            try:
+                age_secs = (now - datetime.fromisoformat(esc.timestamp)).total_seconds()
+            except (ValueError, TypeError):
+                continue
+            if age_secs < timeout:
+                continue
+
+            reesc = Escalation(
+                id=self._escalation_queue.make_id(esc.task_id),
+                task_id=esc.task_id,
+                agent_role='harness-orphan-reaper',
+                severity=esc.severity,
+                category=esc.category,
+                summary=(
+                    f'Orphan L0 ({age_secs:.0f}s old, no active workflow): '
+                    f'{esc.summary}'
+                ),
+                detail=esc.detail,
+                suggested_action='manual_intervention',
+                worktree=esc.worktree,
+                workflow_state=esc.workflow_state,
+                level=1,
+            )
+            self._escalation_queue.submit(reesc)
+            self._escalation_queue.resolve(
+                esc.id,
+                (
+                    'Auto-promoted to level 1 — orphan L0 (no active '
+                    f'workflow for task_id={esc.task_id})'
+                ),
+                dismiss=True,
+                resolved_by='harness-orphan-reaper',
+            )
+            promoted += 1
+
+        if promoted:
+            logger.warning(
+                'Orphan L0 reaper: promoted %d escalation(s) to L1', promoted,
+            )
+        return promoted
 
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""

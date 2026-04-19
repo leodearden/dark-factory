@@ -3,8 +3,10 @@
 import asyncio
 import json
 import logging
+import os
 import uuid as uuid_mod
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
@@ -25,7 +27,10 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 
 if TYPE_CHECKING:
     from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.middleware.curator_escalator import CuratorEscalator
     from fused_memory.middleware.task_file_committer import TaskFileCommitter
+    from fused_memory.reconciliation.backlog_policy import BacklogPolicy
+    from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.targeted import TargetedReconciler
 
 logger = logging.getLogger(__name__)
@@ -44,17 +49,36 @@ class TaskInterceptor:
         event_buffer: EventBuffer,
         task_committer: 'TaskFileCommitter | None' = None,
         config: 'FusedMemoryConfig | None' = None,
+        escalator: 'CuratorEscalator | None' = None,
+        event_queue: 'EventQueue | None' = None,
+        backlog_policy: 'BacklogPolicy | None' = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
         self.buffer = event_buffer
+        # WP-B: when an event queue is wired in, journalling is fire-and-forget
+        # via the background drainer. If None, fall back to inline buffer.push
+        # — preserves the legacy call pattern for tests that haven't yet been
+        # updated to construct a queue.
+        self.event_queue = event_queue
         self.task_committer = task_committer
+        # WP-D: bounded-backlog enforcement. Each mutating public method calls
+        # ``_backlog_policy.check(project_id, project_root)`` before acquiring
+        # the project lock; a rejection verdict short-circuits to a structured
+        # error dict with no taskmaster mutation.
+        self._backlog_policy = backlog_policy
         self._background_tasks: set[asyncio.Task] = set()
 
         # Task curator: LLM-judged drop/combine/create gate. Lazy-initialized in
         # _get_curator() because it pulls in a Qdrant client + embedder.
         self._config = config
         self._curator: TaskCurator | None = None
+        self._escalator = escalator
+        # R3: per-project async lock serialises add_task / add_subtask
+        # calls. Concurrent triages of the same suggestion no longer race
+        # to create duplicate tasks — the second call waits, sees the
+        # first's ``note_created`` entry, and short-circuits to drop.
+        self._project_locks: dict[str, asyncio.Lock] = {}
         # One-shot flag: prevents redundant auto-backfill checks on subsequent calls.
         self._backfill_triggered: bool = False
         # Set by close(); prevents _get_curator() from re-creating a curator.
@@ -66,6 +90,18 @@ class TaskInterceptor:
             raise RuntimeError('Taskmaster is not configured.')
         await self.taskmaster.ensure_connected()
         return self.taskmaster
+
+    async def _backlog_gate(self, project_root: str) -> dict | None:
+        """WP-D guard. Returns a structured error dict if the policy rejects;
+        otherwise ``None`` and the caller proceeds.
+        """
+        if self._backlog_policy is None:
+            return None
+        project_id = resolve_project_id(project_root)
+        verdict = await self._backlog_policy.check(project_id, project_root)
+        if verdict.is_rejection:
+            return verdict.to_error_dict()
+        return None
 
     def _make_event(
         self, event_type: EventType, project_root: str, payload: dict
@@ -79,6 +115,21 @@ class TaskInterceptor:
             timestamp=datetime.now(UTC),
             payload=payload,
         )
+
+    async def _journal(self, event: ReconciliationEvent) -> None:
+        """Hand off an event for persistence.
+
+        WP-B: when a fire-and-forget ``EventQueue`` is configured, enqueue
+        synchronously and return immediately — the MCP hot path never
+        awaits SQLite. Without a queue (legacy / test setups), fall back
+        to an inline ``buffer.push``.
+        """
+        if self.event_queue is not None:
+            self.event_queue.enqueue(event)
+            return
+        # Legacy inline push (no queue wired) — tests and degraded setups.
+        buffer = self.buffer
+        await buffer.push(event)
 
     @staticmethod
     def _on_reconciliation_done(task: asyncio.Task) -> None:
@@ -154,17 +205,24 @@ class TaskInterceptor:
         tag: str | None = None,
     ) -> dict:
         """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered."""
+        if err := await self._backlog_gate(project_root):
+            return err
         tm = await self._ensure_taskmaster()
-        # 1. Get before-state
-        before = await tm.get_task(task_id, project_root, tag)
+        project_id = resolve_project_id(project_root)
+        # WP-E: hold the per-project lock across the read + no-op check +
+        # write so two concurrent status transitions can't observe the
+        # same before-state and both mutate tasks.json.
+        async with self._project_lock(project_id):
+            # 1. Get before-state
+            before = await tm.get_task(task_id, project_root, tag)
 
-        # 2. Same-status guard: no-op if nothing changed
-        old_status = _extract_status(before)
-        if status == old_status:
-            return {'success': True, 'no_op': True, 'task_id': task_id}
+            # 2. Same-status guard: no-op if nothing changed
+            old_status = _extract_status(before)
+            if status == old_status:
+                return {'success': True, 'no_op': True, 'task_id': task_id}
 
-        # 3. Execute status change
-        result = await tm.set_task_status(task_id, status, project_root, tag)
+            # 3. Execute status change
+            result = await tm.set_task_status(task_id, status, project_root, tag)
 
         # 5. Emit event
         event = self._make_event(
@@ -172,7 +230,7 @@ class TaskInterceptor:
             project_root,
             {'task_id': task_id, 'old_status': old_status, 'new_status': status},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
         self._schedule_commit(project_root, f'set_task_status({task_id}={status})')
 
         # 6. Targeted reconciliation for trigger statuses (fire-and-forget)
@@ -205,27 +263,34 @@ class TaskInterceptor:
         force: bool = False,
         tag: str | None = None,
     ) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         tm = await self._ensure_taskmaster()
+        project_id = resolve_project_id(project_root)
 
-        # Pre-snapshot: capture the task tree before Taskmaster generates subtasks
-        try:
-            pre_snapshot = await tm.get_tasks(project_root)
-        except Exception as pre_exc:
-            logger.warning(
-                'bulk_dedup: pre-snapshot failed for expand_task(%s): %s', task_id, pre_exc,
+        # WP-E: serialise the pre-snapshot + bulk mutation + commit so a
+        # concurrent add_task can't slip a task into the snapshot gap and
+        # get misclassified as newly-bulk-created.
+        async with self._project_lock(project_id):
+            # Pre-snapshot: capture the task tree before Taskmaster generates subtasks
+            try:
+                pre_snapshot = await tm.get_tasks(project_root)
+            except Exception as pre_exc:
+                logger.warning(
+                    'bulk_dedup: pre-snapshot failed for expand_task(%s): %s', task_id, pre_exc,
+                )
+                pre_snapshot = None
+
+            result = await tm.expand_task(
+                task_id, project_root, num=num, prompt=prompt, force=force, tag=tag
             )
-            pre_snapshot = None
-
-        result = await tm.expand_task(
-            task_id, project_root, num=num, prompt=prompt, force=force, tag=tag
-        )
+            await self._await_commit(project_root, f'expand_task({task_id})')
         event = self._make_event(
             EventType.tasks_bulk_created,
             project_root,
             {'parent_task_id': task_id, 'operation': 'expand_task'},
         )
-        await self.buffer.push(event)
-        await self._await_commit(project_root, f'expand_task({task_id})')
+        await self._journal(event)
 
         # Post-hoc dedup: remove newly-created tasks that duplicate pre-existing ones
         try:
@@ -268,25 +333,31 @@ class TaskInterceptor:
         num_tasks: str | None = None,
         tag: str | None = None,
     ) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         tm = await self._ensure_taskmaster()
+        project_id = resolve_project_id(project_root)
 
-        # Pre-snapshot: capture the task tree before Taskmaster generates tasks
-        try:
-            pre_snapshot = await tm.get_tasks(project_root)
-        except Exception as pre_exc:
-            logger.warning('bulk_dedup: pre-snapshot failed for parse_prd: %s', pre_exc)
-            pre_snapshot = None
+        # WP-E: serialise pre-snapshot + bulk mutation + commit; see
+        # expand_task for the rationale.
+        async with self._project_lock(project_id):
+            # Pre-snapshot: capture the task tree before Taskmaster generates tasks
+            try:
+                pre_snapshot = await tm.get_tasks(project_root)
+            except Exception as pre_exc:
+                logger.warning('bulk_dedup: pre-snapshot failed for parse_prd: %s', pre_exc)
+                pre_snapshot = None
 
-        result = await tm.parse_prd(
-            input_path, project_root, num_tasks=num_tasks, tag=tag
-        )
+            result = await tm.parse_prd(
+                input_path, project_root, num_tasks=num_tasks, tag=tag
+            )
+            await self._await_commit(project_root, 'parse_prd')
         event = self._make_event(
             EventType.tasks_bulk_created,
             project_root,
             {'input_path': input_path, 'operation': 'parse_prd'},
         )
-        await self.buffer.push(event)
-        await self._await_commit(project_root, 'parse_prd')
+        await self._journal(event)
 
         # Post-hoc dedup: remove newly-created tasks that duplicate pre-existing ones
         try:
@@ -349,6 +420,7 @@ class TaskInterceptor:
                 config=self._config,
                 taskmaster=self.taskmaster,
                 cwd=cwd,
+                escalator=self._escalator,
             )
             # Trigger the one-shot backfill check as a background task so the
             # caller is not delayed by the Qdrant count() round-trip.
@@ -470,11 +542,58 @@ class TaskInterceptor:
         falls back to create). Combine is implemented via Taskmaster's
         ``update_task`` with a ``prompt`` that instructs a verbatim replacement
         plus metadata carrying the combine marker.
+
+        Before writing, verifies the target's fingerprint and status. A
+        mismatched fingerprint (curator targeted the wrong task) or terminal
+        status (done/cancelled) aborts the write and returns None so the
+        caller degrades to ``create`` instead of silently clobbering an
+        unrelated task.
         """
         if decision.rewritten_task is None or decision.target_id is None:
             return None
         rt = decision.rewritten_task
         tm = await self._ensure_taskmaster()
+        project_id = resolve_project_id(project_root)
+
+        # ── Guard: fetch live target and verify fingerprint + status ──
+        try:
+            raw_target = await tm.get_task(decision.target_id, project_root)
+        except Exception as exc:
+            logger.warning(
+                'combine-guard: get_task failed for target=%s: %s — aborting combine',
+                decision.target_id, exc,
+            )
+            return None
+
+        target = _extract_task_dict(raw_target)
+        if target is None:
+            logger.warning(
+                'combine-guard: target %s returned no task dict — aborting combine',
+                decision.target_id,
+            )
+            return None
+
+        target_status = str(target.get('status', '') or '')
+        if target_status in {'done', 'cancelled'}:
+            logger.warning(
+                'combine-guard: target %s has terminal status %r — aborting '
+                'combine to avoid silently losing candidate work',
+                decision.target_id, target_status,
+            )
+            return None
+
+        target_title = str(target.get('title', '') or '')
+        expected_fp = _normalize_title(target_title)
+        got_fp = _normalize_title(decision.target_fingerprint or '')
+        if not got_fp or expected_fp != got_fp:
+            logger.warning(
+                'combine-guard: fingerprint mismatch for target=%s: '
+                'expected=%r got=%r — aborting combine',
+                decision.target_id,
+                target_title[:80],
+                (decision.target_fingerprint or '')[:80],
+            )
+            return None
 
         files_block = '\n'.join(f'  - {f}' for f in rt.files_to_modify)
         combine_prompt = (
@@ -493,6 +612,19 @@ class TaskInterceptor:
             'curator_justification': decision.justification[:500],
             'combined_at': datetime.now(UTC).isoformat(),
         })
+
+        # ── Audit: persist old-vs-new BEFORE the mutation so we can
+        # recover if the write crashes mid-flight.
+        _append_combine_audit(
+            project_id=project_id,
+            target_id=decision.target_id,
+            old_title=target_title,
+            old_description=str(target.get('description', '') or ''),
+            old_status=target_status,
+            new_title=rt.title,
+            new_description=rt.description,
+            justification=decision.justification,
+        )
 
         try:
             return await tm.update_task(
@@ -579,7 +711,9 @@ class TaskInterceptor:
 
             if decision.action == 'drop' and decision.target_id:
                 try:
-                    await tm.remove_task(tid, project_root)
+                    # WP-E: serialise the tasks.json mutation.
+                    async with self._project_lock(project_id):
+                        await tm.remove_task(tid, project_root)
                     removed.append({
                         'task_id': tid,
                         'title': title,
@@ -596,12 +730,16 @@ class TaskInterceptor:
                 continue
 
             if decision.action == 'combine' and decision.target_id:
-                combine_result = await self._execute_combine(project_root, decision)
-                if combine_result is None:
-                    kept.append({'task_id': tid, 'title': title})
-                    continue
+                # WP-E: combine writes to the target *and* removes the new
+                # task — hold the lock across both so no concurrent writer
+                # can observe the intermediate "new still present" state.
                 try:
-                    await tm.remove_task(tid, project_root)
+                    async with self._project_lock(project_id):
+                        combine_result = await self._execute_combine(project_root, decision)
+                        if combine_result is None:
+                            kept.append({'task_id': tid, 'title': title})
+                            continue
+                        await tm.remove_task(tid, project_root)
                 except Exception as exc:
                     errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
                     continue
@@ -643,7 +781,89 @@ class TaskInterceptor:
 
     # ── Write pass-throughs (emit event, no targeted reconciliation) ───
 
+    def _project_lock(self, project_id: str) -> asyncio.Lock:
+        """Return (lazily) the per-project serialisation lock for adds."""
+        lock = self._project_locks.get(project_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._project_locks[project_id] = lock
+        return lock
+
+    @staticmethod
+    def _extract_metadata_dict(metadata) -> dict | None:
+        """Best-effort parse of ``metadata`` into a dict, or None."""
+        if metadata is None:
+            return None
+        if isinstance(metadata, dict):
+            return metadata
+        if isinstance(metadata, str):
+            try:
+                parsed = json.loads(metadata)
+            except (json.JSONDecodeError, ValueError):
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return None
+
+    async def _check_escalation_idempotency(
+        self, *, project_root: str, metadata,
+    ) -> dict | None:
+        """Return an existing task's identity if ``(escalation_id,
+        suggestion_hash)`` in ``metadata`` matches a non-cancelled task.
+
+        R4: authoritative and cheap — no LLM, no embedding lookup.
+        Works even when the curator is disabled or broken, which is
+        exactly the regime that triggered the duplicate Type::Error
+        tasks (esc-1912-179 → esc-1912-190).
+        """
+        meta = self._extract_metadata_dict(metadata)
+        if not meta:
+            return None
+        esc_id = meta.get('escalation_id')
+        sug_hash = meta.get('suggestion_hash')
+        if not isinstance(esc_id, str) or not isinstance(sug_hash, str):
+            return None
+        if not esc_id or not sug_hash:
+            return None
+
+        if self.taskmaster is None:
+            return None
+        try:
+            tasks_result = await self.taskmaster.get_tasks(project_root)
+        except Exception:
+            logger.debug(
+                'r4: get_tasks failed during idempotency check', exc_info=True,
+            )
+            return None
+        for task in flatten_task_tree(tasks_result):
+            tmeta = task.get('metadata')
+            if not isinstance(tmeta, dict):
+                continue
+            if tmeta.get('escalation_id') != esc_id:
+                continue
+            if tmeta.get('suggestion_hash') != sug_hash:
+                continue
+            if str(task.get('status', '')) == 'cancelled':
+                continue
+            tid = str(task.get('id', ''))
+            if not tid:
+                continue
+            logger.warning(
+                'r4: idempotency hit — returning existing task %s for '
+                'escalation_id=%s suggestion_hash=%s',
+                tid, esc_id, sug_hash,
+            )
+            return {
+                'id': tid,
+                'title': str(task.get('title', '')),
+                'deduplicated': True,
+                'action': 'idempotency_hit',
+                'reason': 'escalation+suggestion matched',
+            }
+        return None
+
     async def add_task(self, project_root: str, **kwargs: Any) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         # Extract metadata before forwarding — taskmaster's add_task doesn't accept it
         metadata = kwargs.pop('metadata', None)
         if metadata is not None:
@@ -653,6 +873,36 @@ class TaskInterceptor:
             kwargs_for_candidate = kwargs
         candidate = self._build_candidate(kwargs_for_candidate)
         project_id = resolve_project_id(project_root)
+
+        async with self._project_lock(project_id):
+            return await self._add_task_locked(
+                project_root=project_root,
+                project_id=project_id,
+                candidate=candidate,
+                metadata=metadata,
+                kwargs=kwargs,
+            )
+
+    async def _add_task_locked(
+        self,
+        *,
+        project_root: str,
+        project_id: str,
+        candidate,
+        metadata,
+        kwargs: dict,
+    ) -> dict:
+        # ── R4: escalation-level idempotency ─────────────────────────
+        # When the caller stamps (escalation_id, suggestion_hash) into
+        # metadata, walk existing tasks and skip the curator entirely if
+        # a match is found. This covers the steward-timeout requeue case
+        # (esc-1912-179 → esc-1912-190 on Type::Error) without an LLM
+        # call or embedding lookup.
+        idempotency_hit = await self._check_escalation_idempotency(
+            project_root=project_root, metadata=metadata,
+        )
+        if idempotency_hit is not None:
+            return idempotency_hit
 
         # ── Curator gate: drop / combine / create ────────────────────
         curator = await self._get_curator()
@@ -716,53 +966,95 @@ class TaskInterceptor:
 
         # ── Create task ──────────────────────────────────────────────
         tm = await self._ensure_taskmaster()
-        result = await tm.add_task(project_root=project_root, **kwargs)
 
-        # Persist metadata via follow-up update_task if provided
+        # Normalise metadata to a JSON string for taskmaster. Serialising here
+        # keeps the MCP boundary (which demands a string) simple and preserves
+        # the plain-dict shape for the fallback update_task path.
+        metadata_json: str | None = None
+        if metadata:
+            metadata_json = (
+                metadata if isinstance(metadata, str) else json.dumps(metadata)
+            )
+
+        # Atomic path: pass metadata in the initial add_task so the task is
+        # never visible without its metadata (prevents the race that dropped
+        # files_to_modify under concurrent load — see task #1922).
+        try:
+            result = await tm.add_task(
+                project_root=project_root,
+                metadata=metadata_json,
+                **kwargs,
+            )
+            atomic_metadata_written = metadata_json is not None
+        except TypeError:
+            # Backwards-compat: pre-R5 taskmaster backends reject the new
+            # ``metadata`` kwarg. Fall through to the legacy two-step path.
+            result = await tm.add_task(project_root=project_root, **kwargs)
+            atomic_metadata_written = False
+
+        # Legacy fallback: follow-up update_task when the atomic write was
+        # unavailable. Racy by construction; kept only for rollout safety
+        # while both sides upgrade.
         task_id = None
         if isinstance(result, dict):
             task_id = str(result.get('id', ''))
-        if metadata and task_id:
+        if metadata_json and task_id and not atomic_metadata_written:
             try:
                 await tm.update_task(
-                    task_id=task_id, metadata=metadata, project_root=project_root,
+                    task_id=task_id,
+                    metadata=metadata_json,
+                    project_root=project_root,
                 )
             except Exception as e:
                 logger.warning(
                     f'add_task: metadata update for task {task_id} failed: {e}',
                 )
 
-        # Record survivor in the curator corpus so future checks see it.
+        # Record survivor in the curator. Two layers:
+        # 1. ``note_created`` — synchronous, in-memory exact-match cache.
+        #    MUST run inside the project lock so the *next* waiter on the
+        #    same lock sees the new entry on its pre-LLM check (R3).
+        # 2. ``record_task`` — awaited (not fire-and-forget) so the Qdrant
+        #    corpus has the point before the lock releases, letting a
+        #    near-miss follower's embedding lookup see it too.
         if curator is not None and candidate is not None and task_id:
-            bg = asyncio.create_task(
-                curator.record_task(task_id, candidate, project_id),
-                name=f'curator-record-{task_id}',
-            )
-            self._background_tasks.add(bg)
-            bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+            curator.note_created(project_id, candidate, task_id)
+            try:
+                await curator.record_task(task_id, candidate, project_id)
+            except Exception:
+                logger.warning(
+                    'add_task: curator.record_task awaited path failed for %s',
+                    task_id, exc_info=True,
+                )
 
         event = self._make_event(
             EventType.task_created,
             project_root,
             {'operation': 'add_task', 'task_id': task_id},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
         self._schedule_commit(project_root, 'add_task')
         return result
 
     async def update_task(
         self, task_id: str, project_root: str, **kwargs: Any,
     ) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         tm = await self._ensure_taskmaster()
-        result = await tm.update_task(
-            task_id=task_id, project_root=project_root, **kwargs,
-        )
+        project_id = resolve_project_id(project_root)
+        # WP-E: serialise the write; re-embed below reads only and stays
+        # outside the lock.
+        async with self._project_lock(project_id):
+            result = await tm.update_task(
+                task_id=task_id, project_root=project_root, **kwargs,
+            )
         event = self._make_event(
             EventType.task_modified,
             project_root,
             {'task_id': task_id, 'operation': 'update_task'},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
         self._schedule_commit(project_root, f'update_task({task_id})')
 
         # Re-embed if any corpus-relevant field changed. Taskmaster's update_task
@@ -812,9 +1104,28 @@ class TaskInterceptor:
     async def add_subtask(
         self, parent_id: str, project_root: str, **kwargs: Any,
     ) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         candidate = self._build_candidate(kwargs)
         project_id = resolve_project_id(project_root)
+        async with self._project_lock(project_id):
+            return await self._add_subtask_locked(
+                parent_id=parent_id,
+                project_root=project_root,
+                project_id=project_id,
+                candidate=candidate,
+                kwargs=kwargs,
+            )
 
+    async def _add_subtask_locked(
+        self,
+        *,
+        parent_id: str,
+        project_root: str,
+        project_id: str,
+        candidate,
+        kwargs: dict,
+    ) -> dict:
         # Curator gate for subtasks — previously bypassed entirely.
         curator = await self._get_curator()
         if curator is not None and candidate is not None:
@@ -861,32 +1172,40 @@ class TaskInterceptor:
             project_root,
             {'parent_id': parent_id, 'operation': 'add_subtask'},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
         self._schedule_commit(project_root, f'add_subtask({parent_id})')
 
-        # Record the new subtask in the curator corpus.
+        # Record the new subtask in the curator corpus (synchronous cache
+        # update + awaited Qdrant upsert — see add_task for the rationale).
         if curator is not None and candidate is not None and isinstance(result, dict):
             new_id = str(result.get('id', ''))
             if new_id:
-                bg = asyncio.create_task(
-                    curator.record_task(new_id, candidate, project_id),
-                    name=f'curator-record-{new_id}',
-                )
-                self._background_tasks.add(bg)
-                bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+                curator.note_created(project_id, candidate, new_id)
+                try:
+                    await curator.record_task(new_id, candidate, project_id)
+                except Exception:
+                    logger.warning(
+                        'add_subtask: curator.record_task awaited path failed for %s',
+                        new_id, exc_info=True,
+                    )
         return result
 
     async def remove_task(
         self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         tm = await self._ensure_taskmaster()
-        result = await tm.remove_task(task_id, project_root, tag)
+        project_id = resolve_project_id(project_root)
+        # WP-E: serialise against concurrent mutations on the same project.
+        async with self._project_lock(project_id):
+            result = await tm.remove_task(task_id, project_root, tag)
         event = self._make_event(
             EventType.task_deleted,
             project_root,
             {'task_id': task_id, 'operation': 'remove_task'},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
         self._schedule_commit(project_root, f'remove_task({task_id})')
         return result
 
@@ -897,16 +1216,21 @@ class TaskInterceptor:
         project_root: str,
         tag: str | None = None,
     ) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         tm = await self._ensure_taskmaster()
-        result = await tm.add_dependency(
-            task_id, depends_on, project_root, tag
-        )
+        project_id = resolve_project_id(project_root)
+        # WP-E: serialise against concurrent mutations on the same project.
+        async with self._project_lock(project_id):
+            result = await tm.add_dependency(
+                task_id, depends_on, project_root, tag
+            )
         event = self._make_event(
             EventType.task_modified,
             project_root,
             {'task_id': task_id, 'depends_on': depends_on, 'operation': 'add_dependency'},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
         self._schedule_commit(project_root, f'add_dependency({task_id}<-{depends_on})')
         return result
 
@@ -917,16 +1241,21 @@ class TaskInterceptor:
         project_root: str,
         tag: str | None = None,
     ) -> dict:
+        if err := await self._backlog_gate(project_root):
+            return err
         tm = await self._ensure_taskmaster()
-        result = await tm.remove_dependency(
-            task_id, depends_on, project_root, tag
-        )
+        project_id = resolve_project_id(project_root)
+        # WP-E: serialise against concurrent mutations on the same project.
+        async with self._project_lock(project_id):
+            result = await tm.remove_dependency(
+                task_id, depends_on, project_root, tag
+            )
         event = self._make_event(
             EventType.task_modified,
             project_root,
             {'task_id': task_id, 'depends_on': depends_on, 'operation': 'remove_dependency'},
         )
-        await self.buffer.push(event)
+        await self._journal(event)
         self._schedule_commit(project_root, f'remove_dependency({task_id}<-{depends_on})')
         return result
 
@@ -953,3 +1282,81 @@ def _extract_status(task_data: dict) -> str:
     if isinstance(data, dict):
         return data.get('status', 'unknown')
     return 'unknown'
+
+
+def _extract_task_dict(raw: Any) -> dict | None:
+    """Normalise a Taskmaster get_task response to the inner task dict.
+
+    Taskmaster's MCP responses are sometimes wrapped in ``{'data': {...}}``;
+    callers that care about the task's fields (title, description, status)
+    need the unwrapped shape.
+    """
+    if not isinstance(raw, dict):
+        return None
+    data = raw.get('data')
+    if isinstance(data, dict) and ('title' in data or 'status' in data):
+        return data
+    return raw
+
+
+def _normalize_title(title: str) -> str:
+    """Lowercase + collapse whitespace for forgiving title comparison.
+
+    Used by the combine-guard fingerprint check — the LLM echoes the target's
+    title verbatim, but accepting case/whitespace drift costs us nothing
+    while avoiding false-negative aborts on trivial formatting noise.
+    """
+    return ' '.join(title.strip().lower().split())
+
+
+def _combine_audit_path() -> Path:
+    """Resolve the combine-audit log path.
+
+    Honours ``DARK_FACTORY_DATA_DIR``; defaults to ``data/`` relative to the
+    process CWD (which for the shared systemd server is the repo root).
+    """
+    return Path(os.getenv('DARK_FACTORY_DATA_DIR', 'data')) / 'combine_audit.jsonl'
+
+
+def _append_combine_audit(
+    *,
+    project_id: str,
+    target_id: str,
+    old_title: str,
+    old_description: str,
+    old_status: str,
+    new_title: str,
+    new_description: str,
+    justification: str,
+) -> None:
+    """Append a one-line JSON record documenting an about-to-happen combine.
+
+    Append-only, best-effort. Failures log WARN but never propagate —
+    a flaky audit write should not block task-merge progress.
+    """
+    record = {
+        'ts': datetime.now(UTC).isoformat(),
+        'project_id': project_id,
+        'target_id': target_id,
+        'curator_decision_id': str(uuid_mod.uuid4()),
+        'old': {
+            'title': old_title,
+            'description_truncated': old_description[:500],
+            'status': old_status,
+        },
+        'new': {
+            'title': new_title,
+            'description_truncated': new_description[:500],
+        },
+        'justification_truncated': justification[:500],
+    }
+    path = _combine_audit_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a', encoding='utf-8') as fh:
+            fh.write(json.dumps(record) + '\n')
+    except Exception as exc:
+        logger.warning(
+            'combine-audit: failed to append audit record for target=%s: %s',
+            target_id, exc,
+        )
