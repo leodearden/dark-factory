@@ -1,7 +1,5 @@
 """Tests for orchestrator/verify.py, specifically _run_cmd bash executable handling."""
 
-import asyncio
-import tempfile
 from pathlib import Path
 
 import pytest
