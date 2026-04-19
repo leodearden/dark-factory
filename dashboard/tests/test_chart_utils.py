@@ -6,7 +6,7 @@ import typing
 
 import pytest
 
-from dashboard.data.chart_utils import ChartData, group_top_n, separate_label
+from dashboard.data.chart_utils import ChartData, group_top_n, separate_label, trim_leading_zero_buckets
 
 
 class TestChartDataType:
@@ -289,3 +289,71 @@ class TestSeparateLabelBoundsWithinRange:
         data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [30, 20]}
         with pytest.raises(ValueError, match="same length"):
             separate_label(data, 'b')
+
+
+# ---------------------------------------------------------------------------
+# TestTrimLeadingZeroBuckets
+# ---------------------------------------------------------------------------
+
+
+class TestTrimLeadingZeroBuckets:
+    """Tests for trim_leading_zero_buckets — drop leading zero-value (label, 0) pairs."""
+
+    def test_empty_input_returns_empty(self):
+        """Empty ChartData returns empty ChartData."""
+        data: ChartData = {'labels': [], 'values': []}
+        result = trim_leading_zero_buckets(data)
+        assert result == {'labels': [], 'values': []}
+
+    def test_all_zeros_returns_empty(self):
+        """All-zero values result is fully trimmed to empty lists."""
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [0, 0, 0]}
+        result = trim_leading_zero_buckets(data)
+        assert result['labels'] == []
+        assert result['values'] == []
+
+    def test_leading_zeros_trimmed_interior_zeros_preserved(self):
+        """Leading zeros are dropped; interior zeros (between activity clusters) remain."""
+        data: ChartData = {
+            'labels': ['t1', 't2', 't3', 't4', 't5'],
+            'values': [0, 0, 3, 0, 5],
+        }
+        result = trim_leading_zero_buckets(data)
+        # First two (0, 0) are leading — trimmed
+        assert result['labels'] == ['t3', 't4', 't5']
+        assert result['values'] == [3, 0, 5]
+
+    def test_trailing_zeros_not_trimmed(self):
+        """Trailing zeros are NOT removed — only leading-prefix zeros are trimmed."""
+        data: ChartData = {
+            'labels': ['t1', 't2', 't3'],
+            'values': [0, 5, 0],
+        }
+        result = trim_leading_zero_buckets(data)
+        # Only leading 0 trimmed; trailing 0 stays
+        assert result['labels'] == ['t2', 't3']
+        assert result['values'] == [5, 0]
+
+    def test_no_leading_zeros_returns_shallow_copy(self):
+        """Input with no leading zeros returns a copy with same labels/values."""
+        data: ChartData = {'labels': ['a', 'b', 'c'], 'values': [1, 0, 3]}
+        result = trim_leading_zero_buckets(data)
+        assert result['labels'] == ['a', 'b', 'c']
+        assert result['values'] == [1, 0, 3]
+        # Must be a new dict (shallow copy), not the same object
+        assert result is not data
+
+    def test_does_not_mutate_input(self):
+        """trim_leading_zero_buckets does not modify the input ChartData."""
+        original_labels = ['x', 'y', 'z']
+        original_values = [0, 2, 4]
+        data: ChartData = {'labels': list(original_labels), 'values': list(original_values)}
+        trim_leading_zero_buckets(data)
+        assert data['labels'] == original_labels
+        assert data['values'] == original_values
+
+    def test_length_mismatch_raises_value_error(self):
+        """Mismatched labels/values lengths raise ValueError like sibling helpers."""
+        data: ChartData = {'labels': ['a', 'b'], 'values': [1]}
+        with pytest.raises(ValueError):
+            trim_leading_zero_buckets(data)
