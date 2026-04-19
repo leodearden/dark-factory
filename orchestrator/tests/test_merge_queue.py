@@ -2229,20 +2229,20 @@ class TestSpeculativeMergeWorker:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 class TestSpeculativeItemDefaults:
-    async def test_started_monotonic_default_is_none(
-        self, git_ops: GitOps, config: OrchestratorConfig,
-    ):
+    def test_started_monotonic_default_is_none(self):
         """SpeculativeItem.started_monotonic defaults to None when not passed.
 
         Ensures construction sites that omit started_monotonic produce NULL
         duration_ms (via _elapsed_ms) rather than a bogus time-since-process-start
         value derived from the 0.0 sentinel.
+
+        Uses a MagicMock for request to avoid the asyncio.Future that
+        MergeRequest.result requires (we only care about the dataclass default).
         """
-        req = _make_request('t1', 'b1', git_ops.project_root, config)
+        from unittest.mock import MagicMock
         item = SpeculativeItem(
-            request=req,
+            request=MagicMock(),
             merge_result=None,
             merge_wt=None,
             base_sha='',
@@ -2257,9 +2257,8 @@ class TestSpeculativeItemDefaults:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 class TestEmitMergeAttemptHelper:
-    async def test_emit_merge_attempt_writes_row_without_attempt(
+    def test_emit_merge_attempt_writes_row_without_attempt(
         self, tmp_path: Path,
     ):
         """Call with outcome and duration_ms — row has no 'attempt' key."""
@@ -2285,7 +2284,7 @@ class TestEmitMergeAttemptHelper:
         assert attempt is None, f'Expected no attempt key, got {attempt!r}'
         assert dur == 42
 
-    async def test_emit_merge_attempt_writes_row_with_attempt(
+    def test_emit_merge_attempt_writes_row_with_attempt(
         self, tmp_path: Path,
     ):
         """Call with outcome, attempt, and duration_ms — row includes 'attempt'."""
@@ -2311,7 +2310,7 @@ class TestEmitMergeAttemptHelper:
         assert attempt == 3
         assert dur == 500
 
-    async def test_emit_merge_attempt_null_duration_when_none(
+    def test_emit_merge_attempt_null_duration_when_none(
         self, tmp_path: Path,
     ):
         """Call with duration_ms=None — duration_ms column is NULL."""
@@ -2334,7 +2333,7 @@ class TestEmitMergeAttemptHelper:
         assert outcome == 'done'
         assert dur is None, f'Expected NULL duration_ms, got {dur!r}'
 
-    async def test_emit_merge_attempt_noop_when_event_store_is_none(
+    def test_emit_merge_attempt_noop_when_event_store_is_none(
         self, tmp_path: Path,
     ):
         """Call with event_store=None — no exception, no row written."""
