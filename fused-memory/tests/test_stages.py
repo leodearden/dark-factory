@@ -412,6 +412,135 @@ class TestTaskKnowledgeSyncPayload:
         assert 'project_id="reify"' in payload
 
 
+class TestDoneProvenanceSection:
+    """_render_done_provenance_section and Stage 2 briefing integration."""
+
+    @pytest.fixture
+    def mock_deps(self, tmp_path):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root=str(tmp_path))
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @staticmethod
+    def _init_repo(path):
+        import subprocess
+        subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
+        subprocess.run(
+            ['git', '-C', str(path), 'config', 'user.email', 't@e.example'], check=True,
+        )
+        subprocess.run(
+            ['git', '-C', str(path), 'config', 'user.name', 'T'], check=True,
+        )
+        (path / 'a.txt').write_text('a\n')
+        (path / 'b.txt').write_text('b\n')
+        subprocess.run(['git', '-C', str(path), 'add', '-A'], check=True)
+        subprocess.run(
+            ['git', '-C', str(path), 'commit', '-q', '-m', 'feat: ship a + b'],
+            check=True,
+        )
+        return subprocess.run(
+            ['git', '-C', str(path), 'rev-parse', 'HEAD'],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    @pytest.mark.asyncio
+    async def test_commit_provenance_renders_file_list(self, mock_deps, tmp_path):
+        """Task with commit provenance → git show file list injected."""
+        sha = self._init_repo(tmp_path)
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'p'
+        stage.project_root = str(tmp_path)
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [{
+                'id': 7, 'status': 'done', 'title': 'Ship A+B',
+                'metadata': {'done_provenance': {'commit': sha}},
+            }],
+        }
+
+        payload = await stage.assemble_payload([], Watermark(project_id='p'), [])
+
+        assert '### Done-task Provenance' in payload
+        assert f'commit: {sha}' in payload
+        assert 'a.txt' in payload
+        assert 'b.txt' in payload
+
+    @pytest.mark.asyncio
+    async def test_note_only_provenance_renders_note_verbatim(self, mock_deps, tmp_path):
+        """Note-only provenance → quoted verbatim, no git call."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'p'
+        stage.project_root = str(tmp_path)
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [{
+                'id': 9, 'status': 'done', 'title': 'Covered by sibling',
+                'metadata': {
+                    'done_provenance': {'note': 'implementation landed under task 7'},
+                },
+            }],
+        }
+
+        payload = await stage.assemble_payload([], Watermark(project_id='p'), [])
+
+        assert '### Done-task Provenance' in payload
+        assert 'note: implementation landed under task 7' in payload
+        assert 'commit:' not in _extract_section(payload, '### Done-task Provenance')
+
+    @pytest.mark.asyncio
+    async def test_missing_provenance_marked_legacy(self, mock_deps, tmp_path):
+        """Done task without metadata.done_provenance → 'provenance: unknown (legacy)'."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'p'
+        stage.project_root = str(tmp_path)
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [{'id': 11, 'status': 'done', 'title': 'Legacy'}],
+        }
+
+        payload = await stage.assemble_payload([], Watermark(project_id='p'), [])
+
+        section = _extract_section(payload, '### Done-task Provenance')
+        assert 'provenance: unknown (legacy)' in section
+
+    @pytest.mark.asyncio
+    async def test_no_done_tasks_omits_section(self, mock_deps, tmp_path):
+        """Empty done_tasks → provenance section is not injected."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'p'
+        stage.project_root = str(tmp_path)
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [{'id': 1, 'status': 'pending', 'title': 'WIP'}],
+        }
+
+        payload = await stage.assemble_payload([], Watermark(project_id='p'), [])
+
+        assert '### Done-task Provenance' not in payload
+
+    @pytest.mark.asyncio
+    async def test_invalid_commit_gracefully_omits_file_list(self, mock_deps, tmp_path):
+        """Unresolvable commit → section header emitted, no file list, no exception."""
+        self._init_repo(tmp_path)
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'p'
+        stage.project_root = str(tmp_path)
+        bad = 'deadbeef' * 5  # 40 chars but not a real SHA
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [{
+                'id': 3, 'status': 'done', 'title': 'Bad ref',
+                'metadata': {'done_provenance': {'commit': bad}},
+            }],
+        }
+
+        payload = await stage.assemble_payload([], Watermark(project_id='p'), [])
+
+        section = _extract_section(payload, '### Done-task Provenance')
+        assert f'commit: {bad}' in section
+        # git show failed → no files line
+        assert 'files:' not in section
+
+
 class BaseStageValidationTest:
     """Shared infrastructure for stage validation test classes.
 

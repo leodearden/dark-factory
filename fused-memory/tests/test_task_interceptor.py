@@ -1,6 +1,7 @@
 """Tests for task interceptor middleware."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -9,6 +10,7 @@ import pytest_asyncio
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.task_curator import CuratorDecision, RewrittenTask
 from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 
@@ -1419,6 +1421,216 @@ async def test_done_gate_does_not_fire_for_non_done_transitions(
         result = await interceptor.set_task_status('5', status, '/project')
         assert 'error' not in result, f'gate should not fire on {status}'
         taskmaster.set_task_status.assert_called_once()
+
+
+# ── Tests for done_provenance gate ─────────────────────────────────────────
+
+
+def _init_git_repo(path) -> str:
+    """Create a minimal git repo at path with one commit; return full SHA."""
+    import subprocess
+    subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
+    subprocess.run(
+        ['git', '-C', str(path), 'config', 'user.email', 't@e.example'], check=True,
+    )
+    subprocess.run(
+        ['git', '-C', str(path), 'config', 'user.name', 'T'], check=True,
+    )
+    (path / 'seed.txt').write_text('seed\n')
+    subprocess.run(['git', '-C', str(path), 'add', '-A'], check=True)
+    subprocess.run(
+        ['git', '-C', str(path), 'commit', '-q', '-m', 'seed'], check=True,
+    )
+    return subprocess.run(
+        ['git', '-C', str(path), 'rev-parse', 'HEAD'],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+@pytest.fixture
+def config_with_strict_provenance():
+    """FusedMemoryConfig with require_done_provenance=True."""
+    cfg = FusedMemoryConfig()
+    cfg.reconciliation.require_done_provenance = True
+    return cfg
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_warn_only_when_missing_by_default(
+    taskmaster, reconciler, event_buffer
+):
+    """Without require_done_provenance, a missing payload logs a warning but proceeds."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    assert 'error' not in result
+    taskmaster.set_task_status.assert_called_once()
+    # metadata was not touched because no provenance was provided
+    taskmaster.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_rejects_missing_when_required(
+    taskmaster, reconciler, event_buffer, config_with_strict_provenance
+):
+    """With the gate enabled, a missing payload is rejected with a structured error."""
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=config_with_strict_provenance,
+    )
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_required'
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_rejects_empty_payload(
+    taskmaster, reconciler, event_buffer, config_with_strict_provenance
+):
+    """An object with empty commit AND empty note is invalid even with gate on."""
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=config_with_strict_provenance,
+    )
+
+    result = await interceptor.set_task_status(
+        '1', 'done', '/project', done_provenance={'commit': '', 'note': ''},
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_rejects_invalid_commit_ref(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """A commit that can't be resolved by git rev-parse errors regardless of gate."""
+    _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={'commit': 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'},
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_resolves_short_sha_and_persists(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """A short SHA is resolved to full SHA and persisted via update_task metadata."""
+    sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path), done_provenance={'commit': sha[:7]},
+    )
+
+    assert 'error' not in result
+    taskmaster.update_task.assert_called_once()
+    kwargs = taskmaster.update_task.call_args.kwargs
+    persisted = json.loads(kwargs['metadata'])
+    assert persisted['done_provenance']['commit'] == sha
+    assert persisted['done_provenance']['commit_input'] == sha[:7]
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_note_only_accepted_and_persisted(
+    taskmaster, reconciler, event_buffer
+):
+    """A note-only payload is accepted without git validation and persisted."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', '/project',
+        done_provenance={'note': 'covered by parent task 1745'},
+    )
+
+    assert 'error' not in result
+    taskmaster.update_task.assert_called_once()
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    assert persisted['done_provenance'] == {'note': 'covered by parent task 1745'}
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_commit_plus_note_both_persisted(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """Both commit and note may be provided; both are recorded."""
+    sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={'commit': sha, 'note': 'ff-merged after review'},
+    )
+
+    assert 'error' not in result
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    assert persisted['done_provenance']['commit'] == sha
+    assert persisted['done_provenance']['note'] == 'ff-merged after review'
+    # No commit_input when the full SHA was supplied
+    assert 'commit_input' not in persisted['done_provenance']
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_reopen_does_not_require_provenance(
+    taskmaster, reconciler, event_buffer, config_with_strict_provenance
+):
+    """Transitioning out of done (e.g. done → in-progress) bypasses the gate."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'done', 'title': 'T'},
+    )
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=config_with_strict_provenance,
+    )
+
+    result = await interceptor.set_task_status('1', 'in-progress', '/project')
+
+    assert 'error' not in result
+    taskmaster.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_malformed_shape_errors_even_warn_only(
+    taskmaster, reconciler, event_buffer
+):
+    """Wrong type (list instead of dict) always errors — never persists corrupt data."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', '/project', done_provenance=['not', 'a', 'dict'],  # type: ignore[arg-type]
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_included_in_event_payload(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """The task_status_changed event carries resolved provenance for downstream recon."""
+    sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    await interceptor.set_task_status(
+        '1', 'done', str(tmp_path), done_provenance={'commit': sha},
+    )
+
+    project_id = resolve_project_id(str(tmp_path))
+    events = await event_buffer.peek_buffered(project_id, limit=10)
+    assert events, 'event should be buffered'
+    payload = events[-1].payload
+    assert payload['done_provenance']['commit'] == sha
 
 
 # ── Tests for background task retention (step-3) ───────────────────────────

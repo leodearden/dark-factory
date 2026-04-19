@@ -368,19 +368,29 @@ class GraphitiBackend:
         )
 
     async def update_edge(
-        self, edge_uuid: str, fact: str, *, group_id: str
+        self, edge_uuid: str, fact: str | None = None, *, group_id: str,
+        invalid_at: datetime | None = None,
     ) -> dict[str, Any]:
-        """Update an existing edge's fact text, re-embed, and refresh endpoint summaries.
+        """Update an existing edge's fact text and/or invalidate it.
 
-        No LLM extraction or edge resolution — the fact is written directly.
+        At least one of ``fact`` or ``invalid_at`` must be provided. When
+        ``fact`` is set, the edge's fact text is replaced and its embedding is
+        regenerated. When ``invalid_at`` is set, the edge is marked superseded
+        as of that timestamp (no re-embedding needed). Both may be combined.
+
         After saving, both source and target entity node summaries are rebuilt
         from their current valid edges so they stay consistent.
         """
+        if fact is None and invalid_at is None:
+            raise ValueError('update_edge requires fact or invalid_at to be set')
         driver = self._driver_for(group_id)
         edge = await EntityEdge.get_by_uuid(driver, edge_uuid)
-        edge.fact = fact
-        embedder = self._require_client().embedder
-        await edge.generate_embedding(embedder)
+        if fact is not None:
+            edge.fact = fact
+            embedder = self._require_client().embedder
+            await edge.generate_embedding(embedder)
+        if invalid_at is not None:
+            edge.invalid_at = invalid_at
         await asyncio.wait_for(edge.save(driver), timeout=self._write_timeout)
 
         # Deterministically refresh both endpoint entity summaries so they

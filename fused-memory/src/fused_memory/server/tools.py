@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid as uuid_mod
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -658,28 +658,36 @@ def create_mcp_server(
     @mcp.tool()
     async def update_edge(
         edge_uuid: str,
-        fact: str,
         project_id: str,
+        fact: str | None = None,
+        invalid_at: str | None = None,
         agent_id: str | None = None,
         session_id: str | None = None,
         metadata: dict | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Update an existing Graphiti edge's fact text directly.
+        """Update an existing Graphiti edge's fact text and/or invalidate it.
 
-        Bypasses the LLM extraction and edge resolution pipeline — the new fact
-        text replaces the old one, the embedding is regenerated, and both endpoint
-        entity summaries are refreshed. All other edge properties (valid_at,
-        invalid_at, episodes, endpoints) are preserved.
+        At least one of ``fact`` or ``invalid_at`` must be provided.
 
-        Use this instead of add_memory when refining or restating an existing
-        relationship that was found via search. This prevents false invalidation
-        of active edges.
+        - ``fact``: new fact text. Bypasses the LLM extraction and edge
+          resolution pipeline — the embedding is regenerated and both endpoint
+          entity summaries are refreshed. Use this when refining or restating
+          an existing relationship found via search, instead of add_memory
+          (which could false-invalidate active edges).
+        - ``invalid_at``: ISO 8601 timestamp marking the edge as superseded
+          as of that moment. Used by Stage-2 reconciliation to retire
+          contradicted facts (e.g. a 'shipped via X' edge where X isn't in
+          the task's recorded commit diff) without destroying the audit trail.
+
+        All other edge properties (valid_at, endpoints, episodes) are preserved.
 
         Args:
             edge_uuid: UUID of the existing edge (from search results)
-            fact: New fact text for the edge
             project_id: Project scope (required)
+            fact: New fact text for the edge (optional)
+            invalid_at: ISO 8601 timestamp to mark the edge as superseded
+                (optional; e.g. "2026-04-19T12:34:56+00:00")
             agent_id: Which agent is updating (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
@@ -689,14 +697,31 @@ def create_mcp_server(
             return err
         if not edge_uuid or not edge_uuid.strip():
             return {'error': 'edge_uuid is required', 'error_type': 'ValidationError'}
-        if not fact or not fact.strip():
-            return {'error': 'fact text is required', 'error_type': 'ValidationError'}
+        normalised_fact: str | None = None
+        if fact is not None:
+            if not fact.strip():
+                return {'error': 'fact text must be non-empty when provided',
+                        'error_type': 'ValidationError'}
+            normalised_fact = fact
+        parsed_invalid_at: datetime | None = None
+        if invalid_at is not None:
+            try:
+                parsed_invalid_at = datetime.fromisoformat(invalid_at)
+            except ValueError as e:
+                return {'error': f'invalid_at must be ISO 8601: {e}',
+                        'error_type': 'ValidationError'}
+            if parsed_invalid_at.tzinfo is None:
+                parsed_invalid_at = parsed_invalid_at.replace(tzinfo=UTC)
+        if normalised_fact is None and parsed_invalid_at is None:
+            return {'error': 'update_edge requires fact or invalid_at',
+                    'error_type': 'ValidationError'}
         try:
             causation_id, source, _ = _extract_causation(metadata, agent_id)
             return await memory_service.update_edge(
-                edge_uuid=edge_uuid, fact=fact, project_id=project_id,
+                edge_uuid=edge_uuid, fact=normalised_fact, project_id=project_id,
                 agent_id=agent_id, session_id=session_id,
                 causation_id=causation_id, _source=source,
+                invalid_at=parsed_invalid_at,
             )
         except Exception as e:
             logger.error(f'update_edge error: {e}')
@@ -1085,6 +1110,7 @@ def create_mcp_server(
         status: str,
         project_root: str,
         tag: str | None = None,
+        done_provenance: dict | None = None,
     ) -> dict[str, Any]:
         """Update task status. Triggers targeted reconciliation for
         done/blocked/cancelled/deferred transitions.
@@ -1097,6 +1123,18 @@ def create_mcp_server(
             status: pending, done, in-progress, blocked, review, deferred, or cancelled
             project_root: Absolute path to project root
             tag: Tag context (optional)
+            done_provenance: Verified evidence for a done transition; Stage-2
+                reconciliation uses this instead of fabricating 'shipped via X'
+                edges from metadata.modules. Shape:
+                  {"commit": "<sha-or-ref>"} — preferred; resolved via
+                  git rev-parse and pinned to a full SHA.
+                  {"note": "<explanation>"} — escape hatch for fast-forward
+                  merges, work covered by a sibling task, or interactive
+                  sessions where no single commit applies.
+                Both keys may be provided. At least one non-empty value is
+                required when reconciliation.require_done_provenance is True
+                (default False during rollout — missing provenance logs a
+                warning but does not block the transition).
         """
         project_root, err = _normalize_project_root(project_root)
         if err:
@@ -1111,7 +1149,8 @@ def create_mcp_server(
             }
         try:
             return await task_interceptor.set_task_status(
-                task_id=id, status=status, project_root=project_root, tag=tag
+                task_id=id, status=status, project_root=project_root, tag=tag,
+                done_provenance=done_provenance,
             )
         except Exception as e:
             logger.error(f'set_task_status error: {e}')
