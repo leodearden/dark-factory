@@ -12,6 +12,7 @@ import pytest
 from dashboard.data.performance import (
     aggregate_completion_paths,
     aggregate_escalation_rates,
+    aggregate_loop_histograms,
     get_completion_paths,
     get_escalation_rates,
     get_loop_histograms,
@@ -604,4 +605,98 @@ class TestAggregateEscalationRates:
         result = await aggregate_escalation_rates(
             [None, None], [edir, edir], days=7,
         )
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Tests: aggregate_loop_histograms
+# ---------------------------------------------------------------------------
+
+class TestAggregateLoopHistograms:
+    """Tests for aggregate_loop_histograms across multiple DB connections."""
+
+    @pytest.fixture()
+    async def two_hist_conns(self, tmp_path):
+        """Two runs.dbs each with dark_factory tasks (and DB2 has reify too)."""
+        now = datetime.now(UTC)
+        ts1 = (now - timedelta(minutes=40)).isoformat()
+        ts2 = (now - timedelta(minutes=30)).isoformat()
+        ts3 = (now - timedelta(minutes=20)).isoformat()
+
+        # DB1: dark_factory — rc=0,va=0 and rc=2,va=3
+        db1_path = _make_runs_db(tmp_path / 'db1', 'runs.db', [
+            ('run-a', 't1', 'dark_factory', 'T1', 'done',
+             0.5, 300_000, 2, 1, 0, 0, 0.0, 0, ts1),   # rc=0, va=0
+            ('run-a', 't2', 'dark_factory', 'T2', 'done',
+             0.5, 400_000, 3, 1, 3, 2, 0.0, 0, ts2),   # rc=2, va=3
+        ])
+
+        # DB2: dark_factory — rc=1,va=1 and rc=0,va=2
+        # reify — rc=0,va=0
+        db2_path = _make_runs_db(tmp_path / 'db2', 'runs.db', [
+            ('run-b', 't3', 'dark_factory', 'T3', 'done',
+             0.3, 200_000, 2, 1, 1, 1, 0.0, 0, ts1),   # rc=1, va=1
+            ('run-b', 't4', 'dark_factory', 'T4', 'done',
+             0.3, 250_000, 2, 1, 2, 0, 0.0, 0, ts2),   # rc=0, va=2
+            ('run-b', 't5', 'reify', 'T5', 'done',
+             0.2, 150_000, 1, 1, 0, 0, 0.0, 0, ts3),   # rc=0, va=0
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1_path)) as c1,
+            aiosqlite.connect(str(db2_path)) as c2,
+        ):
+            c1.row_factory = aiosqlite.Row
+            c2.row_factory = aiosqlite.Row
+            yield [c1, c2]
+
+    @pytest.mark.asyncio
+    async def test_outer_bins_summed_same_project(self, two_hist_conns):
+        """Outer (review_cycles) bins summed across DBs for same project_id."""
+        dbs = two_hist_conns
+        result = await aggregate_loop_histograms(dbs, days=1)
+        df = result['dark_factory']
+        outer = df['outer']
+        # DB1: rc=[0,2] → bins [1,0,1,0]; DB2: rc=[1,0] → bins [1,1,0,0]
+        # merged: [2, 1, 1, 0]
+        assert outer['values'] == [2, 1, 1, 0]
+
+    @pytest.mark.asyncio
+    async def test_inner_bins_summed_same_project(self, two_hist_conns):
+        """Inner (verify_attempts) bins summed across DBs for same project_id."""
+        dbs = two_hist_conns
+        result = await aggregate_loop_histograms(dbs, days=1)
+        df = result['dark_factory']
+        inner = df['inner']
+        # DB1: va=[0,3] → bins [1,0,0,1,0,0]; DB2: va=[1,2] → bins [0,1,1,0,0,0]
+        # merged: [1,1,1,1,0,0]
+        assert inner['values'] == [1, 1, 1, 1, 0, 0]
+
+    @pytest.mark.asyncio
+    async def test_labels_preserved(self, two_hist_conns):
+        """Labels are the canonical fixed lists for outer and inner loops."""
+        dbs = two_hist_conns
+        result = await aggregate_loop_histograms(dbs, days=1)
+        df = result['dark_factory']
+        assert df['outer']['labels'] == ['0', '1', '2', '3+']
+        assert df['inner']['labels'] == ['0', '1', '2', '3', '4', '5+']
+
+    @pytest.mark.asyncio
+    async def test_two_projects_surfaced(self, two_hist_conns):
+        """Both dark_factory and reify appear when each DB has a distinct project."""
+        dbs = two_hist_conns
+        result = await aggregate_loop_histograms(dbs, days=1)
+        assert 'dark_factory' in result
+        assert 'reify' in result
+
+    @pytest.mark.asyncio
+    async def test_empty_dbs_list(self):
+        """`dbs=[]` returns empty dict."""
+        result = await aggregate_loop_histograms([], days=7)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_none_dbs_returns_empty(self):
+        """`dbs=[None, None]` returns empty dict."""
+        result = await aggregate_loop_histograms([None, None], days=7)
         assert result == {}
