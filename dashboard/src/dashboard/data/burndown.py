@@ -276,6 +276,50 @@ async def aggregate_burndown_projects(
     return sorted(seen)
 
 
+async def aggregate_burndown_series(
+    dbs: list[aiosqlite.Connection | None],
+    project_id: str,
+    *,
+    days: int = 7,
+) -> dict:
+    """Return merged time-series data for *project_id* across all burndown DBs.
+
+    Calls :func:`get_burndown_series` for each DB in *dbs* concurrently, then
+    merges by timestamp label using a last-writer-wins strategy (later DBs in
+    the list overwrite earlier ones for the same timestamp).  The result is
+    sorted by timestamp and returned in the same dict-of-lists shape as
+    :func:`get_burndown_series`.
+
+    Returns the empty-series default ``{labels: [], done: [], ...}`` when no
+    rows are found across any DB.
+    """
+    _keys = ('done', 'cancelled', 'blocked', 'deferred', 'in_progress', 'pending')
+    empty: dict = {'labels': [], **{k: [] for k in _keys}}
+
+    if not dbs:
+        return empty
+
+    per_db: tuple[dict, ...] = await asyncio.gather(
+        *(get_burndown_series(db, project_id, days=days) for db in dbs)
+    )
+
+    # Merge by timestamp label (last-writer-wins: iterate DBs in order so that
+    # later entries overwrite earlier ones for the same timestamp key).
+    merged: dict[str, dict[str, int]] = {}
+    for series in per_db:
+        for i, label in enumerate(series['labels']):
+            merged[label] = {k: series[k][i] for k in _keys}
+
+    if not merged:
+        return empty
+
+    sorted_labels = sorted(merged)
+    result: dict = {'labels': sorted_labels}
+    for k in _keys:
+        result[k] = [merged[label][k] for label in sorted_labels]
+    return result
+
+
 async def get_burndown_projects(db: aiosqlite.Connection | None) -> list[str]:
     """Return distinct project IDs that have snapshot data."""
     if db is None:
