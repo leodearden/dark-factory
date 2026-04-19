@@ -575,15 +575,16 @@ class SpeculativeMergeWorker:
                 break
 
         # Drain verifier queue — also clean up orphaned merge worktrees.
-        # cleanup_merge_worktree is wrapped in suppress(Exception): filesystem
-        # errors during shutdown must not abort the drain loop and leave
-        # remaining Futures unresolved (callers would hang forever).
+        # cleanup_merge_worktree is wrapped in suppress(BaseException) so that
+        # CancelledError mid-drain (cancellation is propagating from SIGTERM)
+        # does not abort the drain loop and leave remaining Futures unresolved
+        # (callers would hang forever) and leaked merge worktrees on disk.
         while not self._verifier_queue.empty():
             try:
                 item = self._verifier_queue.get_nowait()
                 if item is not None:
                     if item.merge_wt is not None:
-                        with contextlib.suppress(Exception):
+                        with contextlib.suppress(BaseException):
                             await self._git_ops.cleanup_merge_worktree(item.merge_wt)
                     if not item.request.result.done():
                         item.request.result.set_result(shutdown)
@@ -607,14 +608,15 @@ class SpeculativeMergeWorker:
 
         # Re-drain the verifier queue: the merger may have pushed SpeculativeItems
         # after the initial drain above (e.g., after completing its in-flight merge
-        # while asyncio.wait() was running). Use the same suppress pattern so
-        # cleanup failures don't prevent Future resolution.
+        # while asyncio.wait() was running). Use the same suppress(BaseException)
+        # pattern so cleanup failures (including CancelledError mid-cleanup) don't
+        # prevent Future resolution.
         while not self._verifier_queue.empty():
             try:
                 item = self._verifier_queue.get_nowait()
                 if item is not None:
                     if item.merge_wt is not None:
-                        with contextlib.suppress(Exception):
+                        with contextlib.suppress(BaseException):
                             await self._git_ops.cleanup_merge_worktree(item.merge_wt)
                     if not item.request.result.done():
                         item.request.result.set_result(shutdown)
@@ -1032,12 +1034,20 @@ class SpeculativeMergeWorker:
 
         # ── Step 4: verify ────────────────────────────────────────────
         if not item.skip_verify:
+            logger.info(
+                f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
+                f'worktree={merge_wt.name})'
+            )
             try:
                 verify = await run_scoped_verification(
                     merge_wt, req.config, req.module_configs,
                     task_files=req.task_files,
                 )
             except Exception as exc:
+                logger.info(
+                    f'Task {req.task_id}: verify end '
+                    f'(merge={merge_commit[:8]}, error)'
+                )
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if not req.result.done():
                     req.result.set_result(MergeOutcome(
@@ -1045,6 +1055,10 @@ class SpeculativeMergeWorker:
                     ))
                 return False
 
+            logger.info(
+                f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
+                f'passed={verify.passed})'
+            )
             if not verify.passed:
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if not req.result.done():
