@@ -1316,7 +1316,8 @@ class GraphitiBackend:
     async def close(self) -> None:
         """Shut down the driver."""
         for cloned in self._cloned_drivers.values():
-            await cloned.close()
+            with contextlib.suppress(Exception):
+                await cloned.close()
         self._cloned_drivers.clear()
         if self._driver is not None:
             with contextlib.suppress(Exception):

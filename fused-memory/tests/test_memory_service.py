@@ -1021,9 +1021,11 @@ class TestGraphitiBackendClose:
 
         backend = GraphitiBackend(mock_config)
 
-        # Primary driver mock
-        backend._driver = MagicMock()
-        backend._driver.close = AsyncMock()
+        # Primary driver mock — save close reference before close() nulls _driver
+        primary_driver = MagicMock()
+        primary_close = AsyncMock()
+        primary_driver.close = primary_close
+        backend._driver = primary_driver
 
         # clone_a raises, clone_b should still be closed
         clone_a = MagicMock()
@@ -1038,7 +1040,7 @@ class TestGraphitiBackendClose:
         # clone_b still closed despite clone_a raising
         clone_b.close.assert_awaited_once()
         # Primary driver still closed
-        backend._driver.close.assert_awaited_once()
+        primary_close.assert_awaited_once()
         # Dict cleared
         assert backend._cloned_drivers == {}
         # Primary driver nulled out
