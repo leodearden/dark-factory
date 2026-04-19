@@ -117,7 +117,7 @@ class SpeculativeItem:
     speculative: bool                  # True → merged against pending N's SHA
     skip_verify: bool                  # True → pre_rebased and main unchanged
     immediate_outcome: MergeOutcome | None = None  # Set for conflict/already_merged
-    started_monotonic: float = 0.0  # time.monotonic() at request processing entry
+    started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
 
 
 class MergeWorker:
@@ -1026,7 +1026,7 @@ class SpeculativeMergeWorker:
                 remerge_occurred = iteration_did_remerge
                 self._speculation_slot.set()
 
-    async def _remerge(self, req: MergeRequest, started_monotonic: float) -> SpeculativeItem:
+    async def _remerge(self, req: MergeRequest, started_monotonic: float | None) -> SpeculativeItem:
         """Re-merge a request against actual main after speculation invalidation."""
         actual_main = await self._git_ops.get_main_sha()
         merge_result = await self._git_ops.merge_to_main(
