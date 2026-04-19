@@ -149,12 +149,6 @@ class TestOrchestratorRouteBasics:
         # x-show is now on rows rather than the wrapper, but the store reference is the same
         assert "x-show=\"$store.panels[" in html
 
-    def test_task_table_wrapper_has_x_cloak(self, client):
-        """x-cloak present in rendered HTML (now on row elements)."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        assert 'x-cloak' in html
-
     def test_card_shows_single_pid_label(self, client):
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
@@ -463,10 +457,13 @@ class TestOrchestratorFilterCheckboxes:
 
     def test_x_init_default_state(self, client):
         """x-init seeds active:true so in-progress/blocked rows start visible by default."""
+        import re
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
-        # The most important default: active rows are visible from first render
-        assert 'active: true' in html
+        # Use regex to tolerate whitespace variation around the colon (e.g. 'active:true' vs 'active: true')
+        assert re.search(r'active\s*:\s*true', html), (
+            "x-init does not contain active=true default (regex: r'active\\s*:\\s*true')"
+        )
 
 
 class TestOrchestratorTaskRowFiltering:

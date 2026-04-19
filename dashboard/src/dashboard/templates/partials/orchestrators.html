@@ -8,7 +8,7 @@
   {% if orchestrators %}
     {% for orch in orchestrators %}
       {% set orch_key = orch.label | replace('/', '-') | replace('.', '-') %}
-      <div x-data x-init="$store.panels['{{ orch_key }}'] = $store.panels['{{ orch_key }}'] || {active: true, pending: false, done: false}" id="orch-{{ orch_key }}" class="bg-gray-800 rounded-lg p-6 mb-4">
+      <div x-data x-init="if (typeof $store.panels['{{ orch_key }}'] !== 'object' || $store.panels['{{ orch_key }}'] === null) $store.panels['{{ orch_key }}'] = {active: true, pending: false, done: false}" id="orch-{{ orch_key }}" class="bg-gray-800 rounded-lg p-6 mb-4">
         <div class="flex items-center gap-3">
           {% if orch.pids|length > 1 %}<span class="text-gray-100 font-semibold">PIDs {{ orch.pids|join(", ") }}</span>{% else %}<span class="text-gray-100 font-semibold">PID {{ orch.pids[0] }}</span>{% endif %}
           {{ status_badge('running' if orch.running else 'completed', aria_label='Orchestrator status', color='bg-green-600' if orch.running else 'bg-gray-600') }}
@@ -45,6 +45,8 @@
           <label class="flex items-center gap-1 cursor-pointer">
             <input type="checkbox"
               x-model="$store.panels['{{ orch_key }}'].done">
+            {# "other" bucket count: tasks not in-progress, blocked, or pending.
+               Must stay in sync with the bucket='other' else-branch in partials/tasks.html. #}
             <span>Done ({{ orch.summary.total - orch.summary.in_progress - orch.summary.blocked - orch.summary.pending }})</span>
           </label>
         </div>
