@@ -1559,6 +1559,30 @@ def _build_workflow_with_escalation(
     return workflow, scheduler, queue
 
 
+def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
+    """Return a steward class that resolves all pending L0 escalations in start().
+
+    Used by TestMarkBlockedFalseDoneGuard tests to drive _mark_blocked through
+    the post-steward `if not remaining:` branch without a full workflow.run() cycle.
+    """
+
+    class _FakeSteward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            pass
+
+        async def start(self) -> None:
+            pending = queue.get_by_task(task_id, status='pending', level=0)
+            for esc in pending:
+                queue.resolve(
+                    esc.id, 'Resolved by FakeSteward', resolved_by='fake-steward',
+                )
+
+        async def stop(self) -> None:
+            pass
+
+    return _FakeSteward
+
+
 @pytest.mark.asyncio
 class TestTaskFailureEscalation:
     """Blocked tasks create escalation entries in the queue."""
@@ -2274,23 +2298,9 @@ class TestMarkBlockedFalseDoneGuard:
 
         # 3. FakeSteward: resolves all pending L0 escalations immediately in start()
         #    so _await_steward_completion() exits without timeout, and remaining == []
-        class _FakeSteward:
-            def __init__(self_inner, wt_path, cfg_dir):
-                pass
-
-            async def start(self_inner):
-                pending = queue.get_by_task(
-                    task_assignment.task_id, status='pending', level=0,
-                )
-                for esc in pending:
-                    queue.resolve(
-                        esc.id, 'Resolved by FakeSteward', resolved_by='fake-steward',
-                    )
-
-            async def stop(self_inner):
-                pass
-
-        workflow._steward_factory = _FakeSteward
+        workflow._steward_factory = _make_resolving_steward(
+            queue, task_assignment.task_id,
+        )
 
         # 4. Call _mark_blocked directly (no full run() cycle needed)
         outcome = await workflow._mark_blocked('synthetic failure')
@@ -2347,23 +2357,9 @@ class TestMarkBlockedFalseDoneGuard:
         workflow.artifacts = TaskArtifacts(wt)
 
         # 4. FakeSteward resolves all pending L0 escalations immediately in start()
-        class _FakeSteward:
-            def __init__(self_inner, wt_path, cfg_dir):
-                pass
-
-            async def start(self_inner):
-                pending = queue.get_by_task(
-                    task_assignment.task_id, status='pending', level=0,
-                )
-                for esc in pending:
-                    queue.resolve(
-                        esc.id, 'Resolved by FakeSteward', resolved_by='fake-steward',
-                    )
-
-            async def stop(self_inner):
-                pass
-
-        workflow._steward_factory = _FakeSteward
+        workflow._steward_factory = _make_resolving_steward(
+            queue, task_assignment.task_id,
+        )
 
         # 5. Call _mark_blocked directly
         outcome = await workflow._mark_blocked('synthetic failure')
@@ -2378,6 +2374,56 @@ class TestMarkBlockedFalseDoneGuard:
             f"Last scheduler status must be 'done' for genuine prior merge, got: {statuses}"
         )
         assert workflow.state == WorkflowState.DONE
+
+    async def test_git_exception_in_ancestor_check_requeues(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """git exception during is_ancestor must fall through to requeue, not crash.
+
+        The try/except at the is_ancestor call site swallows all exceptions and
+        falls through to the normal requeue path.  This test ensures a future
+        refactor can't accidentally turn a RuntimeError into an unguarded raise
+        or a false-done transition.
+        """
+        # 1. Create a fresh worktree (base commit only — no implementation commits)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. FakeSteward resolves the L0 so we reach the is_ancestor check
+        workflow._steward_factory = _make_resolving_steward(
+            queue, task_assignment.task_id,
+        )
+
+        # 4. Force is_ancestor to raise RuntimeError — simulates a git subprocess
+        #    failure (e.g. corrupted index, network mount offline, etc.)
+        async def _boom(*args, **kwargs):  # noqa: ARG001
+            raise RuntimeError('simulated git failure')
+
+        monkeypatch.setattr(git_ops, 'is_ancestor', _boom)
+
+        # 5. Call _mark_blocked — must survive the exception and requeue
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        # 6. Assertions: exception path must fall through to requeue
+        assert outcome == WorkflowOutcome.REQUEUED, (
+            f'Expected REQUEUED after git exception but got {outcome!r} — '
+            'the except-block in _mark_blocked is broken'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear after a git exception: {statuses}"
+        )
+        assert statuses[-1] == 'pending', (
+            f"Last status must be 'pending' after exception-path requeue: {statuses}"
+        )
 
 
 # ---------------------------------------------------------------------------

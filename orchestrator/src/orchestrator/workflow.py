@@ -2404,10 +2404,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             ):
                                 if not self._has_prior_implementation():
                                     logger.warning(
-                                        'Task %s: branch is ancestor of main '
-                                        'but no implementation entries — '
-                                        'proceeding with requeue',
+                                        'Task %s: branch HEAD %s is ancestor '
+                                        'of main %s but no implementation '
+                                        'entries — proceeding with requeue',
                                         self.task_id,
+                                        wt_head.strip()[:8],
+                                        main_sha[:8],
                                     )
                                 else:
                                     logger.info(
