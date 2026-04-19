@@ -54,8 +54,8 @@ class _StubQueue:
 
 async def _seed_buffered(event_buffer: EventBuffer, project_id: str, n: int) -> None:
     """Insert ``n`` buffered events for ``project_id`` directly via the schema."""
-    from datetime import UTC, datetime
     import uuid
+    from datetime import UTC, datetime
 
     from fused_memory.models.reconciliation import (
         EventSource,

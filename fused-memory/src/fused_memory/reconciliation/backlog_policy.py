@@ -21,14 +21,20 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Literal, Protocol
 
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
-    from fused_memory.reconciliation.event_queue import EventQueue
+
+
+class EventQueueLike(Protocol):
+    """Structural interface for the event queue; only ``stats()`` is used."""
+
+    def stats(self) -> dict: ...
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +97,8 @@ class BacklogPolicy:
 
     def __init__(
         self,
-        event_buffer: 'EventBuffer',
-        event_queue: 'EventQueue | None',
+        event_buffer: EventBuffer,
+        event_queue: EventQueueLike | None,
         orchestrator_detector: OrchestratorDetector,
         *,
         hard_limit: int = 500,

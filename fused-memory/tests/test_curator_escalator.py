@@ -15,6 +15,7 @@ that suppresses spam from a stuck curator.
 from __future__ import annotations
 
 import fcntl
+from typing import IO, Literal, overload
 
 import pytest
 
@@ -22,7 +23,11 @@ from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.task_curator import CuratorFailureError
 
 
-def _make_orchestrator_layout(root, *, hold_lock: bool):
+@overload
+def _make_orchestrator_layout(root, *, hold_lock: Literal[True]) -> IO[bytes]: ...
+@overload
+def _make_orchestrator_layout(root, *, hold_lock: Literal[False]) -> None: ...
+def _make_orchestrator_layout(root, *, hold_lock: bool) -> IO[bytes] | None:
     """Create the orchestrator.lock file; optionally hold LOCK_EX on it.
 
     Returns the open file handle when ``hold_lock=True`` so the caller
