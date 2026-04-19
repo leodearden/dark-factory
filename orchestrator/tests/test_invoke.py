@@ -519,3 +519,36 @@ class TestReleaseProbeSlotOnException:
                                         system_prompt='sys', cwd='/tmp')
 
         gate.release_probe_slot.assert_called_once_with('tok-a')
+
+
+# ── _run_subprocess_local process-group fix ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestRunSubprocessLocalProcessGroup:
+    """_run_subprocess_local must spawn subprocesses in their own process group."""
+
+    async def test_run_subprocess_local_passes_start_new_session_true(self, tmp_path):
+        """create_subprocess_exec is called with start_new_session=True.
+
+        Failing test -- _run_subprocess_local does not pass that kwarg yet.
+        """
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b'', b''))
+            proc.returncode = 0
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('orchestrator.agents.invoke.asyncio.create_subprocess_exec',
+                   side_effect=fake_exec):
+            await _run_subprocess_local(
+                ['echo', 'hi'], cwd=tmp_path, env={},
+                backend='codex', model='gpt-5.4', max_budget_usd=1.0,
+            )
+
+        assert captured_kwargs.get('start_new_session') is True
