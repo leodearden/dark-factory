@@ -14,7 +14,20 @@
   <tbody>
     {% for task in orch.tasks|sort(attribute='id', reverse=true) %}
       {% set wt = orch.worktrees.get(task.id, {}) %}
-      <tr class="border-b border-gray-700">
+      {% if task.status in ['in-progress', 'blocked'] %}
+        {% set bucket = 'active' %}
+      {% elif task.status == 'pending' %}
+        {% set bucket = 'pending' %}
+      {% else %}
+        {% set bucket = 'other' %}
+      {% endif %}
+      {% if bucket == 'active' %}
+        <tr x-show="$store.panels['{{ orch_key }}'].all || $store.panels['{{ orch_key }}'].active" x-cloak class="border-b border-gray-700">
+      {% elif bucket == 'pending' %}
+        <tr x-show="$store.panels['{{ orch_key }}'].all || $store.panels['{{ orch_key }}'].pending" x-cloak class="border-b border-gray-700">
+      {% else %}
+        <tr x-show="$store.panels['{{ orch_key }}'].all" x-cloak class="border-b border-gray-700">
+      {% endif %}
         <td class="px-3 py-2">{{ task.id }}</td>
         <td class="px-3 py-2">{{ task.title }}</td>
         <td class="px-3 py-2">
