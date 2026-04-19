@@ -15,6 +15,7 @@ import asyncio
 import collections
 import contextlib
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -177,6 +178,7 @@ class MergeWorker:
 
     def _emit_merge(
         self, task_id: str, outcome: str, *, attempt: int | None = None,
+        duration_ms: int | None = None,
     ) -> None:
         if self._event_store:
             data: dict = {'outcome': outcome}
@@ -184,7 +186,7 @@ class MergeWorker:
                 data['attempt'] = attempt
             self._event_store.emit(
                 EventType.merge_attempt, task_id=task_id, phase='merge',
-                data=data,
+                data=data, duration_ms=duration_ms,
             )
 
     # ------------------------------------------------------------------
@@ -252,6 +254,7 @@ class MergeWorker:
             return MergeOutcome('blocked', reason=f'Merge worker error: {exc}')
 
     async def _do_merge(self, req: MergeRequest) -> MergeOutcome | None:
+        t0 = time.monotonic()
         # 1. Already-merged detection (ghost-loop fix)
         _, branch_head, _ = await _run(
             ['git', 'rev-parse', 'HEAD'], cwd=req.worktree,
@@ -269,7 +272,7 @@ class MergeWorker:
                 logger.info(
                     f'Task {req.task_id}: branch already on main — skipping merge'
                 )
-                self._emit_merge(req.task_id, 'already_merged')
+                self._emit_merge(req.task_id, 'already_merged', duration_ms=round((time.monotonic() - t0) * 1000))
                 return MergeOutcome('already_merged')
 
         # 2. Merge in a temporary worktree
@@ -280,7 +283,7 @@ class MergeWorker:
         # 3. Conflict → reject immediately (caller resolves outside queue)
         if merge_result.conflicts:
             logger.info(f'Task {req.task_id}: merge conflicts detected')
-            self._emit_merge(req.task_id, 'conflict')
+            self._emit_merge(req.task_id, 'conflict', duration_ms=round((time.monotonic() - t0) * 1000))
             if merge_result.merge_worktree:
                 await self._git_ops.cleanup_merge_worktree(
                     merge_result.merge_worktree,
@@ -311,7 +314,7 @@ class MergeWorker:
             logger.warning(
                 f'Task {req.task_id}: merge dropped plan targets: {dropped}'
             )
-            self._emit_merge(req.task_id, 'dropped_plan_targets')
+            self._emit_merge(req.task_id, 'dropped_plan_targets', duration_ms=round((time.monotonic() - t0) * 1000))
             return MergeOutcome(
                 'blocked',
                 reason=(
@@ -362,7 +365,7 @@ class MergeWorker:
         if result == 'advanced':
             self._cas_retries.pop(req.task_id, None)
             logger.info(f'Task {req.task_id}: merged to main successfully')
-            self._emit_merge(req.task_id, 'done')
+            self._emit_merge(req.task_id, 'done', duration_ms=round((time.monotonic() - t0) * 1000))
             return MergeOutcome('done')
 
         if result in ('wip_overlap', 'pop_conflict'):
@@ -435,7 +438,7 @@ class MergeWorker:
                 f'Task {req.task_id}: CAS retry limit exhausted '
                 f'({self.MAX_CAS_RETRIES} attempts)'
             )
-            self._emit_merge(req.task_id, 'cas_exhausted', attempt=retries)
+            self._emit_merge(req.task_id, 'cas_exhausted', attempt=retries, duration_ms=round((time.monotonic() - t0) * 1000))
             return MergeOutcome(
                 'blocked',
                 reason=(
@@ -448,7 +451,7 @@ class MergeWorker:
             f'Task {req.task_id}: CAS failed (attempt {retries}/'
             f'{self.MAX_CAS_RETRIES}), re-enqueueing at front'
         )
-        self._emit_merge(req.task_id, 'cas_retry', attempt=retries)
+        self._emit_merge(req.task_id, 'cas_retry', attempt=retries, duration_ms=round((time.monotonic() - t0) * 1000))
         self._urgent.append(req)
         return None  # don't resolve Future — will be reprocessed
 

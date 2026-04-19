@@ -593,6 +593,172 @@ class TestMergeWorker:
         with pytest.raises(asyncio.CancelledError):
             await worker_task
 
+    async def test_merge_worker_emits_duration_ms_on_done(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """MergeWorker emits duration_ms on the 'done' outcome.
+
+        Asserts that the merge_attempt event row for outcome='done' has a
+        non-null integer duration_ms >= 0.
+        """
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        wt = await _make_branch_with_file(
+            git_ops, 'dur-done', 'dur_done.py', 'dur = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req = _make_request('dur-done', 'dur-done', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done'
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.outcome') AS outcome, duration_ms "
+            "FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+
+        done_rows = [r for r in rows if r[0] == 'done']
+        assert len(done_rows) == 1, f'Expected 1 done row, got: {rows}'
+        assert done_rows[0][1] is not None, 'duration_ms should not be NULL'
+        assert isinstance(done_rows[0][1], int), f'duration_ms should be int, got {type(done_rows[0][1])}'
+        assert done_rows[0][1] >= 0, f'duration_ms should be >= 0, got {done_rows[0][1]}'
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_merge_worker_emits_duration_ms_on_non_done_outcomes(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Every MergeWorker emit site sets a non-null duration_ms.
+
+        Covers already_merged, conflict, and cas_retry outcomes in addition
+        to done (covered by test_merge_worker_emits_duration_ms_on_done).
+        """
+        # --- Scenario A: already_merged ---
+        db_a = tmp_path / 'events_a.db'
+        es_a = EventStore(db_path=db_a, run_id='run-a')
+
+        wt_am = await _make_branch_with_file(
+            git_ops, 'dur-am', 'dur_am.py', 'am = 1\n',
+        )
+        # Merge manually so it's already on main
+        r = await git_ops.merge_to_main(wt_am, 'dur-am')
+        assert r.success
+        assert r.merge_commit is not None
+        await git_ops.advance_main(r.merge_commit)
+        if r.merge_worktree:
+            await git_ops.cleanup_merge_worktree(r.merge_worktree)
+
+        q_a: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        w_a = MergeWorker(git_ops, q_a, event_store=es_a)
+        wt_a = asyncio.create_task(w_a.run())
+
+        req_am = _make_request('dur-am', 'dur-am', wt_am, config)
+        await q_a.put(req_am)
+        out_am = await asyncio.wait_for(req_am.result, timeout=30)
+        assert out_am.status == 'already_merged'
+        await w_a.stop()
+        wt_a.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wt_a
+
+        conn = sqlite3.connect(str(db_a))
+        rows_a = conn.execute(
+            "SELECT json_extract(data, '$.outcome'), duration_ms "
+            "FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+        assert all(r[1] is not None for r in rows_a), f'NULL duration_ms in already_merged: {rows_a}'
+
+        # --- Scenario B: conflict ---
+        db_b = tmp_path / 'events_b.db'
+        es_b = EventStore(db_path=db_b, run_id='run-b')
+
+        wt_cfl = (await git_ops.create_worktree('dur-cfl')).path
+        # Advance main with a conflicting change
+        (git_ops.project_root / 'README.md').write_text('# conflict-source\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Conflict source'], cwd=git_ops.project_root)
+        # Make conflicting change in worktree
+        (wt_cfl / 'README.md').write_text('# conflict-task\n')
+        await git_ops.commit(wt_cfl, 'Conflict task change')
+
+        q_b: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        w_b = MergeWorker(git_ops, q_b, event_store=es_b)
+        wt_b = asyncio.create_task(w_b.run())
+
+        req_cfl = _make_request('dur-cfl', 'dur-cfl', wt_cfl, config)
+        await q_b.put(req_cfl)
+        out_cfl = await asyncio.wait_for(req_cfl.result, timeout=30)
+        assert out_cfl.status == 'conflict'
+        await w_b.stop()
+        wt_b.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wt_b
+
+        conn = sqlite3.connect(str(db_b))
+        rows_b = conn.execute(
+            "SELECT json_extract(data, '$.outcome'), duration_ms "
+            "FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+        assert all(r[1] is not None for r in rows_b), f'NULL duration_ms in conflict: {rows_b}'
+
+        # --- Scenario C: cas_retry ---
+        db_c = tmp_path / 'events_c.db'
+        es_c = EventStore(db_path=db_c, run_id='run-c')
+
+        wt_cas = await _make_branch_with_file(
+            git_ops, 'dur-cas', 'dur_cas.py', 'cas = 1\n',
+        )
+
+        q_c: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        w_c = MergeWorker(git_ops, q_c, event_store=es_c)
+        wt_c = asyncio.create_task(w_c.run())
+
+        original_advance = git_ops.advance_main
+        call_count_c = 0
+
+        async def _fail_once(*args, **kwargs):
+            nonlocal call_count_c
+            call_count_c += 1
+            if call_count_c == 1:
+                return 'cas_failed'
+            return await original_advance(*args, **kwargs)
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_fail_once),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req_cas = _make_request('dur-cas', 'dur-cas', wt_cas, config)
+            await q_c.put(req_cas)
+            out_cas = await asyncio.wait_for(req_cas.result, timeout=30)
+
+        assert out_cas.status == 'done'
+        await w_c.stop()
+        wt_c.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wt_c
+
+        conn = sqlite3.connect(str(db_c))
+        rows_c = conn.execute(
+            "SELECT json_extract(data, '$.outcome'), duration_ms "
+            "FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+        assert all(r[1] is not None for r in rows_c), f'NULL duration_ms in cas scenario: {rows_c}'
+
 
 # ---------------------------------------------------------------------------
 # Helpers for speculative tests
