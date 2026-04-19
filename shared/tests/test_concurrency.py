@@ -535,7 +535,12 @@ class TestShutdownRaces:
         async def blocking_save(*args, **kwargs):
             await block.wait()
 
-        gate._cost_store.save_account_event.side_effect = blocking_save
+        # gate._cost_store is CostStore | None here but make_mock_cost_store()
+        # returns a non-None AsyncMock.  Assert + cast-free access via the
+        # assert-narrowed local; side_effect is a MagicMock attribute that
+        # pyright can't see through the AsyncMock bound-method type.
+        assert gate._cost_store is not None
+        gate._cost_store.save_account_event.side_effect = blocking_save  # type: ignore[attr-defined]
 
         gate._fire_cost_event('acct', 'cap_hit', '{}')
         await asyncio.sleep(0)
@@ -555,7 +560,8 @@ class TestShutdownRaces:
         async def blocking_save(*args, **kwargs):
             await block.wait()
 
-        gate._cost_store.save_account_event.side_effect = blocking_save
+        assert gate._cost_store is not None
+        gate._cost_store.save_account_event.side_effect = blocking_save  # type: ignore[attr-defined]
 
         # Fire multiple events
         for _ in range(5):
