@@ -6,12 +6,13 @@ import asyncio
 import logging
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import UsageGate
+from shared.usage_gate import AccountState, UsageGate
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -508,3 +509,77 @@ class TestBeforeInvokeGuardConsistency:
         call_args = mock_fire.call_args
         assert call_args[0][0] == 'acct-B'   # account_name
         assert call_args[0][1] == 'failover'  # event_type
+
+
+# ---------------------------------------------------------------------------
+# UsageGate probe process-group tests (step-23 / step-24)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestUsageGateProbeProcessGroup:
+    """_run_probe must spawn its subprocess in a fresh process group."""
+
+    @pytest.fixture
+    def gate_with_account(self) -> tuple[UsageGate, AccountState]:
+        """Return a (gate, acct) pair with _probe_config_dir mocked."""
+        gate = make_gate(['probe-acct'])
+        # Replace the mock inserted by make_gate with the real method for testing.
+        del gate._run_probe  # remove instance-level mock; fall back to class method
+        acct = gate._accounts[0]
+        # Stub the probe config dir to avoid real filesystem side-effects.
+        gate._probe_config_dir = MagicMock()
+        gate._probe_config_dir.path = Path('/tmp/probe-test')
+        gate._probe_config_dir.write_credentials = MagicMock()
+        return gate, acct
+
+    async def test_usage_gate_probe_passes_start_new_session_true(
+        self, gate_with_account: tuple[UsageGate, AccountState]
+    ) -> None:
+        """create_subprocess_exec is called with start_new_session=True.
+
+        Failing test — _run_probe does not pass that kwarg yet.
+        """
+        gate, acct = gate_with_account
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.returncode = 0
+            proc.communicate = AsyncMock(return_value=(b'{"ok": true}', b''))
+            return proc
+
+        with patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                   side_effect=fake_exec):
+            await gate._run_probe(acct)
+
+        assert captured_kwargs.get('start_new_session') is True, (
+            'create_subprocess_exec must be called with start_new_session=True'
+        )
+
+    async def test_usage_gate_probe_cleanup_uses_terminate_process_group(
+        self, gate_with_account: tuple[UsageGate, AccountState]
+    ) -> None:
+        """TimeoutError branch must await terminate_process_group, not bare kill.
+
+        Failing test — shared.usage_gate does not import terminate_process_group yet.
+        """
+        gate, acct = gate_with_account
+
+        proc = MagicMock()
+        proc.returncode = None
+        proc.communicate = AsyncMock(side_effect=TimeoutError())
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+
+        with (
+            patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                  return_value=proc),
+            patch('shared.usage_gate.terminate_process_group',
+                  new_callable=AsyncMock) as mock_tpg,
+        ):
+            result = await gate._run_probe(acct)
+
+        assert result is False  # timed out → False
+        mock_tpg.assert_awaited_once()
