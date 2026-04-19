@@ -83,7 +83,7 @@ class MergeRequest:
 class MergeOutcome:
     """Result delivered to the caller via the Future."""
 
-    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance']
+    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance', 'unmerged_state']
     reason: str = ''
     conflict_details: str = ''
     recovery_branch: str | None = None
@@ -134,16 +134,42 @@ class MergeWorker:
         # WIP halt: cleared when halted, set when running
         self._wip_halt = asyncio.Event()
         self._wip_halt.set()  # not halted initially
+        # ID of the escalation that owns the current halt. Registered by the
+        # workflow handler after it submits the L1 escalation. Single source
+        # of truth for the resolve-callback un-halt path.
+        self._halt_owner_esc_id: str | None = None
 
     def halt_for_wip(self, reason: str) -> None:
         """Halt the merge queue due to a WIP conflict."""
         logger.warning('Merge queue halted for WIP: %s', reason)
         self._wip_halt.clear()
+        self._halt_owner_esc_id = None
+
+    def set_halt_owner(self, esc_id: str) -> None:
+        """Register the escalation that owns the current halt.
+
+        The workflow calls this right after submitting its halt-triggering
+        escalation. Asserts owner is currently None — a double-register
+        indicates a double-halt bug that should fail loudly.
+        """
+        assert self._halt_owner_esc_id is None, (
+            f'halt owner already set to {self._halt_owner_esc_id!r}, '
+            f'refusing to overwrite with {esc_id!r}'
+        )
+        self._halt_owner_esc_id = esc_id
+
+    def is_halt_owner(self, esc_id: str) -> bool:
+        """True iff esc_id is the currently registered halt owner."""
+        return (
+            self._halt_owner_esc_id is not None
+            and self._halt_owner_esc_id == esc_id
+        )
 
     def unhalt_wip(self) -> None:
         """Resume the merge queue after WIP conflict resolution."""
         logger.info('Merge queue un-halted (WIP conflict resolved)')
         self._wip_halt.set()
+        self._halt_owner_esc_id = None
 
     @property
     def is_wip_halted(self) -> bool:
@@ -366,7 +392,7 @@ class MergeWorker:
             )
             self._cas_retries.pop(req.task_id, None)
             return MergeOutcome(
-                'blocked',
+                'unmerged_state',
                 reason=(
                     f'advance_main returned unmerged_state: project_root has '
                     f'unresolved (UU/AA/DD) merge conflicts — halting queue; '
@@ -463,6 +489,10 @@ class SpeculativeMergeWorker:
         # WIP halt: cleared when halted, set when running
         self._wip_halt = asyncio.Event()
         self._wip_halt.set()  # not halted initially
+        # ID of the escalation that owns the current halt. Registered by the
+        # workflow handler after it submits the L1 escalation. Single source
+        # of truth for the resolve-callback un-halt path.
+        self._halt_owner_esc_id: str | None = None
         # Internal tasks created by run()
         self._merger_task: asyncio.Task | None = None
         self._verifier_task: asyncio.Task | None = None
@@ -480,11 +510,33 @@ class SpeculativeMergeWorker:
         """Halt the merge queue due to a WIP conflict."""
         logger.warning('Merge queue halted for WIP: %s', reason)
         self._wip_halt.clear()
+        self._halt_owner_esc_id = None
+
+    def set_halt_owner(self, esc_id: str) -> None:
+        """Register the escalation that owns the current halt.
+
+        The workflow calls this right after submitting its halt-triggering
+        escalation. Asserts owner is currently None — a double-register
+        indicates a double-halt bug that should fail loudly.
+        """
+        assert self._halt_owner_esc_id is None, (
+            f'halt owner already set to {self._halt_owner_esc_id!r}, '
+            f'refusing to overwrite with {esc_id!r}'
+        )
+        self._halt_owner_esc_id = esc_id
+
+    def is_halt_owner(self, esc_id: str) -> bool:
+        """True iff esc_id is the currently registered halt owner."""
+        return (
+            self._halt_owner_esc_id is not None
+            and self._halt_owner_esc_id == esc_id
+        )
 
     def unhalt_wip(self) -> None:
         """Resume the merge queue after WIP conflict resolution."""
         logger.info('Merge queue un-halted (WIP conflict resolved)')
         self._wip_halt.set()
+        self._halt_owner_esc_id = None
 
     @property
     def is_wip_halted(self) -> bool:
@@ -1061,7 +1113,7 @@ class SpeculativeMergeWorker:
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if not req.result.done():
                     req.result.set_result(MergeOutcome(
-                        'blocked',
+                        'unmerged_state',
                         reason=(
                             f'advance_main returned unmerged_state: project_root has '
                             f'unresolved (UU/AA/DD) merge conflicts — halting queue; '

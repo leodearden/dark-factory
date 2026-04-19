@@ -1660,7 +1660,7 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
-    @pytest.mark.parametrize('failure_code', ['not_descendant', 'contaminated', 'stash_failed', 'unmerged_state'])
+    @pytest.mark.parametrize('failure_code', ['not_descendant', 'contaminated', 'stash_failed'])
     async def test_speculative_permanent_failure_returns_blocked(
         self, git_ops: GitOps, config: OrchestratorConfig, failure_code: str,
     ):
@@ -2008,10 +2008,10 @@ class TestWipHaltMergeWorker:
         with pytest.raises(asyncio.CancelledError):
             await worker_task
 
-    async def test_unmerged_state_returns_blocked_and_halts(
+    async def test_unmerged_state_returns_unmerged_state_and_halts(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """unmerged_state: MergeWorker returns blocked and halts the queue."""
+        """unmerged_state: MergeWorker returns 'unmerged_state' status and halts the queue."""
         wt = await _make_branch_with_file(
             git_ops, 'uu-mw-1', 'file_uu_mw.py', 'uu_mw = 1\n',
         )
@@ -2031,7 +2031,7 @@ class TestWipHaltMergeWorker:
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=30)
 
-        assert outcome.status == 'blocked'
+        assert outcome.status == 'unmerged_state'
         assert 'unmerged' in outcome.reason.lower()
         assert worker.is_wip_halted
 
@@ -2166,10 +2166,10 @@ class TestWipHaltSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
-    async def test_speculative_unmerged_state_returns_blocked_and_halts(
+    async def test_speculative_unmerged_state_returns_unmerged_state_and_halts(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """unmerged_state in SpeculativeMergeWorker returns blocked and halts."""
+        """unmerged_state in SpeculativeMergeWorker returns 'unmerged_state' status and halts."""
         wt = await _make_branch_with_file(
             git_ops, 'uu-sw-1', 'file_uu_sw.py', 'uu_sw = 1\n',
         )
@@ -2189,7 +2189,7 @@ class TestWipHaltSpeculativeMergeWorker:
             await queue.put(req)
             outcome = await asyncio.wait_for(req.result, timeout=30)
 
-        assert outcome.status == 'blocked'
+        assert outcome.status == 'unmerged_state'
         assert 'unmerged' in outcome.reason.lower()
         assert worker.is_wip_halted
 
@@ -2227,3 +2227,96 @@ class TestWipHaltSpeculativeMergeWorker:
 
         await worker.stop()
         await worker_task
+
+
+@pytest.mark.parametrize(
+    'worker_cls', [MergeWorker, SpeculativeMergeWorker],
+)
+class TestHaltOwnerMechanics:
+    """Halt-owner pointer: single source of truth for resolve-callback un-halt.
+
+    Both MergeWorker and SpeculativeMergeWorker implement the same contract.
+    These tests exercise the mechanics directly — no merge flow, just the
+    halt-owner state machine. Integration is covered in test_workflow_e2e.
+    """
+
+    def test_fresh_worker_has_no_halt_owner(
+        self, worker_cls, git_ops: GitOps,
+    ):
+        """Freshly constructed worker: not halted, owner is None, is_halt_owner is False."""
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        assert not worker.is_wip_halted
+        assert worker.is_halt_owner('any-id') is False
+        assert worker._halt_owner_esc_id is None
+
+    def test_halt_for_wip_clears_owner(
+        self, worker_cls, git_ops: GitOps,
+    ):
+        """halt_for_wip sets the halt flag and clears owner (workflow registers after)."""
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        worker.halt_for_wip('test reason')
+        assert worker.is_wip_halted
+        assert worker._halt_owner_esc_id is None
+        assert worker.is_halt_owner('any-id') is False
+
+    def test_set_halt_owner_registers_id(
+        self, worker_cls, git_ops: GitOps,
+    ):
+        """set_halt_owner records the id; is_halt_owner matches on equality only."""
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        worker.halt_for_wip('test reason')
+        worker.set_halt_owner('esc-42-1')
+
+        assert worker.is_halt_owner('esc-42-1') is True
+        assert worker.is_halt_owner('esc-42-2') is False
+        assert worker.is_halt_owner('esc-99-1') is False
+
+    def test_set_halt_owner_rejects_double_register(
+        self, worker_cls, git_ops: GitOps,
+    ):
+        """set_halt_owner raises when owner is already set — catches double-halt bugs."""
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        worker.halt_for_wip('test reason')
+        worker.set_halt_owner('esc-42-1')
+
+        with pytest.raises(AssertionError, match='halt owner already set'):
+            worker.set_halt_owner('esc-42-2')
+
+    def test_unhalt_wip_clears_owner(
+        self, worker_cls, git_ops: GitOps,
+    ):
+        """unhalt_wip releases the halt and clears the owner pointer."""
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        worker.halt_for_wip('test reason')
+        worker.set_halt_owner('esc-42-1')
+        worker.unhalt_wip()
+
+        assert not worker.is_wip_halted
+        assert worker._halt_owner_esc_id is None
+        assert worker.is_halt_owner('esc-42-1') is False
+
+    def test_halt_cycle_allows_reuse(
+        self, worker_cls, git_ops: GitOps,
+    ):
+        """After a full halt→unhalt cycle, a new owner can be registered."""
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = worker_cls(git_ops, queue)
+
+        worker.halt_for_wip('first')
+        worker.set_halt_owner('esc-1-1')
+        worker.unhalt_wip()
+
+        worker.halt_for_wip('second')
+        worker.set_halt_owner('esc-2-1')
+        assert worker.is_halt_owner('esc-2-1') is True
+        assert worker.is_halt_owner('esc-1-1') is False

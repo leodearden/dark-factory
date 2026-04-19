@@ -898,6 +898,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 initial_plan=recovered_plan,
                 steward_factory=steward_factory,
                 merge_queue=self._merge_queue,
+                merge_worker=self._merge_worker,
                 event_store=self.event_store,
                 cost_store=self.cost_store,
             )
@@ -1315,11 +1316,16 @@ Output JSON matching the schema. Every task must appear in the output.
         if event:
             event.set()
 
-        # Un-halt merge queue when a wip_conflict escalation is resolved
+        # Un-halt the merge queue only when the escalation that OWNS the
+        # halt resolves. Prior versions matched on category alone, which
+        # let any wip_conflict resolve release the halt — leaving the real
+        # blocker's escalation pending (phantom-L1 bug, esc-1888-57 on reify
+        # 2026-04-16). The owner pointer is the single source of truth.
         if (
-            getattr(escalation, 'category', None) == 'wip_conflict'
-            and self._merge_worker is not None
-            and self._merge_worker.is_wip_halted
+            self._merge_worker is not None
+            and self._merge_worker.is_halt_owner(escalation.id)
         ):
             self._merge_worker.unhalt_wip()
-            logger.info('Merge queue un-halted: wip_conflict escalation resolved')
+            logger.info(
+                'Merge queue un-halted: halt owner %s resolved', escalation.id,
+            )
