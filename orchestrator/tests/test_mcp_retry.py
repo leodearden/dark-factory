@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from orchestrator.mcp_lifecycle import (
     _MCP_BACKOFF_BASE,
     _MCP_MAX_RETRIES,
+    McpLifecycle,
     McpSession,
 )
 
@@ -194,3 +196,77 @@ class TestRawNotifyRetry:
             await session._raw_notify('notifications/initialized')
 
         assert mock_client.post.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# McpLifecycle process-group tests (step-19 / step-20)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestMcpLifecycleProcessGroup:
+    """McpLifecycle must spawn its subprocess in a fresh process group."""
+
+    @pytest.fixture
+    def mock_config(self, tmp_path: Path) -> MagicMock:
+        """Minimal config-shaped mock for McpLifecycle."""
+        cfg = MagicMock()
+        cfg.fused_memory.server_command = ['echo', 'ok']
+        cfg.fused_memory.url = 'http://localhost:8002'
+        cfg.fused_memory.config_path = 'fused-memory/config/config.yaml'
+        cfg.project_root = tmp_path
+        return cfg
+
+    async def test_mcp_lifecycle_starts_subprocess_in_new_session(
+        self, mock_config: MagicMock
+    ) -> None:
+        """create_subprocess_exec is called with start_new_session=True.
+
+        Failing test — mcp_lifecycle.start() does not pass that kwarg yet.
+        """
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.returncode = None
+            proc.stdout = MagicMock()
+            proc.stderr = MagicMock()
+            return proc
+
+        with (
+            patch(
+                'orchestrator.mcp_lifecycle.asyncio.create_subprocess_exec',
+                side_effect=fake_exec,
+            ),
+            patch.object(
+                McpLifecycle, '_wait_for_health', new=AsyncMock(return_value=True)
+            ),
+            patch('orchestrator.mcp_lifecycle.McpSession') as mock_session_cls,
+        ):
+            mock_session_cls.return_value.initialize = AsyncMock()
+            mcp = McpLifecycle(mock_config)
+            await mcp.start()
+
+        assert captured_kwargs.get('start_new_session') is True, (
+            'create_subprocess_exec must be called with start_new_session=True'
+        )
+
+    async def test_mcp_lifecycle_stop_uses_terminate_process_group(
+        self, mock_config: MagicMock
+    ) -> None:
+        """stop() must delegate to terminate_process_group, not bare terminate/kill.
+
+        Failing test — mcp_lifecycle.stop() uses proc.terminate()/proc.kill() directly.
+        """
+        proc = MagicMock()
+        proc.returncode = None
+
+        with patch(
+            'orchestrator.mcp_lifecycle.terminate_process_group',
+            new_callable=AsyncMock,
+        ) as mock_tpg:
+            mcp = McpLifecycle(mock_config)
+            mcp._process = proc
+            await mcp.stop()
+
+        mock_tpg.assert_awaited_once()
