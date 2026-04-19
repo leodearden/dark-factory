@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 from shared.config_dir import TaskConfigDir
 from shared.config_models import UsageCapConfig
+from shared.proc_group import terminate_process_group
 
 if TYPE_CHECKING:
     from shared.cost_store import CostStore
@@ -686,29 +687,22 @@ class UsageGate:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                start_new_session=True,
             )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(), timeout=_PROBE_TIMEOUT,
             )
         except TimeoutError:
             logger.warning(f'Account {acct.name}: probe timed out')
-            if proc is not None and proc.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+            if proc is not None:
+                await terminate_process_group(proc, grace_secs=5.0)
             return False
         except asyncio.CancelledError:
             # Shutdown path: reap the subprocess and re-raise so the probe
             # task actually terminates. Swallowing the cancel would leave
             # usage_gate.shutdown() blocked waiting for this task forever.
-            if proc is not None and proc.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await asyncio.shield(
-                        asyncio.wait_for(proc.wait(), timeout=5.0)
-                    )
+            if proc is not None:
+                await terminate_process_group(proc, grace_secs=5.0)
             raise
         except Exception as exc:
             logger.warning(f'Account {acct.name}: probe error: {exc}')
