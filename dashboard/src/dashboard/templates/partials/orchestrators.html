@@ -8,7 +8,7 @@
   {% if orchestrators %}
     {% for orch in orchestrators %}
       {% set orch_key = orch.label | replace('/', '-') | replace('.', '-') %}
-      <div x-data x-init="$store.panels['{{ orch_key }}'] = $store.panels['{{ orch_key }}'] || {all: false, active: true, pending: false}" id="orch-{{ orch_key }}" class="bg-gray-800 rounded-lg p-6 mb-4">
+      <div x-data x-init="$store.panels['{{ orch_key }}'] = $store.panels['{{ orch_key }}'] || {active: true, pending: false, done: false}" id="orch-{{ orch_key }}" class="bg-gray-800 rounded-lg p-6 mb-4">
         <div class="flex items-center gap-3">
           {% if orch.pids|length > 1 %}<span class="text-gray-100 font-semibold">PIDs {{ orch.pids|join(", ") }}</span>{% else %}<span class="text-gray-100 font-semibold">PID {{ orch.pids[0] }}</span>{% endif %}
           {{ status_badge('running' if orch.running else 'completed', aria_label='Orchestrator status', color='bg-green-600' if orch.running else 'bg-gray-600') }}
@@ -34,12 +34,6 @@
         <div class="flex items-center gap-4 mt-3 text-sm">
           <label class="flex items-center gap-1 cursor-pointer">
             <input type="checkbox"
-              :checked="$store.panels['{{ orch_key }}'].all"
-              @change="$store.panels['{{ orch_key }}'].all = $event.target.checked; $store.panels['{{ orch_key }}'].active = $event.target.checked; $store.panels['{{ orch_key }}'].pending = $event.target.checked">
-            <span>All ({{ orch.summary.total }})</span>
-          </label>
-          <label class="flex items-center gap-1 cursor-pointer">
-            <input type="checkbox"
               x-model="$store.panels['{{ orch_key }}'].active">
             <span>Active ({{ orch.summary.in_progress + orch.summary.blocked }})</span>
           </label>
@@ -47,6 +41,11 @@
             <input type="checkbox"
               x-model="$store.panels['{{ orch_key }}'].pending">
             <span>Pending ({{ orch.summary.pending }})</span>
+          </label>
+          <label class="flex items-center gap-1 cursor-pointer">
+            <input type="checkbox"
+              x-model="$store.panels['{{ orch_key }}'].done">
+            <span>Done ({{ orch.summary.total - orch.summary.in_progress - orch.summary.blocked - orch.summary.pending }})</span>
           </label>
         </div>
 

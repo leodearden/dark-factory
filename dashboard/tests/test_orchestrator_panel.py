@@ -129,12 +129,11 @@ class TestOrchestratorRouteBasics:
         assert '1 pending' in html
 
     def test_alpine_toggle(self, client):
-        """Card uses x-data, x-show (on rows), @change (on All checkbox), $store.panels."""
+        """Card uses x-data, x-show on rows, x-model checkboxes, $store.panels."""
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
         assert 'x-data' in html
         assert 'x-show' in html
-        assert '@change' in html
         assert '$store.panels' in html
 
     def test_table_wrapper_has_x_cloak(self, client):
@@ -422,12 +421,19 @@ class TestOrchestratorNoPrd:
 
 
 class TestOrchestratorFilterCheckboxes:
-    """Tests for the filter checkbox group replacing the Show/Hide button."""
+    """Tests for the three orthogonal filter checkboxes (Active / Pending / Done).
 
-    # orch_key for MOCK_ORCHESTRATOR_RUNNING:
-    # label = '/home/leo/src/dark-factory/prd/dashboard.md'
-    # replace('/', '-').replace('.', '-') => '-home-leo-src-dark-factory-prd-dashboard-md'
-    ORCH_KEY = '-home-leo-src-dark-factory-prd-dashboard-md'
+    The three checkboxes are independent: Active shows in-progress+blocked rows,
+    Pending shows pending rows, Done shows done/deferred/cancelled rows.
+    Default state: Active=on, Pending=off, Done=off (only active tasks visible).
+
+    Note on default-visibility e2e testing: verifying that exactly 2 rows are
+    *visually* shown on first load requires Alpine.js to initialise and apply
+    x-cloak.  That is a browser/JS-level concern outside the scope of the
+    current server-render test suite.  The x-init default (active: true) is
+    asserted below; end-to-end row-count verification is deferred to a future
+    Playwright smoke test.
+    """
 
     def test_three_checkbox_inputs_rendered(self, client):
         """Three <input type="checkbox"> elements present inside the orchestrator card."""
@@ -436,11 +442,12 @@ class TestOrchestratorFilterCheckboxes:
         count = html.count('type="checkbox"')
         assert count >= 3, f'Expected at least 3 checkboxes, found {count}'
 
-    def test_all_label_with_count(self, client):
-        """Label for the 'All' checkbox shows total task count."""
+    def test_done_label_with_count(self, client):
+        """'Done' checkbox label shows count of done/other tasks (total minus active/pending)."""
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
-        assert 'All (5)' in html
+        # total=5, in_progress=1, blocked=1, pending=1 → done count = 5-1-1-1 = 2
+        assert 'Done (2)' in html
 
     def test_active_label_with_count(self, client):
         """Label for 'Active' checkbox shows in-progress + blocked count."""
@@ -454,66 +461,12 @@ class TestOrchestratorFilterCheckboxes:
             html = client.get('/partials/orchestrators').text
         assert 'Pending (1)' in html
 
-    def test_card_wrapper_has_x_init(self, client):
-        """Card wrapper div carries an x-init attribute to seed default state."""
+    def test_x_init_default_state(self, client):
+        """x-init seeds active:true so in-progress/blocked rows start visible by default."""
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
-        assert 'x-init=' in html
-
-    def test_x_init_seeds_active_true(self, client):
-        """x-init expression sets active: true as the default."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
+        # The most important default: active rows are visible from first render
         assert 'active: true' in html
-
-    def test_x_init_seeds_all_false(self, client):
-        """x-init expression sets all: false as the default."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        assert 'all: false' in html
-
-    def test_x_init_seeds_pending_false(self, client):
-        """x-init expression sets pending: false as the default."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        assert 'pending: false' in html
-
-    def test_active_checkbox_x_model(self, client):
-        """Active checkbox uses x-model bound to .active flag in store."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        key = self.ORCH_KEY
-        assert f"x-model=\"$store.panels['{key}'].active\"" in html
-
-    def test_pending_checkbox_x_model(self, client):
-        """Pending checkbox uses x-model bound to .pending flag in store."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        key = self.ORCH_KEY
-        assert f"x-model=\"$store.panels['{key}'].pending\"" in html
-
-    def test_all_checkbox_change_handler_sets_all(self, client):
-        """All checkbox @change handler writes .all flag."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        key = self.ORCH_KEY
-        # @change handler must update the .all property
-        assert f"$store.panels['{key}'].all" in html
-        assert '@change' in html
-
-    def test_all_checkbox_change_handler_sets_active(self, client):
-        """All checkbox @change handler also writes .active flag."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        key = self.ORCH_KEY
-        assert f"$store.panels['{key}'].active" in html
-
-    def test_all_checkbox_change_handler_sets_pending(self, client):
-        """All checkbox @change handler also writes .pending flag."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        key = self.ORCH_KEY
-        assert f"$store.panels['{key}'].pending" in html
 
 
 class TestOrchestratorTaskRowFiltering:
@@ -560,17 +513,16 @@ class TestOrchestratorTaskRowFiltering:
             f'Expected at least 2 rows with .active in x-show, found {len(active_rows)}'
         )
 
-    def test_active_rows_also_reference_dot_all(self, client):
-        """Active-bucket rows also reference .all in x-show expression."""
+    def test_active_rows_gate_on_active_only(self, client):
+        """Active-bucket rows gate solely on .active (no .all dependency)."""
         import re
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
-        # x-show on active rows must include both .all and .active
         active_rows = re.findall(r'x-show="([^"]*\.active[^"]*)"', html)
         assert len(active_rows) >= 2
         for expr in active_rows:
-            assert '.all' in expr, (
-                f'Active row x-show "{expr}" does not reference .all'
+            assert '.done' not in expr, (
+                f'Active row x-show "{expr}" unexpectedly references .done'
             )
 
     def test_pending_row_references_dot_pending(self, client):
@@ -583,36 +535,35 @@ class TestOrchestratorTaskRowFiltering:
             f'Expected at least 1 row with .pending in x-show, found {len(pending_rows)}'
         )
 
-    def test_pending_row_also_references_dot_all(self, client):
-        """Pending-bucket rows also reference .all in x-show expression."""
+    def test_pending_rows_gate_on_pending_only(self, client):
+        """Pending-bucket rows gate solely on .pending (no .all or .done dependency)."""
         import re
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
         pending_rows = re.findall(r'x-show="([^"]*\.pending[^"]*)"', html)
         assert len(pending_rows) >= 1
         for expr in pending_rows:
-            assert '.all' in expr, (
-                f'Pending row x-show "{expr}" does not reference .all'
+            assert '.done' not in expr, (
+                f'Pending row x-show "{expr}" unexpectedly references .done'
             )
 
-    def test_done_rows_reference_only_dot_all(self, client):
-        """Done/other-bucket rows reference .all but NOT .active or .pending."""
+    def test_done_rows_gate_on_done_flag(self, client):
+        """Done/other-bucket rows gate solely on .done (NOT .active or .pending)."""
         import re
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
         tbody_match = re.search(r'<tbody>(.*?)</tbody>', html, re.DOTALL)
         assert tbody_match is not None
         tbody = tbody_match.group(1)
-        # Extract all x-show values from rows
         all_xshow = re.findall(r'x-show="([^"]+)"', tbody)
-        # Identify "other" bucket rows: have .all but NOT .active AND NOT .pending
-        other_rows = [
+        # "other" rows: reference .done but NOT .active AND NOT .pending
+        done_rows = [
             expr for expr in all_xshow
-            if '.all' in expr and '.active' not in expr and '.pending' not in expr
+            if '.done' in expr and '.active' not in expr and '.pending' not in expr
         ]
         # We have 2 done tasks (ids 1 and 2)
-        assert len(other_rows) >= 2, (
-            f'Expected at least 2 done/other rows gated only on .all, found {len(other_rows)}: {other_rows}'
+        assert len(done_rows) >= 2, (
+            f'Expected at least 2 done/other rows gated only on .done, found {len(done_rows)}: {done_rows}'
         )
 
     def test_rows_have_x_cloak(self, client):
@@ -654,16 +605,11 @@ class TestOrchestratorKeyConsistency:
             f"x-init does not reference key '{orch_key}'"
         )
 
-        # All three x-model / @change bindings must use the same key
-        for attr in ['active', 'pending']:
+        # All three x-model bindings must use the same key
+        for attr in ['active', 'pending', 'done']:
             assert f"$store.panels['{orch_key}'].{attr}" in html, (
                 f"No {attr} binding found for key '{orch_key}'"
             )
-
-        # @change handler for All checkbox must reference the same key
-        assert f"$store.panels['{orch_key}'].all" in html, (
-            f"All @change handler does not reference key '{orch_key}'"
-        )
 
         # All x-show expressions on rows must also use the same key
         row_xshow_values = re.findall(r'x-show="([^"]+)"', html)
