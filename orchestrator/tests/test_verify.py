@@ -138,3 +138,62 @@ class TestRunCmdProcessGroup:
         )
         assert rc == 0
         assert not timed_out
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_run_cmd_killpg_sequence_on_timeout(self, tmp_path: Path):
+        """On timeout, _run_cmd must call os.killpg(pgid, SIGTERM) then SIGKILL.
+
+        We mock asyncio.wait_for so that:
+          - call 1 (communicate timeout in _run_cmd) raises TimeoutError
+          - call 2 (SIGTERM grace in terminate_process_group) raises TimeoutError
+          - call 3 (SIGKILL grace) returns normally
+        This avoids real 5-second grace waits in the unit test.
+        """
+        import signal as signal_module
+
+        wait_for_call_n = 0
+
+        async def counting_wait_for(coro, timeout, **_kwargs):
+            nonlocal wait_for_call_n
+            wait_for_call_n += 1
+            n = wait_for_call_n
+            # Eagerly consume / close the coroutine to avoid ResourceWarnings.
+            try:
+                if n <= 2:
+                    coro.close()
+                    raise TimeoutError()
+                else:
+                    # Let it run (AsyncMock returns immediately).
+                    result = await coro
+                    return result
+            except (AttributeError, RuntimeError):
+                raise TimeoutError()
+
+        async def fake_shell(cmd, **kwargs):
+            proc = MagicMock()
+            proc.pid = 12345
+            proc.returncode = None
+            async def _hang():
+                await asyncio.sleep(3600)
+            proc.communicate = _hang
+            proc.wait = AsyncMock(return_value=None)
+            return proc
+
+        mock_getpgid = MagicMock(return_value=12345)
+        mock_killpg = MagicMock()
+
+        with (
+            patch('orchestrator.verify.asyncio.create_subprocess_shell', side_effect=fake_shell),
+            patch('shared.proc_group.os.getpgid', mock_getpgid),
+            patch('shared.proc_group.os.killpg', mock_killpg),
+            patch('asyncio.wait_for', side_effect=counting_wait_for),
+        ):
+            rc, stdout, timed_out = await _run_cmd('sleep 100', tmp_path, timeout=0.1)
+
+        assert timed_out is True, 'Expected timed_out=True'
+        assert mock_killpg.call_count == 2, (
+            f'Expected 2 killpg calls, got {mock_killpg.call_count}: {mock_killpg.call_args_list}'
+        )
+        assert mock_killpg.call_args_list[0] == call(12345, signal_module.SIGTERM)
+        assert mock_killpg.call_args_list[1] == call(12345, signal_module.SIGKILL)
