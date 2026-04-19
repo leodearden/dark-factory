@@ -7,6 +7,7 @@ performance statistics.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections import defaultdict
@@ -130,6 +131,61 @@ async def get_completion_paths(
         return result
 
     return await with_db(db, _query, {})
+
+
+# ===========================================================================
+# Multi-DB aggregation
+# ===========================================================================
+
+
+async def aggregate_completion_paths(
+    dbs: list[aiosqlite.Connection | None],
+    escalations_dirs: list[Path],
+    *,
+    days: int = 7,
+) -> dict[str, list[dict]]:
+    """Merge :func:`get_completion_paths` results from multiple databases.
+
+    ``dbs`` and ``escalations_dirs`` must have the same length — they are
+    zipped with ``strict=True`` so a mismatch raises immediately.  Each
+    element of ``escalations_dirs`` must be the escalation directory
+    corresponding to the project root whose runs.db is ``dbs[i]``.
+
+    Merging rule: for a given project_id the *count* for each completion
+    path is summed across DBs; ``pct`` is recomputed from the new totals.
+    """
+    if not dbs:
+        return {}
+
+    results = await asyncio.gather(
+        *(get_completion_paths(db, edir, days=days)
+          for db, edir in zip(dbs, escalations_dirs, strict=True))
+    )
+
+    # Merge: sum counts per project_id per path
+    merged: dict[str, dict[str, int]] = {}
+    for result in results:
+        for pid, paths in result.items():
+            if pid not in merged:
+                merged[pid] = {}
+            for entry in paths:
+                path = entry['path']
+                merged[pid][path] = merged[pid].get(path, 0) + entry['count']
+
+    # Recompute pct from merged totals
+    final: dict[str, list[dict]] = {}
+    for pid, path_counts in merged.items():
+        total = sum(path_counts.values()) or 1
+        final[pid] = [
+            {
+                'path': path,
+                'count': count,
+                'pct': round(count / total * 100, 1),
+            }
+            for path, count in path_counts.items()
+            if count > 0
+        ]
+    return final
 
 
 # ---------------------------------------------------------------------------
