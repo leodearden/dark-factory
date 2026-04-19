@@ -49,10 +49,10 @@ from dashboard.data.merge_queue import (
 )
 from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.performance import (
-    get_completion_paths,
-    get_escalation_rates,
-    get_loop_histograms,
-    get_time_centiles,
+    aggregate_completion_paths,
+    aggregate_escalation_rates,
+    aggregate_loop_histograms,
+    aggregate_time_centiles,
 )
 from dashboard.data.reconciliation import (
     get_buffer_stats,
@@ -515,14 +515,20 @@ async def partials_performance(request: Request):
     """Render the performance panel partial (htmx fragment)."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.runs_db)
-    esc_dir = config.escalations_dir
+    dbs = await _cost_dbs(config, pool)
+
+    # Build matching escalations_dirs list (same dedup order as _cost_dbs).
+    esc_dirs = [config.escalations_dir]
+    for root in config.known_project_roots:
+        peer_dir = root / 'data' / 'escalations'
+        if peer_dir.resolve() != config.escalations_dir.resolve():
+            esc_dirs.append(peer_dir)
 
     paths_r, esc_r, hist_r, ttc_r = await asyncio.gather(
-        get_completion_paths(db, esc_dir),
-        get_escalation_rates(db, esc_dir),
-        get_loop_histograms(db),
-        get_time_centiles(db),
+        aggregate_completion_paths(dbs, esc_dirs),
+        aggregate_escalation_rates(dbs, esc_dirs),
+        aggregate_loop_histograms(dbs),
+        aggregate_time_centiles(dbs),
         return_exceptions=True,
     )
     paths = _safe_gather_result(paths_r, {}, 'completion_paths')

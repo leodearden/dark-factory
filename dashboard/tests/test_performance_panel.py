@@ -48,25 +48,25 @@ _UNSET = object()
 
 
 def _patch_perf_data(paths=_UNSET, escalations=_UNSET, histograms=_UNSET, ttc=_UNSET):
-    """Return an ExitStack that patches all 4 performance data functions."""
+    """Return an ExitStack that patches all 4 performance aggregate functions."""
     stack = ExitStack()
     stack.enter_context(patch(
-        'dashboard.app.get_completion_paths',
+        'dashboard.app.aggregate_completion_paths',
         new_callable=AsyncMock,
         return_value=paths if paths is not _UNSET else MOCK_PATHS,
     ))
     stack.enter_context(patch(
-        'dashboard.app.get_escalation_rates',
+        'dashboard.app.aggregate_escalation_rates',
         new_callable=AsyncMock,
         return_value=escalations if escalations is not _UNSET else MOCK_ESCALATIONS,
     ))
     stack.enter_context(patch(
-        'dashboard.app.get_loop_histograms',
+        'dashboard.app.aggregate_loop_histograms',
         new_callable=AsyncMock,
         return_value=histograms if histograms is not _UNSET else MOCK_HISTOGRAMS,
     ))
     stack.enter_context(patch(
-        'dashboard.app.get_time_centiles',
+        'dashboard.app.aggregate_time_centiles',
         new_callable=AsyncMock,
         return_value=ttc if ttc is not _UNSET else MOCK_TTC,
     ))
