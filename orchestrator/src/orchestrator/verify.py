@@ -9,6 +9,7 @@ from pathlib import Path
 
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from shared.proc_group import terminate_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -368,7 +369,7 @@ async def _run_cmd(
         return rc, stdout.decode(), False
     except TimeoutError:
         if proc is not None:
-            proc.kill()
+            await terminate_process_group(proc, grace_secs=5.0)
         return 1, f'Command timed out after {timeout}s: {cmd}', True
     except Exception as e:
         return 1, f'Command failed: {e}', False
