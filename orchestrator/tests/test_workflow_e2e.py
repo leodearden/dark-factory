@@ -1553,6 +1553,7 @@ def _build_workflow_with_escalation(
         mcp=FakeMcp(),  # type: ignore[arg-type]
         escalation_queue=queue,
         merge_queue=merge_queue,
+        merge_worker=worker,
     )
     return workflow, scheduler, queue
 

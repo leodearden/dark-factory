@@ -563,12 +563,15 @@ wording differs.
 4. **Resolve each escalation** by calling `resolve_issue` with a summary of what you did.
 5. **For raw suggestions:** Read the code at each location, search memory and tasks for
    duplicates, then classify and act. Maximum 50 tasks per triage batch.
-6. **Working-tree conflict escalations (`wip_conflict` category).** NEVER attempt to
-   auto-resolve these. They indicate the orchestrator's merge queue corrupted the user's
-   uncommitted work in project_root. Do NOT run destructive git commands (`git reset`,
+6. **Working-tree conflict escalations (`wip_conflict` or `unmerged_state` category).**
+   NEVER attempt to auto-resolve these. Both indicate project_root is in a state that only
+   a human can safely inspect — `wip_conflict` means the merge queue corrupted the user's
+   uncommitted work; `unmerged_state` means project_root already had UU/AA/DD markers
+   before the merge attempted to advance. Do NOT run destructive git commands (`git reset`,
    `git checkout -- .`, `git stash drop/clear`, `git restore`, `git clean`) against the
    main project root. Instead, immediately re-escalate to level-1 via `escalate_blocker`
-   with `category='wip_conflict'` and `suggested_action='manual_intervention'`.
+   preserving the original category (`wip_conflict` or `unmerged_state`) and
+   `suggested_action='manual_intervention'`.
 
 ## CRITICAL: Git Staging Rules
 
