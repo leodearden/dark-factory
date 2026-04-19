@@ -1,6 +1,7 @@
 """Tests for task interceptor middleware."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -9,6 +10,7 @@ import pytest_asyncio
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.task_curator import CuratorDecision, RewrittenTask
 from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 
@@ -1281,6 +1283,354 @@ async def test_set_task_status_cancelled_to_cancelled_noop(taskmaster, reconcile
     assert stats['size'] == 0
     # No reconciliation should be triggered
     reconciler.reconcile_task.assert_not_called()
+
+
+# ── Tests for phantom-done gate (metadata.files existence check) ───────────
+
+
+@pytest.mark.asyncio
+async def test_done_gate_rejects_when_declared_files_missing(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """status=done is refused if metadata.files lists a file that doesn't exist."""
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '1746',
+            'status': 'in-progress',
+            'title': 'Named views',
+            'metadata': {'files': ['gui/src/panels/ViewSelector.tsx']},
+        }
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1746', 'done', str(tmp_path))
+
+    assert result['success'] is False
+    assert result['error'] == 'done_gate_missing_files'
+    assert result['missing_files'] == ['gui/src/panels/ViewSelector.tsx']
+    assert result['task_id'] == '1746'
+    # Taskmaster write must not have fired
+    taskmaster.set_task_status.assert_not_called()
+    # No event, no reconciliation
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 0
+    reconciler.reconcile_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_gate_passes_when_files_exist(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """status=done succeeds when every declared file exists under project_root."""
+    (tmp_path / 'src').mkdir()
+    (tmp_path / 'src' / 'mod.rs').write_text('// shipped')
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '42',
+            'status': 'in-progress',
+            'title': 'Legit task',
+            'metadata': {'files': ['src/mod.rs']},
+        }
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('42', 'done', str(tmp_path))
+
+    assert 'error' not in result
+    taskmaster.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_done_gate_noop_without_metadata_files(
+    taskmaster, reconciler, event_buffer
+):
+    """Gate does not fire when metadata.files is absent — back-compat for legacy tasks."""
+    # default taskmaster fixture returns {'id':'1','status':'pending','title':'Test Task'} — no metadata
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    assert 'error' not in result
+    taskmaster.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_done_gate_reports_partial_missing(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """When some declared files exist and others don't, only the missing ones are reported."""
+    (tmp_path / 'exists.rs').write_text('')
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '99',
+            'status': 'in-progress',
+            'title': 'Partial',
+            'metadata': {'files': ['exists.rs', 'missing.rs', 'also_missing.ts']},
+        }
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('99', 'done', str(tmp_path))
+
+    assert result['success'] is False
+    assert sorted(result['missing_files']) == ['also_missing.ts', 'missing.rs']
+    assert sorted(result['files_checked']) == sorted(
+        ['exists.rs', 'missing.rs', 'also_missing.ts']
+    )
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_gate_unwraps_data_envelope(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """Gate handles the {'data': {...}} wrapper shape used by some taskmaster responses."""
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'data': {
+                'id': '7',
+                'status': 'in-progress',
+                'metadata': {'files': ['ghost.py']},
+            }
+        }
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('7', 'done', str(tmp_path))
+
+    assert result['success'] is False
+    assert result['missing_files'] == ['ghost.py']
+
+
+@pytest.mark.asyncio
+async def test_done_gate_does_not_fire_for_non_done_transitions(
+    taskmaster, reconciler, event_buffer
+):
+    """blocked/cancelled/deferred transitions bypass the file-existence gate."""
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '5',
+            'status': 'in-progress',
+            'metadata': {'files': ['does_not_exist.rs']},
+        }
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    for status in ('blocked', 'cancelled', 'deferred'):
+        taskmaster.set_task_status.reset_mock()
+        result = await interceptor.set_task_status('5', status, '/project')
+        assert 'error' not in result, f'gate should not fire on {status}'
+        taskmaster.set_task_status.assert_called_once()
+
+
+# ── Tests for done_provenance gate ─────────────────────────────────────────
+
+
+def _init_git_repo(path) -> str:
+    """Create a minimal git repo at path with one commit; return full SHA."""
+    import subprocess
+    subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
+    subprocess.run(
+        ['git', '-C', str(path), 'config', 'user.email', 't@e.example'], check=True,
+    )
+    subprocess.run(
+        ['git', '-C', str(path), 'config', 'user.name', 'T'], check=True,
+    )
+    (path / 'seed.txt').write_text('seed\n')
+    subprocess.run(['git', '-C', str(path), 'add', '-A'], check=True)
+    subprocess.run(
+        ['git', '-C', str(path), 'commit', '-q', '-m', 'seed'], check=True,
+    )
+    return subprocess.run(
+        ['git', '-C', str(path), 'rev-parse', 'HEAD'],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+@pytest.fixture
+def config_with_strict_provenance():
+    """FusedMemoryConfig with require_done_provenance=True."""
+    cfg = FusedMemoryConfig()
+    cfg.reconciliation.require_done_provenance = True
+    return cfg
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_warn_only_when_missing_by_default(
+    taskmaster, reconciler, event_buffer
+):
+    """Without require_done_provenance, a missing payload logs a warning but proceeds."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    assert 'error' not in result
+    taskmaster.set_task_status.assert_called_once()
+    # metadata was not touched because no provenance was provided
+    taskmaster.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_rejects_missing_when_required(
+    taskmaster, reconciler, event_buffer, config_with_strict_provenance
+):
+    """With the gate enabled, a missing payload is rejected with a structured error."""
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=config_with_strict_provenance,
+    )
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_required'
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_rejects_empty_payload(
+    taskmaster, reconciler, event_buffer, config_with_strict_provenance
+):
+    """An object with empty commit AND empty note is invalid even with gate on."""
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=config_with_strict_provenance,
+    )
+
+    result = await interceptor.set_task_status(
+        '1', 'done', '/project', done_provenance={'commit': '', 'note': ''},
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_rejects_invalid_commit_ref(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """A commit that can't be resolved by git rev-parse errors regardless of gate."""
+    _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={'commit': 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'},
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_resolves_short_sha_and_persists(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """A short SHA is resolved to full SHA and persisted via update_task metadata."""
+    sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path), done_provenance={'commit': sha[:7]},
+    )
+
+    assert 'error' not in result
+    taskmaster.update_task.assert_called_once()
+    kwargs = taskmaster.update_task.call_args.kwargs
+    persisted = json.loads(kwargs['metadata'])
+    assert persisted['done_provenance']['commit'] == sha
+    assert persisted['done_provenance']['commit_input'] == sha[:7]
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_note_only_accepted_and_persisted(
+    taskmaster, reconciler, event_buffer
+):
+    """A note-only payload is accepted without git validation and persisted."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', '/project',
+        done_provenance={'note': 'covered by parent task 1745'},
+    )
+
+    assert 'error' not in result
+    taskmaster.update_task.assert_called_once()
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    assert persisted['done_provenance'] == {'note': 'covered by parent task 1745'}
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_commit_plus_note_both_persisted(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """Both commit and note may be provided; both are recorded."""
+    sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', str(tmp_path),
+        done_provenance={'commit': sha, 'note': 'ff-merged after review'},
+    )
+
+    assert 'error' not in result
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    assert persisted['done_provenance']['commit'] == sha
+    assert persisted['done_provenance']['note'] == 'ff-merged after review'
+    # No commit_input when the full SHA was supplied
+    assert 'commit_input' not in persisted['done_provenance']
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_reopen_does_not_require_provenance(
+    taskmaster, reconciler, event_buffer, config_with_strict_provenance
+):
+    """Transitioning out of done (e.g. done → in-progress) bypasses the gate."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'done', 'title': 'T'},
+    )
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=config_with_strict_provenance,
+    )
+
+    result = await interceptor.set_task_status('1', 'in-progress', '/project')
+
+    assert 'error' not in result
+    taskmaster.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_malformed_shape_errors_even_warn_only(
+    taskmaster, reconciler, event_buffer
+):
+    """Wrong type (list instead of dict) always errors — never persists corrupt data."""
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1', 'done', '/project', done_provenance=['not', 'a', 'dict'],  # type: ignore[arg-type]
+    )
+
+    assert result['success'] is False
+    assert result['error'] == 'done_provenance_invalid'
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_included_in_event_payload(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """The task_status_changed event carries resolved provenance for downstream recon."""
+    sha = _init_git_repo(tmp_path)
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    await interceptor.set_task_status(
+        '1', 'done', str(tmp_path), done_provenance={'commit': sha},
+    )
+
+    project_id = resolve_project_id(str(tmp_path))
+    events = await event_buffer.peek_buffered(project_id, limit=10)
+    assert events, 'event should be buffered'
+    payload = events[-1].payload
+    assert payload['done_provenance']['commit'] == sha
 
 
 # ── Tests for background task retention (step-3) ───────────────────────────

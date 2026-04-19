@@ -26,6 +26,8 @@ from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 if TYPE_CHECKING:
+    from shared.usage_gate import UsageGate
+
     from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.middleware.curator_escalator import CuratorEscalator
     from fused_memory.middleware.task_file_committer import TaskFileCommitter
@@ -52,6 +54,7 @@ class TaskInterceptor:
         escalator: 'CuratorEscalator | None' = None,
         event_queue: 'EventQueue | None' = None,
         backlog_policy: 'BacklogPolicy | None' = None,
+        usage_gate: 'UsageGate | None' = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
@@ -74,6 +77,10 @@ class TaskInterceptor:
         self._config = config
         self._curator: TaskCurator | None = None
         self._escalator = escalator
+        # Forwarded to ``TaskCurator`` for cap-aware LLM invocation across the
+        # shared account pool. ``None`` falls back to the legacy single-shot
+        # path with no cap retry — preserved for tests.
+        self._usage_gate = usage_gate
         # R3: per-project async lock serialises add_task / add_subtask
         # calls. Concurrent triages of the same suggestion no longer race
         # to create duplicate tasks — the second call waits, sees the
@@ -203,6 +210,7 @@ class TaskInterceptor:
         status: str,
         project_root: str,
         tag: str | None = None,
+        done_provenance: dict | None = None,
     ) -> dict:
         """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered."""
         if err := await self._backlog_gate(project_root):
@@ -212,6 +220,7 @@ class TaskInterceptor:
         # WP-E: hold the per-project lock across the read + no-op check +
         # write so two concurrent status transitions can't observe the
         # same before-state and both mutate tasks.json.
+        resolved_provenance: dict | None = None
         async with self._project_lock(project_id):
             # 1. Get before-state
             before = await tm.get_task(task_id, project_root, tag)
@@ -221,14 +230,54 @@ class TaskInterceptor:
             if status == old_status:
                 return {'success': True, 'no_op': True, 'task_id': task_id}
 
+            # 2b. Phantom-done gate: if transitioning to done and the task
+            # advertises concrete files in metadata.files, refuse when any of
+            # those files is absent at project_root. Catches set_task_status
+            # calls that bypass the orchestrator's merge gate (reify tasks
+            # 1746/1747/1749, 2026-04-19).
+            if status == 'done':
+                declared = _extract_metadata_files(before)
+                if declared:
+                    missing = _missing_files(project_root, declared)
+                    if missing:
+                        return _done_gate_error(task_id, declared, missing)
+
+            # 2c. Done-provenance gate: require done_provenance={commit?, note?}
+            # so Stage-2 reconciliation has verified evidence to reference
+            # instead of fabricating 'shipped via X' edges from metadata.modules.
+            if status == 'done':
+                validation_err, resolved_provenance = await _validate_done_provenance(
+                    task_id, done_provenance, project_root,
+                    require=self._require_done_provenance(),
+                )
+                if validation_err is not None:
+                    return validation_err
+                if resolved_provenance is not None:
+                    try:
+                        await tm.update_task(
+                            task_id=task_id,
+                            metadata=json.dumps({'done_provenance': resolved_provenance}),
+                            project_root=project_root,
+                            tag=tag,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            'Failed to persist done_provenance for task %s: %s', task_id, e,
+                        )
+
             # 3. Execute status change
             result = await tm.set_task_status(task_id, status, project_root, tag)
 
         # 5. Emit event
+        payload: dict[str, Any] = {
+            'task_id': task_id, 'old_status': old_status, 'new_status': status,
+        }
+        if resolved_provenance is not None:
+            payload['done_provenance'] = resolved_provenance
         event = self._make_event(
             EventType.task_status_changed,
             project_root,
-            {'task_id': task_id, 'old_status': old_status, 'new_status': status},
+            payload,
         )
         await self._journal(event)
         self._schedule_commit(project_root, f'set_task_status({task_id}={status})')
@@ -421,6 +470,7 @@ class TaskInterceptor:
                 taskmaster=self.taskmaster,
                 cwd=cwd,
                 escalator=self._escalator,
+                usage_gate=self._usage_gate,
             )
             # Trigger the one-shot backfill check as a background task so the
             # caller is not delayed by the Qdrant count() round-trip.
@@ -1273,6 +1323,18 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
         return await tm.get_task(task_id, project_root, tag)
 
+    def _require_done_provenance(self) -> bool:
+        """True when the provenance gate is enforcing (reject missing/invalid).
+
+        False during phased rollout — in that mode a missing/malformed
+        provenance payload logs a warning and the transition proceeds.
+        """
+        cfg = self._config
+        if cfg is None:
+            return False
+        recon = getattr(cfg, 'reconciliation', None)
+        return bool(getattr(recon, 'require_done_provenance', False))
+
 
 def _extract_status(task_data: dict) -> str:
     """Extract status from Taskmaster get_task response."""
@@ -1282,6 +1344,184 @@ def _extract_status(task_data: dict) -> str:
     if isinstance(data, dict):
         return data.get('status', 'unknown')
     return 'unknown'
+
+
+def _extract_metadata_files(task_data: Any) -> list[str]:
+    """Return ``metadata.files`` as a list[str] from a Taskmaster get_task response.
+
+    Handles the two common envelope shapes (bare task dict, or ``{'data': {...}}``
+    wrapper). Silently returns ``[]`` when the field is absent, empty, or
+    malformed — the phantom-done gate only fires when files is a non-empty
+    list of strings, so defensive behaviour here means "do not gate".
+    """
+    inner = _extract_task_dict(task_data) or {}
+    metadata = inner.get('metadata')
+    if not isinstance(metadata, dict):
+        return []
+    files = metadata.get('files')
+    if not isinstance(files, list):
+        return []
+    return [f for f in files if isinstance(f, str) and f]
+
+
+def _missing_files(project_root: str, declared: list[str]) -> list[str]:
+    """Return the subset of ``declared`` that does not exist under ``project_root``."""
+    root = Path(project_root)
+    return [f for f in declared if not (root / f).exists()]
+
+
+def _done_gate_error(task_id: str, declared: list[str], missing: list[str]) -> dict:
+    """Structured error returned when the phantom-done gate trips."""
+    return {
+        'success': False,
+        'error': 'done_gate_missing_files',
+        'task_id': task_id,
+        'missing_files': missing,
+        'files_checked': declared,
+        'hint': (
+            'Cannot mark task done: files listed in metadata.files do not exist '
+            "at project_root. Either the implementation wasn't committed, or "
+            'metadata.files is stale. Land the implementation (or fix '
+            'metadata.files via update_task) before retrying.'
+        ),
+    }
+
+
+async def _validate_done_provenance(
+    task_id: str,
+    raw: object,
+    project_root: str,
+    *,
+    require: bool,
+) -> tuple[dict | None, dict | None]:
+    """Validate + resolve done_provenance for set_task_status(done).
+
+    Returns ``(error_payload, resolved_provenance)``. Error payload is a
+    structured dict suitable for returning to the MCP caller; when it is
+    non-None the transition must be aborted. Resolved provenance is a dict
+    with normalised ``commit`` (full 40-char SHA) and/or ``note`` keys, plus
+    the original ``commit_input`` when a short hash or ref was resolved.
+
+    When ``require`` is False, missing/empty provenance logs a warning but
+    returns ``(None, None)`` so the transition proceeds. Malformed provenance
+    (wrong type, unresolvable commit) still errors regardless of ``require``
+    — we never want to record corrupt provenance on the task.
+    """
+    if raw is None or raw == {}:
+        if require:
+            return _done_provenance_missing_error(task_id), None
+        logger.warning(
+            'set_task_status(%s, done) called without done_provenance; '
+            'Stage-2 reconciliation will treat this task as provenance-unknown. '
+            'Pass done_provenance={"commit": "..."} or {"note": "..."} '
+            'to record verified evidence.',
+            task_id,
+        )
+        return None, None
+
+    if not isinstance(raw, dict):
+        return (
+            _done_provenance_error(
+                task_id,
+                'done_provenance must be an object with keys "commit" and/or "note"',
+            ),
+            None,
+        )
+
+    commit_input = raw.get('commit')
+    note = raw.get('note')
+
+    if commit_input is not None and not isinstance(commit_input, str):
+        return _done_provenance_error(task_id, 'commit must be a string'), None
+    if note is not None and not isinstance(note, str):
+        return _done_provenance_error(task_id, 'note must be a string'), None
+
+    commit_input = (commit_input or '').strip() or None
+    note = (note or '').strip() or None
+
+    if commit_input is None and note is None:
+        return (
+            _done_provenance_error(
+                task_id,
+                'done_provenance requires at least one non-empty commit or note',
+            ),
+            None,
+        )
+
+    resolved: dict = {}
+    if commit_input is not None:
+        sha_or_err = await _resolve_commit_sha(project_root, commit_input)
+        if isinstance(sha_or_err, dict):
+            return _done_provenance_error(
+                task_id,
+                f'commit {commit_input!r} not found in {project_root}: '
+                f'{sha_or_err.get("reason", "rev-parse failed")}',
+            ), None
+        resolved['commit'] = sha_or_err
+        if sha_or_err != commit_input:
+            resolved['commit_input'] = commit_input
+    if note is not None:
+        resolved['note'] = note
+
+    return None, resolved
+
+
+async def _resolve_commit_sha(project_root: str, commit: str) -> str | dict:
+    """Resolve a tree-ish to a 40-char SHA via ``git rev-parse --verify``.
+
+    Returns the SHA on success or a ``{'reason': ...}`` dict on failure.
+    Uses a commit-peeling suffix (``^{commit}``) so a tag that points at a
+    commit resolves to the commit SHA directly.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'git', '-C', project_root, 'rev-parse', '--verify',
+            f'{commit}^{{commit}}',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        except TimeoutError:
+            proc.kill()
+            return {'reason': 'git rev-parse timed out'}
+    except FileNotFoundError:
+        return {'reason': 'git binary not found'}
+    except Exception as e:
+        return {'reason': f'{type(e).__name__}: {e}'}
+
+    if proc.returncode != 0:
+        msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'no such ref'
+        return {'reason': msg}
+    sha = stdout.decode('utf-8', errors='replace').strip()
+    if not sha or len(sha) < 7:
+        return {'reason': 'empty rev-parse output'}
+    return sha
+
+
+def _done_provenance_missing_error(task_id: str) -> dict:
+    return {
+        'success': False,
+        'error': 'done_provenance_required',
+        'task_id': task_id,
+        'hint': (
+            'Cannot mark task done: done_provenance is required when '
+            'reconciliation.require_done_provenance is enabled. Pass '
+            'done_provenance={"commit": "<sha-or-ref>"} with the merge '
+            'commit that landed the implementation, or '
+            'done_provenance={"note": "<explanation>"} when no commit applies '
+            '(fast-forward merge, covered by sibling task, interactive session).'
+        ),
+    }
+
+
+def _done_provenance_error(task_id: str, reason: str) -> dict:
+    return {
+        'success': False,
+        'error': 'done_provenance_invalid',
+        'task_id': task_id,
+        'reason': reason,
+    }
 
 
 def _extract_task_dict(raw: Any) -> dict | None:

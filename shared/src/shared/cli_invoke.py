@@ -18,14 +18,20 @@ from typing import TYPE_CHECKING, Any
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
 # that never set ANTHROPIC_BASE_URL can still import shared.cli_invoke.
 try:
-    from shared.vllm_bridge import VllmBridge
+    from shared.vllm_bridge import VllmBridge as _VllmBridgeRuntime
 except ImportError:  # pragma: no cover - exercised only when aiohttp absent
-    VllmBridge = None  # type: ignore[assignment,misc]
+    _VllmBridgeRuntime = None
 
 if TYPE_CHECKING:
     from shared.config_dir import TaskConfigDir
     from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
+    from shared.vllm_bridge import VllmBridge
+else:
+    # Re-expose the runtime binding under the public name so callers (and test
+    # patchers) can refer to ``shared.cli_invoke.VllmBridge``.  This is the
+    # Optional form: ``None`` when aiohttp isn't installed.
+    VllmBridge = _VllmBridgeRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -507,12 +513,13 @@ async def _invoke_claude(
     bridge: VllmBridge | None = None
     try:
         if env_overrides and env_overrides.get('ANTHROPIC_BASE_URL'):
-            if VllmBridge is None:
+            BridgeCls = VllmBridge
+            if BridgeCls is None:
                 raise RuntimeError(
                     'ANTHROPIC_BASE_URL is set but aiohttp is not installed; '
                     'install dark-factory-shared with the vllm extras to use VllmBridge.'
                 )
-            bridge = VllmBridge(upstream_url=env_overrides['ANTHROPIC_BASE_URL'])
+            bridge = BridgeCls(upstream_url=env_overrides['ANTHROPIC_BASE_URL'])
             await bridge.start()
             env['ANTHROPIC_BASE_URL'] = bridge.url
 
@@ -537,6 +544,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             subtype='error_empty_output',
             stderr=result.stderr,
             timed_out=result.timed_out,
+            duration_ms=result.duration_ms,
         )
 
     try:

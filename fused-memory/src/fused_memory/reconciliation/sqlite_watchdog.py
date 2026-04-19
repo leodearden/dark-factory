@@ -11,7 +11,6 @@ WP-D will subscribe to the optional callback to escalate at L1.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -31,7 +30,7 @@ class WatchableQueue(Protocol):
 
 
 class SqliteWatchdog:
-    """Background watchdog over an :class:`EventQueue` drainer.
+    """Background watchdog over an :class:`~fused_memory.reconciliation.event_queue.EventQueue` drainer.
 
     Wedge condition (both must hold):
       ``now - last_commit_ts > stall_threshold_seconds`` AND
@@ -87,8 +86,16 @@ class SqliteWatchdog:
         if self._task is None:
             return
         self._task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
+        try:
             await self._task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.warning(
+                'SqliteWatchdog: unexpected exception awaiting cancelled task',
+                exc_info=True,
+            )
+            raise
         self._task = None
 
     async def _loop(self) -> None:

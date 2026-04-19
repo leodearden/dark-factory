@@ -12,6 +12,19 @@ import pytest
 from shared.cost_store import CostStore
 
 
+def _conn(store: CostStore) -> aiosqlite.Connection:
+    """Return ``store._conn`` narrowed to the non-Optional connection.
+
+    CostStore.__init__ sets ``_conn`` to None; after ``open()`` it holds a
+    connection.  Tests that use the connection directly (e.g. raw SQL
+    verification) need the non-Optional form — assert here rather than
+    repeating the assertion at every call site.
+    """
+    conn = store._conn
+    assert conn is not None, 'store._conn is None — did you forget to open()?'
+    return conn
+
+
 @pytest.mark.asyncio
 class TestCostStoreInit:
     """step-1: CostStore.__init__ stores db_path and sets _conn to None."""
@@ -51,13 +64,14 @@ class TestSaveInvocation:
                 completed_at='2024-01-01T00:00:01',
             )
             # Verify via raw SQL
-            async with store._conn.execute(
+            async with _conn(store).execute(
                 'SELECT run_id, task_id, project_id, account_name, model, role, '
                 'cost_usd, input_tokens, output_tokens, cache_read_tokens, '
                 'cache_create_tokens, duration_ms, capped, started_at, completed_at '
                 'FROM invocations'
             ) as cur:
                 row = await cur.fetchone()
+        assert row is not None
         assert row[0] == 'run-abc'
         assert row[1] == 'task-42'
         assert row[2] == 'dark_factory'
@@ -94,11 +108,12 @@ class TestSaveInvocation:
                 started_at='2024-01-01T00:00:00',
                 completed_at='2024-01-01T00:00:00',
             )
-            async with store._conn.execute(
+            async with _conn(store).execute(
                 'SELECT task_id, input_tokens, output_tokens, cache_read_tokens, '
                 'cache_create_tokens, capped FROM invocations'
             ) as cur:
                 row = await cur.fetchone()
+        assert row is not None
         assert row[0] is None
         assert row[1] is None
         assert row[2] is None
@@ -127,8 +142,10 @@ class TestSaveInvocation:
                     started_at='2024-01-01T00:00:00',
                     completed_at='2024-01-01T00:00:00',
                 )
-            async with store._conn.execute('SELECT COUNT(*) FROM invocations') as cur:
-                (count,) = await cur.fetchone()
+            async with _conn(store).execute('SELECT COUNT(*) FROM invocations') as cur:
+                row = await cur.fetchone()
+        assert row is not None
+        (count,) = row
         assert count == 3
 
 
@@ -146,11 +163,12 @@ class TestSaveAccountEvent:
                 details='{"reset_at": "2024-01-01T05:00:00"}',
                 created_at='2024-01-01T00:00:00',
             )
-            async with store._conn.execute(
+            async with _conn(store).execute(
                 'SELECT account_name, event_type, project_id, run_id, details, created_at '
                 'FROM account_events'
             ) as cur:
                 row = await cur.fetchone()
+        assert row is not None
         assert row[0] == 'max-d'
         assert row[1] == 'cap_hit'
         assert row[2] == 'dark_factory'
@@ -169,10 +187,11 @@ class TestSaveAccountEvent:
                 details=None,
                 created_at='2024-06-15T12:00:00',
             )
-            async with store._conn.execute(
+            async with _conn(store).execute(
                 'SELECT project_id, run_id, details FROM account_events'
             ) as cur:
                 row = await cur.fetchone()
+        assert row is not None
         assert row[0] is None
         assert row[1] is None
         assert row[2] is None
@@ -189,10 +208,12 @@ class TestSaveAccountEvent:
                     details=None,
                     created_at='2024-01-01T00:00:00',
                 )
-            async with store._conn.execute(
+            async with _conn(store).execute(
                 'SELECT COUNT(*) FROM account_events'
             ) as cur:
-                (count,) = await cur.fetchone()
+                row = await cur.fetchone()
+        assert row is not None
+        (count,) = row
         assert count == 3
 
 
@@ -330,8 +351,9 @@ class TestCostStoreOpenClose:
         store = CostStore(tmp_path / 'costs.db')
         await store.open()
         try:
-            async with store._conn.execute('PRAGMA journal_mode') as cur:
+            async with _conn(store).execute('PRAGMA journal_mode') as cur:
                 row = await cur.fetchone()
+            assert row is not None
             assert row[0] == 'wal'
         finally:
             await store.close()
@@ -340,8 +362,9 @@ class TestCostStoreOpenClose:
         store = CostStore(tmp_path / 'costs.db')
         await store.open()
         try:
-            async with store._conn.execute('PRAGMA busy_timeout') as cur:
+            async with _conn(store).execute('PRAGMA busy_timeout') as cur:
                 row = await cur.fetchone()
+            assert row is not None
             assert row[0] == 30000
         finally:
             await store.close()
@@ -423,7 +446,9 @@ class TestCostStoreOpenClose:
                 raise RuntimeError('schema failure')
 
             conn.close = tracking_close
-            conn.executescript = failing_executescript
+            # Test-only monkeypatch: swap the method to simulate schema failure.
+            # Pyright flags cross-signature assignment; suppress narrowly.
+            conn.executescript = failing_executescript  # type: ignore[method-assign,assignment]
             return conn
 
         with patch('shared.async_sqlite_base.aiosqlite.connect', side_effect=fake_connect), pytest.raises(RuntimeError, match='schema failure'):
@@ -548,7 +573,7 @@ class TestPersistAcrossReopen:
         store2 = CostStore(db_path)
         await store2.open()
         try:
-            async with store2._conn.execute(
+            async with _conn(store2).execute(
                 'SELECT run_id, task_id, cost_usd FROM invocations'
             ) as cur:
                 row = await cur.fetchone()
@@ -581,7 +606,7 @@ class TestPersistAcrossReopen:
         store2 = CostStore(db_path)
         await store2.open()
         try:
-            async with store2._conn.execute(
+            async with _conn(store2).execute(
                 'SELECT account_name, event_type, project_id, run_id, details, created_at'
                 ' FROM account_events'
             ) as cur:

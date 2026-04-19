@@ -31,14 +31,8 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
 
 
-class _QueueLike(Protocol):
-    """Structural interface for objects that expose queue statistics.
-
-    Accepted by :class:`BacklogPolicy` instead of the concrete
-    :class:`~fused_memory.reconciliation.event_queue.EventQueue` so that
-    lightweight test stubs (which implement only ``stats()``) satisfy the
-    type checker without inheriting from the full queue class.
-    """
+class EventQueueLike(Protocol):
+    """Structural interface for the event queue; only ``stats()`` is used."""
 
     def stats(self) -> dict: ...
 
@@ -104,7 +98,7 @@ class BacklogPolicy:
     def __init__(
         self,
         event_buffer: EventBuffer,
-        event_queue: _QueueLike | None,
+        event_queue: EventQueueLike | None,
         orchestrator_detector: OrchestratorDetector,
         *,
         hard_limit: int = 500,

@@ -98,6 +98,7 @@ PLAN = {
     'task_id': '42',
     'title': 'Add farewell function',
     'modules': ['lib'],
+    'files': ['lib.py', 'test_lib.py'],
     'analysis': 'Simple function addition with TDD',
     'prerequisites': [],
     'steps': [
@@ -1133,7 +1134,7 @@ class TestBlastRadiusExpansion:
         class ExpandingArchitectStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
                 plan = dict(PLAN)
-                plan['modules'] = ['lib', 'utils']  # wider than assigned ['lib']
+                plan['files'] = ['lib.py', 'test_lib.py']  # wider than assigned ['lib']
                 plan['_schema_version'] = 1
                 task_dir = cwd / '.task'
                 task_dir.mkdir(parents=True, exist_ok=True)
@@ -1155,7 +1156,7 @@ class TestBlastRadiusExpansion:
         outcome = await workflow.run()
 
         assert outcome == WorkflowOutcome.DONE
-        assert set(workflow.modules) == {'lib', 'utils'}
+        assert set(workflow.modules) == {'lib.py', 'test_lib.py'}
 
     async def test_expansion_denied_requeues(
         self, config, git_ops, task_assignment, monkeypatch
@@ -1165,7 +1166,7 @@ class TestBlastRadiusExpansion:
         class ExpandingArchitectStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
                 plan = dict(PLAN)
-                plan['modules'] = ['lib', 'locked_module']
+                plan['files'] = ['lib.py', 'locked_module.py']
                 plan['_schema_version'] = 1
                 task_dir = cwd / '.task'
                 task_dir.mkdir(parents=True, exist_ok=True)
@@ -1553,6 +1554,7 @@ def _build_workflow_with_escalation(
         mcp=FakeMcp(),  # type: ignore[arg-type]
         escalation_queue=queue,
         merge_queue=merge_queue,
+        merge_worker=worker,
     )
     return workflow, scheduler, queue
 

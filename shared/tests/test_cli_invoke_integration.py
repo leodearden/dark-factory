@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -33,16 +34,19 @@ _need_two_accounts = pytest.mark.skipif(
     reason='Requires at least 2 OAuth accounts in env',
 )
 
-# Shared invocation kwargs to minimize cost
-_INVOKE_DEFAULTS = dict(
-    system_prompt='You are a helpful assistant. Be very brief.',
-    cwd=Path('/tmp'),
-    model='haiku',
-    max_turns=1,
-    max_budget_usd=0.01,
-    allowed_tools=[],
-    effort='low',
-)
+# Shared invocation kwargs to minimize cost.
+# dict[str, Any] is intentional: invoke_claude_agent parameters have
+# heterogeneous types (Path/str/int/float/list), so a concrete dict type
+# would lose per-parameter type checking at the ** call site.
+_INVOKE_DEFAULTS: dict[str, Any] = {
+    'system_prompt': 'You are a helpful assistant. Be very brief.',
+    'cwd': Path('/tmp'),
+    'model': 'haiku',
+    'max_turns': 1,
+    'max_budget_usd': 0.01,
+    'allowed_tools': [],
+    'effort': 'low',
+}
 
 
 @pytest.mark.integration

@@ -175,6 +175,7 @@ class TaskWorkflow:
         initial_plan: dict | None = None,
         steward_factory=None,
         merge_queue: asyncio.Queue | None = None,
+        merge_worker=None,
         event_store: EventStore | None = None,
         cost_store: CostStore | None = None,
     ):
@@ -185,6 +186,10 @@ class TaskWorkflow:
         self.briefing = briefing
         self.mcp = mcp
         self.merge_queue = merge_queue
+        # MergeWorker | SpeculativeMergeWorker | None — used by wip/unmerged
+        # handlers to register halt ownership. The asyncio.Queue above carries
+        # merge requests; this is the worker that owns the halt flag.
+        self.merge_worker = merge_worker
         self.event_store = event_store
         self.cost_store = cost_store
 
@@ -794,17 +799,20 @@ class TaskWorkflow:
                 },
             )
 
-        # Derive modules from plan's file list (deterministic) or fall back to
-        # the plan's module list (heuristic).
         plan_files = self.plan.get('files', [])
-        if plan_files:
-            plan_modules = files_to_modules(plan_files, self.config.lock_depth)
-            logger.info(
-                f'Task {self.task_id}: derived {len(plan_modules)} modules '
-                f'from {len(plan_files)} files: {plan_modules}'
+        if not plan_files:
+            return await self._mark_blocked(
+                'Planning failed: plan missing "files"',
+                detail=(
+                    'Architect wrote plan.json without a non-empty "files" array. '
+                    'Files are required to derive module locks.'
+                ),
             )
-        else:
-            plan_modules = self.plan.get('modules', [])
+        plan_modules = files_to_modules(plan_files, self.config.lock_depth)
+        logger.info(
+            f'Task {self.task_id}: derived {len(plan_modules)} modules '
+            f'from {len(plan_files)} files: {plan_modules}'
+        )
 
         if set(plan_modules) != set(self.modules):
             expanded = await self.scheduler.handle_blast_radius_expansion(
@@ -1628,6 +1636,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return await self._handle_wip_recovery(result)
         if result.status == 'wip_recovery_no_advance':
             return await self._handle_wip_recovery_no_advance(result)
+        if result.status == 'unmerged_state':
+            return await self._handle_unmerged_state(result, branch_name)
         if result.status == 'done':
             return WorkflowOutcome.DONE
         if result.status == 'already_merged':
@@ -1720,6 +1730,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 workflow_state=self.state.value,
             )
             self.escalation_queue.submit(esc)
+            if self.merge_worker is not None:
+                self.merge_worker.set_halt_owner(esc.id)
             if self.event_store:
                 self.event_store.emit(
                     EventType.escalation_created,
@@ -1776,6 +1788,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 workflow_state=self.state.value,
             )
             self.escalation_queue.submit(esc)
+            if self.merge_worker is not None:
+                self.merge_worker.set_halt_owner(esc.id)
             if self.event_store:
                 self.event_store.emit(
                     EventType.escalation_created,
@@ -1839,6 +1853,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 workflow_state=self.state.value,
             )
             self.escalation_queue.submit(esc)
+            if self.merge_worker is not None:
+                self.merge_worker.set_halt_owner(esc.id)
             if self.event_store:
                 self.event_store.emit(
                     EventType.escalation_created,
@@ -1853,6 +1869,76 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             self._escalation_event.clear()
             await self._escalation_event.wait()
             logger.info(f'Task {self.task_id}: wip_recovery_no_advance escalation resolved')
+
+        return WorkflowOutcome.BLOCKED
+
+    async def _handle_unmerged_state(
+        self, result, branch_name: str,
+    ) -> WorkflowOutcome:
+        """Handle an unmerged_state merge outcome.
+
+        ``project_root`` had pre-existing UU/AA/DD markers BEFORE this merge
+        attempted to advance main. The merge did NOT land, and the tree is
+        already in an inconsistent state. Halt stays in effect until a human
+        inspects, cleans up project_root (``git mergetool`` / manual
+        resolution / ``git reset``), and resolves the escalation.
+        """
+        detail = (
+            f'Merge for task {self.task_id} (branch {branch_name}) was '
+            f'blocked because project_root already has unresolved merge '
+            f'conflicts (UU/AA/DD markers) from a prior, unrelated event — '
+            f'the merge queue refuses to stash/advance over a partially '
+            f'resolved tree.\n\n'
+            f'Action required: inspect ``git status`` in project_root, '
+            f'resolve the existing merge state (``git mergetool`` / edit '
+            f'the conflicted files / ``git reset`` to abandon the prior '
+            f'merge), then resolve this escalation to un-halt the merge '
+            f'queue.\n\n'
+            f'Manual intervention required — do NOT let automated tooling '
+            f'resolve this escalation.'
+        )
+        logger.warning(
+            f'Task {self.task_id}: unmerged_state in project_root — '
+            f'creating level-1 escalation'
+        )
+
+        if self.escalation_queue:
+            from escalation.models import Escalation
+
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role='orchestrator',
+                severity='blocking',
+                category='unmerged_state',
+                summary=(
+                    'project_root has unresolved (UU/AA/DD) markers — '
+                    'merge queue halted'
+                ),
+                detail=detail,
+                suggested_action='manual_intervention',
+                level=1,
+                worktree=str(self.worktree) if self.worktree else None,
+                workflow_state=self.state.value,
+            )
+            self.escalation_queue.submit(esc)
+            if self.merge_worker is not None:
+                self.merge_worker.set_halt_owner(esc.id)
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.escalation_created,
+                    task_id=self.task_id, phase=self.state.value,
+                    data={'escalation_id': esc.id, 'category': 'unmerged_state',
+                          'severity': 'blocking', 'summary': esc.summary[:200]},
+                )
+
+            if self._escalation_event is None:
+                self._escalation_event = asyncio.Event()
+            self._escalation_event.clear()
+            await self._escalation_event.wait()
+            logger.info(
+                f'Task {self.task_id}: unmerged_state escalation resolved'
+            )
 
         return WorkflowOutcome.BLOCKED
 

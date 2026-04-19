@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -40,8 +41,13 @@ class TestToTokenCount:
         assert _to_token_count(42) == 42
 
 
-def _make_result(**overrides) -> AgentResult:
-    defaults = dict(success=True, output='ok', cost_usd=0.5, stderr='')
+def _make_result(**overrides: Any) -> AgentResult:
+    # dict[str, Any] is intentional: AgentResult fields have heterogeneous
+    # types and spreading a concrete dict[str, <union>] defeats pyright's
+    # per-parameter type checking at the ** call site.
+    defaults: dict[str, Any] = {
+        'success': True, 'output': 'ok', 'cost_usd': 0.5, 'stderr': '',
+    }
     defaults.update(overrides)
     return AgentResult(**defaults)
 
@@ -1247,6 +1253,20 @@ class TestParseClaudeOutputPropagatesTimedOut:
                                 duration_ms=100, timed_out=input_timed_out)
         agent = _parse_claude_output(sub)
         assert agent.timed_out is input_timed_out
+
+    def test_empty_output_preserves_duration_ms(self):
+        """A subprocess that produced no stdout (e.g. SIGTERM'd on timeout)
+        must forward its real duration to AgentResult so downstream heuristics
+        can distinguish a true zero-cost instant exit from a long timeout.
+        """
+        sub = _SubprocessResult(
+            stdout='', stderr='terminated', returncode=-15,
+            duration_ms=240_003, timed_out=True,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.subtype == 'error_empty_output'
+        assert agent.timed_out is True
+        assert agent.duration_ms == 240_003
 
 
 # ── schema salvage (R1) ────────────────────────────────────────────────────────

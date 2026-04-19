@@ -507,10 +507,12 @@ class TestCurateFallbacks:
         failing_result = AgentResult(
             success=False, output='err', structured_output=None,
         )
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
-             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(return_value=failing_result)), \
-             pytest.raises(CuratorFailureError):
+        with (
+            patch.object(curator, '_build_corpus', side_effect=empty_corpus),
+            patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                  new=AsyncMock(return_value=failing_result)),
+            pytest.raises(CuratorFailureError),
+        ):
             await curator.curate(
                 CandidateTask(title='T'), project_id='p', project_root='/x',
             )
@@ -525,9 +527,11 @@ class TestCurateFallbacks:
             success=False, output='error_max_turns', structured_output=None,
             subtype='error_max_turns', turns=2,
         )
-        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(return_value=failing_result)), \
-             pytest.raises(CuratorFailureError):
+        with (
+            patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                  new=AsyncMock(return_value=failing_result)),
+            pytest.raises(CuratorFailureError),
+        ):
             await curator._call_llm(
                 CandidateTask(title='T'),
                 pool=[],
@@ -536,6 +540,43 @@ class TestCurateFallbacks:
                 project_id='p',
                 project_root='/x',
             )
+
+    @pytest.mark.asyncio
+    async def test_call_llm_failure_message_surfaces_timeout_diagnostics(self):
+        """CuratorFailureError message includes timed_out and the configured
+        timeout so the L1 escalation reads as '240s timeout' instead of
+        'produced no output'.
+        """
+        config = _make_config()
+        config.curator.timeout_seconds = 240.0
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        timed_out_result = AgentResult(
+            success=False,
+            output='Agent produced no output',
+            subtype='error_empty_output',
+            timed_out=True,
+            duration_ms=240_003,
+        )
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=AsyncMock(return_value=timed_out_result),
+        ), pytest.raises(CuratorFailureError) as exc_info:
+            await curator._call_llm(
+                CandidateTask(title='T'),
+                pool=[],
+                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+        msg = str(exc_info.value)
+        assert 'timed_out=True' in msg
+        assert 'duration_ms=240003' in msg
+        assert 'configured_timeout_secs=240' in msg
+        # Error attaches structured attributes for CuratorEscalator.
+        assert exc_info.value.timed_out is True
+        assert exc_info.value.duration_ms == 240_003
 
     @pytest.mark.asyncio
     async def test_call_llm_salvages_schema_payload(self):

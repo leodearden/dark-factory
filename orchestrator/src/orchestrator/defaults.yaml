@@ -86,7 +86,7 @@ budgets:
 
 # Turn limits per invocation
 max_turns:
-  architect: 75
+  architect: 100
   implementer: 80
   debugger: 50
   reviewer: 30

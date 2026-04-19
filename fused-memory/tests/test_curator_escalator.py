@@ -102,10 +102,32 @@ class TestReportFailure:
             handle.close()
 
     @pytest.mark.asyncio
-    async def test_cooldown_suppresses_duplicate_within_window(self, tmp_path):
+    async def test_first_three_escalate_then_suppress(self, tmp_path):
+        """Policy: first three failures in window escalate; 4th+ are suppressed."""
         handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
         try:
-            # 1h cooldown is the default; give a wide window explicitly.
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            for _ in range(5):
+                await escalator.report_failure(
+                    project_root=str(tmp_path),
+                    project_id='proj-x',
+                    justification='repeat',
+                    candidate_title='T',
+                )
+            files = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            # First three calls produce queue files; 4th and 5th are suppressed.
+            assert len(files) == 3
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_third_escalation_carries_suppression_note(self, tmp_path):
+        """The third escalation embeds an explicit 'further suppressed' note
+        with an absolute resume-time timestamp so operators can see the
+        window boundary without reading logs.
+        """
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
             escalator = CuratorEscalator(cooldown_secs=3600.0)
             for _ in range(3):
                 await escalator.report_failure(
@@ -115,8 +137,107 @@ class TestReportFailure:
                     candidate_title='T',
                 )
             files = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
-            # Only the first call should produce a queue file.
+            assert len(files) == 3
+            third = files[-1].read_text()
+            assert 'Further curator failures will be suppressed' in third
+            # ISO-8601 UTC timestamp with timezone offset should be present.
+            assert '+00:00' in third
+            # Burst count N of 3 should be visible on each escalation.
+            first = files[0].read_text()
+            second = files[1].read_text()
+            assert 'failures_in_window=1 of 3' in first
+            assert 'failures_in_window=2 of 3' in second
+            assert 'failures_in_window=3 of 3' in third
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_fourth_failure_within_window_is_suppressed(self, tmp_path):
+        """A failure after the 3rd within cooldown does not enqueue."""
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            for _ in range(4):
+                await escalator.report_failure(
+                    project_root=str(tmp_path),
+                    project_id='proj-x',
+                    justification='repeat',
+                    candidate_title='T',
+                )
+            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 3  # 4th was suppressed
+
+            # Another call also remains suppressed.
+            await escalator.report_failure(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                justification='still broken',
+                candidate_title='T',
+            )
+            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 3
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_window_reset_after_cooldown_re_escalates(self, tmp_path):
+        """A failure past the cooldown cutoff resets the counter."""
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            # Short cooldown so we don't need to mock monotonic clocks.
+            escalator = CuratorEscalator(cooldown_secs=0.05)
+            for _ in range(3):
+                await escalator.report_failure(
+                    project_root=str(tmp_path),
+                    project_id='proj-x',
+                    justification='burst-1',
+                    candidate_title='T',
+                )
+            # 4th call inside the short window is suppressed…
+            await escalator.report_failure(
+                project_root=str(tmp_path), project_id='proj-x',
+                justification='burst-1', candidate_title='T',
+            )
+            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 3
+
+            # Sleep past the cooldown and confirm the next failure escalates
+            # again (window reset).
+            import asyncio
+            await asyncio.sleep(0.1)
+            await escalator.report_failure(
+                project_root=str(tmp_path), project_id='proj-x',
+                justification='burst-2', candidate_title='T',
+            )
+            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+            assert len(files) == 4
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_escalation_detail_includes_timed_out_and_duration(
+        self, tmp_path,
+    ):
+        """When the curator attaches timed_out/duration_ms, surface them in
+        the escalation JSON so operators see '240s timeout' not just
+        'produced no output'.
+        """
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            await escalator.report_failure(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                justification='timed out at 240s',
+                candidate_title='T',
+                timed_out=True,
+                duration_ms=240003,
+            )
+            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
             assert len(files) == 1
+            body = files[0].read_text()
+            assert 'timed_out=True' in body
+            assert 'duration_ms=240003' in body
         finally:
             handle.close()
 

@@ -16,6 +16,17 @@ _tests_dir = os.path.dirname(os.path.abspath(__file__))
 if _tests_dir not in sys.path:
     sys.path.insert(0, _tests_dir)
 
+# Make the sibling 'escalation' workspace package importable without installing it.
+# curator_escalator.py uses a try/except guard (HAS_ESCALATION) — adding the src
+# path here (before test files are collected) ensures the guard resolves to True so
+# tests that exercise the escalation-routing branch can actually run.
+_escalation_src = os.path.join(
+    os.path.dirname(os.path.dirname(_tests_dir)),  # workspace root
+    'escalation', 'src',
+)
+if _escalation_src not in sys.path:
+    sys.path.insert(0, _escalation_src)
+
 from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: E402
 from fused_memory.config.schema import (  # noqa: E402
     EmbedderConfig,

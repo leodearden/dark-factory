@@ -49,7 +49,23 @@ class CuratorFailureError(RuntimeError):
     The curator no longer degrades silently to ``action='create'`` on LLM
     errors; instead the interceptor translates this into an L1 escalation or
     a hard failure at the MCP boundary so operators notice breakage.
+
+    Attaches ``timed_out`` and ``duration_ms`` from the underlying
+    ``AgentResult`` so :class:`CuratorEscalator` can surface them in the L1
+    escalation detail. Defaults make the attributes safe to read even when
+    the failure originates outside :meth:`TaskCurator._call_llm`.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        timed_out: bool | None = None,
+        duration_ms: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.timed_out = timed_out
+        self.duration_ms = duration_ms
 
 
 Action = Literal['drop', 'combine', 'create']
@@ -545,6 +561,8 @@ class TaskCurator:
                     project_id=project_id,
                     justification=str(exc),
                     candidate_title=candidate.title,
+                    timed_out=exc.timed_out,
+                    duration_ms=exc.duration_ms,
                 )
             else:
                 logger.warning(
@@ -1005,7 +1023,12 @@ class TaskCurator:
         if not agent_result.success:
             raise CuratorFailureError(
                 f'curator LLM call failed: output={agent_result.output[:200]!r} '
-                f'subtype={agent_result.subtype!r} turns={agent_result.turns}',
+                f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
+                f'timed_out={agent_result.timed_out} '
+                f'duration_ms={agent_result.duration_ms} '
+                f'configured_timeout_secs={self._config.curator.timeout_seconds}',
+                timed_out=agent_result.timed_out,
+                duration_ms=agent_result.duration_ms,
             )
 
         return _parse_decision(

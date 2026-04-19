@@ -273,6 +273,25 @@ Bash(
 
 Leave the escalation pending — the `/unblock` skill resolves it when the human finishes. Track the spawned session so you can report its status if asked.
 
+### `wip_conflict` / `unmerged_state` (blocking, halt-owner)
+
+These escalations mean the **merge queue is globally halted** — no other task can merge until exactly one of them (the "halt owner") is resolved. The orchestrator records which escalation owns the halt on the merge worker (`_halt_owner_esc_id`); resolving that specific escalation via MCP un-halts the queue. Resolving any other escalation — even another `wip_conflict` — will NOT release the halt (fixed 2026-04-19; prior code relied on a category heuristic that caused phantom-L1 bugs like esc-1888-57).
+
+Two flavours:
+- **`wip_conflict`** — the merge queue tripped on uncommitted work in `project_root`. Three sub-variants distinguishable from the `detail`:
+  - WIP overlaps the merge diff (merge did not land; workflow will retry after resolution).
+  - Stash pop conflicted after the merge landed (merge IS on main; WIP preserved on `wip/recovery-<task>-<ts>`).
+  - Stash pop conflicted on CAS-failure path (merge did NOT land; WIP on recovery branch; task blocks).
+- **`unmerged_state`** — `project_root` already had UU/AA/DD markers before the merge attempted to advance (pre-existing corruption, not caused by this merge).
+
+**Never auto-resolve** — `manual_intervention` is authoritative. The human has to inspect `project_root`:
+- For `wip_conflict`: recovery branch named in the detail preserves the user's WIP; they may need to cherry-pick or reapply before resolving.
+- For `unmerged_state`: run `git status` in `project_root`; UU/AA/DD files need `git mergetool`, manual edit, or `git reset` depending on intent.
+
+**Spawn an interactive `/unblock` session** (same invocation pattern as `task_failure` above) so the human can see the recovery branch, inspect `project_root`, and resolve the escalation when finished.
+
+**Phantom-halt check:** if the orchestrator log shows "Merge queue un-halted: halt owner &lt;esc.id&gt; resolved" but the escalation file still has `status: pending`, that is a bug — report to the human; do **not** silently dismiss. (Historical context: pre-fix, this was a common symptom of the category-match un-halt bug.)
+
 ### `scope_violation` (info or blocking)
 
 Agent discovered it needs modules beyond its assigned scope.

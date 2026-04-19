@@ -134,6 +134,19 @@ async def run_server():
 
     curator_escalator = CuratorEscalator()
 
+    # Curator UsageGate — independent instance reading the same shared
+    # accounts file the orchestrator / eval runner use. Protects the curator
+    # from silent outages when its default account caps.
+    curator_usage_gate = None
+    if config.usage_cap is not None and config.usage_cap.enabled:
+        from shared.usage_gate import UsageGate
+
+        curator_usage_gate = UsageGate(config.usage_cap)
+        logger.info(
+            f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
+            f'from {config.usage_cap.accounts_file or "inline"}',
+        )
+
     event_queue = None
     sqlite_watchdog = None
     backlog_policy = None
@@ -199,6 +212,14 @@ async def run_server():
         # if the drainer stalls (no commit in N seconds with non-empty queue).
         # Surfaces the SQLite-lock condition that previously rotted silently.
         if config.reconciliation.event_queue_watchdog_enabled:
+            # ``on_watchdog_wedge`` returns ``list[BacklogVerdict]`` for
+            # tests/introspection, but ``WedgeCallback`` is typed as returning
+            # ``Awaitable[None]`` — the watchdog discards the return value.
+            # Wrap to satisfy the narrower callback type without changing
+            # runtime behavior.
+            async def _on_wedge(payload: dict) -> None:
+                await backlog_policy.on_watchdog_wedge(payload)
+
             sqlite_watchdog = SqliteWatchdog(
                 event_queue,
                 check_interval_seconds=(
@@ -210,7 +231,7 @@ async def run_server():
                 rearm_after_seconds=(
                     config.reconciliation.event_queue_watchdog_rearm_after_seconds
                 ),
-                wedge_callback=backlog_policy.on_watchdog_wedge,  # type: ignore[arg-type]
+                wedge_callback=_on_wedge,
             )
             await sqlite_watchdog.start()
 
@@ -235,6 +256,7 @@ async def run_server():
             config=config, escalator=curator_escalator,
             event_queue=event_queue,
             backlog_policy=backlog_policy,
+            usage_gate=curator_usage_gate,
         )
 
         # Full reconciliation harness (background loop)
@@ -263,6 +285,7 @@ async def run_server():
         task_interceptor = TaskInterceptor(
             taskmaster, None, event_buffer, task_committer,
             config=config, escalator=curator_escalator,
+            usage_gate=curator_usage_gate,
         )
 
     # Create MCP server with both memory and task tools

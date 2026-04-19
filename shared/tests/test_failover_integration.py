@@ -1136,7 +1136,9 @@ class TestConfigDirIntegrationWithFailover:
             tokens_written.append(token)
             original_write(token)
 
-        config_dir.write_credentials = tracking_write
+        # Monkeypatch write_credentials to observe which token the retry loop
+        # persists; pyright flags the method-assign because it breaks LSP.
+        config_dir.write_credentials = tracking_write  # type: ignore[method-assign]
 
         with (
             patch('shared.cli_invoke.invoke_claude_agent', new_callable=AsyncMock,

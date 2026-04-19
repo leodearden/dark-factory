@@ -1141,23 +1141,40 @@ class MemoryService:
     async def update_edge(
         self,
         edge_uuid: str,
-        fact: str,
+        fact: str | None = None,
         project_id: str = 'main',
         agent_id: str | None = None,
         session_id: str | None = None,
         causation_id: str | None = None,
         _source: str = 'mcp_tool',
+        invalid_at: datetime | None = None,
     ) -> dict:
-        """Update an existing Graphiti edge's fact text directly (no LLM pipeline)."""
+        """Update an existing Graphiti edge's fact text and/or invalidate it.
+
+        At least one of ``fact`` or ``invalid_at`` must be supplied. Setting
+        ``invalid_at`` to a timestamp marks the edge as superseded as of that
+        moment (used by reconciliation to retire contradicted facts without
+        destroying their audit trail).
+        """
+        if fact is None and invalid_at is None:
+            raise ValueError('update_edge requires fact or invalid_at to be set')
         write_op_id = str(uuid_mod.uuid4())
+
+        params: dict[str, Any] = {'edge_uuid': edge_uuid}
+        if fact is not None:
+            params['fact'] = fact[:200]
+        if invalid_at is not None:
+            params['invalid_at'] = invalid_at.isoformat()
 
         result_data = await self._journaled_backend_call(
             write_op_id=write_op_id,
             causation_id=causation_id,
             backend='graphiti',
             operation='update_edge',
-            payload={'edge_uuid': edge_uuid, 'fact': fact[:200]},
-            coro=self.graphiti.update_edge(edge_uuid, fact, group_id=project_id),
+            payload=params,
+            coro=self.graphiti.update_edge(
+                edge_uuid, fact, group_id=project_id, invalid_at=invalid_at,
+            ),
         )
         result = {'status': 'updated', 'store': 'graphiti', **result_data}
 
@@ -1170,7 +1187,7 @@ class MemoryService:
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'edge_uuid': edge_uuid, 'fact': fact[:200]},
+                params=params,
                 result_summary=result,
                 success=True,
             )

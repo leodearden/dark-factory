@@ -807,8 +807,27 @@ class TestUpdateEdge:
         )
         await service.update_edge(edge_uuid='e-1', fact='new fact', project_id='proj')
         service.graphiti.update_edge.assert_called_once_with(
-            'e-1', 'new fact', group_id='proj'
+            'e-1', 'new fact', group_id='proj', invalid_at=None,
         )
+
+    @pytest.mark.asyncio
+    async def test_update_edge_invalid_at_only(self, service):
+        from datetime import UTC, datetime
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'e-1', 'fact': 'unchanged', 'refreshed_nodes': []}
+        )
+        ts = datetime(2026, 4, 19, 12, 0, tzinfo=UTC)
+        await service.update_edge(
+            edge_uuid='e-1', project_id='proj', invalid_at=ts,
+        )
+        service.graphiti.update_edge.assert_called_once_with(
+            'e-1', None, group_id='proj', invalid_at=ts,
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_edge_requires_fact_or_invalid_at(self, service):
+        with pytest.raises(ValueError, match='fact or invalid_at'):
+            await service.update_edge(edge_uuid='e-1', project_id='proj')
 
     @pytest.mark.asyncio
     async def test_update_edge_not_found_propagates(self, service):

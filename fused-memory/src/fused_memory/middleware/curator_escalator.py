@@ -21,8 +21,11 @@ Liveness is probed via ``flock(LOCK_SH | LOCK_NB)`` on
 ``{project_root}/data/orchestrator/orchestrator.lock`` (the orchestrator
 holds ``LOCK_EX`` on startup). Treat a missing file as "no orchestrator".
 
-Per-project 1 h cooldown keeps a stuck curator from flooding the queue
-with a near-identical escalation on every ``add_task`` call.
+Per-project burst policy: escalate the first 3 failures within a rolling
+1 h window, then suppress further escalations for the rest of the window.
+Single-pin suppression previously hid a sustained outage behind a stale
+L1 — surfacing the third failure with an explicit "further suppressed"
+note makes the burst visible to operators without flooding the queue.
 """
 
 from __future__ import annotations
@@ -30,24 +33,23 @@ from __future__ import annotations
 import fcntl
 import logging
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fused_memory.middleware.task_curator import CuratorFailureError
 
 if TYPE_CHECKING:
-    from escalation.models import Escalation as _EscalationT  # type: ignore[import-untyped]
-    from escalation.queue import (
-        EscalationQueue as _EscalationQueueT,  # type: ignore[import-untyped]
-    )
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
 # ``escalation`` is a sibling workspace package. The main reconciliation
 # harness also imports it defensively (harness.py:38-46) because historical
 # deployments could lack the package. Mirror that pattern here so the
 # curator still functions (without escalation routing) in minimal envs.
 try:
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    from escalation.models import Escalation  # type: ignore[import-untyped,no-redef]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
     HAS_ESCALATION = True
 except ImportError:  # pragma: no cover - exercised only in minimal envs
     HAS_ESCALATION = False
@@ -63,10 +65,16 @@ _QUEUE_DIRNAME = 'data/escalations'
 class CuratorEscalator:
     """Route :class:`CuratorFailureError` to the orchestrator or back to the caller."""
 
+    # Queue the first N failures in a burst window; suppress the rest.
+    _ESCALATE_FIRST_N = 3
+
     def __init__(self, cooldown_secs: float = _DEFAULT_COOLDOWN_SECS) -> None:
         self._cooldown_secs = cooldown_secs
-        self._last_escalation: dict[str, float] = {}
-        self._queues: dict[str, _EscalationQueueT] = {}
+        # project_id → monotonic timestamps of recent failures in the window.
+        # Pruned on every ``report_failure`` call; a server restart resets
+        # the burst, which is desired (operator gets fresh visibility).
+        self._failure_log: dict[str, list[float]] = {}
+        self._queues: dict[str, EscalationQueue] = {}
 
     def _orchestrator_running(self, project_root: str) -> bool:
         """Return True if the project's orchestrator holds its exclusive lock.
@@ -100,7 +108,7 @@ class CuratorEscalator:
         finally:
             fd.close()
 
-    def _queue_for(self, project_root: str) -> _EscalationQueueT:
+    def _queue_for(self, project_root: str) -> EscalationQueue:
         q = self._queues.get(project_root)
         if q is None:
             q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
@@ -114,14 +122,19 @@ class CuratorEscalator:
         project_id: str,
         justification: str,
         candidate_title: str,
+        timed_out: bool | None = None,
+        duration_ms: int | None = None,
     ) -> None:
         """Route a curator failure. Raises :class:`CuratorFailureError` when no
         orchestrator is running so the MCP caller sees a loud error.
 
         When an orchestrator *is* running for this project, submit a level-1
-        escalation (once per project per cooldown window) and return — the
-        caller will fall back to ``action='create'`` so the current
-        ``add_task`` still succeeds.
+        escalation for each of the first :attr:`_ESCALATE_FIRST_N` failures
+        in a rolling cooldown window. The third escalation carries an
+        explicit "further suppressed" note with the absolute window-end
+        timestamp so operators can see the burst is ongoing. Subsequent
+        failures within the window log a WARNING and return — preventing
+        queue spam while keeping diagnostics visible.
         """
         if not HAS_ESCALATION:
             # No escalation package available — fall back to a loud raise so
@@ -140,30 +153,66 @@ class CuratorEscalator:
             )
 
         now = time.monotonic()
-        last = self._last_escalation.get(project_id, 0.0)
-        if now - last < self._cooldown_secs:
+        cutoff = now - self._cooldown_secs
+        log = [t for t in self._failure_log.get(project_id, []) if t >= cutoff]
+        log.append(now)
+        self._failure_log[project_id] = log
+        count = len(log)
+        burst_started = log[0]
+
+        if count > self._ESCALATE_FIRST_N:
+            # Window still has >=3 prior failures within cooldown; suppress.
             logger.warning(
                 'curator_escalator: suppressing escalation for project %s '
-                '(cooldown %.0fs remaining); failure=%s',
+                '(failure %d in window; cooldown %.0fs remaining since '
+                'burst start); failure=%s',
                 project_id,
-                self._cooldown_secs - (now - last),
+                count,
+                self._cooldown_secs - (now - burst_started),
                 justification[:200],
             )
             return
 
+        # ``failures_in_window`` is always present so operator triage can
+        # see "N of 3" at a glance without reading logs.
+        detail_lines = [
+            f'candidate_title={candidate_title!r}',
+            f'project_id={project_id!r}',
+            f'failures_in_window={count} of {self._ESCALATE_FIRST_N}',
+        ]
+        if timed_out is not None:
+            detail_lines.append(f'timed_out={timed_out}')
+        if duration_ms is not None:
+            detail_lines.append(f'duration_ms={duration_ms}')
+        detail_lines.append(f'justification={justification}')
+
+        if count == self._ESCALATE_FIRST_N:
+            # Absolute resume time via wall-clock — monotonic cannot convert
+            # directly. Window closes cooldown_secs after burst's first entry.
+            resume_at = datetime.now(UTC).timestamp() + (
+                self._cooldown_secs - (now - burst_started)
+            )
+            resume_iso = datetime.fromtimestamp(resume_at, tz=UTC).isoformat()
+            detail_lines.append('')
+            detail_lines.append(
+                f'NOTE: this is the {self._ESCALATE_FIRST_N}rd curator failure '
+                f'for this project within the last hour. Further curator '
+                f'failures will be suppressed from escalation for 1h '
+                f'(until {resume_iso}). Investigate immediately — dedupe is '
+                f'intermittently disabled. See logs for `task_curator: '
+                f'decision=create cost_usd=0.0000` entries.',
+            )
+        detail = '\n'.join(detail_lines)
+
         queue = self._queue_for(project_root)
-        escalation: _EscalationT = Escalation(
+        escalation = Escalation(
             id=queue.make_id('curator'),
             task_id='task-curator',
             agent_role='fused-memory/task-curator',
             severity='blocking',
             category='curator_failure',
             summary='TaskCurator LLM failing; dedupe disabled',
-            detail=(
-                f'candidate_title={candidate_title!r}\n'
-                f'project_id={project_id!r}\n'
-                f'justification={justification}'
-            ),
+            detail=detail,
             level=1,
         )
         try:
@@ -177,8 +226,8 @@ class CuratorEscalator:
             # than failing the add_task just because queue I/O broke.
             return
 
-        self._last_escalation[project_id] = now
         logger.warning(
-            'curator_escalator: queued L1 escalation %s for project %s',
-            escalation.id, project_id,
+            'curator_escalator: queued L1 escalation %s for project %s '
+            '(failure %d of %d in window)',
+            escalation.id, project_id, count, self._ESCALATE_FIRST_N,
         )
