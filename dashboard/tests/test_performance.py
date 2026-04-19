@@ -11,6 +11,7 @@ import pytest
 
 from dashboard.data.performance import (
     aggregate_completion_paths,
+    aggregate_escalation_rates,
     get_completion_paths,
     get_escalation_rates,
     get_loop_histograms,
@@ -512,3 +513,95 @@ class TestAggregateCompletionPaths:
         assert 'proj' in result
         paths = {p['path']: p['count'] for p in result['proj']}
         assert paths.get('via-interactive', 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: aggregate_escalation_rates
+# ---------------------------------------------------------------------------
+
+class TestAggregateEscalationRates:
+    """Tests for aggregate_escalation_rates across multiple DB connections."""
+
+    @pytest.fixture()
+    async def two_esc_conns(self, tmp_path):
+        """Two runs.dbs each with dark_factory tasks; DB2 also has reify."""
+        now = datetime.now(UTC)
+        ts1 = (now - timedelta(minutes=40)).isoformat()
+        ts2 = (now - timedelta(minutes=30)).isoformat()
+        ts3 = (now - timedelta(minutes=20)).isoformat()
+
+        # DB1: dark_factory — 3 tasks, 1 has steward_invocations > 0
+        db1_path = _make_runs_db(tmp_path / 'db1', 'runs.db', [
+            ('run-a', 't1', 'dark_factory', 'T1', 'done', 0.5, 300_000, 2, 1, 0, 0, 0.0, 0, ts1),
+            ('run-a', 't2', 'dark_factory', 'T2', 'done', 0.5, 400_000, 3, 1, 0, 0, 0.2, 2, ts2),
+            ('run-a', 't3', 'dark_factory', 'T3', 'blocked', 0.3, 150_000, 1, 1, 0, 0, 0.0, 0, ts3),
+        ])
+        # Escalation: task t2 had a level-1 interactive escalation with 4 turns
+        esc1 = _make_escalations_dir(tmp_path / 'esc1', 'e', [
+            {'id': 'e1', 'task_id': 't2', 'level': 1, 'status': 'resolved',
+             'resolution_turns': 4, 'resolved_by': 'interactive'},
+        ])
+
+        # DB2: dark_factory — 2 more tasks; reify — 1 task
+        db2_path = _make_runs_db(tmp_path / 'db2', 'runs.db', [
+            ('run-b', 't4', 'dark_factory', 'T4', 'done', 0.3, 200_000, 2, 1, 0, 0, 0.0, 0, ts1),
+            ('run-b', 't5', 'dark_factory', 'T5', 'done', 0.3, 250_000, 2, 1, 0, 0, 0.3, 3, ts2),
+            ('run-b', 't6', 'reify', 'T6', 'done', 0.2, 100_000, 1, 1, 0, 0, 0.0, 0, ts3),
+        ])
+        esc2 = _make_escalations_dir(tmp_path / 'esc2', 'e', [])
+
+        async with (
+            aiosqlite.connect(str(db1_path)) as c1,
+            aiosqlite.connect(str(db2_path)) as c2,
+        ):
+            c1.row_factory = aiosqlite.Row
+            c2.row_factory = aiosqlite.Row
+            yield [c1, c2], [esc1, esc2]
+
+    @pytest.mark.asyncio
+    async def test_sums_task_counts(self, two_esc_conns):
+        """total_tasks, steward_count, interactive_count summed across DBs."""
+        (dbs, edirs) = two_esc_conns
+        result = await aggregate_escalation_rates(dbs, edirs, days=1)
+        df = result['dark_factory']
+        # DB1: 3 tasks (1 steward, 1 interactive); DB2: 2 tasks (1 steward)
+        assert df['total_tasks'] == 5
+        assert df['steward_count'] == 2  # t2 from DB1 + t5 from DB2
+        assert df['interactive_count'] == 1  # t2 from DB1 only (has level-1 esc)
+
+    @pytest.mark.asyncio
+    async def test_human_attention_buckets_summed(self, two_esc_conns):
+        """human_attention buckets are summed across DBs."""
+        (dbs, edirs) = two_esc_conns
+        result = await aggregate_escalation_rates(dbs, edirs, days=1)
+        attention = result['dark_factory']['human_attention']
+        # t2: 4 resolution_turns → 'significant' (> 2)
+        assert attention['significant'] == 1
+        assert attention['minimal'] == 0
+        assert attention['zero'] == 0
+
+    @pytest.mark.asyncio
+    async def test_rates_recomputed_from_merged_totals(self, two_esc_conns):
+        """steward_rate and interactive_rate derived from merged totals (not averaged)."""
+        (dbs, edirs) = two_esc_conns
+        result = await aggregate_escalation_rates(dbs, edirs, days=1)
+        df = result['dark_factory']
+        # 2 steward_count / 5 total = 40.0%
+        assert df['steward_rate'] == pytest.approx(40.0, abs=0.1)
+        # 1 interactive_count / 5 total = 20.0%
+        assert df['interactive_rate'] == pytest.approx(20.0, abs=0.1)
+
+    @pytest.mark.asyncio
+    async def test_empty_dbs_list(self, tmp_path):
+        """`dbs=[]` returns empty dict."""
+        result = await aggregate_escalation_rates([], [], days=7)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_none_dbs_returns_empty(self, tmp_path):
+        """`dbs=[None, None]` returns empty dict."""
+        edir = _make_escalations_dir(tmp_path, 'esc', [])
+        result = await aggregate_escalation_rates(
+            [None, None], [edir, edir], days=7,
+        )
+        assert result == {}
