@@ -1267,7 +1267,7 @@ class TestSpeculativeMergeWorker:
         mock_verify.return_value.passed = False
         mock_verify.return_value.summary = 'tests failed'
 
-        async def raise_on_remerge(req):  # type: ignore[no-untyped-def]
+        async def raise_on_remerge(req, started_monotonic: float = 0.0):  # type: ignore[no-untyped-def]
             raise RuntimeError('_remerge failed unexpectedly')
 
         worker._remerge = raise_on_remerge  # type: ignore[method-assign]
@@ -1986,6 +1986,239 @@ class TestSpeculativeMergeWorker:
         assert outcome_ok.status == 'done', (
             f'Merger loop should continue after exceptions, got {outcome_ok}'
         )
+
+        await worker.stop()
+        await worker_task
+
+    async def test_speculative_merge_worker_emits_duration_ms_on_done(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """SpeculativeMergeWorker emits duration_ms on the 'done' outcome.
+
+        Exercises the verifier-phase emit at _verify_and_advance (done path).
+        Asserts the merge_attempt event row has a non-null integer duration_ms.
+        """
+        db_path = tmp_path / 'events_spec_done.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        wt = await _make_branch_with_file(
+            git_ops, 'sdur-done', 'sdur_done.py', 'sdur = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req = _make_request('sdur-done', 'sdur-done', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done', f'Expected done, got: {outcome}'
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.outcome') AS outcome, duration_ms "
+            "FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+
+        done_rows = [r for r in rows if r[0] == 'done']
+        assert len(done_rows) == 1, f'Expected 1 done row, got: {rows}'
+        assert done_rows[0][1] is not None, 'duration_ms should not be NULL'
+        assert isinstance(done_rows[0][1], int), f'duration_ms should be int, got {type(done_rows[0][1])}'
+        assert done_rows[0][1] >= 0, f'duration_ms should be >= 0, got {done_rows[0][1]}'
+
+        await worker.stop()
+        await worker_task
+
+    async def test_speculative_merger_phase_emits_duration_ms(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Merger-phase emit sites set non-null duration_ms.
+
+        Covers already_merged and conflict outcomes emitted from _merger_loop.
+        """
+        # --- Scenario A: already_merged (merger phase) ---
+        db_a = tmp_path / 'events_sphase_a.db'
+        es_a = EventStore(db_path=db_a, run_id='run-a')
+
+        wt_n = await _make_branch_with_file(
+            git_ops, 'sphase-n', 'sphase_n.py', 'sphase_n = 1\n',
+        )
+        # Create N+1 as already-merged: merge it first, then submit it
+        wt_n1 = (await git_ops.create_worktree('sphase-n1')).path
+        (wt_n1 / 'sphase_n1.py').write_text('sphase_n1 = 2\n')
+        await git_ops.commit(wt_n1, 'Add sphase_n1.py')
+        r = await git_ops.merge_to_main(wt_n1, 'sphase-n1')
+        assert r.success
+        assert r.merge_commit is not None
+        await git_ops.advance_main(r.merge_commit)
+        if r.merge_worktree:
+            await git_ops.cleanup_merge_worktree(r.merge_worktree)
+
+        q_a: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        w_a = SpeculativeMergeWorker(git_ops, q_a, event_store=es_a)
+        wt_a = asyncio.create_task(w_a.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req_n = _make_request('sphase-n', 'sphase-n', wt_n, config)
+            req_n1 = _make_request('sphase-n1', 'sphase-n1', wt_n1, config)
+            await q_a.put(req_n)
+            await q_a.put(req_n1)
+            out_n = await asyncio.wait_for(req_n.result, timeout=30)
+            out_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+
+        assert out_n.status == 'done', f'N: {out_n}'
+        assert out_n1.status == 'already_merged', f'N+1: {out_n1}'
+        await w_a.stop()
+        await wt_a
+
+        conn = sqlite3.connect(str(db_a))
+        rows_a = conn.execute(
+            "SELECT json_extract(data, '$.outcome'), duration_ms "
+            "FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+        assert all(r[1] is not None for r in rows_a), f'NULL duration_ms in already_merged scenario: {rows_a}'
+
+        # --- Scenario B: conflict (merger phase) ---
+        db_b = tmp_path / 'events_sphase_b.db'
+        es_b = EventStore(db_path=db_b, run_id='run-b')
+
+        wt_n2 = await _make_branch_with_file(
+            git_ops, 'sphase-n2', 'sphase_n2.py', 'sphase_n2 = 1\n',
+        )
+        # Create a conflicting N+2 (README conflict)
+        wt_cfl = (await git_ops.create_worktree('sphase-cfl')).path
+        (git_ops.project_root / 'README.md').write_text('# conflict-src-sphase\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Conflict source sphase'], cwd=git_ops.project_root)
+        (wt_cfl / 'README.md').write_text('# conflict-task-sphase\n')
+        await git_ops.commit(wt_cfl, 'Conflict task sphase')
+
+        q_b: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        w_b = SpeculativeMergeWorker(git_ops, q_b, event_store=es_b)
+        wt_b = asyncio.create_task(w_b.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req_n2 = _make_request('sphase-n2', 'sphase-n2', wt_n2, config)
+            req_cfl = _make_request('sphase-cfl', 'sphase-cfl', wt_cfl, config)
+            await q_b.put(req_n2)
+            await q_b.put(req_cfl)
+            out_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+            out_cfl = await asyncio.wait_for(req_cfl.result, timeout=30)
+
+        assert out_n2.status == 'done', f'N2: {out_n2}'
+        assert out_cfl.status == 'conflict', f'Conflict: {out_cfl}'
+        await w_b.stop()
+        await wt_b
+
+        conn = sqlite3.connect(str(db_b))
+        rows_b = conn.execute(
+            "SELECT json_extract(data, '$.outcome'), duration_ms "
+            "FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+        assert all(r[1] is not None for r in rows_b), f'NULL duration_ms in conflict scenario: {rows_b}'
+
+    async def test_speculative_remerge_preserves_duration_ms(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """_remerge uses the original started_monotonic so duration_ms is realistic.
+
+        The _remerge path is triggered when N fails verification and N+1 was
+        speculatively merged. The verifier discards N+1's stale worktree and
+        calls _remerge. If started_monotonic is correctly threaded through,
+        the conflict emit inside _remerge yields a realistic duration (< 60s).
+        If it falls back to the 0.0 default, duration would be huge (seconds
+        since process start × 1000).
+
+        Setup: N succeeds merge but fails verification, so N+1 is discarded
+        and re-merged. We patch merge_to_main so the re-merge produces a
+        conflict for N+1, causing a conflict emit inside _remerge.
+        """
+        db_path = tmp_path / 'events_remerge.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        wt_n = await _make_branch_with_file(
+            git_ops, 'rmp-n', 'rmp_n.py', 'rmp_n = 1\n',
+        )
+        wt_n1 = await _make_branch_with_file(
+            git_ops, 'rmp-n1', 'rmp_n1.py', 'rmp_n1 = 2\n',
+        )
+
+        # Track merge_to_main calls so we can return conflict on the re-merge
+        original_merge = git_ops.merge_to_main
+        merge_call_count = 0
+
+        async def _controlled_merge(worktree, branch, **kwargs):
+            nonlocal merge_call_count
+            merge_call_count += 1
+            # First two calls are speculative merges for N and N+1 (normal)
+            # Third call is the re-merge for N+1 after N fails — return conflict
+            if merge_call_count >= 3 and branch == 'rmp-n1':
+                return MergeResult(
+                    success=False,
+                    conflicts=True,
+                    details='simulated remerge conflict',
+                    merge_commit=None,
+                    merge_worktree=None,
+                    pre_merge_sha=None,
+                )
+            return await original_merge(worktree, branch, **kwargs)
+
+        async def _fail_n_pass_n1(merge_wt, cfg, module_configs, task_files=None):
+            """Fail N's verification; N+1 re-merge won't reach verify (conflicts)."""
+            result = AsyncMock()
+            n_present = (merge_wt / 'rmp_n.py').exists()
+            if n_present:
+                result.passed = False
+                result.summary = 'N failed intentionally'
+            else:
+                result.passed = True
+                result.summary = ''
+            return result
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        with (
+            patch.object(git_ops, 'merge_to_main', side_effect=_controlled_merge),
+            patch('orchestrator.merge_queue.run_scoped_verification', side_effect=_fail_n_pass_n1),
+        ):
+            req_n = _make_request('rmp-n', 'rmp-n', wt_n, config)
+            req_n1 = _make_request('rmp-n1', 'rmp-n1', wt_n1, config)
+            await queue.put(req_n)
+            await queue.put(req_n1)
+            out_n = await asyncio.wait_for(req_n.result, timeout=30)
+            out_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+
+        # N should be blocked (verify failed); N+1 should be conflict (from _remerge)
+        assert out_n.status == 'blocked', f'N: {out_n}'
+        assert out_n1.status == 'conflict', f'N+1: {out_n1}'
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.outcome'), duration_ms "
+            "FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+
+        # All merge_attempt events must have non-null duration_ms
+        assert all(r[1] is not None for r in rows), f'NULL duration_ms found: {rows}'
+
+        # The conflict emit inside _remerge must have a realistic duration_ms
+        # (0 to 60000 ms). If started_monotonic were 0.0 (default), the value
+        # would be time-since-process-start * 1000 — many thousands of ms.
+        conflict_rows = [r for r in rows if r[0] == 'conflict']
+        assert len(conflict_rows) >= 1, f'Expected at least one conflict event: {rows}'
+        for outcome, dur in conflict_rows:
+            assert 0 <= dur <= 60_000, (
+                f'duration_ms={dur} is not realistic; '
+                f'started_monotonic was likely not threaded through _remerge'
+            )
 
         await worker.stop()
         await worker_task

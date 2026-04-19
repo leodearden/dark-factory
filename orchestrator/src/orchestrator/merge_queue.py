@@ -106,6 +106,7 @@ class SpeculativeItem:
     speculative: bool                  # True → merged against pending N's SHA
     skip_verify: bool                  # True → pre_rebased and main unchanged
     immediate_outcome: MergeOutcome | None = None  # Set for conflict/already_merged
+    started_monotonic: float = 0.0    # time.monotonic() at request processing entry
 
 
 class MergeWorker:
@@ -638,6 +639,7 @@ class SpeculativeMergeWorker:
 
     def _emit_merge(
         self, task_id: str, outcome: str, *, attempt: int | None = None,
+        duration_ms: int | None = None,
     ) -> None:
         if self._event_store:
             data: dict = {'outcome': outcome}
@@ -645,6 +647,7 @@ class SpeculativeMergeWorker:
                 data['attempt'] = attempt
             self._event_store.emit(
                 EventType.merge_attempt, task_id=task_id, phase='merge', data=data,
+                duration_ms=duration_ms,
             )
 
     def _emit_speculative(
@@ -692,6 +695,7 @@ class SpeculativeMergeWorker:
                     await self._wip_halt.wait()
 
                 self._inflight_req = req  # track for stop() race resolution
+                t0 = time.monotonic()
                 merge_result_local: MergeResult | None = None
                 try:
                     speculative = spec_base is not None
@@ -714,6 +718,7 @@ class SpeculativeMergeWorker:
                                 'blocked',
                                 reason=f'rev-parse HEAD failed: {err.strip()}',
                             ),
+                            started_monotonic=t0,
                         ))
                         spec_base = None
                         self._inflight_req = None
@@ -723,12 +728,13 @@ class SpeculativeMergeWorker:
                         logger.info(
                             f'Task {req.task_id}: branch already on main — skipping'
                         )
-                        self._emit_merge(req.task_id, 'already_merged')
+                        self._emit_merge(req.task_id, 'already_merged', duration_ms=round((time.monotonic() - t0) * 1000))
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=speculative,
                             skip_verify=False,
                             immediate_outcome=MergeOutcome('already_merged'),
+                            started_monotonic=t0,
                         ))
                         spec_base = None
                         self._inflight_req = None
@@ -748,7 +754,7 @@ class SpeculativeMergeWorker:
                     # ── Step 3: conflict or non-conflict failure ───────────────
                     if merge_result.conflicts:
                         logger.info(f'Task {req.task_id}: merge conflicts')
-                        self._emit_merge(req.task_id, 'conflict')
+                        self._emit_merge(req.task_id, 'conflict', duration_ms=round((time.monotonic() - t0) * 1000))
                         if merge_result.merge_worktree:
                             await self._git_ops.cleanup_merge_worktree(
                                 merge_result.merge_worktree,
@@ -760,6 +766,7 @@ class SpeculativeMergeWorker:
                             immediate_outcome=MergeOutcome(
                                 'conflict', conflict_details=merge_result.details,
                             ),
+                            started_monotonic=t0,
                         ))
                         spec_base = None
                         self._inflight_req = None
@@ -777,6 +784,7 @@ class SpeculativeMergeWorker:
                             immediate_outcome=MergeOutcome(
                                 'blocked', reason=merge_result.details,
                             ),
+                            started_monotonic=t0,
                         ))
                         spec_base = None
                         self._inflight_req = None
@@ -800,7 +808,7 @@ class SpeculativeMergeWorker:
                             f'Task {req.task_id}: merge dropped plan '
                             f'targets: {dropped}'
                         )
-                        self._emit_merge(req.task_id, 'dropped_plan_targets')
+                        self._emit_merge(req.task_id, 'dropped_plan_targets', duration_ms=round((time.monotonic() - t0) * 1000))
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=base_for_merge, speculative=speculative,
@@ -815,6 +823,7 @@ class SpeculativeMergeWorker:
                                     f'and restore missing files.'
                                 ),
                             ),
+                            started_monotonic=t0,
                         ))
                         spec_base = None
                         self._inflight_req = None
@@ -830,6 +839,7 @@ class SpeculativeMergeWorker:
                         merge_wt=merge_result.merge_worktree,
                         base_sha=base_for_merge, speculative=speculative,
                         skip_verify=skip_verify,
+                        started_monotonic=t0,
                     ))
                     self._inflight_req = None  # item is now owned by verifier
 
@@ -946,7 +956,7 @@ class SpeculativeMergeWorker:
                         f'Task {req.task_id}: discarding stale speculative merge '
                         f'({discard_reason}), re-merging against actual main'
                     )
-                    item = await self._remerge(req)
+                    item = await self._remerge(req, item.started_monotonic)
 
                 # ── Immediate outcome (already_merged / conflict / blocked) ─
                 if item.immediate_outcome is not None:
@@ -985,14 +995,14 @@ class SpeculativeMergeWorker:
                 remerge_occurred = iteration_did_remerge
                 self._speculation_slot.set()
 
-    async def _remerge(self, req: MergeRequest) -> SpeculativeItem:
+    async def _remerge(self, req: MergeRequest, started_monotonic: float) -> SpeculativeItem:
         """Re-merge a request against actual main after speculation invalidation."""
         actual_main = await self._git_ops.get_main_sha()
         merge_result = await self._git_ops.merge_to_main(
             req.worktree, req.branch, base_sha=None,
         )
         if merge_result.conflicts:
-            self._emit_merge(req.task_id, 'conflict')
+            self._emit_merge(req.task_id, 'conflict', duration_ms=round((time.monotonic() - started_monotonic) * 1000))
             if merge_result.merge_worktree:
                 await self._git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
             return SpeculativeItem(
@@ -1001,6 +1011,7 @@ class SpeculativeMergeWorker:
                 immediate_outcome=MergeOutcome(
                     'conflict', conflict_details=merge_result.details,
                 ),
+                started_monotonic=started_monotonic,
             )
         if not merge_result.success:
             if merge_result.merge_worktree:
@@ -1009,6 +1020,7 @@ class SpeculativeMergeWorker:
                 request=req, merge_result=None, merge_wt=None,
                 base_sha=actual_main, speculative=False, skip_verify=False,
                 immediate_outcome=MergeOutcome('blocked', reason=merge_result.details),
+                started_monotonic=started_monotonic,
             )
         skip_verify = (
             req.pre_rebased
@@ -1019,6 +1031,7 @@ class SpeculativeMergeWorker:
             request=req, merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=actual_main, speculative=False, skip_verify=skip_verify,
+            started_monotonic=started_monotonic,
         )
 
     async def _verify_and_advance(self, item: SpeculativeItem) -> bool:
@@ -1092,7 +1105,7 @@ class SpeculativeMergeWorker:
             if result == 'advanced':
                 self._cas_retries.pop(req.task_id, None)
                 logger.info(f'Task {req.task_id}: merged to main successfully')
-                self._emit_merge(req.task_id, 'done')
+                self._emit_merge(req.task_id, 'done', duration_ms=round((time.monotonic() - item.started_monotonic) * 1000))
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if not req.result.done():
                     req.result.set_result(MergeOutcome('done'))
@@ -1179,7 +1192,7 @@ class SpeculativeMergeWorker:
                     f'Task {req.task_id}: CAS retry limit exhausted '
                     f'({self.MAX_CAS_RETRIES} attempts)'
                 )
-                self._emit_merge(req.task_id, 'cas_exhausted', attempt=total)
+                self._emit_merge(req.task_id, 'cas_exhausted', attempt=total, duration_ms=round((time.monotonic() - item.started_monotonic) * 1000))
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if not req.result.done():
                     req.result.set_result(MergeOutcome(
@@ -1199,9 +1212,10 @@ class SpeculativeMergeWorker:
                 base_sha=await self._git_ops.get_main_sha(),
                 speculative=item.speculative,
                 skip_verify=item.skip_verify,
+                started_monotonic=item.started_monotonic,
             )
             logger.info(
                 f'Task {req.task_id}: CAS failed (attempt {total}/'
                 f'{self.MAX_CAS_RETRIES}), retrying'
             )
-            self._emit_merge(req.task_id, 'cas_retry', attempt=total)
+            self._emit_merge(req.task_id, 'cas_retry', attempt=total, duration_ms=round((time.monotonic() - item.started_monotonic) * 1000))
