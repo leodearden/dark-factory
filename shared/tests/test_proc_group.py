@@ -93,3 +93,26 @@ class TestTerminateProcessGroup:
         # All members of the group must be gone.
         with pytest.raises(ProcessLookupError):
             os.killpg(pgid, 0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_terminate_process_group_idempotent_on_already_dead_proc(self):
+        """terminate_process_group is a no-op when the process has already exited.
+
+        Covers the ProcessLookupError race: if the OS has already reaped the
+        group before we call terminate_process_group, the helper must return
+        cleanly without raising.  This locks in the design decision to defensively
+        suppress ProcessLookupError/OSError around both killpg calls.
+        """
+        proc = await asyncio.create_subprocess_shell(
+            'true',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        # Let the process exit naturally before calling the helper.
+        await proc.wait()
+        assert proc.returncode is not None
+
+        # Must not raise even though the process group is already gone.
+        await terminate_process_group(proc, grace_secs=5.0)
