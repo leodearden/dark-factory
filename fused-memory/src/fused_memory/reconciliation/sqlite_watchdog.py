@@ -22,12 +22,8 @@ WedgeCallback = Callable[[dict], Awaitable[None]] | Callable[[dict], None]
 
 
 @runtime_checkable
-class WatchdogObservable(Protocol):
-    """Minimal interface required by :class:`SqliteWatchdog`.
-
-    Both :class:`~fused_memory.reconciliation.event_queue.EventQueue` and
-    test doubles satisfy this protocol.
-    """
+class WatchableQueue(Protocol):
+    """Minimal interface that :class:`SqliteWatchdog` needs from an event queue."""
 
     def stats(self) -> dict: ...
     def recent_ops(self) -> list[dict]: ...
@@ -52,7 +48,7 @@ class SqliteWatchdog:
 
     def __init__(
         self,
-        event_queue: WatchdogObservable,
+        event_queue: WatchableQueue,
         *,
         check_interval_seconds: float = 30.0,
         stall_threshold_seconds: float = 120.0,

@@ -1404,7 +1404,7 @@ class TestInvokeSlot:
         gate._accounts[0].probing = True
         gate._open.set()
 
-        async with gate.invoke_slot() as slot:
+        async with gate.invoke_slot() as _:
             # Simulate resume-failed: just exit without settling
             assert gate._accounts[0].probe_in_flight is True
 
@@ -1419,7 +1419,7 @@ class TestInvokeSlot:
         gate._open.set()
 
         with pytest.raises(RuntimeError, match='boom'):
-            async with gate.invoke_slot() as slot:
+            async with gate.invoke_slot() as _:
                 assert gate._accounts[0].probe_in_flight is True
                 raise RuntimeError('boom')
 

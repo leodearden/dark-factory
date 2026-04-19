@@ -968,6 +968,85 @@ class TestMem0BackendClose:
         assert backend._instances == {}
 
 
+class TestGraphitiBackendClose:
+    @pytest.mark.asyncio
+    async def test_close_awaits_close_on_all_cloned_drivers(self, mock_config):
+        """GraphitiBackend.close() must await close() on every cached cloned driver."""
+        from fused_memory.backends.graphiti_client import GraphitiBackend
+
+        backend = GraphitiBackend(mock_config)
+
+        # Primary driver mock
+        backend._driver = MagicMock()
+        backend._driver.close = AsyncMock()
+
+        # Two cloned-driver mocks
+        clone_a = MagicMock()
+        clone_a.close = AsyncMock()
+        clone_b = MagicMock()
+        clone_b.close = AsyncMock()
+        backend._cloned_drivers = {'group-a': clone_a, 'group-b': clone_b}
+
+        await backend.close()
+
+        clone_a.close.assert_awaited_once()
+        clone_b.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_close_clears_cloned_drivers_dict(self, mock_config):
+        """GraphitiBackend.close() must clear _cloned_drivers after closing them."""
+        from fused_memory.backends.graphiti_client import GraphitiBackend
+
+        backend = GraphitiBackend(mock_config)
+
+        # Primary driver mock
+        backend._driver = MagicMock()
+        backend._driver.close = AsyncMock()
+
+        # Two cloned-driver mocks
+        clone_a = MagicMock()
+        clone_a.close = AsyncMock()
+        clone_b = MagicMock()
+        clone_b.close = AsyncMock()
+        backend._cloned_drivers = {'group-a': clone_a, 'group-b': clone_b}
+
+        await backend.close()
+
+        assert backend._cloned_drivers == {}
+
+    @pytest.mark.asyncio
+    async def test_close_resilient_to_cloned_driver_close_error(self, mock_config):
+        """A failing clone.close() must not prevent other clones or the primary from closing."""
+        from fused_memory.backends.graphiti_client import GraphitiBackend
+
+        backend = GraphitiBackend(mock_config)
+
+        # Primary driver mock — save close reference before close() nulls _driver
+        primary_driver = MagicMock()
+        primary_close = AsyncMock()
+        primary_driver.close = primary_close
+        backend._driver = primary_driver
+
+        # clone_a raises, clone_b should still be closed
+        clone_a = MagicMock()
+        clone_a.close = AsyncMock(side_effect=RuntimeError('boom'))
+        clone_b = MagicMock()
+        clone_b.close = AsyncMock()
+        backend._cloned_drivers = {'group-a': clone_a, 'group-b': clone_b}
+
+        # Must not raise
+        await backend.close()
+
+        # clone_b still closed despite clone_a raising
+        clone_b.close.assert_awaited_once()
+        # Primary driver still closed
+        primary_close.assert_awaited_once()
+        # Dict cleared
+        assert backend._cloned_drivers == {}
+        # Primary driver nulled out
+        assert backend._driver is None
+
+
 class TestGetEpisodes:
     @pytest.mark.asyncio
     async def test_returns_list(self, service):
