@@ -67,5 +67,29 @@ class TestTerminateProcessGroup:
         assert proc.returncode == -signal.SIGKILL, (
             f'Expected returncode -9 (SIGKILL), got {proc.returncode}'
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_terminate_process_group_reaps_grandchildren(self):
+        """terminate_process_group kills grandchildren (bash → sleep sleep).
+
+        Reproduces the canonical cargo → rustc incident shape: bash spawns two
+        background sleeps and waits for them.  After terminate_process_group,
+        pgrep must report no processes in the group.
+        """
+        proc = await asyncio.create_subprocess_shell(
+            'sleep 60 & sleep 60 & wait',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        pgid = os.getpgid(proc.pid)
+
+        # Brief settle so grandchildren actually start.
+        await asyncio.sleep(0.2)
+
+        await terminate_process_group(proc, grace_secs=5.0)
+
+        # All members of the group must be gone.
         with pytest.raises(ProcessLookupError):
             os.killpg(pgid, 0)
