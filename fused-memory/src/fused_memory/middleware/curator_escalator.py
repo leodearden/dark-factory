@@ -31,8 +31,15 @@ import fcntl
 import logging
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fused_memory.middleware.task_curator import CuratorFailureError
+
+if TYPE_CHECKING:
+    from escalation.models import Escalation as _EscalationT  # type: ignore[import-untyped]
+    from escalation.queue import (
+        EscalationQueue as _EscalationQueueT,  # type: ignore[import-untyped]
+    )
 
 # ``escalation`` is a sibling workspace package. The main reconciliation
 # harness also imports it defensively (harness.py:38-46) because historical
@@ -44,8 +51,6 @@ try:
     HAS_ESCALATION = True
 except ImportError:  # pragma: no cover - exercised only in minimal envs
     HAS_ESCALATION = False
-    Escalation = None  # type: ignore[assignment,misc]
-    EscalationQueue = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +66,7 @@ class CuratorEscalator:
     def __init__(self, cooldown_secs: float = _DEFAULT_COOLDOWN_SECS) -> None:
         self._cooldown_secs = cooldown_secs
         self._last_escalation: dict[str, float] = {}
-        self._queues: dict[str, EscalationQueue] = {}  # type: ignore[valid-type]
+        self._queues: dict[str, _EscalationQueueT] = {}
 
     def _orchestrator_running(self, project_root: str) -> bool:
         """Return True if the project's orchestrator holds its exclusive lock.
@@ -95,10 +100,10 @@ class CuratorEscalator:
         finally:
             fd.close()
 
-    def _queue_for(self, project_root: str) -> EscalationQueue:  # type: ignore[valid-type]
+    def _queue_for(self, project_root: str) -> _EscalationQueueT:
         q = self._queues.get(project_root)
         if q is None:
-            q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)  # type: ignore[operator]
+            q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
             self._queues[project_root] = q
         return q
 
@@ -147,7 +152,7 @@ class CuratorEscalator:
             return
 
         queue = self._queue_for(project_root)
-        escalation = Escalation(  # type: ignore[operator]
+        escalation: _EscalationT = Escalation(
             id=queue.make_id('curator'),
             task_id='task-curator',
             agent_role='fused-memory/task-curator',
