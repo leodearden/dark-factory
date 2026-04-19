@@ -457,3 +457,98 @@ class TestOrchestratorNoPrd:
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_NO_PRD]):
             html = client.get('/partials/orchestrators').text
         assert '$store.panels' in html
+
+
+class TestOrchestratorFilterCheckboxes:
+    """Tests for the filter checkbox group replacing the Show/Hide button."""
+
+    # orch_key for MOCK_ORCHESTRATOR_RUNNING:
+    # label = '/home/leo/src/dark-factory/prd/dashboard.md'
+    # replace('/', '-').replace('.', '-') => '-home-leo-src-dark-factory-prd-dashboard-md'
+    ORCH_KEY = '-home-leo-src-dark-factory-prd-dashboard-md'
+
+    def test_three_checkbox_inputs_rendered(self, client):
+        """Three <input type="checkbox"> elements present inside the orchestrator card."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        count = html.count('type="checkbox"')
+        assert count >= 3, f'Expected at least 3 checkboxes, found {count}'
+
+    def test_all_label_with_count(self, client):
+        """Label for the 'All' checkbox shows total task count."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'All (5)' in html
+
+    def test_active_label_with_count(self, client):
+        """Label for 'Active' checkbox shows in-progress + blocked count."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'Active (2)' in html
+
+    def test_pending_label_with_count(self, client):
+        """Label for 'Pending' checkbox shows pending count."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'Pending (1)' in html
+
+    def test_card_wrapper_has_x_init(self, client):
+        """Card wrapper div carries an x-init attribute to seed default state."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'x-init=' in html
+
+    def test_x_init_seeds_active_true(self, client):
+        """x-init expression sets active: true as the default."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'active: true' in html
+
+    def test_x_init_seeds_all_false(self, client):
+        """x-init expression sets all: false as the default."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'all: false' in html
+
+    def test_x_init_seeds_pending_false(self, client):
+        """x-init expression sets pending: false as the default."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        assert 'pending: false' in html
+
+    def test_active_checkbox_x_model(self, client):
+        """Active checkbox uses x-model bound to .active flag in store."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        key = self.ORCH_KEY
+        assert f"x-model=\"$store.panels['{key}'].active\"" in html
+
+    def test_pending_checkbox_x_model(self, client):
+        """Pending checkbox uses x-model bound to .pending flag in store."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        key = self.ORCH_KEY
+        assert f"x-model=\"$store.panels['{key}'].pending\"" in html
+
+    def test_all_checkbox_change_handler_sets_all(self, client):
+        """All checkbox @change handler writes .all flag."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        key = self.ORCH_KEY
+        # @change handler must update the .all property
+        assert f"$store.panels['{key}'].all" in html
+        assert '@change' in html
+
+    def test_all_checkbox_change_handler_sets_active(self, client):
+        """All checkbox @change handler also writes .active flag."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        key = self.ORCH_KEY
+        assert f"$store.panels['{key}'].active" in html
+
+    def test_all_checkbox_change_handler_sets_pending(self, client):
+        """All checkbox @change handler also writes .pending flag."""
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        key = self.ORCH_KEY
+        assert f"$store.panels['{key}'].pending" in html
