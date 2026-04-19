@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -10,8 +11,36 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from escalation.models import Escalation
+from shared.usage_gate import InvokeSlot
 
 from orchestrator.steward import StewardMetrics, TaskSteward, _is_timeout_kill
+
+
+def _attach_invoke_slot(gate: MagicMock) -> MagicMock:
+    """Install a real async-CM on gate.invoke_slot() that wires a real InvokeSlot.
+
+    Mirrors ``UsageGate.invoke_slot`` so tests exercise the production
+    contract: ``slot.detect_cap_hit``/``slot.confirm`` delegate to the
+    mocked gate methods, and the ``__aexit__`` safety net calls
+    ``gate.release_probe_slot(token)`` on unsettled exit paths.
+
+    Caller must have already configured ``gate.before_invoke`` (returns
+    token), ``gate.active_account_name``, ``gate.detect_cap_hit``,
+    ``gate.confirm_account_ok``, ``gate.on_agent_complete``, and
+    ``gate.release_probe_slot`` on the mock.
+    """
+    @contextlib.asynccontextmanager
+    async def _cm():
+        token = await gate.before_invoke()
+        slot = InvokeSlot(gate, token)
+        try:
+            yield slot
+        finally:
+            if not slot._settled:
+                gate.release_probe_slot(token)
+
+    gate.invoke_slot = _cm
+    return gate
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1606,6 +1635,7 @@ class TestStewardReleaseProbeSlotOnException:
         gate.active_account_name = 'acct-a'
         gate.confirm_account_ok = MagicMock()
         gate.release_probe_slot = MagicMock()
+        _attach_invoke_slot(gate)
         steward.usage_gate = gate
 
         mcp_config = {'mcpServers': {}}
@@ -1628,6 +1658,7 @@ class TestStewardReleaseProbeSlotOnException:
         gate.before_invoke = AsyncMock(return_value='tok-a')
         gate.active_account_name = 'acct-a'
         gate.release_probe_slot = MagicMock()
+        _attach_invoke_slot(gate)
         steward.usage_gate = gate
 
         with (
@@ -1650,6 +1681,7 @@ class TestStewardReleaseProbeSlotOnException:
         gate.active_account_name = 'acct-a'
         gate.confirm_account_ok = MagicMock()
         gate.release_probe_slot = MagicMock()
+        _attach_invoke_slot(gate)
         steward.usage_gate = gate
 
         with (
@@ -1673,6 +1705,7 @@ class TestStewardReleaseProbeSlotOnException:
         gate.before_invoke = AsyncMock(return_value='tok-a')
         gate.active_account_name = 'acct-a'
         gate.release_probe_slot = MagicMock()
+        _attach_invoke_slot(gate)
         steward.usage_gate = gate
 
         with (
@@ -1729,6 +1762,7 @@ class TestPreTriageUsageGateCleanup:
     @staticmethod
     def _gate(token: str = 'tok-a', cap_effects=None) -> MagicMock:
         gate = MagicMock()
+        gate.account_count = 1
         gate.before_invoke = AsyncMock(return_value=token)
         gate.active_account_name = 'acct-a'
         gate.confirm_account_ok = MagicMock()
@@ -1739,7 +1773,7 @@ class TestPreTriageUsageGateCleanup:
             if cap_effects is not None
             else MagicMock(return_value=False)
         )
-        return gate
+        return _attach_invoke_slot(gate)
 
     async def test_confirm_account_ok_called_on_success(self, steward: TaskSteward):
         """After successful _pre_triage_suggestions, gate.confirm_account_ok('tok-a') is called.
