@@ -117,7 +117,7 @@ class SpeculativeItem:
     speculative: bool                  # True → merged against pending N's SHA
     skip_verify: bool                  # True → pre_rebased and main unchanged
     immediate_outcome: MergeOutcome | None = None  # Set for conflict/already_merged
-    started_monotonic: float | None = None  # time.monotonic() at request processing entry
+    started_monotonic: float = 0.0  # time.monotonic() at request processing entry
 
 
 class MergeWorker:
