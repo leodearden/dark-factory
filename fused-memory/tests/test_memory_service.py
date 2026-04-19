@@ -968,6 +968,31 @@ class TestMem0BackendClose:
         assert backend._instances == {}
 
 
+class TestGraphitiBackendClose:
+    @pytest.mark.asyncio
+    async def test_close_awaits_close_on_all_cloned_drivers(self, mock_config):
+        """GraphitiBackend.close() must await close() on every cached cloned driver."""
+        from fused_memory.backends.graphiti_client import GraphitiBackend
+
+        backend = GraphitiBackend(mock_config)
+
+        # Primary driver mock
+        backend._driver = MagicMock()
+        backend._driver.close = AsyncMock()
+
+        # Two cloned-driver mocks
+        clone_a = MagicMock()
+        clone_a.close = AsyncMock()
+        clone_b = MagicMock()
+        clone_b.close = AsyncMock()
+        backend._cloned_drivers = {'group-a': clone_a, 'group-b': clone_b}
+
+        await backend.close()
+
+        clone_a.close.assert_awaited_once()
+        clone_b.close.assert_awaited_once()
+
+
 class TestGetEpisodes:
     @pytest.mark.asyncio
     async def test_returns_list(self, service):
