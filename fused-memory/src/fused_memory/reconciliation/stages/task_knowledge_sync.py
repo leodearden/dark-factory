@@ -3,6 +3,7 @@ Stage 3: Cross-System Integrity Check — read-only verification."""
 
 from __future__ import annotations
 
+import asyncio
 import heapq
 import itertools
 import json
@@ -89,6 +90,14 @@ class TaskKnowledgeSync(BaseStage):
         else:
             recently_completed_text = format_task_list([])  # 'No tasks.'
 
+        # Done-task provenance section — feeds verified evidence to the agent
+        # so 'shipped via X' edges come from commit diffs instead of being
+        # fabricated from metadata.modules. Empty string when no done tasks
+        # carry done_provenance (legacy tree, warn-only rollout).
+        provenance_section = await _render_done_provenance_section(
+            filtered.done_tasks, self.project_root,
+        )
+
         remediation_note = ''
         if self.remediation_mode:
             remediation_note = (
@@ -122,7 +131,8 @@ class TaskKnowledgeSync(BaseStage):
 {format_filtered_task_tree(filtered)}
 
 ### Recently Completed Tasks
-{recently_completed_text}{proactive_sample_section}
+{recently_completed_text}
+{provenance_section}{proactive_sample_section}
 
 ## Your Task
 Reconcile task state against memory:
@@ -275,6 +285,126 @@ def _format_flagged(items: list[dict]) -> str:
     if len(items) > 50:
         lines.append(f'... and {len(items) - 50} more')
     return '\n'.join(lines)
+
+
+async def _render_done_provenance_section(
+    done_tasks: list[dict],
+    project_root: str | None,
+    *,
+    max_files_per_task: int = 50,
+    max_chars_per_task: int = 2000,
+) -> str:
+    """Render a '### Done-task Provenance' block from task metadata.done_provenance.
+
+    For each done task:
+    - With ``commit``: emits the resolved SHA + a bounded file list produced by
+      ``git show --name-only --format=%H%n%ai%n%s <sha>``. Capped at
+      ``max_files_per_task`` files and ``max_chars_per_task`` characters per task
+      so a single runaway commit can't blow the prompt budget.
+    - With ``note``: emits the note text verbatim (no git call).
+    - Without either: emits ``provenance: unknown (legacy)``.
+
+    Returns an empty string when ``done_tasks`` is empty — no section is injected
+    in that case, keeping the prompt tight when no new completions exist.
+    """
+    if not done_tasks:
+        return ''
+
+    lines: list[str] = ['### Done-task Provenance']
+    for task in done_tasks:
+        if not isinstance(task, dict):
+            continue
+        tid = task.get('id', '?')
+        title = task.get('title', '')
+        metadata = task.get('metadata') if isinstance(task.get('metadata'), dict) else {}
+        prov = metadata.get('done_provenance') if isinstance(metadata, dict) else None
+        header = f'- [{tid}] {title}'
+
+        if not isinstance(prov, dict):
+            lines.append(f'{header} — provenance: unknown (legacy)')
+            continue
+
+        commit = prov.get('commit') if isinstance(prov.get('commit'), str) else None
+        note = prov.get('note') if isinstance(prov.get('note'), str) else None
+
+        if commit and project_root:
+            diff_block = await _git_show_name_only(
+                project_root, commit,
+                max_files=max_files_per_task,
+                max_chars=max_chars_per_task,
+            )
+            lines.append(f'{header}\n  commit: {commit}')
+            if diff_block:
+                indented = '\n'.join('    ' + ln for ln in diff_block.splitlines())
+                lines.append(indented)
+        if note:
+            lines.append(f'  note: {note}')
+        if not commit and not note:
+            lines.append(f'{header} — provenance: unknown (legacy)')
+
+    return '\n'.join(lines) + '\n'
+
+
+async def _git_show_name_only(
+    project_root: str, commit: str,
+    *, max_files: int, max_chars: int,
+) -> str:
+    """Run ``git show --name-only --format=%H%n%ai%n%s <commit>`` and truncate.
+
+    Returns a short text block:
+
+        <sha>
+        <iso date>
+        <subject>
+        files:
+          path/to/file1
+          path/to/file2
+          ... (N more)
+
+    Returns an empty string on subprocess failure — the caller still emits the
+    commit SHA header, just without the file list. We deliberately don't raise
+    so one broken ref doesn't abort the whole Stage-2 briefing.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'git', '-C', project_root, 'show', '--name-only',
+            '--format=%H%n%ai%n%s', '--no-color', commit,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        except TimeoutError:
+            proc.kill()
+            return ''
+    except FileNotFoundError:
+        return ''
+    except Exception as e:
+        logger.warning('git show failed for %s in %s: %s', commit, project_root, e)
+        return ''
+    if proc.returncode != 0:
+        return ''
+
+    raw = stdout.decode('utf-8', errors='replace')
+    lines = raw.splitlines()
+    if len(lines) < 3:
+        return raw[:max_chars]
+
+    header = lines[:3]
+    file_lines = [ln for ln in lines[3:] if ln.strip()]
+    total = len(file_lines)
+    shown = file_lines[:max_files]
+    more = total - len(shown)
+
+    block = '\n'.join(header) + '\nfiles:'
+    for f in shown:
+        block += f'\n  {f}'
+    if more > 0:
+        block += f'\n  ... ({more} more)'
+
+    if len(block) > max_chars:
+        block = block[:max_chars] + '\n  ... (truncated)'
+    return block
 
 
 def _select_proactive_sample(tasks: Iterable[dict], n: int) -> list[dict]:

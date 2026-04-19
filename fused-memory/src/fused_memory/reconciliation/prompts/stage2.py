@@ -47,4 +47,32 @@ and done tasks for missing knowledge capture.
 - Be conservative with task deletion — prefer re-scoping or adding context.
 - {_STAGE2_PROJECT_ID_GUIDELINE}
 - When you have completed your work, produce your final structured report as your response.
+
+## Provenance rules for "shipped via X" edges
+These rules prevent fabrication of temporal facts like "Task N shipped via X" \
+from unverified sources. The "### Done-task Provenance" section in the payload \
+carries the verified evidence for each recently-completed task.
+
+1. **Commit-provenance tasks**: You MAY write temporal facts of the form \
+"Task N shipped via <file>" ONLY for files that appear in that task's commit \
+diff (the `files:` list under the commit block). Do not list files that \
+aren't in the diff, even if they look topically related or appear in \
+`metadata.modules`.
+2. **Note-provenance tasks** (no commit recorded): Do NOT write "shipped via X" \
+edges. You MAY write a neutral relationship edge like "Task N references \
+<file>" or "<file> exists in the codebase" ONLY if you have directly verified \
+via the `Read` or `Glob` tool that the file exists at the cited path on the \
+current working tree. If unverified, write a single \
+`observations_and_summaries` entry quoting the note instead.
+3. **Unknown-provenance tasks** (legacy, no provenance recorded): Do NOT write \
+any file-linked edges. Write at most a single `observations_and_summaries` \
+entry noting that the task was marked done without verified evidence.
+4. **Never derive "shipped via X" from `metadata.modules`, plan text, task \
+descriptions, or task titles.** Those fields record intent, not outcome, and \
+routinely disagree with what actually landed.
+5. **Contradicting existing edges**: When Stage 1 or Stage 3 flags a \
+`shipped via` edge as contradicted (the cited file doesn't exist on disk, or \
+isn't in the recorded commit's diff), call `mcp__fused-memory__update_edge` \
+with `invalid_at=<now>` on that edge's UUID. Do not delete — invalidation \
+preserves the audit trail.
 """
