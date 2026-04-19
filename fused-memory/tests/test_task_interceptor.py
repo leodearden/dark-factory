@@ -1283,6 +1283,144 @@ async def test_set_task_status_cancelled_to_cancelled_noop(taskmaster, reconcile
     reconciler.reconcile_task.assert_not_called()
 
 
+# ── Tests for phantom-done gate (metadata.files existence check) ───────────
+
+
+@pytest.mark.asyncio
+async def test_done_gate_rejects_when_declared_files_missing(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """status=done is refused if metadata.files lists a file that doesn't exist."""
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '1746',
+            'status': 'in-progress',
+            'title': 'Named views',
+            'metadata': {'files': ['gui/src/panels/ViewSelector.tsx']},
+        }
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1746', 'done', str(tmp_path))
+
+    assert result['success'] is False
+    assert result['error'] == 'done_gate_missing_files'
+    assert result['missing_files'] == ['gui/src/panels/ViewSelector.tsx']
+    assert result['task_id'] == '1746'
+    # Taskmaster write must not have fired
+    taskmaster.set_task_status.assert_not_called()
+    # No event, no reconciliation
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 0
+    reconciler.reconcile_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_gate_passes_when_files_exist(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """status=done succeeds when every declared file exists under project_root."""
+    (tmp_path / 'src').mkdir()
+    (tmp_path / 'src' / 'mod.rs').write_text('// shipped')
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '42',
+            'status': 'in-progress',
+            'title': 'Legit task',
+            'metadata': {'files': ['src/mod.rs']},
+        }
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('42', 'done', str(tmp_path))
+
+    assert 'error' not in result
+    taskmaster.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_done_gate_noop_without_metadata_files(
+    taskmaster, reconciler, event_buffer
+):
+    """Gate does not fire when metadata.files is absent — back-compat for legacy tasks."""
+    # default taskmaster fixture returns {'id':'1','status':'pending','title':'Test Task'} — no metadata
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('1', 'done', '/project')
+
+    assert 'error' not in result
+    taskmaster.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_done_gate_reports_partial_missing(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """When some declared files exist and others don't, only the missing ones are reported."""
+    (tmp_path / 'exists.rs').write_text('')
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '99',
+            'status': 'in-progress',
+            'title': 'Partial',
+            'metadata': {'files': ['exists.rs', 'missing.rs', 'also_missing.ts']},
+        }
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('99', 'done', str(tmp_path))
+
+    assert result['success'] is False
+    assert sorted(result['missing_files']) == ['also_missing.ts', 'missing.rs']
+    assert sorted(result['files_checked']) == sorted(
+        ['exists.rs', 'missing.rs', 'also_missing.ts']
+    )
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_done_gate_unwraps_data_envelope(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """Gate handles the {'data': {...}} wrapper shape used by some taskmaster responses."""
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'data': {
+                'id': '7',
+                'status': 'in-progress',
+                'metadata': {'files': ['ghost.py']},
+            }
+        }
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status('7', 'done', str(tmp_path))
+
+    assert result['success'] is False
+    assert result['missing_files'] == ['ghost.py']
+
+
+@pytest.mark.asyncio
+async def test_done_gate_does_not_fire_for_non_done_transitions(
+    taskmaster, reconciler, event_buffer
+):
+    """blocked/cancelled/deferred transitions bypass the file-existence gate."""
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '5',
+            'status': 'in-progress',
+            'metadata': {'files': ['does_not_exist.rs']},
+        }
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    for status in ('blocked', 'cancelled', 'deferred'):
+        taskmaster.set_task_status.reset_mock()
+        result = await interceptor.set_task_status('5', status, '/project')
+        assert 'error' not in result, f'gate should not fire on {status}'
+        taskmaster.set_task_status.assert_called_once()
+
+
 # ── Tests for background task retention (step-3) ───────────────────────────
 
 

@@ -221,6 +221,18 @@ class TaskInterceptor:
             if status == old_status:
                 return {'success': True, 'no_op': True, 'task_id': task_id}
 
+            # 2b. Phantom-done gate: if transitioning to done and the task
+            # advertises concrete files in metadata.files, refuse when any of
+            # those files is absent at project_root. Catches set_task_status
+            # calls that bypass the orchestrator's merge gate (reify tasks
+            # 1746/1747/1749, 2026-04-19).
+            if status == 'done':
+                declared = _extract_metadata_files(before)
+                if declared:
+                    missing = _missing_files(project_root, declared)
+                    if missing:
+                        return _done_gate_error(task_id, declared, missing)
+
             # 3. Execute status change
             result = await tm.set_task_status(task_id, status, project_root, tag)
 
@@ -1282,6 +1294,47 @@ def _extract_status(task_data: dict) -> str:
     if isinstance(data, dict):
         return data.get('status', 'unknown')
     return 'unknown'
+
+
+def _extract_metadata_files(task_data: Any) -> list[str]:
+    """Return ``metadata.files`` as a list[str] from a Taskmaster get_task response.
+
+    Handles the two common envelope shapes (bare task dict, or ``{'data': {...}}``
+    wrapper). Silently returns ``[]`` when the field is absent, empty, or
+    malformed — the phantom-done gate only fires when files is a non-empty
+    list of strings, so defensive behaviour here means "do not gate".
+    """
+    inner = _extract_task_dict(task_data) or {}
+    metadata = inner.get('metadata')
+    if not isinstance(metadata, dict):
+        return []
+    files = metadata.get('files')
+    if not isinstance(files, list):
+        return []
+    return [f for f in files if isinstance(f, str) and f]
+
+
+def _missing_files(project_root: str, declared: list[str]) -> list[str]:
+    """Return the subset of ``declared`` that does not exist under ``project_root``."""
+    root = Path(project_root)
+    return [f for f in declared if not (root / f).exists()]
+
+
+def _done_gate_error(task_id: str, declared: list[str], missing: list[str]) -> dict:
+    """Structured error returned when the phantom-done gate trips."""
+    return {
+        'success': False,
+        'error': 'done_gate_missing_files',
+        'task_id': task_id,
+        'missing_files': missing,
+        'files_checked': declared,
+        'hint': (
+            'Cannot mark task done: files listed in metadata.files do not exist '
+            "at project_root. Either the implementation wasn't committed, or "
+            'metadata.files is stale. Land the implementation (or fix '
+            'metadata.files via update_task) before retrying.'
+        ),
+    }
 
 
 def _extract_task_dict(raw: Any) -> dict | None:
