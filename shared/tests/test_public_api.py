@@ -60,6 +60,7 @@ class TestModuleLevelAll:
         assert set(usage_gate.__all__) == {
             'UsageGate',
             'AccountState',
+            'InvokeSlot',
             'SessionBudgetExhausted',
         }
 
