@@ -2253,6 +2253,98 @@ class TestSpeculativeItemDefaults:
 
 
 # ---------------------------------------------------------------------------
+# TestEmitMergeAttemptHelper — unit tests for module-level _emit_merge_attempt
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEmitMergeAttemptHelper:
+    async def test_emit_merge_attempt_writes_row_without_attempt(
+        self, tmp_path: Path,
+    ):
+        """Call with outcome and duration_ms — row has no 'attempt' key."""
+        from orchestrator.merge_queue import _emit_merge_attempt
+
+        db_path = tmp_path / 'eh_a.db'
+        es = EventStore(db_path=db_path, run_id='eh-run')
+
+        _emit_merge_attempt(es, 'task-1', 'conflict', duration_ms=42)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.outcome'), "
+            "       json_extract(data, '$.attempt'), "
+            "       duration_ms "
+            "FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1, f'Expected 1 row, got: {rows}'
+        outcome, attempt, dur = rows[0]
+        assert outcome == 'conflict'
+        assert attempt is None, f'Expected no attempt key, got {attempt!r}'
+        assert dur == 42
+
+    async def test_emit_merge_attempt_writes_row_with_attempt(
+        self, tmp_path: Path,
+    ):
+        """Call with outcome, attempt, and duration_ms — row includes 'attempt'."""
+        from orchestrator.merge_queue import _emit_merge_attempt
+
+        db_path = tmp_path / 'eh_b.db'
+        es = EventStore(db_path=db_path, run_id='eh-run')
+
+        _emit_merge_attempt(es, 'task-2', 'cas_retry', attempt=3, duration_ms=500)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.outcome'), "
+            "       json_extract(data, '$.attempt'), "
+            "       duration_ms "
+            "FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1, f'Expected 1 row, got: {rows}'
+        outcome, attempt, dur = rows[0]
+        assert outcome == 'cas_retry'
+        assert attempt == 3
+        assert dur == 500
+
+    async def test_emit_merge_attempt_null_duration_when_none(
+        self, tmp_path: Path,
+    ):
+        """Call with duration_ms=None — duration_ms column is NULL."""
+        from orchestrator.merge_queue import _emit_merge_attempt
+
+        db_path = tmp_path / 'eh_c.db'
+        es = EventStore(db_path=db_path, run_id='eh-run')
+
+        _emit_merge_attempt(es, 'task-3', 'done', duration_ms=None)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.outcome'), duration_ms "
+            "FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1, f'Expected 1 row, got: {rows}'
+        outcome, dur = rows[0]
+        assert outcome == 'done'
+        assert dur is None, f'Expected NULL duration_ms, got {dur!r}'
+
+    async def test_emit_merge_attempt_noop_when_event_store_is_none(
+        self, tmp_path: Path,
+    ):
+        """Call with event_store=None — no exception, no row written."""
+        from orchestrator.merge_queue import _emit_merge_attempt
+
+        # Should not raise
+        _emit_merge_attempt(None, 'task-4', 'done', duration_ms=1)
+
+
+# ---------------------------------------------------------------------------
 # TestSpeculativeBackwardCompat — step-17
 # Run key MergeWorker scenarios through SpeculativeMergeWorker to confirm
 # they behave identically with queue depth 1.
