@@ -2128,3 +2128,62 @@ class TestPreTriageSuggestionsPath:
             await steward._handle_escalation(esc)
 
         mock_pre_triage.assert_called_once_with(esc)
+
+
+# ---------------------------------------------------------------------------
+# Steward watcher process-group tests (step-21 / step-22)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardWatcherProcessGroup:
+    """_watch_for_escalation must spawn in its own process group."""
+
+    async def test_steward_watcher_passes_start_new_session_true(
+        self, steward: TaskSteward
+    ) -> None:
+        """create_subprocess_exec is called with start_new_session=True.
+
+        Failing test — _watch_for_escalation does not pass that kwarg yet.
+        """
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+            captured_kwargs.update(kwargs)
+            proc = AsyncMock()
+            proc.returncode = 1
+            proc.communicate.return_value = (b'', b'')
+            return proc
+
+        with patch('asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await steward._watch_for_escalation()
+
+        assert captured_kwargs.get('start_new_session') is True, (
+            'create_subprocess_exec must be called with start_new_session=True'
+        )
+
+    async def test_steward_watcher_cleanup_uses_terminate_process_group(
+        self, steward: TaskSteward
+    ) -> None:
+        """CancelledError branch must await terminate_process_group, not bare kill.
+
+        Failing test — orchestrator.steward does not import terminate_process_group yet.
+        """
+        proc = AsyncMock()
+        proc.returncode = None
+        proc.communicate.side_effect = asyncio.CancelledError()
+
+        async def fake_exec(*args: object, **kwargs: object) -> AsyncMock:
+            return proc
+
+        with (
+            patch('asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch(
+                'orchestrator.steward.terminate_process_group',
+                new_callable=AsyncMock,
+            ) as mock_tpg,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await steward._watch_for_escalation()
+
+        mock_tpg.assert_awaited_once()
