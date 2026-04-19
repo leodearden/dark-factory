@@ -24,6 +24,8 @@ from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data.burndown import (
     BURNDOWN_SCHEMA,
+    aggregate_burndown_projects,
+    aggregate_burndown_series,
     collect_snapshot,
     downsample,
     get_burndown_projects,
@@ -742,19 +744,33 @@ async def partials_merge_queue(request: Request):
 # ---------------------------------------------------------------------------
 
 
+async def _burndown_dbs(config: DashboardConfig, pool: DbPool) -> list[aiosqlite.Connection | None]:
+    """Collect DB connections for all known project burndown.db files.
+
+    Mirrors ``_cost_dbs``: starts from the main burndown_db, then appends each
+    known_project_root's burndown.db (dedup by resolved path).
+    """
+    paths = [config.burndown_db]
+    for root in config.known_project_roots:
+        p = root / 'data' / 'burndown' / 'burndown.db'
+        if p.resolve() != config.burndown_db.resolve():
+            paths.append(p)
+    return [await pool.get(p) for p in paths]
+
+
 @app.get('/burndown/partials/charts')
 async def burndown_partials_charts(request: Request):
-    """Burndown charts: stacked area chart per project."""
+    """Burndown charts: stacked area chart per project, aggregated across all known roots."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    db = await pool.get(config.burndown_db)
+    dbs = await _burndown_dbs(config, pool)
     window_raw = request.query_params.get('window', '7d')
     days = _BURNDOWN_WINDOWS.get(window_raw, 7)
     try:
-        projects = await get_burndown_projects(db)
+        projects = await aggregate_burndown_projects(dbs)
         series: dict = {}
         for pid in projects:
-            series[pid] = await get_burndown_series(db, pid, days=days)
+            series[pid] = await aggregate_burndown_series(dbs, pid, days=days)
     except Exception:
         logger.warning('Error fetching burndown data', exc_info=True)
         series = {}
