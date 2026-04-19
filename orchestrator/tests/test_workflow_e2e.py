@@ -1010,7 +1010,7 @@ class TestBaseCommitDiff:
             async def _implementer(self, cwd: Path) -> AgentResult:
                 return AgentResult(success=True, output='{}', cost_usd=0.10)
 
-            async def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+            def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
                 return AgentResult(success=True, output=json.dumps(_make_review(role)),
                                    structured_output=_make_review(role), cost_usd=0.10)
 
@@ -2259,8 +2259,6 @@ class TestMarkBlockedFalseDoneGuard:
         With the guard it detects the stale branch point and falls through to the
         normal requeue path.  This test FAILS on unmodified code (step-1 TDD).
         """
-        import json as _json
-
         # 1. Create a fresh worktree with no implementation commits (base commit only)
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
