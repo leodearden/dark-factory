@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 # Re-export shared Claude invocation primitives for backwards compatibility
+from shared.proc_group import terminate_process_group
 from shared.cli_invoke import (  # noqa: F401
     CAP_HIT_RESUME_PROMPT,
     AgentResult,
@@ -644,6 +645,7 @@ async def _run_subprocess_local(
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
 
     try:
@@ -652,8 +654,7 @@ async def _run_subprocess_local(
             timeout=timeout_seconds,
         )
     except TimeoutError:
-        proc.kill()
-        await proc.wait()
+        await terminate_process_group(proc)
         duration_ms = int(time.monotonic() * 1000) - start_ms
         return _SubprocessResult(
             stdout='',
