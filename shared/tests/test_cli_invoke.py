@@ -1573,3 +1573,33 @@ class TestHeuristicCapGating:
         second_cooldown = mock_asyncio.sleep.call_args_list[1][0][0]
         assert first_cooldown == _CAP_HIT_COOLDOWN_SECS
         assert second_cooldown == _CAP_HIT_COOLDOWN_SECS * 2
+
+
+# ── _run_subprocess process-group fix ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestRunSubprocessProcessGroup:
+    """_run_subprocess must spawn subprocesses in their own process group."""
+
+    async def test_run_subprocess_passes_start_new_session_true(self, tmp_path):
+        """create_subprocess_exec is called with start_new_session=True.
+
+        Failing test — _run_subprocess does not pass that kwarg yet.
+        """
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b'', b''))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await _run_subprocess(['echo', 'hi'], tmp_path, env={}, model='test')
+
+        assert captured_kwargs.get('start_new_session') is True
