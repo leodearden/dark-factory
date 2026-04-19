@@ -64,7 +64,24 @@ def make_result(
 
 
 def _mock_gate(**overrides) -> MagicMock:
-    """Build a MagicMock UsageGate with sensible defaults."""
+    """Build a MagicMock UsageGate with sensible defaults.
+
+    Since commit 065e95a4c9 the cap-retry path in ``invoke_with_cap_retry``
+    goes through ``async with usage_gate.invoke_slot() as slot:``, where
+    ``slot`` is an :class:`~shared.usage_gate.InvokeSlot` instance that
+    proxies to the gate.  This helper wires ``gate.invoke_slot()`` to an
+    async-context-manager mock whose ``__aenter__`` yields a slot whose
+    ``detect_cap_hit`` / ``confirm`` / ``settle`` methods proxy to the
+    corresponding gate attributes — so tests can still assert on
+    ``gate.detect_cap_hit.call_args``, ``gate.confirm_account_ok``, etc.
+
+    ``__aexit__`` calls ``gate.release_probe_slot(slot.token)`` unless the
+    slot was settled by ``detect_cap_hit(...)==True``, ``confirm(...)``,
+    or ``settle()``.  This matches the production ``UsageGate.invoke_slot``
+    asynccontextmanager behaviour and keeps the ``release_probe_slot``
+    assertions in ``TestReleaseProbeSlotOnException`` /
+    ``TestCancelledErrorReleaseProbeSlot`` meaningful.
+    """
     gate = MagicMock()
     gate.account_count = overrides.pop('account_count', 1)
     gate.before_invoke = overrides.pop('before_invoke', AsyncMock(return_value='tok'))
@@ -75,6 +92,59 @@ def _mock_gate(**overrides) -> MagicMock:
     gate.release_probe_slot = overrides.pop('release_probe_slot', MagicMock())
     for k, v in overrides.items():
         setattr(gate, k, v)
+
+    # Wire gate.invoke_slot() to yield an InvokeSlot-shaped proxy.
+    # A fresh slot is built on each call to invoke_slot() so that
+    # per-iteration side_effects on before_invoke / detect_cap_hit /
+    # active_account_name PropertyMock fire in the expected order.
+    def _make_invoke_slot_cm():
+        holder: dict = {'slot': None}
+
+        async def _aenter_impl(*_args, **_kw):
+            token = await gate.before_invoke()
+            slot = MagicMock()
+            slot.token = token
+            slot.account_name = gate.active_account_name
+            slot._settled = False
+
+            def _slot_detect_cap_hit(stderr, output, backend='claude'):
+                hit = gate.detect_cap_hit(
+                    stderr, output, backend, oauth_token=slot.token,
+                )
+                if hit:
+                    slot._settled = True
+                return hit
+
+            def _slot_confirm(cost_usd=0.0):
+                gate.confirm_account_ok(slot.token)
+                gate.on_agent_complete(cost_usd)
+                slot._settled = True
+
+            def _slot_settle():
+                slot._settled = True
+
+            # Plain synchronous MagicMocks — InvokeSlot.detect_cap_hit /
+            # confirm / settle are plain methods, not coroutines.  Using
+            # MagicMock (not AsyncMock) is load-bearing: prod does
+            # ``if slot.detect_cap_hit(...):`` without ``await``.
+            slot.detect_cap_hit = MagicMock(side_effect=_slot_detect_cap_hit)
+            slot.confirm = MagicMock(side_effect=_slot_confirm)
+            slot.settle = MagicMock(side_effect=_slot_settle)
+            holder['slot'] = slot
+            return slot
+
+        async def _aexit_impl(*_args, **_kw):
+            slot = holder['slot']
+            if slot is not None and not slot._settled:
+                gate.release_probe_slot(slot.token)
+            return None
+
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(side_effect=_aenter_impl)
+        cm.__aexit__ = AsyncMock(side_effect=_aexit_impl)
+        return cm
+
+    gate.invoke_slot = MagicMock(side_effect=_make_invoke_slot_cm)
     return gate
 
 
