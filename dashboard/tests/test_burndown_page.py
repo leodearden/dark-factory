@@ -74,3 +74,85 @@ class TestNavLink:
     def test_burndown_link_on_costs(self, client):
         resp = client.get('/costs')
         assert 'href="/burndown"' in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Helpers for multi-project burndown route tests
+# ---------------------------------------------------------------------------
+
+import sqlite3  # noqa: E402 (after class definitions)
+from datetime import UTC, datetime, timedelta  # noqa: E402
+from pathlib import Path  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+
+from starlette.testclient import TestClient  # noqa: E402
+
+
+def _make_burndown_db(db_path: Path, project_id: str) -> None:
+    """Create a burndown.db at *db_path* with one recent snapshot for *project_id*."""
+    from dashboard.data.burndown import BURNDOWN_SCHEMA, _INSERT_SNAPSHOT_SQL
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    ts = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(BURNDOWN_SCHEMA)
+    conn.execute(_INSERT_SNAPSHOT_SQL, (project_id, ts, 0, 0, 0, 0, 0, 3))
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Multi-project burndown charts route tests
+# ---------------------------------------------------------------------------
+
+
+class TestBurndownChartsRouteMultiProject:
+    """Route-level tests for /burndown/partials/charts with multiple project roots.
+
+    Before step-16 the route queries only the main burndown.db and misses the
+    peer project.  After step-16 it calls the aggregate helpers and surfaces
+    both project_ids.
+    """
+
+    def test_both_project_ids_in_html(self, tmp_path):
+        """Both project_ids appear in HTML when two burndown DBs exist.
+
+        FAILS before step-16 (route only queries main burndown.db).
+        PASSES after step-16 (route calls aggregate helpers across both DBs).
+        """
+        from dashboard.app import app
+        from dashboard.config import DashboardConfig
+
+        main_root = tmp_path / 'main'
+        peer_root = tmp_path / 'peer'
+
+        _make_burndown_db(main_root / 'data' / 'burndown' / 'burndown.db', 'dark_factory')
+        _make_burndown_db(peer_root / 'data' / 'burndown' / 'burndown.db', 'peer_project')
+
+        config = DashboardConfig(
+            project_root=main_root,
+            known_project_roots=[peer_root],
+        )
+
+        with patch('dashboard.app.DashboardConfig.from_env', return_value=config):
+            with TestClient(app) as c:
+                html = c.get('/burndown/partials/charts?window=30d').text
+
+        assert 'dark_factory' in html
+        assert 'peer_project' in html
+
+    def test_single_project_unchanged(self, tmp_path):
+        """Single-project behavior is unchanged when known_project_roots=[]."""
+        from dashboard.app import app
+        from dashboard.config import DashboardConfig
+
+        main_root = tmp_path / 'main'
+        _make_burndown_db(main_root / 'data' / 'burndown' / 'burndown.db', 'dark_factory')
+
+        config = DashboardConfig(project_root=main_root, known_project_roots=[])
+
+        with patch('dashboard.app.DashboardConfig.from_env', return_value=config):
+            with TestClient(app) as c:
+                html = c.get('/burndown/partials/charts?window=30d').text
+
+        assert 'dark_factory' in html
