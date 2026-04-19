@@ -1,5 +1,6 @@
 """Tests for orchestrator/verify.py, specifically _run_cmd bash executable handling."""
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -197,3 +198,48 @@ class TestRunCmdProcessGroup:
         )
         assert mock_killpg.call_args_list[0] == call(12345, signal_module.SIGTERM)
         assert mock_killpg.call_args_list[1] == call(12345, signal_module.SIGKILL)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_run_cmd_killpg_on_cancellation(self, tmp_path: Path):
+        """When the calling task is cancelled, _run_cmd must killpg the subprocess.
+
+        Creates a task running _run_cmd, cancels it after one event-loop tick,
+        then asserts that os.killpg(pgid, SIGTERM) was called and that
+        CancelledError is re-raised.
+        """
+        import signal as signal_module
+
+        async def fake_shell(cmd, **kwargs):
+            proc = MagicMock()
+            proc.pid = 12345
+            proc.returncode = None
+            async def _hang():
+                await asyncio.sleep(3600)
+            proc.communicate = _hang
+            proc.wait = AsyncMock(return_value=None)
+            return proc
+
+        mock_getpgid = MagicMock(return_value=12345)
+        mock_killpg = MagicMock()
+
+        async def run_it():
+            with (
+                patch('orchestrator.verify.asyncio.create_subprocess_shell', side_effect=fake_shell),
+                patch('shared.proc_group.os.getpgid', mock_getpgid),
+                patch('shared.proc_group.os.killpg', mock_killpg),
+            ):
+                await _run_cmd('sleep 100', tmp_path, timeout=60.0)
+
+        task = asyncio.create_task(run_it())
+        # Yield one tick to let the subprocess be spawned and communicate() be awaited.
+        await asyncio.sleep(0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert any(
+            c == call(12345, signal_module.SIGTERM)
+            for c in mock_killpg.call_args_list
+        ), f'SIGTERM killpg not called; calls: {mock_killpg.call_args_list}'
