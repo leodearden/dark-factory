@@ -188,6 +188,54 @@ async def aggregate_completion_paths(
     return final
 
 
+async def aggregate_escalation_rates(
+    dbs: list[aiosqlite.Connection | None],
+    escalations_dirs: list[Path],
+    *,
+    days: int = 7,
+) -> dict[str, dict]:
+    """Merge :func:`get_escalation_rates` results from multiple databases.
+
+    ``dbs`` and ``escalations_dirs`` must have the same length.
+    For each project_id: total_tasks, steward_count, interactive_count, and
+    each human_attention bucket are summed across DBs.  steward_rate and
+    interactive_rate are recomputed from the merged totals (not averaged).
+    """
+    if not dbs:
+        return {}
+
+    results = await asyncio.gather(
+        *(get_escalation_rates(db, edir, days=days)
+          for db, edir in zip(dbs, escalations_dirs, strict=True))
+    )
+
+    merged: dict[str, dict] = {}
+    for result in results:
+        for pid, info in result.items():
+            if pid not in merged:
+                merged[pid] = {
+                    'total_tasks': 0,
+                    'steward_count': 0,
+                    'interactive_count': 0,
+                    'human_attention': {'zero': 0, 'minimal': 0, 'significant': 0},
+                }
+            m = merged[pid]
+            m['total_tasks'] += info['total_tasks']
+            m['steward_count'] += info['steward_count']
+            m['interactive_count'] += info['interactive_count']
+            for bucket in ('zero', 'minimal', 'significant'):
+                m['human_attention'][bucket] += info['human_attention'][bucket]
+
+    # Recompute rates from merged totals
+    for pid, m in merged.items():
+        total = m['total_tasks']
+        m['steward_rate'] = round(m['steward_count'] / total * 100, 1) if total else 0.0
+        m['interactive_rate'] = (
+            round(m['interactive_count'] / total * 100, 1) if total else 0.0
+        )
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # 2. Escalation rates
 # ---------------------------------------------------------------------------
