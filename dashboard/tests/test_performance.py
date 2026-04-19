@@ -10,6 +10,7 @@ import aiosqlite
 import pytest
 
 from dashboard.data.performance import (
+    aggregate_completion_paths,
     get_completion_paths,
     get_escalation_rates,
     get_loop_histograms,
@@ -361,3 +362,152 @@ class TestTimeCentiles:
     async def test_missing_db(self, tmp_path):
         result = await get_time_centiles(None)
         assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Helpers for aggregate tests
+# ---------------------------------------------------------------------------
+
+def _make_runs_db(tmp_path, name: str, tasks: list[tuple]) -> 'Path':
+    """Create a runs.db at tmp_path/name with provided task_results rows."""
+    from pathlib import Path
+    db_path = Path(tmp_path) / name
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(RUNS_SCHEMA)
+    now = datetime.now(UTC)
+
+    # Insert a minimal run row for each distinct project
+    seen_runs: set = set()
+    for t in tasks:
+        run_id, project_id = t[0], t[2]
+        if run_id not in seen_runs:
+            conn.execute(
+                'INSERT INTO runs (run_id, project_id, prd_path, started_at) '
+                'VALUES (?, ?, ?, ?)',
+                (run_id, project_id, '/prd.md',
+                 (now - timedelta(hours=2)).isoformat()),
+            )
+            seen_runs.add(run_id)
+        conn.execute(
+            'INSERT INTO task_results '
+            '(run_id, task_id, project_id, title, outcome, cost_usd, duration_ms, '
+            ' agent_invocations, execute_iterations, verify_attempts, review_cycles, '
+            ' steward_cost_usd, steward_invocations, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', t,
+        )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def _make_escalations_dir(tmp_path, name: str,
+                          esc_list: list[dict]) -> 'Path':
+    """Create an escalations directory with JSON files."""
+    import json as _json
+    from pathlib import Path
+    esc_dir = Path(tmp_path) / name
+    esc_dir.mkdir(parents=True, exist_ok=True)
+    for i, esc in enumerate(esc_list):
+        (esc_dir / f'esc-{i}.json').write_text(_json.dumps(esc))
+    return esc_dir
+
+
+# ---------------------------------------------------------------------------
+# Tests: aggregate_completion_paths
+# ---------------------------------------------------------------------------
+
+class TestAggregateCompletionPaths:
+    """Tests for aggregate_completion_paths across multiple DB connections."""
+
+    @pytest.fixture()
+    async def two_project_conns(self, tmp_path):
+        """Two runs.dbs, both with dark_factory tasks (and DB2 also has reify)."""
+        now = datetime.now(UTC)
+        ts1 = (now - timedelta(minutes=30)).isoformat()
+        ts2 = (now - timedelta(minutes=20)).isoformat()
+
+        # DB1: dark_factory — 1 one-pass task, 1 via-steward
+        db1_path = _make_runs_db(tmp_path / 'db1', 'runs.db', [
+            ('run-a', 't1', 'dark_factory', 'T1', 'done',
+             0.5, 300_000, 2, 1, 0, 0, 0.0, 0, ts1),
+            ('run-a', 't2', 'dark_factory', 'T2', 'done',
+             0.5, 400_000, 3, 1, 0, 0, 0.2, 2, ts2),
+        ])
+
+        # DB2: dark_factory — 2 more one-pass tasks; reify — 1 one-pass
+        db2_path = _make_runs_db(tmp_path / 'db2', 'runs.db', [
+            ('run-b', 't3', 'dark_factory', 'T3', 'done',
+             0.3, 200_000, 2, 1, 0, 0, 0.0, 0, ts1),
+            ('run-b', 't4', 'dark_factory', 'T4', 'done',
+             0.3, 250_000, 2, 1, 0, 0, 0.0, 0, ts2),
+            ('run-b', 't5', 'reify', 'T5', 'done',
+             0.2, 150_000, 1, 1, 0, 0, 0.0, 0, ts1),
+        ])
+
+        # No escalations (via-interactive = 0 in both)
+        edir1 = _make_escalations_dir(tmp_path / 'esc1', 'e', [])
+        edir2 = _make_escalations_dir(tmp_path / 'esc2', 'e', [])
+
+        async with (
+            aiosqlite.connect(str(db1_path)) as c1,
+            aiosqlite.connect(str(db2_path)) as c2,
+        ):
+            c1.row_factory = aiosqlite.Row
+            c2.row_factory = aiosqlite.Row
+            yield [c1, c2], [edir1, edir2]
+
+    @pytest.mark.asyncio
+    async def test_sums_counts_for_same_project(self, two_project_conns):
+        """Counts for the same project_id across DBs are summed."""
+        (dbs, edirs) = two_project_conns
+        result = await aggregate_completion_paths(dbs, edirs, days=1)
+
+        df = result['dark_factory']
+        paths = {p['path']: p['count'] for p in df}
+        # DB1: 1 one-pass + 1 via-steward; DB2: 2 one-pass
+        assert paths.get('one-pass', 0) == 3
+        assert paths.get('via-steward', 0) == 1
+
+    @pytest.mark.asyncio
+    async def test_both_project_ids_surface(self, two_project_conns):
+        """Both dark_factory and reify appear in the result."""
+        (dbs, edirs) = two_project_conns
+        result = await aggregate_completion_paths(dbs, edirs, days=1)
+        assert 'dark_factory' in result
+        assert 'reify' in result
+
+    @pytest.mark.asyncio
+    async def test_empty_dbs_list(self, tmp_path):
+        """`dbs=[]` returns empty dict."""
+        result = await aggregate_completion_paths([], [], days=7)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_none_dbs_returns_empty(self, tmp_path):
+        """`dbs=[None, None]` (no valid connections) returns empty dict."""
+        edir = _make_escalations_dir(tmp_path, 'esc', [])
+        result = await aggregate_completion_paths(
+            [None, None], [edir, edir], days=7,
+        )
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_missing_escalations_dir_no_crash(self, tmp_path):
+        """A non-existent escalations_dir does not crash; via-interactive=0."""
+        now = datetime.now(UTC)
+        ts = (now - timedelta(minutes=10)).isoformat()
+        db_path = _make_runs_db(tmp_path, 'runs.db', [
+            ('run-x', 'tx1', 'proj', 'T', 'done',
+             0.3, 100_000, 1, 1, 0, 0, 0.0, 0, ts),
+        ])
+        missing_dir = tmp_path / 'does_not_exist'
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await aggregate_completion_paths(
+                [conn], [missing_dir], days=7,
+            )
+
+        assert 'proj' in result
+        paths = {p['path']: p['count'] for p in result['proj']}
+        assert paths.get('via-interactive', 0) == 0
