@@ -2214,7 +2214,7 @@ class TestSpeculativeMergeWorker:
         # would be time-since-process-start * 1000 — many thousands of ms.
         conflict_rows = [r for r in rows if r[0] == 'conflict']
         assert len(conflict_rows) >= 1, f'Expected at least one conflict event: {rows}'
-        for outcome, dur in conflict_rows:
+        for _outcome, dur in conflict_rows:
             assert 0 <= dur <= 60_000, (
                 f'duration_ms={dur} is not realistic; '
                 f'started_monotonic was likely not threaded through _remerge'
