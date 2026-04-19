@@ -352,8 +352,9 @@ async def test_wedge_fires_with_real_event_queue(tmp_path, caplog):
     Exercises the full stats()/recent_ops() surface against the production
     class so we know the watchdog reads fields that actually exist.
     """
-    import aiosqlite
     from unittest.mock import AsyncMock
+
+    import aiosqlite
 
     from fused_memory.models.reconciliation import (
         EventSource,
@@ -396,8 +397,8 @@ async def test_wedge_fires_with_real_event_queue(tmp_path, caplog):
     await watchdog.start()
     try:
         # Enqueue an event — drainer will keep retrying, never commit.
-        from datetime import UTC, datetime
         import uuid
+        from datetime import UTC, datetime
 
         event = ReconciliationEvent(
             id=str(uuid.uuid4()),

@@ -701,7 +701,6 @@ async def test_concurrent_add_task_produces_single_task(
     lookup missed the first task's vector.
     """
     from fused_memory.middleware.task_curator import (
-        CandidateTask,
         CuratorDecision,
         TaskCurator,
     )
@@ -1787,7 +1786,6 @@ async def test_set_task_status_holds_lock_across_read_and_write(
     # transitions must chain pending->in-progress->done (no stale read
     # of 'pending' for the second call).
     assert len(call_log) <= 2
-    statuses = [c.split('->')[1] for c in call_log]
     # Both statuses recorded should be among the ones we asked for;
     # crucially the `from` side of the second must NOT still say 'pending'
     # if the first already mutated it.
