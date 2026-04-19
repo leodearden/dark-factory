@@ -361,6 +361,7 @@ async def _run_cmd(
             stderr=asyncio.subprocess.STDOUT,
             executable='/bin/bash',
             env=subprocess_env,
+            start_new_session=True,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         rc = proc.returncode if proc.returncode is not None else 1
