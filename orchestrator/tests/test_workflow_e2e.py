@@ -2235,6 +2235,83 @@ class TestPrerequisitesValidation:
 
 
 # ---------------------------------------------------------------------------
+# Tests: _mark_blocked false-done guard (_has_prior_implementation check)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMarkBlockedFalseDoneGuard:
+    """Empty-branch is_ancestor path must not false-done — must requeue instead.
+
+    Regression for task 839: an empty task branch (worktree HEAD == base commit)
+    trivially satisfies is_ancestor(HEAD, main), causing _mark_blocked to mark
+    the task 'done' with no code landed on main.
+    """
+
+    async def test_empty_branch_with_resolved_l0_requeues_not_done(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Empty task branch with steward-resolved L0 must requeue, not false-done.
+
+        The base commit is always an ancestor of main, so is_ancestor returns True
+        even when no implementation was committed.  Without the
+        _has_prior_implementation() guard this path marks the task 'done'.
+        With the guard it detects the stale branch point and falls through to the
+        normal requeue path.  This test FAILS on unmodified code (step-1 TDD).
+        """
+        import json as _json
+
+        # 1. Create a fresh worktree with no implementation commits (base commit only)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Build workflow with escalation queue, wire up worktree and artifacts
+        #    (no iterations.jsonl → _has_prior_implementation() returns False)
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. FakeSteward: resolves all pending L0 escalations immediately in start()
+        #    so _await_steward_completion() exits without timeout, and remaining == []
+        class _FakeSteward:
+            def __init__(self_inner, wt_path, cfg_dir):
+                pass
+
+            async def start(self_inner):
+                pending = queue.get_by_task(
+                    task_assignment.task_id, status='pending', level=0,
+                )
+                for esc in pending:
+                    queue.resolve(
+                        esc.id, 'Resolved by FakeSteward', resolved_by='fake-steward',
+                    )
+
+            async def stop(self_inner):
+                pass
+
+        workflow._steward_factory = _FakeSteward
+
+        # 4. Call _mark_blocked directly (no full run() cycle needed)
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        # 5. Assertions: must REQUEUE, not false-done
+        assert outcome == WorkflowOutcome.REQUEUED, (
+            f'Expected REQUEUED but got {outcome!r} — '
+            'empty-branch is_ancestor guard is missing or broken'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses for an empty branch: {statuses}"
+        )
+        assert statuses[-1] == 'pending', (
+            f"Last scheduler status must be 'pending' after requeue, got: {statuses}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # File-structure invariants
 # ---------------------------------------------------------------------------
 
