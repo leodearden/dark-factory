@@ -234,3 +234,124 @@ def test_sigterm_reaps_subprocess_and_no_stragglers(tmp_path: Path):
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             proc.wait(timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# Integration test: SIGTERM propagates through verify._run_cmd subprocess tree
+# ---------------------------------------------------------------------------
+
+# Script template for test_sigterm_reaps_verify_subprocess_tree.
+# Paths to orchestrator/src and shared/src are injected at test time via
+# .format(paths=...) so this module-level string doesn't need to be
+# evaluated at import time.
+_VERIFY_SHUTDOWN_SCRIPT = """\
+# Integration test: SIGTERM propagates through verify._run_cmd to subprocess tree.
+import asyncio
+import sys
+import signal
+from pathlib import Path
+
+# Inject package source paths so orchestrator and shared are importable.
+for _p in {paths!r}:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from orchestrator.verify import _run_cmd
+
+
+async def main():
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+    assert main_task is not None
+
+    def _cancel():
+        main_task.cancel()
+
+    loop.add_signal_handler(signal.SIGTERM, _cancel)
+    loop.add_signal_handler(signal.SIGINT, _cancel)
+
+    # Print READY so the test knows the handler is registered and the
+    # subprocess about to be spawned.
+    print('READY', flush=True)
+
+    try:
+        await _run_cmd("bash -c 'sleep 3600'", Path('/tmp'), timeout=600.0)
+    except asyncio.CancelledError:
+        pass  # terminate_process_group already cleaned up the subprocess tree
+
+
+try:
+    asyncio.run(main())
+except asyncio.CancelledError:
+    pass
+sys.exit(0)
+"""
+
+
+@pytest.mark.timeout(30)
+def test_sigterm_reaps_verify_subprocess_tree(tmp_path: Path):
+    """SIGTERM propagates through verify._run_cmd and reaps the subprocess tree.
+
+    Spawns a python child that calls verify._run_cmd("bash -c 'sleep 3600'")
+    under an asyncio SIGTERM->cancel handler. After the child prints READY,
+    sends SIGTERM and asserts:
+
+    1. Child exits within 10 s with rc == 0 or rc == -SIGTERM.
+    2. No orphan process remains in the child's session/process group.
+    """
+    here = Path(__file__).resolve().parent
+    orch_src = str(here.parent / 'src')
+    shared_src = str(here.parent.parent / 'shared' / 'src')
+    paths = [orch_src, shared_src]
+
+    script = tmp_path / 'verify_shutdown.py'
+    script.write_text(_VERIFY_SHUTDOWN_SCRIPT.format(paths=paths))
+
+    proc = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+    try:
+        deadline = time.monotonic() + 10.0
+        ready = False
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline() if proc.stdout else b''
+            if line.strip() == b'READY':
+                ready = True
+                break
+        assert ready, 'verify_shutdown.py never reached READY'
+
+        proc.send_signal(signal.SIGTERM)
+
+        try:
+            rc = proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired as exc:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5.0)
+            raise AssertionError(
+                'verify subprocess tree: child did not exit within 10s of SIGTERM'
+            ) from exc
+
+        assert rc in (0, -signal.SIGTERM), (
+            f'expected clean exit (0 or -{signal.SIGTERM}), got rc={rc}'
+        )
+
+        # After the child exits, its process group (session == child itself,
+        # since start_new_session=True) should be fully gone.
+        try:
+            os.killpg(os.getpgid(proc.pid), 0)
+            still_alive = True
+        except ProcessLookupError:
+            still_alive = False
+        assert not still_alive, 'child process group was not fully reaped'
+    finally:
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5.0)
