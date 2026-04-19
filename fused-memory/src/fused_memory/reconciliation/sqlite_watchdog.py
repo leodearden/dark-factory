@@ -14,18 +14,27 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from fused_memory.reconciliation.event_queue import EventQueue
+from typing import Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
 WedgeCallback = Callable[[dict], Awaitable[None]] | Callable[[dict], None]
 
 
+@runtime_checkable
+class WatchdogObservable(Protocol):
+    """Minimal interface required by :class:`SqliteWatchdog`.
+
+    Both :class:`~fused_memory.reconciliation.event_queue.EventQueue` and
+    test doubles satisfy this protocol.
+    """
+
+    def stats(self) -> dict: ...
+    def recent_ops(self) -> list[dict]: ...
+
+
 class SqliteWatchdog:
-    """Background watchdog over an :class:`EventQueue` drainer.
+    """Background watchdog over an :class:`~fused_memory.reconciliation.event_queue.EventQueue` drainer.
 
     Wedge condition (both must hold):
       ``now - last_commit_ts > stall_threshold_seconds`` AND
@@ -43,7 +52,7 @@ class SqliteWatchdog:
 
     def __init__(
         self,
-        event_queue: 'EventQueue',
+        event_queue: WatchdogObservable,
         *,
         check_interval_seconds: float = 30.0,
         stall_threshold_seconds: float = 120.0,
