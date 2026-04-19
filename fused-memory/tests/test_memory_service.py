@@ -1014,6 +1014,36 @@ class TestGraphitiBackendClose:
 
         assert backend._cloned_drivers == {}
 
+    @pytest.mark.asyncio
+    async def test_close_resilient_to_cloned_driver_close_error(self, mock_config):
+        """A failing clone.close() must not prevent other clones or the primary from closing."""
+        from fused_memory.backends.graphiti_client import GraphitiBackend
+
+        backend = GraphitiBackend(mock_config)
+
+        # Primary driver mock
+        backend._driver = MagicMock()
+        backend._driver.close = AsyncMock()
+
+        # clone_a raises, clone_b should still be closed
+        clone_a = MagicMock()
+        clone_a.close = AsyncMock(side_effect=RuntimeError('boom'))
+        clone_b = MagicMock()
+        clone_b.close = AsyncMock()
+        backend._cloned_drivers = {'group-a': clone_a, 'group-b': clone_b}
+
+        # Must not raise
+        await backend.close()
+
+        # clone_b still closed despite clone_a raising
+        clone_b.close.assert_awaited_once()
+        # Primary driver still closed
+        backend._driver.close.assert_awaited_once()
+        # Dict cleared
+        assert backend._cloned_drivers == {}
+        # Primary driver nulled out
+        assert backend._driver is None
+
 
 class TestGetEpisodes:
     @pytest.mark.asyncio
