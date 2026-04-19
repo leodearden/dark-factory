@@ -340,26 +340,29 @@ class TaskWorkflow:
                     return plan_outcome  # _plan() already called _mark_blocked
 
             # ── Ghost-loop early exit (before EXECUTE) ─────────────
-            # If the worktree HEAD is already an ancestor of main AND
-            # the branch has diverged (HEAD != main), the task's code
-            # was merged in a prior run that never reached DONE status
-            # (e.g. post-merge memory write failed).  Skip the entire
-            # execute/review/merge cycle to avoid the implementer
-            # making redundant commits that defeat the merge-phase
-            # ancestor check.
+            # If the worktree HEAD is already reachable from main, the
+            # task's code was merged in a prior run that never reached
+            # DONE status (e.g. post-merge memory write failed).  Skip
+            # the entire execute/review/merge cycle to avoid the
+            # implementer making redundant commits that defeat the
+            # merge-phase ancestor check.
             #
-            # When HEAD == main, the worktree is fresh (no work done
-            # yet) — don't skip.
+            # NOTE: wt_head == current_main is ALSO a legitimate ghost-
+            # loop case — create_worktree rebases reused worktrees onto
+            # main, fast-forwarding a post-merge branch to match main
+            # exactly.  The has_work check below distinguishes stale
+            # branch points (no implementation) from true ghost loops.
             wt_head = await self._get_head_commit()
             current_main = await self.git_ops.get_main_sha()
             already_on_main = (
-                wt_head != current_main
-                and await self.git_ops.is_ancestor(wt_head, current_main)
+                wt_head == current_main
+                or await self.git_ops.is_ancestor(wt_head, current_main)
             )
             if already_on_main and not self._worktree_external:
                 # Guard: a stale branch point (requeued task that was planned
-                # but never implemented) also satisfies is_ancestor.  Only
-                # skip if there's evidence of prior implementation work.
+                # but never implemented, or a freshly-created worktree) also
+                # satisfies the ancestor check.  Only skip if there's
+                # evidence of prior implementation work.
                 has_work = (
                     self._has_prior_implementation()
                     or await self.git_ops.has_uncommitted_work(self.worktree)
