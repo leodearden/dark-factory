@@ -785,7 +785,8 @@ class TestRunProbe:
             call_order.append('subprocess')
             return proc
 
-        gate._probe_config_dir.write_credentials = track_write
+        # Test-only monkeypatch of a method — pyright flags the assign.
+        gate._probe_config_dir.write_credentials = track_write  # type: ignore[method-assign]
 
         with patch('asyncio.create_subprocess_exec', side_effect=track_exec):
             await gate._run_probe(acct)

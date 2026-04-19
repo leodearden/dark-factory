@@ -1043,22 +1043,23 @@ def create_mcp_server(
         _fallback_buffer = EventBuffer(db_path=None)
         task_interceptor = TaskInterceptor(None, None, _fallback_buffer)
 
-    def _normalize_project_root(project_root: str) -> tuple[str | None, dict | None]:
+    def _normalize_project_root(project_root: str) -> str | dict:
         """Validate then redirect project_root to the main git checkout.
 
         Worktrees must never hold their own tasks.json — every task tool
         funnels through this choke point so reads and writes see the same
         canonical copy regardless of which path the caller passed in.
 
-        Returns (normalized_path, None) on success or (None, error_dict)
-        on failure.
+        Returns the normalized path (str) on success, or an error payload
+        (dict with 'error' and 'error_type' keys) on failure. Call sites
+        should `isinstance(result, dict)` to narrow.
         """
         if err := validate_project_root(project_root):
-            return None, err
+            return err
         try:
-            return resolve_main_checkout(project_root), None
+            return resolve_main_checkout(project_root)
         except ValueError as e:
-            return None, {'error': str(e), 'error_type': 'ValidationError'}
+            return {'error': str(e), 'error_type': 'ValidationError'}
 
     @mcp.tool()
     async def get_tasks(
@@ -1071,9 +1072,10 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
-        if err:
-            return err
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
         try:
             return await task_interceptor.get_tasks(project_root=project_root, tag=tag)
         except Exception as e:
@@ -1093,9 +1095,10 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
-        if err:
-            return err
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
         try:
             return await task_interceptor.get_task(
                 task_id=id, project_root=project_root, tag=tag
@@ -1136,9 +1139,10 @@ def create_mcp_server(
                 (default False during rollout — missing provenance logs a
                 warning but does not block the transition).
         """
-        project_root, err = _normalize_project_root(project_root)
-        if err:
-            return err
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
         if status not in _VALID_TASK_STATUSES:
             return {
                 'error': (
@@ -1189,9 +1193,10 @@ def create_mcp_server(
                 Persisted via a follow-up update_task call after creation.
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
-        if err:
-            return err
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
         try:
             return await task_interceptor.add_task(
                 project_root=project_root,
@@ -1227,9 +1232,10 @@ def create_mcp_server(
             append: Append instead of full update
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
-        if err:
-            return err
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
         try:
             if isinstance(metadata, dict):
                 metadata = json.dumps(metadata)
@@ -1264,9 +1270,10 @@ def create_mcp_server(
             details: Subtask details
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
-        if err:
-            return err
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
         try:
             return await task_interceptor.add_subtask(
                 parent_id=id,
@@ -1293,9 +1300,10 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
-        if err:
-            return err
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
         try:
             return await task_interceptor.remove_task(
                 task_id=id, project_root=project_root, tag=tag
@@ -1319,9 +1327,10 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
-        if err:
-            return err
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
         try:
             return await task_interceptor.add_dependency(
                 task_id=id,
@@ -1348,9 +1357,10 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
-        if err:
-            return err
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
         try:
             return await task_interceptor.remove_dependency(
                 task_id=id,
@@ -1381,9 +1391,10 @@ def create_mcp_server(
             force: Force expansion even if subtasks exist
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
-        if err:
-            return err
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
         try:
             return await task_interceptor.expand_task(
                 task_id=id,
@@ -1412,9 +1423,10 @@ def create_mcp_server(
             num_tasks: Approximate number of tasks to generate
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
-        if err:
-            return err
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
         try:
             return await task_interceptor.parse_prd(
                 input_path=input,

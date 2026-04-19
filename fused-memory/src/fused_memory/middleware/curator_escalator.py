@@ -35,21 +35,24 @@ import logging
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fused_memory.middleware.task_curator import CuratorFailureError
+
+if TYPE_CHECKING:
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
 # ``escalation`` is a sibling workspace package. The main reconciliation
 # harness also imports it defensively (harness.py:38-46) because historical
 # deployments could lack the package. Mirror that pattern here so the
 # curator still functions (without escalation routing) in minimal envs.
 try:
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    from escalation.models import Escalation  # type: ignore[import-untyped,no-redef]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
     HAS_ESCALATION = True
 except ImportError:  # pragma: no cover - exercised only in minimal envs
     HAS_ESCALATION = False
-    Escalation = None  # type: ignore[assignment,misc]
-    EscalationQueue = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 

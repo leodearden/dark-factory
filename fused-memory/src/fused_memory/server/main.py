@@ -212,6 +212,14 @@ async def run_server():
         # if the drainer stalls (no commit in N seconds with non-empty queue).
         # Surfaces the SQLite-lock condition that previously rotted silently.
         if config.reconciliation.event_queue_watchdog_enabled:
+            # ``on_watchdog_wedge`` returns ``list[BacklogVerdict]`` for
+            # tests/introspection, but ``WedgeCallback`` is typed as returning
+            # ``Awaitable[None]`` — the watchdog discards the return value.
+            # Wrap to satisfy the narrower callback type without changing
+            # runtime behavior.
+            async def _on_wedge(payload: dict) -> None:
+                await backlog_policy.on_watchdog_wedge(payload)
+
             sqlite_watchdog = SqliteWatchdog(
                 event_queue,
                 check_interval_seconds=(
@@ -223,7 +231,7 @@ async def run_server():
                 rearm_after_seconds=(
                     config.reconciliation.event_queue_watchdog_rearm_after_seconds
                 ),
-                wedge_callback=backlog_policy.on_watchdog_wedge,
+                wedge_callback=_on_wedge,
             )
             await sqlite_watchdog.start()
 

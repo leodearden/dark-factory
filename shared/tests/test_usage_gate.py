@@ -408,7 +408,11 @@ class TestShutdownBackgroundTasks:
         async def blocking_save(*args, **kwargs):
             await block_event.wait()
 
-        gate._cost_store.save_account_event.side_effect = blocking_save
+        # gate._cost_store is CostStore | None; the fixture injects an
+        # AsyncMock.  Assert + suppress the MagicMock.side_effect attribute
+        # assignment against the bound-method type.
+        assert gate._cost_store is not None
+        gate._cost_store.save_account_event.side_effect = blocking_save  # type: ignore[attr-defined]
 
         # Fire two events — creates two tasks in _background_tasks.
         gate._fire_cost_event('acct-A', 'cap_hit', '{}')

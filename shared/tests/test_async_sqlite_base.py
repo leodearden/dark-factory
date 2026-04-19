@@ -29,6 +29,7 @@ class TestApplyWalPragmas:
             await apply_wal_pragmas(conn, busy_timeout_ms=5000)
             async with conn.execute('PRAGMA journal_mode') as cur:
                 row = await cur.fetchone()
+        assert row is not None
         assert row[0] == 'wal'
 
     async def test_sets_busy_timeout(self, tmp_path: Path):
@@ -40,6 +41,7 @@ class TestApplyWalPragmas:
             await apply_wal_pragmas(conn, busy_timeout_ms=12345)
             async with conn.execute('PRAGMA busy_timeout') as cur:
                 row = await cur.fetchone()
+        assert row is not None
         assert row[0] == 12345
 
     async def test_zero_busy_timeout_skips_pragma(self, tmp_path: Path):
@@ -54,6 +56,7 @@ class TestApplyWalPragmas:
             async with conn.execute('PRAGMA busy_timeout') as cur:
                 row = await cur.fetchone()
         # busy_timeout=0 → skip pragma → previous value 9999 should be unchanged
+        assert row is not None
         assert row[0] == 9999
 
     async def test_default_busy_timeout_is_set(self, tmp_path: Path):
@@ -65,6 +68,7 @@ class TestApplyWalPragmas:
             await apply_wal_pragmas(conn, busy_timeout_ms=5000)
             async with conn.execute('PRAGMA busy_timeout') as cur:
                 row = await cur.fetchone()
+        assert row is not None
         assert row[0] == 5000
 
     async def test_wal_fallback_raises_runtime_error(self) -> None:
@@ -176,6 +180,7 @@ class TestAsyncSqliteBaseOpen:
         async with _SimpleStore(tmp_path / 'store.db') as store:  # noqa: SIM117
             async with store._conn.execute('PRAGMA journal_mode') as cur:  # type: ignore[union-attr]
                 row = await cur.fetchone()
+        assert row is not None
         assert row[0] == 'wal'
 
     async def test_open_sets_busy_timeout(self, tmp_path: Path) -> None:
@@ -183,6 +188,7 @@ class TestAsyncSqliteBaseOpen:
         async with _SimpleStore(tmp_path / 'store.db', busy_timeout_ms=7777) as store:  # noqa: SIM117
             async with store._conn.execute('PRAGMA busy_timeout') as cur:  # type: ignore[union-attr]
                 row = await cur.fetchone()
+        assert row is not None
         assert row[0] == 7777
 
     async def test_open_creates_schema_tables(self, tmp_path: Path) -> None:
