@@ -129,70 +129,32 @@ class TestOrchestratorRouteBasics:
         assert '1 pending' in html
 
     def test_alpine_toggle(self, client):
+        """Card uses x-data, x-show (on rows), @change (on All checkbox), $store.panels."""
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
         assert 'x-data' in html
         assert 'x-show' in html
-        assert '@click' in html
+        assert '@change' in html
         assert '$store.panels' in html
 
-    def test_show_tasks_button(self, client):
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        assert 'Show tasks' in html
-
-    def test_table_wrapper_hidden_by_default(self, client):
-        """Task table wrapper must have style='display:none' so it is hidden
-        even before Alpine processes the element after an HTMX morph."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        assert 'style="display:none"' in html
-
     def test_table_wrapper_has_x_cloak(self, client):
-        """Wrapper retains x-cloak for initial page load (non-HTMX) scenarios."""
+        """x-cloak appears on task rows so they are hidden before Alpine mounts."""
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
         assert 'x-cloak' in html
 
     def test_table_wrapper_x_show_uses_store(self, client):
-        """x-show references $store.panels[key] so state persists across morphs."""
+        """x-show on rows still references $store.panels[key] for persistence."""
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
-        # The x-show must use $store.panels, not local x-data state
+        # x-show is now on rows rather than the wrapper, but the store reference is the same
         assert "x-show=\"$store.panels[" in html
 
-    def test_button_x_text_uses_store(self, client):
-        """Button x-text expression uses $store.panels[key] for label toggling."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        assert "x-text=\"$store.panels[" in html
-
     def test_task_table_wrapper_has_x_cloak(self, client):
-        """x-show div must have x-cloak so it is hidden before Alpine initializes
-        after an innerHTML swap (MutationObserver detects new x-data elements)."""
+        """x-cloak present in rendered HTML (now on row elements)."""
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
         assert 'x-cloak' in html
-
-    def test_store_key_consistent_between_toggle_and_show(self, client):
-        """The $store.panels key in @click toggle must match the x-show key.
-
-        Extracts both keys from the rendered HTML and asserts they are equal.
-        Guards against key drift between the button and the table wrapper.
-        """
-        import re
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        # Extract key from @click: $store.panels['<key>'] = !$store.panels['<key>']
-        click_match = re.search(r"\$store\.panels\['([^']+)'\]\s*=\s*!", html)
-        # Extract key from x-show: x-show="$store.panels['<key>']"
-        show_match = re.search(r'x-show="\$store\.panels\[\'([^\']+)\'\]"', html)
-        assert click_match is not None, '@click $store.panels key not found'
-        assert show_match is not None, 'x-show $store.panels key not found'
-        assert click_match.group(1) == show_match.group(1), (
-            f'Key mismatch: @click uses {click_match.group(1)!r} '
-            f'but x-show uses {show_match.group(1)!r}'
-        )
 
     def test_card_shows_single_pid_label(self, client):
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
