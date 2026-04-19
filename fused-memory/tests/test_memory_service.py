@@ -992,6 +992,28 @@ class TestGraphitiBackendClose:
         clone_a.close.assert_awaited_once()
         clone_b.close.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_close_clears_cloned_drivers_dict(self, mock_config):
+        """GraphitiBackend.close() must clear _cloned_drivers after closing them."""
+        from fused_memory.backends.graphiti_client import GraphitiBackend
+
+        backend = GraphitiBackend(mock_config)
+
+        # Primary driver mock
+        backend._driver = MagicMock()
+        backend._driver.close = AsyncMock()
+
+        # Two cloned-driver mocks
+        clone_a = MagicMock()
+        clone_a.close = AsyncMock()
+        clone_b = MagicMock()
+        clone_b.close = AsyncMock()
+        backend._cloned_drivers = {'group-a': clone_a, 'group-b': clone_b}
+
+        await backend.close()
+
+        assert backend._cloned_drivers == {}
+
 
 class TestGetEpisodes:
     @pytest.mark.asyncio
