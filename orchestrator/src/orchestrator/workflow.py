@@ -799,17 +799,20 @@ class TaskWorkflow:
                 },
             )
 
-        # Derive modules from plan's file list (deterministic) or fall back to
-        # the plan's module list (heuristic).
         plan_files = self.plan.get('files', [])
-        if plan_files:
-            plan_modules = files_to_modules(plan_files, self.config.lock_depth)
-            logger.info(
-                f'Task {self.task_id}: derived {len(plan_modules)} modules '
-                f'from {len(plan_files)} files: {plan_modules}'
+        if not plan_files:
+            return await self._mark_blocked(
+                'Planning failed: plan missing "files"',
+                detail=(
+                    'Architect wrote plan.json without a non-empty "files" array. '
+                    'Files are required to derive module locks.'
+                ),
             )
-        else:
-            plan_modules = self.plan.get('modules', [])
+        plan_modules = files_to_modules(plan_files, self.config.lock_depth)
+        logger.info(
+            f'Task {self.task_id}: derived {len(plan_modules)} modules '
+            f'from {len(plan_files)} files: {plan_modules}'
+        )
 
         if set(plan_modules) != set(self.modules):
             expanded = await self.scheduler.handle_blast_radius_expansion(
