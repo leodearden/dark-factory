@@ -42,3 +42,30 @@ class TestTerminateProcessGroup:
         )
         with pytest.raises(ProcessLookupError):
             os.killpg(pgid, 0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_terminate_process_group_escalates_to_sigkill(self):
+        """When the child ignores SIGTERM, SIGKILL fires after grace_secs.
+
+        bash traps SIGTERM (ignores it) so the SIGTERM leg times out, then
+        SIGKILL should kill the group. proc.returncode == -9 (SIGKILL).
+        """
+        proc = await asyncio.create_subprocess_shell(
+            "trap '' TERM; sleep 30",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        pgid = os.getpgid(proc.pid)
+
+        await terminate_process_group(proc, grace_secs=0.5)
+
+        assert proc.returncode is not None, (
+            'Process was not killed even after SIGKILL escalation'
+        )
+        assert proc.returncode == -signal.SIGKILL, (
+            f'Expected returncode -9 (SIGKILL), got {proc.returncode}'
+        )
+        with pytest.raises(ProcessLookupError):
+            os.killpg(pgid, 0)
