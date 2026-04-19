@@ -268,6 +268,12 @@ class ReconciliationConfig(BaseModel):
     max_mutations_per_stage: int = Field(default=50)
     halt_on_judge_serious: bool = Field(default=True)
 
+    # Done-provenance gate — when True, set_task_status(done) rejects calls
+    # lacking done_provenance={commit?, note?}. Default False during phased
+    # rollout: warn-only so existing callers (orchestrator, steward, interactive
+    # sessions) can be updated to pass provenance before enforcement flips on.
+    require_done_provenance: bool = Field(default=False)
+
     # Escalation
     escalation_port: int = Field(default=8103)
     escalation_host: str = Field(default='127.0.0.1')

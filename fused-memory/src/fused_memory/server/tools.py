@@ -1085,6 +1085,7 @@ def create_mcp_server(
         status: str,
         project_root: str,
         tag: str | None = None,
+        done_provenance: dict | None = None,
     ) -> dict[str, Any]:
         """Update task status. Triggers targeted reconciliation for
         done/blocked/cancelled/deferred transitions.
@@ -1097,6 +1098,18 @@ def create_mcp_server(
             status: pending, done, in-progress, blocked, review, deferred, or cancelled
             project_root: Absolute path to project root
             tag: Tag context (optional)
+            done_provenance: Verified evidence for a done transition; Stage-2
+                reconciliation uses this instead of fabricating 'shipped via X'
+                edges from metadata.modules. Shape:
+                  {"commit": "<sha-or-ref>"} — preferred; resolved via
+                  git rev-parse and pinned to a full SHA.
+                  {"note": "<explanation>"} — escape hatch for fast-forward
+                  merges, work covered by a sibling task, or interactive
+                  sessions where no single commit applies.
+                Both keys may be provided. At least one non-empty value is
+                required when reconciliation.require_done_provenance is True
+                (default False during rollout — missing provenance logs a
+                warning but does not block the transition).
         """
         project_root, err = _normalize_project_root(project_root)
         if err:
@@ -1111,7 +1124,8 @@ def create_mcp_server(
             }
         try:
             return await task_interceptor.set_task_status(
-                task_id=id, status=status, project_root=project_root, tag=tag
+                task_id=id, status=status, project_root=project_root, tag=tag,
+                done_provenance=done_provenance,
             )
         except Exception as e:
             logger.error(f'set_task_status error: {e}')
