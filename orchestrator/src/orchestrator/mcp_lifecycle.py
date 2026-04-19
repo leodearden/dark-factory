@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from orchestrator.config import OrchestratorConfig
+from shared.proc_group import terminate_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -299,6 +300,7 @@ class McpLifecycle:
                 cwd=str(self.project_root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
 
             # Wait for health
@@ -322,14 +324,8 @@ class McpLifecycle:
         logger.info('Stopping fused-memory HTTP server')
         _session = None
         try:
-            self._process.terminate()
-            try:
-                await asyncio.wait_for(self._process.wait(), timeout=10)
-            except TimeoutError:
-                logger.warning('Server did not stop gracefully, killing')
-                self._process.kill()
-                await self._process.wait()
-        except ProcessLookupError:
+            await terminate_process_group(self._process, grace_secs=10.0)
+        except Exception:
             pass
         finally:
             self._process = None
