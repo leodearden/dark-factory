@@ -13,6 +13,7 @@ from dashboard.data.performance import (
     aggregate_completion_paths,
     aggregate_escalation_rates,
     aggregate_loop_histograms,
+    aggregate_time_centiles,
     get_completion_paths,
     get_escalation_rates,
     get_loop_histograms,
@@ -699,4 +700,86 @@ class TestAggregateLoopHistograms:
     async def test_none_dbs_returns_empty(self):
         """`dbs=[None, None]` returns empty dict."""
         result = await aggregate_loop_histograms([None, None], days=7)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Tests: aggregate_time_centiles
+# ---------------------------------------------------------------------------
+
+class TestAggregateTimeCentiles:
+    """Tests for aggregate_time_centiles across multiple DB connections."""
+
+    @pytest.fixture()
+    async def two_centile_conns(self, tmp_path):
+        """Two runs.dbs: DB1 has dark_factory with short durations,
+        DB2 has dark_factory with longer durations (and reify too)."""
+        now = datetime.now(UTC)
+        ts1 = (now - timedelta(minutes=40)).isoformat()
+        ts2 = (now - timedelta(minutes=30)).isoformat()
+        ts3 = (now - timedelta(minutes=20)).isoformat()
+
+        # DB1: dark_factory — durations 100k, 200k ms
+        db1_path = _make_runs_db(tmp_path / 'db1', 'runs.db', [
+            ('run-a', 't1', 'dark_factory', 'T1', 'done',
+             0.5, 100_000, 2, 1, 0, 0, 0.0, 0, ts1),
+            ('run-a', 't2', 'dark_factory', 'T2', 'done',
+             0.5, 200_000, 2, 1, 0, 0, 0.0, 0, ts2),
+        ])
+
+        # DB2: dark_factory — durations 300k, 400k ms; reify — 500k ms
+        db2_path = _make_runs_db(tmp_path / 'db2', 'runs.db', [
+            ('run-b', 't3', 'dark_factory', 'T3', 'done',
+             0.3, 300_000, 2, 1, 0, 0, 0.0, 0, ts1),
+            ('run-b', 't4', 'dark_factory', 'T4', 'done',
+             0.3, 400_000, 2, 1, 0, 0, 0.0, 0, ts2),
+            ('run-b', 't5', 'reify', 'T5', 'done',
+             0.2, 500_000, 1, 1, 0, 0, 0.0, 0, ts3),
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1_path)) as c1,
+            aiosqlite.connect(str(db2_path)) as c2,
+        ):
+            c1.row_factory = aiosqlite.Row
+            c2.row_factory = aiosqlite.Row
+            yield [c1, c2]
+
+    @pytest.mark.asyncio
+    async def test_count_sums(self, two_centile_conns):
+        """count is the sum of task counts across DBs."""
+        dbs = two_centile_conns
+        result = await aggregate_time_centiles(dbs, days=1)
+        # DB1: 2 tasks, DB2: 2 dark_factory tasks = 4 total
+        assert result['dark_factory']['count'] == 4
+
+    @pytest.mark.asyncio
+    async def test_percentiles_from_unified_sample(self, two_centile_conns):
+        """p50 is the true median of all 4 durations [100k,200k,300k,400k]."""
+        dbs = two_centile_conns
+        result = await aggregate_time_centiles(dbs, days=1)
+        # True median of [100k,200k,300k,400k] = 250k
+        df = result['dark_factory']
+        assert df['p50'] == pytest.approx(250_000, rel=0.05)
+        assert df['p50'] <= df['p75'] <= df['p90'] <= df['p95']
+
+    @pytest.mark.asyncio
+    async def test_reify_project_surfaced(self, two_centile_conns):
+        """reify project from DB2 appears in result."""
+        dbs = two_centile_conns
+        result = await aggregate_time_centiles(dbs, days=1)
+        assert 'reify' in result
+        assert result['reify']['count'] == 1
+        assert result['reify']['p50'] == 500_000
+
+    @pytest.mark.asyncio
+    async def test_empty_dbs_list(self):
+        """`dbs=[]` returns empty dict."""
+        result = await aggregate_time_centiles([], days=7)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_none_dbs_returns_empty(self):
+        """`dbs=[None, None]` returns empty dict."""
+        result = await aggregate_time_centiles([None, None], days=7)
         assert result == {}
