@@ -552,3 +552,116 @@ class TestOrchestratorFilterCheckboxes:
             html = client.get('/partials/orchestrators').text
         key = self.ORCH_KEY
         assert f"$store.panels['{key}'].pending" in html
+
+
+class TestOrchestratorTaskRowFiltering:
+    """Tests for per-row x-show filtering on task table rows."""
+
+    ORCH_KEY = '-home-leo-src-dark-factory-prd-dashboard-md'
+
+    def test_all_tbody_rows_have_x_show(self, client):
+        """Every data <tr> in <tbody> carries an x-show attribute."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # Find tbody content
+        tbody_match = re.search(r'<tbody>(.*?)</tbody>', html, re.DOTALL)
+        assert tbody_match is not None, 'No <tbody> found'
+        tbody = tbody_match.group(1)
+        # Count <tr> tags and x-show occurrences in tbody
+        tr_count = tbody.count('<tr ')
+        xshow_count = tbody.count('x-show=')
+        assert tr_count > 0, 'No <tr> rows found in tbody'
+        assert xshow_count == tr_count, (
+            f'Expected {tr_count} x-show attributes but found {xshow_count}'
+        )
+
+    def test_total_row_count_equals_task_count(self, client):
+        """All 5 tasks are server-rendered; client-side x-show controls visibility."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        tbody_match = re.search(r'<tbody>(.*?)</tbody>', html, re.DOTALL)
+        assert tbody_match is not None
+        tbody = tbody_match.group(1)
+        tr_count = tbody.count('<tr ')
+        assert tr_count == 5, f'Expected 5 rows, found {tr_count}'
+
+    def test_active_rows_reference_dot_active(self, client):
+        """Rows for in-progress/blocked tasks reference .active in x-show."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # Find x-show attributes referencing .active (for active bucket rows)
+        active_rows = re.findall(r'x-show="([^"]*\.active[^"]*)"', html)
+        assert len(active_rows) >= 2, (
+            f'Expected at least 2 rows with .active in x-show, found {len(active_rows)}'
+        )
+
+    def test_active_rows_also_reference_dot_all(self, client):
+        """Active-bucket rows also reference .all in x-show expression."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        # x-show on active rows must include both .all and .active
+        active_rows = re.findall(r'x-show="([^"]*\.active[^"]*)"', html)
+        assert len(active_rows) >= 2
+        for expr in active_rows:
+            assert '.all' in expr, (
+                f'Active row x-show "{expr}" does not reference .all'
+            )
+
+    def test_pending_row_references_dot_pending(self, client):
+        """Row for pending task references .pending in x-show."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        pending_rows = re.findall(r'x-show="([^"]*\.pending[^"]*)"', html)
+        assert len(pending_rows) >= 1, (
+            f'Expected at least 1 row with .pending in x-show, found {len(pending_rows)}'
+        )
+
+    def test_pending_row_also_references_dot_all(self, client):
+        """Pending-bucket rows also reference .all in x-show expression."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        pending_rows = re.findall(r'x-show="([^"]*\.pending[^"]*)"', html)
+        assert len(pending_rows) >= 1
+        for expr in pending_rows:
+            assert '.all' in expr, (
+                f'Pending row x-show "{expr}" does not reference .all'
+            )
+
+    def test_done_rows_reference_only_dot_all(self, client):
+        """Done/other-bucket rows reference .all but NOT .active or .pending."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        tbody_match = re.search(r'<tbody>(.*?)</tbody>', html, re.DOTALL)
+        assert tbody_match is not None
+        tbody = tbody_match.group(1)
+        # Extract all x-show values from rows
+        all_xshow = re.findall(r'x-show="([^"]+)"', tbody)
+        # Identify "other" bucket rows: have .all but NOT .active AND NOT .pending
+        other_rows = [
+            expr for expr in all_xshow
+            if '.all' in expr and '.active' not in expr and '.pending' not in expr
+        ]
+        # We have 2 done tasks (ids 1 and 2)
+        assert len(other_rows) >= 2, (
+            f'Expected at least 2 done/other rows gated only on .all, found {len(other_rows)}: {other_rows}'
+        )
+
+    def test_rows_have_x_cloak(self, client):
+        """Task rows carry x-cloak to avoid flash before Alpine mounts."""
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        tbody_match = re.search(r'<tbody>(.*?)</tbody>', html, re.DOTALL)
+        assert tbody_match is not None
+        tbody = tbody_match.group(1)
+        cloak_count = tbody.count('x-cloak')
+        assert cloak_count >= 5, (
+            f'Expected at least 5 x-cloak attributes on rows, found {cloak_count}'
+        )
