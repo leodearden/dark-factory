@@ -58,6 +58,48 @@ def group_top_n(data: ChartData, n: int = 5) -> ChartData:
     }
 
 
+def trim_leading_zero_buckets(data: ChartData) -> ChartData:
+    """Drop leading (label, 0) pairs from ChartData, preserving interior zeros.
+
+    Scans the values list from the left and removes consecutive zero-value
+    entries until the first non-zero entry is found.  Interior zeros (between
+    two non-zero values) and trailing zeros are intentionally kept so that
+    activity gaps remain visible in time-series charts.
+
+    The input is never mutated; a new ChartData dict is always returned.
+
+    Args:
+        data: ChartData with 'labels' and 'values' lists.
+
+    Returns:
+        ChartData with leading zero-value (label, value) pairs stripped.
+        Returns ``{'labels': [], 'values': []}`` when all values are zero or
+        the input is empty.
+
+    Raises:
+        ValueError: If labels and values have different lengths.
+    """
+    labels: list[str] = data.get('labels', [])
+    values: list[int | float] = data.get('values', [])
+
+    if len(labels) != len(values):
+        raise ValueError(
+            f"labels and values must have the same length "
+            f"(got {len(labels)} labels and {len(values)} values)"
+        )
+
+    # Find the first non-zero index.
+    first_nonzero = next((i for i, v in enumerate(values) if v != 0), None)
+    if first_nonzero is None:
+        # All zeros (or empty).
+        return {'labels': [], 'values': []}
+
+    return {
+        'labels': list(labels[first_nonzero:]),
+        'values': list(values[first_nonzero:]),
+    }
+
+
 def separate_label(
     data: ChartData, label: str
 ) -> tuple[ChartData, int | float]:
