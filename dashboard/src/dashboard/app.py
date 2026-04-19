@@ -31,7 +31,7 @@ from dashboard.data.burndown import (
     get_burndown_projects,
     get_burndown_series,
 )
-from dashboard.data.chart_utils import ChartData, group_top_n
+from dashboard.data.chart_utils import ChartData, group_top_n, trim_leading_zero_buckets
 from dashboard.data.costs import (
     aggregate_account_events,
     aggregate_cost_by_account,
@@ -715,6 +715,7 @@ async def partials_merge_queue(request: Request):
     )
 
     depth = _safe_gather_result(depth, {'labels': [], 'values': []}, 'merge_queue.depth')
+    depth = trim_leading_zero_buckets(depth)
     outcomes = _safe_gather_result(outcomes, {'labels': [], 'values': []}, 'merge_queue.outcomes')
     latency = _safe_gather_result(
         latency, {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0},
