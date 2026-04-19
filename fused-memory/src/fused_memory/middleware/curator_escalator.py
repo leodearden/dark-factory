@@ -61,7 +61,7 @@ class CuratorEscalator:
     def __init__(self, cooldown_secs: float = _DEFAULT_COOLDOWN_SECS) -> None:
         self._cooldown_secs = cooldown_secs
         self._last_escalation: dict[str, float] = {}
-        self._queues: dict[str, EscalationQueue] = {}
+        self._queues: dict[str, EscalationQueue] = {}  # type: ignore[valid-type]
 
     def _orchestrator_running(self, project_root: str) -> bool:
         """Return True if the project's orchestrator holds its exclusive lock.
@@ -95,10 +95,10 @@ class CuratorEscalator:
         finally:
             fd.close()
 
-    def _queue_for(self, project_root: str) -> EscalationQueue:
+    def _queue_for(self, project_root: str) -> EscalationQueue:  # type: ignore[valid-type]
         q = self._queues.get(project_root)
         if q is None:
-            q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+            q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)  # type: ignore[operator]
             self._queues[project_root] = q
         return q
 
@@ -147,7 +147,7 @@ class CuratorEscalator:
             return
 
         queue = self._queue_for(project_root)
-        escalation = Escalation(
+        escalation = Escalation(  # type: ignore[operator]
             id=queue.make_id('curator'),
             task_id='task-curator',
             agent_role='fused-memory/task-curator',

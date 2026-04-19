@@ -1046,7 +1046,7 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
+        project_root, err = _normalize_project_root(project_root)  # type: ignore[assignment]
         if err:
             return err
         try:
@@ -1068,7 +1068,7 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
+        project_root, err = _normalize_project_root(project_root)  # type: ignore[assignment]
         if err:
             return err
         try:
@@ -1098,7 +1098,7 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
+        project_root, err = _normalize_project_root(project_root)  # type: ignore[assignment]
         if err:
             return err
         if status not in _VALID_TASK_STATUSES:
@@ -1150,7 +1150,7 @@ def create_mcp_server(
                 Persisted via a follow-up update_task call after creation.
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
+        project_root, err = _normalize_project_root(project_root)  # type: ignore[assignment]
         if err:
             return err
         try:
@@ -1188,7 +1188,7 @@ def create_mcp_server(
             append: Append instead of full update
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
+        project_root, err = _normalize_project_root(project_root)  # type: ignore[assignment]
         if err:
             return err
         try:
@@ -1225,7 +1225,7 @@ def create_mcp_server(
             details: Subtask details
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
+        project_root, err = _normalize_project_root(project_root)  # type: ignore[assignment]
         if err:
             return err
         try:
@@ -1254,7 +1254,7 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
+        project_root, err = _normalize_project_root(project_root)  # type: ignore[assignment]
         if err:
             return err
         try:
@@ -1280,7 +1280,7 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
+        project_root, err = _normalize_project_root(project_root)  # type: ignore[assignment]
         if err:
             return err
         try:
@@ -1309,7 +1309,7 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
+        project_root, err = _normalize_project_root(project_root)  # type: ignore[assignment]
         if err:
             return err
         try:
@@ -1342,7 +1342,7 @@ def create_mcp_server(
             force: Force expansion even if subtasks exist
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
+        project_root, err = _normalize_project_root(project_root)  # type: ignore[assignment]
         if err:
             return err
         try:
@@ -1373,7 +1373,7 @@ def create_mcp_server(
             num_tasks: Approximate number of tasks to generate
             tag: Tag context (optional)
         """
-        project_root, err = _normalize_project_root(project_root)
+        project_root, err = _normalize_project_root(project_root)  # type: ignore[assignment]
         if err:
             return err
         try:

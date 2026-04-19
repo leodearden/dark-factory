@@ -21,10 +21,11 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -102,8 +103,8 @@ class BacklogPolicy:
 
     def __init__(
         self,
-        event_buffer: 'EventBuffer',
-        event_queue: '_QueueLike | None',
+        event_buffer: EventBuffer,
+        event_queue: _QueueLike | None,
         orchestrator_detector: OrchestratorDetector,
         *,
         hard_limit: int = 500,

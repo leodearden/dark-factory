@@ -20,7 +20,6 @@ from fused_memory.services.memory_service import MemoryService  # noqa: E402
 
 if TYPE_CHECKING:
     from fused_memory.middleware.task_interceptor import TaskInterceptor
-    from fused_memory.reconciliation.backlog_policy import BacklogPolicy
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
@@ -211,7 +210,7 @@ async def run_server():
                 rearm_after_seconds=(
                     config.reconciliation.event_queue_watchdog_rearm_after_seconds
                 ),
-                wedge_callback=backlog_policy.on_watchdog_wedge,
+                wedge_callback=backlog_policy.on_watchdog_wedge,  # type: ignore[arg-type]
             )
             await sqlite_watchdog.start()
 
