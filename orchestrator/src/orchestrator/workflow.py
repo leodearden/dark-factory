@@ -2402,16 +2402,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             if await self.git_ops.is_ancestor(
                                 wt_head.strip(), main_sha,
                             ):
-                                logger.info(
-                                    'Task %s: branch already on main — '
-                                    'completing instead of re-queueing',
-                                    self.task_id,
-                                )
-                                self._enter_phase(WorkflowState.DONE)
-                                await self.scheduler.set_task_status(
-                                    self.task_id, 'done',
-                                )
-                                return WorkflowOutcome.DONE
+                                if not self._has_prior_implementation():
+                                    logger.warning(
+                                        'Task %s: branch is ancestor of main '
+                                        'but no implementation entries — '
+                                        'proceeding with requeue',
+                                        self.task_id,
+                                    )
+                                else:
+                                    logger.info(
+                                        'Task %s: branch already on main — '
+                                        'completing instead of re-queueing',
+                                        self.task_id,
+                                    )
+                                    self._enter_phase(WorkflowState.DONE)
+                                    await self.scheduler.set_task_status(
+                                        self.task_id, 'done',
+                                    )
+                                    return WorkflowOutcome.DONE
                         except Exception:
                             logger.warning(
                                 'Task %s: merge-check failed, '
