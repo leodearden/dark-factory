@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
+from shared.usage_gate import InvokeSlot
 
 from orchestrator.agents.invoke import (
     _invoke_claude_with_sandbox,
@@ -19,6 +21,30 @@ from orchestrator.agents.invoke import (
     _SubprocessResult,
     invoke_with_cap_retry,
 )
+
+
+def _attach_invoke_slot(gate: MagicMock) -> MagicMock:
+    """Install a real async-CM on gate.invoke_slot() that wires a real InvokeSlot.
+
+    Mirrors ``UsageGate.invoke_slot`` so tests that assert gate-level
+    mock calls (``gate.release_probe_slot(token)`` via ``__aexit__`` safety
+    net, ``gate.confirm_account_ok(token)``/``gate.on_agent_complete(cost)``
+    via ``slot.confirm``) exercise the real delegation.  Complements
+    ``_make_slot``/``_make_gate_yielding`` which wrap fully-mocked slots
+    for iteration-level control.
+    """
+    @contextlib.asynccontextmanager
+    async def _cm():
+        token = await gate.before_invoke()
+        slot = InvokeSlot(gate, token)
+        try:
+            yield slot
+        finally:
+            if not slot._settled:
+                gate.release_probe_slot(token)
+
+    gate.invoke_slot = _cm
+    return gate
 
 
 def _make_result(
@@ -415,6 +441,7 @@ class TestReleaseProbeSlotOnException:
         gate.on_agent_complete = MagicMock()
         gate.confirm_account_ok = MagicMock()
         gate.release_probe_slot = MagicMock()
+        _attach_invoke_slot(gate)
 
         with (
             patch(
@@ -435,6 +462,7 @@ class TestReleaseProbeSlotOnException:
         gate.before_invoke = AsyncMock(return_value='tok-a')
         gate.active_account_name = 'acct-a'
         gate.release_probe_slot = MagicMock()
+        _attach_invoke_slot(gate)
 
         with (
             patch(
@@ -456,6 +484,7 @@ class TestReleaseProbeSlotOnException:
         gate.active_account_name = 'acct-a'
         gate.confirm_account_ok = MagicMock()
         gate.release_probe_slot = MagicMock()
+        _attach_invoke_slot(gate)
 
         with (
             patch(
@@ -476,6 +505,7 @@ class TestReleaseProbeSlotOnException:
         gate.before_invoke = AsyncMock(return_value='tok-a')
         gate.active_account_name = 'acct-a'
         gate.release_probe_slot = MagicMock()
+        _attach_invoke_slot(gate)
 
         with (
             patch(
