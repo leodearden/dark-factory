@@ -1572,6 +1572,7 @@ def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
 
         async def start(self) -> None:
             pending = queue.get_by_task(task_id, status='pending', level=0)
+            assert pending, 'expected at least one pending L0 escalation to resolve'
             for esc in pending:
                 queue.resolve(
                     esc.id, 'Resolved by FakeSteward', resolved_by='fake-steward',
@@ -2316,6 +2317,9 @@ class TestMarkBlockedFalseDoneGuard:
         )
         assert statuses[-1] == 'pending', (
             f"Last scheduler status must be 'pending' after requeue, got: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE after empty-branch guard: {workflow.state!r}'
         )
 
     async def test_genuine_prior_merge_still_fast_paths_to_done(
