@@ -137,7 +137,7 @@ class InvokeSlot:
 
     __slots__ = ('_gate', 'token', 'account_name', '_settled')
 
-    def __init__(self, gate: 'UsageGate', token: str | None) -> None:
+    def __init__(self, gate: UsageGate, token: str | None) -> None:
         self._gate = gate
         self.token = token
         self.account_name = gate.active_account_name or ''
