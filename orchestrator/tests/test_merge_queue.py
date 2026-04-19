@@ -2241,6 +2241,7 @@ class TestSpeculativeItemDefaults:
         MergeRequest.result requires (we only care about the dataclass default).
         """
         from unittest.mock import MagicMock
+        from orchestrator.merge_queue import _elapsed_ms
         item = SpeculativeItem(
             request=MagicMock(),
             merge_result=None,
@@ -2250,6 +2251,8 @@ class TestSpeculativeItemDefaults:
             skip_verify=False,
         )
         assert item.started_monotonic is None
+        # Tie the default to the observability guarantee: None → NULL duration_ms
+        assert _elapsed_ms(item.started_monotonic) is None
 
 
 # ---------------------------------------------------------------------------
@@ -2333,14 +2336,22 @@ class TestEmitMergeAttemptHelper:
         assert outcome == 'done'
         assert dur is None, f'Expected NULL duration_ms, got {dur!r}'
 
-    def test_emit_merge_attempt_noop_when_event_store_is_none(
-        self, tmp_path: Path,
-    ):
-        """Call with event_store=None — no exception, no row written."""
+    def test_emit_merge_attempt_noop_when_event_store_is_none(self):
+        """Call with event_store=None — no exception, emit never invoked."""
         from orchestrator.merge_queue import _emit_merge_attempt
+        from unittest.mock import MagicMock
 
-        # Should not raise
+        mock_es = MagicMock()
+
+        # Affirmative case: emit IS called when a real (mock) store is provided.
+        _emit_merge_attempt(mock_es, 'task-check', 'done', duration_ms=1)
+        mock_es.emit.assert_called_once()
+
+        # None case: emit must NOT be called; call count must stay at 1.
         _emit_merge_attempt(None, 'task-4', 'done', duration_ms=1)
+        assert mock_es.emit.call_count == 1, (
+            'emit must not be called when event_store is None'
+        )
 
 
 # ---------------------------------------------------------------------------

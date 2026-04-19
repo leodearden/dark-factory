@@ -99,7 +99,7 @@ def _emit_merge_attempt(
     (e.g. ``dropped_plan_targets``, ``cas_exhausted``) ARE emitted here;
     only ``blocked`` outcomes from infrastructure failures are not.
     """
-    if event_store:
+    if event_store is not None:
         data: dict = {'outcome': outcome}
         if attempt is not None:
             data['attempt'] = attempt
@@ -670,6 +670,8 @@ class SpeculativeMergeWorker:
     def _emit_speculative(
         self, event_type: EventType, task_id: str, **data: object,
     ) -> None:
+        # Stays a method (not _emit_merge_attempt) because it emits
+        # speculative-specific event types — not generic merge_attempt rows.
         if self._event_store:
             self._event_store.emit(
                 event_type, task_id=task_id, phase='merge',
