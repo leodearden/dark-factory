@@ -1,6 +1,7 @@
 """Tests for orchestrator/verify.py, specifically _run_cmd bash executable handling."""
 
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -109,3 +110,31 @@ class TestRunCmdBashExecutable:
 
         assert rc == 0
         assert "custom_value" in stdout
+
+
+class TestRunCmdProcessGroup:
+    """Tests for _run_cmd process-group safety (SIGTERM propagation fix)."""
+
+    @pytest.mark.asyncio
+    async def test_run_cmd_passes_start_new_session_true(self, tmp_path: Path):
+        """_run_cmd must spawn subprocess with start_new_session=True.
+
+        Failing test — production _run_cmd doesn't pass that kwarg yet.
+        """
+        captured_kwargs: dict = {}
+
+        async def fake_shell(cmd, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b'hi\n', None))
+            proc.returncode = 0
+            return proc
+
+        with patch('orchestrator.verify.asyncio.create_subprocess_shell', side_effect=fake_shell):
+            rc, stdout, timed_out = await _run_cmd('echo hi', tmp_path, timeout=5.0)
+
+        assert captured_kwargs.get('start_new_session') is True, (
+            f'start_new_session not in subprocess kwargs: {captured_kwargs}'
+        )
+        assert rc == 0
+        assert not timed_out
