@@ -371,6 +371,10 @@ async def _run_cmd(
         if proc is not None:
             await terminate_process_group(proc, grace_secs=5.0)
         return 1, f'Command timed out after {timeout}s: {cmd}', True
+    except asyncio.CancelledError:
+        if proc is not None:
+            await terminate_process_group(proc, grace_secs=5.0)
+        raise
     except Exception as e:
         return 1, f'Command failed: {e}', False
 
