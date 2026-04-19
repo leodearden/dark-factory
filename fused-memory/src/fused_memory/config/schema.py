@@ -302,7 +302,7 @@ class CuratorConfig(BaseModel):
 
     enabled: bool = Field(default=True)
     model: str = Field(default='sonnet')
-    timeout_seconds: float = Field(default=60.0)
+    timeout_seconds: float = Field(default=240.0)
     max_budget_usd: float = Field(default=0.30)
 
     # Corpus caps — see design notes in shared/docs (the four-stream pool).
@@ -327,6 +327,24 @@ class CuratorConfig(BaseModel):
 
 # --- Top-level ---
 
+
+def _default_curator_usage_cap() -> UsageCapConfig:
+    """Construct the curator's default :class:`UsageCapConfig`.
+
+    Reads ``USAGE_ACCOUNTS_FILE`` if set (aligns with the orchestrator / eval
+    runner), otherwise falls back to the canonical shared accounts file. The
+    fused-memory server inherits the unset shell env, so it gets the shared
+    G→F→E→C→B→D pool used by the orchestrator — see memory note
+    ``project_eval_account_isolation.md``.
+    """
+    return UsageCapConfig(
+        accounts_file=os.environ.get(
+            'USAGE_ACCOUNTS_FILE',
+            '/home/leo/src/dark-factory/config/usage-accounts.yaml',
+        ),
+    )
+
+
 class FusedMemoryConfig(BaseSettings):
     """Fused Memory configuration with YAML and environment support."""
 
@@ -340,6 +358,9 @@ class FusedMemoryConfig(BaseSettings):
     taskmaster: TaskmasterConfig | None = Field(default=None)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
+    # Curator's usage-gate pool; independent from ``reconciliation.usage_cap``
+    # because each UsageGate instance tracks cap state per-process / per-loop.
+    usage_cap: UsageCapConfig | None = Field(default_factory=_default_curator_usage_cap)
 
     model_config = SettingsConfigDict(
         env_prefix='',

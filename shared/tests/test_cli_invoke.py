@@ -1248,6 +1248,20 @@ class TestParseClaudeOutputPropagatesTimedOut:
         agent = _parse_claude_output(sub)
         assert agent.timed_out is input_timed_out
 
+    def test_empty_output_preserves_duration_ms(self):
+        """A subprocess that produced no stdout (e.g. SIGTERM'd on timeout)
+        must forward its real duration to AgentResult so downstream heuristics
+        can distinguish a true zero-cost instant exit from a long timeout.
+        """
+        sub = _SubprocessResult(
+            stdout='', stderr='terminated', returncode=-15,
+            duration_ms=240_003, timed_out=True,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.subtype == 'error_empty_output'
+        assert agent.timed_out is True
+        assert agent.duration_ms == 240_003
+
 
 # ── schema salvage (R1) ────────────────────────────────────────────────────────
 

@@ -537,6 +537,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             subtype='error_empty_output',
             stderr=result.stderr,
             timed_out=result.timed_out,
+            duration_ms=result.duration_ms,
         )
 
     try:

@@ -26,6 +26,8 @@ from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 if TYPE_CHECKING:
+    from shared.usage_gate import UsageGate
+
     from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.middleware.curator_escalator import CuratorEscalator
     from fused_memory.middleware.task_file_committer import TaskFileCommitter
@@ -52,6 +54,7 @@ class TaskInterceptor:
         escalator: 'CuratorEscalator | None' = None,
         event_queue: 'EventQueue | None' = None,
         backlog_policy: 'BacklogPolicy | None' = None,
+        usage_gate: 'UsageGate | None' = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
@@ -74,6 +77,10 @@ class TaskInterceptor:
         self._config = config
         self._curator: TaskCurator | None = None
         self._escalator = escalator
+        # Forwarded to ``TaskCurator`` for cap-aware LLM invocation across the
+        # shared account pool. ``None`` falls back to the legacy single-shot
+        # path with no cap retry — preserved for tests.
+        self._usage_gate = usage_gate
         # R3: per-project async lock serialises add_task / add_subtask
         # calls. Concurrent triages of the same suggestion no longer race
         # to create duplicate tasks — the second call waits, sees the
@@ -433,6 +440,7 @@ class TaskInterceptor:
                 taskmaster=self.taskmaster,
                 cwd=cwd,
                 escalator=self._escalator,
+                usage_gate=self._usage_gate,
             )
             # Trigger the one-shot backfill check as a background task so the
             # caller is not delayed by the Qdrant count() round-trip.
