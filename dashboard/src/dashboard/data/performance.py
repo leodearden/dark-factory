@@ -265,6 +265,86 @@ async def aggregate_loop_histograms(
     return merged
 
 
+async def _durations_by_project(
+    db: aiosqlite.Connection | None,
+    *,
+    days: int = 7,
+) -> dict[str, list[int]]:
+    """Return raw ``duration_ms`` lists per project_id (internal helper).
+
+    Unlike :func:`get_time_centiles`, this function preserves the raw sample
+    list so that :func:`aggregate_time_centiles` can concatenate samples from
+    multiple DBs before computing percentiles on the unified distribution.
+    """
+
+    async def _query(db: aiosqlite.Connection) -> dict[str, list[int]]:
+        cutoffs = await _project_cutoffs(db, days)
+        if not cutoffs:
+            return {}
+
+        result: dict[str, list[int]] = {}
+        for project_id, cutoff in cutoffs.items():
+            rows = await db.execute_fetchall(
+                'SELECT duration_ms FROM task_results '
+                " WHERE project_id = ? AND completed_at >= ? AND outcome = 'done' "
+                ' ORDER BY duration_ms ',
+                (project_id, cutoff),
+            )
+            result[project_id] = [
+                row[0] for row in rows
+                if row[0] is not None and row[0] > 0
+            ]
+
+        return result
+
+    return await with_db(db, _query, {})
+
+
+async def aggregate_time_centiles(
+    dbs: list[aiosqlite.Connection | None],
+    *,
+    days: int = 7,
+) -> dict[str, dict]:
+    """Merge time-centile data from multiple databases.
+
+    Calls :func:`_durations_by_project` per DB to collect raw duration
+    samples, concatenates them per project_id, then computes p50/p75/p90/p95
+    from the unified sample distribution so percentiles are exact (not
+    averages of per-DB percentiles).  ``count`` is the total number of tasks
+    across all DBs.
+    """
+    if not dbs:
+        return {}
+
+    results = await asyncio.gather(
+        *(_durations_by_project(db, days=days) for db in dbs)
+    )
+
+    # Merge: concatenate raw duration lists per project_id
+    merged: dict[str, list[int]] = {}
+    for result in results:
+        for pid, durations in result.items():
+            if pid not in merged:
+                merged[pid] = []
+            merged[pid].extend(durations)
+
+    # Compute percentiles from the merged (concatenated) sample
+    final: dict[str, dict] = {}
+    for pid, durations in merged.items():
+        if not durations:
+            final[pid] = {'p50': 0, 'p75': 0, 'p90': 0, 'p95': 0, 'count': 0}
+            continue
+        durations.sort()
+        final[pid] = {
+            'p50': round(percentile(durations, 50)),
+            'p75': round(percentile(durations, 75)),
+            'p90': round(percentile(durations, 90)),
+            'p95': round(percentile(durations, 95)),
+            'count': len(durations),
+        }
+    return final
+
+
 # ---------------------------------------------------------------------------
 # 2. Escalation rates
 # ---------------------------------------------------------------------------
