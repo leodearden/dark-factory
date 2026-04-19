@@ -2310,6 +2310,77 @@ class TestMarkBlockedFalseDoneGuard:
             f"Last scheduler status must be 'pending' after requeue, got: {statuses}"
         )
 
+    async def test_genuine_prior_merge_still_fast_paths_to_done(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Positive control: branch with impl entry + merged to main must still fast-path to DONE.
+
+        Verifies the guard is not over-conservative: when a real implementer
+        iteration entry exists and the branch HEAD is a genuine ancestor of main
+        (because it was merged), _mark_blocked must still return DONE.
+        """
+        import json as _json
+
+        # 1. Create worktree and write an implementer iteration entry
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+
+        # 2. Make a real implementation commit on the branch and merge it to main
+        (wt / 'farewell.py').write_text('def farewell(name):\n    return f"Bye, {name}"\n')
+        await git_ops.commit(wt, 'Implement farewell')
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # 3. Build workflow with escalation queue, wire up worktree and artifacts
+        #    (has implementer iteration entry → _has_prior_implementation() returns True)
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 4. FakeSteward resolves all pending L0 escalations immediately in start()
+        class _FakeSteward:
+            def __init__(self_inner, wt_path, cfg_dir):
+                pass
+
+            async def start(self_inner):
+                pending = queue.get_by_task(
+                    task_assignment.task_id, status='pending', level=0,
+                )
+                for esc in pending:
+                    queue.resolve(
+                        esc.id, 'Resolved by FakeSteward', resolved_by='fake-steward',
+                    )
+
+            async def stop(self_inner):
+                pass
+
+        workflow._steward_factory = _FakeSteward
+
+        # 5. Call _mark_blocked directly
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        # 6. Assertions: genuine prior merge must still fast-path to DONE
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE for genuine prior merge but got {outcome!r} — '
+            'the _has_prior_implementation guard is too conservative'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert statuses[-1] == 'done', (
+            f"Last scheduler status must be 'done' for genuine prior merge, got: {statuses}"
+        )
+        assert workflow.state == WorkflowState.DONE
+
 
 # ---------------------------------------------------------------------------
 # File-structure invariants
