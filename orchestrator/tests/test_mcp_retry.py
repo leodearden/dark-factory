@@ -134,10 +134,15 @@ class TestRawCallRetry:
         ):
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-            with pytest.raises(httpx.ConnectError):
+            # Exhausted retries now raise RuntimeError carrying the original
+            # exception type + message so downstream loggers produce something
+            # diagnostic even when str(exc) is empty (e.g. httpx.ReadTimeout).
+            with pytest.raises(RuntimeError) as excinfo:
                 await session._raw_call('tools/call', {'name': 't', 'arguments': {}})
 
         assert mock_client.post.call_count == _MCP_MAX_RETRIES
+        assert 'ConnectError' in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, httpx.ConnectError)
 
     @pytest.mark.asyncio
     async def test_clears_initialized_on_retry(self):
@@ -159,6 +164,64 @@ class TestRawCallRetry:
 
         # _initialized cleared during retry so call_tool will re-init
         assert session._initialized is False
+
+    @pytest.mark.asyncio
+    async def test_retries_on_read_timeout(self):
+        """Motivating fix (2026-04-20): httpx.ReadTimeout is now in the
+        retry except clause. Before this fix, a ReadTimeout propagated
+        directly out of _raw_call with empty str(exc), producing empty
+        'Failed to set task X status to Y:' error lines in orchestrator
+        logs when fused-memory was briefly slow (e.g. curator LLM call
+        inside add_task held the project lock for 30s).
+        """
+        session = McpSession('http://localhost:8002')
+        ok = _make_response()
+        mock_client = AsyncMock()
+        # First two attempts time out; third succeeds.
+        mock_client.post.side_effect = [
+            httpx.ReadTimeout(''),
+            httpx.ReadTimeout(''),
+            ok,
+        ]
+
+        with (
+            patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await session._raw_call(
+                'tools/call', {'name': 't', 'arguments': {}},
+            )
+
+        assert mock_client.post.call_count == 3
+        assert result['result']['ok'] is True
+
+    @pytest.mark.asyncio
+    async def test_exhausted_read_timeout_wrapped_in_runtimeerror(self):
+        """When retries exhaust on ReadTimeout (empty str), the wrapped
+        RuntimeError MUST carry the exception type name so log lines
+        produce diagnostic output instead of an empty string."""
+        session = McpSession('http://localhost:8002')
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = httpx.ReadTimeout('')
+
+        with (
+            patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            with pytest.raises(RuntimeError) as excinfo:
+                await session._raw_call(
+                    'tools/call', {'name': 't', 'arguments': {}},
+                )
+
+        assert mock_client.post.call_count == _MCP_MAX_RETRIES
+        # The wrapped message must contain the type name so that downstream
+        # loggers produce something useful even when str(exc) is empty.
+        assert 'ReadTimeout' in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, httpx.ReadTimeout)
 
 
 class TestRawNotifyRetry:

@@ -81,11 +81,30 @@ class TaskInterceptor:
         # shared account pool. ``None`` falls back to the legacy single-shot
         # path with no cap retry — preserved for tests.
         self._usage_gate = usage_gate
-        # R3: per-project async lock serialises add_task / add_subtask
-        # calls. Concurrent triages of the same suggestion no longer race
-        # to create duplicate tasks — the second call waits, sees the
-        # first's ``note_created`` entry, and short-circuits to drop.
-        self._project_locks: dict[str, asyncio.Lock] = {}
+        # Split per-project locks (2026-04-20):
+        #
+        # ``_write_locks`` (short, high-frequency) serialises tasks.json
+        # mutations for every write op (set_task_status, update_task,
+        # add_dependency, remove_dependency, and the actual tm.add_task
+        # write inside add_task). Held only across the fast Taskmaster
+        # stdio call. Every mutation takes this lock.
+        #
+        # ``_curator_locks`` (long, curator-family) serialises the
+        # add_task / add_subtask / expand_task / parse_prd / remove_task
+        # flow so concurrent candidates can't both decide "create" for
+        # a duplicate. Held across ``curator.curate()`` (an LLM round-trip,
+        # 25-35s tail) plus the synchronous ``note_created`` + awaited
+        # ``record_task`` so the NEXT waiter on the curator lock sees the
+        # new entry on its pre-LLM check (R3).
+        #
+        # Lock ordering is always curator_lock BEFORE write_lock to avoid
+        # deadlock. Write-only ops take just write_lock, so a long curator
+        # call on a project no longer blocks status updates on the same
+        # project — fixing the symptom that caused 50+ spurious "Failed to
+        # set task X status to Y: " errors in the reify orchestrator run
+        # on 2026-04-20.
+        self._write_locks: dict[str, asyncio.Lock] = {}
+        self._curator_locks: dict[str, asyncio.Lock] = {}
         # One-shot flag: prevents redundant auto-backfill checks on subsequent calls.
         self._backfill_triggered: bool = False
         # Set by close(); prevents _get_curator() from re-creating a curator.
@@ -221,7 +240,7 @@ class TaskInterceptor:
         # write so two concurrent status transitions can't observe the
         # same before-state and both mutate tasks.json.
         resolved_provenance: dict | None = None
-        async with self._project_lock(project_id):
+        async with self._write_lock(project_id):
             # 1. Get before-state
             before = await tm.get_task(task_id, project_root, tag)
 
@@ -320,7 +339,7 @@ class TaskInterceptor:
         # WP-E: serialise the pre-snapshot + bulk mutation + commit so a
         # concurrent add_task can't slip a task into the snapshot gap and
         # get misclassified as newly-bulk-created.
-        async with self._project_lock(project_id):
+        async with self._write_lock(project_id):
             # Pre-snapshot: capture the task tree before Taskmaster generates subtasks
             try:
                 pre_snapshot = await tm.get_tasks(project_root)
@@ -389,7 +408,7 @@ class TaskInterceptor:
 
         # WP-E: serialise pre-snapshot + bulk mutation + commit; see
         # expand_task for the rationale.
-        async with self._project_lock(project_id):
+        async with self._write_lock(project_id):
             # Pre-snapshot: capture the task tree before Taskmaster generates tasks
             try:
                 pre_snapshot = await tm.get_tasks(project_root)
@@ -762,7 +781,7 @@ class TaskInterceptor:
             if decision.action == 'drop' and decision.target_id:
                 try:
                     # WP-E: serialise the tasks.json mutation.
-                    async with self._project_lock(project_id):
+                    async with self._write_lock(project_id):
                         await tm.remove_task(tid, project_root)
                     removed.append({
                         'task_id': tid,
@@ -784,7 +803,7 @@ class TaskInterceptor:
                 # task — hold the lock across both so no concurrent writer
                 # can observe the intermediate "new still present" state.
                 try:
-                    async with self._project_lock(project_id):
+                    async with self._write_lock(project_id):
                         combine_result = await self._execute_combine(project_root, decision)
                         if combine_result is None:
                             kept.append({'task_id': tid, 'title': title})
@@ -831,12 +850,36 @@ class TaskInterceptor:
 
     # ── Write pass-throughs (emit event, no targeted reconciliation) ───
 
-    def _project_lock(self, project_id: str) -> asyncio.Lock:
-        """Return (lazily) the per-project serialisation lock for adds."""
-        lock = self._project_locks.get(project_id)
+    def _write_lock(self, project_id: str) -> asyncio.Lock:
+        """Per-project lock for tasks.json mutations.
+
+        Short-held; covers only the Taskmaster stdio write. Every mutating
+        op (set_task_status, update_task, add_dependency, remove_dependency,
+        the actual tm.add_task/tm.add_subtask/tm.remove_task calls, and the
+        bulk expand/parse_prd pre-snapshot+mutation) takes this lock.
+        """
+        lock = self._write_locks.get(project_id)
         if lock is None:
             lock = asyncio.Lock()
-            self._project_locks[project_id] = lock
+            self._write_locks[project_id] = lock
+        return lock
+
+    def _curator_lock(self, project_id: str) -> asyncio.Lock:
+        """Per-project lock for curator-family operations.
+
+        Long-held; covers ``curator.curate()`` (LLM round-trip) plus the
+        post-write ``note_created``/``record_task`` steps so the next waiter
+        on this lock sees the new entry on its pre-LLM check.
+
+        Taken by: add_task, add_subtask, remove_task (conservative: protects
+        concurrent combine-target integrity). Lock order: curator_lock BEFORE
+        write_lock. Short writes (set_task_status etc.) never take this lock
+        and so are not blocked by an in-flight curator decision.
+        """
+        lock = self._curator_locks.get(project_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._curator_locks[project_id] = lock
         return lock
 
     @staticmethod
@@ -924,7 +967,11 @@ class TaskInterceptor:
         candidate = self._build_candidate(kwargs_for_candidate)
         project_id = resolve_project_id(project_root)
 
-        async with self._project_lock(project_id):
+        # Hold curator_lock across the whole add flow (curator.curate +
+        # tm.add_task + note_created + record_task). write_lock is acquired
+        # internally for the brief tm.add_task call. See _write_lock /
+        # _curator_lock docstrings.
+        async with self._curator_lock(project_id):
             return await self._add_task_locked(
                 project_root=project_root,
                 project_id=project_id,
@@ -974,7 +1021,10 @@ class TaskInterceptor:
                 }
 
             if decision.action == 'combine' and decision.target_id:
-                combine_result = await self._execute_combine(project_root, decision)
+                # _execute_combine writes (tm.update_task) — wrap in write_lock.
+                # curator_lock is already held by the caller.
+                async with self._write_lock(project_id):
+                    combine_result = await self._execute_combine(project_root, decision)
                 if combine_result is not None:
                     logger.warning(
                         'task_curator: combine — folded candidate into task %s: %s',
@@ -1029,44 +1079,49 @@ class TaskInterceptor:
         # Atomic path: pass metadata in the initial add_task so the task is
         # never visible without its metadata (prevents the race that dropped
         # files_to_modify under concurrent load — see task #1922).
-        try:
-            result = await tm.add_task(
-                project_root=project_root,
-                metadata=metadata_json,
-                **kwargs,
-            )
-            atomic_metadata_written = metadata_json is not None
-        except TypeError:
-            # Backwards-compat: pre-R5 taskmaster backends reject the new
-            # ``metadata`` kwarg. Fall through to the legacy two-step path.
-            result = await tm.add_task(project_root=project_root, **kwargs)
-            atomic_metadata_written = False
-
-        # Legacy fallback: follow-up update_task when the atomic write was
-        # unavailable. Racy by construction; kept only for rollout safety
-        # while both sides upgrade.
-        task_id = None
-        if isinstance(result, dict):
-            task_id = str(result.get('id', ''))
-        if metadata_json and task_id and not atomic_metadata_written:
+        # Writes are wrapped in write_lock so concurrent set_task_status /
+        # update_task calls see a consistent tasks.json view; curator_lock
+        # is already held by the outer caller.
+        async with self._write_lock(project_id):
             try:
-                await tm.update_task(
-                    task_id=task_id,
-                    metadata=metadata_json,
+                result = await tm.add_task(
                     project_root=project_root,
+                    metadata=metadata_json,
+                    **kwargs,
                 )
-            except Exception as e:
-                logger.warning(
-                    f'add_task: metadata update for task {task_id} failed: {e}',
-                )
+                atomic_metadata_written = metadata_json is not None
+            except TypeError:
+                # Backwards-compat: pre-R5 taskmaster backends reject the new
+                # ``metadata`` kwarg. Fall through to the legacy two-step path.
+                result = await tm.add_task(project_root=project_root, **kwargs)
+                atomic_metadata_written = False
+
+            # Legacy fallback: follow-up update_task when the atomic write
+            # was unavailable. Racy by construction; kept only for rollout
+            # safety while both sides upgrade.
+            task_id = None
+            if isinstance(result, dict):
+                task_id = str(result.get('id', ''))
+            if metadata_json and task_id and not atomic_metadata_written:
+                try:
+                    await tm.update_task(
+                        task_id=task_id,
+                        metadata=metadata_json,
+                        project_root=project_root,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f'add_task: metadata update for task {task_id} failed: {e}',
+                    )
 
         # Record survivor in the curator. Two layers:
         # 1. ``note_created`` — synchronous, in-memory exact-match cache.
-        #    MUST run inside the project lock so the *next* waiter on the
-        #    same lock sees the new entry on its pre-LLM check (R3).
+        #    MUST run inside ``_curator_lock`` so the *next* waiter on the
+        #    curator lock sees the new entry on its pre-LLM check (R3).
+        #    Not inside ``_write_lock`` — that's for tasks.json only.
         # 2. ``record_task`` — awaited (not fire-and-forget) so the Qdrant
-        #    corpus has the point before the lock releases, letting a
-        #    near-miss follower's embedding lookup see it too.
+        #    corpus has the point before the curator lock releases, letting
+        #    a near-miss follower's embedding lookup see it too.
         if curator is not None and candidate is not None and task_id:
             curator.note_created(project_id, candidate, task_id)
             try:
@@ -1095,7 +1150,7 @@ class TaskInterceptor:
         project_id = resolve_project_id(project_root)
         # WP-E: serialise the write; re-embed below reads only and stays
         # outside the lock.
-        async with self._project_lock(project_id):
+        async with self._write_lock(project_id):
             result = await tm.update_task(
                 task_id=task_id, project_root=project_root, **kwargs,
             )
@@ -1158,7 +1213,9 @@ class TaskInterceptor:
             return err
         candidate = self._build_candidate(kwargs)
         project_id = resolve_project_id(project_root)
-        async with self._project_lock(project_id):
+        # curator_lock across curator.curate + note_created/record_task;
+        # write_lock acquired internally for the brief tm.add_subtask call.
+        async with self._curator_lock(project_id):
             return await self._add_subtask_locked(
                 parent_id=parent_id,
                 project_root=project_root,
@@ -1196,7 +1253,10 @@ class TaskInterceptor:
                     'justification': decision.justification,
                 }
             if decision.action == 'combine' and decision.target_id:
-                combine_result = await self._execute_combine(project_root, decision)
+                # _execute_combine writes; wrap in write_lock (curator_lock
+                # is already held by the caller).
+                async with self._write_lock(project_id):
+                    combine_result = await self._execute_combine(project_root, decision)
                 if combine_result is not None:
                     logger.warning(
                         'task_curator: combine (subtask) — folded into task %s',
@@ -1214,9 +1274,13 @@ class TaskInterceptor:
                     }
 
         tm = await self._ensure_taskmaster()
-        result = await tm.add_subtask(
-            parent_id=parent_id, project_root=project_root, **kwargs,
-        )
+        # write_lock across the actual tm.add_subtask call so concurrent
+        # set_task_status / update_task on the same project see a consistent
+        # tasks.json view.
+        async with self._write_lock(project_id):
+            result = await tm.add_subtask(
+                parent_id=parent_id, project_root=project_root, **kwargs,
+            )
         event = self._make_event(
             EventType.task_created,
             project_root,
@@ -1247,8 +1311,17 @@ class TaskInterceptor:
             return err
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
-        # WP-E: serialise against concurrent mutations on the same project.
-        async with self._project_lock(project_id):
+        # curator_lock (conservative): a concurrent add_task / add_subtask
+        # curator decision of ``combine target=task_id`` would hold the
+        # curator_lock; blocking remove_task here prevents the target
+        # from vanishing between the curator's decision and
+        # _execute_combine's guarded write. _execute_combine also has a
+        # fingerprint-and-status guard that degrades to ``create`` on
+        # mismatch, so this is belt-and-braces, not load-bearing.
+        async with (
+            self._curator_lock(project_id),
+            self._write_lock(project_id),
+        ):
             result = await tm.remove_task(task_id, project_root, tag)
         event = self._make_event(
             EventType.task_deleted,
@@ -1271,7 +1344,7 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
         # WP-E: serialise against concurrent mutations on the same project.
-        async with self._project_lock(project_id):
+        async with self._write_lock(project_id):
             result = await tm.add_dependency(
                 task_id, depends_on, project_root, tag
             )
@@ -1296,7 +1369,7 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
         # WP-E: serialise against concurrent mutations on the same project.
-        async with self._project_lock(project_id):
+        async with self._write_lock(project_id):
             result = await tm.remove_dependency(
                 task_id, depends_on, project_root, tag
             )
