@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -739,6 +740,73 @@ class TestAggregateLoopHistograms:
         """`dbs=[None, None]` returns empty dict."""
         result = await aggregate_loop_histograms([None, None], days=7)
         assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_mismatched_histogram_lengths_warn_and_skip(self, monkeypatch, caplog):
+        """Mismatched values length across DBs triggers warning and skips the merge.
+
+        First DB (baseline): outer has 4 values, inner has 6 values.
+        Second DB: outer has 6 values (longer — IndexError-prone), inner has 6 (matched).
+
+        Expected behaviour after the fix:
+        - No exception raised.
+        - A WARNING log record contains 'mismatch' and 'proj'.
+        - outer.values equals the baseline [1, 2, 3, 4] (skipped, not corrupted).
+        - inner.values equals the element-wise sum (matched shape merges normally).
+        """
+        call_count = 0
+
+        async def _fake_get_loop_histograms(db, *, days):  # noqa: ARG001
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Baseline (first DB)
+                return {
+                    'proj': {
+                        'outer': {'labels': ['0', '1', '2', '3+'], 'values': [1, 2, 3, 4]},
+                        'inner': {
+                            'labels': ['0', '1', '2', '3', '4', '5+'],
+                            'values': [1, 1, 1, 1, 1, 1],
+                        },
+                    },
+                }
+            else:
+                # Second DB: outer has 6 values (mismatch), inner has 6 (match)
+                return {
+                    'proj': {
+                        'outer': {
+                            'labels': ['0', '1', '2', '3', '4', '5+'],
+                            'values': [5, 6, 7, 8, 9, 10],
+                        },
+                        'inner': {
+                            'labels': ['0', '1', '2', '3', '4', '5+'],
+                            'values': [2, 3, 4, 5, 6, 7],
+                        },
+                    },
+                }
+
+        monkeypatch.setattr(
+            'dashboard.data.performance.get_loop_histograms',
+            _fake_get_loop_histograms,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.performance'):
+            result = await aggregate_loop_histograms([None, None], days=7)
+
+        # (a) No IndexError — we got here
+        assert 'proj' in result
+
+        # (b) At least one WARNING record mentions 'mismatch' and 'proj'
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('mismatch' in t and 'proj' in t for t in warning_texts), (
+            f'Expected mismatch warning mentioning proj; got: {warning_texts}'
+        )
+
+        # (c) Mismatched outer.values preserved as baseline (skip-on-mismatch)
+        assert result['proj']['outer']['values'] == [1, 2, 3, 4]
+
+        # (d) Matched inner.values is element-wise summed: [1+2, 1+3, 1+4, 1+5, 1+6, 1+7]
+        assert result['proj']['inner']['values'] == [3, 4, 5, 6, 7, 8]
 
 
 # ---------------------------------------------------------------------------
