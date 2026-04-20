@@ -214,6 +214,9 @@ def test_sigterm_reaps_subprocess_and_no_stragglers(tmp_path: Path):
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
+    # start_new_session=True guarantees pgid == pid at spawn; frozen int
+    # avoids PID-reuse foot-gun after proc.wait().
+    pgid = proc.pid
 
     try:
         deadline = time.monotonic() + 10.0
@@ -229,13 +232,13 @@ def test_sigterm_reaps_subprocess_and_no_stragglers(tmp_path: Path):
             rc = proc.wait(timeout=20.0)
         except subprocess.TimeoutExpired as exc:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(pgid, signal.SIGKILL)
             raise AssertionError('shutdown hung') from exc
         assert rc == 0
     finally:
         if proc.poll() is None:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(pgid, signal.SIGKILL)
             proc.wait(timeout=5.0)
 
 
