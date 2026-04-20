@@ -2445,6 +2445,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                                     self._enter_phase(WorkflowState.DONE)
                                     await self.scheduler.set_task_status(
                                         self.task_id, 'done',
+                                        done_provenance={
+                                            'note': (
+                                                'branch already on main '
+                                                'after escalation resolution'
+                                            ),
+                                        },
                                     )
                                     return WorkflowOutcome.DONE
                         except Exception:
