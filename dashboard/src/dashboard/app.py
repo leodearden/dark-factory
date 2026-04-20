@@ -94,10 +94,10 @@ def _parse_window(request: Any) -> int:
     """Parse the ``window`` query parameter and return the corresponding days int.
 
     Valid values: '24h' → 1, '7d' → 7, '30d' → 30, 'all' → 3650.
-    Missing or unknown values default to 7.
+    Missing or unknown values default to 30.
     """
-    window = request.query_params.get('window', '7d')
-    return _WINDOW_DAYS.get(window, 7)
+    window = request.query_params.get('window', '30d')
+    return _WINDOW_DAYS.get(window, 30)
 
 
 _T = TypeVar('_T')
@@ -332,15 +332,15 @@ async def index(request: Request):
 
 @app.get('/costs')
 async def costs(request: Request):
-    window_raw = request.query_params.get('window', '7d')
-    window = window_raw if window_raw in _WINDOW_DAYS else '7d'
+    window_raw = request.query_params.get('window', '30d')
+    window = window_raw if window_raw in _WINDOW_DAYS else '30d'
     return templates.TemplateResponse(request, 'costs.html', context={'window': window})
 
 
 @app.get('/burndown')
 async def burndown(request: Request):
-    window_raw = request.query_params.get('window', '7d')
-    window = window_raw if window_raw in _BURNDOWN_WINDOWS else '7d'
+    window_raw = request.query_params.get('window', '30d')
+    window = window_raw if window_raw in _BURNDOWN_WINDOWS else '30d'
     return templates.TemplateResponse(request, 'burndown.html', context={'window': window})
 
 
@@ -702,7 +702,7 @@ async def partials_merge_queue(request: Request):
     dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     hours = days * 24
-    window_raw = request.query_params.get('window', '7d')
+    window_raw = request.query_params.get('window', '30d')
 
     effective_now = datetime.now(UTC)
     depth, outcomes, latency, recent, spec = await asyncio.gather(
@@ -765,8 +765,8 @@ async def burndown_partials_charts(request: Request):
     config = request.app.state.config
     pool: DbPool = request.app.state.db
     dbs = await _burndown_dbs(config, pool)
-    window_raw = request.query_params.get('window', '7d')
-    days = _BURNDOWN_WINDOWS.get(window_raw, 7)
+    window_raw = request.query_params.get('window', '30d')
+    days = _BURNDOWN_WINDOWS.get(window_raw, 30)
     try:
         projects = await aggregate_burndown_projects(dbs)
         series: dict = {}
