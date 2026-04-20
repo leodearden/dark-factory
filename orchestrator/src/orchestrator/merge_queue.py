@@ -398,7 +398,7 @@ class MergeWorker:
             self._cas_retries.pop(req.task_id, None)
             logger.info(f'Task {req.task_id}: merged to main successfully')
             _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(t0))
-            return MergeOutcome('done')
+            return MergeOutcome('done', merge_sha=merge_result.merge_commit)
 
         if result in ('wip_overlap', 'pop_conflict'):
             # Halt the queue globally — no more merges until resolved
