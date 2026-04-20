@@ -329,8 +329,12 @@ class McpLifecycle:
         logger.info('Stopping fused-memory HTTP server')
         _session = None
         try:
-            if self._pgid is not None:
-                await terminate_process_group(self._process, self._pgid, grace_secs=10.0)
+            # If start() crashed between subprocess spawn and self._pgid assignment,
+            # fall back to self._process.pid — start_new_session=True guarantees
+            # pgid == pid while the proc is unreaped, and _unsafe_pgid_reason enforces
+            # that invariant.
+            pgid = self._pgid if self._pgid is not None else self._process.pid
+            await terminate_process_group(self._process, pgid, grace_secs=10.0)
         except Exception as exc:
             logger.warning('Failed to terminate fused-memory server: %s', exc)
         finally:
