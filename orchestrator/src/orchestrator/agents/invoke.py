@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+# Re-export shared Claude invocation primitives for backwards compatibility
 from shared.cli_invoke import (  # noqa: F401
     CAP_HIT_RESUME_PROMPT,
     AgentResult,
@@ -25,7 +26,7 @@ from shared.cli_invoke import (  # noqa: F401
     invoke_claude_agent,
 )
 
-# Re-export shared Claude invocation primitives for backwards compatibility
+# Process-group termination helper for subprocess tree cleanup
 from shared.proc_group import terminate_process_group
 
 if TYPE_CHECKING:

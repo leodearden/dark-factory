@@ -282,11 +282,16 @@ class TestCapHitResume:
 class TestRunSubprocessLocalTimedOut:
 
     async def test_run_subprocess_local_sets_timed_out_on_timeout(self, tmp_path):
-        """_run_subprocess_local sets timed_out=True when TimeoutError fires."""
+        """_run_subprocess_local propagates timed_out=True when TimeoutError fires.
+
+        This test only verifies that the timed_out flag and error message are
+        set correctly on the returned SubprocessResult.  It does not assert
+        that terminate_process_group is called — that is covered by a separate
+        test that patches the helper directly.
+        """
         proc = MagicMock()
-        proc.pid = 99999  # must be int; pgid = proc.pid in invoke.py
+        proc.pid = 12345  # int required so pgid safety-check doesn't TypeError
         proc.communicate = AsyncMock(side_effect=TimeoutError)
-        proc.kill = MagicMock()
         proc.wait = AsyncMock()
         proc.returncode = None
 
@@ -303,6 +308,35 @@ class TestRunSubprocessLocalTimedOut:
         assert result.timed_out is True
         assert 'Process killed after' in result.stderr and 'timeout' in result.stderr
         assert result.returncode == 1
+
+    async def test_run_subprocess_local_timeout_calls_terminate_process_group(self, tmp_path):
+        """terminate_process_group is awaited (not proc.kill) when TimeoutError fires."""
+        proc = MagicMock()
+        proc.pid = 12345  # int so pgid capture and safety-check pass
+        proc.communicate = AsyncMock(side_effect=TimeoutError)
+        proc.wait = AsyncMock()
+        proc.returncode = None
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('orchestrator.agents.invoke.asyncio.create_subprocess_exec',
+                  side_effect=fake_exec),
+            patch('orchestrator.agents.invoke.terminate_process_group',
+                  new_callable=AsyncMock) as mock_tpg,
+        ):
+            result = await _run_subprocess_local(
+                ['fake'], cwd=tmp_path, env={}, backend='codex', model='gpt-5.4',
+                max_budget_usd=1.0, timeout_seconds=0.1,
+            )
+
+        mock_tpg.assert_awaited_once()
+        # First positional arg must be the proc, second must be the captured pgid
+        call_args = mock_tpg.call_args
+        assert call_args.args[0] is proc
+        assert call_args.args[1] == 12345
+        assert result.timed_out is True
 
 
 _CODEX_VALID_JSONL_STDOUT = (
