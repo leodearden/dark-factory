@@ -313,6 +313,9 @@ def test_sigterm_reaps_verify_subprocess_tree(tmp_path: Path):
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
+    # start_new_session=True guarantees pgid == pid at spawn; frozen int
+    # avoids PID-reuse foot-gun after proc.wait().
+    pgid = proc.pid
 
     try:
         deadline = time.monotonic() + 10.0
@@ -330,7 +333,7 @@ def test_sigterm_reaps_verify_subprocess_tree(tmp_path: Path):
             rc = proc.wait(timeout=10.0)
         except subprocess.TimeoutExpired as exc:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(pgid, signal.SIGKILL)
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5.0)
             raise AssertionError(
@@ -343,8 +346,9 @@ def test_sigterm_reaps_verify_subprocess_tree(tmp_path: Path):
 
         # After the child exits, its process group (session == child itself,
         # since start_new_session=True) should be fully gone.
+        # pgid captured at spawn — see start_new_session=True above.
         try:
-            os.killpg(os.getpgid(proc.pid), 0)
+            os.killpg(pgid, 0)
             still_alive = True
         except ProcessLookupError:
             still_alive = False
@@ -352,6 +356,6 @@ def test_sigterm_reaps_verify_subprocess_tree(tmp_path: Path):
     finally:
         if proc.poll() is None:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(pgid, signal.SIGKILL)
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5.0)
