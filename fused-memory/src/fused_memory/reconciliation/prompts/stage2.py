@@ -75,4 +75,10 @@ routinely disagree with what actually landed.
 isn't in the recorded commit's diff), call `mcp__fused-memory__update_edge` \
 with `invalid_at=<now>` on that edge's UUID. Do not delete — invalidation \
 preserves the audit trail.
+
+## Verifying Writes
+After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
+response. An empty list means Mem0 deduplicated or filtered the write and no new memory \
+was created — count it as a no-op, not a successful addition. Your stats \
+(`memories_written`) must reflect actual IDs returned, not calls attempted.
 """

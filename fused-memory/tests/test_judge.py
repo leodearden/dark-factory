@@ -8,7 +8,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import JudgeVerdict, VerdictSeverity
+from fused_memory.models.reconciliation import (
+    JudgeVerdict,
+    VerdictAction,
+    VerdictSeverity,
+)
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
@@ -269,6 +273,66 @@ async def test_build_review_prompt_handles_error_dict_entries(mock_journal):
     assert 'memory_consolidator' in prompt
     # The prompt should also contain the error dict key
     assert '_error' in prompt
+
+
+@pytest.mark.asyncio
+async def test_build_review_prompt_excludes_recent_verdicts(mock_journal):
+    """Regression: verdict history must not be serialized into the LLM prompt.
+
+    Including prior verdicts caused a feedback loop where the LLM generated
+    'systemic_trend' findings whenever recent verdicts were moderate, keeping
+    projects halted indefinitely. The code-side _check_error_trends is the
+    intended trend-detection mechanism.
+    """
+
+    from fused_memory.models.reconciliation import (
+        ReconciliationRun,
+        RunStatus,
+        RunType,
+        StageId,
+        StageReport,
+    )
+
+    config = _make_judge_config()
+    judge = Judge(config=config, journal=mock_journal)
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='run-feedback-loop',
+        project_id='reify',
+        run_type=RunType.full,
+        trigger_reason='test',
+        started_at=now,
+        events_processed=0,
+        status=RunStatus.completed,
+        stage_reports={
+            'memory_consolidator': StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=now,
+                completed_at=now,
+                stats={'memories_added': 1},
+            ),
+        },
+    )
+
+    prior_verdicts = [
+        JudgeVerdict(
+            run_id=f'prior-{i}',
+            reviewed_at=now,
+            severity=VerdictSeverity.moderate,
+            findings=[{'issue': f'finding-{i}'}],
+            action_taken=VerdictAction.rollback,
+        )
+        for i in range(10)
+    ]
+
+    prompt = judge._build_review_prompt(
+        run, entries=[], recent_verdicts=prior_verdicts,
+    )
+
+    assert 'Recent Judge Verdicts' not in prompt
+    assert 'trend context' not in prompt
+    for v in prior_verdicts:
+        assert v.run_id not in prompt
 
 
 @pytest.mark.asyncio

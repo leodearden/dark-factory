@@ -87,6 +87,12 @@ class Judge:
 
     def _build_review_prompt(self, run, entries, recent_verdicts,
                              combined_actions: list[dict] | None = None) -> str:
+        # recent_verdicts is intentionally NOT fed into the LLM prompt.
+        # _check_error_trends handles systemic-pattern detection in code; exposing the
+        # history here caused a feedback loop where the LLM generated 'systemic_trend'
+        # findings whenever prior verdicts were non-ok, keeping the streak alive.
+        del recent_verdicts
+
         entry_summaries = []
         for e in entries:
             entry_summaries.append({
@@ -96,15 +102,6 @@ class Judge:
                 'reasoning': e.reasoning,
                 'has_before': e.before_state is not None,
                 'has_after': e.after_state is not None,
-            })
-
-        verdict_history = []
-        for v in recent_verdicts:
-            verdict_history.append({
-                'run_id': v.run_id,
-                'severity': v.severity,
-                'findings_count': len(v.findings),
-                'reviewed_at': v.reviewed_at.isoformat(),
             })
 
         stage_reports = {}
@@ -150,9 +147,6 @@ class Judge:
 
 ### Journal Entries ({len(entries)} total)
 {json.dumps(entry_summaries, indent=2, default=str)}
-
-### Recent Judge Verdicts (trend context)
-{json.dumps(verdict_history, indent=2, default=str)}
 
 Review this run and provide your verdict as JSON.
 """

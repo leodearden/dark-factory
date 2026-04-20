@@ -44,9 +44,8 @@ When evaluating a run, cross-reference stage report stats against MCP Actions to
 consistency. Do NOT flag a run as contradictory simply because journal entries are empty \
 while stats show mutations were performed.
 
-## Error Trends
-Also consider the trend across recent runs. If minor issues are accumulating, that may indicate \
-a systemic prompt or configuration problem.
+Evaluate this run on its own merits. Do not issue findings about trends or patterns across \
+runs — a separate code-side mechanism monitors verdict history and halts on systemic issues.
 
 ## Output Format
 Respond with a JSON object:
