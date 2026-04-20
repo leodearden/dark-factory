@@ -2225,6 +2225,26 @@ class TestSpeculativeMergeWorker:
 
 
 # ---------------------------------------------------------------------------
+# TestMergeOutcomeDataclass — unit tests for MergeOutcome dataclass fields
+# ---------------------------------------------------------------------------
+
+
+class TestMergeOutcomeDataclass:
+    def test_merge_outcome_has_merge_sha_field_default_none(self):
+        """MergeOutcome.merge_sha defaults to None and can be set.
+
+        Verifies that the field exists (step-1 / step-2 guard), that constructing
+        MergeOutcome without the kwarg gives None, and that the field stores the
+        value when supplied.
+        """
+        outcome_no_sha = MergeOutcome('done')
+        assert outcome_no_sha.merge_sha is None  # type: ignore[attr-defined]
+
+        outcome_with_sha = MergeOutcome('done', merge_sha='abc123')  # type: ignore[call-arg]
+        assert outcome_with_sha.merge_sha == 'abc123'  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
 # TestSpeculativeItemDefaults — unit tests for SpeculativeItem field defaults
 # ---------------------------------------------------------------------------
 
