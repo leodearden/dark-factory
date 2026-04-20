@@ -243,3 +243,50 @@ class TestRunCmdProcessGroup:
             c == call(12345, signal_module.SIGTERM)
             for c in mock_killpg.call_args_list
         ), f'SIGTERM killpg not called; calls: {mock_killpg.call_args_list}'
+
+
+class TestVerifyWarmMarker:
+    """Tests for the _is_verify_cold / _mark_verify_warm filesystem helpers."""
+
+    def test_is_cold_when_task_dir_exists_without_marker(self, tmp_path: Path):
+        """`_is_verify_cold` returns True when .task/ exists but verify_warmed is absent."""
+        from orchestrator.verify import _is_verify_cold
+        (tmp_path / '.task').mkdir()
+        assert _is_verify_cold(tmp_path) is True
+
+    def test_is_warm_when_marker_present(self, tmp_path: Path):
+        """`_is_verify_cold` returns False when .task/verify_warmed exists."""
+        from orchestrator.verify import _is_verify_cold
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+        (task_dir / 'verify_warmed').touch()
+        assert _is_verify_cold(tmp_path) is False
+
+    def test_is_warm_when_task_dir_absent(self, tmp_path: Path):
+        """`_is_verify_cold` returns False when .task/ itself is missing (e.g. project_root)."""
+        from orchestrator.verify import _is_verify_cold
+        # No .task/ directory created — project_root / review-checkpoint case.
+        assert _is_verify_cold(tmp_path) is False
+
+    def test_mark_verify_warm_creates_marker(self, tmp_path: Path):
+        """`_mark_verify_warm` creates .task/verify_warmed when .task/ already exists."""
+        from orchestrator.verify import _mark_verify_warm
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+        _mark_verify_warm(tmp_path)
+        assert (task_dir / 'verify_warmed').exists()
+
+    def test_mark_verify_warm_is_idempotent(self, tmp_path: Path):
+        """`_mark_verify_warm` called twice does not raise."""
+        from orchestrator.verify import _mark_verify_warm
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+        _mark_verify_warm(tmp_path)
+        _mark_verify_warm(tmp_path)  # must not raise
+        assert (task_dir / 'verify_warmed').exists()
+
+    def test_mark_verify_warm_noop_without_task_dir(self, tmp_path: Path):
+        """`_mark_verify_warm` is a no-op and does not create .task/ when it's absent."""
+        from orchestrator.verify import _mark_verify_warm
+        _mark_verify_warm(tmp_path)
+        assert not (tmp_path / '.task').exists()
