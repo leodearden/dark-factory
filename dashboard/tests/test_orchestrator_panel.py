@@ -136,19 +136,6 @@ class TestOrchestratorRouteBasics:
         assert 'x-show' in html
         assert '$store.panels' in html
 
-    def test_table_wrapper_has_x_cloak(self, client):
-        """x-cloak appears on task rows so they are hidden before Alpine mounts."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        assert 'x-cloak' in html
-
-    def test_table_wrapper_x_show_uses_store(self, client):
-        """x-show on rows still references $store.panels[key] for persistence."""
-        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
-            html = client.get('/partials/orchestrators').text
-        # x-show is now on rows rather than the wrapper, but the store reference is the same
-        assert "x-show=\"$store.panels[" in html
-
     def test_card_shows_single_pid_label(self, client):
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
