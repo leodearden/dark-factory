@@ -355,3 +355,116 @@ class TestResolveVerifyTimeout:
         mc = self._make_mc(warm=2000.0, cold=None)
         # cold cascade: mc.cold=None → config.cold=None → mc.warm=2000
         assert _resolve_verify_timeout(config, mc, is_cold=True) == 2000.0
+
+
+class TestRunVerificationColdFirstUse:
+    """Integration tests for cold-first-use timeout selection in run_verification.
+
+    Patches orchestrator.verify._run_cmd to capture the timeout argument
+    without spawning real subprocesses.
+    """
+
+    def _make_config(self, warm=1800.0, cold=5400.0, retries=0):
+        from orchestrator.config import OrchestratorConfig
+        return OrchestratorConfig(
+            verify_command_timeout_secs=warm,
+            verify_cold_command_timeout_secs=cold,
+            verify_timeout_retries=retries,
+            test_command='echo test',
+            lint_command='echo lint',
+            type_check_command='echo type',
+        )
+
+    def _make_success_mock(self):
+        """AsyncMock that records timeout kwargs and returns (0, '', False) — success."""
+        captured_timeouts: list[float] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            captured_timeouts.append(timeout)
+            return 0, '', False
+
+        return fake_run_cmd, captured_timeouts
+
+    def _make_timeout_mock(self):
+        """AsyncMock that always returns a pure-timeout result (1, 'Command timed out…', True)."""
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            return 1, f'Command timed out after {timeout}s: {cmd}', True
+
+        return fake_run_cmd
+
+    @pytest.mark.asyncio
+    async def test_first_run_uses_cold_timeout(self, tmp_path: Path):
+        """First run with .task/ present (no marker) uses cold timeout (5400)."""
+        from orchestrator.verify import run_verification
+        (tmp_path / '.task').mkdir()
+
+        config = self._make_config(warm=1800.0, cold=5400.0)
+        fake_cmd, captured = self._make_success_mock()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            await run_verification(tmp_path, config)
+
+        assert 5400.0 in captured, f'Expected cold timeout 5400 in {captured}'
+
+    @pytest.mark.asyncio
+    async def test_first_run_creates_warm_marker(self, tmp_path: Path):
+        """After a successful first run, .task/verify_warmed marker must exist."""
+        from orchestrator.verify import run_verification
+        (tmp_path / '.task').mkdir()
+
+        config = self._make_config(warm=1800.0, cold=5400.0)
+        fake_cmd, _ = self._make_success_mock()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            await run_verification(tmp_path, config)
+
+        assert (tmp_path / '.task' / 'verify_warmed').exists()
+
+    @pytest.mark.asyncio
+    async def test_second_run_uses_warm_timeout(self, tmp_path: Path):
+        """Second run (marker already present) uses warm timeout (1800)."""
+        from orchestrator.verify import run_verification
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+        (task_dir / 'verify_warmed').touch()
+
+        config = self._make_config(warm=1800.0, cold=5400.0)
+        fake_cmd, captured = self._make_success_mock()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            await run_verification(tmp_path, config)
+
+        assert 1800.0 in captured, f'Expected warm timeout 1800 in {captured}'
+        assert 5400.0 not in captured, f'Unexpected cold timeout in second run: {captured}'
+
+    @pytest.mark.asyncio
+    async def test_pure_timeout_does_not_create_marker(self, tmp_path: Path):
+        """When all retries time out, the warm marker must NOT be created."""
+        from orchestrator.verify import run_verification
+        (tmp_path / '.task').mkdir()
+
+        config = self._make_config(warm=1800.0, cold=5400.0, retries=0)
+        fake_cmd = self._make_timeout_mock()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await run_verification(tmp_path, config)
+
+        assert result.timed_out is True
+        assert not (tmp_path / '.task' / 'verify_warmed').exists()
+
+    @pytest.mark.asyncio
+    async def test_non_timeout_failure_creates_marker(self, tmp_path: Path):
+        """A real test failure (non-timeout) marks the worktree warm (build completed)."""
+        from orchestrator.verify import run_verification
+        (tmp_path / '.task').mkdir()
+
+        config = self._make_config(warm=1800.0, cold=5400.0, retries=0)
+
+        async def fake_real_failure(cmd, cwd, timeout, env=None):
+            return 1, 'FAILED some_test', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_real_failure):
+            result = await run_verification(tmp_path, config)
+
+        assert result.timed_out is False
+        assert (tmp_path / '.task' / 'verify_warmed').exists()
