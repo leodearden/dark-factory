@@ -331,8 +331,9 @@ class McpLifecycle:
         try:
             # If start() crashed between subprocess spawn and self._pgid assignment,
             # fall back to self._process.pid — start_new_session=True guarantees
-            # pgid == pid while the proc is unreaped, and _unsafe_pgid_reason enforces
-            # that invariant.
+            # pgid == pid while the proc is unreaped, and terminate_process_group's
+            # _unsafe_pgid_reason sanity-check refuses to signal if the invariant is
+            # ever violated.
             pgid = self._pgid if self._pgid is not None else self._process.pid
             await terminate_process_group(self._process, pgid, grace_secs=10.0)
         except Exception as exc:

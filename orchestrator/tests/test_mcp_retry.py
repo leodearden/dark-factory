@@ -289,9 +289,9 @@ class TestMcpLifecycleProcessGroup:
             mcp._process = MagicMock(returncode=None, pid=12345)
             mcp._pgid = 12345
             with caplog.at_level(logging.WARNING, logger='orchestrator.mcp_lifecycle'):
+                # stop() must not re-raise — reaching the next line proves it
                 await mcp.stop()
 
-        # stop() must not re-raise
         # Warning must mention the prescribed phrase and the exception message
         assert 'Failed to terminate fused-memory server' in caplog.text
         assert 'boom' in caplog.text
