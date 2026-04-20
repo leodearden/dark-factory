@@ -147,7 +147,9 @@ Overridable fields (see `_OVERRIDABLE_FIELDS` in `orchestrator/src/orchestrator/
 
 - `test_command`, `lint_command`, `type_check_command`
 - `lock_depth`, `max_per_module`, `module_overrides`
-- `verify_command_timeout_secs`, `concurrent_verify`, `verify_env`, `scope_cargo`
+- `verify_command_timeout_secs` — per-command timeout for warm (cached) verify runs
+- `verify_cold_command_timeout_secs` — timeout for the *first* verify in a freshly created worktree (before `.task/verify_warmed` exists); falls back to `verify_command_timeout_secs` when unset
+- `concurrent_verify`, `verify_env`, `scope_cargo`
 
 Example — a Rust subproject with hot crates that should serialize:
 
