@@ -297,7 +297,13 @@ class Scheduler:
                             self._set_cached_status(tid, s)
                     return tasks
         except Exception as e:
-            logger.error(f'Failed to fetch tasks: {e}')
+            # logger.exception preserves the traceback + exception class so the
+            # next time this fires we have more than str(e) to go on — str()
+            # produces bare forms like "[Errno 2] No such file or directory"
+            # with no indication of which layer raised it.
+            logger.exception(
+                'Failed to fetch tasks: %s: %s', type(e).__name__, e,
+            )
         return []
 
     async def set_task_status(
@@ -333,7 +339,10 @@ class Scheduler:
             )
             self._set_cached_status(task_id, status)
         except Exception as e:
-            logger.error(f'Failed to set task {task_id} status to {status}: {e}')
+            logger.exception(
+                'Failed to set task %s status to %s: %s: %s',
+                task_id, status, type(e).__name__, e,
+            )
 
     def get_cached_status(self, task_id: str) -> str | None:
         """Return the last known status for a task, or None if not yet seen."""
@@ -379,7 +388,10 @@ class Scheduler:
                 return False
             return True
         except Exception as e:
-            logger.error(f'Failed to update task {task_id}: {e}')
+            logger.exception(
+                'Failed to update task %s: %s: %s',
+                task_id, type(e).__name__, e,
+            )
             return False
 
     def _deps_satisfied(self, task: dict, status_map: dict[str, str]) -> bool:

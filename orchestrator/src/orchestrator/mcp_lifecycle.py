@@ -19,6 +19,26 @@ _RETRYABLE_STATUS = frozenset({502, 503, 504})
 _MCP_MAX_RETRIES = 3
 _MCP_BACKOFF_BASE = 1.0  # seconds; exponential: 1s, 2s, 4s
 
+# Exceptions treated as transient for retry purposes.
+#
+# httpx.NetworkError is the parent of ConnectError, ReadError, WriteError and
+# CloseError — cover them all so mid-transfer drops on a 6MB response also
+# retry instead of blowing up the caller.  We also include bare OSError
+# because httpx's map_httpcore_exceptions() only re-wraps exceptions it
+# recognises from httpcore; low-level asyncio/anyio socket failures can
+# occasionally surface as raw OSError (including FileNotFoundError, which
+# stringifies to the unhelpful "[Errno 2] No such file or directory" with
+# no filename).  Retrying these lets the client recover transparently and,
+# if it keeps failing, the wrapped RuntimeError preserves the type name
+# so the top-level catch-all logs something diagnostic.
+_RETRYABLE_EXCEPTIONS: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.RemoteProtocolError,
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    OSError,
+)
+
 MCP_HEADERS = {
     'Content-Type': 'application/json',
     'Accept': 'application/json, text/event-stream',
@@ -130,11 +150,7 @@ class McpSession:
 
                     return self._parse_response(resp)
 
-            except (
-                httpx.ConnectError,
-                httpx.RemoteProtocolError,
-                httpx.TimeoutException,
-            ) as exc:
+            except _RETRYABLE_EXCEPTIONS as exc:
                 logger.warning(
                     'MCP %s transient error (attempt %d/%d): %s: %s',
                     method, attempt + 1, _MCP_MAX_RETRIES,
@@ -188,11 +204,7 @@ class McpSession:
                         )
                     return
 
-            except (
-                httpx.ConnectError,
-                httpx.RemoteProtocolError,
-                httpx.TimeoutException,
-            ) as exc:
+            except _RETRYABLE_EXCEPTIONS as exc:
                 logger.warning(
                     'MCP notify %s transient error (attempt %d/%d): %s: %s',
                     method, attempt + 1, _MCP_MAX_RETRIES,
