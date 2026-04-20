@@ -2239,3 +2239,78 @@ async def test_single_call_latency_not_regressed(
     # Very generous bound — on a mock this should complete in well under
     # 2s; bumping for CI jitter.
     assert elapsed < 2.0, f'{N} sequential calls took {elapsed:.3f}s'
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_does_not_block_during_add_task_curator(
+    taskmaster, reconciler, event_buffer, curator_enabled_config,
+):
+    """Split-lock regression (2026-04-20): a long-running curator.curate()
+    inside add_task MUST NOT block a concurrent set_task_status on the
+    same project.
+
+    Before the split, both ops took the single ``_project_lock``; a 25-35 s
+    curator LLM call under add_task stalled every set_task_status on the
+    same project for the full duration, blowing past the orchestrator's
+    15 s client timeout and logging 50+ empty-str "Failed to set task X
+    status to Y:" errors per run (reify log
+    /tmp/orch-reify-20260420-082733.log). After the split, add_task holds
+    ``_curator_lock`` for the LLM call and only briefly acquires
+    ``_write_lock`` for the tm.add_task write; set_task_status takes just
+    ``_write_lock`` and so completes promptly.
+    """
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+    )
+
+    CURATOR_LATENCY_S = 2.0
+
+    async def slow_curate(candidate, project_id, project_root):
+        await asyncio.sleep(CURATOR_LATENCY_S)
+        # action='create' so the flow falls through to tm.add_task
+        return CuratorDecision(
+            action='create', justification='ok',
+        )
+
+    curator = MagicMock()
+    curator.curate = AsyncMock(side_effect=slow_curate)
+    curator.record_task = AsyncMock()
+    curator.reembed_task = AsyncMock()
+    curator.note_created = MagicMock()
+    interceptor._curator = curator
+
+    start = asyncio.get_event_loop().time()
+
+    async def timed_set_status():
+        # Fire slightly after add_task so add_task is the one holding
+        # _curator_lock first.
+        await asyncio.sleep(0.05)
+        t0 = asyncio.get_event_loop().time()
+        result = await interceptor.set_task_status(
+            '1', 'in-progress', '/project',
+        )
+        return result, asyncio.get_event_loop().time() - t0
+
+    add_result, (status_result, status_elapsed) = await asyncio.gather(
+        interceptor.add_task('/project', title='concurrent add'),
+        timed_set_status(),
+    )
+    total_elapsed = asyncio.get_event_loop().time() - start
+
+    # add_task ran the full curator → ~CURATOR_LATENCY_S
+    assert total_elapsed >= CURATOR_LATENCY_S * 0.9, (
+        f'add_task did not wait for curator: total={total_elapsed:.3f}s'
+    )
+    # set_task_status must NOT wait for curator.
+    # Budget: well under curator latency. Mocked tm writes yield only once,
+    # so half a second is generous for CI jitter.
+    assert status_elapsed < 0.5, (
+        f'set_task_status blocked behind add_task curator: '
+        f'status_elapsed={status_elapsed:.3f}s (budget 0.5s), '
+        f'curator_latency={CURATOR_LATENCY_S}s'
+    )
+    # Both writes landed.
+    assert add_result.get('id') == '2'  # taskmaster fixture default
+    assert status_result.get('success') or status_result.get('no_op')
+    taskmaster.add_task.assert_called_once()
+    taskmaster.set_task_status.assert_called_once()

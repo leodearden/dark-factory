@@ -130,17 +130,29 @@ class McpSession:
 
                     return self._parse_response(resp)
 
-            except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+            except (
+                httpx.ConnectError,
+                httpx.RemoteProtocolError,
+                httpx.TimeoutException,
+            ) as exc:
                 logger.warning(
-                    'MCP %s connection error (attempt %d/%d): %s',
-                    method, attempt + 1, _MCP_MAX_RETRIES, exc,
+                    'MCP %s transient error (attempt %d/%d): %s: %s',
+                    method, attempt + 1, _MCP_MAX_RETRIES,
+                    type(exc).__name__, exc,
                 )
                 self._session_id = None
                 self._initialized = False
                 last_exc = exc
                 await asyncio.sleep(_MCP_BACKOFF_BASE * (2 ** attempt))
 
-        raise last_exc or RuntimeError('_raw_call exhausted retries')
+        # Wrap exhausted retries so downstream log lines carry real context
+        # even when str(last_exc) is empty (httpx.ReadTimeout has no message).
+        if last_exc is not None:
+            raise RuntimeError(
+                f'MCP {method} failed after {_MCP_MAX_RETRIES} attempts: '
+                f'{type(last_exc).__name__}: {last_exc}'
+            ) from last_exc
+        raise RuntimeError('_raw_call exhausted retries')
 
     async def _raw_notify(
         self,
@@ -176,17 +188,27 @@ class McpSession:
                         )
                     return
 
-            except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+            except (
+                httpx.ConnectError,
+                httpx.RemoteProtocolError,
+                httpx.TimeoutException,
+            ) as exc:
                 logger.warning(
-                    'MCP notify %s connection error (attempt %d/%d): %s',
-                    method, attempt + 1, _MCP_MAX_RETRIES, exc,
+                    'MCP notify %s transient error (attempt %d/%d): %s: %s',
+                    method, attempt + 1, _MCP_MAX_RETRIES,
+                    type(exc).__name__, exc,
                 )
                 self._session_id = None
                 self._initialized = False
                 last_exc = exc
                 await asyncio.sleep(_MCP_BACKOFF_BASE * (2 ** attempt))
 
-        raise last_exc or RuntimeError('_raw_notify exhausted retries')
+        if last_exc is not None:
+            raise RuntimeError(
+                f'MCP notify {method} failed after {_MCP_MAX_RETRIES} attempts: '
+                f'{type(last_exc).__name__}: {last_exc}'
+            ) from last_exc
+        raise RuntimeError('_raw_notify exhausted retries')
 
     @staticmethod
     def _parse_response(resp: httpx.Response) -> dict:
