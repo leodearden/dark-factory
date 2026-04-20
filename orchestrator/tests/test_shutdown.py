@@ -144,6 +144,9 @@ def test_sigterm_exits_within_deadline(tmp_path: Path):
         # New process group so we can reap stray children deterministically.
         start_new_session=True,
     )
+    # start_new_session=True guarantees pgid == pid at spawn; frozen int
+    # avoids PID-reuse foot-gun after proc.wait().
+    pgid = proc.pid
 
     try:
         # Wait for the script to print READY so the signal handler is
@@ -167,7 +170,7 @@ def test_sigterm_exits_within_deadline(tmp_path: Path):
         except subprocess.TimeoutExpired as exc:
             # Kill the whole group so we don't leak sleep 300 processes.
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(pgid, signal.SIGKILL)
             proc.wait(timeout=5.0)
             raise AssertionError(
                 'Shutdown hung: python did not exit within 20s of SIGTERM'
@@ -176,9 +179,9 @@ def test_sigterm_exits_within_deadline(tmp_path: Path):
         assert rc == 0, f'expected clean exit, got rc={rc}'
 
         # No stray sleep 300 should still be alive in our process group.
-        # (start_new_session → getpgid(pid) is the group leader.)
+        # pgid captured at spawn — see start_new_session=True above.
         try:
-            os.killpg(os.getpgid(proc.pid), 0)
+            os.killpg(pgid, 0)
             still_alive = True
         except ProcessLookupError:
             still_alive = False
@@ -186,7 +189,7 @@ def test_sigterm_exits_within_deadline(tmp_path: Path):
     finally:
         if proc.poll() is None:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(pgid, signal.SIGKILL)
             proc.wait(timeout=5.0)
 
 
