@@ -806,9 +806,10 @@ async def burndown_partials_charts(request: Request):
     days = _BURNDOWN_WINDOWS.get(window_raw, 30)
     try:
         projects = await aggregate_burndown_projects(dbs)
-        series: dict = {}
-        for pid in projects:
-            series[pid] = await aggregate_burndown_series(dbs, pid, days=days)
+        per_pid = await asyncio.gather(
+            *(aggregate_burndown_series(dbs, pid, days=days) for pid in projects)
+        )
+        series: dict = dict(zip(projects, per_pid, strict=True))
     except Exception:
         logger.warning('Error fetching burndown data', exc_info=True)
         series = {}
