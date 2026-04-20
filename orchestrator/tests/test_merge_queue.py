@@ -759,6 +759,41 @@ class TestMergeWorker:
         conn.close()
         assert all(r[1] is not None for r in rows_c), f'NULL duration_ms in cas scenario: {rows_c}'
 
+    async def test_merge_worker_success_returns_merge_sha(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """MergeWorker success path: MergeOutcome.merge_sha is the merge commit.
+
+        Drives the full CAS-advance path through MergeWorker and asserts that
+        the resulting MergeOutcome carries the real 40-char merge commit SHA.
+        Fails initially because merge_queue.py:400 still constructs
+        MergeOutcome('done') without the SHA (step-3 guard; impl in step-4).
+        """
+        worktree = await _make_branch_with_file(
+            git_ops, 'sha-basic', 'sha_basic.py', 'sha = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req = _make_request('sha-task', 'sha-basic', worktree, config)
+            await queue.put(req)
+            result = await asyncio.wait_for(req.result, timeout=30)
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+        assert result.status == 'done'
+        assert result.merge_sha is not None, 'merge_sha must be set on done outcome'
+        assert len(result.merge_sha) == 40, f'expected 40-char SHA, got: {result.merge_sha!r}'
+        assert all(c in '0123456789abcdef' for c in result.merge_sha), (
+            f'merge_sha is not a hex string: {result.merge_sha!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Helpers for speculative tests
