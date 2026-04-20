@@ -2216,6 +2216,22 @@ class TestEvalSchedulerCachedStatus:
         await sched.set_task_status('99', 'done')
         assert ('99', 'done') in recorded
 
+    @pytest.mark.asyncio
+    async def test_eval_scheduler_set_task_status_accepts_done_provenance(self):
+        """_EvalScheduler.set_task_status accepts done_provenance kwarg without error.
+
+        Eval mode doesn't persist provenance; the kwarg is accepted and ignored.
+        Also asserts the cached status is updated normally.
+        Fails until _EvalScheduler.set_task_status signature adds done_provenance.
+        """
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.runner import _EvalScheduler
+
+        sched = _EvalScheduler(OrchestratorConfig())
+        # Should not raise TypeError
+        await sched.set_task_status('99', 'done', done_provenance={'commit': 'abc'})
+        assert sched.get_cached_status('99') == 'done'
+
 
 # ---------------------------------------------------------------------------
 # Tests: Prerequisites format validation
