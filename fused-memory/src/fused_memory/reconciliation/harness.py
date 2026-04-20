@@ -33,6 +33,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
 )
+from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
 from fused_memory.reconciliation.task_filter import FilteredTaskTree, filter_task_tree
 from fused_memory.services.memory_service import MemoryService
 
@@ -644,6 +645,14 @@ class ReconciliationHarness:
             run.status = RunStatus.completed
             await self.journal.complete_run(run_id, 'completed')
 
+            # Cross-check self-reported stats against write-journal ops BEFORE the
+            # judge reads them. Stage agents sometimes over-report successful
+            # writes when Mem0 silently dedups; the verifier overwrites those
+            # counts with observed truth and keeps the originals under _reported.
+            await verify_and_rewrite_stats(
+                run_id, run.stage_reports, self.journal.write_journal,
+            )
+
             # Persist stage reports before judge — the judge reads from the DB,
             # so reports must be committed before firing the async task.
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
@@ -875,6 +884,12 @@ class ReconciliationHarness:
             run.completed_at = datetime.now(UTC)
             run.status = RunStatus.completed
             await self.journal.complete_run(run_id, 'completed')
+
+            # Cross-check self-reported stats against write-journal ops before
+            # the judge reads them (same as run_full_cycle).
+            await verify_and_rewrite_stats(
+                run_id, run.stage_reports, self.journal.write_journal,
+            )
 
             # Persist stage reports before judge (same fix as run_full_cycle)
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)

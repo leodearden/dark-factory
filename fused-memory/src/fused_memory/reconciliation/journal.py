@@ -176,6 +176,11 @@ class ReconciliationJournal:
         """Store reference for cross-queries (combined run actions)."""
         self._write_journal = write_journal
 
+    @property
+    def write_journal(self) -> WriteJournal | None:
+        """Paired write journal, if one has been attached."""
+        return self._write_journal
+
     async def initialize(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         db_path = self.data_dir / 'reconciliation.db'

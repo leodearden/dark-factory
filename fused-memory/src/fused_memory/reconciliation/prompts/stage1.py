@@ -60,6 +60,14 @@ that don't correspond to any existing edge.
 - {_STAGE1_PROJECT_ID_GUIDELINE}
 - When you have completed your work, produce your final structured report as your response.
 
+## Verifying Writes
+After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
+response. An empty list means Mem0 deduplicated or filtered the write and no new memory \
+was created — count it as a no-op, not a successful addition. Your stats \
+(`memories_added` / `memories_written`) must reflect actual IDs returned, not calls \
+attempted. If a write returns zero IDs and you expected a new memory, either retry with \
+different content or note the deduplication in your report.
+
 ## Retrospective Episodes
 When creating or reviewing retrospective summaries via `add_episode`, always pass \
 `reference_time` set to the ISO 8601 date when the described state was **current**, \
