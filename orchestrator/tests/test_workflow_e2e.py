@@ -354,9 +354,18 @@ class FakeScheduler:
 
     def __init__(self):
         self.statuses: dict[str, list[str]] = {}
+        self.provenance: dict[str, dict] = {}
 
-    async def set_task_status(self, task_id: str, status: str) -> None:
+    async def set_task_status(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        done_provenance: dict | None = None,
+    ) -> None:
         self.statuses.setdefault(task_id, []).append(status)
+        if done_provenance is not None:
+            self.provenance[task_id] = done_provenance
 
     async def handle_blast_radius_expansion(
         self, task_id: str, current: list[str], needed: list[str]
@@ -588,6 +597,55 @@ class TestHappyPath:
         assert workflow.metrics.agent_invocations == 3
         assert workflow.metrics.total_cost_usd > 0
         assert workflow.metrics.execute_iterations == 1
+
+    async def test_workflow_success_path_passes_merge_sha_as_done_provenance(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Merge SHA from MergeOutcome.merge_sha is threaded through to done_provenance.
+
+        The merge-queue stub resolves the future with MergeOutcome('done', merge_sha='FEEDFACE').
+        After run() returns DONE, scheduler.provenance must contain {'commit': 'FEEDFACE'}.
+        Fails until _submit_to_merge_queue stores merge_sha on self._merge_sha (step-15)
+        and workflow.py:554 passes it as done_provenance.
+        """
+        from orchestrator.merge_queue import MergeOutcome
+
+        stub = AgentStub()
+        scheduler = FakeScheduler()
+        merge_queue: asyncio.Queue = asyncio.Queue()
+
+        # Stub merge worker: resolve every request immediately with done + known SHA
+        async def _stub_merge_worker() -> None:
+            while True:
+                req = await merge_queue.get()
+                req.result.set_result(MergeOutcome('done', merge_sha='FEEDFACE'))
+
+        asyncio.create_task(_stub_merge_worker(), name='test-stub-merge-worker')
+
+        workflow = TaskWorkflow(
+            assignment=task_assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=scheduler,  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=FakeMcp(),  # type: ignore[arg-type]
+            merge_queue=merge_queue,
+        )
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        # After step-15: merge_sha 'FEEDFACE' from MergeOutcome must be recorded
+        assert scheduler.provenance.get(task_assignment.task_id) == {'commit': 'FEEDFACE'}
 
 
 # ---------------------------------------------------------------------------
@@ -2165,6 +2223,18 @@ class TestFakeSchedulerCachedStatus:
         await fake.set_task_status('x', 'done')
         assert fake.get_cached_status('x') == 'done'
 
+    @pytest.mark.asyncio
+    async def test_fake_scheduler_accepts_and_records_done_provenance(self):
+        """FakeScheduler.set_task_status records done_provenance on the instance.
+
+        Asserts that after calling set_task_status('x', 'done', done_provenance={...}),
+        fake.provenance['x'] == {'commit': 'deadbeef'}.
+        Fails until FakeScheduler signature and provenance dict are updated (step-13).
+        """
+        fake = FakeScheduler()
+        await fake.set_task_status('x', 'done', done_provenance={'commit': 'deadbeef'})
+        assert fake.provenance['x'] == {'commit': 'deadbeef'}  # type: ignore[attr-defined]
+
 
 # ---------------------------------------------------------------------------
 # Tests: _EvalScheduler.get_cached_status
@@ -2215,6 +2285,22 @@ class TestEvalSchedulerCachedStatus:
 
         await sched.set_task_status('99', 'done')
         assert ('99', 'done') in recorded
+
+    @pytest.mark.asyncio
+    async def test_eval_scheduler_set_task_status_accepts_done_provenance(self):
+        """_EvalScheduler.set_task_status accepts done_provenance kwarg without error.
+
+        Eval mode doesn't persist provenance; the kwarg is accepted and ignored.
+        Also asserts the cached status is updated normally.
+        Fails until _EvalScheduler.set_task_status signature adds done_provenance.
+        """
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.runner import _EvalScheduler
+
+        sched = _EvalScheduler(OrchestratorConfig())
+        # Should not raise TypeError
+        await sched.set_task_status('99', 'done', done_provenance={'commit': 'abc'})
+        assert sched.get_cached_status('99') == 'done'
 
 
 # ---------------------------------------------------------------------------
@@ -2410,6 +2496,60 @@ class TestMarkBlockedFalseDoneGuard:
             f"Last scheduler status must be 'done' for genuine prior merge, got: {statuses}"
         )
         assert workflow.state == WorkflowState.DONE
+
+    async def test_workflow_already_on_main_done_uses_note_provenance(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """already-on-main path passes done_provenance={'note': '...'} to set_task_status.
+
+        When _mark_blocked detects the branch is already on main after steward resolution,
+        scheduler.provenance must record the note explanation, not a commit SHA.
+        Fails until step-17 adds done_provenance={'note': ...} at workflow.py:2446-2448.
+        """
+        import json as _json
+
+        # 1. Create worktree with an implementer iteration entry (makes _has_prior_implementation True)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+
+        # 2. Make a real implementation commit on the branch and merge it to main
+        (wt / 'farewell.py').write_text('def farewell(name):\n    return f"Bye, {name}"\n')
+        await git_ops.commit(wt, 'Implement farewell')
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # 3. Build workflow with escalation queue, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 4. FakeSteward resolves all pending L0 escalations immediately in start()
+        workflow._steward_factory = _make_resolving_steward(
+            queue, task_assignment.task_id,
+        )
+
+        # 5. Call _mark_blocked directly (drives the already-on-main completion path)
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        # 6. Assertions: must DONE with the note provenance
+        assert outcome == WorkflowOutcome.DONE
+        assert scheduler.provenance.get(task_assignment.task_id) == {
+            'note': 'branch already on main after escalation resolution'
+        }, (
+            f"Expected done_provenance note but got: "
+            f"{scheduler.provenance.get(task_assignment.task_id)!r}"
+        )
 
     async def test_git_exception_in_ancestor_check_requeues(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path

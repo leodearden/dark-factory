@@ -514,8 +514,15 @@ class _EvalScheduler:
     async def get_tasks(self):
         return []
 
-    async def set_task_status(self, task_id: str, status: str):
-        logger.info(f'[eval] Task {task_id} → {status}')
+    async def set_task_status(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        done_provenance: dict | None = None,
+    ) -> None:
+        log_extra = f' (provenance={done_provenance!r})' if done_provenance is not None else ''
+        logger.info(f'[eval] Task {task_id} → {status}{log_extra}')
         self._set_cached_status(task_id, status)
 
     def get_cached_status(self, task_id: str) -> str | None:

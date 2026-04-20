@@ -132,6 +132,7 @@ class MergeOutcome:
     conflict_details: str = ''
     recovery_branch: str | None = None
     overlap_files: list[str] | None = None
+    merge_sha: str | None = None
 
 
 @dataclass
@@ -397,7 +398,7 @@ class MergeWorker:
             self._cas_retries.pop(req.task_id, None)
             logger.info(f'Task {req.task_id}: merged to main successfully')
             _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(t0))
-            return MergeOutcome('done')
+            return MergeOutcome('done', merge_sha=merge_result.merge_commit)
 
         if result in ('wip_overlap', 'pop_conflict'):
             # Halt the queue globally — no more merges until resolved
@@ -1127,7 +1128,7 @@ class SpeculativeMergeWorker:
                 _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(item.started_monotonic))
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if not req.result.done():
-                    req.result.set_result(MergeOutcome('done'))
+                    req.result.set_result(MergeOutcome('done', merge_sha=merge_commit))
                 return True
 
             if result in ('wip_overlap', 'pop_conflict'):

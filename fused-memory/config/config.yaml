@@ -71,6 +71,8 @@ taskmaster:
 
 reconciliation:
   enabled: true
+  # Phase 2 enforcement of done_provenance: require commit|note payload on done transitions
+  require_done_provenance: true
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
   buffer_size_threshold: 250
   max_staleness_seconds: 14400

@@ -182,7 +182,8 @@ The merge procedure is iterative — don't assume one pass will be enough:
 4. On green: rebase on main again — other tasks may have merged while you were fixing.
 5. Repeat steps 2-4 until stable (rebase is clean AND verification passes with no new changes needed).
 6. Use `/merge-queue` to merge. It routes through the orchestrator's merge queue when available (preventing races with concurrent tasks) and falls back to direct merge when the orchestrator isn't running.
-7. On green: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>")`
+7. On green: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"commit": "<sha-of-merge>"})`
+   - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main (the normal case — merge_request returns the SHA). Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
 8. Clean up: `git worktree remove .worktrees/<TASK_ID>` and `git branch -d task/<TASK_ID>`
 
 *If this is an escalated task (pending escalation, agent is paused):*

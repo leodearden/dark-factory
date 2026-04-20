@@ -759,6 +759,41 @@ class TestMergeWorker:
         conn.close()
         assert all(r[1] is not None for r in rows_c), f'NULL duration_ms in cas scenario: {rows_c}'
 
+    async def test_merge_worker_success_returns_merge_sha(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """MergeWorker success path: MergeOutcome.merge_sha is the merge commit.
+
+        Drives the full CAS-advance path through MergeWorker and asserts that
+        the resulting MergeOutcome carries the real 40-char merge commit SHA.
+        Fails initially because merge_queue.py:400 still constructs
+        MergeOutcome('done') without the SHA (step-3 guard; impl in step-4).
+        """
+        worktree = await _make_branch_with_file(
+            git_ops, 'sha-basic', 'sha_basic.py', 'sha = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req = _make_request('sha-task', 'sha-basic', worktree, config)
+            await queue.put(req)
+            result = await asyncio.wait_for(req.result, timeout=30)
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+        assert result.status == 'done'
+        assert result.merge_sha is not None, 'merge_sha must be set on done outcome'
+        assert len(result.merge_sha) == 40, f'expected 40-char SHA, got: {result.merge_sha!r}'
+        assert all(c in '0123456789abcdef' for c in result.merge_sha), (
+            f'merge_sha is not a hex string: {result.merge_sha!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Helpers for speculative tests
@@ -2222,6 +2257,62 @@ class TestSpeculativeMergeWorker:
 
         await worker.stop()
         await worker_task
+
+    async def test_speculative_merge_worker_success_returns_merge_sha(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """SpeculativeMergeWorker success path: MergeOutcome.merge_sha is set.
+
+        Submits one request, drives through the verify-and-advance path, and
+        asserts the resulting MergeOutcome has status='done' with a 40-char
+        merge commit SHA.  Fails initially because line ~1130 still constructs
+        MergeOutcome('done') without merge_sha (step-5 guard; impl in step-6).
+        """
+        wt_n = await _make_branch_with_file(
+            git_ops, 'sspec-n', 'file_sspec_n.py', 'sspec_n = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _mock_verify_pass(),
+        ):
+            req_n = _make_request('sspec-task', 'sspec-n', wt_n, config)
+            await queue.put(req_n)
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
+
+        await worker.stop()
+        await worker_task
+
+        assert outcome_n.status == 'done', f'Expected done, got: {outcome_n}'
+        assert outcome_n.merge_sha is not None, 'merge_sha must be set on done outcome'
+        assert len(outcome_n.merge_sha) == 40, f'Expected 40-char SHA, got: {outcome_n.merge_sha!r}'
+        assert all(c in '0123456789abcdef' for c in outcome_n.merge_sha), (
+            f'merge_sha is not a hex string: {outcome_n.merge_sha!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestMergeOutcomeDataclass — unit tests for MergeOutcome dataclass fields
+# ---------------------------------------------------------------------------
+
+
+class TestMergeOutcomeDataclass:
+    def test_merge_outcome_has_merge_sha_field_default_none(self):
+        """MergeOutcome.merge_sha defaults to None and can be set.
+
+        Verifies that the field exists (step-1 / step-2 guard), that constructing
+        MergeOutcome without the kwarg gives None, and that the field stores the
+        value when supplied.
+        """
+        outcome_no_sha = MergeOutcome('done')
+        assert outcome_no_sha.merge_sha is None  # type: ignore[attr-defined]
+
+        outcome_with_sha = MergeOutcome('done', merge_sha='abc123')  # type: ignore[call-arg]
+        assert outcome_with_sha.merge_sha == 'abc123'  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------

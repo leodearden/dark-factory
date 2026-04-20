@@ -357,8 +357,9 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
    ```
 6. **Update task status**:
    ```
-   set_task_status(id="<task-id>", status="done", project_root="$TARGET_PROJECT")
+   set_task_status(id="<task-id>", status="done", project_root="$TARGET_PROJECT", done_provenance={"commit": "<merge-commit-sha>"})
    ```
+   Use `{"commit": "<sha>"}` when a merge commit contains the landed work (the normal case — read the SHA from `git log -1 --format=%H` after the merge). Use `{"note": "<one-sentence explanation>"}` for fast-forward merges or when the work was covered by a sibling task and no single commit applies.
 7. **Clean up worktree** (from inside `$TARGET_PROJECT`):
    ```bash
    git worktree remove .worktrees/<task-id>

@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import unittest.mock
+from pathlib import Path
 
 import pytest
 import yaml
@@ -340,3 +341,27 @@ class TestYamlSettingsSourceABCContract:
         assert result[0] is None
         assert result[1] == 'my_field'
         assert result[2] is False
+
+
+class TestConfigYamlReconciliationFlags:
+    """Tests for deployment-config values in fused-memory/config/config.yaml."""
+
+    def test_config_yaml_enables_require_done_provenance(self, monkeypatch):
+        """config.yaml must enable require_done_provenance for Phase 2 enforcement.
+
+        Step-21: loads the real deployment YAML via CONFIG_PATH env and asserts
+        the gate is on. Phase 2 (6a272fd46e) shipped the validator with the
+        schema default of False; this project's YAML is the source of truth for
+        flipping enforcement on — see design decision 5 on task 844.
+        """
+        # Walk from this test file up to the repo root, then to the yaml.
+        # fused-memory/tests/test_config_schema.py → ../../fused-memory/config/config.yaml
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        cfg = FusedMemoryConfig()
+        assert cfg.reconciliation.require_done_provenance is True, (
+            'fused-memory/config/config.yaml must set '
+            'reconciliation.require_done_provenance: true to enable Phase 2 '
+            'enforcement of the done_provenance gate.'
+        )

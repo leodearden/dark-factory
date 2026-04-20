@@ -57,7 +57,9 @@ if TYPE_CHECKING:
 
 
 class _SchedulerLike(Protocol):
-    async def set_task_status(self, task_id: str, status: str, /) -> None: ...
+    async def set_task_status(
+        self, task_id: str, status: str, /, *, done_provenance: dict | None = ...
+    ) -> None: ...
     async def handle_blast_radius_expansion(
         self, task_id: str, current: list[str], needed: list[str], /
     ) -> bool: ...
@@ -222,6 +224,7 @@ class TaskWorkflow:
         self._steward: Any | None = None
         self._config_dir: TaskConfigDir | None = None
         self._old_plan_base: str | None = None  # base commit from prior session (for revalidation diff)
+        self._merge_sha: str | None = None  # merge commit SHA set by _submit_to_merge_queue on success
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -551,7 +554,10 @@ class TaskWorkflow:
             await self._ensure_steward_started()
             await self._await_steward_completion()
             self._enter_phase(WorkflowState.DONE)
-            await self.scheduler.set_task_status(self.task_id, 'done')
+            await self.scheduler.set_task_status(
+                self.task_id, 'done',
+                done_provenance={'commit': self._merge_sha} if self._merge_sha else None,
+            )
             logger.info(
                 f'Task {self.task_id} DONE — '
                 f'cost=${self.metrics.total_cost_usd:.2f} '
@@ -1639,6 +1645,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if result.status == 'unmerged_state':
             return await self._handle_unmerged_state(result, branch_name)
         if result.status == 'done':
+            if result.merge_sha is not None:
+                self._merge_sha = result.merge_sha
             return WorkflowOutcome.DONE
         if result.status == 'already_merged':
             logger.info(f'Task {self.task_id}: already merged to main')
@@ -2437,6 +2445,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                                     self._enter_phase(WorkflowState.DONE)
                                     await self.scheduler.set_task_status(
                                         self.task_id, 'done',
+                                        done_provenance={
+                                            'note': (
+                                                'branch already on main '
+                                                'after escalation resolution'
+                                            ),
+                                        },
                                     )
                                     return WorkflowOutcome.DONE
                         except Exception:
