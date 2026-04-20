@@ -162,7 +162,6 @@ class TestBurndownChartsRouteMultiProject:
 
 
 import asyncio  # noqa: E402
-import pytest  # noqa: E402
 
 
 class TestBurndownChartsRouteParallelism:
@@ -206,7 +205,7 @@ class TestBurndownChartsRouteParallelism:
         async def fake_aggregate_burndown_series(dbs, project_id, *, days):
             try:
                 await asyncio.wait_for(barrier.wait(), timeout=2.0)
-            except (asyncio.TimeoutError, asyncio.BrokenBarrierError) as exc:
+            except (TimeoutError, asyncio.BrokenBarrierError) as exc:
                 raise AssertionError(
                     'per-project aggregate_burndown_series calls did not run '
                     'concurrently — expected asyncio.gather across projects '
