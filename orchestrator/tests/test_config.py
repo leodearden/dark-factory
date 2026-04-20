@@ -94,6 +94,34 @@ class TestDefaults:
         assert config.timeouts.steward == 1800.0
         assert config.timeouts.steward >= config.steward_completion_timeout
 
+    def test_verify_cold_command_timeout_secs_from_defaults_yaml(self, monkeypatch, tmp_path):
+        """verify_cold_command_timeout_secs is loaded from defaults.yaml (expected 5400)."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        defaults = _load_package_defaults()
+        assert config.verify_cold_command_timeout_secs == defaults['verify_cold_command_timeout_secs']
+        assert config.verify_cold_command_timeout_secs == 5400
+
+    def test_verify_cold_command_timeout_secs_pydantic_default_is_none(self, monkeypatch, tmp_path):
+        """Without loading defaults.yaml, the raw Pydantic field default for
+        verify_cold_command_timeout_secs is None — the shipped value comes from
+        defaults.yaml, not the field declaration itself.
+        """
+        monkeypatch.chdir(tmp_path)
+        # Force a no-yaml scenario by pointing ORCH_CONFIG_PATH at a file that
+        # explicitly omits the cold-timeout key and also prevents the package
+        # defaults source from firing.  We use a YAML that sets an unrelated
+        # key so load_config/OrchestratorConfig() works, but overrides the
+        # package-defaults source via env so we can test the Pydantic default.
+        # The simplest way: build OrchestratorConfig directly with no YAML source.
+        # pydantic-settings honours __init__ kwargs — instantiate it with
+        # ORCH_CONFIG_PATH='' which suppresses the project-yaml source, then
+        # check the raw Field default by inspecting model_fields.
+        field_info = OrchestratorConfig.model_fields['verify_cold_command_timeout_secs']
+        # The Pydantic field default (not the shipped defaults.yaml value) is None.
+        assert field_info.default is None
+
 
 class TestYamlLoading:
     def test_load_config_raises_when_explicit_path_nonexistent(self, tmp_path: Path):
@@ -193,6 +221,23 @@ class TestModuleConfigDiscovery:
             'dashboard': ModuleConfig(prefix='dashboard'),
         }
         assert config.for_module('orchestrator/src/config.py') is None
+
+    def test_discover_loads_verify_cold_command_timeout_secs(self, tmp_path: Path):
+        """_discover_module_configs propagates verify_cold_command_timeout_secs from orchestrator.yaml."""
+        sub = tmp_path / 'backend'
+        sub.mkdir()
+        (sub / 'orchestrator.yaml').write_text(yaml.dump({
+            'verify_cold_command_timeout_secs': 7200,
+        }))
+        configs = _discover_module_configs(tmp_path)
+        assert 'backend' in configs
+        mc = configs['backend']
+        assert mc.verify_cold_command_timeout_secs == 7200.0
+
+    def test_bare_module_config_has_none_cold_timeout(self):
+        """A bare ModuleConfig has verify_cold_command_timeout_secs is None by default."""
+        mc = ModuleConfig(prefix='x')
+        assert mc.verify_cold_command_timeout_secs is None
 
     def test_load_config_populates_module_configs(self, tmp_path: Path):
         # Create a minimal global config
