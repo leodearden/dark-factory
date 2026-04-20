@@ -576,6 +576,26 @@ class TestOrchestratorTaskRowFiltering:
             f'Expected at least 5 x-cloak attributes on rows, found {cloak_count}'
         )
 
+    def test_row_xshow_uses_optional_chaining(self, client):
+        """Per-row x-show expressions use optional chaining (?.) on $store.panels[key].
+
+        Guards against Alpine evaluating a child x-show before the parent x-init
+        has populated the panel object (e.g. during HTMX morph), causing a crash
+        instead of a transient hide.
+        """
+        import re
+        with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
+            html = client.get('/partials/orchestrators').text
+        tbody_match = re.search(r'<tbody>(.*?)</tbody>', html, re.DOTALL)
+        assert tbody_match is not None, 'No <tbody> found'
+        tbody = tbody_match.group(1)
+        exprs = re.findall(r'x-show="([^"]+)"', tbody)
+        assert len(exprs) > 0, 'No x-show expressions found in tbody'
+        for expr in exprs:
+            assert '?.' in expr, (
+                f'Per-row x-show expression does not use optional chaining: {expr!r}'
+            )
+
 
 class TestOrchestratorKeyConsistency:
     """Regression: x-init, checkboxes, and row x-show all reference the same orch_key."""
