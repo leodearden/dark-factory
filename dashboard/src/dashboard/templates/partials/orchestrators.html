@@ -47,7 +47,7 @@
               x-model="$store.panels['{{ orch_key }}'].done">
             {# "other" bucket count: tasks not in-progress, blocked, or pending.
                Must stay in sync with the bucket='other' else-branch in partials/tasks.html. #}
-            <span>Done ({{ orch.summary.total - orch.summary.in_progress - orch.summary.blocked - orch.summary.pending }})</span>
+            <span>Done/other ({{ orch.summary.total - orch.summary.in_progress - orch.summary.blocked - orch.summary.pending }})</span>
           </label>
         </div>
 
