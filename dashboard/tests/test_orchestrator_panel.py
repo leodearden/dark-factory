@@ -573,12 +573,15 @@ class TestOrchestratorTaskRowFiltering:
         import re
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
-        tbody_match = re.search(r'<tbody>(.*?)</tbody>', html, re.DOTALL)
-        assert tbody_match is not None, 'No <tbody> found'
-        tbody = tbody_match.group(1)
-        exprs = re.findall(r'x-show="([^"]+)"', tbody)
-        assert len(exprs) > 0, 'No x-show expressions found in tbody'
-        for expr in exprs:
+        tbody_blocks = re.findall(r'<tbody>(.*?)</tbody>', html, re.DOTALL)
+        assert len(tbody_blocks) > 0, 'No <tbody> found in rendered HTML'
+        all_exprs = [
+            expr
+            for tbody in tbody_blocks
+            for expr in re.findall(r'x-show="([^"]+)"', tbody)
+        ]
+        assert len(all_exprs) > 0, 'No x-show expressions found in any tbody'
+        for expr in all_exprs:
             assert '?.' in expr, (
                 f'Per-row x-show expression does not use optional chaining: {expr!r}'
             )

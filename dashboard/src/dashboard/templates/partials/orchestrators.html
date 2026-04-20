@@ -31,6 +31,13 @@
           <span class="text-yellow-400">{{ orch.summary.pending }} pending</span>
         </div>
 
+        {# x-model bindings below intentionally use plain dot access (no ?.) —
+           they are direct children of the x-data/x-init element, so Alpine
+           guarantees x-init has already seeded $store.panels[key] before any
+           child directive is evaluated (same-element synchronous init order).
+           Contrast with the per-row x-show in partials/tasks.html which uses
+           ?. because HTMX morphing can re-evaluate those rows before the
+           parent x-init has re-populated the panel after a swap. #}
         <div class="flex items-center gap-4 mt-3 text-sm">
           <label class="flex items-center gap-1 cursor-pointer">
             <input type="checkbox"
