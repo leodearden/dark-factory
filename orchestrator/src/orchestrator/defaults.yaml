@@ -23,6 +23,13 @@ inter_iteration_rebase: true
 
 # Verification timeouts
 verify_command_timeout_secs: 1800
+# Cold-build timeout: used for the *first* verify in a freshly created worktree
+# (before the .task/verify_warmed marker exists — i.e., before cargo/build cache
+# is populated).  After the first non-timeout run, subsequent verifies use
+# verify_command_timeout_secs.  Set to null to disable the cold window and always
+# use verify_command_timeout_secs.  Default = 3× warm (90 min) to accommodate
+# cold OCCT + Tauri + full workspace builds seen in the reify escalation cluster.
+verify_cold_command_timeout_secs: 5400
 verify_timeout_retries: 2
 
 # Verification execution mode + environment injection

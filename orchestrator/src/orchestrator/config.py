@@ -383,6 +383,7 @@ _OVERRIDABLE_FIELDS = frozenset({
     'test_command', 'lint_command', 'type_check_command',
     'lock_depth', 'max_per_module', 'module_overrides',
     'verify_command_timeout_secs',
+    'verify_cold_command_timeout_secs',
     'concurrent_verify', 'verify_env',
     'scope_cargo',
 })
@@ -400,6 +401,9 @@ class ModuleConfig:
     max_per_module: int | None = None
     module_overrides: dict[str, int] | None = None
     verify_command_timeout_secs: float | None = None
+    # Per-subproject cold-build timeout override (first verify before .task/verify_warmed exists).
+    # Falls back to verify_command_timeout_secs when None.
+    verify_cold_command_timeout_secs: float | None = None
     concurrent_verify: bool | None = None
     verify_env: dict[str, str] | None = None
     scope_cargo: bool | None = None
@@ -462,6 +466,11 @@ class OrchestratorConfig(BaseSettings):
 
     # Verification timeouts
     verify_command_timeout_secs: float = Field(default=1800.0)
+    # Timeout for the *first* verify in a freshly created worktree (cold build
+    # cache).  Applies until `.task/verify_warmed` exists.  Falls back to
+    # verify_command_timeout_secs when None (preserves existing behaviour).
+    # Shipped default comes from defaults.yaml (5400s = 3× warm).
+    verify_cold_command_timeout_secs: float | None = Field(default=None)
     verify_timeout_retries: int = Field(default=2)
 
     # Verification execution mode + env
