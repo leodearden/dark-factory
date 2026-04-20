@@ -2030,7 +2030,9 @@ class TestAggregateBurndownSeries:
 
         # (b) The single record's message contains the collision count and project_id.
         msg = collision_warnings[0].getMessage()
-        assert '3' in msg, f'Expected collision count "3" in warning message: {msg!r}'
+        assert '3 timestamp collisions' in msg, (
+            f'Expected "3 timestamp collisions" in warning message: {msg!r}'
+        )
         assert 'proj_a' in msg, f'Expected project_id "proj_a" in warning message: {msg!r}'
 
         # (c) Last-writer-wins: db2 values (10, 20, 30) win over db1 values (1, 2, 3).
