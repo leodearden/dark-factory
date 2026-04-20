@@ -313,17 +313,22 @@ async def aggregate_burndown_series(
     # and a warning is emitted so the misconfiguration is visible in logs.
     merged: dict[str, dict[str, int]] = {}
     collisions = 0
+    first_colliding: list[str] = []
     for series in per_db:
         for i, label in enumerate(series['labels']):
             if label in merged:
                 collisions += 1
+                if len(first_colliding) < 3:
+                    first_colliding.append(label)
             merged[label] = {k: series[k][i] for k in _keys}
     if collisions:
         logger.warning(
             'aggregate_burndown_series: %d timestamp collisions for project %r '
-            '— last-writer-wins applied; check for overlapping project roots',
+            '— last-writer-wins applied; check for overlapping project roots '
+            '(first: %s)',
             collisions,
             project_id,
+            ', '.join(first_colliding),
         )
 
     if not merged:

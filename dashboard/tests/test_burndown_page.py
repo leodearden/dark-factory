@@ -80,7 +80,8 @@ class TestNavLink:
 # Helpers for multi-project burndown route tests
 # ---------------------------------------------------------------------------
 
-import sqlite3  # noqa: E402 (after class definitions)
+import asyncio  # noqa: E402 (after class definitions)
+import sqlite3  # noqa: E402
 from datetime import UTC, datetime, timedelta  # noqa: E402
 from pathlib import Path  # noqa: E402
 from unittest.mock import patch  # noqa: E402
@@ -161,28 +162,23 @@ class TestBurndownChartsRouteMultiProject:
 # ---------------------------------------------------------------------------
 
 
-import asyncio  # noqa: E402
-
-
 class TestBurndownChartsRouteParallelism:
     """Verify that burndown_partials_charts fetches series concurrently across projects.
 
-    The test patches aggregate_burndown_series with a fake that awaits an
-    asyncio.Barrier(3).  If the handler loops sequentially, only one coroutine
-    reaches the barrier at a time and the wait_for raises TimeoutError — the
-    AssertionError propagates to the handler's try/except, series becomes {},
-    and none of the project IDs appear in the response HTML.  If asyncio.gather
-    is used, all three reach the barrier simultaneously, it releases within the
-    timeout, each fake returns valid data, and all project IDs appear in the HTML.
+    The test patches aggregate_burndown_series with a fake that tracks how many
+    calls are in-flight simultaneously.  If the handler gathers all projects, the
+    counter reaches 3; if it awaits sequentially, the counter never exceeds 1.
+    This tests the real concurrency property directly without depending on the
+    handler's except-clause behavior or a slow timeout.
     """
 
     def test_per_project_calls_are_concurrent(self, tmp_path):
-        """All project IDs appear in HTML only when calls run concurrently via gather.
+        """Max simultaneous in-flight calls equals the number of projects.
 
-        FAILS before the gather fix (sequential await causes barrier timeout,
-        handler catches the error, series={}, HTML has no project data).
-        PASSES after the gather fix (all three coroutines reach the barrier
-        simultaneously, valid data returned, HTML contains all project IDs).
+        FAILS before the gather fix (sequential await never has more than 1
+        in-flight call at once, max_concurrent stays at 1).
+        PASSES after the gather fix (all three coroutines overlap, max_concurrent
+        reaches 3).
         """
         from dashboard.app import app
         from dashboard.config import DashboardConfig
@@ -199,18 +195,17 @@ class TestBurndownChartsRouteParallelism:
             known_project_roots=roots[1:],
         )
 
-        n_projects = 3
-        barrier = asyncio.Barrier(n_projects)
+        # Shared state (lists because Python closures can't rebind bare ints).
+        in_flight = [0]
+        max_concurrent = [0]
 
         async def fake_aggregate_burndown_series(dbs, project_id, *, days):
-            try:
-                await asyncio.wait_for(barrier.wait(), timeout=2.0)
-            except (TimeoutError, asyncio.BrokenBarrierError) as exc:
-                raise AssertionError(
-                    'per-project aggregate_burndown_series calls did not run '
-                    'concurrently — expected asyncio.gather across projects '
-                    f'(barrier raised {type(exc).__name__})'
-                ) from exc
+            in_flight[0] += 1
+            max_concurrent[0] = max(max_concurrent[0], in_flight[0])
+            # Yield control several times so other coroutines get scheduled.
+            for _ in range(5):
+                await asyncio.sleep(0)
+            in_flight[0] -= 1
             # Return a valid empty-series dict so the template still renders.
             return {'labels': [], 'done': [], 'cancelled': [], 'blocked': [],
                     'deferred': [], 'in_progress': [], 'pending': []}
@@ -223,15 +218,8 @@ class TestBurndownChartsRouteParallelism:
             resp = c.get('/burndown/partials/charts?window=30d')
 
         assert resp.status_code == 200
-        # All three project IDs must appear in the rendered HTML.
-        # In the sequential case the barrier times out, the handler's try/except
-        # catches the AssertionError, series={}, and the HTML has no project data.
-        # In the parallel (gather) case all three succeed and the template renders
-        # each project_id in an <h3> tag via the project_name filter.
-        html = resp.text
-        assert 'alpha' in html, (
-            'project "alpha" not in HTML — per-project calls likely ran sequentially '
-            '(barrier timed out for the first call, handler caught the error, series={})'
+        assert max_concurrent[0] == 3, (
+            f'per-project aggregate_burndown_series calls did not run concurrently '
+            f'— max simultaneous in-flight: {max_concurrent[0]}, expected 3 '
+            f'(sequential await would give max_concurrent=1)'
         )
-        assert 'beta' in html, 'project "beta" not in HTML — per-project calls likely ran sequentially'
-        assert 'gamma' in html, 'project "gamma" not in HTML — per-project calls likely ran sequentially'
