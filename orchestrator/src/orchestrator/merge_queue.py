@@ -1128,7 +1128,7 @@ class SpeculativeMergeWorker:
                 _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(item.started_monotonic))
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if not req.result.done():
-                    req.result.set_result(MergeOutcome('done'))
+                    req.result.set_result(MergeOutcome('done', merge_sha=merge_commit))
                 return True
 
             if result in ('wip_overlap', 'pop_conflict'):
