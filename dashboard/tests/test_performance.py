@@ -931,6 +931,88 @@ class TestAggregateLoopHistograms:
         # (d) inner (canonical match) is element-wise summed: [2+2, 2+2, 0, 0, 0, 0]
         assert result['p']['inner']['values'] == [4, 4, 0, 0, 0, 0]
 
+    @pytest.mark.asyncio
+    async def test_three_dbs_canonical_mismatched_canonical_two_warnings(
+        self, monkeypatch, caplog,
+    ):
+        """Three DBs (canonical → extended → canonical) emit two WARNINGs.
+
+        DB1 outer: canonical ['0','1','2','3+'] → [1,2,3,4].
+        DB2 outer: extended  ['0','1','2','3+','4+'] → [5,6,7,8,9].
+          Mismatch #1 vs accumulator → dict-merge; accumulator becomes
+          labels=['0','1','2','3+','4+'], values=[6,8,10,12,9].
+        DB3 outer: canonical ['0','1','2','3+'] → [1,1,1,1].
+          Mismatch #2 vs extended accumulator → dict-merge; '4+' retains 9.
+          Final: labels=['0','1','2','3+','4+'], values=[7,9,11,13,9].
+
+        All DBs share identical canonical inner (values [1,1,1,1,1,1]) →
+        no inner WARNINGs; inner fast-path sums to [3,3,3,3,3,3].
+        """
+        call_count = 0
+        canonical_inner = {
+            'labels': ['0', '1', '2', '3', '4', '5+'],
+            'values': [1, 1, 1, 1, 1, 1],
+        }
+
+        async def _fake_get_loop_histograms(db, *, days):  # noqa: ARG001
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return {
+                    'proj': {
+                        'outer': {'labels': ['0', '1', '2', '3+'], 'values': [1, 2, 3, 4]},
+                        'inner': canonical_inner,
+                    },
+                }
+            elif call_count == 2:
+                return {
+                    'proj': {
+                        'outer': {
+                            'labels': ['0', '1', '2', '3+', '4+'],
+                            'values': [5, 6, 7, 8, 9],
+                        },
+                        'inner': canonical_inner,
+                    },
+                }
+            else:
+                return {
+                    'proj': {
+                        'outer': {'labels': ['0', '1', '2', '3+'], 'values': [1, 1, 1, 1]},
+                        'inner': canonical_inner,
+                    },
+                }
+
+        monkeypatch.setattr(
+            'dashboard.data.performance.get_loop_histograms',
+            _fake_get_loop_histograms,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.performance'):
+            result = await aggregate_loop_histograms([None, None, None], days=7)
+
+        # (a) No exception raised — we got here
+        assert 'proj' in result
+
+        # (b) Exactly two WARNINGs for outer mismatch (DB2 and DB3)
+        mismatch_warns = [
+            r.message
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and 'mismatch' in r.message and 'proj' in r.message
+        ]
+        assert len(mismatch_warns) == 2, (
+            f'Expected 2 outer-mismatch warnings, got {len(mismatch_warns)}: {mismatch_warns}'
+        )
+
+        # (c) outer: label-dict merges accumulate correctly across all three DBs
+        outer = result['proj']['outer']
+        assert outer['labels'] == ['0', '1', '2', '3+', '4+']
+        assert outer['values'] == [7, 9, 11, 13, 9], (
+            f'Expected [7,9,11,13,9] after three-DB merge, got {outer["values"]!r}'
+        )
+
+        # (d) inner: no mismatch — fast-path element-wise sum → [3,3,3,3,3,3]
+        assert result['proj']['inner']['values'] == [3, 3, 3, 3, 3, 3]
+
 
 # ---------------------------------------------------------------------------
 # Tests: aggregate_time_centiles

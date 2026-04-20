@@ -252,11 +252,6 @@ async def aggregate_escalation_rates(
     return merged
 
 
-# Canonical histogram bin counts defined by get_loop_histograms (review cycles / verify attempts).
-# Used by aggregate_loop_histograms to validate each result independently of DB ordering.
-_CANONICAL_HISTOGRAM_LENS: dict[str, int] = {'outer': 4, 'inner': 6}
-
-
 async def aggregate_loop_histograms(
     dbs: list[aiosqlite.Connection | None],
     *,
@@ -288,24 +283,27 @@ async def aggregate_loop_histograms(
             else:
                 m = merged[pid]
                 for key in ('outer', 'inner'):
-                    if info[key]['labels'] != m[key]['labels']:
+                    if info[key]['labels'] == m[key]['labels']:
+                        # Fast path: canonical case — label lists match, element-wise sum.
+                        for i, val in enumerate(info[key]['values']):
+                            m[key]['values'][i] += val
+                    else:
+                        # Mismatch branch: merge by label dict and warn once per (pid, key).
                         logger.warning(
                             'aggregate_loop_histograms: label list mismatch'
                             ' for project %r key %r'
                             ' (base=%r, incoming=%r)',
                             pid, key, m[key]['labels'], info[key]['labels'],
                         )
-                    # Merge by label dict: sum values for matching labels,
-                    # append any new labels from incoming at the end.
-                    label_map = dict(zip(m[key]['labels'], m[key]['values'], strict=True))
-                    for lbl, val in zip(info[key]['labels'], info[key]['values'], strict=True):
-                        label_map[lbl] = label_map.get(lbl, 0) + val
-                    known = list(m[key]['labels'])
-                    for lbl in info[key]['labels']:
-                        if lbl not in known:
-                            known.append(lbl)
-                    m[key]['labels'] = known
-                    m[key]['values'] = [label_map[lbl] for lbl in known]
+                        label_map = dict(zip(m[key]['labels'], m[key]['values']))
+                        for lbl, val in zip(info[key]['labels'], info[key]['values']):
+                            label_map[lbl] = label_map.get(lbl, 0) + val
+                        known = list(m[key]['labels'])
+                        for lbl in info[key]['labels']:
+                            if lbl not in known:
+                                known.append(lbl)
+                        m[key]['labels'] = known
+                        m[key]['values'] = [label_map[lbl] for lbl in known]
     return merged
 
 
