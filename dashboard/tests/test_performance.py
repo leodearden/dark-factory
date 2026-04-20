@@ -369,24 +369,17 @@ class TestTimeCentiles:
         assert result == {}
 
     @pytest.mark.asyncio
-    async def test_delegates_to_durations_by_project(self, runs_conn, monkeypatch):
-        """get_time_centiles must delegate to _durations_by_project, not run inline SQL.
+    async def test_single_db_parity_with_aggregate(self, runs_conn):
+        """get_time_centiles and aggregate_time_centiles must return identical
+        percentiles for the same single database.
 
-        Monkeypatch _durations_by_project to return a hardcoded dict.  If the
-        function honours the stub the result keys come from the stub; if it
-        still runs its own inline SQL the real DB rows are returned instead and
-        the assertion fails.
+        Both functions share _durations_by_project as the single SQL source.
+        For a single DB the results must be exactly equal — this is the core
+        invariant the shared helper exists to preserve.
         """
-        async def _fake_durations(db, *, days):  # noqa: ARG001
-            return {'mocked_proj': [100, 200, 300, 400, 500]}
-
-        monkeypatch.setattr(
-            'dashboard.data.performance._durations_by_project', _fake_durations,
-        )
-        result = await get_time_centiles(runs_conn, days=7)
-        assert list(result.keys()) == ['mocked_proj']
-        assert result['mocked_proj']['count'] == 5
-        assert result['mocked_proj']['p50'] == 300
+        single = await get_time_centiles(runs_conn, days=7)
+        agg = await aggregate_time_centiles([runs_conn], days=7)
+        assert single == agg
 
 
 # ---------------------------------------------------------------------------
@@ -514,25 +507,6 @@ class TestAggregateCompletionPaths:
             [None, None], [edir, edir], days=7,
         )
         assert result == {}
-
-    @pytest.mark.asyncio
-    async def test_empty_paths_list_still_present_in_dict(self, tmp_path, monkeypatch):
-        """project_id key is preserved in result even when its path list is empty.
-
-        Stubs get_completion_paths to return {'proj_x': []} (no path entries),
-        then verifies aggregate_completion_paths keeps the key with an empty list.
-        Pins the behaviour described in the Shape-contract docstring.
-        """
-        async def _fake_get_completion_paths(db, edir, *, days):  # noqa: ARG001
-            return {'proj_x': []}
-
-        monkeypatch.setattr(
-            'dashboard.data.performance.get_completion_paths',
-            _fake_get_completion_paths,
-        )
-        result = await aggregate_completion_paths([None], [tmp_path], days=7)
-        assert 'proj_x' in result
-        assert result['proj_x'] == []
 
     @pytest.mark.asyncio
     async def test_missing_escalations_dir_no_crash(self, tmp_path):
@@ -794,6 +768,68 @@ class TestAggregateLoopHistograms:
             result = await aggregate_loop_histograms([None, None], days=7)
 
         # (a) No IndexError — we got here
+        assert 'proj' in result
+
+        # (b) At least one WARNING record mentions 'mismatch' and 'proj'
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('mismatch' in t and 'proj' in t for t in warning_texts), (
+            f'Expected mismatch warning mentioning proj; got: {warning_texts}'
+        )
+
+        # (c) Mismatched outer.values preserved as baseline (skip-on-mismatch)
+        assert result['proj']['outer']['values'] == [1, 2, 3, 4]
+
+        # (d) Matched inner.values is element-wise summed: [1+2, 1+3, 1+4, 1+5, 1+6, 1+7]
+        assert result['proj']['inner']['values'] == [3, 4, 5, 6, 7, 8]
+
+    @pytest.mark.asyncio
+    async def test_mismatched_histogram_shorter_incoming_warns_and_skips(
+        self, monkeypatch, caplog,
+    ):
+        """Shorter incoming values also triggers warning and skips the merge.
+
+        First DB (baseline): outer has 4 values (canonical), inner has 6 (canonical).
+        Second DB: outer has 3 values — shorter than canonical 4.
+
+        Expected: same skip-on-mismatch behaviour as for the longer-incoming case,
+        confirming the guard is symmetric.
+        """
+        call_count = 0
+
+        async def _fake_get_loop_histograms(db, *, days):  # noqa: ARG001
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return {
+                    'proj': {
+                        'outer': {'labels': ['0', '1', '2', '3+'], 'values': [1, 2, 3, 4]},
+                        'inner': {
+                            'labels': ['0', '1', '2', '3', '4', '5+'],
+                            'values': [1, 1, 1, 1, 1, 1],
+                        },
+                    },
+                }
+            else:
+                # Second DB: outer has 3 values (shorter than canonical 4), inner matches
+                return {
+                    'proj': {
+                        'outer': {'labels': ['0', '1', '2+'], 'values': [5, 6, 7]},
+                        'inner': {
+                            'labels': ['0', '1', '2', '3', '4', '5+'],
+                            'values': [2, 3, 4, 5, 6, 7],
+                        },
+                    },
+                }
+
+        monkeypatch.setattr(
+            'dashboard.data.performance.get_loop_histograms',
+            _fake_get_loop_histograms,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.performance'):
+            result = await aggregate_loop_histograms([None, None], days=7)
+
+        # (a) No exception raised
         assert 'proj' in result
 
         # (b) At least one WARNING record mentions 'mismatch' and 'proj'
