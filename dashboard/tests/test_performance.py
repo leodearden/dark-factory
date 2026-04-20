@@ -515,6 +515,25 @@ class TestAggregateCompletionPaths:
         assert result == {}
 
     @pytest.mark.asyncio
+    async def test_empty_paths_list_still_present_in_dict(self, tmp_path, monkeypatch):
+        """project_id key is preserved in result even when its path list is empty.
+
+        Stubs get_completion_paths to return {'proj_x': []} (no path entries),
+        then verifies aggregate_completion_paths keeps the key with an empty list.
+        Pins the behaviour described in the Shape-contract docstring.
+        """
+        async def _fake_get_completion_paths(db, edir, *, days):  # noqa: ARG001
+            return {'proj_x': []}
+
+        monkeypatch.setattr(
+            'dashboard.data.performance.get_completion_paths',
+            _fake_get_completion_paths,
+        )
+        result = await aggregate_completion_paths([None], [tmp_path], days=7)
+        assert 'proj_x' in result
+        assert result['proj_x'] == []
+
+    @pytest.mark.asyncio
     async def test_missing_escalations_dir_no_crash(self, tmp_path):
         """A non-existent escalations_dir does not crash; via-interactive=0."""
         now = datetime.now(UTC)
