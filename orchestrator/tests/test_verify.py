@@ -290,3 +290,68 @@ class TestVerifyWarmMarker:
         from orchestrator.verify import _mark_verify_warm
         _mark_verify_warm(tmp_path)
         assert not (tmp_path / '.task').exists()
+
+
+class TestResolveVerifyTimeout:
+    """Tests for the updated _resolve_verify_timeout(config, module_config, *, is_cold) helper."""
+
+    def _make_config(self, warm=1800.0, cold=None):
+        """Build a minimal OrchestratorConfig with the given timeout values."""
+        from orchestrator.config import OrchestratorConfig
+        return OrchestratorConfig(
+            verify_command_timeout_secs=warm,
+            verify_cold_command_timeout_secs=cold,
+        )
+
+    def _make_mc(self, warm=None, cold=None):
+        """Build a minimal ModuleConfig with the given timeout values."""
+        from orchestrator.config import ModuleConfig
+        return ModuleConfig(
+            prefix='test',
+            verify_command_timeout_secs=warm,
+            verify_cold_command_timeout_secs=cold,
+        )
+
+    def test_warm_no_module_override_returns_config_warm(self):
+        """is_cold=False + no module override → config.verify_command_timeout_secs."""
+        from orchestrator.verify import _resolve_verify_timeout
+        config = self._make_config(warm=1800.0, cold=5400.0)
+        assert _resolve_verify_timeout(config, None, is_cold=False) == 1800.0
+
+    def test_cold_config_cold_set_returns_cold(self):
+        """is_cold=True + config.verify_cold_command_timeout_secs=5400 → 5400."""
+        from orchestrator.verify import _resolve_verify_timeout
+        config = self._make_config(warm=1800.0, cold=5400.0)
+        assert _resolve_verify_timeout(config, None, is_cold=True) == 5400.0
+
+    def test_cold_all_none_falls_back_to_warm(self):
+        """is_cold=True + cold values all None at every level → warm timeout."""
+        from orchestrator.verify import _resolve_verify_timeout
+        config = self._make_config(warm=1800.0, cold=None)
+        mc = self._make_mc(warm=None, cold=None)
+        assert _resolve_verify_timeout(config, mc, is_cold=True) == 1800.0
+
+    def test_module_cold_wins_over_config_cold(self):
+        """module_config.verify_cold_command_timeout_secs wins over config-level when is_cold=True."""
+        from orchestrator.verify import _resolve_verify_timeout
+        config = self._make_config(warm=1800.0, cold=5400.0)
+        mc = self._make_mc(cold=7200.0)
+        assert _resolve_verify_timeout(config, mc, is_cold=True) == 7200.0
+
+    def test_module_warm_wins_when_cold_false(self):
+        """module_config.verify_command_timeout_secs wins for the warm track when is_cold=False."""
+        from orchestrator.verify import _resolve_verify_timeout
+        config = self._make_config(warm=1800.0, cold=5400.0)
+        mc = self._make_mc(warm=2000.0)
+        assert _resolve_verify_timeout(config, mc, is_cold=False) == 2000.0
+
+    def test_module_warm_only_cold_fallthrough(self):
+        """module has warm override but no cold; is_cold=True falls through to config.cold, then module.warm.
+
+        Fallthrough order: module.cold (None) → top.cold (None) → module.warm.
+        """
+        from orchestrator.verify import _resolve_verify_timeout
+        config = self._make_config(warm=1800.0, cold=None)
+        mc = self._make_mc(warm=2000.0, cold=None)
+        # cold cascade: mc.cold=None → config.cold=None → mc.warm=2000
+        assert _resolve_verify_timeout(config, mc, is_cold=True) == 2000.0
