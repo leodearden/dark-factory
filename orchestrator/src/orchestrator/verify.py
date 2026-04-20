@@ -7,9 +7,10 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from shared.proc_group import terminate_process_group
+
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from shared.proc_group import terminate_process_group
 
 logger = logging.getLogger(__name__)
 

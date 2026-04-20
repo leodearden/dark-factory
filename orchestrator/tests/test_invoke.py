@@ -284,6 +284,7 @@ class TestRunSubprocessLocalTimedOut:
     async def test_run_subprocess_local_sets_timed_out_on_timeout(self, tmp_path):
         """_run_subprocess_local sets timed_out=True when TimeoutError fires."""
         proc = MagicMock()
+        proc.pid = 99999  # must be int; pgid = proc.pid in invoke.py
         proc.communicate = AsyncMock(side_effect=TimeoutError)
         proc.kill = MagicMock()
         proc.wait = AsyncMock()

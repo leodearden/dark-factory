@@ -1565,10 +1565,9 @@ class TestNextEscalation:
             patch(
                 'orchestrator.steward.terminate_process_group',
                 new_callable=AsyncMock,
-            ) as mock_tpg,
+            ) as mock_tpg,pytest.raises(asyncio.CancelledError)
         ):
-            with pytest.raises(asyncio.CancelledError):
-                await steward._watch_for_escalation()
+            await steward._watch_for_escalation()
 
         mock_tpg.assert_awaited_once()
 
@@ -2183,9 +2182,8 @@ class TestStewardWatcherProcessGroup:
             patch(
                 'orchestrator.steward.terminate_process_group',
                 new_callable=AsyncMock,
-            ) as mock_tpg,
+            ) as mock_tpg,pytest.raises(asyncio.CancelledError)
         ):
-            with pytest.raises(asyncio.CancelledError):
-                await steward._watch_for_escalation()
+            await steward._watch_for_escalation()
 
         mock_tpg.assert_awaited_once()

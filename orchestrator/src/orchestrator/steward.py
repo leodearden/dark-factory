@@ -17,13 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-
-from shared.proc_group import terminate_process_group
 import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from shared.proc_group import terminate_process_group
 
 from orchestrator.agents.invoke import invoke_agent, invoke_with_cap_retry
 from orchestrator.agents.roles import STEWARD

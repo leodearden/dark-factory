@@ -169,7 +169,7 @@ class TestRunCmdProcessGroup:
                     result = await coro
                     return result
             except (AttributeError, RuntimeError):
-                raise TimeoutError()
+                raise TimeoutError() from None
 
         async def fake_shell(cmd, **kwargs):
             proc = MagicMock()

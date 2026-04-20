@@ -8,9 +8,9 @@ import logging
 from typing import Any
 
 import httpx
+from shared.proc_group import terminate_process_group
 
 from orchestrator.config import OrchestratorConfig
-from shared.proc_group import terminate_process_group
 
 logger = logging.getLogger(__name__)
 
