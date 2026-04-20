@@ -331,8 +331,8 @@ class McpLifecycle:
         try:
             if self._pgid is not None:
                 await terminate_process_group(self._process, self._pgid, grace_secs=10.0)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning('Failed to terminate fused-memory server: %s', exc)
         finally:
             self._process = None
             self._pgid = None
