@@ -264,17 +264,16 @@ async def aggregate_loop_histograms(
 ) -> dict[str, dict]:
     """Merge :func:`get_loop_histograms` results from multiple databases.
 
-    For each project_id: element-wise sum the outer.values and inner.values
-    arrays across DBs.  Labels are always the canonical fixed lists set by
-    :func:`get_loop_histograms` (4 bins for outer, 6 bins for inner).
+    For each project_id: merge outer.values and inner.values by label key
+    across DBs.  In the canonical case all DBs return the same label lists
+    (4 bins for outer, 6 for inner), so the merge is equivalent to the
+    previous element-wise sum.
 
-    Each histogram's ``values`` array is validated against the canonical
-    expected length — not against a first-seen baseline.  This makes the
-    check order-independent: if any DB (including the first) delivers a
-    malformed shape, a ``WARNING`` is logged and that histogram key is
-    skipped to avoid silently corrupting the merge.  The warning message
-    includes the project_id, key name, and both the canonical and incoming
-    lengths.
+    If a DB returns a different label list for a key, a ``WARNING`` is logged
+    once per (project_id, key) identifying the mismatched lists.  The merge
+    still proceeds: values for known labels are summed, and any new labels
+    from the incoming result are appended at the end (preserving the
+    accumulator's original label order).
     """
     if not dbs:
         return {}
@@ -289,19 +288,24 @@ async def aggregate_loop_histograms(
             else:
                 m = merged[pid]
                 for key in ('outer', 'inner'):
-                    canonical_len = _CANONICAL_HISTOGRAM_LENS[key]
-                    base_len = len(m[key]['values'])
-                    incoming_len = len(info[key]['values'])
-                    if base_len != canonical_len or incoming_len != canonical_len:
+                    if info[key]['labels'] != m[key]['labels']:
                         logger.warning(
-                            'aggregate_loop_histograms: %s histogram length mismatch'
-                            ' for project %r (canonical=%d, base=%d, incoming=%d)'
-                            ' — skipping merge to avoid silent corruption',
-                            key, pid, canonical_len, base_len, incoming_len,
+                            'aggregate_loop_histograms: label list mismatch'
+                            ' for project %r key %r'
+                            ' (base=%r, incoming=%r)',
+                            pid, key, m[key]['labels'], info[key]['labels'],
                         )
-                        continue
-                    for i, val in enumerate(info[key]['values']):
-                        m[key]['values'][i] += val
+                    # Merge by label dict: sum values for matching labels,
+                    # append any new labels from incoming at the end.
+                    label_map = dict(zip(m[key]['labels'], m[key]['values'], strict=True))
+                    for lbl, val in zip(info[key]['labels'], info[key]['values'], strict=True):
+                        label_map[lbl] = label_map.get(lbl, 0) + val
+                    known = list(m[key]['labels'])
+                    for lbl in info[key]['labels']:
+                        if lbl not in known:
+                            known.append(lbl)
+                    m[key]['labels'] = known
+                    m[key]['values'] = [label_map[lbl] for lbl in known]
     return merged
 
 
