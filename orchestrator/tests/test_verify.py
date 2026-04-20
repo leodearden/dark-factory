@@ -6,7 +6,13 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from orchestrator.verify import _run_cmd
+from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify import (
+    _run_cmd,
+    run_scoped_verification,
+    run_verification,
+    scope_module_config,
+)
 
 
 class TestRunCmdBashExecutable:
@@ -591,3 +597,157 @@ def test_apply_cargo_scope_preserves_verify_cold_command_timeout_secs(tmp_path: 
 
     assert result.verify_command_timeout_secs == 2000.0
     assert result.verify_cold_command_timeout_secs == 6000.0
+
+
+class TestScopeModuleConfigReturnsNone:
+    """`scope_module_config` returns None when no task_files match the prefix.
+
+    Callers must treat None as "skip this subproject" rather than falling
+    back to the full unscoped suite — running a subproject with zero
+    matching files was the root cause of the 2026-04-20 merge-queue stall
+    (a fused-memory/** merge ran the whole shared/ suite and hung).
+    """
+
+    def test_returns_none_when_no_files_under_prefix(self):
+        mc = ModuleConfig(
+            prefix='shared',
+            test_command='uv run pytest tests/',
+            lint_command='ruff check src/',
+            type_check_command='pyright',
+        )
+        result = scope_module_config(mc, ['fused-memory/src/foo.py'])
+        assert result is None
+
+    def test_returns_none_when_task_files_empty(self):
+        mc = ModuleConfig(prefix='shared', test_command='pytest')
+        result = scope_module_config(mc, [])
+        assert result is None
+
+    def test_returns_scoped_config_when_files_match(self):
+        mc = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+        )
+        result = scope_module_config(mc, ['shared/tests/test_x.py', 'shared/src/y.py'])
+        assert result is not None
+        # The specific files should appear in the scoped commands.
+        assert result.test_command is not None
+        assert 'shared/tests/test_x.py' in result.test_command
+        assert result.lint_command is not None
+        assert 'shared/src/y.py' in result.lint_command
+
+
+class TestRunScopedVerificationSkipsUntouched:
+    """End-to-end: run_scoped_verification skips subprojects with no matching files."""
+
+    @pytest.mark.asyncio
+    async def test_skips_subprojects_with_no_matching_files(
+        self, tmp_path: Path,
+    ):
+        """A task that only touches module A should not run module B's commands."""
+        # Pretend the task touched a fused-memory test file.
+        (tmp_path / 'fused-memory' / 'tests').mkdir(parents=True)
+        touched = tmp_path / 'fused-memory' / 'tests' / 'test_changed.py'
+        touched.write_text('def test_x(): pass\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(
+                prefix='shared',
+                test_command='uv run --directory shared pytest tests/',
+            ),
+            ModuleConfig(
+                prefix='fused-memory',
+                test_command='uv run --directory fused-memory pytest tests/',
+            ),
+        ]
+
+        # Spy on _run_cmd; pretend every command passes instantly.
+        calls: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            calls.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['fused-memory/tests/test_changed.py'],
+            )
+
+        assert result.passed
+        joined = ' | '.join(calls)
+        assert calls, 'expected at least one command to run'
+        # shared's command (identified by its --directory shared flag) must
+        # NOT appear — that's the whole point of the fix.
+        assert '--directory shared' not in joined, (
+            f'shared subproject was run despite no matching files: {calls}'
+        )
+        # And something fused-memory-related did run.
+        assert 'fused-memory' in joined or 'test_changed.py' in joined, (
+            f'fused-memory command should have run; calls: {calls}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_max_retries_zero_disables_timeout_retry(self, tmp_path: Path):
+        """max_retries=0 (merge-queue path) short-circuits the retry loop.
+
+        Without the plumbing, a deterministic hang triples the stall.
+        """
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='__test_cmd__',
+            lint_command='__lint_cmd__',
+            type_check_command='__type_cmd__',
+            verify_command_timeout_secs=0.2,
+            verify_timeout_retries=5,
+        )
+
+        test_calls = 0
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            nonlocal test_calls
+            if cmd == '__test_cmd__':
+                test_calls += 1
+                return 1, f'Command timed out after {timeout}s: {cmd}', True
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, config, max_retries=0)
+
+        assert not result.passed
+        assert result.timed_out
+        assert test_calls == 1, (
+            f'max_retries=0 should run test cmd once; ran {test_calls} times'
+        )
+
+    @pytest.mark.asyncio
+    async def test_max_retries_default_uses_config(self, tmp_path: Path):
+        """When max_retries is None, the config value is used (regression guard)."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='__test_cmd__',
+            lint_command='__lint_cmd__',
+            type_check_command='__type_cmd__',
+            verify_command_timeout_secs=0.1,
+            verify_timeout_retries=2,
+        )
+
+        test_calls = 0
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            nonlocal test_calls
+            if cmd == '__test_cmd__':
+                test_calls += 1
+                return 1, f'Command timed out after {timeout}s: {cmd}', True
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, config)
+
+        assert not result.passed
+        # 1 initial + 2 retries = 3 invocations.
+        assert test_calls == 3, (
+            f'default should retry per config; got {test_calls} invocations'
+        )

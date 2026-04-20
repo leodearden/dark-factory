@@ -371,9 +371,12 @@ class MergeWorker:
                 f'(pre-rebased, main unchanged)'
             )
         if not skip_verify:
+            # max_retries=0: post-merge verify hangs are usually deterministic
+            # (e.g. a deadlocked test); retrying just multiplies queue-wide stall.
             verify = await run_scoped_verification(
                 merge_wt, req.config, req.module_configs,
                 task_files=req.task_files,
+                max_retries=0,
             )
             if not verify.passed:
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
@@ -1075,9 +1078,13 @@ class SpeculativeMergeWorker:
                 f'worktree={merge_wt.name})'
             )
             try:
+                # max_retries=0: a hung post-merge verify is almost always a
+                # deterministic failure (e.g. deadlocked test); retries just
+                # multiply queue-wide stall.
                 verify = await run_scoped_verification(
                     merge_wt, req.config, req.module_configs,
                     task_files=req.task_files,
+                    max_retries=0,
                 )
             except Exception as exc:
                 logger.info(

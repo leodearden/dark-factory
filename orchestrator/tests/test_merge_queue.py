@@ -886,7 +886,9 @@ class TestSpeculativeMergeWorker:
         # Track how many times verify is called per task
         verify_calls: dict[str, int] = {}
 
-        async def _verify_side_effect(merge_wt, cfg, module_configs, task_files=None):
+        async def _verify_side_effect(
+            merge_wt, cfg, module_configs, task_files=None, **_kwargs,
+        ):
             # Determine which task by looking at which file is present
             n_file = merge_wt / 'file_disc_n.py'
             if n_file.exists():
@@ -1044,6 +1046,47 @@ class TestSpeculativeMergeWorker:
 
         await worker.stop()
         await worker_task
+
+    async def test_speculative_verify_called_with_max_retries_zero(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Merge-queue post-merge verify must pass max_retries=0.
+
+        A deterministic verify hang would otherwise be retried per
+        ``config.verify_timeout_retries``, tripling queue-wide stall.
+        This is the regression that caused the 2026-04-20 90-minute jam.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'retry0', 'retry0.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        captured_kwargs: list[dict] = []
+
+        async def spy_verify(*args, **kwargs):
+            captured_kwargs.append(kwargs)
+            result = AsyncMock()
+            result.passed = True
+            result.summary = ''
+            return result
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=spy_verify,
+        ):
+            req = _make_request('retry0', 'retry0', wt, config)
+            await queue.put(req)
+            await asyncio.wait_for(req.result, timeout=30)
+
+        await worker.stop()
+        await worker_task
+
+        assert captured_kwargs, 'run_scoped_verification was not invoked'
+        assert captured_kwargs[0].get('max_retries') == 0, (
+            f'merge-queue verify must pass max_retries=0; got {captured_kwargs[0]!r}'
+        )
 
     async def test_speculative_shutdown_drains_both(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -1722,7 +1765,9 @@ class TestSpeculativeMergeWorker:
         # Fail verification whenever file_chain_n.py is present (N's tainted code).
         # N's merge is non-spec → fail; N+2's speculative worktree descends from
         # N's commit → also has file_chain_n.py → would fail unless discarded first.
-        async def _verify_chain(merge_wt, cfg, module_configs, task_files=None):
+        async def _verify_chain(
+            merge_wt, cfg, module_configs, task_files=None, **_kwargs,
+        ):
             result = AsyncMock()
             if (merge_wt / 'file_chain_n.py').exists():
                 result.passed = False

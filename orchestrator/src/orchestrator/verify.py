@@ -231,7 +231,7 @@ def _apply_cargo_scope(
     )
 
 
-def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig:
+def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig | None:
     """Narrow *mc*'s commands to the specific *task_files* it covers.
 
     Filters *task_files* to ``.py`` files matching ``mc.prefix + '/'`` and
@@ -239,8 +239,11 @@ def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig
     from scoped commands so that tools resolve paths from the worktree root,
     where the full paths are valid.
 
-    Returns the original *mc* when no ``.py`` files from *task_files* fall
-    under the prefix.
+    Returns ``None`` when no ``.py`` files from *task_files* fall under the
+    prefix — the caller should skip that subproject entirely rather than run
+    its full unscoped suite.  Running a subproject's complete test suite for
+    a task that touched zero of its files is both wasteful and a source of
+    unrelated-flake blockers on the merge-queue path.
     """
     prefix = mc.prefix + '/'
     # Keep full worktree-relative paths, filter to .py files under this module
@@ -250,7 +253,7 @@ def scope_module_config(mc: ModuleConfig, task_files: list[str]) -> ModuleConfig
             scoped.append(f)
 
     if not scoped:
-        return mc
+        return None
 
     test_files = [f for f in scoped if _is_test_file(f)]
 
@@ -511,6 +514,7 @@ async def run_verification(
     module_config: ModuleConfig | None = None,
     *,
     allow_cold_cache: bool = True,
+    max_retries: int | None = None,
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
 
@@ -519,9 +523,12 @@ async def run_verification(
     global config commands are used for every check.
 
     If any enabled command times out while the others pass, the whole verify
-    is retried up to ``config.verify_timeout_retries`` times.  A retry that
-    surfaces a genuine failure (e.g., a real lint error) is returned
-    immediately instead of being retried further.
+    is retried up to *max_retries* times (default ``config.verify_timeout_retries``).
+    Pass ``max_retries=0`` to disable retries entirely — appropriate for
+    merge-queue post-merge verification, where a deterministic hang would
+    otherwise triple the queue-wide stall.  A retry that surfaces a genuine
+    failure (e.g., a real lint error) is returned immediately instead of
+    being retried further.
 
     When *allow_cold_cache* is ``False`` cold-timeout detection is disabled
     entirely regardless of filesystem state, and the warm timeout is always
@@ -543,7 +550,8 @@ async def run_verification(
     module_prefix = module_config.prefix if module_config is not None else None
     is_cold = _is_verify_cold(worktree, module_prefix) if allow_cold_cache else False
     timeout = _resolve_verify_timeout(config, module_config, is_cold=is_cold)
-    max_retries = config.verify_timeout_retries
+    if max_retries is None:
+        max_retries = config.verify_timeout_retries
 
     if is_cold:
         warm_timeout = _resolve_verify_timeout(config, module_config, is_cold=False)
@@ -729,6 +737,8 @@ async def run_scoped_verification(
     config: OrchestratorConfig,
     module_configs: list[ModuleConfig],
     task_files: list[str] | None = None,
+    *,
+    max_retries: int | None = None,
 ) -> VerifyResult:
     """Run verification scoped to specific subprojects and optionally to task files.
 
@@ -736,12 +746,17 @@ async def run_scoped_verification(
 
     1. **File-scoped within subprojects** — when *module_configs* is non-empty
        and *task_files* is provided, each ModuleConfig's commands are narrowed
-       to the specific files via :func:`scope_module_config`.
+       to the specific files via :func:`scope_module_config`.  Subprojects
+       with zero matching files are skipped entirely.
     2. **Fallback-scoped** — when *module_configs* is empty and *task_files* is
        provided, a synthetic ModuleConfig is built via
        :func:`_build_fallback_config`, bypassing the global commands entirely.
     3. **Global** — when *task_files* is ``None`` (or falsy) with no
        module_configs, or when fallback returns ``None`` (no .py files).
+
+    *max_retries* overrides ``config.verify_timeout_retries`` for this call;
+    pass ``0`` from the merge-queue path so a deterministic hang doesn't
+    triple the stall.
     """
     scope_cargo_enabled = config.scope_cargo
 
@@ -754,7 +769,28 @@ async def run_scoped_verification(
         if task_files:
             # Filter to files that still exist — tasks may delete files as part of their work
             existing_files = [f for f in task_files if (worktree / f).exists()]
-            scoped = [scope_module_config(mc, existing_files) for mc in module_configs]
+            # scope_module_config returns None when no files touch the subproject;
+            # those subprojects are skipped rather than running their full suite.
+            per_module = [
+                (mc.prefix, scope_module_config(mc, existing_files))
+                for mc in module_configs
+            ]
+            skipped = [prefix for prefix, scoped_mc in per_module if scoped_mc is None]
+            scoped = [scoped_mc for _prefix, scoped_mc in per_module if scoped_mc is not None]
+            if skipped:
+                logger.info(
+                    'Verification scope: skipping %d subproject(s) with no matching files: %s',
+                    len(skipped), ', '.join(skipped),
+                )
+            if not scoped:
+                # No subproject has matching files — fall through to global.
+                # Otherwise we'd gather() zero coroutines and silently pass.
+                logger.info(
+                    'Verification mode: global (file-scoped filtered every subproject)',
+                )
+                return await run_verification(
+                    worktree, config, max_retries=max_retries,
+                )
             # Rewrite cargo --workspace → cargo -p <crate> when all task files
             # are .rs and map to known workspace crates.
             scoped = [
@@ -768,7 +804,7 @@ async def run_scoped_verification(
             scoped = module_configs
             logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
         results = await asyncio.gather(
-            *(run_verification(worktree, config, mc) for mc in scoped)
+            *(run_verification(worktree, config, mc, max_retries=max_retries) for mc in scoped)
         )
         return _aggregate_results(list(results))
 
@@ -782,7 +818,9 @@ async def run_scoped_verification(
                 fallback, existing_files, worktree, scope_cargo_enabled,
             )
             logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
-            return await run_verification(worktree, config, fallback)
+            return await run_verification(
+                worktree, config, fallback, max_retries=max_retries,
+            )
 
         # For Rust projects with no module_configs and no Python fallback
         # (Reify's layout), try to scope the global commands.
@@ -801,7 +839,9 @@ async def run_scoped_verification(
                     'Verification mode: cargo-scoped (%d .rs files)',
                     len(existing_files),
                 )
-                return await run_verification(worktree, config, rewritten)
+                return await run_verification(
+                    worktree, config, rewritten, max_retries=max_retries,
+                )
 
     logger.info('Verification mode: global (no scope info)')
-    return await run_verification(worktree, config)
+    return await run_verification(worktree, config, max_retries=max_retries)
