@@ -598,6 +598,55 @@ class TestHappyPath:
         assert workflow.metrics.total_cost_usd > 0
         assert workflow.metrics.execute_iterations == 1
 
+    async def test_workflow_success_path_passes_merge_sha_as_done_provenance(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """Merge SHA from MergeOutcome.merge_sha is threaded through to done_provenance.
+
+        The merge-queue stub resolves the future with MergeOutcome('done', merge_sha='FEEDFACE').
+        After run() returns DONE, scheduler.provenance must contain {'commit': 'FEEDFACE'}.
+        Fails until _submit_to_merge_queue stores merge_sha on self._merge_sha (step-15)
+        and workflow.py:554 passes it as done_provenance.
+        """
+        from orchestrator.merge_queue import MergeOutcome
+
+        stub = AgentStub()
+        scheduler = FakeScheduler()
+        merge_queue: asyncio.Queue = asyncio.Queue()
+
+        # Stub merge worker: resolve every request immediately with done + known SHA
+        async def _stub_merge_worker() -> None:
+            while True:
+                req = await merge_queue.get()
+                req.result.set_result(MergeOutcome('done', merge_sha='FEEDFACE'))
+
+        asyncio.create_task(_stub_merge_worker(), name='test-stub-merge-worker')
+
+        workflow = TaskWorkflow(
+            assignment=task_assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=scheduler,  # type: ignore[arg-type]
+            briefing=FakeBriefing(),  # type: ignore[arg-type]
+            mcp=FakeMcp(),  # type: ignore[arg-type]
+            merge_queue=merge_queue,
+        )
+
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        # After step-15: merge_sha 'FEEDFACE' from MergeOutcome must be recorded
+        assert scheduler.provenance.get(task_assignment.task_id) == {'commit': 'FEEDFACE'}
+
 
 # ---------------------------------------------------------------------------
 # Tests: Completion Judge (ζ)
