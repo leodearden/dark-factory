@@ -155,12 +155,14 @@ async def aggregate_completion_paths(
     Merging rule: for a given project_id the *count* for each completion
     path is summed across DBs; ``pct`` is recomputed from the new totals.
 
-    Shape contract: project_ids whose merged path counts are *all zero* are
-    **excluded** from the returned dict (the ``if count > 0`` guard on the
-    list comprehension drops zero-count paths; if every path is zero the list
-    is empty and the key is still present — but in practice a project with no
-    completed tasks has no rows in ``task_results`` so its project_id never
-    appears in ``cutoffs`` and is never added to ``merged``).
+    Shape contract: every project_id that appears in any per-DB
+    :func:`get_completion_paths` result is a key in the returned dict.  Its
+    value list contains only paths whose merged count is > 0 (the
+    ``if count > 0`` guard on the list comprehension), so the list may be
+    empty if every per-DB result for that project had an empty list.  In
+    practice this does not occur because :func:`get_completion_paths` only
+    yields a project_id when at least one ``task_results`` row exists for it,
+    which always classifies into at least one non-zero path.
 
     Note: :func:`aggregate_escalation_rates` includes projects with
     ``total_tasks == 0`` (returning rates of 0.0).  The difference is
