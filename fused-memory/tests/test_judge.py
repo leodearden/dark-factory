@@ -8,7 +8,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import JudgeVerdict, VerdictSeverity
+from fused_memory.models.reconciliation import (
+    JudgeVerdict,
+    VerdictAction,
+    VerdictSeverity,
+)
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
@@ -314,9 +318,9 @@ async def test_build_review_prompt_excludes_recent_verdicts(mock_journal):
         JudgeVerdict(
             run_id=f'prior-{i}',
             reviewed_at=now,
-            severity='moderate',
+            severity=VerdictSeverity.moderate,
             findings=[{'issue': f'finding-{i}'}],
-            action_taken='rollback',
+            action_taken=VerdictAction.rollback,
         )
         for i in range(10)
     ]
