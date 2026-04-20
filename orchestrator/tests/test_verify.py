@@ -561,6 +561,86 @@ class TestRunVerificationColdFirstUse:
         assert 1800.0 in captured, f'Expected warm timeout 1800; got: {captured}'
         assert 5400.0 not in captured, f'Unexpected cold timeout when allow_cold_cache=False: {captured}'
 
+    @pytest.mark.asyncio
+    async def test_is_merge_verify_forces_cold_timeout(self, tmp_path: Path):
+        """is_merge_verify=True forces cold timeout even without .task/ present.
+
+        Merge worktrees have .taskmaster/ but not .task/, so
+        _is_verify_cold's filesystem heuristic returns False (treats them
+        as warm).  But merge worktrees are always freshly created = cold
+        cargo build.  Asserting the flag bypasses the heuristic is Fix #1.
+        """
+        from orchestrator.verify import run_verification
+        # No .task/ dir — filesystem heuristic would say "warm".
+        assert not (tmp_path / '.task').exists()
+
+        config = self._make_config(warm=1800.0, cold=5400.0)
+        fake_cmd, captured = self._make_success_mock()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            await run_verification(tmp_path, config, is_merge_verify=True)
+
+        assert 5400.0 in captured, (
+            f'is_merge_verify=True must force cold timeout; got: {captured}'
+        )
+        assert 1800.0 not in captured, (
+            f'Unexpected warm timeout when is_merge_verify=True: {captured}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_is_merge_verify_does_not_write_warm_marker(
+        self, tmp_path: Path,
+    ):
+        """is_merge_verify success must NOT write the warm marker.
+
+        Merge worktrees are ephemeral (cleaned up right after), so writing
+        a marker is at best a no-op and at worst leaks into a path that
+        happens to have .task/ (e.g. when a test fixture shares a dir).
+        Skipping the marker keeps the intent explicit.
+        """
+        from orchestrator.verify import run_verification
+        # Create .task/ so _mark_verify_warm would otherwise succeed.
+        (tmp_path / '.task').mkdir()
+
+        config = self._make_config(warm=1800.0, cold=5400.0)
+        fake_cmd, _ = self._make_success_mock()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await run_verification(
+                tmp_path, config, is_merge_verify=True,
+            )
+
+        assert result.passed
+        assert not (tmp_path / '.task' / 'verify_warmed').exists(), (
+            'is_merge_verify=True must not write the warm marker'
+        )
+
+    @pytest.mark.asyncio
+    async def test_is_merge_verify_default_preserves_existing_behaviour(
+        self, tmp_path: Path,
+    ):
+        """Default is_merge_verify=False keeps the existing cold-detection path.
+
+        Ensures non-merge callers (workflow-level task verify, review
+        checkpoints) continue to use _is_verify_cold as before.
+        """
+        from orchestrator.verify import run_verification
+        # No .task/ dir → heuristic says "warm" (project_root case).
+        assert not (tmp_path / '.task').exists()
+
+        config = self._make_config(warm=1800.0, cold=5400.0)
+        fake_cmd, captured = self._make_success_mock()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            await run_verification(tmp_path, config)  # default flags
+
+        # With no .task/ and default flags, _is_verify_cold returns False →
+        # warm timeout applies.
+        assert 1800.0 in captured, (
+            f'Default call without .task/ must use warm timeout; got: {captured}'
+        )
+        assert 5400.0 not in captured
+
 
 def test_apply_cargo_scope_preserves_verify_cold_command_timeout_secs(tmp_path: Path):
     """_apply_cargo_scope propagates verify_cold_command_timeout_secs to the rebuilt ModuleConfig.

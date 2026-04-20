@@ -2576,6 +2576,384 @@ class TestSpeculativeBackwardCompat:
 
 
 # ---------------------------------------------------------------------------
+# TestMergeVerifyColdTimeout — Fix #1
+# Merge worktrees are freshly created per merge (no warm cargo cache) but
+# lack .task/ (only .taskmaster/), so _is_verify_cold mis-classifies them as
+# warm.  The merge-queue call sites must pass is_merge_verify=True so the
+# cold-track timeout applies.  These tests assert the kwarg is threaded
+# through both MergeWorker and SpeculativeMergeWorker.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeVerifyColdTimeout:
+    async def test_merge_worker_passes_is_merge_verify_true(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """MergeWorker's verify call must set is_merge_verify=True.
+
+        The legacy serial worker is preserved for compat; even though
+        SpeculativeMergeWorker is the default production path, this flag
+        must still flow through here so tests/eval/debug harnesses that
+        opt back into the serial worker also get the cold timeout.
+        """
+        worktree = (await git_ops.create_worktree('merge-cold-mw')).path
+        (worktree / 'coldmw.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add coldmw')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        captured_kwargs: list[dict] = []
+
+        async def spy_verify(*args, **kwargs):
+            captured_kwargs.append(kwargs)
+            result = AsyncMock()
+            result.passed = True
+            result.summary = ''
+            result.timed_out = False
+            return result
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=spy_verify,
+        ):
+            req = _make_request('cold-mw', 'merge-cold-mw', worktree, config)
+            await queue.put(req)
+            await asyncio.wait_for(req.result, timeout=30)
+
+        await worker.stop()
+        await worker_task
+
+        assert captured_kwargs, 'run_scoped_verification was not invoked'
+        assert captured_kwargs[0].get('is_merge_verify') is True, (
+            f'merge-queue verify must pass is_merge_verify=True; '
+            f'got {captured_kwargs[0]!r}'
+        )
+
+    async def test_speculative_worker_passes_is_merge_verify_true(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """SpeculativeMergeWorker's verify call must set is_merge_verify=True.
+
+        This is the production path — it's the call site that was
+        mis-classifying merge worktrees as warm and blowing the 30-min
+        timeout on each post-merge verify against reify.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'merge-cold-spec', 'coldspec.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        captured_kwargs: list[dict] = []
+
+        async def spy_verify(*args, **kwargs):
+            captured_kwargs.append(kwargs)
+            result = AsyncMock()
+            result.passed = True
+            result.summary = ''
+            result.timed_out = False
+            return result
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=spy_verify,
+        ):
+            req = _make_request('cold-spec', 'merge-cold-spec', wt, config)
+            await queue.put(req)
+            await asyncio.wait_for(req.result, timeout=30)
+
+        await worker.stop()
+        await worker_task
+
+        assert captured_kwargs, 'run_scoped_verification was not invoked'
+        assert captured_kwargs[0].get('is_merge_verify') is True, (
+            f'speculative merge-queue verify must pass is_merge_verify=True; '
+            f'got {captured_kwargs[0]!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestMergeVerifyTimeoutLoopBreaker — Fix #2
+# After MAX_POST_MERGE_VERIFY_TIMEOUTS consecutive post-merge verify
+# TIMEOUTS for the same task, the merge queue must stop running merge+verify
+# and return a ``blocked`` outcome with the ABANDONED_REASON_PREFIX.  Real
+# (non-timeout) verify failures must NOT feed the counter, and a successful
+# merge must reset the counter.
+# ---------------------------------------------------------------------------
+
+
+def _mock_verify_timeout():
+    """Return a mock that makes run_scoped_verification time out."""
+    async def _fake(*args, **kwargs):
+        result = AsyncMock()
+        result.passed = False
+        result.summary = 'Verification timed out'
+        result.timed_out = True
+        result.failure_report = lambda: '## Verify Timed Out\n\n(mock)'
+        return result
+    return _fake
+
+
+@pytest.mark.asyncio
+class TestMergeVerifyTimeoutLoopBreaker:
+    async def test_merge_worker_abandons_after_threshold(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """N consecutive verify timeouts → next submission blocked without verify.
+
+        Submits the same task_id MAX+1 times.  The first MAX submissions
+        run merge+verify and surface a blocked/timeout outcome.  The next
+        submission must short-circuit: no merge, no verify, blocked
+        outcome with ABANDONED_REASON_PREFIX.
+        """
+        from orchestrator.merge_queue import ABANDONED_REASON_PREFIX
+
+        wt = await _make_branch_with_file(
+            git_ops, 'loop-break-mw', 'lb.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        assert worker.MAX_POST_MERGE_VERIFY_TIMEOUTS == 2
+        worker_task = asyncio.create_task(worker.run())
+
+        verify_call_count = 0
+
+        async def counting_timeout_verify(*args, **kwargs):
+            nonlocal verify_call_count
+            verify_call_count += 1
+            result = AsyncMock()
+            result.passed = False
+            result.summary = 'Verification timed out'
+            result.timed_out = True
+            result.failure_report = lambda: ''
+            return result
+
+        try:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                side_effect=counting_timeout_verify,
+            ):
+                # Submissions 1..MAX: run merge+verify, surface timeout.
+                outcomes: list[MergeOutcome] = []
+                for _ in range(worker.MAX_POST_MERGE_VERIFY_TIMEOUTS):
+                    req = _make_request('lb-task', 'loop-break-mw', wt, config)
+                    await queue.put(req)
+                    outcomes.append(await asyncio.wait_for(req.result, timeout=30))
+
+                # Every one of those must be blocked with the verify-failed reason.
+                for o in outcomes:
+                    assert o.status == 'blocked'
+                    assert 'verification failed' in o.reason.lower()
+
+                verify_calls_before_loopbreak = verify_call_count
+                assert verify_calls_before_loopbreak == worker.MAX_POST_MERGE_VERIFY_TIMEOUTS
+
+                # Submission MAX+1: must short-circuit BEFORE invoking verify.
+                req_final = _make_request(
+                    'lb-task', 'loop-break-mw', wt, config,
+                )
+                await queue.put(req_final)
+                final = await asyncio.wait_for(req_final.result, timeout=10)
+
+            assert final.status == 'blocked'
+            assert final.reason.startswith(ABANDONED_REASON_PREFIX), (
+                f'Expected abandoned reason prefix; got {final.reason!r}'
+            )
+            # Crucially: verify was NOT invoked again on the abandoned path.
+            assert verify_call_count == verify_calls_before_loopbreak, (
+                f'Abandoned submission must not invoke verify; '
+                f'before={verify_calls_before_loopbreak} after={verify_call_count}'
+            )
+        finally:
+            await worker.stop()
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+
+    async def test_speculative_worker_abandons_after_threshold(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """SpeculativeMergeWorker loop-breaker — same contract as MergeWorker."""
+        from orchestrator.merge_queue import ABANDONED_REASON_PREFIX
+
+        wt = await _make_branch_with_file(
+            git_ops, 'loop-break-spec', 'lbs.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        assert worker.MAX_POST_MERGE_VERIFY_TIMEOUTS == 2
+        worker_task = asyncio.create_task(worker.run())
+
+        verify_call_count = 0
+
+        async def counting_timeout_verify(*args, **kwargs):
+            nonlocal verify_call_count
+            verify_call_count += 1
+            result = AsyncMock()
+            result.passed = False
+            result.summary = 'Verification timed out'
+            result.timed_out = True
+            result.failure_report = lambda: ''
+            return result
+
+        try:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                side_effect=counting_timeout_verify,
+            ):
+                for _ in range(worker.MAX_POST_MERGE_VERIFY_TIMEOUTS):
+                    req = _make_request('lbs-task', 'loop-break-spec', wt, config)
+                    await queue.put(req)
+                    outcome = await asyncio.wait_for(req.result, timeout=30)
+                    assert outcome.status == 'blocked'
+
+                verify_calls_before_loopbreak = verify_call_count
+                assert verify_calls_before_loopbreak == worker.MAX_POST_MERGE_VERIFY_TIMEOUTS
+
+                req_final = _make_request(
+                    'lbs-task', 'loop-break-spec', wt, config,
+                )
+                await queue.put(req_final)
+                final = await asyncio.wait_for(req_final.result, timeout=10)
+
+            assert final.status == 'blocked'
+            assert final.reason.startswith(ABANDONED_REASON_PREFIX)
+            assert verify_call_count == verify_calls_before_loopbreak
+        finally:
+            await worker.stop()
+            await worker_task
+
+    async def test_non_timeout_failure_does_not_feed_counter(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Real (non-timeout) verify failures must NOT count toward the budget.
+
+        Submits the same task twice with a real test-failure result and
+        then a third time — the third submission must still run merge+verify
+        (not abandon), because the counter only advances on timed_out=True.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'loop-real-fail', 'lrf.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        call_count = 0
+
+        async def real_failure(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            result = AsyncMock()
+            result.passed = False
+            result.summary = 'tests failed'
+            result.timed_out = False
+            result.failure_report = lambda: ''
+            return result
+
+        try:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                side_effect=real_failure,
+            ):
+                # Submit 3 times — more than the abandon threshold (2).
+                # Real failures must not abandon; all 3 must run verify.
+                for _ in range(worker.MAX_POST_MERGE_VERIFY_TIMEOUTS + 1):
+                    req = _make_request('rf-task', 'loop-real-fail', wt, config)
+                    await queue.put(req)
+                    outcome = await asyncio.wait_for(req.result, timeout=30)
+                    assert outcome.status == 'blocked'
+                    assert 'verification failed' in outcome.reason.lower()
+                    # Must NOT be the abandoned-reason prefix.
+                    assert not outcome.reason.startswith(
+                        'Post-merge verify timed out'
+                    ), (
+                        f'Real failure must not produce abandoned reason; '
+                        f'got {outcome.reason!r}'
+                    )
+
+            assert call_count == worker.MAX_POST_MERGE_VERIFY_TIMEOUTS + 1, (
+                f'Every submission must run verify when failures are real; '
+                f'got {call_count} verify calls'
+            )
+            # Counter must be zero (real failures never bumped it).
+            assert worker._post_merge_verify_timeouts.get('rf-task', 0) == 0
+        finally:
+            await worker.stop()
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+
+    async def test_success_resets_counter(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """A successful merge clears the counter so future timeouts start fresh.
+
+        Injects 1 timeout (under the threshold of 2), then a success, and
+        asserts the counter is reset to zero.  A separate assert on the
+        dict keeps this test decoupled from the ``_abandon_outcome`` path.
+        """
+        # First task: time out once.
+        wt_fail = await _make_branch_with_file(
+            git_ops, 'reset-fail', 'rf.py', 'x = 1\n',
+        )
+        # Second task: same task_id, but arrange verify to pass.
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        verify_pass_once_after_timeout = {'first_call': True}
+
+        async def timeout_then_pass(*args, **kwargs):
+            result = AsyncMock()
+            if verify_pass_once_after_timeout['first_call']:
+                verify_pass_once_after_timeout['first_call'] = False
+                result.passed = False
+                result.summary = 'Verification timed out'
+                result.timed_out = True
+                result.failure_report = lambda: ''
+            else:
+                result.passed = True
+                result.summary = ''
+                result.timed_out = False
+            return result
+
+        try:
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                side_effect=timeout_then_pass,
+            ):
+                # First submission → verify times out → counter = 1.
+                req1 = _make_request('reset-task', 'reset-fail', wt_fail, config)
+                await queue.put(req1)
+                r1 = await asyncio.wait_for(req1.result, timeout=30)
+                assert r1.status == 'blocked'
+                assert worker._post_merge_verify_timeouts.get('reset-task') == 1
+
+                # Second submission for a *different* branch that merges cleanly,
+                # same task_id → verify passes → counter cleared.
+                wt_ok = await _make_branch_with_file(
+                    git_ops, 'reset-ok', 'ro.py', 'x = 2\n',
+                )
+                req2 = _make_request('reset-task', 'reset-ok', wt_ok, config)
+                await queue.put(req2)
+                r2 = await asyncio.wait_for(req2.result, timeout=30)
+                assert r2.status == 'done'
+
+            # Counter must have been cleared by the successful merge.
+            assert 'reset-task' not in worker._post_merge_verify_timeouts
+        finally:
+            await worker.stop()
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+
+
+# ---------------------------------------------------------------------------
 # TestWipHalt — WIP-safe merge queue halt mechanism
 # ---------------------------------------------------------------------------
 

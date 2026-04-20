@@ -66,6 +66,14 @@ async def _check_plan_targets_in_tree(
     return missing
 
 
+ABANDONED_REASON_PREFIX = 'Post-merge verify timed out'
+"""Prefix of the ``MergeOutcome.reason`` string emitted by the merge-queue
+loop-breaker.  Downstream classifiers (task steward, dashboard) use this to
+recognise a task that has been abandoned after repeated post-merge verify
+timeouts rather than a first-time verify failure.  Kept as a module-level
+constant so tests and any future callers share a single source of truth."""
+
+
 def _elapsed_ms(start: float | None) -> int | None:
     """Milliseconds since *start* (a ``time.monotonic()`` value).
 
@@ -162,6 +170,12 @@ class MergeWorker:
     """
 
     MAX_CAS_RETRIES = 5
+    # After this many consecutive post-merge verify TIMEOUTS for the same
+    # task, the merge queue stops trying and returns an 'abandoned' blocked
+    # outcome.  Caps the verify-timeout / re-enqueue oscillation (two tasks
+    # alternating on the merge queue for hours, each dying at the 30-min
+    # warm timeout).  Counter resets on any successful merge for that task.
+    MAX_POST_MERGE_VERIFY_TIMEOUTS = 2
 
     def __init__(
         self,
@@ -177,6 +191,11 @@ class MergeWorker:
         self._running = True
         # Per-task CAS re-enqueue counter — prevents infinite loops
         self._cas_retries: dict[str, int] = {}
+        # Per-task consecutive post-merge-verify-timeout counter.  Bumped
+        # when a verify times out, cleared on a successful merge.  Keyed by
+        # task_id; lives across submissions (re-submits of the same task
+        # after an orchestrator re-queue also feed this counter).
+        self._post_merge_verify_timeouts: dict[str, int] = {}
         # WIP halt: cleared when halted, set when running
         self._wip_halt = asyncio.Event()
         self._wip_halt.set()  # not halted initially
@@ -184,6 +203,23 @@ class MergeWorker:
         # workflow handler after it submits the L1 escalation. Single source
         # of truth for the resolve-callback un-halt path.
         self._halt_owner_esc_id: str | None = None
+
+    def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome:
+        """Build the terminal MergeOutcome for the loop-breaker.
+
+        Kept as a method so tests can assert against the reason string via a
+        single source.  Uses ``ABANDONED_REASON_PREFIX`` so downstream
+        classifiers (task steward, dashboard) can recognise the outcome.
+        """
+        return MergeOutcome(
+            'blocked',
+            reason=(
+                f'{ABANDONED_REASON_PREFIX} {count} times for task '
+                f'{task_id} — manual investigation required. '
+                'The merge queue has stopped retrying this task to avoid '
+                'starving the queue behind a deterministic verify hang.'
+            ),
+        )
 
     def halt_for_wip(self, reason: str) -> None:
         """Halt the merge queue due to a WIP conflict."""
@@ -287,6 +323,25 @@ class MergeWorker:
 
     async def _do_merge(self, req: MergeRequest) -> MergeOutcome | None:
         t0 = time.monotonic()
+
+        # Loop-breaker: refuse to process tasks that have already timed out
+        # in post-merge verify MAX_POST_MERGE_VERIFY_TIMEOUTS times in a
+        # row.  Short-circuits before any git work so a stuck task can't
+        # keep burning merge-queue capacity (30+ minutes per attempt).
+        prior_timeouts = self._post_merge_verify_timeouts.get(req.task_id, 0)
+        if prior_timeouts >= self.MAX_POST_MERGE_VERIFY_TIMEOUTS:
+            logger.warning(
+                'Task %s: abandoning merge — %d consecutive post-merge '
+                'verify timeouts (threshold=%d)',
+                req.task_id, prior_timeouts,
+                self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+            )
+            _emit_merge_attempt(
+                self._event_store, req.task_id, 'abandoned_verify_timeouts',
+                attempt=prior_timeouts, duration_ms=_elapsed_ms(t0),
+            )
+            return self._abandon_outcome(req.task_id, prior_timeouts)
+
         # 1. Already-merged detection (ghost-loop fix)
         _, branch_head, _ = await _run(
             ['git', 'rev-parse', 'HEAD'], cwd=req.worktree,
@@ -373,10 +428,15 @@ class MergeWorker:
         if not skip_verify:
             # max_retries=0: post-merge verify hangs are usually deterministic
             # (e.g. a deadlocked test); retrying just multiplies queue-wide stall.
+            # is_merge_verify=True: merge worktrees are freshly created per
+            # merge (no `.task/` dir and no warm cargo cache), so they need
+            # the cold timeout despite `_is_verify_cold`'s filesystem
+            # heuristic classifying them as warm.
             verify = await run_scoped_verification(
                 merge_wt, req.config, req.module_configs,
                 task_files=req.task_files,
                 max_retries=0,
+                is_merge_verify=True,
             )
             if not verify.passed:
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
@@ -384,6 +444,19 @@ class MergeWorker:
                 reason = f'Post-merge verification failed: {verify.summary}'
                 if detail:
                     reason = f'{reason}\n\n{detail}'
+                # Loop-breaker bookkeeping: bump only when the failure was a
+                # pure timeout.  Real test/lint/type failures already bubble
+                # up to the steward and don't drive the re-queue oscillation
+                # the loop-breaker is designed to catch.
+                if verify.timed_out:
+                    new_count = prior_timeouts + 1
+                    self._post_merge_verify_timeouts[req.task_id] = new_count
+                    if new_count >= self.MAX_POST_MERGE_VERIFY_TIMEOUTS:
+                        logger.warning(
+                            'Task %s: post-merge verify timed out %d times in a '
+                            'row — next submission will be abandoned',
+                            req.task_id, new_count,
+                        )
                 return MergeOutcome('blocked', reason=reason)
 
         # 5. CAS advance_main
@@ -399,6 +472,10 @@ class MergeWorker:
 
         if result == 'advanced':
             self._cas_retries.pop(req.task_id, None)
+            # Loop-breaker counter: a successful merge means whatever caused
+            # the earlier timeouts has cleared (e.g. test was flaky, host
+            # contention eased).  Reset so future timeouts start from 0.
+            self._post_merge_verify_timeouts.pop(req.task_id, None)
             logger.info(f'Task {req.task_id}: merged to main successfully')
             _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(t0))
             return MergeOutcome('done', merge_sha=merge_result.merge_commit)
@@ -506,6 +583,10 @@ class SpeculativeMergeWorker:
     """
 
     MAX_CAS_RETRIES = 5
+    # Mirror of MergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS — see that class
+    # for rationale.  Kept as a class attribute so tests can monkeypatch
+    # per-class if the two workers ever diverge.
+    MAX_POST_MERGE_VERIFY_TIMEOUTS = 2
 
     def __init__(
         self,
@@ -520,6 +601,12 @@ class SpeculativeMergeWorker:
         self._verifier_queue: asyncio.Queue[SpeculativeItem | None] = asyncio.Queue()
         self._running = True
         self._cas_retries: dict[str, int] = {}
+        # Per-task consecutive post-merge-verify-timeout counter.  Bumped by
+        # the Verifier when a post-merge verify finishes with timed_out=True,
+        # cleared on a successful CAS advance.  Keyed by task_id; lives
+        # across submissions so an orchestrator re-queue of the same task
+        # continues to feed the same counter.
+        self._post_merge_verify_timeouts: dict[str, int] = {}
         # Depth-1 cap: cleared when a speculative merge is in flight,
         # set by the Verifier when it finishes the item before the speculation.
         self._speculation_slot = asyncio.Event()
@@ -539,6 +626,23 @@ class SpeculativeMergeWorker:
         # queue. Used by stop() to resolve Futures for requests that were
         # mid-processing when shutdown was initiated.
         self._inflight_req: MergeRequest | None = None
+
+    def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome:
+        """Build the terminal MergeOutcome for the loop-breaker.
+
+        Mirror of ``MergeWorker._abandon_outcome`` — kept in sync so
+        downstream classifiers (steward, dashboard) see the same reason
+        prefix regardless of which worker served the request.
+        """
+        return MergeOutcome(
+            'blocked',
+            reason=(
+                f'{ABANDONED_REASON_PREFIX} {count} times for task '
+                f'{task_id} — manual investigation required. '
+                'The merge queue has stopped retrying this task to avoid '
+                'starving the queue behind a deterministic verify hang.'
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Public API (same interface as MergeWorker)
@@ -724,6 +828,39 @@ class SpeculativeMergeWorker:
                     speculative = spec_base is not None
                     actual_main = await self._git_ops.get_main_sha()
                     base_for_merge = spec_base if spec_base else actual_main
+
+                    # ── Step 0: loop-breaker short-circuit ────────────────────
+                    # If this task has already timed out in post-merge verify
+                    # MAX_POST_MERGE_VERIFY_TIMEOUTS times in a row, abandon
+                    # without doing any git work.  The outcome rides through
+                    # the verifier queue as an ``immediate_outcome`` so the
+                    # usual resolution path (including speculation bookkeeping
+                    # via ``n_failed``) stays consistent.
+                    prior_timeouts = self._post_merge_verify_timeouts.get(req.task_id, 0)
+                    if prior_timeouts >= self.MAX_POST_MERGE_VERIFY_TIMEOUTS:
+                        logger.warning(
+                            'Task %s: abandoning merge — %d consecutive '
+                            'post-merge verify timeouts (threshold=%d)',
+                            req.task_id, prior_timeouts,
+                            self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+                        )
+                        _emit_merge_attempt(
+                            self._event_store, req.task_id,
+                            'abandoned_verify_timeouts',
+                            attempt=prior_timeouts, duration_ms=_elapsed_ms(t0),
+                        )
+                        await self._verifier_queue.put(SpeculativeItem(
+                            request=req, merge_result=None, merge_wt=None,
+                            base_sha=actual_main, speculative=speculative,
+                            skip_verify=False,
+                            immediate_outcome=self._abandon_outcome(
+                                req.task_id, prior_timeouts,
+                            ),
+                            started_monotonic=t0,
+                        ))
+                        spec_base = None
+                        self._inflight_req = None
+                        continue
 
                     # ── Step 1: already-merged detection ──────────────────────
                     rc, branch_head, err = await _run(
@@ -1081,10 +1218,15 @@ class SpeculativeMergeWorker:
                 # max_retries=0: a hung post-merge verify is almost always a
                 # deterministic failure (e.g. deadlocked test); retries just
                 # multiply queue-wide stall.
+                # is_merge_verify=True: merge worktrees are freshly created
+                # per merge (no `.task/` dir and no warm cargo cache), so
+                # they need the cold timeout despite `_is_verify_cold`'s
+                # filesystem heuristic classifying them as warm.
                 verify = await run_scoped_verification(
                     merge_wt, req.config, req.module_configs,
                     task_files=req.task_files,
                     max_retries=0,
+                    is_merge_verify=True,
                 )
             except Exception as exc:
                 logger.info(
@@ -1104,6 +1246,20 @@ class SpeculativeMergeWorker:
             )
             if not verify.passed:
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
+                # Loop-breaker bookkeeping: bump only when the failure was a
+                # pure timeout.  Real test/lint/type failures already bubble
+                # up to the steward via the ``blocked`` outcome and do not
+                # drive the verify-timeout / re-queue oscillation this
+                # counter is designed to detect.
+                if verify.timed_out:
+                    new_count = self._post_merge_verify_timeouts.get(req.task_id, 0) + 1
+                    self._post_merge_verify_timeouts[req.task_id] = new_count
+                    if new_count >= self.MAX_POST_MERGE_VERIFY_TIMEOUTS:
+                        logger.warning(
+                            'Task %s: post-merge verify timed out %d times in '
+                            'a row — next submission will be abandoned',
+                            req.task_id, new_count,
+                        )
                 if not req.result.done():
                     detail = verify.failure_report()
                     reason = f'Post-merge verification failed: {verify.summary}'
@@ -1131,6 +1287,8 @@ class SpeculativeMergeWorker:
 
             if result == 'advanced':
                 self._cas_retries.pop(req.task_id, None)
+                # Loop-breaker counter reset on success — see MergeWorker.
+                self._post_merge_verify_timeouts.pop(req.task_id, None)
                 logger.info(f'Task {req.task_id}: merged to main successfully')
                 _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(item.started_monotonic))
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
