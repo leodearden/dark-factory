@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -271,3 +272,30 @@ class TestMcpLifecycleProcessGroup:
             await mcp.stop()
 
         mock_tpg.assert_awaited_once()
+
+    async def test_stop_logs_warning_when_terminate_raises(
+        self, mock_config: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """stop() must log a warning (not re-raise) when terminate_process_group raises.
+
+        Failing test — current code swallows silently with `except Exception: pass`.
+        """
+        with patch(
+            'orchestrator.mcp_lifecycle.terminate_process_group',
+            new_callable=AsyncMock,
+            side_effect=RuntimeError('boom'),
+        ):
+            mcp = McpLifecycle(mock_config)
+            mcp._process = MagicMock(returncode=None, pid=12345)
+            mcp._pgid = 12345
+            with caplog.at_level(logging.WARNING, logger='orchestrator.mcp_lifecycle'):
+                await mcp.stop()
+
+        # stop() must not re-raise
+        # Warning must mention the prescribed phrase and the exception message
+        assert 'Failed to terminate fused-memory server' in caplog.text
+        assert 'boom' in caplog.text
+        # State cleaned up regardless
+        assert mcp._process is None
+        assert mcp._pgid is None
+
