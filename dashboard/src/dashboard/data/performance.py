@@ -295,8 +295,8 @@ async def aggregate_loop_histograms(
                             ' (base=%r, incoming=%r)',
                             pid, key, m[key]['labels'], info[key]['labels'],
                         )
-                        label_map = dict(zip(m[key]['labels'], m[key]['values']))
-                        for lbl, val in zip(info[key]['labels'], info[key]['values']):
+                        label_map = dict(zip(m[key]['labels'], m[key]['values'], strict=True))
+                        for lbl, val in zip(info[key]['labels'], info[key]['values'], strict=True):
                             label_map[lbl] = label_map.get(lbl, 0) + val
                         known = list(m[key]['labels'])
                         for lbl in info[key]['labels']:
