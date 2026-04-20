@@ -347,6 +347,12 @@ class TaskWorkflow:
                             data={'waste_type': 'replan_after_failure'},
                         )
                     return plan_outcome  # _plan() already called _mark_blocked
+                if plan_outcome == WorkflowOutcome.DONE:
+                    # _mark_blocked's "branch already on main → DONE" recovery
+                    # propagates up here.  The scheduler status is already DONE
+                    # and plan.json was never stamped — entering EXECUTE would
+                    # spuriously fire the plan-overwrite escalation.
+                    return plan_outcome
 
             # ── Ghost-loop early exit (before EXECUTE) ─────────────
             # If the worktree HEAD is already reachable from main, the
@@ -2240,12 +2246,36 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         return any(e.get('agent') in ('implementer', 'debugger') for e in entries)
 
     def _escalate_plan_overwrite(self) -> None:
-        """Submit a blocking escalation when plan.json is overwritten by a foreign session."""
+        """Submit a blocking escalation when plan.json ownership doesn't match.
+
+        Distinguishes two cases by reading the current _session_id:
+
+        - **Empty/missing**: the architect failed before stamping provenance.
+          This is usually a downstream effect of a planning-phase failure
+          (e.g. 403/cap hit with no retry), not a duplicate workflow.
+        - **Non-empty but different**: a genuine foreign session wrote plan.json.
+        """
         summary = f'plan.json overwrite detected for task {self.task_id}'
-        detail = (
-            f'Expected _session_id={self.session_id} but plan.json contains a different value. '
-            f'A duplicate workflow may have overwritten plan.json.'
-        )
+        foreign_session = ''
+        try:
+            plan_path = self.artifacts.root / 'plan.json'
+            data = json.loads(plan_path.read_text())
+            foreign_session = data.get('_session_id') or ''
+        except Exception:
+            pass
+
+        if not foreign_session:
+            detail = (
+                f'plan.json is not stamped with the current session '
+                f'(expected _session_id={self.session_id}). Most likely the '
+                f'architect failed before stamping — a downstream effect of a '
+                f'planning-phase failure, not a duplicate workflow.'
+            )
+        else:
+            detail = (
+                f'Expected _session_id={self.session_id} but plan.json contains '
+                f'{foreign_session}. A duplicate workflow may have overwritten plan.json.'
+            )
         logger.error(f'Task {self.task_id}: {summary}')
 
         if not self.escalation_queue:

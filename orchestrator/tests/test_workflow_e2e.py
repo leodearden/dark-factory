@@ -2674,6 +2674,100 @@ class TestFileStructureInvariants:
 # signature drift, not behavioural regressions.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Tests: _plan → DONE propagates without entering EXECUTE
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPlanDoneEarlyReturn:
+    """workflow.run returns DONE when _plan returns DONE, without entering EXECUTE.
+
+    Prevents the cascade where _mark_blocked's "branch already on main → DONE"
+    recovery fell through into _execute_iterations → validate_plan_owner → the
+    spurious plan-overwrite escalation.
+    """
+
+    async def test_plan_done_returns_without_execute(
+        self, config, git_ops, task_assignment
+    ):
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        # Stub _plan to return DONE (simulates _mark_blocked's ghost-loop recovery)
+        workflow._plan = AsyncMock(return_value=WorkflowOutcome.DONE)
+        # If EXECUTE were entered, this would raise
+        workflow._execute_iterations = AsyncMock(
+            side_effect=AssertionError('EXECUTE must not be entered when _plan returns DONE'),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.DONE
+        workflow._execute_iterations.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: _escalate_plan_overwrite message variants
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEscalatePlanOverwriteMessage:
+    """The escalation detail distinguishes empty _session_id from foreign."""
+
+    async def test_empty_session_id_message(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        stub = AgentStub()
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.session_id = 'sess-current'
+
+        # Manually initialise artifacts (normally done inside workflow.run)
+        workflow.artifacts = TaskArtifacts(tmp_path)
+        workflow.artifacts.root.mkdir(parents=True, exist_ok=True)
+
+        # plan.json exists but has no _session_id
+        plan_path = workflow.artifacts.root / 'plan.json'
+        plan_path.write_text(json.dumps({'steps': [{'description': 'x'}]}))
+
+        workflow._escalate_plan_overwrite()
+
+        escalations = queue.get_by_task(task_assignment.task_id)
+        assert len(escalations) == 1
+        detail = escalations[0].detail
+        assert 'not stamped with the current session' in detail
+        assert 'architect failed before stamping' in detail
+
+    async def test_foreign_session_id_message(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        stub = AgentStub()
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.session_id = 'sess-current'
+
+        workflow.artifacts = TaskArtifacts(tmp_path)
+        workflow.artifacts.root.mkdir(parents=True, exist_ok=True)
+
+        plan_path = workflow.artifacts.root / 'plan.json'
+        plan_path.write_text(json.dumps({
+            '_session_id': 'sess-foreign',
+            'steps': [{'description': 'x'}],
+        }))
+
+        workflow._escalate_plan_overwrite()
+
+        escalations = queue.get_by_task(task_assignment.task_id)
+        assert len(escalations) == 1
+        detail = escalations[0].detail
+        assert 'sess-foreign' in detail
+        assert 'duplicate workflow' in detail
+
+
 if TYPE_CHECKING:
     from orchestrator.evals.runner import _EvalScheduler as _EvalSchedulerStatic
     from orchestrator.workflow import _SchedulerLike
