@@ -597,7 +597,7 @@ to understand current progress, then continue from where the previous agent left
 # Action
 
 1. Understand the escalation and the task context.
-2. Check whether this task's branch is already merged to main (`git merge-base --is-ancestor HEAD main` from the worktree, or `git log --oneline main | head -20`). If the branch is already on main, set the task status to `done` via fused-memory's `set_task_status` tool, then call `resolve_issue` explaining the task was already merged. Do NOT attempt to fix code or re-merge.
+2. Check whether this task's branch is already merged to main (`git merge-base --is-ancestor HEAD main` from the worktree, or `git log --oneline main | head -20`). If the branch is already on main, set the task status to `done` via fused-memory's `set_task_status` tool — **pass `done_provenance={{"commit": "<merge-commit-sha>"}}`** if you can identify the landing commit on main that contains this task's work, or **`done_provenance={{"note": "<one-sentence explanation>"}}`** otherwise (e.g. "covered by sibling task" or "fast-forward with no single merge commit"). Then call `resolve_issue` explaining the task was already merged. Do NOT attempt to fix code or re-merge.
 3. Read the relevant code.
 4. Handle the escalation — fix the issue, or triage suggestions.
 5. Run tests to verify any code changes.
