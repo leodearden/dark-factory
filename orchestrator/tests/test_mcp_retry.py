@@ -299,3 +299,37 @@ class TestMcpLifecycleProcessGroup:
         assert mcp._process is None
         assert mcp._pgid is None
 
+    async def test_stop_falls_back_to_process_pid_when_pgid_missing(
+        self, mock_config: MagicMock
+    ) -> None:
+        """stop() must use _process.pid as fallback pgid when _pgid is None.
+
+        Simulates a crash in start() between create_subprocess_exec and the
+        `self._pgid = self._process.pid` assignment, leaving _process set but
+        _pgid None. Currently fails because the `if self._pgid is not None:`
+        guard short-circuits and terminate_process_group is never called.
+        """
+        fake_proc = MagicMock(returncode=None, pid=54321)
+
+        with patch(
+            'orchestrator.mcp_lifecycle.terminate_process_group',
+            new_callable=AsyncMock,
+        ) as mock_tpg:
+            mcp = McpLifecycle(mock_config)
+            mcp._process = fake_proc
+            mcp._pgid = None  # crash between spawn and pgid assignment
+            await mcp.stop()
+
+        # terminate_process_group must have been called exactly once
+        mock_tpg.assert_awaited_once()
+        # pgid fallback must be _process.pid
+        call_args = mock_tpg.call_args
+        assert call_args.args[1] == 54321, (
+            f'Expected pgid=54321 (from _process.pid), got {call_args.args[1]}'
+        )
+        # proc argument must be the process object
+        assert call_args.args[0] is fake_proc
+        # State cleaned up
+        assert mcp._process is None
+        assert mcp._pgid is None
+
