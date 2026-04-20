@@ -20,10 +20,17 @@ import json
 import logging
 import os
 import re
+import signal
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover — python-dotenv is optional
+    def load_dotenv(*args, **kwargs) -> bool:  # type: ignore[misc]
+        return False
 
 from shared.config_dir import TaskConfigDir
 from shared.config_models import UsageCapConfig
@@ -107,6 +114,13 @@ class AccountState:
     #   probe_in_flight=True → one task is testing, others must wait
     probing: bool = False
     probe_in_flight: bool = False
+    # Auth-failure lifecycle (distinct from cap): 4xx responses indicate the
+    # account is not authorised (e.g. org access revoked, token expired).
+    # Unlike cap, auth_failed only clears on an explicit re-probe after the
+    # configured interval or a SIGHUP-triggered env reload.
+    auth_failed: bool = False
+    auth_failed_at: datetime | None = None
+    auth_reprobe_task: asyncio.Task | None = field(default=None, repr=False)
 
 
 class SessionBudgetExhausted(Exception):
@@ -199,6 +213,7 @@ class UsageGate:
 
         self._probe_config_dir = TaskConfigDir('usage-gate-probe')
         self._accounts: list[AccountState] = self._init_accounts()
+        self._register_sighup_handler()
 
     def _init_accounts(self) -> list[AccountState]:
         """Resolve account tokens from env vars.
@@ -264,7 +279,7 @@ class UsageGate:
         while True:
             async with self._lock:
                 for acct in self._accounts:
-                    if acct.capped or acct.probe_in_flight:
+                    if acct.capped or acct.probe_in_flight or acct.auth_failed:
                         continue
                     if acct.probing:
                         # First task claims the probe slot — others block
@@ -426,8 +441,8 @@ class UsageGate:
             self._fire_cost_event(acct.name, 'cap_hit', json.dumps({'reason': reason}))
         self._start_account_resume_probe(acct)
 
-        # If all accounts are now capped, close the global gate
-        if all(a.capped for a in self._accounts):
+        # If all accounts are now unavailable (capped or auth_failed), close the global gate
+        if all(a.capped or a.auth_failed for a in self._accounts):
             self._open.clear()
             self._paused_reason = f'All accounts capped (last: {reason})'
             if self._pause_started_at is None:
@@ -455,6 +470,169 @@ class UsageGate:
         if self._cost_store:
             self._fire_cost_event(acct.name, 'near_cap', json.dumps({'reason': reason}))
         return True
+
+    def _handle_auth_failure(
+        self,
+        reason: str,
+        oauth_token: str | None,
+    ) -> bool:
+        """Mark the matching account as auth_failed.
+
+        Returns True if an account was resolved and mutated; False if
+        ``_resolve_account`` returned None (unknown token).
+
+        Auth failure is distinct from a usage cap: it indicates the OAuth
+        token is no longer accepted (403/401), typically because org access
+        was revoked or the token expired. The account is skipped by
+        ``before_invoke`` until an explicit re-probe succeeds — usually
+        after the operator updates the token in ``.env`` and sends SIGHUP,
+        or after ``auth_reprobe_secs`` elapses.
+        """
+        acct = self._resolve_account(oauth_token)
+        if acct is None:
+            logger.warning(f'Auth failure but no matching account: {reason}')
+            return False
+
+        acct.auth_failed = True
+        acct.auth_failed_at = datetime.now(UTC)
+        acct.probe_in_flight = False
+        acct.probing = False
+        logger.warning(f'Account {acct.name} AUTH-FAILED: {reason}')
+        if self._cost_store:
+            self._fire_cost_event(
+                acct.name, 'auth_failed', json.dumps({'reason': reason}),
+            )
+        self._start_auth_reprobe(acct)
+
+        if all(a.capped or a.auth_failed for a in self._accounts):
+            self._open.clear()
+            self._paused_reason = f'All accounts unavailable (last: {reason})'
+            if self._pause_started_at is None:
+                self._pause_started_at = datetime.now(UTC)
+            logger.warning(f'Usage gate PAUSED: {self._paused_reason}')
+        return True
+
+    def _start_auth_reprobe(self, acct: AccountState) -> None:
+        """Schedule a background re-probe loop for an auth_failed account."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if acct.auth_reprobe_task is None or acct.auth_reprobe_task.done():
+            acct.auth_reprobe_task = loop.create_task(
+                self._auth_reprobe_loop(acct),
+                name=f'usage-gate-auth-reprobe-{acct.name}',
+            )
+
+    async def _auth_reprobe_loop(self, acct: AccountState) -> None:
+        """Periodically re-probe an auth_failed account.
+
+        Sleeps ``auth_reprobe_secs`` between attempts; each attempt reloads
+        ``.env`` and re-reads ``os.environ`` before issuing a minimal CLI
+        call. On success (probe returns True), clears ``auth_failed`` and
+        re-opens the gate. On failure, keeps waiting for the next cycle.
+        """
+        interval = max(1, self._config.auth_reprobe_secs)
+        while acct.auth_failed:
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+            if not acct.auth_failed:
+                return
+            try:
+                await self._reprobe_account(acct)
+            except Exception:
+                logger.warning(
+                    f'Account {acct.name}: auth re-probe raised — '
+                    f'retrying after interval',
+                    exc_info=True,
+                )
+
+    async def _reprobe_account(self, acct: AccountState) -> None:
+        """Reload env, refresh the account token, and probe once.
+
+        On success: clear ``auth_failed`` + ``auth_failed_at`` and reopen the
+        global gate. On failure: leave ``auth_failed`` set; caller retries.
+        """
+        load_dotenv(override=True)
+        token_env = self._token_env_for(acct)
+        if token_env:
+            fresh = os.environ.get(token_env)
+            if fresh and fresh != acct.token:
+                logger.info(
+                    f'Account {acct.name}: env token changed — refreshing'
+                )
+                acct.token = fresh
+
+        logger.info(f'Account {acct.name}: firing auth re-probe')
+        ok = await self._run_probe(acct)
+        if ok:
+            acct.auth_failed = False
+            acct.auth_failed_at = None
+            logger.info(f'Account {acct.name} AUTH RESUMED (probe confirmed)')
+            self._open.set()
+            if self._cost_store:
+                self._fire_cost_event(
+                    acct.name, 'auth_resumed', json.dumps({}),
+                )
+        else:
+            logger.info(
+                f'Account {acct.name}: auth re-probe failed — staying auth_failed',
+            )
+
+    def _token_env_for(self, acct: AccountState) -> str | None:
+        """Look up the env-var name that sourced *acct*'s token."""
+        for cfg in self._config.accounts:
+            if cfg.name == acct.name:
+                return cfg.oauth_token_env
+        return None
+
+    def _register_sighup_handler(self) -> None:
+        """Install a SIGHUP handler that triggers an immediate auth re-probe.
+
+        Uses ``loop.add_signal_handler`` to avoid the pitfalls of
+        ``signal.signal`` inside asyncio (interrupting asyncio internals at
+        arbitrary bytecode). No-op when no event loop is running (typical
+        in unit tests that construct the gate outside of run_until_complete).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        try:
+            loop.add_signal_handler(signal.SIGHUP, self._on_sighup)
+        except (NotImplementedError, ValueError):
+            # NotImplementedError: Windows. ValueError: not main thread.
+            logger.debug('SIGHUP handler not installed (unsupported on this platform/thread)')
+
+    def _on_sighup(self) -> None:
+        """Signal-handler entry point — schedules the async reprobe trigger."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(
+            self._on_sighup_async(),
+            name='usage-gate-sighup-reprobe',
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _on_sighup_async(self) -> None:
+        """Re-probe all auth_failed accounts immediately."""
+        load_dotenv(override=True)
+        failing = [a for a in self._accounts if a.auth_failed]
+        if not failing:
+            logger.info('SIGHUP received but no auth_failed accounts — no-op')
+            return
+        logger.info(
+            f'SIGHUP: re-probing {len(failing)} auth_failed account(s)'
+        )
+        await asyncio.gather(
+            *(self._reprobe_account(a) for a in failing),
+            return_exceptions=True,
+        )
 
     def _find_account_by_token(self, token: str) -> AccountState | None:
         for acct in self._accounts:
@@ -489,9 +667,9 @@ class UsageGate:
                     ' possible config drift'
                 )
             return acct
-        # oauth_token is None: no identity — use first-uncapped fallback
+        # oauth_token is None: no identity — use first-available fallback
         for a in self._accounts:
-            if not a.capped:
+            if not a.capped and not a.auth_failed:
                 return a
         return None
 
@@ -752,6 +930,11 @@ class UsageGate:
                 with contextlib.suppress(asyncio.CancelledError):
                     await acct.resume_task
                 acct.resume_task = None
+            if acct.auth_reprobe_task and not acct.auth_reprobe_task.done():
+                acct.auth_reprobe_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await acct.auth_reprobe_task
+                acct.auth_reprobe_task = None
 
         for task in list(self._background_tasks):
             task.cancel()
@@ -764,7 +947,7 @@ class UsageGate:
     def is_paused(self) -> bool:
         if not self._accounts:
             return False
-        return all(a.capped for a in self._accounts)
+        return all(a.capped or a.auth_failed for a in self._accounts)
 
     @property
     def paused_reason(self) -> str:
@@ -789,9 +972,9 @@ class UsageGate:
 
     @property
     def active_account_name(self) -> str | None:
-        """Name of the first non-capped account, or None."""
+        """Name of the first non-capped, non-auth-failed account, or None."""
         for acct in self._accounts:
-            if not acct.capped:
+            if not acct.capped and not acct.auth_failed:
                 return acct.name
         return None
 
