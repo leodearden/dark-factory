@@ -1710,6 +1710,46 @@ class TestSchedulerInternalRouting:
         await scheduler.get_tasks()
         assert ('42', 'pending') in recorded
 
+    @pytest.mark.asyncio
+    async def test_set_task_status_forwards_done_provenance(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """set_task_status with done_provenance kwarg forwards it in MCP arguments.
+
+        Asserts the 'done_provenance' key reaches the MCP call's arguments dict.
+        Fails initially because the current signature has no done_provenance kwarg.
+        """
+        mcp_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+        scheduler._status_cache['1'] = 'pending'
+
+        await scheduler.set_task_status('1', 'done', done_provenance={'commit': 'abc123'})
+
+        mcp_mock.assert_called_once()
+        call_args = mcp_mock.call_args
+        arguments = call_args[0][2]['arguments']  # positional arg 3 = body dict
+        assert arguments.get('done_provenance') == {'commit': 'abc123'}
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_omits_done_provenance_when_absent(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """set_task_status without done_provenance must NOT include the key in MCP arguments.
+
+        Guards against accidentally forwarding a None value to the MCP tool,
+        which would trigger the Phase-1 validator error path.
+        """
+        mcp_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+        scheduler._status_cache['1'] = 'pending'
+
+        await scheduler.set_task_status('1', 'in-progress')
+
+        mcp_mock.assert_called_once()
+        call_args = mcp_mock.call_args
+        arguments = call_args[0][2]['arguments']  # positional arg 3 = body dict
+        assert 'done_provenance' not in arguments
+
 
 class TestSpySetCachedStatus:
     """Unit tests for the _spy_set_cached_status helper in conftest.py."""
