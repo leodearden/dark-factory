@@ -844,6 +844,81 @@ class TestAggregateLoopHistograms:
         # (d) Matched inner.values is element-wise summed: [1+2, 1+3, 1+4, 1+5, 1+6, 1+7]
         assert result['proj']['inner']['values'] == [3, 4, 5, 6, 7, 8]
 
+    @pytest.mark.asyncio
+    async def test_divergent_values_length_does_not_crash(
+        self, monkeypatch, caplog,
+    ):
+        """Mismatched label lists are merged by label key; no IndexError, WARNING emitted.
+
+        DB1 outer: 4 canonical labels ['0','1','2','3+'] with values [1,1,0,0].
+        DB2 outer: 3 labels ['0','1','2'] with values [2,1,0] (shorter, non-canonical).
+        Both DBs share a canonical inner histogram.
+
+        Label-dict merge must:
+        (a) not raise an exception
+        (b) keep 'p' in the result
+        (c) emit a WARNING mentioning the mismatch and project 'p'
+        (d) merge outer by label: '0'→1+2=3, '1'→1+1=2, '2'→0+0=0, '3+'→0
+            so outer.values == [3, 2, 0, 0], not the skip-preserved baseline [1, 1, 0, 0]
+        """
+        call_count = 0
+
+        async def _fake_get_loop_histograms(db, *, days):  # noqa: ARG001
+            nonlocal call_count
+            call_count += 1
+            canonical_inner = {
+                'labels': ['0', '1', '2', '3', '4', '5+'],
+                'values': [2, 2, 0, 0, 0, 0],
+            }
+            if call_count == 1:
+                return {
+                    'p': {
+                        'outer': {
+                            'labels': ['0', '1', '2', '3+'],
+                            'values': [1, 1, 0, 0],
+                        },
+                        'inner': canonical_inner,
+                    },
+                }
+            else:
+                return {
+                    'p': {
+                        'outer': {
+                            'labels': ['0', '1', '2'],
+                            'values': [2, 1, 0],
+                        },
+                        'inner': canonical_inner,
+                    },
+                }
+
+        monkeypatch.setattr(
+            'dashboard.data.performance.get_loop_histograms',
+            _fake_get_loop_histograms,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.performance'):
+            result = await aggregate_loop_histograms([None, None], days=7)
+
+        # (a) No exception raised — we got here
+        assert 'p' in result
+
+        # (b) At least one WARNING mentioning mismatch and project 'p'
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('mismatch' in t and 'p' in t for t in warning_texts), (
+            f'Expected mismatch warning mentioning project p; got: {warning_texts}'
+        )
+
+        # (c) outer is merged by label (not skipped): '0'→3, '1'→2, '2'→0, '3+'→0
+        outer = result['p']['outer']
+        assert outer['labels'] == ['0', '1', '2', '3+']
+        assert outer['values'] == [3, 2, 0, 0], (
+            f'Expected label-dict merge [3,2,0,0], got {outer["values"]!r}; '
+            f'skip-on-mismatch would leave baseline [1,1,0,0]'
+        )
+
+        # (d) inner (canonical match) is element-wise summed: [2+2, 2+2, 0, 0, 0, 0]
+        assert result['p']['inner']['values'] == [4, 4, 0, 0, 0, 0]
+
 
 # ---------------------------------------------------------------------------
 # Tests: aggregate_time_centiles
