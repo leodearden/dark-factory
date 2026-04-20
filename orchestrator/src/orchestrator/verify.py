@@ -417,15 +417,39 @@ def _mark_verify_warm(worktree: Path) -> None:
 def _resolve_verify_timeout(
     config: OrchestratorConfig,
     module_config: ModuleConfig | None,
+    *,
+    is_cold: bool,
 ) -> float:
     """Return the effective per-command verify timeout.
 
-    Module override wins over top-level config; falls back to the
-    top-level ``verify_command_timeout_secs`` default.
+    When *is_cold* is False (warm cache), the warm timeout is returned:
+    ``module_config.verify_command_timeout_secs`` takes precedence over
+    ``config.verify_command_timeout_secs``.
+
+    When *is_cold* is True (first verify in a fresh worktree), the cold
+    timeout is resolved via the cascade:
+      1. ``module_config.verify_cold_command_timeout_secs`` (if set)
+      2. ``config.verify_cold_command_timeout_secs`` (if set)
+      3. The warm timeout computed above (fallback when cold knob is unset
+         at every level — preserves existing behaviour for deployments that
+         don't configure the cold window).
     """
+    # Warm track: module override wins over top-level.
+    warm: float
     if module_config is not None and module_config.verify_command_timeout_secs is not None:
-        return module_config.verify_command_timeout_secs
-    return config.verify_command_timeout_secs
+        warm = module_config.verify_command_timeout_secs
+    else:
+        warm = config.verify_command_timeout_secs
+
+    if not is_cold:
+        return warm
+
+    # Cold track: cascade module → top → warm fallback.
+    if module_config is not None and module_config.verify_cold_command_timeout_secs is not None:
+        return module_config.verify_cold_command_timeout_secs
+    if config.verify_cold_command_timeout_secs is not None:
+        return config.verify_cold_command_timeout_secs
+    return warm
 
 
 def _resolve_concurrent_verify(
@@ -484,7 +508,7 @@ async def run_verification(
         lint_cmd = config.lint_command
         type_cmd = config.type_check_command
 
-    timeout = _resolve_verify_timeout(config, module_config)
+    timeout = _resolve_verify_timeout(config, module_config, is_cold=False)
     max_retries = config.verify_timeout_retries
     concurrent = _resolve_concurrent_verify(config, module_config)
     verify_env = _resolve_verify_env(config, module_config)
