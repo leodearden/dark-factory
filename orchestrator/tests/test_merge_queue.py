@@ -2241,6 +2241,7 @@ class TestSpeculativeItemDefaults:
         MergeRequest.result requires (we only care about the dataclass default).
         """
         from unittest.mock import MagicMock
+
         from orchestrator.merge_queue import _elapsed_ms
         item = SpeculativeItem(
             request=MagicMock(),
@@ -2338,8 +2339,9 @@ class TestEmitMergeAttemptHelper:
 
     def test_emit_merge_attempt_noop_when_event_store_is_none(self):
         """Call with event_store=None — no exception, emit never invoked."""
-        from orchestrator.merge_queue import _emit_merge_attempt
         from unittest.mock import MagicMock
+
+        from orchestrator.merge_queue import _emit_merge_attempt
 
         mock_es = MagicMock()
 
