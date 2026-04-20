@@ -103,23 +103,9 @@ class TestDefaults:
         assert config.verify_cold_command_timeout_secs == defaults['verify_cold_command_timeout_secs']
         assert config.verify_cold_command_timeout_secs == 5400
 
-    def test_verify_cold_command_timeout_secs_pydantic_default_is_none(self, monkeypatch, tmp_path):
-        """Without loading defaults.yaml, the raw Pydantic field default for
-        verify_cold_command_timeout_secs is None — the shipped value comes from
-        defaults.yaml, not the field declaration itself.
-        """
-        monkeypatch.chdir(tmp_path)
-        # Force a no-yaml scenario by pointing ORCH_CONFIG_PATH at a file that
-        # explicitly omits the cold-timeout key and also prevents the package
-        # defaults source from firing.  We use a YAML that sets an unrelated
-        # key so load_config/OrchestratorConfig() works, but overrides the
-        # package-defaults source via env so we can test the Pydantic default.
-        # The simplest way: build OrchestratorConfig directly with no YAML source.
-        # pydantic-settings honours __init__ kwargs — instantiate it with
-        # ORCH_CONFIG_PATH='' which suppresses the project-yaml source, then
-        # check the raw Field default by inspecting model_fields.
+    def test_verify_cold_command_timeout_secs_pydantic_default_is_none(self):
+        """Raw Pydantic field default is None; the shipped 5400 value comes from defaults.yaml."""
         field_info = OrchestratorConfig.model_fields['verify_cold_command_timeout_secs']
-        # The Pydantic field default (not the shipped defaults.yaml value) is None.
         assert field_info.default is None
 
 

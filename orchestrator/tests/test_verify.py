@@ -291,6 +291,36 @@ class TestVerifyWarmMarker:
         _mark_verify_warm(tmp_path)
         assert not (tmp_path / '.task').exists()
 
+    def test_is_cold_per_prefix_independent_of_shared_marker(self, tmp_path: Path):
+        """Per-prefix marker is independent: touching verify_warmed doesn't warm a prefixed check."""
+        from orchestrator.verify import _is_verify_cold, _mark_verify_warm
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+        # Mark the shared (no-prefix) marker
+        _mark_verify_warm(tmp_path, None)
+        # The 'orchestrator' subproject should still be cold
+        assert _is_verify_cold(tmp_path, 'orchestrator') is True
+
+    def test_is_cold_per_prefix_becomes_warm_after_prefix_marker(self, tmp_path: Path):
+        """Touching the per-prefix marker makes that prefix warm but leaves others cold."""
+        from orchestrator.verify import _is_verify_cold, _mark_verify_warm
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+        _mark_verify_warm(tmp_path, 'orchestrator')
+        assert _is_verify_cold(tmp_path, 'orchestrator') is False
+        # 'fused-memory' subproject should still be cold
+        assert _is_verify_cold(tmp_path, 'fused-memory') is True
+
+    def test_warm_marker_name_sanitizes_path_separators(self, tmp_path: Path):
+        """Path separators in prefix are replaced with underscores in marker filename."""
+        from orchestrator.verify import _mark_verify_warm, _warm_marker_name
+        task_dir = tmp_path / '.task'
+        task_dir.mkdir()
+        _mark_verify_warm(tmp_path, 'a/b/c')
+        expected_name = _warm_marker_name('a/b/c')
+        assert '/' not in expected_name
+        assert (task_dir / expected_name).exists()
+
 
 class TestResolveVerifyTimeout:
     """Tests for the updated _resolve_verify_timeout(config, module_config, *, is_cold) helper."""
@@ -468,6 +498,64 @@ class TestRunVerificationColdFirstUse:
 
         assert result.timed_out is False
         assert (tmp_path / '.task' / 'verify_warmed').exists()
+
+    @pytest.mark.asyncio
+    async def test_cold_log_message_emitted_when_timeout_differs(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """'Cold-cache verify' log is emitted when cold timeout differs from warm."""
+        import logging
+
+        from orchestrator.verify import run_verification
+        (tmp_path / '.task').mkdir()
+
+        config = self._make_config(warm=1800.0, cold=5400.0)
+        fake_cmd, _ = self._make_success_mock()
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
+            with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+                await run_verification(tmp_path, config)
+
+        assert any('Cold-cache verify' in r.message for r in caplog.records), (
+            f'Expected "Cold-cache verify" log; got: {[r.message for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cold_log_message_suppressed_when_cold_same_as_warm(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """'Cold-cache verify' log is suppressed when cold timeout is not set (fallback to warm)."""
+        import logging
+
+        from orchestrator.verify import run_verification
+        (tmp_path / '.task').mkdir()
+
+        # cold=None means cold falls back to warm — no log should fire
+        config = self._make_config(warm=1800.0, cold=None)
+        fake_cmd, _ = self._make_success_mock()
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
+            with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+                await run_verification(tmp_path, config)
+
+        assert not any('Cold-cache verify' in r.message for r in caplog.records), (
+            f'Unexpected "Cold-cache verify" log when cold==warm: {[r.message for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_allow_cold_cache_false_uses_warm_timeout(self, tmp_path: Path):
+        """allow_cold_cache=False forces warm timeout even when .task/ is present."""
+        from orchestrator.verify import run_verification
+        (tmp_path / '.task').mkdir()  # cold filesystem state, but caller opts out
+
+        config = self._make_config(warm=1800.0, cold=5400.0)
+        fake_cmd, captured = self._make_success_mock()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            await run_verification(tmp_path, config, allow_cold_cache=False)
+
+        assert 1800.0 in captured, f'Expected warm timeout 1800; got: {captured}'
+        assert 5400.0 not in captured, f'Unexpected cold timeout when allow_cold_cache=False: {captured}'
 
 
 def test_apply_cargo_scope_preserves_verify_cold_command_timeout_secs(tmp_path: Path):

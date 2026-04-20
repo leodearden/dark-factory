@@ -388,31 +388,54 @@ async def _run_cmd(
 _VERIFY_WARM_MARKER = 'verify_warmed'
 
 
-def _is_verify_cold(worktree: Path) -> bool:
+def _warm_marker_name(module_prefix: str | None) -> str:
+    """Return the marker filename for the given module prefix.
+
+    When *module_prefix* is ``None`` the shared worktree marker is used
+    (``verify_warmed``).  When a prefix is provided the marker is scoped to
+    that subproject (``verify_warmed_<safe_prefix>``), preventing a successful
+    subproject A from hiding a cold-build need for concurrently-run subproject B.
+    Path separators and spaces are replaced with underscores.
+    """
+    if module_prefix is None:
+        return _VERIFY_WARM_MARKER
+    safe = module_prefix.replace('/', '_').replace(' ', '_')
+    return f'{_VERIFY_WARM_MARKER}_{safe}'
+
+
+def _is_verify_cold(worktree: Path, module_prefix: str | None = None) -> bool:
     """Return True when *worktree* has never completed a non-timeout verify.
 
     A worktree is considered cold when its ``.task/`` scratch directory exists
     but the ``verify_warmed`` marker inside it does not.  Paths without
     ``.task/`` (e.g., the project root used by review checkpoints) are treated
     as warm so that review-checkpoint verifies always use the standard timeout.
+
+    When *module_prefix* is provided the check uses a per-subproject marker
+    (``verify_warmed_{prefix}``), so one subproject completing successfully
+    does not falsely warm-classify a concurrently-run sibling subproject.
     """
     task_dir = worktree / '.task'
     if not task_dir.is_dir():
         return False
-    return not (task_dir / _VERIFY_WARM_MARKER).exists()
+    return not (task_dir / _warm_marker_name(module_prefix)).exists()
 
 
-def _mark_verify_warm(worktree: Path) -> None:
+def _mark_verify_warm(worktree: Path, module_prefix: str | None = None) -> None:
     """Atomically mark *worktree* as warm by touching the verify_warmed marker.
 
     No-op when ``.task/`` is absent — we never create the scratch directory
     from within the verify path.  Idempotent (``exist_ok=True``).
+
+    When *module_prefix* is provided the per-subproject marker is touched
+    (``verify_warmed_{prefix}``) rather than the shared worktree marker.
     """
     task_dir = worktree / '.task'
     if not task_dir.is_dir():
         return
-    (task_dir / _VERIFY_WARM_MARKER).touch(exist_ok=True)
-    logger.debug('verify warm marker set: %s', task_dir / _VERIFY_WARM_MARKER)
+    marker_path = task_dir / _warm_marker_name(module_prefix)
+    marker_path.touch(exist_ok=True)
+    logger.debug('verify warm marker set: %s', marker_path)
 
 
 def _resolve_verify_timeout(
@@ -486,6 +509,8 @@ async def run_verification(
     worktree: Path,
     config: OrchestratorConfig,
     module_config: ModuleConfig | None = None,
+    *,
+    allow_cold_cache: bool = True,
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
 
@@ -497,6 +522,12 @@ async def run_verification(
     is retried up to ``config.verify_timeout_retries`` times.  A retry that
     surfaces a genuine failure (e.g., a real lint error) is returned
     immediately instead of being retried further.
+
+    When *allow_cold_cache* is ``False`` cold-timeout detection is disabled
+    entirely regardless of filesystem state, and the warm timeout is always
+    used.  Useful for review-checkpoint or eval callers that pass arbitrary
+    paths which may happen to contain a ``.task/`` directory.  Defaults to
+    ``True`` (auto-detect from filesystem).
     """
     if module_config is not None:
         # Scoped: use module command; None → skip
@@ -509,7 +540,8 @@ async def run_verification(
         lint_cmd = config.lint_command
         type_cmd = config.type_check_command
 
-    is_cold = _is_verify_cold(worktree)
+    module_prefix = module_config.prefix if module_config is not None else None
+    is_cold = _is_verify_cold(worktree, module_prefix) if allow_cold_cache else False
     timeout = _resolve_verify_timeout(config, module_config, is_cold=is_cold)
     max_retries = config.verify_timeout_retries
 
@@ -613,9 +645,11 @@ async def run_verification(
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
-    # so subsequent verifies use the faster warm timeout.
+    # so subsequent verifies use the faster warm timeout.  The marker is
+    # per-subproject (keyed by module_prefix) so a concurrent sibling
+    # subproject that times out remains cold on the next attempt.
     if not result.timed_out:
-        _mark_verify_warm(worktree)
+        _mark_verify_warm(worktree, module_prefix)
 
     if passed:
         logger.info('Verification passed: %s', summary)
