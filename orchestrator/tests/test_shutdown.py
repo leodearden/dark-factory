@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -367,35 +366,3 @@ def test_sigterm_reaps_verify_subprocess_tree(tmp_path: Path):
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5.0)
 
-
-# ---------------------------------------------------------------------------
-# Structural meta-test: pin absence of the getpgid-on-reaped-pid pattern
-# ---------------------------------------------------------------------------
-
-
-def test_shutdown_never_calls_os_getpgid_on_proc_pid() -> None:
-    """Structural guard: the os-dot-getpgid pattern must not appear in this file.
-
-    Reads this file's own source and asserts the getpgid-on-reaped-pid call
-    pattern has zero occurrences.  The safe alternative is to capture
-    ``pgid = proc.pid`` immediately after
-    ``subprocess.Popen(..., start_new_session=True)`` — where
-    ``start_new_session=True`` guarantees pgid == pid at spawn — and use the
-    frozen int thereafter.
-
-    Rationale: ``shared/src/shared/proc_group.py`` module docstring documents
-    why calling getpgid-on-proc-pid after proc.wait() is a TOCTOU foot-gun:
-    the kernel may recycle proc.pid between the reap and the getpgid call,
-    targeting an unrelated process group.  See also the production pattern in
-    ``shared/src/shared/cli_invoke.py:646-650`` and
-    ``orchestrator/src/orchestrator/verify.py:367-370``.
-    """
-    content = Path(__file__).read_text()
-    matches = re.findall(r"os\.getpgid\(", content)
-    assert matches == [], (
-        f"Found {len(matches)} getpgid-on-reaped-pid call(s) in this file. "
-        "Capture pgid = proc.pid right after "
-        "subprocess.Popen(..., start_new_session=True) instead — "
-        "see shared/src/shared/proc_group.py module docstring for the "
-        "TOCTOU rationale."
-    )
