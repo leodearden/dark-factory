@@ -154,3 +154,85 @@ class TestBurndownChartsRouteMultiProject:
             html = c.get('/burndown/partials/charts?window=30d').text
 
         assert 'dark_factory' in html
+
+
+# ---------------------------------------------------------------------------
+# Parallelism sanity test for burndown_partials_charts
+# ---------------------------------------------------------------------------
+
+
+import asyncio  # noqa: E402
+import pytest  # noqa: E402
+
+
+class TestBurndownChartsRouteParallelism:
+    """Verify that burndown_partials_charts fetches series concurrently across projects.
+
+    The test patches aggregate_burndown_series with a fake that awaits an
+    asyncio.Barrier(3).  If the handler loops sequentially, only one coroutine
+    reaches the barrier at a time and the wait_for raises TimeoutError — the
+    AssertionError propagates to the handler's try/except, series becomes {},
+    and none of the project IDs appear in the response HTML.  If asyncio.gather
+    is used, all three reach the barrier simultaneously, it releases within the
+    timeout, each fake returns valid data, and all project IDs appear in the HTML.
+    """
+
+    def test_per_project_calls_are_concurrent(self, tmp_path):
+        """All project IDs appear in HTML only when calls run concurrently via gather.
+
+        FAILS before the gather fix (sequential await causes barrier timeout,
+        handler catches the error, series={}, HTML has no project data).
+        PASSES after the gather fix (all three coroutines reach the barrier
+        simultaneously, valid data returned, HTML contains all project IDs).
+        """
+        from dashboard.app import app
+        from dashboard.config import DashboardConfig
+
+        # Three project roots, each with its own burndown.db and project_id.
+        roots = []
+        for name in ('alpha', 'beta', 'gamma'):
+            root = tmp_path / name
+            _make_burndown_db(root / 'data' / 'burndown' / 'burndown.db', name)
+            roots.append(root)
+
+        config = DashboardConfig(
+            project_root=roots[0],
+            known_project_roots=roots[1:],
+        )
+
+        n_projects = 3
+        barrier = asyncio.Barrier(n_projects)
+
+        async def fake_aggregate_burndown_series(dbs, project_id, *, days):
+            try:
+                await asyncio.wait_for(barrier.wait(), timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.BrokenBarrierError) as exc:
+                raise AssertionError(
+                    'per-project aggregate_burndown_series calls did not run '
+                    'concurrently — expected asyncio.gather across projects '
+                    f'(barrier raised {type(exc).__name__})'
+                ) from exc
+            # Return a valid empty-series dict so the template still renders.
+            return {'labels': [], 'done': [], 'cancelled': [], 'blocked': [],
+                    'deferred': [], 'in_progress': [], 'pending': []}
+
+        with (
+            patch('dashboard.app.DashboardConfig.from_env', return_value=config),
+            patch('dashboard.app.aggregate_burndown_series', new=fake_aggregate_burndown_series),
+            TestClient(app) as c,
+        ):
+            resp = c.get('/burndown/partials/charts?window=30d')
+
+        assert resp.status_code == 200
+        # All three project IDs must appear in the rendered HTML.
+        # In the sequential case the barrier times out, the handler's try/except
+        # catches the AssertionError, series={}, and the HTML has no project data.
+        # In the parallel (gather) case all three succeed and the template renders
+        # each project_id in an <h3> tag via the project_name filter.
+        html = resp.text
+        assert 'alpha' in html, (
+            'project "alpha" not in HTML — per-project calls likely ran sequentially '
+            '(barrier timed out for the first call, handler caught the error, series={})'
+        )
+        assert 'beta' in html, 'project "beta" not in HTML — per-project calls likely ran sequentially'
+        assert 'gamma' in html, 'project "gamma" not in HTML — per-project calls likely ran sequentially'
