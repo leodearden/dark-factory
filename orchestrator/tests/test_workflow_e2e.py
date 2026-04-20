@@ -2497,6 +2497,60 @@ class TestMarkBlockedFalseDoneGuard:
         )
         assert workflow.state == WorkflowState.DONE
 
+    async def test_workflow_already_on_main_done_uses_note_provenance(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """already-on-main path passes done_provenance={'note': '...'} to set_task_status.
+
+        When _mark_blocked detects the branch is already on main after steward resolution,
+        scheduler.provenance must record the note explanation, not a commit SHA.
+        Fails until step-17 adds done_provenance={'note': ...} at workflow.py:2446-2448.
+        """
+        import json as _json
+
+        # 1. Create worktree with an implementer iteration entry (makes _has_prior_implementation True)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+
+        # 2. Make a real implementation commit on the branch and merge it to main
+        (wt / 'farewell.py').write_text('def farewell(name):\n    return f"Bye, {name}"\n')
+        await git_ops.commit(wt, 'Implement farewell')
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # 3. Build workflow with escalation queue, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 4. FakeSteward resolves all pending L0 escalations immediately in start()
+        workflow._steward_factory = _make_resolving_steward(
+            queue, task_assignment.task_id,
+        )
+
+        # 5. Call _mark_blocked directly (drives the already-on-main completion path)
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        # 6. Assertions: must DONE with the note provenance
+        assert outcome == WorkflowOutcome.DONE
+        assert scheduler.provenance.get(task_assignment.task_id) == {
+            'note': 'branch already on main after escalation resolution'
+        }, (
+            f"Expected done_provenance note but got: "
+            f"{scheduler.provenance.get(task_assignment.task_id)!r}"
+        )
+
     async def test_git_exception_in_ancestor_check_requeues(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path
     ):
