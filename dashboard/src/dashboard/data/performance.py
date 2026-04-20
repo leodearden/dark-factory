@@ -228,7 +228,7 @@ async def aggregate_escalation_rates(
                 m['human_attention'][bucket] += info['human_attention'][bucket]
 
     # Recompute rates from merged totals
-    for pid, m in merged.items():
+    for _pid, m in merged.items():
         total = m['total_tasks']
         m['steward_rate'] = round(m['steward_count'] / total * 100, 1) if total else 0.0
         m['interactive_rate'] = (

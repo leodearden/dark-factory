@@ -7,11 +7,9 @@ import os
 import re
 import runpy
 from contextlib import ExitStack
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-from unittest.mock import MagicMock
 
 from dashboard.app import _parse_window, _safe_gather_result
 
@@ -483,22 +481,22 @@ def _patch_perf_integration(paths=_UNSET, escalations=_UNSET, histograms=_UNSET,
     }
     stack = ExitStack()
     stack.enter_context(patch(
-        'dashboard.app.get_completion_paths',
+        'dashboard.app.aggregate_completion_paths',
         new_callable=AsyncMock,
         return_value=defaults['paths'],
     ))
     stack.enter_context(patch(
-        'dashboard.app.get_escalation_rates',
+        'dashboard.app.aggregate_escalation_rates',
         new_callable=AsyncMock,
         return_value=defaults['escalations'],
     ))
     stack.enter_context(patch(
-        'dashboard.app.get_loop_histograms',
+        'dashboard.app.aggregate_loop_histograms',
         new_callable=AsyncMock,
         return_value=defaults['histograms'],
     ))
     stack.enter_context(patch(
-        'dashboard.app.get_time_centiles',
+        'dashboard.app.aggregate_time_centiles',
         new_callable=AsyncMock,
         return_value=defaults['ttc'],
     ))
@@ -531,9 +529,9 @@ class TestPerformancePartialIntegration:
 
     def test_performance_backend_error_degrades_gracefully(self, client):
         # With return_exceptions=True, other results are preserved even when one fails.
-        # get_completion_paths failing → paths={} but ttc still has data, so else branch renders.
+        # aggregate_completion_paths failing → paths={} but ttc still has data, so else branch renders.
         with _patch_perf_integration(), patch(
-            'dashboard.app.get_completion_paths',
+            'dashboard.app.aggregate_completion_paths',
             new_callable=AsyncMock,
             side_effect=RuntimeError('db unavailable'),
         ):
@@ -541,10 +539,10 @@ class TestPerformancePartialIntegration:
             assert resp.status_code == 200
 
     @pytest.mark.parametrize('failing_fn', [
-        'get_completion_paths',
-        'get_escalation_rates',
-        'get_loop_histograms',
-        'get_time_centiles',
+        'aggregate_completion_paths',
+        'aggregate_escalation_rates',
+        'aggregate_loop_histograms',
+        'aggregate_time_centiles',
     ])
     def test_performance_partial_failure(self, client, failing_fn):
         """One failing coroutine should not discard its siblings' data."""
@@ -558,18 +556,18 @@ class TestPerformancePartialIntegration:
             html = resp.text
             # When paths fails, the template renders empty (all content is paths-keyed)
             # but we still get a 200 — no 500 from one failed gather coroutine.
-            if failing_fn == 'get_completion_paths':
+            if failing_fn == 'aggregate_completion_paths':
                 # No 500, template still renders (empty else block since ttc non-empty)
                 assert 'Performance' in html
             # When escalations fail, paths data (one-pass) still renders
-            if failing_fn == 'get_escalation_rates':
+            if failing_fn == 'aggregate_escalation_rates':
                 assert 'one-pass' in html
             # When histograms fail, paths and escalations still render
-            if failing_fn == 'get_loop_histograms':
+            if failing_fn == 'aggregate_loop_histograms':
                 assert 'one-pass' in html
                 assert 'Steward' in html
             # When ttc fails, paths and escalations still render
-            if failing_fn == 'get_time_centiles':
+            if failing_fn == 'aggregate_time_centiles':
                 assert 'one-pass' in html
                 assert 'Steward' in html
 
