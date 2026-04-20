@@ -1830,9 +1830,7 @@ class TestAggregateBurndownProjects:
             aiosqlite.connect(str(db2_path)) as c2,
         ):
             result = await aggregate_burndown_projects([c1, c2])
-        assert result.count('shared') == 1
-        assert 'only_1' in result
-        assert 'only_2' in result
+        assert result == ['only_1', 'only_2', 'shared']
 
     @pytest.mark.asyncio
     async def test_empty_dbs_list_returns_empty(self):
