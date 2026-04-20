@@ -499,6 +499,44 @@ class TestGetTasksSeedsCache:
         )
 
 
+class TestGetTasksExceptionLogging:
+    """get_tasks() must emit tracebacks + class names when the MCP call raises.
+
+    Motivated by 2026-04-20 orchestrator hang where `logger.error(f'...: {e}')`
+    produced bare '[Errno 2] No such file or directory' lines with no
+    traceback and no exception class — leaving future investigators unable
+    to locate where in the httpx / mcp_lifecycle stack the OSError originated.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_logs_exception_with_traceback(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        import logging as _logging
+
+        raiser = AsyncMock(
+            side_effect=FileNotFoundError(2, 'No such file or directory')
+        )
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', raiser)
+
+        with caplog.at_level(_logging.ERROR, logger='orchestrator.scheduler'):
+            result = await scheduler.get_tasks()
+
+        # get_tasks() still swallows and returns an empty list (so the
+        # scheduler tick continues), but the log line now carries traceback
+        # info AND the exception class name so diagnostics are possible.
+        assert result == []
+        assert 'Failed to fetch tasks' in caplog.text
+        assert 'FileNotFoundError' in caplog.text
+        # logger.exception automatically appends 'Traceback (most recent call last):'
+        assert 'Traceback' in caplog.text
+
+
 class TestAcquireNextNoDuplicates:
     """acquire_next() must not return the same task twice while its locks are held."""
 

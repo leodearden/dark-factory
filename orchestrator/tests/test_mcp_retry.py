@@ -198,6 +198,68 @@ class TestRawCallRetry:
         assert result['result']['ok'] is True
 
     @pytest.mark.asyncio
+    async def test_retries_on_oserror(self):
+        """Raw OSError (e.g. FileNotFoundError) surfaces when httpx's
+        map_httpcore_exceptions() doesn't rewrap a lower-level failure.
+
+        Reproduces 2026-04-20 orchestrator hang where the scheduler logged
+        "Failed to fetch tasks: [Errno 2] No such file or directory" every
+        15s for >1.5h with zero outgoing HTTP requests — the exception was
+        escaping the retry loop because OSError wasn't in the except set.
+        Now OSError is retryable.
+        """
+        session = McpSession('http://localhost:8002')
+        ok = _make_response()
+        mock_client = AsyncMock()
+        # First two attempts raise FileNotFoundError (subclass of OSError);
+        # third succeeds.
+        mock_client.post.side_effect = [
+            FileNotFoundError(2, 'No such file or directory'),
+            FileNotFoundError(2, 'No such file or directory'),
+            ok,
+        ]
+
+        with (
+            patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await session._raw_call(
+                'tools/call', {'name': 't', 'arguments': {}},
+            )
+
+        assert mock_client.post.call_count == 3
+        assert result['result']['ok'] is True
+
+    @pytest.mark.asyncio
+    async def test_exhausted_oserror_wrapped_in_runtimeerror(self):
+        """FileNotFoundError's str() is '[Errno 2] No such file or directory'
+        with no filename; the wrapped RuntimeError must carry the class name
+        so log lines are not indistinguishable from a real file-open error.
+        """
+        session = McpSession('http://localhost:8002')
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = FileNotFoundError(
+            2, 'No such file or directory',
+        )
+
+        with (
+            patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            with pytest.raises(RuntimeError) as excinfo:
+                await session._raw_call(
+                    'tools/call', {'name': 't', 'arguments': {}},
+                )
+
+        assert mock_client.post.call_count == _MCP_MAX_RETRIES
+        assert 'FileNotFoundError' in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, FileNotFoundError)
+
+    @pytest.mark.asyncio
     async def test_exhausted_read_timeout_wrapped_in_runtimeerror(self):
         """When retries exhaust on ReadTimeout (empty str), the wrapped
         RuntimeError MUST carry the exception type name so log lines
