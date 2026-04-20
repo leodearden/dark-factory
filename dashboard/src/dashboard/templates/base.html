@@ -98,9 +98,23 @@
         })();
     </script>
     <script>
+        // Polling scheduler with three self-healing layers:
+        //   1. Primary chain: htmx:afterSettle -> scheduleNext -> setTimeout -> htmx.trigger('poll')
+        //   2. Visibility hook: pause polling while tab hidden, kick on visible
+        //      (jittered 0-500ms to avoid a herd across tabs)
+        //   3. Watchdog: every 5s, re-poll any section whose last-updated stamp
+        //      is older than 2 * poll_base + 5s. Catches dropped afterSettle
+        //      events, browser timer clamping, and JS edge-case stalls.
         (function () {
             var JITTER_RATIO = 0.2;
+            var VISIBILITY_KICK_JITTER_MS = 500;
+            var WATCHDOG_INTERVAL_MS = 5000;
+            var WATCHDOG_TOLERANCE_SEC = 5;
             function scheduleNext(el) {
+                if (document.visibilityState === 'hidden') {
+                    clearTimeout(el._pollTimer);
+                    return;
+                }
                 var base = el.dataset.pollBase;
                 if (!base) { return; }
                 var baseMs = parseInt(base, 10) * 1000;
@@ -123,6 +137,38 @@
             document.body.addEventListener('htmx:responseError', recoverPoll);
             document.body.addEventListener('htmx:timeout', recoverPoll);
             document.body.addEventListener('htmx:sendError', recoverPoll);
+
+            document.addEventListener('visibilitychange', function () {
+                if (document.visibilityState === 'visible') {
+                    document.querySelectorAll('[data-poll-base]').forEach(function (el) {
+                        var kickDelay = Math.floor(Math.random() * VISIBILITY_KICK_JITTER_MS);
+                        setTimeout(function () { htmx.trigger(el, 'poll'); }, kickDelay);
+                    });
+                } else {
+                    document.querySelectorAll('[data-poll-base]').forEach(function (el) {
+                        clearTimeout(el._pollTimer);
+                    });
+                }
+            });
+
+            setInterval(function () {
+                if (document.visibilityState !== 'visible') { return; }
+                var now = Date.now();
+                document.querySelectorAll('[data-poll-base]').forEach(function (el) {
+                    var base = parseInt(el.dataset.pollBase, 10);
+                    if (!Number.isFinite(base) || base <= 0) { return; }
+                    var name = el.getAttribute('data-section');
+                    var stamp = document.querySelector('[data-updated-for="' + name + '"]');
+                    var ts = stamp && parseInt(stamp.getAttribute('data-updated-at'), 10);
+                    if (!Number.isFinite(ts)) { return; }
+                    var thresholdMs = (base * 2 + WATCHDOG_TOLERANCE_SEC) * 1000;
+                    if (now - ts > thresholdMs) {
+                        console.warn('[dashboard] watchdog re-polling stale section:',
+                            name, 'age=' + Math.round((now - ts) / 1000) + 's');
+                        htmx.trigger(el, 'poll');
+                    }
+                });
+            }, WATCHDOG_INTERVAL_MS);
         })();
     </script>
 </body>
