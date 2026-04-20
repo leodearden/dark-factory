@@ -260,7 +260,14 @@ async def aggregate_loop_histograms(
     """Merge :func:`get_loop_histograms` results from multiple databases.
 
     For each project_id: element-wise sum the outer.values and inner.values
-    arrays across DBs (labels are always the canonical fixed lists).
+    arrays across DBs.  Labels are always the canonical fixed lists set by
+    :func:`get_loop_histograms`.
+
+    If an incoming histogram's ``values`` array has a different length from
+    the baseline (first DB's shape), a ``WARNING`` is logged and that
+    histogram key is skipped — the baseline values are preserved rather than
+    being partially corrupted.  The warning message includes the project_id,
+    the key name, and both array lengths.
     """
     if not dbs:
         return {}
@@ -275,6 +282,16 @@ async def aggregate_loop_histograms(
             else:
                 m = merged[pid]
                 for key in ('outer', 'inner'):
+                    base_len = len(m[key]['values'])
+                    incoming_len = len(info[key]['values'])
+                    if base_len != incoming_len:
+                        logger.warning(
+                            'aggregate_loop_histograms: %s histogram length mismatch'
+                            ' for project %r (baseline=%d, incoming=%d)'
+                            ' — skipping merge to avoid silent corruption',
+                            key, pid, base_len, incoming_len,
+                        )
+                        continue
                     for i, val in enumerate(info[key]['values']):
                         m[key]['values'][i] += val
     return merged
