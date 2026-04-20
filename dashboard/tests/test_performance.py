@@ -367,6 +367,26 @@ class TestTimeCentiles:
         result = await get_time_centiles(None)
         assert result == {}
 
+    @pytest.mark.asyncio
+    async def test_delegates_to_durations_by_project(self, runs_conn, monkeypatch):
+        """get_time_centiles must delegate to _durations_by_project, not run inline SQL.
+
+        Monkeypatch _durations_by_project to return a hardcoded dict.  If the
+        function honours the stub the result keys come from the stub; if it
+        still runs its own inline SQL the real DB rows are returned instead and
+        the assertion fails.
+        """
+        async def _fake_durations(db, *, days):  # noqa: ARG001
+            return {'mocked_proj': [100, 200, 300, 400, 500]}
+
+        monkeypatch.setattr(
+            'dashboard.data.performance._durations_by_project', _fake_durations,
+        )
+        result = await get_time_centiles(runs_conn, days=7)
+        assert list(result.keys()) == ['mocked_proj']
+        assert result['mocked_proj']['count'] == 5
+        assert result['mocked_proj']['p50'] == 300
+
 
 # ---------------------------------------------------------------------------
 # Helpers for aggregate tests
