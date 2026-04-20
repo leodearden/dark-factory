@@ -132,6 +132,7 @@ class MergeOutcome:
     conflict_details: str = ''
     recovery_branch: str | None = None
     overlap_files: list[str] | None = None
+    merge_sha: str | None = None
 
 
 @dataclass
