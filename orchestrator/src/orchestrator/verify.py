@@ -383,6 +383,37 @@ async def _run_cmd(
         return 1, f'Command failed: {e}', False
 
 
+# Marker file that records a worktree has completed at least one non-timeout verify.
+_VERIFY_WARM_MARKER = 'verify_warmed'
+
+
+def _is_verify_cold(worktree: Path) -> bool:
+    """Return True when *worktree* has never completed a non-timeout verify.
+
+    A worktree is considered cold when its ``.task/`` scratch directory exists
+    but the ``verify_warmed`` marker inside it does not.  Paths without
+    ``.task/`` (e.g., the project root used by review checkpoints) are treated
+    as warm so that review-checkpoint verifies always use the standard timeout.
+    """
+    task_dir = worktree / '.task'
+    if not task_dir.is_dir():
+        return False
+    return not (task_dir / _VERIFY_WARM_MARKER).exists()
+
+
+def _mark_verify_warm(worktree: Path) -> None:
+    """Atomically mark *worktree* as warm by touching the verify_warmed marker.
+
+    No-op when ``.task/`` is absent — we never create the scratch directory
+    from within the verify path.  Idempotent (``exist_ok=True``).
+    """
+    task_dir = worktree / '.task'
+    if not task_dir.is_dir():
+        return
+    (task_dir / _VERIFY_WARM_MARKER).touch(exist_ok=True)
+    logger.debug('verify warm marker set: %s', task_dir / _VERIFY_WARM_MARKER)
+
+
 def _resolve_verify_timeout(
     config: OrchestratorConfig,
     module_config: ModuleConfig | None,
