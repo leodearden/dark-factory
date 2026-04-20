@@ -271,3 +271,190 @@ async def test_call_tool_broken_pipe_resets_session(client):
 
     c._cleanup_contexts.assert_called_once()
     assert c._session is None
+
+
+# ── transport-dead exception handling in call_tool ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_call_tool_closed_resource_error_resets_session(client):
+    """anyio.ClosedResourceError must trigger cleanup — this is the
+    exact exception class seen in esc-1956-44 that the narrow except
+    list used to miss.
+    """
+    import anyio
+
+    c, session = client
+    session.call_tool = AsyncMock(side_effect=anyio.ClosedResourceError())
+    c._cleanup_contexts = AsyncMock(side_effect=lambda: setattr(c, '_session', None))
+
+    with pytest.raises(anyio.ClosedResourceError):
+        await c.call_tool('get_tasks', {})
+
+    c._cleanup_contexts.assert_called_once()
+    assert c._session is None
+
+
+@pytest.mark.asyncio
+async def test_call_tool_broken_resource_error_resets_session(client):
+    """anyio.BrokenResourceError must trigger cleanup."""
+    import anyio
+
+    c, session = client
+    session.call_tool = AsyncMock(side_effect=anyio.BrokenResourceError())
+    c._cleanup_contexts = AsyncMock(side_effect=lambda: setattr(c, '_session', None))
+
+    with pytest.raises(anyio.BrokenResourceError):
+        await c.call_tool('get_tasks', {})
+
+    c._cleanup_contexts.assert_called_once()
+    assert c._session is None
+
+
+@pytest.mark.asyncio
+async def test_call_tool_mcp_connection_closed_resets_session(client):
+    """McpError with CONNECTION_CLOSED code must trigger cleanup."""
+    from mcp.shared.exceptions import McpError
+    from mcp.types import CONNECTION_CLOSED, ErrorData
+
+    c, session = client
+    err = McpError(ErrorData(code=CONNECTION_CLOSED, message='closed'))
+    session.call_tool = AsyncMock(side_effect=err)
+    c._cleanup_contexts = AsyncMock(side_effect=lambda: setattr(c, '_session', None))
+
+    with pytest.raises(McpError):
+        await c.call_tool('get_tasks', {})
+
+    c._cleanup_contexts.assert_called_once()
+    assert c._session is None
+
+
+@pytest.mark.asyncio
+async def test_call_tool_mcp_request_timeout_resets_session(client):
+    """McpError with REQUEST_TIMEOUT code (408) must trigger cleanup —
+    this is how send_request surfaces a hung stdio subprocess."""
+    import httpx
+    from mcp.shared.exceptions import McpError
+    from mcp.types import ErrorData
+
+    c, session = client
+    err = McpError(ErrorData(code=int(httpx.codes.REQUEST_TIMEOUT), message='timeout'))
+    session.call_tool = AsyncMock(side_effect=err)
+    c._cleanup_contexts = AsyncMock(side_effect=lambda: setattr(c, '_session', None))
+
+    with pytest.raises(McpError):
+        await c.call_tool('get_tasks', {})
+
+    c._cleanup_contexts.assert_called_once()
+    assert c._session is None
+
+
+@pytest.mark.asyncio
+async def test_call_tool_passes_through_tool_level_mcp_errors(client):
+    """Tool-level McpError (INTERNAL_ERROR etc.) must NOT tear down
+    the session — the proxy is alive, Taskmaster just said no."""
+    from mcp.shared.exceptions import McpError
+    from mcp.types import INTERNAL_ERROR, ErrorData
+
+    c, session = client
+    err = McpError(ErrorData(code=INTERNAL_ERROR, message='tool refused'))
+    session.call_tool = AsyncMock(side_effect=err)
+    c._cleanup_contexts = AsyncMock()
+
+    with pytest.raises(McpError):
+        await c.call_tool('some_tool', {})
+
+    c._cleanup_contexts.assert_not_called()
+    assert c._session is session
+
+
+# ── is_alive() probe ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_is_alive_returns_false_when_disconnected(config):
+    """is_alive reports (False, 'not connected') and does not probe
+    when _session is None."""
+    c = TaskmasterBackend(config)
+    alive, err = await c.is_alive()
+    assert alive is False
+    assert err == 'not connected'
+
+
+@pytest.mark.asyncio
+async def test_is_alive_probes_via_get_tasks(client):
+    """Healthy probe calls get_tasks with configured projectRoot and
+    reports (True, None)."""
+    c, session = client
+    session.call_tool = AsyncMock(return_value=_mock_tool_result({'tasks': []}))
+
+    alive, err = await c.is_alive()
+
+    assert alive is True
+    assert err is None
+    call_args = session.call_tool.call_args[0]
+    assert call_args[0] == 'get_tasks'
+    assert call_args[1]['projectRoot'] == '/project'
+
+
+@pytest.mark.asyncio
+async def test_is_alive_reports_false_on_closed_resource_error(client):
+    """ClosedResourceError from the probe → (False, ...) and _session
+    is torn down so next mutating call reconnects."""
+    import anyio
+
+    c, session = client
+    session.call_tool = AsyncMock(side_effect=anyio.ClosedResourceError())
+    c._cleanup_contexts = AsyncMock(side_effect=lambda: setattr(c, '_session', None))
+
+    alive, err = await c.is_alive()
+
+    assert alive is False
+    assert err is not None and 'ClosedResourceError' in err
+    assert c._session is None
+
+
+@pytest.mark.asyncio
+async def test_is_alive_treats_tool_level_mcp_error_as_healthy(client):
+    """A tool-level McpError response still proves the stdio round-trip
+    completed — that is proof-of-life for the proxy."""
+    from mcp.shared.exceptions import McpError
+    from mcp.types import INTERNAL_ERROR, ErrorData
+
+    c, session = client
+    session.call_tool = AsyncMock(
+        side_effect=McpError(ErrorData(code=INTERNAL_ERROR, message='bad project')),
+    )
+    c._cleanup_contexts = AsyncMock()
+
+    alive, err = await c.is_alive()
+
+    assert alive is True
+    assert err is None
+    c._cleanup_contexts.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_is_alive_caches_within_ttl(client):
+    """Two rapid is_alive calls hit session.call_tool only once."""
+    c, session = client
+    session.call_tool = AsyncMock(return_value=_mock_tool_result({'tasks': []}))
+
+    await c.is_alive()
+    await c.is_alive()
+
+    assert session.call_tool.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_is_alive_reprobes_after_ttl(config):
+    """After cache TTL expires, is_alive probes again."""
+    c = TaskmasterBackend(config, alive_cache_ttl_seconds=0.0)
+    session = AsyncMock()
+    session.call_tool = AsyncMock(return_value=_mock_tool_result({'tasks': []}))
+    c._session = session
+
+    await c.is_alive()
+    await c.is_alive()
+
+    assert session.call_tool.call_count == 2

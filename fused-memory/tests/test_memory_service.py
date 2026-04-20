@@ -2462,3 +2462,59 @@ class TestSearchGraphitiInvalidatedFiltering:
         assert scores_by_id['pos-4'] == pytest.approx(0.80), (
             'Edge at original rank 4 must score 0.8 (1.0 - 4*0.05)'
         )
+
+
+# ── get_status taskmaster liveness ────────────────────────────────
+
+
+class TestGetStatusTaskmasterLiveness:
+    """get_status must probe the live Taskmaster proxy, not a sticky flag.
+
+    Regression coverage for esc-1956-44: the proxy was wedged yet
+    get_status kept reporting ``taskmaster.connected=true``.
+    """
+
+    @pytest.fixture
+    def status_service(self, service):
+        """Extend the `service` fixture with minimal graphiti/mem0 list stubs
+        so get_status runs to completion."""
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.graphiti.node_count = AsyncMock(return_value=0)
+        service.mem0.list_projects = AsyncMock(return_value=[])
+        service.mem0.count = AsyncMock(return_value=0)
+        return service
+
+    @pytest.mark.asyncio
+    async def test_reports_not_configured_when_taskmaster_is_none(self, status_service):
+        status_service.taskmaster = None
+        status = await status_service.get_status()
+        assert status['taskmaster'] == {
+            'connected': False,
+            'error': 'not configured',
+        }
+
+    @pytest.mark.asyncio
+    async def test_reports_connected_when_probe_succeeds(self, status_service):
+        fake = MagicMock()
+        fake.is_alive = AsyncMock(return_value=(True, None))
+        status_service.taskmaster = fake
+
+        status = await status_service.get_status()
+
+        assert status['taskmaster'] == {'connected': True}
+        fake.is_alive.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reports_unhealthy_with_error_when_probe_fails(self, status_service):
+        """This is the regression: with the sticky-bool implementation
+        the field read True forever. With the probe, we see the failure."""
+        fake = MagicMock()
+        fake.is_alive = AsyncMock(
+            return_value=(False, 'ClosedResourceError: '),
+        )
+        status_service.taskmaster = fake
+
+        status = await status_service.get_status()
+
+        assert status['taskmaster']['connected'] is False
+        assert 'ClosedResourceError' in status['taskmaster']['error']
