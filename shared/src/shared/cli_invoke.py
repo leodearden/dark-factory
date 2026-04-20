@@ -111,6 +111,7 @@ class AgentResult:
     cache_create_tokens: int | None = None
     timed_out: bool = False
     schema_salvaged: bool = False
+    api_error_status: int | None = None
 
 
 def _to_token_count(v: int | None) -> int | None:
@@ -566,6 +567,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     session_id = data.get('session_id', '')
     subtype = data.get('subtype', '')
     structured = data.get('structured_output')
+    api_error_status = data.get('api_error_status')
 
     usage = data.get('usage') or {}
     input_tokens = _to_token_count(usage.get('input_tokens'))
@@ -615,6 +617,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         cache_create_tokens=cache_create_tokens,
         timed_out=result.timed_out,
         schema_salvaged=schema_salvaged,
+        api_error_status=api_error_status,
     )
 
 
