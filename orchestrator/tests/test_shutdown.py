@@ -365,3 +365,4 @@ def test_sigterm_reaps_verify_subprocess_tree(tmp_path: Path):
                 os.killpg(pgid, signal.SIGKILL)
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5.0)
+
