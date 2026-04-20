@@ -394,7 +394,7 @@ class TestRunVerificationColdFirstUse:
     without spawning real subprocesses.
     """
 
-    def _make_config(self, warm=1800.0, cold=5400.0, retries=0):
+    def _make_config(self, warm=1800.0, cold: float | None = 5400.0, retries=0):
         from orchestrator.config import OrchestratorConfig
         return OrchestratorConfig(
             verify_command_timeout_secs=warm,
@@ -512,9 +512,8 @@ class TestRunVerificationColdFirstUse:
         config = self._make_config(warm=1800.0, cold=5400.0)
         fake_cmd, _ = self._make_success_mock()
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
-            with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
-                await run_verification(tmp_path, config)
+        with caplog.at_level(logging.INFO, logger='orchestrator.verify'), patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            await run_verification(tmp_path, config)
 
         assert any('Cold-cache verify' in r.message for r in caplog.records), (
             f'Expected "Cold-cache verify" log; got: {[r.message for r in caplog.records]}'
@@ -534,9 +533,8 @@ class TestRunVerificationColdFirstUse:
         config = self._make_config(warm=1800.0, cold=None)
         fake_cmd, _ = self._make_success_mock()
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
-            with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
-                await run_verification(tmp_path, config)
+        with caplog.at_level(logging.INFO, logger='orchestrator.verify'), patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            await run_verification(tmp_path, config)
 
         assert not any('Cold-cache verify' in r.message for r in caplog.records), (
             f'Unexpected "Cold-cache verify" log when cold==warm: {[r.message for r in caplog.records]}'
