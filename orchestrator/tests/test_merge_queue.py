@@ -1267,7 +1267,7 @@ class TestSpeculativeMergeWorker:
         mock_verify.return_value.passed = False
         mock_verify.return_value.summary = 'tests failed'
 
-        async def raise_on_remerge(req, started_monotonic: float = 0.0):  # type: ignore[no-untyped-def]
+        async def raise_on_remerge(req, started_monotonic: float | None = None):  # type: ignore[no-untyped-def]
             raise RuntimeError('_remerge failed unexpectedly')
 
         worker._remerge = raise_on_remerge  # type: ignore[method-assign]
