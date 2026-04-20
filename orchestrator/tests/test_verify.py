@@ -468,3 +468,40 @@ class TestRunVerificationColdFirstUse:
 
         assert result.timed_out is False
         assert (tmp_path / '.task' / 'verify_warmed').exists()
+
+
+def test_apply_cargo_scope_preserves_verify_cold_command_timeout_secs(tmp_path: Path):
+    """_apply_cargo_scope propagates verify_cold_command_timeout_secs to the rebuilt ModuleConfig.
+
+    Constructs a ModuleConfig with both warm and cold timeout values, forces the
+    cargo-scope rewrite path via mocked workspace discovery, and asserts the
+    returned ModuleConfig carries both timeout fields unchanged.
+    """
+    from unittest.mock import patch
+
+    from orchestrator.config import ModuleConfig
+    from orchestrator.verify import _apply_cargo_scope
+
+    mc = ModuleConfig(
+        prefix='crates',
+        test_command='cargo test --workspace',
+        lint_command='cargo clippy --workspace',
+        type_check_command=None,
+        verify_command_timeout_secs=2000.0,
+        verify_cold_command_timeout_secs=6000.0,
+    )
+
+    # Force the rewrite path: workspace has one crate, and the .rs file maps to it.
+    with (
+        patch('orchestrator.verify.discover_workspace_crates', return_value={'crates/foo': 'foo'}),
+        patch('orchestrator.verify.files_to_crates', return_value=['foo']),
+    ):
+        result = _apply_cargo_scope(
+            mc,
+            task_files=['crates/foo/src/lib.rs'],
+            project_root=tmp_path,
+            scope_cargo_enabled=True,
+        )
+
+    assert result.verify_command_timeout_secs == 2000.0
+    assert result.verify_cold_command_timeout_secs == 6000.0
