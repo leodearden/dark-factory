@@ -90,7 +90,7 @@ from starlette.testclient import TestClient  # noqa: E402
 
 def _make_burndown_db(db_path: Path, project_id: str) -> None:
     """Create a burndown.db at *db_path* with one recent snapshot for *project_id*."""
-    from dashboard.data.burndown import BURNDOWN_SCHEMA, _INSERT_SNAPSHOT_SQL
+    from dashboard.data.burndown import _INSERT_SNAPSHOT_SQL, BURNDOWN_SCHEMA
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     ts = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
@@ -134,9 +134,8 @@ class TestBurndownChartsRouteMultiProject:
             known_project_roots=[peer_root],
         )
 
-        with patch('dashboard.app.DashboardConfig.from_env', return_value=config):
-            with TestClient(app) as c:
-                html = c.get('/burndown/partials/charts?window=30d').text
+        with patch('dashboard.app.DashboardConfig.from_env', return_value=config), TestClient(app) as c:
+            html = c.get('/burndown/partials/charts?window=30d').text
 
         assert 'dark_factory' in html
         assert 'peer_project' in html
@@ -151,8 +150,7 @@ class TestBurndownChartsRouteMultiProject:
 
         config = DashboardConfig(project_root=main_root, known_project_roots=[])
 
-        with patch('dashboard.app.DashboardConfig.from_env', return_value=config):
-            with TestClient(app) as c:
-                html = c.get('/burndown/partials/charts?window=30d').text
+        with patch('dashboard.app.DashboardConfig.from_env', return_value=config), TestClient(app) as c:
+            html = c.get('/burndown/partials/charts?window=30d').text
 
         assert 'dark_factory' in html

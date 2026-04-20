@@ -6,7 +6,12 @@ import typing
 
 import pytest
 
-from dashboard.data.chart_utils import ChartData, group_top_n, separate_label, trim_leading_zero_buckets
+from dashboard.data.chart_utils import (
+    ChartData,
+    group_top_n,
+    separate_label,
+    trim_leading_zero_buckets,
+)
 
 
 class TestChartDataType:
