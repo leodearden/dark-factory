@@ -267,6 +267,7 @@ class TestMcpLifecycleProcessGroup:
         ) as mock_tpg:
             mcp = McpLifecycle(mock_config)
             mcp._process = proc
+            mcp._pgid = 12345  # captured at spawn in production; stub here
             await mcp.stop()
 
         mock_tpg.assert_awaited_once()

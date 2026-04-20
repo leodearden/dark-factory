@@ -645,6 +645,9 @@ async def _run_subprocess(
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
+    # Capture pgid at spawn (pgid == pid under start_new_session).  Never
+    # refresh via os.getpgid() later — the PID may be reused post-reap.
+    pgid = proc.pid
 
     try:
         try:
@@ -669,7 +672,7 @@ async def _run_subprocess(
             except TimeoutError:
                 # Still alive after grace period — kill entire process group
                 # (bash → cargo → rustc grandchildren included).
-                await terminate_process_group(proc, grace_secs=_SIGTERM_GRACE_SECS)
+                await terminate_process_group(proc, pgid, grace_secs=_SIGTERM_GRACE_SECS)
                 stdout_text = ''
                 stderr_text = f'Process killed after {timeout_seconds}s timeout (SIGTERM+SIGKILL)'
             else:
@@ -698,7 +701,7 @@ async def _run_subprocess(
         # grandchildren are also reaped.
         if proc.returncode is None:
             logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
-            await terminate_process_group(proc, grace_secs=5.0)
+            await terminate_process_group(proc, pgid, grace_secs=5.0)
         raise
 
     duration_ms = int(time.monotonic() * 1000) - start_ms

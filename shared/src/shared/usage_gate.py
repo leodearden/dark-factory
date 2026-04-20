@@ -681,6 +681,7 @@ class UsageGate:
         env['CLAUDE_CONFIG_DIR'] = str(self._probe_config_dir.path)
 
         proc: asyncio.subprocess.Process | None = None
+        pgid: int | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -689,20 +690,22 @@ class UsageGate:
                 env=env,
                 start_new_session=True,
             )
+            # Capture pgid at spawn (pgid == pid under start_new_session).
+            pgid = proc.pid
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(), timeout=_PROBE_TIMEOUT,
             )
         except TimeoutError:
             logger.warning(f'Account {acct.name}: probe timed out')
-            if proc is not None:
-                await terminate_process_group(proc, grace_secs=5.0)
+            if proc is not None and pgid is not None:
+                await terminate_process_group(proc, pgid, grace_secs=5.0)
             return False
         except asyncio.CancelledError:
             # Shutdown path: reap the subprocess and re-raise so the probe
             # task actually terminates. Swallowing the cancel would leave
             # usage_gate.shutdown() blocked waiting for this task forever.
-            if proc is not None:
-                await terminate_process_group(proc, grace_secs=5.0)
+            if proc is not None and pgid is not None:
+                await terminate_process_group(proc, pgid, grace_secs=5.0)
             raise
         except Exception as exc:
             logger.warning(f'Account {acct.name}: probe error: {exc}')

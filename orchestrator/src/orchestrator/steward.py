@@ -177,6 +177,7 @@ class TaskSteward:
         ]
 
         proc = None
+        pgid: int | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -185,10 +186,12 @@ class TaskSteward:
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
             )
+            # Capture pgid at spawn; start_new_session guarantees pgid == pid.
+            pgid = proc.pid
             stdout, stderr = await proc.communicate()
         except asyncio.CancelledError:
-            if proc is not None and proc.returncode is None:
-                await terminate_process_group(proc, grace_secs=5.0)
+            if proc is not None and pgid is not None and proc.returncode is None:
+                await terminate_process_group(proc, pgid, grace_secs=5.0)
             raise
         except Exception as e:
             logger.warning(f'Steward watcher failed for task {self.task_id}: {e}')

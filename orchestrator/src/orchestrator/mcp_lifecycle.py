@@ -268,6 +268,10 @@ class McpLifecycle:
         self.config = config.fused_memory
         self.project_root = config.project_root
         self._process: asyncio.subprocess.Process | None = None
+        # pgid captured at spawn (pgid == pid under start_new_session); kept
+        # alongside _process so stop() never has to call os.getpgid, which
+        # would be unsafe if the PID has been reused post-reap.
+        self._pgid: int | None = None
 
     @property
     def url(self) -> str:
@@ -302,6 +306,7 @@ class McpLifecycle:
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
             )
+            self._pgid = self._process.pid
 
             # Wait for health
             if not await self._wait_for_health(timeout=30):
@@ -324,11 +329,13 @@ class McpLifecycle:
         logger.info('Stopping fused-memory HTTP server')
         _session = None
         try:
-            await terminate_process_group(self._process, grace_secs=10.0)
+            if self._pgid is not None:
+                await terminate_process_group(self._process, self._pgid, grace_secs=10.0)
         except Exception:
             pass
         finally:
             self._process = None
+            self._pgid = None
 
     async def health_check(self) -> bool:
         """Check if the server is responding."""

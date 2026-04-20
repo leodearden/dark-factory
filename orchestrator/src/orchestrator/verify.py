@@ -351,6 +351,7 @@ async def _run_cmd(
     ``RUSTC_WRAPPER=sccache`` without mutating the parent process's env.
     """
     proc = None
+    pgid: int | None = None
     subprocess_env: dict[str, str] | None = None
     if env:
         subprocess_env = {**os.environ, **env}
@@ -364,16 +365,18 @@ async def _run_cmd(
             env=subprocess_env,
             start_new_session=True,
         )
+        # Capture pgid at spawn; start_new_session guarantees pgid == pid.
+        pgid = proc.pid
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         rc = proc.returncode if proc.returncode is not None else 1
         return rc, stdout.decode(), False
     except TimeoutError:
-        if proc is not None:
-            await terminate_process_group(proc, grace_secs=5.0)
+        if proc is not None and pgid is not None:
+            await terminate_process_group(proc, pgid, grace_secs=5.0)
         return 1, f'Command timed out after {timeout}s: {cmd}', True
     except asyncio.CancelledError:
-        if proc is not None:
-            await terminate_process_group(proc, grace_secs=5.0)
+        if proc is not None and pgid is not None:
+            await terminate_process_group(proc, pgid, grace_secs=5.0)
         raise
     except Exception as e:
         return 1, f'Command failed: {e}', False

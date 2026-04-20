@@ -647,6 +647,8 @@ async def _run_subprocess_local(
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
+    # Capture pgid at spawn; start_new_session guarantees pgid == pid.
+    pgid = proc.pid
 
     try:
         stdout, stderr = await asyncio.wait_for(
@@ -654,7 +656,7 @@ async def _run_subprocess_local(
             timeout=timeout_seconds,
         )
     except TimeoutError:
-        await terminate_process_group(proc)
+        await terminate_process_group(proc, pgid)
         duration_ms = int(time.monotonic() * 1000) - start_ms
         return _SubprocessResult(
             stdout='',

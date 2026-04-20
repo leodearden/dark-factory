@@ -13,10 +13,44 @@ fresh process group).
 
 Usage
 -----
-Wherever a subprocess is created with ``start_new_session=True``, replace
-bare ``proc.terminate()`` / ``proc.kill()`` cleanup with::
+The pgid MUST be captured by the caller immediately after spawn::
 
-    await terminate_process_group(proc, grace_secs=5.0)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, ..., start_new_session=True,
+    )
+    pgid = proc.pid  # start_new_session guarantees pgid == pid at spawn
+
+    try:
+        await proc.communicate(...)
+    except TimeoutError:
+        await terminate_process_group(proc, pgid, grace_secs=5.0)
+
+Why the caller captures pgid instead of the helper calling
+``os.getpgid(proc.pid)``:
+- Once ``proc`` has been reaped (``proc.returncode is not None``), the kernel
+  is free to reuse that PID for an unrelated process.  ``os.getpgid`` on a
+  reused PID returns the *new* owner's group — which has, in practice,
+  ended up being the user ``systemd --user`` manager's group and killed the
+  user's entire login session (see root cause for task 845).
+- Capturing ``pgid`` at spawn eliminates that TOCTOU entirely.  After spawn,
+  ``start_new_session=True`` guarantees the child is the leader of its own
+  group with ``pgid == pid``.  The captured int is frozen; it is never
+  refreshed from a possibly-reaped PID.
+
+Safety checks
+-------------
+Even with a correctly-captured pgid, ``terminate_process_group`` refuses to
+``killpg`` any of the following as defence-in-depth:
+
+- ``pgid <= 1`` (init or invalid)
+- ``pgid == os.getpid()`` (ourselves)
+- ``pgid == os.getppid()`` (our parent)
+- ``pgid == os.getpgrp()`` (our own process group — hitting this would kill
+  our own orchestrator/tests)
+- ``pgid != proc.pid`` (mismatch — a caller corrupted the capture, or the
+  ``proc`` object was somehow swapped)
+
+If any check fires, the helper logs an error and returns without signalling.
 
 Limitations
 -----------
@@ -30,49 +64,89 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import signal
+
+logger = logging.getLogger(__name__)
+
+
+def _unsafe_pgid_reason(pgid: int, proc_pid: int | None) -> str | None:
+    """Return a reason string if *pgid* is unsafe to killpg, else ``None``.
+
+    Applied as defence-in-depth: even if a caller (or a PID-reuse race) hands
+    us a pgid that targets the user session or ourselves, we refuse.
+    """
+    if pgid <= 1:
+        return f'pgid <= 1 ({pgid!r})'
+    if pgid == os.getpid():
+        return f'pgid == os.getpid() ({pgid})'
+    try:
+        ppid = os.getppid()
+    except OSError:
+        ppid = None
+    if ppid is not None and pgid == ppid:
+        return f'pgid == os.getppid() ({pgid})'
+    try:
+        own_pgrp = os.getpgrp()
+    except OSError:
+        own_pgrp = None
+    if own_pgrp is not None and pgid == own_pgrp:
+        return f'pgid == os.getpgrp() ({pgid})'
+    if proc_pid is not None and pgid != proc_pid:
+        return f'pgid ({pgid}) != proc.pid ({proc_pid}) — captured value corrupted'
+    return None
 
 
 async def terminate_process_group(
     proc: asyncio.subprocess.Process,
+    pgid: int,
     *,
     grace_secs: float = 5.0,
 ) -> None:
-    """Send SIGTERM to proc's entire process group, then SIGKILL if needed.
+    """Send SIGTERM to *pgid*, then SIGKILL if the group outlives *grace_secs*.
 
-    Steps:
-    1. If proc has already exited, return immediately (idempotent).
-    2. Derive the process group ID via ``os.getpgid(proc.pid)``.  If the OS
-       has already reaped the PID, return (race-safe).
-    3. ``os.killpg(pgid, SIGTERM)`` — delivers to every member of the group.
-    4. Wait up to *grace_secs* for ``proc`` to exit.
-    5. If still alive after the grace period, escalate with
-       ``os.killpg(pgid, SIGKILL)`` and wait another *grace_secs*.
+    *pgid* must be the process-group id captured immediately after spawning
+    *proc* with ``start_new_session=True`` (at which point ``pgid == proc.pid``
+    by POSIX guarantee).  Passing a value fetched via ``os.getpgid(proc.pid)``
+    after *proc* may have been reaped is unsafe — see module docstring.
 
-    All ``os.killpg`` calls are wrapped in ``contextlib.suppress(ProcessLookupError,
-    OSError)`` to handle the race where the group vanishes between the
-    ``getpgid`` call and the ``killpg`` call.
+    Behaviour:
+    1. If *proc* has already been reaped (``returncode is not None``), return
+       immediately.  The group is already gone with the leader.
+    2. Sanity-check *pgid* via :func:`_unsafe_pgid_reason`.  If unsafe, log
+       and return without signalling.
+    3. ``os.killpg(pgid, SIGTERM)``.  Wait up to *grace_secs* for *proc* to
+       exit.
+    4. If *proc* is still alive, ``os.killpg(pgid, SIGKILL)`` and wait
+       another *grace_secs*.
+
+    All ``killpg`` calls are wrapped in ``contextlib.suppress(ProcessLookupError,
+    OSError)`` because the group may vanish between our liveness check and
+    the signal dispatch.
     """
     if proc.returncode is not None:
-        return
-    if proc.pid is None:
-        return
-
-    try:
-        pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
-        # Process already reaped by the OS.
+        # Already reaped — the entire group has exited along with the leader.
         return
 
-    # SIGTERM — ask the group to clean up.
+    reason = _unsafe_pgid_reason(pgid, proc.pid)
+    if reason is not None:
+        logger.error(
+            'terminate_process_group: refusing to killpg — %s. '
+            'This indicates a bug in the caller; proc will NOT be signalled.',
+            reason,
+        )
+        return
+
     with contextlib.suppress(ProcessLookupError, OSError):
         os.killpg(pgid, signal.SIGTERM)
 
     try:
         await asyncio.wait_for(proc.wait(), grace_secs)
     except TimeoutError:
-        # Still alive after grace period — force kill.
+        # Re-check liveness before escalating.
+        if proc.returncode is not None:
+            return
         with contextlib.suppress(ProcessLookupError, OSError):
             os.killpg(pgid, signal.SIGKILL)
         with contextlib.suppress(TimeoutError):
