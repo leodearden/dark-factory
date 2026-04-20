@@ -354,9 +354,18 @@ class FakeScheduler:
 
     def __init__(self):
         self.statuses: dict[str, list[str]] = {}
+        self.provenance: dict[str, dict] = {}
 
-    async def set_task_status(self, task_id: str, status: str) -> None:
+    async def set_task_status(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        done_provenance: dict | None = None,
+    ) -> None:
         self.statuses.setdefault(task_id, []).append(status)
+        if done_provenance is not None:
+            self.provenance[task_id] = done_provenance
 
     async def handle_blast_radius_expansion(
         self, task_id: str, current: list[str], needed: list[str]
