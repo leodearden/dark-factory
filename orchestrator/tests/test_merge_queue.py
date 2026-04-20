@@ -2225,6 +2225,140 @@ class TestSpeculativeMergeWorker:
 
 
 # ---------------------------------------------------------------------------
+# TestSpeculativeItemDefaults — unit tests for SpeculativeItem field defaults
+# ---------------------------------------------------------------------------
+
+
+class TestSpeculativeItemDefaults:
+    def test_started_monotonic_default_is_none(self):
+        """SpeculativeItem.started_monotonic defaults to None when not passed.
+
+        Ensures construction sites that omit started_monotonic produce NULL
+        duration_ms (via _elapsed_ms) rather than a bogus time-since-process-start
+        value derived from the 0.0 sentinel.
+
+        Uses a MagicMock for request to avoid the asyncio.Future that
+        MergeRequest.result requires (we only care about the dataclass default).
+        """
+        from unittest.mock import MagicMock
+
+        from orchestrator.merge_queue import _elapsed_ms
+        item = SpeculativeItem(
+            request=MagicMock(),
+            merge_result=None,
+            merge_wt=None,
+            base_sha='',
+            speculative=False,
+            skip_verify=False,
+        )
+        assert item.started_monotonic is None
+        # Tie the default to the observability guarantee: None → NULL duration_ms
+        assert _elapsed_ms(item.started_monotonic) is None
+
+
+# ---------------------------------------------------------------------------
+# TestEmitMergeAttemptHelper — unit tests for module-level _emit_merge_attempt
+# ---------------------------------------------------------------------------
+
+
+class TestEmitMergeAttemptHelper:
+    def test_emit_merge_attempt_writes_row_without_attempt(
+        self, tmp_path: Path,
+    ):
+        """Call with outcome and duration_ms — row has no 'attempt' key."""
+        from orchestrator.merge_queue import _emit_merge_attempt
+
+        db_path = tmp_path / 'eh_a.db'
+        es = EventStore(db_path=db_path, run_id='eh-run')
+
+        _emit_merge_attempt(es, 'task-1', 'conflict', duration_ms=42)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.outcome'), "
+            "       json_extract(data, '$.attempt'), "
+            "       duration_ms "
+            "FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1, f'Expected 1 row, got: {rows}'
+        outcome, attempt, dur = rows[0]
+        assert outcome == 'conflict'
+        assert attempt is None, f'Expected no attempt key, got {attempt!r}'
+        assert dur == 42
+
+    def test_emit_merge_attempt_writes_row_with_attempt(
+        self, tmp_path: Path,
+    ):
+        """Call with outcome, attempt, and duration_ms — row includes 'attempt'."""
+        from orchestrator.merge_queue import _emit_merge_attempt
+
+        db_path = tmp_path / 'eh_b.db'
+        es = EventStore(db_path=db_path, run_id='eh-run')
+
+        _emit_merge_attempt(es, 'task-2', 'cas_retry', attempt=3, duration_ms=500)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.outcome'), "
+            "       json_extract(data, '$.attempt'), "
+            "       duration_ms "
+            "FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1, f'Expected 1 row, got: {rows}'
+        outcome, attempt, dur = rows[0]
+        assert outcome == 'cas_retry'
+        assert attempt == 3
+        assert dur == 500
+
+    def test_emit_merge_attempt_null_duration_when_none(
+        self, tmp_path: Path,
+    ):
+        """Call with duration_ms=None — duration_ms column is NULL."""
+        from orchestrator.merge_queue import _emit_merge_attempt
+
+        db_path = tmp_path / 'eh_c.db'
+        es = EventStore(db_path=db_path, run_id='eh-run')
+
+        _emit_merge_attempt(es, 'task-3', 'done', duration_ms=None)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.outcome'), duration_ms "
+            "FROM events WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1, f'Expected 1 row, got: {rows}'
+        outcome, dur = rows[0]
+        assert outcome == 'done'
+        assert dur is None, f'Expected NULL duration_ms, got {dur!r}'
+
+    def test_emit_merge_attempt_calls_emit_when_store_provided(self):
+        """Call with a real (mock) store — emit is invoked exactly once."""
+        from unittest.mock import MagicMock
+
+        from orchestrator.merge_queue import _emit_merge_attempt
+
+        mock_es = MagicMock()
+        _emit_merge_attempt(mock_es, 'task-check', 'done', duration_ms=1)
+        mock_es.emit.assert_called_once()
+
+    def test_emit_merge_attempt_noop_when_event_store_is_none(self):
+        """Call with event_store=None — no exception, emit never invoked."""
+        from unittest.mock import MagicMock
+
+        from orchestrator.merge_queue import _emit_merge_attempt
+
+        mock_es = MagicMock()
+        _emit_merge_attempt(None, 'task-4', 'done', duration_ms=1)
+        mock_es.emit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # TestSpeculativeBackwardCompat — step-17
 # Run key MergeWorker scenarios through SpeculativeMergeWorker to confirm
 # they behave identically with queue depth 1.

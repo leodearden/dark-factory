@@ -77,6 +77,38 @@ def _elapsed_ms(start: float | None) -> int | None:
     return round((time.monotonic() - start) * 1000)
 
 
+def _emit_merge_attempt(
+    event_store: EventStore | None,
+    task_id: str,
+    outcome: str,
+    *,
+    attempt: int | None = None,
+    duration_ms: int | None = None,
+) -> None:
+    """Emit a ``merge_attempt`` event for the given outcome.
+
+    Note: certain terminal outcomes are intentionally NOT emitted here —
+    specifically ``blocked`` outcomes from ``not merge_result.success`` paths
+    (e.g. merge infrastructure failures unrelated to conflicts) and from
+    ``advance_main`` non-CAS failure codes (``not_descendant``, ``contaminated``,
+    ``stash_failed``).  These are rare infrastructure errors rather than
+    normal merge-latency outcomes and omitting them keeps dashboard latency
+    percentiles free of unbounded outliers from external failures.
+
+    ``blocked`` outcomes that carry a specific diagnostic outcome code
+    (e.g. ``dropped_plan_targets``, ``cas_exhausted``) ARE emitted here;
+    only ``blocked`` outcomes from infrastructure failures are not.
+    """
+    if event_store is not None:
+        data: dict = {'outcome': outcome}
+        if attempt is not None:
+            data['attempt'] = attempt
+        event_store.emit(
+            EventType.merge_attempt, task_id=task_id, phase='merge',
+            data=data, duration_ms=duration_ms,
+        )
+
+
 @dataclass
 class MergeRequest:
     """A request to merge a task branch into main."""
@@ -117,7 +149,7 @@ class SpeculativeItem:
     speculative: bool                  # True → merged against pending N's SHA
     skip_verify: bool                  # True → pre_rebased and main unchanged
     immediate_outcome: MergeOutcome | None = None  # Set for conflict/already_merged
-    started_monotonic: float = 0.0  # time.monotonic() at request processing entry
+    started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
 
 
 class MergeWorker:
@@ -187,29 +219,6 @@ class MergeWorker:
     @property
     def is_wip_halted(self) -> bool:
         return not self._wip_halt.is_set()
-
-    def _emit_merge(
-        self, task_id: str, outcome: str, *, attempt: int | None = None,
-        duration_ms: int | None = None,
-    ) -> None:
-        """Emit a ``merge_attempt`` event for the given outcome.
-
-        Note: certain terminal outcomes are intentionally NOT emitted here —
-        specifically ``blocked`` outcomes from ``not merge_result.success`` paths
-        (e.g. merge infrastructure failures unrelated to conflicts) and from
-        ``advance_main`` non-CAS failure codes (``not_descendant``, ``contaminated``,
-        ``stash_failed``).  These are rare infrastructure errors rather than
-        normal merge-latency outcomes and omitting them keeps dashboard latency
-        percentiles free of unbounded outliers from external failures.
-        """
-        if self._event_store:
-            data: dict = {'outcome': outcome}
-            if attempt is not None:
-                data['attempt'] = attempt
-            self._event_store.emit(
-                EventType.merge_attempt, task_id=task_id, phase='merge',
-                data=data, duration_ms=duration_ms,
-            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -294,7 +303,7 @@ class MergeWorker:
                 logger.info(
                     f'Task {req.task_id}: branch already on main — skipping merge'
                 )
-                self._emit_merge(req.task_id, 'already_merged', duration_ms=_elapsed_ms(t0))
+                _emit_merge_attempt(self._event_store, req.task_id, 'already_merged', duration_ms=_elapsed_ms(t0))
                 return MergeOutcome('already_merged')
 
         # 2. Merge in a temporary worktree
@@ -305,7 +314,7 @@ class MergeWorker:
         # 3. Conflict → reject immediately (caller resolves outside queue)
         if merge_result.conflicts:
             logger.info(f'Task {req.task_id}: merge conflicts detected')
-            self._emit_merge(req.task_id, 'conflict', duration_ms=_elapsed_ms(t0))
+            _emit_merge_attempt(self._event_store, req.task_id, 'conflict', duration_ms=_elapsed_ms(t0))
             if merge_result.merge_worktree:
                 await self._git_ops.cleanup_merge_worktree(
                     merge_result.merge_worktree,
@@ -336,7 +345,7 @@ class MergeWorker:
             logger.warning(
                 f'Task {req.task_id}: merge dropped plan targets: {dropped}'
             )
-            self._emit_merge(req.task_id, 'dropped_plan_targets', duration_ms=_elapsed_ms(t0))
+            _emit_merge_attempt(self._event_store, req.task_id, 'dropped_plan_targets', duration_ms=_elapsed_ms(t0))
             return MergeOutcome(
                 'blocked',
                 reason=(
@@ -387,7 +396,7 @@ class MergeWorker:
         if result == 'advanced':
             self._cas_retries.pop(req.task_id, None)
             logger.info(f'Task {req.task_id}: merged to main successfully')
-            self._emit_merge(req.task_id, 'done', duration_ms=_elapsed_ms(t0))
+            _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(t0))
             return MergeOutcome('done')
 
         if result in ('wip_overlap', 'pop_conflict'):
@@ -460,7 +469,7 @@ class MergeWorker:
                 f'Task {req.task_id}: CAS retry limit exhausted '
                 f'({self.MAX_CAS_RETRIES} attempts)'
             )
-            self._emit_merge(req.task_id, 'cas_exhausted', attempt=retries, duration_ms=_elapsed_ms(t0))
+            _emit_merge_attempt(self._event_store, req.task_id, 'cas_exhausted', attempt=retries, duration_ms=_elapsed_ms(t0))
             return MergeOutcome(
                 'blocked',
                 reason=(
@@ -473,7 +482,7 @@ class MergeWorker:
             f'Task {req.task_id}: CAS failed (attempt {retries}/'
             f'{self.MAX_CAS_RETRIES}), re-enqueueing at front'
         )
-        self._emit_merge(req.task_id, 'cas_retry', attempt=retries, duration_ms=_elapsed_ms(t0))
+        _emit_merge_attempt(self._event_store, req.task_id, 'cas_retry', attempt=retries, duration_ms=_elapsed_ms(t0))
         self._urgent.append(req)
         return None  # don't resolve Future — will be reprocessed
 
@@ -658,32 +667,11 @@ class SpeculativeMergeWorker:
     # Event helpers
     # ------------------------------------------------------------------
 
-    def _emit_merge(
-        self, task_id: str, outcome: str, *, attempt: int | None = None,
-        duration_ms: int | None = None,
-    ) -> None:
-        """Emit a ``merge_attempt`` event for the given outcome.
-
-        Note: certain terminal outcomes are intentionally NOT emitted here —
-        specifically ``blocked`` outcomes from ``not merge_result.success`` paths
-        (e.g. merge infrastructure failures unrelated to conflicts) and from
-        ``advance_main`` non-CAS failure codes (``not_descendant``, ``contaminated``,
-        ``stash_failed``).  These are rare infrastructure errors rather than
-        normal merge-latency outcomes and omitting them keeps dashboard latency
-        percentiles free of unbounded outliers from external failures.
-        """
-        if self._event_store:
-            data: dict = {'outcome': outcome}
-            if attempt is not None:
-                data['attempt'] = attempt
-            self._event_store.emit(
-                EventType.merge_attempt, task_id=task_id, phase='merge', data=data,
-                duration_ms=duration_ms,
-            )
-
     def _emit_speculative(
         self, event_type: EventType, task_id: str, **data: object,
     ) -> None:
+        # Stays a method (not _emit_merge_attempt) because it emits
+        # speculative-specific event types — not generic merge_attempt rows.
         if self._event_store:
             self._event_store.emit(
                 event_type, task_id=task_id, phase='merge',
@@ -759,7 +747,7 @@ class SpeculativeMergeWorker:
                         logger.info(
                             f'Task {req.task_id}: branch already on main — skipping'
                         )
-                        self._emit_merge(req.task_id, 'already_merged', duration_ms=_elapsed_ms(t0))
+                        _emit_merge_attempt(self._event_store, req.task_id, 'already_merged', duration_ms=_elapsed_ms(t0))
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=speculative,
@@ -785,7 +773,7 @@ class SpeculativeMergeWorker:
                     # ── Step 3: conflict or non-conflict failure ───────────────
                     if merge_result.conflicts:
                         logger.info(f'Task {req.task_id}: merge conflicts')
-                        self._emit_merge(req.task_id, 'conflict', duration_ms=_elapsed_ms(t0))
+                        _emit_merge_attempt(self._event_store, req.task_id, 'conflict', duration_ms=_elapsed_ms(t0))
                         if merge_result.merge_worktree:
                             await self._git_ops.cleanup_merge_worktree(
                                 merge_result.merge_worktree,
@@ -839,7 +827,7 @@ class SpeculativeMergeWorker:
                             f'Task {req.task_id}: merge dropped plan '
                             f'targets: {dropped}'
                         )
-                        self._emit_merge(req.task_id, 'dropped_plan_targets', duration_ms=_elapsed_ms(t0))
+                        _emit_merge_attempt(self._event_store, req.task_id, 'dropped_plan_targets', duration_ms=_elapsed_ms(t0))
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=base_for_merge, speculative=speculative,
@@ -1026,14 +1014,14 @@ class SpeculativeMergeWorker:
                 remerge_occurred = iteration_did_remerge
                 self._speculation_slot.set()
 
-    async def _remerge(self, req: MergeRequest, started_monotonic: float) -> SpeculativeItem:
+    async def _remerge(self, req: MergeRequest, started_monotonic: float | None) -> SpeculativeItem:
         """Re-merge a request against actual main after speculation invalidation."""
         actual_main = await self._git_ops.get_main_sha()
         merge_result = await self._git_ops.merge_to_main(
             req.worktree, req.branch, base_sha=None,
         )
         if merge_result.conflicts:
-            self._emit_merge(req.task_id, 'conflict', duration_ms=_elapsed_ms(started_monotonic))
+            _emit_merge_attempt(self._event_store, req.task_id, 'conflict', duration_ms=_elapsed_ms(started_monotonic))
             if merge_result.merge_worktree:
                 await self._git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
             return SpeculativeItem(
@@ -1136,7 +1124,7 @@ class SpeculativeMergeWorker:
             if result == 'advanced':
                 self._cas_retries.pop(req.task_id, None)
                 logger.info(f'Task {req.task_id}: merged to main successfully')
-                self._emit_merge(req.task_id, 'done', duration_ms=_elapsed_ms(item.started_monotonic))
+                _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(item.started_monotonic))
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if not req.result.done():
                     req.result.set_result(MergeOutcome('done'))
@@ -1223,7 +1211,7 @@ class SpeculativeMergeWorker:
                     f'Task {req.task_id}: CAS retry limit exhausted '
                     f'({self.MAX_CAS_RETRIES} attempts)'
                 )
-                self._emit_merge(req.task_id, 'cas_exhausted', attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
+                _emit_merge_attempt(self._event_store, req.task_id, 'cas_exhausted', attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if not req.result.done():
                     req.result.set_result(MergeOutcome(
@@ -1249,4 +1237,4 @@ class SpeculativeMergeWorker:
                 f'Task {req.task_id}: CAS failed (attempt {total}/'
                 f'{self.MAX_CAS_RETRIES}), retrying'
             )
-            self._emit_merge(req.task_id, 'cas_retry', attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
+            _emit_merge_attempt(self._event_store, req.task_id, 'cas_retry', attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
