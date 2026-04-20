@@ -22,6 +22,12 @@ from orchestrator.agents.invoke import (
     invoke_with_cap_retry,
 )
 
+# Cap-retry path is now the unified shared loop; orchestrator callers
+# pass ``invoke_fn=invoke_agent`` to route through multi-backend dispatch.
+# Tests below patch that same function or pass an AsyncMock as ``invoke_fn``.
+_INVOKE_AGENT_PATCH = 'orchestrator.agents.invoke.invoke_agent'
+_SHARED_ASYNCIO_PATCH = 'shared.cli_invoke.asyncio'
+
 
 def _attach_invoke_slot(gate: MagicMock) -> MagicMock:
     """Install a real async-CM on gate.invoke_slot() that wires a real InvokeSlot.
@@ -94,6 +100,7 @@ def _make_gate_yielding(slots, *, active_account_name=None):
 
     gate = MagicMock()
     gate.invoke_slot = MagicMock(side_effect=_new_cm)
+    gate.account_count = len(slots)
     gate.active_account_name = (
         active_account_name if active_account_name is not None
         else slots[0].account_name
@@ -101,6 +108,7 @@ def _make_gate_yielding(slots, *, active_account_name=None):
     gate.before_invoke = AsyncMock(return_value=slots[0].token)
     gate.on_agent_complete = MagicMock()
     gate.confirm_account_ok = MagicMock()
+    gate.release_probe_slot = MagicMock()
     return gate
 
 
@@ -110,30 +118,24 @@ class TestAccountNameThreading:
     async def test_account_name_set_from_usage_gate(self):
         """account_name is stamped from slot.account_name on success."""
         gate = _make_gate_yielding([_make_slot(account_name='acct-a', cap_hit=False)])
-        result = _make_result()
+        fake_invoke = AsyncMock(return_value=_make_result())
 
-        with patch(
-            'orchestrator.agents.invoke.invoke_agent',
-            new_callable=AsyncMock,
-            return_value=result,
-        ):
-            got = await invoke_with_cap_retry(gate, 'test-label', prompt='hi',
-                                              system_prompt='sys', cwd='/tmp')
+        got = await invoke_with_cap_retry(
+            gate, 'test-label', invoke_fn=fake_invoke,
+            prompt='hi', system_prompt='sys', cwd='/tmp',
+        )
 
         assert got.account_name == 'acct-a'
 
     async def test_account_name_none_coerced_to_empty(self):
         """When slot.account_name is '', result.account_name is ''."""
         gate = _make_gate_yielding([_make_slot(account_name='', cap_hit=False)])
-        result = _make_result()
+        fake_invoke = AsyncMock(return_value=_make_result())
 
-        with patch(
-            'orchestrator.agents.invoke.invoke_agent',
-            new_callable=AsyncMock,
-            return_value=result,
-        ):
-            got = await invoke_with_cap_retry(gate, 'test-label', prompt='hi',
-                                              system_prompt='sys', cwd='/tmp')
+        got = await invoke_with_cap_retry(
+            gate, 'test-label', invoke_fn=fake_invoke,
+            prompt='hi', system_prompt='sys', cwd='/tmp',
+        )
 
         assert got.account_name == ''
 
@@ -148,19 +150,14 @@ class TestAccountNameThreading:
             _make_slot(account_name='acct-a', cap_hit=True),
             _make_slot(account_name='acct-b', cap_hit=False),
         ])
-        result = _make_result()
+        fake_invoke = AsyncMock(return_value=_make_result())
 
-        with (
-            patch(
-                'orchestrator.agents.invoke.invoke_agent',
-                new_callable=AsyncMock,
-                return_value=result,
-            ),
-            patch('orchestrator.agents.invoke.asyncio') as mock_asyncio,
-        ):
+        with patch(_SHARED_ASYNCIO_PATCH) as mock_asyncio:
             mock_asyncio.sleep = AsyncMock()
-            got = await invoke_with_cap_retry(gate, 'test-label', prompt='hi',
-                                              system_prompt='sys', cwd='/tmp')
+            got = await invoke_with_cap_retry(
+                gate, 'test-label', invoke_fn=fake_invoke,
+                prompt='hi', system_prompt='sys', cwd='/tmp',
+            )
 
         assert got.account_name == 'acct-b'
 
@@ -170,15 +167,11 @@ class TestAccountNameNoGate:
 
     async def test_account_name_empty_without_gate(self):
         """When usage_gate=None, result.account_name is ''."""
-        result = _make_result()
-
-        with patch(
-            'orchestrator.agents.invoke.invoke_agent',
-            new_callable=AsyncMock,
-            return_value=result,
-        ):
-            got = await invoke_with_cap_retry(None, 'test-label', prompt='hi',
-                                              system_prompt='sys', cwd='/tmp')
+        fake_invoke = AsyncMock(return_value=_make_result())
+        got = await invoke_with_cap_retry(
+            None, 'test-label', invoke_fn=fake_invoke,
+            prompt='hi', system_prompt='sys', cwd='/tmp',
+        )
 
         assert got.account_name == ''
 
@@ -193,52 +186,53 @@ class TestCapHitResume:
             _make_slot(token='token-b', account_name='acct-b', cap_hit=False),
         ])
 
-        capped_result = _make_result(session_id='sess-abc')
-        ok_result = _make_result()
+        capped_result = _make_result(
+            success=True, cost_usd=0.5, session_id='sess-abc',
+        )
+        capped_result.duration_ms = 6000
+        capped_result.turns = 2
+        ok_result = _make_result(success=True, cost_usd=0.5)
+        ok_result.duration_ms = 6000
+        ok_result.turns = 2
 
-        with (
-            patch(
-                'orchestrator.agents.invoke.invoke_agent',
-                new_callable=AsyncMock,
-                side_effect=[capped_result, ok_result],
-            ) as mock_invoke,
-            patch('orchestrator.agents.invoke.asyncio') as mock_asyncio,
-        ):
+        fake_invoke = AsyncMock(side_effect=[capped_result, ok_result])
+
+        with patch(_SHARED_ASYNCIO_PATCH) as mock_asyncio:
             mock_asyncio.sleep = AsyncMock()
             await invoke_with_cap_retry(
-                gate, 'test-label',
+                gate, 'test-label', invoke_fn=fake_invoke,
                 prompt='hi', system_prompt='sys', cwd='/tmp', backend='claude',
             )
 
-            second_call = mock_invoke.call_args_list[1]
+            second_call = fake_invoke.call_args_list[1]
             assert second_call.kwargs.get('resume_session_id') == 'sess-abc'
             assert second_call.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
 
     async def test_no_resume_on_cap_hit_codex_backend(self):
-        """Codex backend cap hit → no resume_session_id (not supported)."""
+        """Codex backend cap hit → no resume_session_id (not supported).
+
+        The unified loop resumes by session_id when the result has one, regardless
+        of backend.  Codex backends produce no session_id, so no resume happens.
+        """
         gate = _make_gate_yielding([
             _make_slot(token='token-a', account_name='acct-a', cap_hit=True),
             _make_slot(token='token-b', account_name='acct-b', cap_hit=False),
         ])
 
-        capped_result = _make_result(session_id='sess-abc')
+        capped_result = _make_result(session_id='')  # codex: no session
         ok_result = _make_result()
+        ok_result.duration_ms = 6000
+        ok_result.turns = 2
+        fake_invoke = AsyncMock(side_effect=[capped_result, ok_result])
 
-        with (
-            patch(
-                'orchestrator.agents.invoke.invoke_agent',
-                new_callable=AsyncMock,
-                side_effect=[capped_result, ok_result],
-            ) as mock_invoke,
-            patch('orchestrator.agents.invoke.asyncio') as mock_asyncio,
-        ):
+        with patch(_SHARED_ASYNCIO_PATCH) as mock_asyncio:
             mock_asyncio.sleep = AsyncMock()
             await invoke_with_cap_retry(
-                gate, 'test-label',
+                gate, 'test-label', invoke_fn=fake_invoke,
                 prompt='hi', system_prompt='sys', cwd='/tmp', backend='codex',
             )
 
-            second_call = mock_invoke.call_args_list[1]
+            second_call = fake_invoke.call_args_list[1]
             assert 'resume_session_id' not in second_call.kwargs
             assert second_call.kwargs.get('prompt') == 'hi'
 
@@ -252,24 +246,22 @@ class TestCapHitResume:
 
         capped_result = _make_result(session_id='sess-abc')
         failed_resume = _make_result(success=False)
-        ok_result = _make_result()
+        failed_resume.duration_ms = 6000
+        failed_resume.turns = 2
+        ok_result = _make_result(success=True, cost_usd=0.5)
+        ok_result.duration_ms = 6000
+        ok_result.turns = 2
+        fake_invoke = AsyncMock(side_effect=[capped_result, failed_resume, ok_result])
 
-        with (
-            patch(
-                'orchestrator.agents.invoke.invoke_agent',
-                new_callable=AsyncMock,
-                side_effect=[capped_result, failed_resume, ok_result],
-            ) as mock_invoke,
-            patch('orchestrator.agents.invoke.asyncio') as mock_asyncio,
-        ):
+        with patch(_SHARED_ASYNCIO_PATCH) as mock_asyncio:
             mock_asyncio.sleep = AsyncMock()
             got = await invoke_with_cap_retry(
-                gate, 'test-label',
+                gate, 'test-label', invoke_fn=fake_invoke,
                 prompt='original', system_prompt='sys', cwd='/tmp', backend='claude',
             )
 
-            assert mock_invoke.call_count == 3
-            third_call = mock_invoke.call_args_list[2]
+            assert fake_invoke.call_count == 3
+            third_call = fake_invoke.call_args_list[2]
             assert 'resume_session_id' not in third_call.kwargs
             assert third_call.kwargs.get('prompt') == 'original'
             assert got.success is True
@@ -472,8 +464,9 @@ class TestReleaseProbeSlotOnException:
     """invoke_with_cap_retry (orchestrator) calls release_probe_slot() when invoke raises."""
 
     async def test_release_probe_slot_called_on_runtime_error(self):
-        """release_probe_slot is called with oauth_token when invoke_agent raises."""
+        """release_probe_slot is called with oauth_token when invoke raises."""
         gate = MagicMock()
+        gate.account_count = 1
         gate.before_invoke = AsyncMock(return_value='tok-a')
         gate.detect_cap_hit = MagicMock(return_value=False)
         gate.active_account_name = 'acct-a'
@@ -482,80 +475,68 @@ class TestReleaseProbeSlotOnException:
         gate.release_probe_slot = MagicMock()
         _attach_invoke_slot(gate)
 
-        with (
-            patch(
-                'orchestrator.agents.invoke.invoke_agent',
-                new_callable=AsyncMock,
-                side_effect=RuntimeError('subprocess failed'),
-            ),
-            pytest.raises(RuntimeError, match='subprocess failed'),
-        ):
-            await invoke_with_cap_retry(gate, 'lbl', prompt='hi',
-                                        system_prompt='sys', cwd='/tmp')
+        fake_invoke = AsyncMock(side_effect=RuntimeError('subprocess failed'))
+
+        with pytest.raises(RuntimeError, match='subprocess failed'):
+            await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=fake_invoke,
+                prompt='hi', system_prompt='sys', cwd='/tmp',
+            )
 
         gate.release_probe_slot.assert_called_once_with('tok-a')
 
     async def test_runtime_error_propagates(self):
-        """RuntimeError raised by invoke_agent propagates with its message intact."""
+        """RuntimeError raised by invoke propagates with its message intact."""
         gate = MagicMock()
+        gate.account_count = 1
         gate.before_invoke = AsyncMock(return_value='tok-a')
         gate.active_account_name = 'acct-a'
         gate.release_probe_slot = MagicMock()
         _attach_invoke_slot(gate)
 
-        with (
-            patch(
-                'orchestrator.agents.invoke.invoke_agent',
-                new_callable=AsyncMock,
-                side_effect=RuntimeError('crash'),
-            ),
-            pytest.raises(RuntimeError) as exc_info,
-        ):
-            await invoke_with_cap_retry(gate, 'lbl', prompt='hi',
-                                        system_prompt='sys', cwd='/tmp')
+        fake_invoke = AsyncMock(side_effect=RuntimeError('crash'))
+        with pytest.raises(RuntimeError) as exc_info:
+            await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=fake_invoke,
+                prompt='hi', system_prompt='sys', cwd='/tmp',
+            )
 
         assert str(exc_info.value) == 'crash'  # error message preserved verbatim
 
     async def test_confirm_account_ok_not_called_when_invoke_raises(self):
-        """confirm_account_ok is NOT called when invoke_agent raises."""
+        """confirm_account_ok is NOT called when invoke raises."""
         gate = MagicMock()
+        gate.account_count = 1
         gate.before_invoke = AsyncMock(return_value='tok-a')
         gate.active_account_name = 'acct-a'
         gate.confirm_account_ok = MagicMock()
         gate.release_probe_slot = MagicMock()
         _attach_invoke_slot(gate)
 
-        with (
-            patch(
-                'orchestrator.agents.invoke.invoke_agent',
-                new_callable=AsyncMock,
-                side_effect=RuntimeError('crash'),
-            ),
-            pytest.raises(RuntimeError),
-        ):
-            await invoke_with_cap_retry(gate, 'lbl', prompt='hi',
-                                        system_prompt='sys', cwd='/tmp')
+        fake_invoke = AsyncMock(side_effect=RuntimeError('crash'))
+        with pytest.raises(RuntimeError):
+            await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=fake_invoke,
+                prompt='hi', system_prompt='sys', cwd='/tmp',
+            )
 
         gate.confirm_account_ok.assert_not_called()
 
     async def test_cancelled_error_release_probe_slot(self):
         """CancelledError (BaseException, not Exception) triggers release_probe_slot."""
         gate = MagicMock()
+        gate.account_count = 1
         gate.before_invoke = AsyncMock(return_value='tok-a')
         gate.active_account_name = 'acct-a'
         gate.release_probe_slot = MagicMock()
         _attach_invoke_slot(gate)
 
-        with (
-            patch(
-                'orchestrator.agents.invoke.invoke_agent',
-                new_callable=AsyncMock,
-                side_effect=asyncio.CancelledError(),
-            ),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await invoke_with_cap_retry(gate, 'lbl', prompt='hi',
-                                        system_prompt='sys', cwd='/tmp')
+        fake_invoke = AsyncMock(side_effect=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=fake_invoke,
+                prompt='hi', system_prompt='sys', cwd='/tmp',
+            )
 
         gate.release_probe_slot.assert_called_once_with('tok-a')
 

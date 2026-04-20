@@ -68,9 +68,10 @@ async def test_tag_task_modules_calls_update_for_untagged(harness, config):
         success=True,
         output=json.dumps(AGENT_MODULE_RESPONSE),
         structured_output=AGENT_MODULE_RESPONSE,
+        cost_usd=0.01, duration_ms=6000, turns=2,
     )
 
-    with patch('orchestrator.agents.invoke.invoke_agent', AsyncMock(return_value=agent_result)) as mock_invoke:
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)) as mock_invoke:
         await harness._tag_task_modules()
 
         # Agent should be called once with all untagged tasks
@@ -110,7 +111,7 @@ async def test_tag_task_modules_skips_when_all_tagged(harness):
     harness.scheduler.get_tasks = AsyncMock(return_value=all_tagged)
     harness.scheduler.update_task = AsyncMock()
 
-    with patch('orchestrator.agents.invoke.invoke_agent', AsyncMock()) as mock_invoke:
+    with patch('orchestrator.harness.invoke_agent', AsyncMock()) as mock_invoke:
         await harness._tag_task_modules()
         mock_invoke.assert_not_called()
 
@@ -123,9 +124,14 @@ async def test_tag_task_modules_handles_agent_failure(harness):
     harness.scheduler.get_tasks = AsyncMock(return_value=SAMPLE_TASKS)
     harness.scheduler.update_task = AsyncMock()
 
-    agent_result = AgentResult(success=False, output='Agent error')
+    # Non-zero cost/turns/duration avoid the zero-cost instant-exit heuristic
+    # that would otherwise classify this as a cap hit in the unified loop.
+    agent_result = AgentResult(
+        success=False, output='Agent error',
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
 
-    with patch('orchestrator.agents.invoke.invoke_agent', AsyncMock(return_value=agent_result)):
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
         await harness._tag_task_modules()
 
     harness.scheduler.update_task.assert_not_called()
@@ -141,9 +147,10 @@ async def test_tag_task_modules_handles_bad_json(harness):
         success=True,
         output='not valid json',
         structured_output=None,
+        cost_usd=0.01, duration_ms=6000, turns=2,
     )
 
-    with patch('orchestrator.agents.invoke.invoke_agent', AsyncMock(return_value=agent_result)):
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
         await harness._tag_task_modules()
 
     harness.scheduler.update_task.assert_not_called()
@@ -159,9 +166,10 @@ async def test_tag_task_modules_uses_correct_config(harness, config):
         success=True,
         output='{}',
         structured_output={'tasks': []},
+        cost_usd=0.01, duration_ms=6000, turns=2,
     )
 
-    with patch('orchestrator.agents.invoke.invoke_agent', AsyncMock(return_value=agent_result)) as mock_invoke:
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)) as mock_invoke:
         await harness._tag_task_modules()
 
         call_kwargs = mock_invoke.call_args.kwargs

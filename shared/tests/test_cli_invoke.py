@@ -1347,6 +1347,65 @@ class TestParseClaudeOutputSchemaSalvage:
         assert agent.schema_salvaged is False
 
 
+# ── api_error_status surfacing ────────────────────────────────────────────────
+
+
+class TestAgentResultApiErrorStatusField:
+    """AgentResult surfaces HTTP error status for auth/permission failures."""
+
+    def test_api_error_status_defaults_none(self):
+        """AgentResult.api_error_status defaults to None when not set."""
+        result = AgentResult(success=True, output='ok')
+        assert result.api_error_status is None
+
+    def test_api_error_status_accepts_int(self):
+        """api_error_status can be set to an HTTP status code."""
+        result = AgentResult(success=False, output='forbidden', api_error_status=403)
+        assert result.api_error_status == 403
+
+
+class TestParseClaudeOutputApiErrorStatus:
+    """_parse_claude_output populates api_error_status when present in CLI JSON."""
+
+    def test_populated_when_present(self):
+        """api_error_status passes through from CLI JSON."""
+        stdout = json.dumps({
+            'subtype': 'error',
+            'is_error': True,
+            'cost_usd': 0.0,
+            'duration_ms': 100,
+            'num_turns': 0,
+            'api_error_status': 403,
+            'result': 'Your organization does not have access to Claude',
+        })
+        sub = _SubprocessResult(stdout=stdout, stderr='', returncode=1,
+                                duration_ms=100, timed_out=False)
+        agent = _parse_claude_output(sub)
+        assert agent.api_error_status == 403
+        assert agent.success is False
+
+    def test_none_when_absent(self):
+        """api_error_status is None when CLI JSON omits the field."""
+        sub = _SubprocessResult(stdout=_CLAUDE_VALID_JSON_STDOUT, stderr='',
+                                returncode=0, duration_ms=100, timed_out=False)
+        agent = _parse_claude_output(sub)
+        assert agent.api_error_status is None
+
+    def test_none_on_empty_output(self):
+        """api_error_status is None for the empty-output early return."""
+        sub = _SubprocessResult(stdout='', stderr='', returncode=1,
+                                duration_ms=10, timed_out=False)
+        agent = _parse_claude_output(sub)
+        assert agent.api_error_status is None
+
+    def test_none_on_json_decode_error(self):
+        """api_error_status is None for the text-output fallback path."""
+        sub = _SubprocessResult(stdout='not json', stderr='', returncode=0,
+                                duration_ms=10, timed_out=False)
+        agent = _parse_claude_output(sub)
+        assert agent.api_error_status is None
+
+
 # ── caller-level timed_out propagation (characterization tests) ───────────────
 
 

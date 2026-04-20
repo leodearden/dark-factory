@@ -31,6 +31,10 @@ class UsageCapConfig(BaseModel):
     wait_for_reset: bool = Field(default=True)
     probe_interval_secs: int = Field(default=300)
     max_probe_interval_secs: int = Field(default=1800)
+    auth_reprobe_secs: int = Field(
+        default=3600,
+        description='Seconds between auth re-probes for auth_failed accounts.',
+    )
     accounts: list[AccountConfig] = Field(default_factory=list)
     accounts_file: str | None = Field(
         default=None,

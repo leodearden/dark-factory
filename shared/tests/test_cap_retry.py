@@ -1725,3 +1725,160 @@ class TestCapRetryUnattributedCapHit:
         assert kw['capped'] is False, (
             f'Expected capped=False for normal success, got capped={kw["capped"]!r}'
         )
+
+
+# ===================================================================
+# TestAuthFailure403Detection
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestAuthFailure403Detection:
+    """invoke_with_cap_retry routes 4xx api_error_status to _handle_auth_failure."""
+
+    async def test_403_marks_account_auth_failed_and_fails_over(self):
+        """A 403 result triggers _handle_auth_failure, then retries on next account."""
+        gate = make_gate(['a', 'b'])
+
+        results = iter([
+            make_result(
+                success=False,
+                output='Your organization does not have access to Claude',
+                api_error_status=403,
+                cost_usd=0.0,
+            ),
+            make_result(success=True, cost_usd=0.5),
+        ])
+
+        async def fake_invoke(**kwargs):
+            return next(results)
+
+        with (
+            patch(_INVOKE_PATCH, side_effect=fake_invoke) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        assert got.success is True
+        assert mock_inv.await_count == 2
+        # First account must now be auth_failed.
+        assert gate._accounts[0].auth_failed is True
+        # Second account remains healthy.
+        assert gate._accounts[1].auth_failed is False
+
+    async def test_401_also_treated_as_auth_failure(self):
+        """Any 4xx api_error_status is treated as auth failure."""
+        gate = make_gate(['a', 'b'])
+        results = iter([
+            make_result(success=False, output='Unauthorized',
+                         api_error_status=401, cost_usd=0.0),
+            make_result(success=True, cost_usd=0.5),
+        ])
+
+        async def fake_invoke(**kwargs):
+            return next(results)
+
+        with (
+            patch(_INVOKE_PATCH, side_effect=fake_invoke),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+        assert got.success is True
+        assert gate._accounts[0].auth_failed is True
+
+    async def test_500_not_treated_as_auth_failure(self):
+        """5xx api_error_status is NOT treated as auth failure.
+
+        Use non-zero cost / turns so the zero-cost-instant-exit heuristic
+        doesn't mask the assertion by treating the 500 as a cap hit.
+        """
+        gate = make_gate(['a'])
+        result = make_result(
+            success=True, output='server error',
+            api_error_status=500, cost_usd=0.1, duration_ms=6000, turns=2,
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+        assert got.api_error_status == 500
+        assert gate._accounts[0].auth_failed is False
+
+    async def test_no_api_error_status_is_noop(self):
+        """api_error_status=None: the result is returned as-is, no auth handling."""
+        gate = make_gate(['a'])
+        result = make_result(success=True, cost_usd=0.5)  # api_error_status defaults to None
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+        assert got.success is True
+        assert gate._accounts[0].auth_failed is False
+
+
+# ===================================================================
+# TestInvokeFnParameter
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestInvokeFnParameter:
+    """invoke_with_cap_retry accepts an invoke_fn callable for backend dispatch."""
+
+    async def test_custom_invoke_fn_called(self):
+        """When invoke_fn is passed, it is used instead of invoke_claude_agent."""
+        gate = make_gate(['a'])
+        custom = AsyncMock(return_value=make_result(
+            success=True, cost_usd=0.1, duration_ms=6000, turns=2,
+        ))
+        await invoke_with_cap_retry(
+            gate, 'lbl', invoke_fn=custom, backend='claude', prompt='hi',
+        )
+        custom.assert_awaited_once()
+
+    async def test_invoke_fn_receives_kwargs(self):
+        """Custom invoke_fn receives prompt + oauth_token + config_dir kwargs."""
+        gate = make_gate(['a'])
+        custom = AsyncMock(return_value=make_result(
+            success=True, cost_usd=0.1, duration_ms=6000, turns=2,
+        ))
+        await invoke_with_cap_retry(
+            gate, 'lbl', invoke_fn=custom, prompt='hello', model='sonnet',
+        )
+        kw = custom.call_args.kwargs
+        assert kw['prompt'] == 'hello'
+        assert kw['oauth_token'] == 'fake-token-a'
+        assert kw['model'] == 'sonnet'
+
+    async def test_backend_forwarded_to_detect_cap_hit(self):
+        """backend parameter is forwarded to slot.detect_cap_hit."""
+        gate = make_gate(['a'])
+        detect_calls: list[str] = []
+        orig_detect = gate.detect_cap_hit
+
+        def spy(stderr, result_text, backend='claude', oauth_token=None):
+            detect_calls.append(backend)
+            return orig_detect(stderr, result_text, backend, oauth_token=oauth_token)
+
+        gate.detect_cap_hit = spy  # type: ignore[assignment]
+
+        result = make_result(
+            success=True, cost_usd=0.1, duration_ms=6000, turns=2,
+        )
+        with patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result):
+            await invoke_with_cap_retry(
+                gate, 'lbl', backend='codex', prompt='hi',
+            )
+        assert detect_calls == ['codex']
+
+    async def test_default_invoke_fn_is_claude(self):
+        """When invoke_fn is omitted, invoke_claude_agent is used."""
+        gate = make_gate(['a'])
+        result = make_result(
+            success=True, cost_usd=0.1, duration_ms=6000, turns=2,
+        )
+        with patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv:
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+        mock_inv.assert_awaited_once()

@@ -13,10 +13,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING
 
+from shared.cli_invoke import invoke_with_cap_retry
 from shared.cost_store import CostStore
 
 from orchestrator.agents.briefing import BriefingAssembler
-from orchestrator.agents.invoke import invoke_with_cap_retry
+from orchestrator.agents.invoke import invoke_agent
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
@@ -692,6 +693,7 @@ Output JSON matching the schema. Every task must appear in the output.
         result = await invoke_with_cap_retry(
             usage_gate=self.usage_gate,
             label='Module tagging',
+            invoke_fn=invoke_agent,
             prompt=prompt,
             system_prompt='You are a code module classifier. Given task descriptions and a codebase structure, determine which code modules each task will modify. Be precise and conservative.',
             cwd=self.config.project_root,
