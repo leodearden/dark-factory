@@ -2337,6 +2337,16 @@ class TestEmitMergeAttemptHelper:
         assert outcome == 'done'
         assert dur is None, f'Expected NULL duration_ms, got {dur!r}'
 
+    def test_emit_merge_attempt_calls_emit_when_store_provided(self):
+        """Call with a real (mock) store — emit is invoked exactly once."""
+        from unittest.mock import MagicMock
+
+        from orchestrator.merge_queue import _emit_merge_attempt
+
+        mock_es = MagicMock()
+        _emit_merge_attempt(mock_es, 'task-check', 'done', duration_ms=1)
+        mock_es.emit.assert_called_once()
+
     def test_emit_merge_attempt_noop_when_event_store_is_none(self):
         """Call with event_store=None — no exception, emit never invoked."""
         from unittest.mock import MagicMock
@@ -2344,16 +2354,8 @@ class TestEmitMergeAttemptHelper:
         from orchestrator.merge_queue import _emit_merge_attempt
 
         mock_es = MagicMock()
-
-        # Affirmative case: emit IS called when a real (mock) store is provided.
-        _emit_merge_attempt(mock_es, 'task-check', 'done', duration_ms=1)
-        mock_es.emit.assert_called_once()
-
-        # None case: emit must NOT be called; call count must stay at 1.
         _emit_merge_attempt(None, 'task-4', 'done', duration_ms=1)
-        assert mock_es.emit.call_count == 1, (
-            'emit must not be called when event_store is None'
-        )
+        mock_es.emit.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
