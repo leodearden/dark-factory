@@ -9,6 +9,7 @@ import logging
 import os
 import tempfile
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -197,6 +198,8 @@ async def invoke_with_cap_retry(
     role: str = '',
     max_cap_retries: int | None = _DEFAULT_MAX_CAP_RETRIES,
     cap_retry_deadline_secs: float | None = _DEFAULT_CAP_RETRY_DEADLINE_SECS,
+    invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
+    backend: str = 'claude',
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -230,10 +233,13 @@ async def invoke_with_cap_retry(
     started_at = ''
     completed_at = ''
 
+    # Default to Claude-specific invocation when no invoke_fn was provided
+    invoke: Callable[..., Awaitable[AgentResult]] = invoke_fn or invoke_claude_agent
+
     # Fast path: no usage gate → single invocation, no cap retry
     if not usage_gate:
         started_at = datetime.now(UTC).isoformat()
-        result = await invoke_claude_agent(
+        result = await invoke(
             **invoke_kwargs,
             config_dir=config_dir.path if config_dir else None,
         )
@@ -247,14 +253,37 @@ async def invoke_with_cap_retry(
                     config_dir.write_credentials(slot.token)
 
                 started_at = datetime.now(UTC).isoformat()
-                result = await invoke_claude_agent(
+                result = await invoke(
                     **invoke_kwargs,
                     oauth_token=slot.token,
                     config_dir=config_dir.path if config_dir else None,
                 )
                 completed_at = datetime.now(UTC).isoformat()
 
-                if slot.detect_cap_hit(result.stderr, result.output):
+                # Auth-failure routing (403/401/other 4xx): distinct from cap
+                # hits. Mark the account auth_failed and fail over; don't count
+                # toward consecutive_cap_hits so the cooldown doesn't compound.
+                if (
+                    result.api_error_status is not None
+                    and 400 <= result.api_error_status < 500
+                ):
+                    auth_marked = usage_gate._handle_auth_failure(
+                        f'HTTP {result.api_error_status}: {result.output[:120]}',
+                        slot.token,
+                    )
+                    if auth_marked:
+                        slot.settle()
+                        invoke_kwargs.pop('resume_session_id', None)
+                        invoke_kwargs['prompt'] = original_prompt
+                        logger.warning(
+                            f'{label}: account {account_name} auth-failed '
+                            f'(HTTP {result.api_error_status}) — failing over',
+                        )
+                        continue
+                    # Couldn't attribute — fall through; downstream heuristic
+                    # or return handles it.
+
+                if slot.detect_cap_hit(result.stderr, result.output, backend=backend):
                     consecutive_cap_hits += 1
                     full_cycles = (consecutive_cap_hits - 1) // num_accounts
                     cooldown = min(

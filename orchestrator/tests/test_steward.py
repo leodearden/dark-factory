@@ -1786,7 +1786,7 @@ class TestPreTriageUsageGateCleanup:
         steward.usage_gate = gate
         mock_result = _make_result(cost=0.5, session_id='sess-triage')
 
-        with patch('orchestrator.agents.invoke.invoke_agent',
+        with patch('orchestrator.steward.invoke_agent',
                    new_callable=AsyncMock, return_value=mock_result):
             await steward._pre_triage_suggestions(self._esc())
 
@@ -1803,7 +1803,7 @@ class TestPreTriageUsageGateCleanup:
         steward.usage_gate = gate
 
         with (
-            patch('orchestrator.agents.invoke.invoke_agent',
+            patch('orchestrator.steward.invoke_agent',
                   new_callable=AsyncMock,
                   side_effect=RuntimeError('subprocess failed')),
             pytest.raises(RuntimeError, match='subprocess failed'),
@@ -1823,7 +1823,7 @@ class TestPreTriageUsageGateCleanup:
         mock_result = _make_result(cost=0.3, session_id='sess-triage')
 
         with (
-            patch('orchestrator.agents.invoke.invoke_agent',
+            patch('orchestrator.steward.invoke_agent',
                   new_callable=AsyncMock, return_value=mock_result) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
@@ -1846,7 +1846,7 @@ class TestPreTriageUsageGateCleanup:
         success_result = _make_result(cost=0.3, session_id='sess-resumed')
 
         with (
-            patch('orchestrator.agents.invoke.invoke_agent',
+            patch('orchestrator.steward.invoke_agent',
                   new_callable=AsyncMock,
                   side_effect=[cap_result, success_result]) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock),
@@ -1864,7 +1864,7 @@ class TestPreTriageUsageGateCleanup:
         steward.usage_gate = gate
 
         with (
-            patch('orchestrator.agents.invoke.invoke_agent',
+            patch('orchestrator.steward.invoke_agent',
                   new_callable=AsyncMock,
                   side_effect=asyncio.CancelledError()),
             pytest.raises(asyncio.CancelledError),
@@ -1879,7 +1879,7 @@ class TestPreTriageUsageGateCleanup:
         steward.usage_gate = gate
 
         with (
-            patch('orchestrator.agents.invoke.invoke_agent',
+            patch('orchestrator.steward.invoke_agent',
                   new_callable=AsyncMock,
                   side_effect=RuntimeError('crash')),
             pytest.raises(RuntimeError),
@@ -1897,7 +1897,7 @@ class TestPreTriageUsageGateCleanup:
         steward.usage_gate = gate
         mock_result = _make_result(cost=0.42, session_id='sess-triage')
 
-        with patch('orchestrator.agents.invoke.invoke_agent',
+        with patch('orchestrator.steward.invoke_agent',
                    new_callable=AsyncMock, return_value=mock_result):
             await steward._pre_triage_suggestions(self._esc())
 
@@ -1913,7 +1913,7 @@ class TestPreTriageUsageGateCleanup:
         steward.metrics.total_cost_usd = 0.0
         steward.metrics.total_duration_ms = 0
 
-        with patch('orchestrator.agents.invoke.invoke_agent',
+        with patch('orchestrator.steward.invoke_agent',
                    new_callable=AsyncMock, return_value=mock_result):
             await steward._pre_triage_suggestions(self._esc())
 
@@ -1929,7 +1929,7 @@ class TestPreTriageUsageGateCleanup:
 
         mock_result = _make_result(cost=0.1, session_id='sess-triage')
 
-        with patch('orchestrator.agents.invoke.invoke_agent',
+        with patch('orchestrator.steward.invoke_agent',
                    new_callable=AsyncMock, return_value=mock_result):
             result = await steward._pre_triage_suggestions(self._esc())
 
@@ -2086,7 +2086,7 @@ class TestPreTriageSuggestionsPath:
         esc = self._esc_with_suggestions(12)
         # Patches invoke_agent at definition site — invoke_with_cap_retry delegates to it
         # via module-level reference, so patching here intercepts calls through the wrapper.
-        with patch('orchestrator.agents.invoke.invoke_agent',
+        with patch('orchestrator.steward.invoke_agent',
                    new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
             await steward._pre_triage_suggestions(esc)
 
@@ -2102,7 +2102,7 @@ class TestPreTriageSuggestionsPath:
         esc = self._esc_with_suggestions(12)
         # Patches invoke_agent at definition site — invoke_with_cap_retry delegates to it
         # via module-level reference, so patching here intercepts calls through the wrapper.
-        with patch('orchestrator.agents.invoke.invoke_agent',
+        with patch('orchestrator.steward.invoke_agent',
                    new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
             await steward._pre_triage_suggestions(esc)
 

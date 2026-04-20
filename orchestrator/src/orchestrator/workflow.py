@@ -17,7 +17,8 @@ from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
 
 from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
-from orchestrator.agents.invoke import AgentResult, invoke_with_cap_retry
+from orchestrator.agents.invoke import AgentResult, invoke_agent
+from shared.cli_invoke import invoke_with_cap_retry
 from orchestrator.agents.roles import (
     ALL_REVIEWERS,
     ARCHITECT,
@@ -2067,6 +2068,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             usage_gate=self.usage_gate,
             label=f'Task {self.task_id} [{role.name}]',
             config_dir=self._config_dir,
+            invoke_fn=invoke_agent,
             prompt=prompt,
             system_prompt=role.system_prompt,
             cwd=cwd,

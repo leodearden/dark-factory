@@ -2,7 +2,9 @@
 
 Claude-specific invocation is delegated to ``shared.cli_invoke`` so that
 other subsystems (e.g. fused-memory reconciliation) can reuse it without
-depending on the orchestrator package.
+depending on the orchestrator package. The cap-retry loop also lives in
+``shared.cli_invoke``; orchestrator callers pass ``invoke_fn=invoke_agent``
+to route through the multi-backend dispatcher below.
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 # Re-export shared Claude invocation primitives for backwards compatibility
 from shared.cli_invoke import (  # noqa: F401
@@ -24,24 +26,13 @@ from shared.cli_invoke import (  # noqa: F401
     _run_subprocess,
     _SubprocessResult,
     invoke_claude_agent,
+    invoke_with_cap_retry,
 )
 
 # Process-group termination helper for subprocess tree cleanup
 from shared.proc_group import terminate_process_group
 
-if TYPE_CHECKING:
-    from shared.config_dir import TaskConfigDir
-    from shared.usage_gate import UsageGate
-
 logger = logging.getLogger(__name__)
-
-_CAP_HIT_COOLDOWN_SECS = 5.0
-# Hard cap on consecutive cap-hit retries inside invoke_with_cap_retry.  Legitimate
-# retries are bounded by the failover-account count plus a few same-account
-# resumes; anything past this indicates a misconfigured gate or a loop bug
-# (e.g. a test mock whose slot.detect_cap_hit never returns False), so we
-# raise instead of spinning.
-_MAX_CAP_RETRIES = 16
 
 # Approximate cost per million tokens by model (for backends without native cost reporting)
 _MODEL_COSTS: dict[str, dict[str, float]] = {
@@ -52,101 +43,6 @@ _MODEL_COSTS: dict[str, dict[str, float]] = {
     'gemini-3.1-pro-preview': {'input': 1.25, 'output': 5.00},
     'gemini-3-flash': {'input': 0.075, 'output': 0.30},
 }
-
-
-async def invoke_with_cap_retry(
-    usage_gate: UsageGate | None,
-    label: str,
-    *,
-    config_dir: TaskConfigDir | None = None,
-    **invoke_kwargs,
-) -> AgentResult:
-    """Invoke a multi-backend agent, retrying on usage-cap hits with account failover.
-
-    On cap hit for Claude backends, resumes the capped session on the next
-    account via ``--resume`` when a ``session_id`` is available, preserving
-    all agent progress.  Non-Claude backends always restart fresh (they
-    don't support ``--resume``).
-
-    *config_dir*, when set, writes the current account's credentials before
-    each invocation so that ``--resume`` reads the correct credential file.
-
-    *label* identifies the caller in log messages (e.g. "Module tagging",
-    "Task 7 [implementer]").
-
-    All keyword arguments are forwarded to ``invoke_agent()``.
-    """
-    backend = invoke_kwargs.get('backend', 'claude')
-    original_prompt = invoke_kwargs.get('prompt', '')
-    account_name = ''
-
-    # Fast path: no usage gate → single invocation, no cap retry
-    if not usage_gate:
-        result = await invoke_agent(
-            **invoke_kwargs,
-            config_dir=config_dir.path if config_dir else None,
-        )
-        result.account_name = ''
-        return result
-
-    for _ in range(_MAX_CAP_RETRIES):
-        async with usage_gate.invoke_slot() as slot:
-            account_name = slot.account_name
-
-            if config_dir and slot.token:
-                config_dir.write_credentials(slot.token)
-
-            result = await invoke_agent(
-                **invoke_kwargs,
-                oauth_token=slot.token,
-                config_dir=config_dir.path if config_dir else None,
-            )
-
-            if slot.detect_cap_hit(result.stderr, result.output, backend):
-                # Resume the capped session if Claude backend and session_id available
-                if backend == 'claude' and result.session_id:
-                    invoke_kwargs['resume_session_id'] = result.session_id
-                    invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
-                    resume_or_fresh = 'resuming'
-                else:
-                    invoke_kwargs.pop('resume_session_id', None)
-                    invoke_kwargs['prompt'] = original_prompt
-                    resume_or_fresh = 'fresh'
-
-                acct_name = usage_gate.active_account_name
-                if acct_name:
-                    logger.warning(
-                        f'{label}: cap hit, sleeping {_CAP_HIT_COOLDOWN_SECS}s '
-                        f'then {resume_or_fresh} on account {acct_name}',
-                    )
-                else:
-                    logger.warning(
-                        f'{label}: cap hit on all accounts, sleeping '
-                        f'{_CAP_HIT_COOLDOWN_SECS}s then waiting for reset ({resume_or_fresh})',
-                    )
-                await asyncio.sleep(_CAP_HIT_COOLDOWN_SECS)
-                continue
-
-            # Non-cap-hit failure while resuming → fall back to fresh invocation
-            if not result.success and invoke_kwargs.get('resume_session_id'):
-                logger.warning(
-                    f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
-                    f'retrying fresh',
-                )
-                invoke_kwargs.pop('resume_session_id', None)
-                invoke_kwargs['prompt'] = original_prompt
-                continue  # __aexit__ releases probe slot
-
-            slot.confirm(result.cost_usd)
-            break
-    else:
-        raise RuntimeError(
-            f'{label}: cap-retry loop exceeded {_MAX_CAP_RETRIES} attempts '
-            '— usage_gate may be misconfigured',
-        )
-
-    result.account_name = account_name
-    return result
 
 
 async def invoke_agent(

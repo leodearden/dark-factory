@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from orchestrator.agents.invoke import invoke_with_cap_retry
+from orchestrator.agents.invoke import invoke_agent
+from shared.cli_invoke import invoke_with_cap_retry
 from orchestrator.agents.roles import DEEP_REVIEWER
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import VerifyResult, run_full_verification
@@ -138,6 +139,7 @@ class ReviewCheckpoint:
         result = await invoke_with_cap_retry(
             usage_gate=self.usage_gate,
             label=f'Review checkpoint [{review_id}]',
+            invoke_fn=invoke_agent,
             prompt=prompt,
             system_prompt=DEEP_REVIEWER.system_prompt,
             cwd=self.config.project_root,
