@@ -224,6 +224,7 @@ def _apply_cargo_scope(
         max_per_module=mc.max_per_module,
         module_overrides=mc.module_overrides,
         verify_command_timeout_secs=mc.verify_command_timeout_secs,
+        verify_cold_command_timeout_secs=mc.verify_cold_command_timeout_secs,
         concurrent_verify=mc.concurrent_verify,
         verify_env=mc.verify_env,
         scope_cargo=mc.scope_cargo,
