@@ -508,8 +508,17 @@ async def run_verification(
         lint_cmd = config.lint_command
         type_cmd = config.type_check_command
 
-    timeout = _resolve_verify_timeout(config, module_config, is_cold=False)
+    is_cold = _is_verify_cold(worktree)
+    timeout = _resolve_verify_timeout(config, module_config, is_cold=is_cold)
     max_retries = config.verify_timeout_retries
+
+    if is_cold:
+        warm_timeout = _resolve_verify_timeout(config, module_config, is_cold=False)
+        if timeout != warm_timeout:
+            logger.info(
+                'Cold-cache verify: using %ds timeout (warm would be %ds)',
+                int(timeout), int(warm_timeout),
+            )
     concurrent = _resolve_concurrent_verify(config, module_config)
     verify_env = _resolve_verify_env(config, module_config)
 
@@ -601,6 +610,11 @@ async def run_verification(
         summary=summary,
         timed_out=timed_out,
     )
+
+    # Mark the worktree warm whenever the build completed (no pure timeout),
+    # so subsequent verifies use the faster warm timeout.
+    if not result.timed_out:
+        _mark_verify_warm(worktree)
 
     if passed:
         logger.info('Verification passed: %s', summary)
