@@ -437,11 +437,11 @@ class TestOrchestratorFilterCheckboxes:
         assert count >= 3, f'Expected at least 3 checkboxes, found {count}'
 
     def test_done_label_with_count(self, client):
-        """'Done' checkbox label shows count of done/other tasks (total minus active/pending)."""
+        """'Done/other' checkbox label shows count of done/other tasks (total minus active/pending)."""
         with _patch_orchestrator_data([MOCK_ORCHESTRATOR_RUNNING]):
             html = client.get('/partials/orchestrators').text
-        # total=5, in_progress=1, blocked=1, pending=1 → done count = 5-1-1-1 = 2
-        assert 'Done (2)' in html
+        # total=5, in_progress=1, blocked=1, pending=1 → done/other count = 5-1-1-1 = 2
+        assert 'Done/other (2)' in html
 
     def test_active_label_with_count(self, client):
         """Label for 'Active' checkbox shows in-progress + blocked count."""
