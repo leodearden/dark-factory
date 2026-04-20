@@ -298,8 +298,12 @@ class TestRunSubprocessLocalTimedOut:
         async def fake_exec(*args, **kwargs):
             return proc
 
-        with patch('orchestrator.agents.invoke.asyncio.create_subprocess_exec',
-                   side_effect=fake_exec):
+        with (
+            patch('orchestrator.agents.invoke.asyncio.create_subprocess_exec',
+                  side_effect=fake_exec),
+            patch('orchestrator.agents.invoke.terminate_process_group',
+                  new_callable=AsyncMock),
+        ):
             result = await _run_subprocess_local(
                 ['fake'], cwd=tmp_path, env={}, backend='codex', model='gpt-5.4',
                 max_budget_usd=1.0, timeout_seconds=0.1,

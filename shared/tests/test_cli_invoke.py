@@ -1172,7 +1172,10 @@ class TestRunSubprocessTimedOut:
         async def fake_exec(*args, **kwargs):
             return proc
 
-        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
+        ):
             result = await _run_subprocess(
                 ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
             )
