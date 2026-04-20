@@ -516,38 +516,27 @@ async def get_time_centiles(
 
     Returns {project_id: {p50, p75, p90, p95, count}} in milliseconds.
     Filtered to outcome=done tasks only.
+
+    Delegates raw-duration collection to :func:`_durations_by_project` so that
+    the SQL lives in a single place (shared with
+    :func:`aggregate_time_centiles`).
     """
+    durations_by_pid = await _durations_by_project(db, days=days)
 
-    async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
-        cutoffs = await _project_cutoffs(db, days)
-        if not cutoffs:
-            return {}
-
-        result: dict[str, dict] = {}
-        for project_id, cutoff in cutoffs.items():
-            rows = await db.execute_fetchall(
-                'SELECT duration_ms FROM task_results '
-                " WHERE project_id = ? AND completed_at >= ? AND outcome = 'done' "
-                ' ORDER BY duration_ms ',
-                (project_id, cutoff),
-            )
-
-            durations = [row[0] for row in rows if row[0] is not None and row[0] > 0]
-
-            if not durations:
-                result[project_id] = {
-                    'p50': 0, 'p75': 0, 'p90': 0, 'p95': 0, 'count': 0,
-                }
-                continue
-
+    result: dict[str, dict] = {}
+    for project_id, durations in durations_by_pid.items():
+        if not durations:
             result[project_id] = {
-                'p50': round(percentile(durations, 50)),
-                'p75': round(percentile(durations, 75)),
-                'p90': round(percentile(durations, 90)),
-                'p95': round(percentile(durations, 95)),
-                'count': len(durations),
+                'p50': 0, 'p75': 0, 'p90': 0, 'p95': 0, 'count': 0,
             }
+            continue
 
-        return result
+        result[project_id] = {
+            'p50': round(percentile(durations, 50)),
+            'p75': round(percentile(durations, 75)),
+            'p90': round(percentile(durations, 90)),
+            'p95': round(percentile(durations, 95)),
+            'count': len(durations),
+        }
 
-    return await with_db(db, _query, {})
+    return result
