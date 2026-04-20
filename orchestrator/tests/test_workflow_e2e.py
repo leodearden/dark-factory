@@ -2165,6 +2165,18 @@ class TestFakeSchedulerCachedStatus:
         await fake.set_task_status('x', 'done')
         assert fake.get_cached_status('x') == 'done'
 
+    @pytest.mark.asyncio
+    async def test_fake_scheduler_accepts_and_records_done_provenance(self):
+        """FakeScheduler.set_task_status records done_provenance on the instance.
+
+        Asserts that after calling set_task_status('x', 'done', done_provenance={...}),
+        fake.provenance['x'] == {'commit': 'deadbeef'}.
+        Fails until FakeScheduler signature and provenance dict are updated (step-13).
+        """
+        fake = FakeScheduler()
+        await fake.set_task_status('x', 'done', done_provenance={'commit': 'deadbeef'})
+        assert fake.provenance['x'] == {'commit': 'deadbeef'}  # type: ignore[attr-defined]
+
 
 # ---------------------------------------------------------------------------
 # Tests: _EvalScheduler.get_cached_status
