@@ -390,9 +390,8 @@ class TestPerformanceRouteMultiProject:
 
         config = DashboardConfig(project_root=main_root, known_project_roots=[peer_root])
 
-        with patch('dashboard.app.DashboardConfig.from_env', return_value=config):
-            with TestClient(app) as c:
-                html = c.get('/partials/performance').text
+        with patch('dashboard.app.DashboardConfig.from_env', return_value=config), TestClient(app) as c:
+            html = c.get('/partials/performance').text
 
         assert 'dark_factory' in html
         assert 'reify' in html

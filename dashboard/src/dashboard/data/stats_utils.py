@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 
-def percentile(sorted_values: list[float], p: float) -> float:
+def percentile(sorted_values: Sequence[float], p: float) -> float:
     """Compute the p-th percentile from a pre-sorted list.
 
     Args:

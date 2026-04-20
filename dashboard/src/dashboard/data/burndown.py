@@ -267,9 +267,9 @@ async def aggregate_burndown_projects(
     """
     if not dbs:
         return []
-    per_db: tuple[list[str], ...] = await asyncio.gather(
+    per_db: list[list[str]] = list(await asyncio.gather(
         *(get_burndown_projects(db) for db in dbs)
-    )
+    ))
     seen: set[str] = set()
     for project_list in per_db:
         seen.update(project_list)
@@ -299,15 +299,29 @@ async def aggregate_burndown_series(
     if not dbs:
         return empty
 
-    per_db: tuple[dict, ...] = await asyncio.gather(
+    per_db: list[dict] = list(await asyncio.gather(
         *(get_burndown_series(db, project_id, days=days) for db in dbs)
-    )
+    ))
 
-    # Merge by timestamp label (last-writer-wins: iterate DBs in order so that
-    # later entries overwrite earlier ones for the same timestamp key).
+    # Why last-writer-wins and not sum-of-counts (as used in performance.py /
+    # costs.py)?  Burndown values are *snapshots* of task state at an instant,
+    # not counts of independent events.  Summing two snapshots recorded at the
+    # same timestamp would double-count every task state.  In the expected
+    # deployment a single collector writes all projects to the main DB, so two
+    # distinct burndown DBs should never share a (project_id, timestamp) pair.
+    # If they do (misconfigured overlapping roots), the later DB's values win
+    # and a warning is emitted so the misconfiguration is visible in logs.
     merged: dict[str, dict[str, int]] = {}
     for series in per_db:
         for i, label in enumerate(series['labels']):
+            if label in merged:
+                logger.warning(
+                    'aggregate_burndown_series: timestamp collision for project %r '
+                    'at %r — overwriting with later DB values.  '
+                    'Check for overlapping project roots.',
+                    project_id,
+                    label,
+                )
             merged[label] = {k: series[k][i] for k in _keys}
 
     if not merged:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import aiosqlite
 import pytest
@@ -371,9 +372,8 @@ class TestTimeCentiles:
 # Helpers for aggregate tests
 # ---------------------------------------------------------------------------
 
-def _make_runs_db(tmp_path, name: str, tasks: list[tuple]) -> 'Path':
+def _make_runs_db(tmp_path, name: str, tasks: list[tuple]) -> Path:
     """Create a runs.db at tmp_path/name with provided task_results rows."""
-    from pathlib import Path
     db_path = Path(tmp_path) / name
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
@@ -405,10 +405,9 @@ def _make_runs_db(tmp_path, name: str, tasks: list[tuple]) -> 'Path':
 
 
 def _make_escalations_dir(tmp_path, name: str,
-                          esc_list: list[dict]) -> 'Path':
+                          esc_list: list[dict]) -> Path:
     """Create an escalations directory with JSON files."""
     import json as _json
-    from pathlib import Path
     esc_dir = Path(tmp_path) / name
     esc_dir.mkdir(parents=True, exist_ok=True)
     for i, esc in enumerate(esc_list):

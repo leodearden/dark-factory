@@ -515,14 +515,7 @@ async def partials_performance(request: Request):
     """Render the performance panel partial (htmx fragment)."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    dbs = await _cost_dbs(config, pool)
-
-    # Build matching escalations_dirs list (same dedup order as _cost_dbs).
-    esc_dirs = [config.escalations_dir]
-    for root in config.known_project_roots:
-        peer_dir = root / 'data' / 'escalations'
-        if peer_dir.resolve() != config.escalations_dir.resolve():
-            esc_dirs.append(peer_dir)
+    dbs, esc_dirs = await _performance_resources(config, pool)
 
     paths_r, esc_r, hist_r, ttc_r = await asyncio.gather(
         aggregate_completion_paths(dbs, esc_dirs),
@@ -547,18 +540,70 @@ async def partials_performance(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Costs partials
+# Multi-project DB helpers
 # ---------------------------------------------------------------------------
 
 
-async def _cost_dbs(config: DashboardConfig, pool: DbPool) -> list[aiosqlite.Connection | None]:
-    """Collect DB connections for all known project runs.db files."""
-    paths = [config.runs_db]
+async def _project_scoped_dbs(
+    config: DashboardConfig,
+    pool: DbPool,
+    rel_path: Path,
+) -> list[aiosqlite.Connection | None]:
+    """Return DB connections for a project-scoped file across all known roots.
+
+    Deduplicates by resolved project root.  ``DashboardConfig.__post_init__``
+    guarantees that both ``project_root`` and every entry in
+    ``known_project_roots`` are already resolved, so a simple set-membership
+    check on the root path is sufficient and consistent.  Using the root as the
+    dedup key (rather than the resolved target of an individual file) prevents
+    any mismatch between parallel lists built from the same root set.
+    """
+    seen: set[Path] = {config.project_root}
+    paths: list[Path] = [config.project_root / rel_path]
     for root in config.known_project_roots:
-        p = root / 'data' / 'orchestrator' / 'runs.db'
-        if p.resolve() != config.runs_db.resolve():
-            paths.append(p)
+        if root not in seen:
+            seen.add(root)
+            paths.append(root / rel_path)
     return [await pool.get(p) for p in paths]
+
+
+async def _cost_dbs(
+    config: DashboardConfig,
+    pool: DbPool,
+) -> list[aiosqlite.Connection | None]:
+    """Collect DB connections for all known project runs.db files (costs and performance)."""
+    return await _project_scoped_dbs(config, pool, Path('data/orchestrator/runs.db'))
+
+
+async def _performance_resources(
+    config: DashboardConfig,
+    pool: DbPool,
+) -> tuple[list[aiosqlite.Connection | None], list[Path]]:
+    """Return ``(dbs, esc_dirs)`` for the performance panel.
+
+    Both lists are built in a single pass over all known project roots (the
+    main root first, then each entry in ``config.known_project_roots``), with
+    deduplication on the resolved project root.  This guarantees
+    ``len(dbs) == len(esc_dirs)`` regardless of how individual DB files or
+    escalation directories happen to resolve — preventing a ``ValueError`` from
+    ``zip(strict=True)`` inside the ``aggregate_*`` functions when two roots
+    share a DB file (e.g. via symlink) but have distinct escalation dirs.
+    """
+    seen: set[Path] = {config.project_root}
+    run_paths: list[Path] = [config.runs_db]
+    esc_dirs: list[Path] = [config.escalations_dir]
+    for root in config.known_project_roots:
+        if root not in seen:
+            seen.add(root)
+            run_paths.append(root / 'data' / 'orchestrator' / 'runs.db')
+            esc_dirs.append(root / 'data' / 'escalations')
+    dbs = [await pool.get(p) for p in run_paths]
+    return dbs, esc_dirs
+
+
+# ---------------------------------------------------------------------------
+# Costs partials
+# ---------------------------------------------------------------------------
 
 
 @app.get('/costs/partials/summary')
@@ -743,18 +788,12 @@ async def partials_merge_queue(request: Request):
 # ---------------------------------------------------------------------------
 
 
-async def _burndown_dbs(config: DashboardConfig, pool: DbPool) -> list[aiosqlite.Connection | None]:
-    """Collect DB connections for all known project burndown.db files.
-
-    Mirrors ``_cost_dbs``: starts from the main burndown_db, then appends each
-    known_project_root's burndown.db (dedup by resolved path).
-    """
-    paths = [config.burndown_db]
-    for root in config.known_project_roots:
-        p = root / 'data' / 'burndown' / 'burndown.db'
-        if p.resolve() != config.burndown_db.resolve():
-            paths.append(p)
-    return [await pool.get(p) for p in paths]
+async def _burndown_dbs(
+    config: DashboardConfig,
+    pool: DbPool,
+) -> list[aiosqlite.Connection | None]:
+    """Collect DB connections for all known project burndown.db files."""
+    return await _project_scoped_dbs(config, pool, Path('data/burndown/burndown.db'))
 
 
 @app.get('/burndown/partials/charts')

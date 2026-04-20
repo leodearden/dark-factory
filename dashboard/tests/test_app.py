@@ -1185,3 +1185,108 @@ class TestParseWindowDefault:
         assert _parse_window(req) == 30, (
             "_parse_window() with an unknown value should fall back to 30 (new default)"
         )
+
+
+class TestPerformanceResources:
+    """Tests for _performance_resources — ensures dbs and esc_dirs are always in lock-step.
+
+    The old implementation built the two lists with independent dedup criteria
+    (runs.db resolved path vs escalations_dir resolved path).  If a peer root
+    had a runs.db symlinked to the main DB but a distinct escalations dir, the
+    lists would have different lengths and zip(strict=True) inside the aggregate
+    functions would raise ValueError (a 500 for the Performance panel).
+
+    The new implementation deduplicates on the project root itself (which
+    DashboardConfig.__post_init__ already resolves), so both lists are always
+    constructed in lock-step and have the same length.
+    """
+
+    @pytest.mark.asyncio
+    async def test_single_root_returns_length_one(self, tmp_path):
+        """Single project root with no known peers → lists of length 1."""
+        from dashboard.app import _performance_resources
+        from dashboard.config import DashboardConfig
+
+        config = DashboardConfig(project_root=tmp_path)
+        mock_pool = MagicMock()
+        mock_pool.get = AsyncMock(return_value=None)
+
+        dbs, esc_dirs = await _performance_resources(config, mock_pool)
+
+        assert len(dbs) == 1
+        assert len(esc_dirs) == 1
+
+    @pytest.mark.asyncio
+    async def test_two_distinct_roots_returns_length_two(self, tmp_path):
+        """Two distinct project roots → both lists have length 2."""
+        from dashboard.app import _performance_resources
+        from dashboard.config import DashboardConfig
+
+        peer_root = tmp_path / 'peer'
+        peer_root.mkdir()
+        config = DashboardConfig(project_root=tmp_path, known_project_roots=[peer_root])
+        mock_pool = MagicMock()
+        mock_pool.get = AsyncMock(return_value=None)
+
+        dbs, esc_dirs = await _performance_resources(config, mock_pool)
+
+        assert len(dbs) == len(esc_dirs) == 2
+
+    @pytest.mark.asyncio
+    async def test_peer_root_same_as_main_deduplicated(self, tmp_path):
+        """Peer root identical to main root → deduplicated to length 1."""
+        from dashboard.app import _performance_resources
+        from dashboard.config import DashboardConfig
+
+        # DashboardConfig resolves known_project_roots so passing the same path
+        # produces an equal resolved Path — dedup excludes the duplicate.
+        config = DashboardConfig(project_root=tmp_path, known_project_roots=[tmp_path])
+        mock_pool = MagicMock()
+        mock_pool.get = AsyncMock(return_value=None)
+
+        dbs, esc_dirs = await _performance_resources(config, mock_pool)
+
+        assert len(dbs) == len(esc_dirs) == 1
+
+    @pytest.mark.asyncio
+    async def test_peer_with_symlinked_runs_db_no_length_mismatch(self, tmp_path):
+        """Peer root whose runs.db symlinks to main's runs.db → lists stay in lock-step.
+
+        Regression test for the latent bug in the original per-path dedup:
+        if peer.runs_db.resolve() == main.runs_db.resolve() but
+        peer.escalations_dir is distinct, the old code would exclude the peer
+        from dbs (dedup on DB path) but include it in esc_dirs (dedup on
+        escalation-dir path), causing len(dbs) != len(esc_dirs) and a
+        zip(strict=True) ValueError in aggregate_completion_paths.
+
+        With root-based dedup (peer_root != main_root → both included),
+        len(dbs) == len(esc_dirs) always holds.
+        """
+        from dashboard.app import _performance_resources
+        from dashboard.config import DashboardConfig
+
+        # Set up main root with a real runs.db
+        main_root = tmp_path / 'main'
+        (main_root / 'data' / 'orchestrator').mkdir(parents=True)
+        main_runs_db = main_root / 'data' / 'orchestrator' / 'runs.db'
+        main_runs_db.write_bytes(b'')
+
+        # Set up peer root with runs.db symlinked to main's runs.db
+        peer_root = tmp_path / 'peer'
+        (peer_root / 'data' / 'orchestrator').mkdir(parents=True)
+        (peer_root / 'data' / 'escalations').mkdir(parents=True)
+        (peer_root / 'data' / 'orchestrator' / 'runs.db').symlink_to(main_runs_db)
+
+        config = DashboardConfig(project_root=main_root, known_project_roots=[peer_root])
+        mock_pool = MagicMock()
+        mock_pool.get = AsyncMock(return_value=None)
+
+        dbs, esc_dirs = await _performance_resources(config, mock_pool)
+
+        # Primary assertion: lengths must always match regardless of symlink topology
+        assert len(dbs) == len(esc_dirs), (
+            f'len(dbs)={len(dbs)} != len(esc_dirs)={len(esc_dirs)}: '
+            'root-based dedup must keep both lists in sync'
+        )
+        # With root-based dedup, peer_root != main_root so both are included
+        assert len(dbs) == 2
