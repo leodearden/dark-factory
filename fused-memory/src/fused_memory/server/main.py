@@ -117,10 +117,13 @@ async def run_server():
         from fused_memory.backends.taskmaster_client import TaskmasterBackend
 
         taskmaster = TaskmasterBackend(config.taskmaster)
+        # Wire the backend into memory_service before initialize() so
+        # get_status reports an accurate connection state even if the
+        # first initialize fails. is_alive() will probe the live session.
+        memory_service.taskmaster = taskmaster
         try:
             await taskmaster.initialize()
             logger.info(f'  Taskmaster: connected via {config.taskmaster.transport}')
-            memory_service.taskmaster_connected = True
         except Exception as e:
             logger.warning(f'  Taskmaster: failed to connect ({e}), will retry on next tool call')
 

@@ -40,6 +40,7 @@ from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.utils.async_utils import propagate_cancellations
 
 if TYPE_CHECKING:
+    from fused_memory.backends.taskmaster_client import TaskmasterBackend
     from fused_memory.reconciliation.event_buffer import EventBuffer
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
     from fused_memory.services.write_journal import WriteJournal
@@ -77,7 +78,7 @@ class MemoryService:
         self.durable_queue: DurableWriteQueue | None = None
         self._event_buffer: EventBuffer | None = None
         self._write_journal: WriteJournal | None = None
-        self.taskmaster_connected: bool = False
+        self.taskmaster: TaskmasterBackend | None = None
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
 
     def set_event_buffer(self, buffer: EventBuffer) -> None:
@@ -1636,8 +1637,17 @@ class MemoryService:
             except Exception as e:
                 status['queue'] = {'error': str(e)}
 
-        # Taskmaster status (unchanged)
-        status['taskmaster'] = {'connected': self.taskmaster_connected}
+        # Taskmaster liveness — live no-op probe via the backend, short TTL
+        # cache inside ``is_alive`` keeps the recon hot path cheap.
+        taskmaster_status: dict[str, Any]
+        if self.taskmaster is not None:
+            alive, err = await self.taskmaster.is_alive()
+            taskmaster_status = {'connected': alive}
+            if err:
+                taskmaster_status['error'] = err
+        else:
+            taskmaster_status = {'connected': False, 'error': 'not configured'}
+        status['taskmaster'] = taskmaster_status
 
         return status
 

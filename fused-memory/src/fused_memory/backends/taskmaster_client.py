@@ -9,19 +9,44 @@ import time
 from pathlib import Path
 from typing import Any
 
+import anyio
+import httpx
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.types import TextContent
+from mcp.shared.exceptions import McpError
+from mcp.types import CONNECTION_CLOSED, TextContent
 
 from fused_memory.config.schema import TaskmasterConfig
 
 logger = logging.getLogger(__name__)
 
 
+# MCP session maps TimeoutError to an McpError with this HTTP-style code
+# (see mcp/shared/session.py:296).
+_REQUEST_TIMEOUT_CODE = int(httpx.codes.REQUEST_TIMEOUT)
+
+# Transport-level exception classes that mean the stdio session is dead
+# and should be torn down so ensure_connected() can reconnect.
+_TRANSPORT_DEAD_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    BrokenPipeError,
+    ConnectionError,
+    EOFError,
+    OSError,
+    anyio.ClosedResourceError,
+    anyio.BrokenResourceError,
+)
+
+
 class TaskmasterBackend:
     """Connects to Taskmaster's MCP server and proxies tool calls."""
 
-    def __init__(self, config: TaskmasterConfig, reconnect_cooldown_seconds: float = 30.0):
+    def __init__(
+        self,
+        config: TaskmasterConfig,
+        reconnect_cooldown_seconds: float = 30.0,
+        alive_cache_ttl_seconds: float = 2.0,
+        probe_timeout_seconds: float = 2.0,
+    ):
         self.config = config
         self.reconnect_cooldown_seconds = reconnect_cooldown_seconds
         self._session: ClientSession | None = None
@@ -29,6 +54,10 @@ class TaskmasterBackend:
         self._session_ctx = None
         self._last_reconnect_attempt: float = 0.0
         self._reconnect_lock = asyncio.Lock()
+        self._alive_cache_ttl_seconds = alive_cache_ttl_seconds
+        self._probe_timeout_seconds = probe_timeout_seconds
+        # (alive, error_msg, monotonic_timestamp)
+        self._alive_cache: tuple[bool, str | None, float] | None = None
 
     @property
     def connected(self) -> bool:
@@ -130,8 +159,18 @@ class TaskmasterBackend:
         session = self._require_session()
         try:
             result = await session.call_tool(name, arguments)
-        except (BrokenPipeError, ConnectionError, EOFError, OSError):
+        except _TRANSPORT_DEAD_EXCEPTIONS:
             await self._cleanup_contexts()
+            raise
+        except McpError as exc:
+            # Connection-closed and request-timeout live at the transport
+            # layer even though they arrive wrapped in McpError — tear down
+            # so the next mutating call can reconnect. Tool-level errors
+            # (INTERNAL_ERROR, INVALID_PARAMS, …) mean the proxy is alive
+            # and must pass through unchanged.
+            code = getattr(getattr(exc, 'error', None), 'code', None)
+            if code in (CONNECTION_CLOSED, _REQUEST_TIMEOUT_CODE):
+                await self._cleanup_contexts()
             raise
         # MCP tool results come as content blocks
         if result.content:
@@ -144,6 +183,49 @@ class TaskmasterBackend:
             except (json.JSONDecodeError, ValueError):
                 return {'text': combined}
         return {}
+
+    async def is_alive(self) -> tuple[bool, str | None]:
+        """Report whether the Taskmaster proxy is live right now.
+
+        Result is cached briefly (``_alive_cache_ttl_seconds``) so recon hot
+        paths don't stdio-round-trip on every get_status call.
+
+        On failure, ``call_tool``'s except branch tears down the session so
+        the next mutating call can reconnect via ``ensure_connected``.
+        ``is_alive`` itself is read-only and does not attempt reconnect.
+        """
+        now = time.monotonic()
+        if self._alive_cache is not None:
+            cached_alive, cached_err, cached_at = self._alive_cache
+            if now - cached_at < self._alive_cache_ttl_seconds:
+                return cached_alive, cached_err
+
+        result: tuple[bool, str | None]
+        if self._session is None:
+            result = (False, 'not connected')
+        else:
+            try:
+                with anyio.fail_after(self._probe_timeout_seconds):
+                    await self.call_tool(
+                        'get_tasks', {'projectRoot': self.config.project_root},
+                    )
+                result = (True, None)
+            except McpError as exc:
+                # Transport-level McpError (CONNECTION_CLOSED / REQUEST_TIMEOUT)
+                # means call_tool already tore down the session — report
+                # dead. Any other McpError is a tool-level response (e.g.
+                # project not found, invalid params) which proves the proxy
+                # is alive.
+                code = getattr(getattr(exc, 'error', None), 'code', None)
+                if code in (CONNECTION_CLOSED, _REQUEST_TIMEOUT_CODE):
+                    result = (False, f'McpError: {exc}')
+                else:
+                    result = (True, None)
+            except Exception as exc:
+                result = (False, f'{type(exc).__name__}: {exc}')
+
+        self._alive_cache = (result[0], result[1], now)
+        return result
 
     # ── Convenience methods ────────────────────────────────────────────
 
