@@ -515,6 +515,7 @@ async def run_verification(
     *,
     allow_cold_cache: bool = True,
     max_retries: int | None = None,
+    is_merge_verify: bool = False,
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
 
@@ -535,6 +536,17 @@ async def run_verification(
     used.  Useful for review-checkpoint or eval callers that pass arbitrary
     paths which may happen to contain a ``.task/`` directory.  Defaults to
     ``True`` (auto-detect from filesystem).
+
+    When *is_merge_verify* is ``True`` the verify is treated as always cold,
+    regardless of filesystem state (merge worktrees are freshly created per
+    merge — no ``.task/`` dir, but also no warm build cache — and so the
+    ``_is_verify_cold`` filesystem heuristic mis-classifies them as warm).
+    This bypasses ``_is_verify_cold`` entirely and uses the cold-track timeout
+    cascade (``verify_cold_command_timeout_secs``).  Also implies
+    ``allow_cold_cache=True`` semantics for the timeout; the warm marker is
+    NOT written on success because merge worktrees are ephemeral.  Defaults
+    to ``False`` for all non-merge callers so existing cold-detection
+    behaviour is preserved.
     """
     if module_config is not None:
         # Scoped: use module command; None → skip
@@ -548,7 +560,15 @@ async def run_verification(
         type_cmd = config.type_check_command
 
     module_prefix = module_config.prefix if module_config is not None else None
-    is_cold = _is_verify_cold(worktree, module_prefix) if allow_cold_cache else False
+    if is_merge_verify:
+        # Merge worktrees are freshly created per merge — cargo caches are
+        # cold and the ``.task/`` marker is absent — so the filesystem
+        # heuristic mis-classifies them as warm.  Force cold semantics.
+        is_cold = True
+    elif allow_cold_cache:
+        is_cold = _is_verify_cold(worktree, module_prefix)
+    else:
+        is_cold = False
     timeout = _resolve_verify_timeout(config, module_config, is_cold=is_cold)
     if max_retries is None:
         max_retries = config.verify_timeout_retries
@@ -656,7 +676,11 @@ async def run_verification(
     # so subsequent verifies use the faster warm timeout.  The marker is
     # per-subproject (keyed by module_prefix) so a concurrent sibling
     # subproject that times out remains cold on the next attempt.
-    if not result.timed_out:
+    # Skip the marker for merge-queue verifies: merge worktrees are
+    # ephemeral (cleaned up right after), and their `.task/` dir is absent
+    # anyway — `_mark_verify_warm` would be a no-op, but the skip keeps the
+    # intent explicit.
+    if not result.timed_out and not is_merge_verify:
         _mark_verify_warm(worktree, module_prefix)
 
     if passed:
@@ -739,6 +763,7 @@ async def run_scoped_verification(
     task_files: list[str] | None = None,
     *,
     max_retries: int | None = None,
+    is_merge_verify: bool = False,
 ) -> VerifyResult:
     """Run verification scoped to specific subprojects and optionally to task files.
 
@@ -757,6 +782,12 @@ async def run_scoped_verification(
     *max_retries* overrides ``config.verify_timeout_retries`` for this call;
     pass ``0`` from the merge-queue path so a deterministic hang doesn't
     triple the stall.
+
+    *is_merge_verify* is forwarded unchanged to every :func:`run_verification`
+    call.  Merge worktrees are freshly created (no warm cargo cache) but lack
+    ``.task/``, which would otherwise misclassify them as warm via
+    :func:`_is_verify_cold`.  Set this to ``True`` from the merge-queue
+    call sites so post-merge verifies get the cold timeout.
     """
     scope_cargo_enabled = config.scope_cargo
 
@@ -790,6 +821,7 @@ async def run_scoped_verification(
                 )
                 return await run_verification(
                     worktree, config, max_retries=max_retries,
+                    is_merge_verify=is_merge_verify,
                 )
             # Rewrite cargo --workspace → cargo -p <crate> when all task files
             # are .rs and map to known workspace crates.
@@ -804,7 +836,14 @@ async def run_scoped_verification(
             scoped = module_configs
             logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
         results = await asyncio.gather(
-            *(run_verification(worktree, config, mc, max_retries=max_retries) for mc in scoped)
+            *(
+                run_verification(
+                    worktree, config, mc,
+                    max_retries=max_retries,
+                    is_merge_verify=is_merge_verify,
+                )
+                for mc in scoped
+            )
         )
         return _aggregate_results(list(results))
 
@@ -820,6 +859,7 @@ async def run_scoped_verification(
             logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
             return await run_verification(
                 worktree, config, fallback, max_retries=max_retries,
+                is_merge_verify=is_merge_verify,
             )
 
         # For Rust projects with no module_configs and no Python fallback
@@ -841,7 +881,11 @@ async def run_scoped_verification(
                 )
                 return await run_verification(
                     worktree, config, rewritten, max_retries=max_retries,
+                    is_merge_verify=is_merge_verify,
                 )
 
     logger.info('Verification mode: global (no scope info)')
-    return await run_verification(worktree, config, max_retries=max_retries)
+    return await run_verification(
+        worktree, config, max_retries=max_retries,
+        is_merge_verify=is_merge_verify,
+    )
