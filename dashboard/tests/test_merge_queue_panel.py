@@ -257,7 +257,7 @@ class TestMergeQueueTimeWindow:
             assert hours == 720
 
     def test_default_window_forwards_hours_168(self, client):
-        """No window param → default 7d → 168 hours."""
+        """No window param → default 30d → 720 hours (changed 7d→30d, task 841 UX fix)."""
         with patch('dashboard.app.aggregate_queue_depth_timeseries',
                    new_callable=AsyncMock,
                    return_value=MOCK_DEPTH) as mock_depth, \
@@ -271,7 +271,7 @@ class TestMergeQueueTimeWindow:
                    new_callable=AsyncMock, return_value=MOCK_SPEC):
             client.get('/partials/merge-queue')
             hours = mock_depth.call_args.kwargs.get('hours')
-            assert hours == 168
+            assert hours == 720
 
 
 # ---------------------------------------------------------------------------

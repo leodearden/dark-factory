@@ -2,6 +2,15 @@
 
 Queries the write_journal.db for time-series and breakdown data used by
 the memory graphs section of the dashboard.
+
+**Why no multi-DB aggregation here (task 841):**
+``write_journal.db`` is written exclusively by the fused-memory server, which
+is a single-host singleton process.  There is exactly *one* write-journal DB
+per host.  The ``write_ops`` table already carries a ``project_id`` column, so
+the DB is multi-project by construction — every project's memory writes land in
+the same DB.  The existing queries aggregate across all projects intentionally;
+per-project filtering is intentionally out of scope.  Task 841 evaluated
+whether multi-DB aggregation applied here and concluded it is moot.
 """
 
 from __future__ import annotations

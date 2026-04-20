@@ -76,12 +76,12 @@ class TestParseWindow:
     def test_missing_defaults_to_7(self):
         from dashboard.app import _parse_window
         req = self._make_request(None)
-        assert _parse_window(req) == 7
+        assert _parse_window(req) == 30  # default changed 7d→30d (task 841 UX fix)
 
     def test_invalid_defaults_to_7(self):
         from dashboard.app import _parse_window
         req = self._make_request('invalid')
-        assert _parse_window(req) == 7
+        assert _parse_window(req) == 30  # default changed 7d→30d (task 841 UX fix)
 
     def test_returns_int(self):
         from dashboard.app import _parse_window
@@ -164,10 +164,10 @@ class TestCostsPage:
         assert 'border-blue-500' in html
 
     def test_default_window_7d_marked_active(self, client):
-        """Without ?window=, the 7d button should be visually active."""
+        """Without ?window=, the 30d button should be visually active (7d→30d, task 841 UX fix)."""
         html = client.get('/costs').text
-        # The page must indicate 7d is the default/active window via Alpine.store init
-        assert "Alpine.store('costs', { window: \"7d\" })" in html
+        # The page must indicate 30d is the default/active window via Alpine.store init
+        assert "Alpine.store('costs', { window: \"30d\" })" in html
 
 
 # ---------------------------------------------------------------------------
@@ -245,11 +245,11 @@ class TestCostsSummaryPartial:
         assert kwargs.get('days') == 1
 
     def test_default_window_7d(self, client):
-        """Without ?window=, days=7 should be used."""
+        """Without ?window=, days=30 should be used (7d→30d, task 841 UX fix)."""
         with _patch_summary() as mock_fn:
             client.get('/costs/partials/summary')
         _, kwargs = mock_fn.call_args
-        assert kwargs.get('days') == 7
+        assert kwargs.get('days') == 30
 
 
 # ---------------------------------------------------------------------------
@@ -731,11 +731,11 @@ class TestWindowSelectorIntegration:
         assert kwargs.get('days') == 3650
 
     def test_invalid_window_defaults_to_7(self, client):
-        """Invalid ?window=bogus → days=7 (default) for any partial."""
+        """Invalid ?window=bogus → days=30 (new default) for any partial (task 841 UX fix)."""
         with _patch_summary() as mock_fn:
             client.get('/costs/partials/summary?window=bogus')
         _, kwargs = mock_fn.call_args
-        assert kwargs.get('days') == 7
+        assert kwargs.get('days') == 30
 
 
 # ---------------------------------------------------------------------------
@@ -938,10 +938,10 @@ class TestAlpineV3StorePattern:
         assert "alpine:init" in html
 
     def test_store_default_window_7d(self, client):
-        """The store initialization must default to '7d'."""
+        """The store initialization must default to '30d' (changed 7d→30d, task 841 UX fix)."""
         html = client.get('/costs').text
-        # The store init should embed the window value; default is 7d
-        assert "'7d'" in html or '"7d"' in html
+        # The store init should embed the window value; default is now 30d
+        assert "'30d'" in html or '"30d"' in html
 
 
 # ---------------------------------------------------------------------------

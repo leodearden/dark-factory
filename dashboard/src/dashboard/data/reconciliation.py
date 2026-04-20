@@ -3,6 +3,16 @@
 Each function accepts an optional ``aiosqlite.Connection`` (from the shared
 :class:`DbPool`) and returns structured data.  A ``None`` connection is
 treated as "database unavailable" and returns the declared default.
+
+**Why no multi-DB aggregation here (task 841):**
+``reconciliation.db`` is written exclusively by the fused-memory server, which
+is a single-host singleton process.  There is exactly *one* reconciliation DB
+per host — not one per project root.  The DB is already multi-project by
+construction: the ``watermarks``, ``runs``, and ``event_buffer`` tables all
+carry a ``project_id`` column, so every query already surfaces all projects
+without any cross-DB union.  Aggregating across multiple copies of this DB
+would be meaningless (no peer copies exist).  Task 841 verified this
+explicitly and concluded aggregation is moot for this module.
 """
 
 from __future__ import annotations

@@ -590,7 +590,7 @@ class TestTimeWindow:
         ) as mock_fn:
             client.get('/costs/partials/summary')
         _, kwargs = mock_fn.call_args
-        assert kwargs.get('days') == 7
+        assert kwargs.get('days') == 30  # default changed 7d→30d (task 841 UX fix)
 
     def test_trend_24h_calls_with_days_1(self, client):
         with patch(
@@ -611,7 +611,7 @@ class TestTimeWindow:
         ) as mock_fn:
             client.get('/costs/partials/trend')
         _, kwargs = mock_fn.call_args
-        assert kwargs.get('days') == 7
+        assert kwargs.get('days') == 30  # default changed 7d→30d (task 841 UX fix)
 
     def test_summary_30d_calls_with_days_30(self, client):
         with patch(
