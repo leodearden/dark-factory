@@ -63,7 +63,8 @@ This call blocks until the merge worker processes your request. It may take a fe
 The tool returns `{ status, reason, conflict_details }`. Handle each status:
 
 **`done`** — Merge succeeded. Main has been advanced atomically.
-- Update the task: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>")`
+- Update the task: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"commit": "<merge-commit-sha>"})`
+  - Use `{"commit": "<sha>"}` when a landing commit on main contains the work (the normal case — the merge tool's return value has the merge SHA). Use `{"note": "<one-sentence explanation>"}` for covered-by-sibling / fast-forward cases where no single commit applies.
 - Clean up worktree and branch:
   ```bash
   git worktree remove .worktrees/<TASK_ID>
