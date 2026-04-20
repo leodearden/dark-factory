@@ -300,7 +300,13 @@ class Scheduler:
             logger.error(f'Failed to fetch tasks: {e}')
         return []
 
-    async def set_task_status(self, task_id: str, status: str) -> None:
+    async def set_task_status(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        done_provenance: dict | None = None,
+    ) -> None:
         """Update task status via fused-memory."""
         cached = self.get_cached_status(task_id)
         if not is_valid_transition(cached, status):
@@ -309,16 +315,19 @@ class Scheduler:
             )
             return
         try:
+            arguments: dict = {
+                'id': task_id,
+                'status': status,
+                'project_root': self._project_root,
+            }
+            if done_provenance is not None:
+                arguments['done_provenance'] = done_provenance
             await mcp_call(
                 f'{self._memory_url}/mcp',
                 'tools/call',
                 {
                     'name': 'set_task_status',
-                    'arguments': {
-                        'id': task_id,
-                        'status': status,
-                        'project_root': self._project_root,
-                    },
+                    'arguments': arguments,
                 },
                 timeout=15,
             )
