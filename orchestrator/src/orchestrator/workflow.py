@@ -2217,6 +2217,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         Inspects .task/iterations.jsonl for implementer/debugger entries.
         Planning-only runs don't write these, so absence means stale branch
         point rather than a legitimately merged prior run.
+
+        Correctness assumption: worktrees are always created fresh per task run.
+        If .task/iterations.jsonl were ever carried across a worktree recreation
+        (e.g. worktree reuse on the same branch), this guard could incorrectly
+        return True for an empty branch and reintroduce the false-done path.
+        Any future change to create_worktree that enables reuse must revisit here.
         """
         if self.artifacts is None:
             return False
@@ -2403,13 +2409,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                                 wt_head.strip(), main_sha,
                             ):
                                 if not self._has_prior_implementation():
+                                    _base = (
+                                        self.artifacts.read_base_commit()
+                                        if self.artifacts else None
+                                    )
+                                    _entries, _ = (
+                                        self.artifacts.read_iteration_log()
+                                        if self.artifacts else ([], [])
+                                    )
                                     logger.warning(
                                         'Task %s: branch HEAD %s is ancestor '
                                         'of main %s but no implementation '
-                                        'entries — proceeding with requeue',
+                                        'entries (base=%s, entries=%d) — '
+                                        'proceeding with requeue',
                                         self.task_id,
                                         wt_head.strip()[:8],
                                         main_sha[:8],
+                                        _base[:8] if _base else 'none',
+                                        len(_entries),
                                     )
                                 else:
                                     logger.info(

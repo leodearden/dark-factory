@@ -1559,6 +1559,36 @@ def _build_workflow_with_escalation(
     return workflow, scheduler, queue
 
 
+def _build_workflow_no_merge_worker(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    assignment: TaskAssignment,
+    agent_stub: AgentStub,  # noqa: ARG001
+    tmp_path: Path,
+) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
+    """Like _build_workflow_with_escalation but without spawning a MergeWorker task.
+
+    Use this in tests that exercise _mark_blocked directly and never enqueue merge
+    work — omitting asyncio.create_task(worker.run()) avoids the 'Task was destroyed
+    but it is pending!' warning that leaks into the pytest event-loop teardown.
+    """
+    scheduler = FakeScheduler()
+    queue_dir = tmp_path / 'escalation_queue'
+    queue = EscalationQueue(queue_dir)
+    merge_queue: asyncio.Queue = asyncio.Queue()
+    workflow = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=scheduler,  # type: ignore[arg-type]
+        briefing=FakeBriefing(),  # type: ignore[arg-type]
+        mcp=FakeMcp(),  # type: ignore[arg-type]
+        escalation_queue=queue,
+        merge_queue=merge_queue,
+    )
+    return workflow, scheduler, queue
+
+
 def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
     """Return a steward class that resolves all pending L0 escalations in start().
 
@@ -2290,8 +2320,9 @@ class TestMarkBlockedFalseDoneGuard:
 
         # 2. Build workflow with escalation queue, wire up worktree and artifacts
         #    (no iterations.jsonl → _has_prior_implementation() returns False)
+        #    Use the no-merge-worker variant to avoid leaking the MergeWorker task.
         stub = AgentStub()
-        workflow, scheduler, queue = _build_workflow_with_escalation(
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
             config, git_ops, task_assignment, stub, tmp_path,
         )
         workflow.worktree = wt
@@ -2353,8 +2384,9 @@ class TestMarkBlockedFalseDoneGuard:
 
         # 3. Build workflow with escalation queue, wire up worktree and artifacts
         #    (has implementer iteration entry → _has_prior_implementation() returns True)
+        #    Use the no-merge-worker variant to avoid leaking the MergeWorker task.
         stub = AgentStub()
-        workflow, scheduler, queue = _build_workflow_with_escalation(
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
             config, git_ops, task_assignment, stub, tmp_path,
         )
         workflow.worktree = wt
@@ -2394,8 +2426,9 @@ class TestMarkBlockedFalseDoneGuard:
         wt = wt_info.path
 
         # 2. Build workflow, wire up worktree and artifacts
+        #    Use the no-merge-worker variant to avoid leaking the MergeWorker task.
         stub = AgentStub()
-        workflow, scheduler, queue = _build_workflow_with_escalation(
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
             config, git_ops, task_assignment, stub, tmp_path,
         )
         workflow.worktree = wt
