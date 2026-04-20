@@ -13,12 +13,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from shared.cli_invoke import invoke_with_cap_retry
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
 
 from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
 from orchestrator.agents.invoke import AgentResult, invoke_agent
-from shared.cli_invoke import invoke_with_cap_retry
 from orchestrator.agents.roles import (
     ALL_REVIEWERS,
     ARCHITECT,
@@ -2257,12 +2257,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """
         summary = f'plan.json overwrite detected for task {self.task_id}'
         foreign_session = ''
-        try:
-            plan_path = self.artifacts.root / 'plan.json'
-            data = json.loads(plan_path.read_text())
-            foreign_session = data.get('_session_id') or ''
-        except Exception:
-            pass
+        if self.artifacts is not None:
+            try:
+                plan_path = self.artifacts.root / 'plan.json'
+                data = json.loads(plan_path.read_text())
+                foreign_session = data.get('_session_id') or ''
+            except Exception:
+                pass
 
         if not foreign_session:
             detail = (

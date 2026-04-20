@@ -26,11 +26,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-try:
-    from dotenv import load_dotenv
-except ImportError:  # pragma: no cover — python-dotenv is optional
-    def load_dotenv(*args, **kwargs) -> bool:  # type: ignore[misc]
-        return False
+from dotenv import load_dotenv
 
 from shared.config_dir import TaskConfigDir
 from shared.config_models import UsageCapConfig

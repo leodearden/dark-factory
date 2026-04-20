@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -143,9 +143,11 @@ class TestAuthReprobeReReadsEnv:
         gate._accounts[0].auth_failed = True
         gate._accounts[0].auth_failed_at = datetime.now(UTC)
 
-        with patch('shared.usage_gate.load_dotenv') as mock_load:
-            with patch.dict(os.environ, {env_var: 'new-token'}, clear=False):
-                await gate._reprobe_account(gate._accounts[0])
+        with (
+            patch('shared.usage_gate.load_dotenv') as mock_load,
+            patch.dict(os.environ, {env_var: 'new-token'}, clear=False),
+        ):
+            await gate._reprobe_account(gate._accounts[0])
 
         mock_load.assert_called_once()
         # load_dotenv is called with override=True
