@@ -1988,3 +1988,53 @@ class TestAggregateBurndownSeries:
         result = await aggregate_burndown_series([None, None], 'proj_a', days=30)
         assert result['labels'] == []
         assert result['done'] == []
+
+    @pytest.mark.asyncio
+    async def test_multiple_collisions_emit_single_summary_warning(self, tmp_path, caplog):
+        """Multiple timestamp collisions across two DBs emit exactly ONE WARNING summary.
+
+        Current code (before the fix) emits one warning per collision, so with 3
+        colliding timestamps there are 3 WARNING records.  After the fix, one
+        aggregated record with the collision count should appear.
+        """
+        ts1 = _recent_ts(offset_seconds=300)
+        ts2 = _recent_ts(offset_seconds=200)
+        ts3 = _recent_ts(offset_seconds=100)
+
+        # Both DBs have the same three timestamps for 'proj_a' — 3 collisions.
+        db1_path = _make_burndown_db_with_series(
+            tmp_path / 'db1', 'b.db', 'proj_a',
+            [(ts1, 1, 0, 0, 0, 0, 0), (ts2, 2, 0, 0, 0, 0, 0), (ts3, 3, 0, 0, 0, 0, 0)],
+        )
+        db2_path = _make_burndown_db_with_series(
+            tmp_path / 'db2', 'b.db', 'proj_a',
+            [(ts1, 10, 0, 0, 0, 0, 0), (ts2, 20, 0, 0, 0, 0, 0), (ts3, 30, 0, 0, 0, 0, 0)],
+        )
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'):
+            async with (
+                aiosqlite.connect(str(db1_path)) as c1,
+                aiosqlite.connect(str(db2_path)) as c2,
+            ):
+                result = await aggregate_burndown_series([c1, c2], 'proj_a', days=30)
+
+        # (a) Exactly ONE WARNING record mentioning timestamp collisions.
+        collision_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'timestamp collisions' in r.getMessage()
+        ]
+        assert len(collision_warnings) == 1, (
+            f'Expected 1 collision summary WARNING, got {len(collision_warnings)}: '
+            + str([r.getMessage() for r in collision_warnings])
+        )
+
+        # (b) The single record's message contains the collision count and project_id.
+        msg = collision_warnings[0].getMessage()
+        assert '3' in msg, f'Expected collision count "3" in warning message: {msg!r}'
+        assert 'proj_a' in msg, f'Expected project_id "proj_a" in warning message: {msg!r}'
+
+        # (c) Last-writer-wins: db2 values (10, 20, 30) win over db1 values (1, 2, 3).
+        idx1 = result['labels'].index(ts1)
+        assert result['done'][idx1] == 10
+        idx3 = result['labels'].index(ts3)
+        assert result['done'][idx3] == 30
