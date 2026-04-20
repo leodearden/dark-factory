@@ -90,6 +90,16 @@ _CARGO_WORKSPACE_RE = re.compile(
     r'\s--workspace\b',
 )
 
+# Matches ``--exclude <name>`` inside the same cargo subcommand segment.
+# After ``--workspace`` is replaced with ``-p <crate>``, any lingering
+# ``--exclude`` flags become invalid (cargo rejects them with "--exclude
+# can only be used together with --workspace"), so they must be stripped
+# from the rewritten segment.
+_CARGO_EXCLUDE_RE = re.compile(
+    r'(cargo\s+(?:' + '|'.join(_CARGO_SUBCMDS) + r')\b[^&|;]*?)'
+    r'\s--exclude(?:\s+|=)\S+',
+)
+
 
 async def _derive_task_files_from_git(
     worktree: Path, config: OrchestratorConfig,
@@ -158,6 +168,13 @@ def _scope_cargo_workspace(cmd: str | None, crates: list[str]) -> str | None:
     new_cmd = _CARGO_WORKSPACE_RE.sub(
         lambda m: f'{m.group(1)} {p_flags}', cmd,
     )
+    # Strip any ``--exclude <name>`` pairs from the rewritten cargo segment;
+    # they are only valid with ``--workspace`` and cargo errors out otherwise.
+    # Loop until stable to handle multiple ``--exclude`` flags on one cmd.
+    prev = None
+    while prev != new_cmd:
+        prev = new_cmd
+        new_cmd = _CARGO_EXCLUDE_RE.sub(lambda m: m.group(1), new_cmd)
     return new_cmd
 
 
