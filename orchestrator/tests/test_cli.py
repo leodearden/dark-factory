@@ -462,3 +462,45 @@ class TestRunArmsWatchdog:
         assert state['armed_with'] == SHUTDOWN_WATCHDOG_TIMEOUT_SECS, (
             f"expected armed_with={SHUTDOWN_WATCHDOG_TIMEOUT_SECS}, got {state['armed_with']}"
         )
+
+    def test_watchdog_not_armed_on_blocked_exit(self, monkeypatch):
+        """_force_exit_after_delay must NOT be called when report.blocked > 0.
+
+        When the orchestrator exits via sys.exit(1) (blocked tasks), the arm call
+        at the fall-through position is never reached. Only interpreter shutdown
+        after a *successful* run is guarded by the watchdog. The CancelledError
+        branch arms separately before its own sys.exit(130), so SIGTERM/SIGINT
+        shutdown remains covered.
+
+        This test FAILS against the intermediate impl where the arm sits between
+        click.echo and sys.exit(1); it passes only when the arm is placed AFTER
+        the sys.exit(1) branch (fall-through position).
+        """
+        state, fake_force_exit = self._fake_watchdog_factory()
+        monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
+
+        fake_config = MagicMock()
+        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+
+        fake_harness = MagicMock()
+        fake_report = MagicMock()
+        fake_report.blocked = 3  # non-zero forces the sys.exit(1) branch
+        fake_report.summary.return_value = 'blocked'
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+
+        def fake_asyncio_run(coro):
+            coro.close()
+            return fake_report
+
+        monkeypatch.setattr(cli_module.asyncio, 'run', fake_asyncio_run)
+
+        result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
+
+        assert result.exit_code == 1, (
+            f'expected exit_code 1 (blocked tasks), got {result.exit_code}'
+        )
+        assert state['armed_with'] is None, (
+            f'_force_exit_after_delay was called with timeout={state["armed_with"]} '
+            f'on the blocked>0 path — watchdog must NOT be armed before sys.exit(1); '
+            f'arm must be placed after the sys.exit(1) branch (fall-through only)'
+        )
