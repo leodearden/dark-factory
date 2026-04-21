@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from anthropic.types import MessageParam, ToolParam
     from openai.types.chat import ChatCompletionMessageParam
 
-from shared.cli_invoke import AgentResult, invoke_with_cap_retry
+from shared.cli_invoke import AgentResult, classify_agent_failure, invoke_with_cap_retry
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import JournalEntry
@@ -358,7 +358,10 @@ class AgentLoop:
         if not result.success:
             # schema_salvaged=True implies success=True (cli_invoke.py:749-751),
             # so `not result.success` is the complete failure guard.
-            raise RuntimeError(f'Claude CLI agent failed: {result.output[:500]}')
+            cls = classify_agent_failure(result)
+            raise RuntimeError(
+                f'Claude CLI agent failed: {cls.summary}\n{cls.diagnostic_detail}'
+            )
 
         self._cli_session_id = result.session_id or self._cli_session_id
         self.llm_call_count += 1
