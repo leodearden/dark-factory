@@ -912,8 +912,9 @@ Output JSON matching the schema. Every task must appear in the output.
                 owner_pid = lock_data.get('owner_pid')
                 if owner_pid is not None:
                     owner_alive = _pid_alive(int(owner_pid))
-            except Exception:
-                # Corrupt/unreadable lock — treat as stale.
+            except (OSError, json.JSONDecodeError, ValueError):
+                # True corruption or unreadable lock — treat as stale.
+                # (Unexpected exception types propagate — they indicate a bug.)
                 owner_alive = False
 
             if owner_alive:
