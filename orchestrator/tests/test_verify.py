@@ -1533,3 +1533,95 @@ class TestVerificationFailedLogCauseHint:
                 assert '  ' not in msg, (
                     f'Passed log line should not have double spaces: {msg!r}'
                 )
+
+
+class TestFailureReportCauseHint:
+    """Tests for ``VerifyResult.failure_report()`` interaction with ``cause_hint``.
+
+    Tests (a), (b), (d) will fail until step 9 inserts the ``## Failure Cause``
+    section.  Test (c) acts as a regression guard on the existing section order.
+    """
+
+    # (a) non-empty cause_hint → report starts with ## Failure Cause heading
+    def test_failure_report_starts_with_cause_hint_section(self):
+        """When cause_hint is non-empty, report starts with ## Failure Cause."""
+        vr = VerifyResult(
+            passed=False,
+            test_output='test my::mod::it FAILED\n',
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            cause_hint='test my::mod::it FAILED',
+        )
+        report = vr.failure_report()
+        assert report.startswith('## Failure Cause'), (
+            f'Expected report to start with "## Failure Cause"; got:\n{report[:200]!r}'
+        )
+        assert 'test my::mod::it FAILED' in report
+
+    # (b) empty cause_hint → ## Failure Cause must NOT appear
+    def test_failure_report_no_cause_section_when_hint_empty(self):
+        """When cause_hint is '', the report contains no ## Failure Cause section."""
+        vr = VerifyResult(
+            passed=False,
+            test_output='test my::mod::it FAILED\n',
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            cause_hint='',
+        )
+        report = vr.failure_report()
+        assert '## Failure Cause' not in report, (
+            f'"## Failure Cause" present despite empty cause_hint:\n{report[:300]!r}'
+        )
+
+    # (c) existing sections still appear after the cause hint (regression guard)
+    def test_failure_report_existing_sections_appear_in_order(self):
+        """## Test Failures, ## Lint Issues, ## Type Errors appear after ## Failure Cause."""
+        vr = VerifyResult(
+            passed=False,
+            test_output='test my::mod::it FAILED\nline2',
+            lint_output='lint error here',
+            type_output='error: type mismatch',
+            summary='Failures: tests failed, lint issues, type errors',
+            cause_hint='test my::mod::it FAILED',
+        )
+        report = vr.failure_report()
+        # All three sections must be present
+        assert '## Test Failures' in report, f'Missing ## Test Failures in:\n{report!r}'
+        assert '## Lint Issues' in report, f'Missing ## Lint Issues in:\n{report!r}'
+        assert '## Type Errors' in report, f'Missing ## Type Errors in:\n{report!r}'
+        # And they must come AFTER ## Failure Cause
+        cause_pos = report.find('## Failure Cause')
+        test_pos = report.find('## Test Failures')
+        lint_pos = report.find('## Lint Issues')
+        type_pos = report.find('## Type Errors')
+        assert cause_pos < test_pos, 'Expected ## Failure Cause before ## Test Failures'
+        assert test_pos < lint_pos, 'Expected ## Test Failures before ## Lint Issues'
+        assert lint_pos < type_pos, 'Expected ## Lint Issues before ## Type Errors'
+
+    # (d) timed_out=True: ## Verify Timed Out first, then ## Failure Cause
+    def test_failure_report_timeout_preamble_comes_before_cause_hint(self):
+        """When timed_out=True, ## Verify Timed Out appears first, ## Failure Cause after."""
+        vr = VerifyResult(
+            passed=False,
+            test_output='Command timed out after 1800s: cargo test --workspace',
+            lint_output='',
+            type_output='',
+            summary='Verification timed out',
+            timed_out=True,
+            cause_hint='Command timed out after 1800s: cargo test --workspace',
+        )
+        report = vr.failure_report()
+        assert '## Verify Timed Out' in report, (
+            f'Missing ## Verify Timed Out:\n{report!r}'
+        )
+        assert '## Failure Cause' in report, (
+            f'Missing ## Failure Cause:\n{report!r}'
+        )
+        timeout_pos = report.find('## Verify Timed Out')
+        cause_pos = report.find('## Failure Cause')
+        assert timeout_pos < cause_pos, (
+            f'Expected ## Verify Timed Out (pos {timeout_pos}) before '
+            f'## Failure Cause (pos {cause_pos})'
+        )
