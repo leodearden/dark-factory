@@ -1,5 +1,6 @@
 """Tests for CLI helpers."""
 
+import asyncio
 import io
 import logging
 import threading
@@ -7,8 +8,16 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
+from click.testing import CliRunner
 
-from orchestrator.cli import _force_exit_after_delay, _make_cancel_handler, _parse_duration
+import orchestrator.cli as cli_module
+from orchestrator.cli import (
+    SHUTDOWN_WATCHDOG_TIMEOUT_SECS,
+    _force_exit_after_delay,
+    _make_cancel_handler,
+    _parse_duration,
+    main,
+)
 
 
 class TestParseDuration:
@@ -134,3 +143,84 @@ class TestForceExitWatchdog:
             f'no frame lines in dump:\n{output!r}'
         )
         assert calls == [137]
+
+
+class TestRunArmsWatchdog:
+    """run() must arm the shutdown watchdog and disarm it on both exit paths."""
+
+    def _fake_watchdog_factory(self):
+        """Returns (recorder, fake_force_exit_after_delay).
+
+        recorder has:
+          .armed_with       – the timeout_secs passed on arming
+          .disarm_called    – True once disarm() is called
+        """
+        state = {'armed_with': None, 'disarm_called': False}
+
+        def fake_disarm():
+            state['disarm_called'] = True
+
+        def fake_force_exit(timeout_secs, exit_code=137, *, stream=None):
+            state['armed_with'] = timeout_secs
+            return fake_disarm
+
+        return state, fake_force_exit
+
+    def test_normal_path_arms_and_disarms(self, monkeypatch):
+        """run() arms the watchdog and disarms it on normal (non-cancelled) exit."""
+        state, fake_force_exit = self._fake_watchdog_factory()
+        monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
+
+        # Fake config so load_config doesn't need a real file
+        fake_config = MagicMock()
+        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+
+        # Fake Harness so we don't need a real one
+        fake_harness = MagicMock()
+        fake_report = MagicMock()
+        fake_report.blocked = 0
+        fake_report.summary.return_value = 'all done'
+        fake_harness.run = MagicMock()
+
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+
+        # asyncio.run returns fake_report (bypasses _main entirely)
+        monkeypatch.setattr(cli_module.asyncio, 'run', lambda coro: fake_report)
+
+        runner = CliRunner()
+        result = runner.invoke(main, ['run', '--config', '/dev/null'])
+
+        # Watchdog must have been armed with the module constant
+        assert state['armed_with'] == SHUTDOWN_WATCHDOG_TIMEOUT_SECS, (
+            f"expected armed_with={SHUTDOWN_WATCHDOG_TIMEOUT_SECS}, got {state['armed_with']}"
+        )
+        # And disarmed before exit
+        assert state['disarm_called'], 'disarm() was never called on normal exit path'
+
+    def test_cancelled_path_arms_and_disarms(self, monkeypatch):
+        """run() arms the watchdog and disarms it even when asyncio.run raises CancelledError."""
+        state, fake_force_exit = self._fake_watchdog_factory()
+        monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
+
+        fake_config = MagicMock()
+        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+
+        fake_harness = MagicMock()
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+
+        # asyncio.run raises CancelledError to simulate SIGTERM path
+        def raise_cancelled(coro):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(cli_module.asyncio, 'run', raise_cancelled)
+
+        runner = CliRunner()
+        result = runner.invoke(main, ['run', '--config', '/dev/null'])
+
+        assert result.exit_code == 130, (
+            f'expected exit code 130 (SIGINT/SIGTERM), got {result.exit_code}'
+        )
+        assert state['armed_with'] == SHUTDOWN_WATCHDOG_TIMEOUT_SECS, (
+            f"expected armed_with={SHUTDOWN_WATCHDOG_TIMEOUT_SECS}, got {state['armed_with']}"
+        )
+        assert state['disarm_called'], 'disarm() was never called on CancelledError exit path'
