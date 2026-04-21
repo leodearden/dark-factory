@@ -166,8 +166,19 @@ class TestRunArmsWatchdog:
 
         return state, fake_force_exit
 
-    def test_normal_path_arms_and_disarms(self, monkeypatch):
-        """run() arms the watchdog and disarms it on normal (non-cancelled) exit."""
+    def test_normal_path_arms_watchdog_and_leaves_armed(self, monkeypatch):
+        """run() arms the watchdog on normal (non-cancelled) exit and leaves it armed.
+
+        The watchdog must NOT be disarmed — disarming defeats its purpose.
+        The whole point is to guard the interpreter-shutdown path that begins
+        after sys.exit raises SystemExit: atexit callbacks run, then
+        threading._shutdown() joins non-daemon threads. If a non-daemon thread
+        is stuck, threading._shutdown() hangs there. The armed daemon watchdog
+        fires os._exit(137) after SHUTDOWN_WATCHDOG_TIMEOUT_SECS.
+
+        If shutdown completes cleanly, the daemon watchdog thread is killed
+        with the process and fires nothing. Either way, NOT disarming is correct.
+        """
         state, fake_force_exit = self._fake_watchdog_factory()
         monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
 
@@ -199,11 +210,20 @@ class TestRunArmsWatchdog:
         assert state['armed_with'] == SHUTDOWN_WATCHDOG_TIMEOUT_SECS, (
             f"expected armed_with={SHUTDOWN_WATCHDOG_TIMEOUT_SECS}, got {state['armed_with']}"
         )
-        # And disarmed before exit
-        assert state['disarm_called'], 'disarm() was never called on normal exit path'
+        # Watchdog must NOT be disarmed — it must remain armed to guard interpreter shutdown.
+        assert not state['disarm_called'], (
+            'disarm() was called — watchdog must remain armed to guard interpreter shutdown '
+            '(threading._shutdown() joining non-daemon threads after sys.exit)'
+        )
 
-    def test_cancelled_path_arms_and_disarms(self, monkeypatch):
-        """run() arms the watchdog and disarms it even when asyncio.run raises CancelledError."""
+    def test_cancelled_path_arms_watchdog_and_leaves_armed(self, monkeypatch):
+        """run() arms the watchdog even when asyncio.run raises CancelledError, and leaves it armed.
+
+        Same rationale as test_normal_path_arms_watchdog_and_leaves_armed: the
+        watchdog guards the interpreter-shutdown window (atexit + threading._shutdown)
+        that begins AFTER sys.exit(130) raises SystemExit. Disarming it would
+        defeat its purpose on the cancellation path.
+        """
         state, fake_force_exit = self._fake_watchdog_factory()
         monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
 
@@ -230,4 +250,62 @@ class TestRunArmsWatchdog:
         assert state['armed_with'] == SHUTDOWN_WATCHDOG_TIMEOUT_SECS, (
             f"expected armed_with={SHUTDOWN_WATCHDOG_TIMEOUT_SECS}, got {state['armed_with']}"
         )
-        assert state['disarm_called'], 'disarm() was never called on CancelledError exit path'
+        # Watchdog must NOT be disarmed — it guards interpreter shutdown after sys.exit(130).
+        assert not state['disarm_called'], (
+            'disarm() was called on CancelledError path — watchdog must remain armed to guard '
+            'interpreter shutdown (threading._shutdown() joining non-daemon threads)'
+        )
+
+    def test_watchdog_armed_only_after_asyncio_run_returns(self, monkeypatch):
+        """Watchdog must be armed AFTER asyncio.run() returns, not before.
+
+        Arming before asyncio.run would start the 30-second timer at the
+        beginning of orchestration; real runs take longer than 30s, so the
+        watchdog would fire mid-run and kill the orchestrator during normal
+        operation.
+
+        This test captures the state of 'armed_with' INSIDE the fake
+        asyncio.run call (i.e., while _main() is still "running") to prove
+        the watchdog was not yet armed at that point.
+        """
+        state, fake_force_exit = self._fake_watchdog_factory()
+        monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
+
+        fake_config = MagicMock()
+        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+
+        fake_harness = MagicMock()
+        fake_report = MagicMock()
+        fake_report.blocked = 0
+        fake_report.summary.return_value = 'all done'
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+
+        # Capture what 'armed_with' is while asyncio.run is "executing".
+        armed_during_asyncio_run: list = []
+
+        def fake_asyncio_run(coro):
+            coro.close()
+            # At this point asyncio.run is "in progress" — watchdog must NOT be armed yet.
+            armed_during_asyncio_run.append(state['armed_with'])
+            return fake_report
+
+        monkeypatch.setattr(cli_module.asyncio, 'run', fake_asyncio_run)
+
+        runner = CliRunner()
+        runner.invoke(main, ['run', '--config', '/dev/null'])
+
+        # Exactly one call happened (our fake_asyncio_run ran once).
+        assert len(armed_during_asyncio_run) == 1, (
+            f'fake asyncio.run was called {len(armed_during_asyncio_run)} times'
+        )
+        # While asyncio.run was "running", the watchdog must NOT have been armed.
+        assert armed_during_asyncio_run[0] is None, (
+            f'Watchdog was already armed with timeout={armed_during_asyncio_run[0]} '
+            f'before/during asyncio.run — this would fire the watchdog during long-running '
+            f'orchestration (>30s) and kill the orchestrator mid-run.'
+        )
+        # But AFTER asyncio.run returns, the watchdog must be armed.
+        assert state['armed_with'] == SHUTDOWN_WATCHDOG_TIMEOUT_SECS, (
+            f"expected armed_with={SHUTDOWN_WATCHDOG_TIMEOUT_SECS} after asyncio.run returned, "
+            f"got {state['armed_with']}"
+        )
