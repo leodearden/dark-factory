@@ -269,6 +269,7 @@ class ReconciliationConfig(BaseModel):
     # restore the pre-881 per-call ceilings independently.
     agent_cli_timeout_seconds: int = Field(
         default=180,
+        gt=0,
         description=(
             'Wall-clock budget for a single agent_loop._call_claude_cli invocation. '
             'Distinct from stage_timeout_seconds (outer stage guard). '
@@ -277,6 +278,7 @@ class ReconciliationConfig(BaseModel):
     )
     judge_cli_timeout_seconds: int = Field(
         default=600,
+        gt=0,
         description=(
             'Wall-clock budget for a single judge._call_judge_cli invocation. '
             'Distinct from stage_timeout_seconds (outer stage guard). '
@@ -289,6 +291,7 @@ class ReconciliationConfig(BaseModel):
     # process from leaving claims stuck for ten minutes.
     stale_claim_recovery_seconds: int = Field(
         default=60,
+        gt=0,
         description=(
             'Deferred-write claims older than this are re-queued on startup. '
             'Claims are held for seconds; use a much shorter horizon than '
