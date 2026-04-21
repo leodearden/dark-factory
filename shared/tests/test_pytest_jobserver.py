@@ -17,16 +17,21 @@ import shared.pytest_jobserver as _js
 
 @pytest.fixture(autouse=True)
 def _restore_globals():
-    """Snapshot and restore plugin module-level globals around each test.
+    """Snapshot, reset, and restore plugin module-level globals around each test.
 
     The outer pytest session may have already acquired a jobserver token
     (because conftest.py lists pytest_jobserver as a pytest_plugins entry).
     Directly calling pytest_configure / pytest_unconfigure in these tests
-    would clobber that state.  This fixture saves the current values, yields,
-    and then restores them WITHOUT closing any outer-session fd.
+    would clobber that state.  This fixture:
+      1. Saves the current values.
+      2. Resets _fd/_tok to None so each test starts in a clean plugin state.
+      3. Yields.
+      4. Restores the saved values WITHOUT closing any outer-session fd.
     """
     saved_fd = _js._fd
     saved_tok = _js._tok
+    _js._fd = None
+    _js._tok = None
     yield
     _js._fd = saved_fd
     _js._tok = saved_tok
@@ -147,3 +152,34 @@ class TestHappyPath:
         _js.pytest_unconfigure(config=None)
         assert _js._fd is None
         assert _js._tok is None
+
+
+# ---------------------------------------------------------------------------
+# Missing-FIFO regression test
+# ---------------------------------------------------------------------------
+
+
+class TestMissingFifo:
+    def test_missing_fifo_is_silent_noop(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """When the FIFO path does not exist, configure must be a silent no-op.
+
+        The missing-FIFO early-return (pytest_jobserver.py:43-44) must NOT
+        emit any warning — only the real timeout path logs.
+        """
+        nonexistent = str(tmp_path / 'no-such-fifo')
+        monkeypatch.setenv('PYTEST_JOBSERVER_FIFO', nonexistent)
+
+        with caplog.at_level(logging.WARNING, logger='shared.pytest_jobserver'):
+            _js.pytest_configure(config=None)
+
+        assert _js._fd is None
+        assert _js._tok is None
+        jobserver_warnings = [
+            r for r in caplog.records
+            if r.name == 'shared.pytest_jobserver' and r.levelno >= logging.WARNING
+        ]
+        assert jobserver_warnings == [], (
+            f'Missing-FIFO path must not log warnings, got: {jobserver_warnings}'
+        )
