@@ -430,20 +430,19 @@ class ReconciliationHarness:
         await self._start_escalation_server()
 
         # Re-queue any deferred writes left in-progress by a crashed prior process.
-        # This call runs before any in-process claim is issued, so there is no
-        # live claim holder that could race with the release.  Claims are held
-        # for seconds (one memory_service.add_memory call per row), so the
-        # claim-scale horizon (stale_claim_recovery_seconds, default 60s) is
-        # intentionally much shorter than the run-scale horizon used by
-        # _recover_stale_runs (stale_run_recovery_seconds, default 600s).
+        # Cutoff is 0 (release *every* currently-claimed row) rather than
+        # stale_claim_recovery_seconds.  This closes the fast-restart edge case:
+        # if a supervisor restarts the harness within stale_claim_recovery_seconds
+        # of the previous crash, a time-based cutoff would miss rows whose
+        # claimed_at is younger than the horizon, silently stalling those writes.
+        # Safety: the per-project reconciliation lock (EventBuffer._is_run_locked /
+        # mark_run_active) serialises replay — at startup no project loop has
+        # spawned yet, so there is nothing to race with.
         try:
-            released = await self.buffer.release_stale_claims(
-                self.config.stale_claim_recovery_seconds,
-            )
+            released = await self.buffer.release_stale_claims(0)
             if released:
                 logger.info(
                     f'Recovered {released} stale deferred write claim(s) on startup'
-                    f' (claim recovery horizon: {self.config.stale_claim_recovery_seconds}s)'
                 )
         except Exception as e:
             logger.warning(f'release_stale_claims at startup failed: {e}')
