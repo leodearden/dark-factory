@@ -725,6 +725,42 @@ async def test_delete_deferred_write_removes_only_target(buf):
 
 
 @pytest.mark.asyncio
+async def test_release_stale_claims_boundary(buf):
+    """release_stale_claims re-queues old claims but preserves recent ones."""
+    from datetime import UTC, datetime, timedelta
+
+    await buf.defer_write('test-project', 'old', 'cat', {})
+    await buf.defer_write('test-project', 'fresh', 'cat', {})
+
+    # Claim both rows (claimed_at = now)
+    claimed = await buf.claim_deferred_writes('test-project')
+    assert len(claimed) == 2
+
+    # Backdate the 'old' row's claimed_at to 200 seconds ago via direct SQL
+    old_item = next(item for item in claimed if item['content'] == 'old')
+    stale_ts = (datetime.now(UTC) - timedelta(seconds=200)).isoformat()
+    db = buf._require_db()
+    await db.execute(
+        'UPDATE deferred_writes SET claimed_at = ? WHERE id = ?',
+        (stale_ts, old_item['id']),
+    )
+    await db.commit()
+
+    # With 60s cutoff, only the 200s-old claim should be released
+    released = await buf.release_stale_claims(60.0)
+    assert released == 1
+
+    # Re-claim: only the formerly-stale 'old' row is returned (fresh is still claimed)
+    reclaimed = await buf.claim_deferred_writes('test-project')
+    assert len(reclaimed) == 1
+    assert reclaimed[0]['content'] == 'old'
+
+    # Calling again with no additional changes: 0 rows released (fresh is still within 60s)
+    released2 = await buf.release_stale_claims(60.0)
+    assert released2 == 0
+
+
+@pytest.mark.asyncio
 async def test_defer_write_and_pop(buf):
     """Deferred write should be retrievable via pop."""
     write_id = await buf.defer_write(
