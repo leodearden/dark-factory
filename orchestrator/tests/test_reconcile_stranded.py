@@ -86,3 +86,27 @@ class TestReconcileStrandedInProgress:
         assert len(calls) == 1
         assert calls[0].args[0] == '5'
         assert calls[0].args[1] == 'pending'
+
+    async def test_in_progress_with_live_owner_pid_left_alone(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """In-progress task with plan.lock pointing to live PID → untouched."""
+        harness.scheduler.get_tasks.return_value = [
+            {'id': 7, 'status': 'in-progress'},
+        ]
+        # Create worktree with a plan.lock containing our own (live) PID
+        lock_dir = harness.git_ops.worktree_base / '7' / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': '7-abcd1234',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': os.getpid(),
+        }))
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Must NOT revert
+        harness.scheduler.set_task_status.assert_not_called()
+        # Lock file must still exist
+        assert lock_path.exists()
