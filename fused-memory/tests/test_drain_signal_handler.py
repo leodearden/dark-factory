@@ -34,13 +34,13 @@ class TestRegisterDrainSignalHandlerHappyPath:
 
 
 class TestRegisterDrainSignalHandlerFallback:
-    @pytest.mark.parametrize('exc', [NotImplementedError])
-    def test_register_drain_signal_handler_falls_back_on_add_signal_handler_error(self, exc):
+    def test_register_drain_signal_handler_falls_back_on_add_signal_handler_error(self):
         """Fallback: when add_signal_handler raises NotImplementedError, uses signal.signal.
 
         NotImplementedError covers Windows (no add_signal_handler support).
         RuntimeError from add_signal_handler is NOT caught — it propagates (see TestRegisterDrainSignalHandlerRuntimeError).
         """
+        exc = NotImplementedError
         reconciliation_harness = MagicMock()
         reconciliation_harness.drain = MagicMock()
 
@@ -165,7 +165,7 @@ class TestRegisterDrainSignalHandlerRuntimeError:
 
         with patch('asyncio.get_running_loop', return_value=mock_loop), \
              patch('fused_memory.server.main.signal.signal') as mock_signal, \
-             pytest.raises(RuntimeError):
+             pytest.raises(RuntimeError, match='not in main thread'):
             _register_drain_signal_handler(reconciliation_harness)
 
         # signal.signal must NOT be called — we don't attempt the fallback on RuntimeError
