@@ -423,8 +423,9 @@ class TestRunArmsWatchdog:
         original_echo = cli_module.click.echo
 
         def recording_echo(msg=None, **kwargs):
-            if msg == 'all done':
-                events.append('echo_summary')
+            # Record every echo call so failures show what actually happened
+            # and the test is robust to changes in the fake summary string.
+            events.append(('echo', msg))
             return original_echo(msg, **kwargs)
 
         monkeypatch.setattr(cli_module.click, 'echo', recording_echo)
@@ -446,14 +447,19 @@ class TestRunArmsWatchdog:
 
         CliRunner().invoke(main, ['run', '--config', '/dev/null'])
 
-        assert 'echo_summary' in events, (
-            "click.echo(report.summary()) was never called — can't check ordering"
+        summary_str = fake_report.summary.return_value
+        echo_indices = [i for i, e in enumerate(events) if e == ('echo', summary_str)]
+        assert echo_indices, (
+            f"click.echo(report.summary()) was never called — can't check ordering. "
+            f"events: {events!r}"
         )
-        assert 'arm' in events, (
-            '_force_exit_after_delay was never called — watchdog not armed at all'
+        arm_indices = [i for i, e in enumerate(events) if e == 'arm']
+        assert arm_indices, (
+            f'_force_exit_after_delay was never called — watchdog not armed at all. '
+            f'events: {events!r}'
         )
-        echo_idx = events.index('echo_summary')
-        arm_idx = events.index('arm')
+        echo_idx = echo_indices[0]
+        arm_idx = arm_indices[0]
         assert echo_idx < arm_idx, (
             f'click.echo(report.summary()) must run BEFORE _force_exit_after_delay, '
             f'but got order: {events!r}'
@@ -463,18 +469,18 @@ class TestRunArmsWatchdog:
             f"expected armed_with={SHUTDOWN_WATCHDOG_TIMEOUT_SECS}, got {state['armed_with']}"
         )
 
-    def test_watchdog_not_armed_on_blocked_exit(self, monkeypatch):
-        """_force_exit_after_delay must NOT be called when report.blocked > 0.
+    def test_watchdog_armed_before_blocked_exit(self, monkeypatch):
+        """_force_exit_after_delay must be called even when report.blocked > 0.
 
-        When the orchestrator exits via sys.exit(1) (blocked tasks), the arm call
-        at the fall-through position is never reached. Only interpreter shutdown
-        after a *successful* run is guarded by the watchdog. The CancelledError
-        branch arms separately before its own sys.exit(130), so SIGTERM/SIGINT
-        shutdown remains covered.
+        The blocked-task exit (sys.exit(1)) goes through the same interpreter
+        shutdown as the clean exit — atexit callbacks run and
+        threading._shutdown() joins non-daemon threads from harness.run().
+        Both paths carry identical hang risk, so the watchdog must guard both.
 
-        This test FAILS against the intermediate impl where the arm sits between
-        click.echo and sys.exit(1); it passes only when the arm is placed AFTER
-        the sys.exit(1) branch (fall-through position).
+        The arm is placed AFTER click.echo(report.summary()) (not before, so
+        user-visible output is not covered) but BEFORE the
+        `if report.blocked > 0: sys.exit(1)` branch so the blocked path is
+        covered too, matching the CancelledError branch's pattern.
         """
         state, fake_force_exit = self._fake_watchdog_factory()
         monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
@@ -499,8 +505,14 @@ class TestRunArmsWatchdog:
         assert result.exit_code == 1, (
             f'expected exit_code 1 (blocked tasks), got {result.exit_code}'
         )
-        assert state['armed_with'] is None, (
-            f'_force_exit_after_delay was called with timeout={state["armed_with"]} '
-            f'on the blocked>0 path — watchdog must NOT be armed before sys.exit(1); '
-            f'arm must be placed after the sys.exit(1) branch (fall-through only)'
+        # Watchdog must be armed even on the blocked exit path.
+        assert state['armed_with'] == SHUTDOWN_WATCHDOG_TIMEOUT_SECS, (
+            f'_force_exit_after_delay was not called on the blocked>0 path — '
+            f'watchdog must guard interpreter shutdown on both clean and blocked exits. '
+            f'got armed_with={state["armed_with"]!r}'
+        )
+        # Watchdog must NOT be disarmed — it guards interpreter shutdown after sys.exit(1).
+        assert not state['disarm_called'], (
+            'disarm() was called on the blocked>0 path — watchdog must remain armed to '
+            'guard interpreter shutdown (threading._shutdown() joining non-daemon threads)'
         )
