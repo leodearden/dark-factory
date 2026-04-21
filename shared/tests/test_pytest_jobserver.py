@@ -83,33 +83,33 @@ class TestTimeoutFallback:
         assert any(fifo_path in m for m in msgs), (
             f'Expected FIFO path in warning message, got: {msgs}'
         )
-        assert any('0.1' in m for m in msgs), (
-            f'Expected timeout value in warning message, got: {msgs}'
+        assert any(f'{0.1:.1f}' in m for m in msgs), (
+            f"Expected timeout value '{0.1:.1f}' in warning message, got: {msgs}"
         )
 
 
 # ---------------------------------------------------------------------------
-# _acquire_timeout_secs unit tests
+# _read_timeout_secs unit tests
 # ---------------------------------------------------------------------------
 
 
-class TestAcquireTimeoutSecs:
+class TestReadTimeoutSecs:
     """Unit-test env-var parsing without measuring wall time."""
 
     def test_default_when_key_absent(self):
-        assert _js._acquire_timeout_secs({}) == 60.0
+        assert _js._read_timeout_secs({}) == 60.0
 
     def test_valid_float_string(self):
-        assert _js._acquire_timeout_secs({'PYTEST_JOBSERVER_TIMEOUT': '0.25'}) == 0.25
+        assert _js._read_timeout_secs({'PYTEST_JOBSERVER_TIMEOUT': '0.25'}) == 0.25
 
     def test_invalid_string_falls_back_to_default(self):
-        assert _js._acquire_timeout_secs({'PYTEST_JOBSERVER_TIMEOUT': 'abc'}) == 60.0
+        assert _js._read_timeout_secs({'PYTEST_JOBSERVER_TIMEOUT': 'abc'}) == 60.0
 
     def test_empty_string_falls_back_to_default(self):
-        assert _js._acquire_timeout_secs({'PYTEST_JOBSERVER_TIMEOUT': ''}) == 60.0
+        assert _js._read_timeout_secs({'PYTEST_JOBSERVER_TIMEOUT': ''}) == 60.0
 
     def test_integer_looking_string(self):
-        assert _js._acquire_timeout_secs({'PYTEST_JOBSERVER_TIMEOUT': '5'}) == 5.0
+        assert _js._read_timeout_secs({'PYTEST_JOBSERVER_TIMEOUT': '5'}) == 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +121,24 @@ class TestHappyPath:
     def test_acquires_token_when_fifo_is_seeded(
         self, fifo_path, monkeypatch, caplog
     ):
-        """pytest_configure should acquire the token and register cleanup."""
+        """pytest_configure should acquire the token and register cleanup.
+
+        atexit.register and signal.signal are monkeypatched to no-ops so the
+        atexit callback and SIGTERM handler that pytest_configure installs on
+        the happy path do not leak into the outer pytest process.  Without
+        these patches the registrations would persist after the test because
+        _restore_globals only restores _fd/_tok; they are harmless (both
+        handlers are no-ops when _fd/_tok are None), but stubbing them out
+        makes the test self-contained and avoids relying on that invariant.
+        """
         monkeypatch.setenv('PYTEST_JOBSERVER_FIFO', fifo_path)
         # Use a generous timeout so the happy path never races
         monkeypatch.setenv('PYTEST_JOBSERVER_TIMEOUT', '5.0')
+
+        # Suppress side-effecting registrations so they don't leak into the
+        # outer pytest session's atexit stack and SIGTERM handler chain.
+        monkeypatch.setattr(_js.atexit, 'register', lambda *a, **kw: None)
+        monkeypatch.setattr(_js.signal, 'signal', lambda *a, **kw: None)
 
         # Seed one token into the FIFO before calling configure.
         # Open O_RDWR so the open itself doesn't block (same trick as the plugin),
