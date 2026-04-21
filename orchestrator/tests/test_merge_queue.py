@@ -7,7 +7,7 @@ import contextlib
 import sqlite3
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -507,9 +507,7 @@ class TestMergeWorker:
         worker_task = asyncio.create_task(worker.run())
 
         # Mock verification to fail
-        mock_verify = AsyncMock()
-        mock_verify.return_value.passed = False
-        mock_verify.return_value.summary = 'tests failed'
+        mock_verify = AsyncMock(return_value=MagicMock(passed=False, summary='tests failed'))
 
         with patch('orchestrator.merge_queue.run_scoped_verification', mock_verify):
             req = _make_request('6', 'verify-fail', worktree, config)
@@ -893,16 +891,10 @@ class TestSpeculativeMergeWorker:
             n_file = merge_wt / 'file_disc_n.py'
             if n_file.exists():
                 verify_calls['n'] = verify_calls.get('n', 0) + 1
-                result = AsyncMock()
-                result.passed = False
-                result.summary = 'N tests failed'
-                return result
+                return MagicMock(passed=False, summary='N tests failed')
             else:
                 verify_calls['n1'] = verify_calls.get('n1', 0) + 1
-                result = AsyncMock()
-                result.passed = True
-                result.summary = ''
-                return result
+                return MagicMock(passed=True, summary='')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
@@ -1171,20 +1163,11 @@ class TestSpeculativeMergeWorker:
         )
 
         async def _fail_n_pass_n1(merge_wt, cfg, module_configs, task_files=None):
-            result = AsyncMock()
-            result.passed = not (merge_wt / 'file_ev_n.py').exists() or \
-                            (merge_wt / 'file_ev_n1.py').exists() and \
-                            not (merge_wt / 'file_ev_n.py').exists()
-            # Simpler: fail when both N and N+1 are present (speculative), pass after re-merge
             n_present = (merge_wt / 'file_ev_n.py').exists()
             n1_present = (merge_wt / 'file_ev_n1.py').exists()
             if n_present and not n1_present:
-                result.passed = False   # N verification → fail
-                result.summary = 'N failed'
-            else:
-                result.passed = True    # N+1 (re-merged, no N) → pass
-                result.summary = ''
-            return result
+                return MagicMock(passed=False, summary='N failed')
+            return MagicMock(passed=True, summary='')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
@@ -1341,9 +1324,7 @@ class TestSpeculativeMergeWorker:
         worker_task = asyncio.create_task(worker.run())
 
         # N fails verification → n_failed=True; _remerge then raises for N+1
-        mock_verify = AsyncMock()
-        mock_verify.return_value.passed = False
-        mock_verify.return_value.summary = 'tests failed'
+        mock_verify = AsyncMock(return_value=MagicMock(passed=False, summary='tests failed'))
 
         async def raise_on_remerge(req, started_monotonic: float | None = None):  # type: ignore[no-untyped-def]
             raise RuntimeError('_remerge failed unexpectedly')
@@ -1768,14 +1749,9 @@ class TestSpeculativeMergeWorker:
         async def _verify_chain(
             merge_wt, cfg, module_configs, task_files=None, **_kwargs,
         ):
-            result = AsyncMock()
             if (merge_wt / 'file_chain_n.py').exists():
-                result.passed = False
-                result.summary = 'N tainted: file_chain_n.py present'
-            else:
-                result.passed = True
-                result.summary = ''
-            return result
+                return MagicMock(passed=False, summary='N tainted: file_chain_n.py present')
+            return MagicMock(passed=True, summary='')
 
         with patch(
             'orchestrator.merge_queue.run_scoped_verification',
@@ -2250,15 +2226,10 @@ class TestSpeculativeMergeWorker:
 
         async def _fail_n_pass_n1(merge_wt, cfg, module_configs, task_files=None):
             """Fail N's verification; N+1 re-merge won't reach verify (conflicts)."""
-            result = AsyncMock()
             n_present = (merge_wt / 'rmp_n.py').exists()
             if n_present:
-                result.passed = False
-                result.summary = 'N failed intentionally'
-            else:
-                result.passed = True
-                result.summary = ''
-            return result
+                return MagicMock(passed=False, summary='N failed intentionally')
+            return MagicMock(passed=True, summary='')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
@@ -2559,9 +2530,7 @@ class TestSpeculativeBackwardCompat:
         worker = SpeculativeMergeWorker(git_ops, queue)
         worker_task = asyncio.create_task(worker.run())
 
-        mock_verify = AsyncMock()
-        mock_verify.return_value.passed = False
-        mock_verify.return_value.summary = 'tests failed'
+        mock_verify = AsyncMock(return_value=MagicMock(passed=False, summary='tests failed'))
 
         with patch('orchestrator.merge_queue.run_scoped_verification', mock_verify):
             req = _make_request('compat-vf', 'compat-vf', worktree, config)
