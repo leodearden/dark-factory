@@ -761,8 +761,8 @@ async def test_release_stale_claims_boundary(buf):
 
 
 @pytest.mark.asyncio
-async def test_defer_write_and_pop(buf):
-    """Deferred write should be retrievable via pop."""
+async def test_defer_write_and_claim(buf):
+    """Deferred write should be retrievable via claim."""
     write_id = await buf.defer_write(
         project_id='test-project',
         content='Task X completed',
@@ -772,7 +772,7 @@ async def test_defer_write_and_pop(buf):
     )
     assert write_id  # non-empty string
 
-    writes = await buf.pop_deferred_writes('test-project')
+    writes = await buf.claim_deferred_writes('test-project')
     assert len(writes) == 1
     assert writes[0]['content'] == 'Task X completed'
     assert writes[0]['category'] == 'observations_and_summaries'
@@ -781,36 +781,36 @@ async def test_defer_write_and_pop(buf):
 
 
 @pytest.mark.asyncio
-async def test_pop_deferred_writes_empty(buf):
-    """Pop on empty table returns empty list."""
-    writes = await buf.pop_deferred_writes('test-project')
+async def test_claim_deferred_writes_empty(buf):
+    """Claim on empty table returns empty list."""
+    writes = await buf.claim_deferred_writes('test-project')
     assert writes == []
 
 
 @pytest.mark.asyncio
-async def test_pop_deferred_writes_clears(buf):
-    """Second pop returns empty after first pop consumed all writes."""
+async def test_claim_deferred_writes_clears(buf):
+    """Second claim returns empty after first claim marked all writes in-progress."""
     await buf.defer_write('test-project', 'content1', 'cat1', {})
     await buf.defer_write('test-project', 'content2', 'cat2', {})
 
-    first_pop = await buf.pop_deferred_writes('test-project')
-    assert len(first_pop) == 2
+    first_claim = await buf.claim_deferred_writes('test-project')
+    assert len(first_claim) == 2
 
-    second_pop = await buf.pop_deferred_writes('test-project')
-    assert second_pop == []
+    second_claim = await buf.claim_deferred_writes('test-project')
+    assert second_claim == []
 
 
 @pytest.mark.asyncio
-async def test_pop_deferred_writes_project_isolation(buf):
+async def test_claim_deferred_writes_project_isolation(buf):
     """Deferred writes are scoped to project_id."""
     await buf.defer_write('project-a', 'content-a', 'cat', {})
     await buf.defer_write('project-b', 'content-b', 'cat', {})
 
-    writes_a = await buf.pop_deferred_writes('project-a')
+    writes_a = await buf.claim_deferred_writes('project-a')
     assert len(writes_a) == 1
     assert writes_a[0]['content'] == 'content-a'
 
-    writes_b = await buf.pop_deferred_writes('project-b')
+    writes_b = await buf.claim_deferred_writes('project-b')
     assert len(writes_b) == 1
     assert writes_b[0]['content'] == 'content-b'
 
@@ -833,13 +833,13 @@ async def test_is_full_recon_active_with_lock(buf):
 
 
 @pytest.mark.asyncio
-async def test_deferred_writes_ordering(buf):
-    """Pop returns deferred writes in creation order."""
+async def test_claim_deferred_writes_ordering(buf):
+    """Claim returns deferred writes in creation order."""
     await buf.defer_write('test-project', 'first', 'cat', {})
     await buf.defer_write('test-project', 'second', 'cat', {})
     await buf.defer_write('test-project', 'third', 'cat', {})
 
-    writes = await buf.pop_deferred_writes('test-project')
+    writes = await buf.claim_deferred_writes('test-project')
     assert [w['content'] for w in writes] == ['first', 'second', 'third']
 
 
