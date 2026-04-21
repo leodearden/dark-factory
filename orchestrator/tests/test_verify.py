@@ -946,6 +946,22 @@ class TestApplyCargoScopePolyglotGuard:
         assert '-p foo' in (result.test_command or '')
         assert '--workspace' not in (result.test_command or '')
 
+    def test_rs_plus_cargo_lock_scopes(self):
+        """.rs + Cargo.lock must scope to crate (Cargo.lock is Rust-only, not a polyglot indicator)."""
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'Cargo.lock'])
+        assert '-p foo' in (result.test_command or ''), (
+            f'expected -p foo in test_command, got {result.test_command!r}'
+        )
+        assert '--workspace' not in (result.test_command or ''), (
+            f'expected --workspace absent in test_command, got {result.test_command!r}'
+        )
+        assert '-p foo' in (result.lint_command or ''), (
+            f'expected -p foo in lint_command, got {result.lint_command!r}'
+        )
+        assert '--workspace' not in (result.lint_command or ''), (
+            f'expected --workspace absent in lint_command, got {result.lint_command!r}'
+        )
+
     # -- should BAIL (extension outside whitelist) --
 
     def test_rs_plus_ts_bails(self):
