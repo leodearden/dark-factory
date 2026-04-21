@@ -81,24 +81,35 @@ class TestRegisterDrainSignalHandlerNoLoop:
 
 @pytest.mark.skipif(sys.platform == 'win32', reason='SIGUSR1 and loop.add_signal_handler are POSIX-only')
 class TestRegisterDrainSignalHandlerIntegration:
+    """End-to-end signal dispatch tests that send a real SIGUSR1 via os.kill.
+
+    Each test uses asyncio.Runner for clean event-loop lifecycle management (no
+    interaction with the thread's current-loop state or the deprecated event-loop
+    policy API).  The SIGUSR1 handler is restored unconditionally in a try/finally.
+    """
+
     def test_real_sigusr1_dispatch_triggers_drain(self):
         """Integration: a real SIGUSR1 delivered via os.kill reaches harness.drain() through asyncio."""
         stub_harness = MagicMock()
         stub_harness.drain = MagicMock()
 
         prior_handler = signal.getsignal(signal.SIGUSR1)
-        loop = asyncio.new_event_loop()
         try:
             async def _run() -> None:
+                # Use an asyncio.Event so the test waits only as long as needed and
+                # fails deterministically on timeout rather than a fixed sleep.
+                drain_called = asyncio.Event()
+                stub_harness.drain.side_effect = lambda: drain_called.set()
+
                 # Must run inside the running loop so asyncio.get_running_loop() resolves.
                 _register_drain_signal_handler(stub_harness)
                 os.kill(os.getpid(), signal.SIGUSR1)
-                # Yield control so asyncio's signal-dispatch machinery (self-pipe read +
-                # call_soon_threadsafe callback) can invoke _handle_drain_signal.
-                await asyncio.sleep(0.05)
+                # Wait for asyncio's signal-dispatch machinery (self-pipe read +
+                # call_soon_threadsafe callback) to invoke _handle_drain_signal.
+                await asyncio.wait_for(drain_called.wait(), timeout=2.0)
 
-            loop.run_until_complete(_run())
+            with asyncio.Runner() as runner:
+                runner.run(_run())
             stub_harness.drain.assert_called_once()
         finally:
-            loop.close()
             signal.signal(signal.SIGUSR1, prior_handler)
