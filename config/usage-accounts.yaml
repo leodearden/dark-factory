@@ -15,6 +15,8 @@ accounts:
     oauth_token_env: CLAUDE_OAUTH_TOKEN_E
   - name: max-c
     oauth_token_env: CLAUDE_OAUTH_TOKEN_C
+  - name: max-b
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_B
   - name: max-d
     oauth_token_env: CLAUDE_OAUTH_TOKEN_D
 #  - name: max-a
