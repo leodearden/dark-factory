@@ -21,6 +21,7 @@ from fused_memory.services.memory_service import MemoryService  # noqa: E402
 if TYPE_CHECKING:
     from fused_memory.middleware.task_interceptor import TaskInterceptor
     from fused_memory.reconciliation.event_queue import EventQueue
+    from fused_memory.reconciliation.harness import ReconciliationHarness
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
 
@@ -362,7 +363,7 @@ async def run_server():
         )
 
 
-def _register_drain_signal_handler(reconciliation_harness: object) -> None:
+def _register_drain_signal_handler(reconciliation_harness: 'ReconciliationHarness') -> None:
     """Register a SIGUSR1 handler that triggers reconciliation_harness.drain().
 
     Uses loop.add_signal_handler (asyncio-safe) when a running event loop is
@@ -385,7 +386,7 @@ def _register_drain_signal_handler(reconciliation_harness: object) -> None:
 
     def _handle_drain_signal() -> None:
         logger.info('SIGUSR1 received — triggering harness drain')
-        reconciliation_harness.drain()  # type: ignore[attr-defined]
+        reconciliation_harness.drain()
 
     try:
         loop.add_signal_handler(signal.SIGUSR1, _handle_drain_signal)
