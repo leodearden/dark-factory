@@ -1080,7 +1080,7 @@ async def test_debug_get_deferred_row_returns_none_for_unknown_id(buf):
 
 @pytest.mark.asyncio
 async def test_migrate_drops_legacy_idx_dw_project(tmp_path):
-    """_migrate() drops the legacy idx_dw_project single-column index.
+    """Regression: _migrate() drops the legacy idx_dw_project single-column index.
 
     Seeds an intermediate-migration schema — deferred_writes already has
     claimed_at and attempt_count (so executescript's CREATE INDEX IF NOT EXISTS
@@ -1092,11 +1092,6 @@ async def test_migrate_drops_legacy_idx_dw_project(tmp_path):
     After initialize():
     * idx_dw_project must be absent.
     * idx_dw_project_claimed (project_id, claimed_at) must be present.
-
-    This test would FAIL if _migrate() never issued DROP INDEX for
-    idx_dw_project (e.g. an implementation that gates the drop on a
-    sqlite_master check but then evaluates the condition incorrectly and skips
-    the DROP for legacy DBs where the index does exist).
     """
     import aiosqlite
 
