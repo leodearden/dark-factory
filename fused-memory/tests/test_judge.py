@@ -792,12 +792,15 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
     call_kwargs = mock_invoke.call_args.kwargs
     call_positional = mock_invoke.call_args.args
 
+    from pathlib import Path
+
     # Essential contract assertions
     assert call_kwargs['prompt'] == 'Evaluate this run.'
     assert call_kwargs['system_prompt'] == JUDGE_SYSTEM_PROMPT
     assert call_kwargs['model'] == config.judge_llm_model
     assert call_kwargs['timeout_seconds'] == float(config.stage_timeout_seconds)
     assert 'output_schema' not in call_kwargs  # judge output is free-form, no schema
+    assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
 
     # usage_gate may be positional or keyword — accept either
     if 'usage_gate' in call_kwargs:
@@ -843,3 +846,49 @@ async def test_call_judge_cli_empty_output_returns_empty_string(mock_journal):
         result = await judge._call_judge_cli('Evaluate this run.')
 
     assert result == ''
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_forwards_cwd_to_invoke_claude_agent(mock_journal, tmp_path):
+    """_call_judge_cli passes cwd all the way through to invoke_claude_agent.
+
+    Step-9 (b): patches invoke_claude_agent (one level below invoke_with_cap_retry)
+    so the kwargs-forwarding layer is exercised.  Omitting cwd from the
+    invoke_with_cap_retry call would raise TypeError at runtime; this test
+    catches that regression without requiring a live Claude CLI.
+    """
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    # Use tmp_path so the cwd Path actually exists on disk.
+    explore_root = str(tmp_path)
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+        explore_codebase_root=explore_root,
+    )
+
+    fake_result = AgentResult(
+        success=True,
+        output='{"severity": "ok"}',
+        session_id='jsess-cwd',
+    )
+
+    # Patch at the level below invoke_with_cap_retry — this exercises the
+    # kwargs-forwarding path that the higher-level mock skips.
+    # usage_gate=None takes the fast path in invoke_with_cap_retry
+    # (single invocation, no cap retry), so the real forwarding code runs.
+    with patch(
+        'shared.cli_invoke.invoke_claude_agent',
+        new_callable=AsyncMock,
+    ) as mock_agent:
+        mock_agent.return_value = fake_result
+
+        judge = Judge(config=config, journal=mock_journal, usage_gate=None)
+        await judge._call_judge_cli('Evaluate this run.')
+
+    mock_agent.assert_called_once()
+    call_kwargs = mock_agent.call_args.kwargs
+    assert call_kwargs['cwd'] == Path(explore_root)
