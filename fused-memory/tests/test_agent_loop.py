@@ -1298,3 +1298,54 @@ async def test_run_threads_serialized_tool_results_into_claude_cli_prompt():
     # [Tool Result: ...] prefix, or subtly reorder fields.
     second_prompt = mock_invoke.call_args_list[1].kwargs['prompt']
     assert second_prompt == '[Tool Result: tc1] (OK)\n{"doubled": 14}'
+
+
+# ---------------------------------------------------------------------------
+# CLI failure path surfaces stderr + summary in RuntimeError
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_failure_surfaces_stderr_and_summary_in_runtime_error():
+    """_call_claude_cli embeds stderr and classify_agent_failure summary in the RuntimeError.
+
+    Red test (step-1): the current code raises RuntimeError(f'Claude CLI agent
+    failed: {result.output[:500]}').  When result.output is '' (typical for a CLI
+    crash), that message is empty and the diagnostic signal lives in result.stderr.
+    This test asserts that after the fix the RuntimeError message:
+      - starts with 'Claude CLI agent failed:'
+      - contains the stderr content ('ENOENT: claude CLI binary not found')
+      - contains 'error_unexpected' (the subtype, present in diagnostic_detail)
+    """
+    from shared.cli_invoke import AgentResult
+
+    fake_gate = MagicMock()
+    config = _make_cli_config()
+
+    failing_result = AgentResult(
+        success=False,
+        output='',
+        stderr='ENOENT: claude CLI binary not found at /usr/local/bin/claude',
+        subtype='error_unexpected',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = failing_result
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test system prompt',
+            tools={},
+            usage_gate=fake_gate,
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await agent._call_claude_cli(prompt='hi', tools=[])
+
+    msg = str(excinfo.value)
+    assert msg.startswith('Claude CLI agent failed:'), f'unexpected prefix: {msg!r}'
+    assert 'ENOENT: claude CLI binary not found' in msg, f'stderr missing from: {msg!r}'
+    assert "subtype='error_unexpected'" in msg, f'subtype missing from: {msg!r}'
