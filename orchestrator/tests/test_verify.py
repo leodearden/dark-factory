@@ -946,6 +946,38 @@ class TestApplyCargoScopePolyglotGuard:
         assert '-p foo' in (result.test_command or '')
         assert '--workspace' not in (result.test_command or '')
 
+    def test_rs_plus_cargo_lock_scopes(self):
+        """.rs + Cargo.lock must scope to crate (Cargo.lock is Rust-only, not a polyglot indicator)."""
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'Cargo.lock'])
+        assert '-p foo' in (result.test_command or ''), (
+            f'expected -p foo in test_command, got {result.test_command!r}'
+        )
+        assert '--workspace' not in (result.test_command or ''), (
+            f'expected --workspace absent in test_command, got {result.test_command!r}'
+        )
+        assert '-p foo' in (result.lint_command or ''), (
+            f'expected -p foo in lint_command, got {result.lint_command!r}'
+        )
+        assert '--workspace' not in (result.lint_command or ''), (
+            f'expected --workspace absent in lint_command, got {result.lint_command!r}'
+        )
+
+    def test_rs_plus_rust_toolchain_scopes(self):
+        """.rs + rust-toolchain must scope to crate (rustup pin file, no extension)."""
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'rust-toolchain'])
+        assert '-p foo' in (result.test_command or ''), (
+            f'expected -p foo in test_command, got {result.test_command!r}'
+        )
+        assert '--workspace' not in (result.test_command or ''), (
+            f'expected --workspace absent in test_command, got {result.test_command!r}'
+        )
+        assert '-p foo' in (result.lint_command or ''), (
+            f'expected -p foo in lint_command, got {result.lint_command!r}'
+        )
+        assert '--workspace' not in (result.lint_command or ''), (
+            f'expected --workspace absent in lint_command, got {result.lint_command!r}'
+        )
+
     # -- should BAIL (extension outside whitelist) --
 
     def test_rs_plus_ts_bails(self):
@@ -969,6 +1001,19 @@ class TestApplyCargoScopePolyglotGuard:
     def test_rs_plus_unknown_ext_bails(self):
         """.rs + .rst bails to --workspace (unknown extension, conservative)."""
         result = self._call_scoped(['crates/foo/src/lib.rs', 'notes.rst'])
+        assert result.test_command == 'cargo test --workspace'
+        assert result.lint_command == 'cargo clippy --workspace'
+
+    def test_rs_plus_uv_lock_bails(self):
+        """.rs + uv.lock bails to --workspace.
+
+        The ``.lock`` extension is NOT globally safe — it is shared by non-Rust
+        ecosystem lockfiles (``yarn.lock``, ``poetry.lock``, ``uv.lock``).  Only
+        ``Cargo.lock`` by exact filename is allowed; a bare ``.lock`` suffix must
+        keep triggering the polyglot guard so that chained commands such as
+        ``cargo test --workspace && uv run pytest`` are not silently under-protected.
+        """
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'uv.lock'])
         assert result.test_command == 'cargo test --workspace'
         assert result.lint_command == 'cargo clippy --workspace'
 
