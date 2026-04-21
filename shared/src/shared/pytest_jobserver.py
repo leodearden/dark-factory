@@ -23,12 +23,31 @@ import logging
 import os
 import select
 import signal
+from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECS = 60.0
 _fd: int | None = None
 _tok: bytes | None = None
+
+
+def _acquire_timeout_secs(env: Mapping[str, str] | None = None) -> float:
+    """Return the configured FIFO-wait timeout in seconds.
+
+    Reads ``PYTEST_JOBSERVER_TIMEOUT`` from *env* (defaults to ``os.environ``).
+    Returns ``_DEFAULT_TIMEOUT_SECS`` when the key is absent, empty, or not a
+    valid float.
+    """
+    if env is None:
+        env = os.environ
+    raw = env.get('PYTEST_JOBSERVER_TIMEOUT', '')
+    if not raw:
+        return _DEFAULT_TIMEOUT_SECS
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        return _DEFAULT_TIMEOUT_SECS
 
 
 def _release() -> None:
@@ -49,11 +68,7 @@ def pytest_configure(config) -> None:
         return
     try:
         _fd = os.open(path, os.O_RDWR)
-        raw = os.environ.get('PYTEST_JOBSERVER_TIMEOUT', '')
-        try:
-            timeout = float(raw) if raw else _DEFAULT_TIMEOUT_SECS
-        except (ValueError, TypeError):
-            timeout = _DEFAULT_TIMEOUT_SECS
+        timeout = _acquire_timeout_secs()
         ready, _, _ = select.select([_fd], [], [], timeout)
         if not ready:
             logger.warning(
