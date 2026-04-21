@@ -1,6 +1,5 @@
 """Tests for the LLM-as-judge module (judge.py)."""
 
-import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -770,6 +769,7 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(
     implementation because invoke_with_cap_retry is not imported in judge.py yet.
     """
     from unittest.mock import AsyncMock
+
     from shared.cli_invoke import AgentResult
 
     fake_gate = MagicMock()

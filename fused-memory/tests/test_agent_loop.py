@@ -1056,7 +1056,9 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     `.tool_calls`, and `.session_id`.
     """
     from unittest.mock import AsyncMock
+
     from shared.cli_invoke import AgentResult
+
     from fused_memory.reconciliation.agent_loop import CLAUDE_CLI_RESPONSE_SCHEMA
 
     fake_gate = MagicMock()
@@ -1087,7 +1089,7 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
             usage_gate=fake_gate,
         )
 
-        result = await agent._call_claude_cli(prompt='hi', tools=tools)
+        result = await agent._call_claude_cli(prompt='hi', tools=tools)  # type: ignore[arg-type]
 
     mock_invoke.assert_called_once()
     call_kwargs = mock_invoke.call_args.kwargs
@@ -1124,7 +1126,8 @@ async def test_call_claude_cli_threads_session_id_across_turns():
     integration. First call must use resume_session_id=None; second call must use
     resume_session_id='sess-A' (the session_id returned by the first call).
     """
-    from unittest.mock import AsyncMock, call as mock_call
+    from unittest.mock import AsyncMock
+
     from shared.cli_invoke import AgentResult
 
     fake_gate = MagicMock()
