@@ -1216,3 +1216,105 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
     mock_agent.assert_called_once()
     call_kwargs = mock_agent.call_args.kwargs
     assert call_kwargs['cwd'] == Path(explore_root)
+
+
+@pytest.mark.asyncio
+async def test_run_threads_serialized_tool_results_into_claude_cli_prompt():
+    """AgentLoop.run() serializes tool results into the claude_cli prompt on the second turn.
+
+    Closes the coverage gap left by task 881, which deleted
+    test_claude_cli_provider_first_call and test_claude_cli_provider_resume.
+    Those tests exercised the full run() -> _call_llm -> _serialize_tool_results
+    -> _call_claude_cli pipeline.  The replacement tests added by task 881 only
+    exercise _call_claude_cli directly (skipping _call_llm) or
+    _serialize_tool_results as a static method — none of them pass through the
+    claude_cli branch at agent_loop.py:227-230:
+
+        elif provider == 'claude_cli':
+            content = messages[-1]['content']
+            prompt = content if isinstance(content, str) else self._serialize_tool_results(content)
+            return await self._call_claude_cli(prompt=prompt, tools=tool_schemas)
+
+    A regression that passed the raw tool_results list, swapped the OK/ERROR
+    marker, or dropped the isinstance guard would pass every existing test.
+    This test guards that contract.
+    """
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    fake_gate = MagicMock()
+    config = _make_cli_config()
+
+    async def my_tool_fn(x: int = 0):
+        return {'doubled': x * 2}
+
+    tools = {
+        'my_tool': ToolDefinition(
+            name='my_tool',
+            description='Doubles the input',
+            parameters={'type': 'object', 'properties': {'x': {'type': 'integer'}}},
+            function=my_tool_fn,
+        ),
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Signals completion',
+            parameters={'type': 'object', 'properties': {'report': {'type': 'object'}}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    # Turn 1: agent calls my_tool with x=7
+    first_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-1',
+        structured_output={
+            'thinking': 'calling my_tool',
+            'tool_calls': [{'id': 'tc1', 'name': 'my_tool', 'input': {'x': 7}}],
+        },
+    )
+    # Turn 2: agent calls stage_complete with the result
+    second_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-1',
+        structured_output={
+            'thinking': 'done',
+            'tool_calls': [
+                {'id': 'tc2', 'name': 'stage_complete', 'input': {'report': {'result': 14}}}
+            ],
+        },
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.side_effect = [first_result, second_result]
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='You are a test agent.',
+            tools=tools,
+            terminal_tool='stage_complete',
+            usage_gate=fake_gate,
+        )
+
+        result, _journal = await agent.run('initial payload')
+
+    # Terminal tool input round-trips through run()
+    assert result == {'report': {'result': 14}}
+
+    # Both LLM turns must have fired
+    assert mock_invoke.call_count == 2
+
+    # Turn 1: initial string payload is passed straight through (_call_llm string branch)
+    first_prompt = mock_invoke.call_args_list[0].kwargs['prompt']
+    assert first_prompt == 'initial payload'
+
+    # Turn 2: tool_results list is serialized via _serialize_tool_results
+    # before being passed as prompt — the core contract this test guards.
+    second_prompt = mock_invoke.call_args_list[1].kwargs['prompt']
+    assert '[Tool Result: tc1] (OK)' in second_prompt
+    assert '"doubled": 14' in second_prompt
