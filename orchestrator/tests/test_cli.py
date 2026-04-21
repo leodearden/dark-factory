@@ -122,8 +122,8 @@ class TestForceExitWatchdog:
         # Use 0.2s timeout and a 2.0s wait to give ample margin under CI load;
         # disarm() sets the event immediately so the watchdog thread returns
         # without calling os._exit even if the scheduler is delayed.
-        disarm = _force_exit_after_delay(timeout_secs=0.2)
-        disarm()
+        handle = _force_exit_after_delay(timeout_secs=0.2)
+        handle.disarm()
         time.sleep(2.0)
 
         assert calls == [], f'expected no calls, got {calls}'
@@ -288,7 +288,12 @@ class TestRunArmsWatchdog:
 
         def fake_force_exit(timeout_secs, exit_code=137, *, stream=None):
             state['armed_with'] = timeout_secs
-            return fake_disarm
+            # A non-started thread satisfies the WatchdogHandle.thread type
+            # structurally without actually spawning a background thread.
+            fake_thread = threading.Thread(
+                target=lambda: None, name='fake-shutdown-watchdog', daemon=True,
+            )
+            return cli_module.WatchdogHandle(disarm=fake_disarm, thread=fake_thread)
 
         return state, fake_force_exit
 

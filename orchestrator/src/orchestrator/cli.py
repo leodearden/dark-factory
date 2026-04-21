@@ -9,6 +9,7 @@ import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 import click
 from dotenv import load_dotenv
@@ -27,12 +28,18 @@ DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 SHUTDOWN_WATCHDOG_TIMEOUT_SECS = 30
 
 
+class WatchdogHandle(NamedTuple):
+    """Return value of :func:`_force_exit_after_delay`."""
+    disarm: Callable[[], None]
+    thread: threading.Thread
+
+
 def _force_exit_after_delay(
     timeout_secs: float,
     exit_code: int = 137,
     *,
     stream=None,
-) -> Callable[[], None]:
+) -> 'WatchdogHandle':
     """Arm a daemon-thread watchdog that force-exits if not disarmed in time.
 
     Spawns a daemon thread (cannot block interpreter shutdown) that waits
@@ -48,11 +55,13 @@ def _force_exit_after_delay(
     Exit code 137 = 128 + 9 (SIGKILL convention); distinguishable from
     130 (SIGINT) and 143 (SIGTERM) in operator logs.
 
-    Returns a *disarm* callable.  Calling it (even multiple times) is safe
-    and prevents the watchdog from firing.  The disarm handle is provided for
-    tests and future use; the orchestrator intentionally never disarms so the
-    watchdog guards interpreter shutdown (atexit callbacks +
-    ``threading._shutdown()`` joining non-daemon threads).
+    Returns a ``WatchdogHandle`` (NamedTuple of ``disarm: Callable[[], None]``
+    and ``thread: threading.Thread``).  Calling ``handle.disarm()`` (even
+    multiple times) is safe and prevents the watchdog from firing.
+    ``handle.thread`` is exposed for tests that want to ``join()`` after
+    assertions to guarantee the watchdog thread has exited; the orchestrator
+    intentionally never disarms so the watchdog guards interpreter shutdown
+    (atexit callbacks + ``threading._shutdown()`` joining non-daemon threads).
     """
     _event = threading.Event()
 
@@ -95,7 +104,7 @@ def _force_exit_after_delay(
         """Signal the watchdog not to fire."""
         _event.set()
 
-    return disarm
+    return WatchdogHandle(disarm=disarm, thread=thread)
 
 
 def _make_cancel_handler(main_task, logger):
