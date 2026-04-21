@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from shared.cli_invoke import invoke_with_cap_retry
+from shared.cli_invoke import classify_agent_failure, invoke_with_cap_retry
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
 
@@ -33,7 +33,10 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment, files_to_modules, normalize_lock
-from orchestrator.task_status import TERMINAL_STATUSES
+from orchestrator.task_status import (
+    TERMINAL_STATUSES,
+    WORKFLOW_PRESERVE_STATUSES,
+)
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import run_scoped_verification
 
@@ -130,6 +133,7 @@ class WorkflowState(enum.Enum):
 
 class WorkflowOutcome(enum.Enum):
     DONE = 'done'
+    PLANNED = 'planned'
     BLOCKED = 'blocked'
     REQUEUED = 'requeued'
     ESCALATED = 'escalated'
@@ -353,6 +357,7 @@ class TaskWorkflow:
                     # and plan.json was never stamped — entering EXECUTE would
                     # spuriously fire the plan-overwrite escalation.
                     return plan_outcome
+                # WorkflowOutcome.PLANNED falls through to execute/verify/review.
 
             # ── Ghost-loop early exit (before EXECUTE) ─────────────
             # If the worktree HEAD is already reachable from main, the
@@ -728,10 +733,14 @@ class TaskWorkflow:
             result = await self._invoke(ARCHITECT, prompt, self.worktree)
 
             if not result.success:
-                logger.error(f'Task {self.task_id}: architect failed: {result.output[:200]}')
+                cls = classify_agent_failure(result)
+                logger.error(
+                    'Task %s: architect failed (%s): %s',
+                    self.task_id, cls.kind.value, cls.summary,
+                )
                 return await self._mark_blocked(
-                    'Planning failed: architect invocation failed',
-                    detail=f'Architect output:\n{result.output[:2000]}',
+                    f'Planning failed: {cls.summary}',
+                    detail=cls.diagnostic_detail,
                 )
 
             # Detect anomalous premature exit: succeeded but suspiciously
@@ -755,15 +764,16 @@ class TaskWorkflow:
 
         assert result is not None  # range(2) always executes at least once
         if not self.plan:
-            logger.error(f'Task {self.task_id}: architect produced no plan.json')
-            assert result is not None  # range(2) is always non-empty; loop always assigns result
+            cls = classify_agent_failure(result)
+            logger.error(
+                'Task %s: architect produced no plan.json (%s): %s',
+                self.task_id, cls.kind.value, cls.summary,
+            )
             return await self._mark_blocked(
-                'Planning failed: no plan.json produced',
+                f'Planning failed: no plan.json produced — {cls.summary}',
                 detail=(
-                    f'Architect succeeded but did not write .task/plan.json\n'
-                    f'turns={result.turns}, cost=${result.cost_usd:.2f}, '
-                    f'duration={result.duration_ms}ms\n'
-                    f'Architect output:\n{result.output[:2000]}'
+                    'Architect succeeded but did not write .task/plan.json\n'
+                    f'{cls.diagnostic_detail}'
                 ),
             )
 
@@ -844,7 +854,7 @@ class TaskWorkflow:
             f'{len(self.plan.get("prerequisites", []))} prerequisites, '
             f'{len(self.plan.get("steps", []))} steps'
         )
-        return WorkflowOutcome.DONE
+        return WorkflowOutcome.PLANNED
 
     async def _validate_prerequisites_or_block(
         self, context: str
@@ -2204,10 +2214,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             await self._escalation_event.wait()
 
         # Check for level-1 re-escalation (steward gave up)
-        pending_l1 = self.escalation_queue.get_by_task(
-            self.task_id, status='pending', level=1,
-        )
-        if pending_l1:
+        if self.escalation_queue.has_open_l1(self.task_id):
+            pending_l1 = self.escalation_queue.get_by_task(
+                self.task_id, status='pending', level=1,
+            )
             raise _StewardReescalated(pending_l1)
 
         # Collect resolutions
@@ -2383,10 +2393,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         if self.escalation_queue and not skip_escalation:
             # Don't create a duplicate if level-1 already pending
-            existing_l1 = self.escalation_queue.get_by_task(
-                self.task_id, status='pending', level=1,
-            )
-            if not existing_l1:
+            if not self.escalation_queue.has_open_l1(self.task_id):
                 from escalation.models import Escalation
 
                 esc = Escalation(
@@ -2410,6 +2417,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         data={'escalation_id': esc.id, 'category': 'task_failure',
                               'severity': 'blocking', 'summary': reason[:200]},
                     )
+
+            # Snapshot status before steward runs so we can distinguish the
+            # 'blocked' _mark_blocked just wrote from a 'blocked' the steward
+            # deliberately re-asserts.  The preserve check below is positioned
+            # after the branch-merged fast-path so it can't clobber a genuine
+            # DONE transition, and after the L1 guard so ESCALATED still wins.
+            cached_before_steward = self.scheduler.get_cached_status(self.task_id)
 
             # Give the steward a chance to resolve the escalation
             await self._ensure_steward_started()
@@ -2436,6 +2450,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     self.task_id, status='pending', level=0,
                 )
                 if not remaining:
+                    # Guard: if the steward escalated to L1 (human-only),
+                    # leave the task's status untouched and exit.  L0-empty
+                    # alone does not mean "all clear" — an open L1 signals
+                    # that the steward handed off.
+                    if self.escalation_queue.has_open_l1(self.task_id):
+                        logger.info(
+                            'Task %s: L1 escalation open — steward handed '
+                            'off to human; leaving status as-is and exiting',
+                            self.task_id,
+                        )
+                        return WorkflowOutcome.ESCALATED
+
                     # Guard: if the task's branch is already merged to
                     # main, transition to DONE instead of re-queueing —
                     # prevents stash_failed / advance_main ghost loops.
@@ -2492,6 +2518,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                                 'proceeding with requeue',
                                 self.task_id, exc_info=True,
                             )
+
+                    # Preserve steward-set deferred/blocked.  If the cached
+                    # status differs from the snapshot taken before the
+                    # steward ran, AND the new value is in the preserve set,
+                    # the steward deliberately chose that status — do not
+                    # auto-requeue on top of it.  Note: 'blocked' == 'blocked'
+                    # (our own write, steward left alone) still falls through
+                    # here so the historic requeue behaviour is preserved for
+                    # the "steward resolved L0 without touching status" path.
+                    cached_after_steward = self.scheduler.get_cached_status(
+                        self.task_id,
+                    )
+                    if (
+                        cached_after_steward in WORKFLOW_PRESERVE_STATUSES
+                        and cached_after_steward != cached_before_steward
+                    ):
+                        logger.info(
+                            'Task %s: steward set status to %s — preserving, '
+                            'skipping auto-requeue',
+                            self.task_id, cached_after_steward,
+                        )
+                        return WorkflowOutcome.BLOCKED
 
                     if self.event_store:
                         self.event_store.emit(

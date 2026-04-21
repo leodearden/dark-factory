@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import json
 import logging
 import os
@@ -49,8 +50,11 @@ CAP_HIT_RESUME_PROMPT = (
 
 __all__ = [
     'CAP_HIT_RESUME_PROMPT',
+    'AgentFailureClass',
+    'AgentFailureKind',
     'AgentResult',
     'AllAccountsCappedException',
+    'classify_agent_failure',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
 ]
@@ -113,6 +117,122 @@ class AgentResult:
     timed_out: bool = False
     schema_salvaged: bool = False
     api_error_status: int | None = None
+
+
+class AgentFailureKind(enum.StrEnum):
+    """Classification of an AgentResult.  SUCCESS is the non-failure case."""
+
+    SUCCESS = 'success'
+    MAX_TURNS = 'max_turns'
+    EMPTY_OUTPUT = 'empty_output'
+    API_ERROR = 'api_error'
+    TIMED_OUT = 'timed_out'
+    STRUCTURAL = 'structural'
+    UNKNOWN = 'unknown'
+
+
+@dataclass
+class AgentFailureClass:
+    """Operator-facing classification of a failed (or succeeded-via-salvage) agent run.
+
+    - ``kind``: machine-readable classification; drives retry/escalation policy.
+    - ``summary``: one-line description suitable for escalation summaries.
+    - ``diagnostic_detail``: multi-line dump of every diagnostic signal
+      available on the underlying ``AgentResult``, for escalation detail
+      fields.  Never silently drops signals, even when ``kind == UNKNOWN``.
+    """
+
+    kind: AgentFailureKind
+    summary: str
+    diagnostic_detail: str
+
+
+def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
+    """Classify an ``AgentResult`` for the steward / escalation layer.
+
+    The decision rules fire in order — the first match wins:
+
+    1. ``result.success`` → ``SUCCESS``.
+    2. ``result.timed_out`` → ``TIMED_OUT``.
+    3. ``result.subtype == 'error_max_turns'`` → ``MAX_TURNS``
+       (high ``turns`` + non-zero ``output_tokens`` but empty ``output``).
+    4. ``result.api_error_status`` set → ``API_ERROR`` (includes status code
+       in the summary; transient — worth retrying against another account).
+    5. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
+       (may be transient).
+    6. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
+       subtype looked like an error but a valid structured output was
+       recovered; callers usually treat as success).
+    7. otherwise → ``UNKNOWN``.
+
+    ``diagnostic_detail`` always includes: subtype, turns, cost_usd,
+    duration_ms, timed_out, api_error_status, output length, last 500 chars
+    of stdout output, and last 500 chars of stderr.
+    """
+    tail_out = result.output[-500:] if result.output else ''
+    tail_err = result.stderr[-500:] if result.stderr else ''
+    diagnostic_detail = (
+        f'subtype={result.subtype!r}\n'
+        f'turns={result.turns}\n'
+        f'cost_usd={result.cost_usd}\n'
+        f'duration_ms={result.duration_ms}\n'
+        f'timed_out={result.timed_out}\n'
+        f'api_error_status={result.api_error_status}\n'
+        f'len(output)={len(result.output)}\n'
+        f'output (last 500 chars):\n{tail_out}\n'
+        f'stderr (last 500 chars):\n{tail_err}'
+    )
+
+    if result.success:
+        return AgentFailureClass(
+            kind=AgentFailureKind.SUCCESS,
+            summary='agent succeeded',
+            diagnostic_detail=diagnostic_detail,
+        )
+    if result.timed_out:
+        return AgentFailureClass(
+            kind=AgentFailureKind.TIMED_OUT,
+            summary=(
+                f'agent timed out after {result.duration_ms}ms '
+                f'({result.turns} turns)'
+            ),
+            diagnostic_detail=diagnostic_detail,
+        )
+    if result.subtype == 'error_max_turns':
+        return AgentFailureClass(
+            kind=AgentFailureKind.MAX_TURNS,
+            summary=(
+                f'agent hit max_turns ({result.turns} turns, '
+                f'output_tokens={result.output_tokens})'
+            ),
+            diagnostic_detail=diagnostic_detail,
+        )
+    if result.api_error_status is not None:
+        return AgentFailureClass(
+            kind=AgentFailureKind.API_ERROR,
+            summary=f'agent API error: HTTP {result.api_error_status}',
+            diagnostic_detail=diagnostic_detail,
+        )
+    if result.subtype == 'error_empty_output':
+        return AgentFailureClass(
+            kind=AgentFailureKind.EMPTY_OUTPUT,
+            summary='agent returned empty output',
+            diagnostic_detail=diagnostic_detail,
+        )
+    if result.schema_salvaged:
+        return AgentFailureClass(
+            kind=AgentFailureKind.STRUCTURAL,
+            summary='agent succeeded via schema salvage',
+            diagnostic_detail=diagnostic_detail,
+        )
+    return AgentFailureClass(
+        kind=AgentFailureKind.UNKNOWN,
+        summary=(
+            f'agent failed: subtype={result.subtype!r} '
+            f'(no specific failure signal)'
+        ),
+        diagnostic_detail=diagnostic_detail,
+    )
 
 
 def _to_token_count(v: int | None) -> int | None:

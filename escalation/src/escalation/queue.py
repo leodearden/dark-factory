@@ -98,6 +98,14 @@ class EscalationQueue:
                 continue
         return results
 
+    def has_open_l1(self, task_id: str) -> bool:
+        """Return True when the task has at least one pending level-1 escalation.
+
+        Level-1 is the handed-to-human tier: the presence of one signals that
+        the workflow must not auto-requeue the task — a human will unblock.
+        """
+        return bool(self.get_by_task(task_id, status='pending', level=1))
+
     def get_pending(self) -> list[Escalation]:
         """Get all pending escalations."""
         results = []

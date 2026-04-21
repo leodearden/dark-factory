@@ -9,6 +9,15 @@ from __future__ import annotations
 
 TERMINAL_STATUSES: frozenset[str] = frozenset({'done', 'cancelled'})
 
+# Statuses the workflow must NOT overwrite after the steward has set them.
+# Superset of TERMINAL_STATUSES: also includes 'deferred' and 'blocked',
+# which the steward uses to signal "leave this alone, human will sort it".
+# TERMINAL_STATUSES remains the FSM guard for set_task_status transitions —
+# this is a separate concern (workflow self-overwrite after steward).
+WORKFLOW_PRESERVE_STATUSES: frozenset[str] = frozenset(
+    {'done', 'cancelled', 'deferred', 'blocked'}
+)
+
 
 def is_valid_transition(from_status: str | None, to_status: str) -> bool:
     """Return True if the status transition is allowed.

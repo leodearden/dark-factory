@@ -21,6 +21,12 @@ escalation:
   queue_dir: "data/escalations"
   port: 8102
 
+# Per-role turn budgets. Raising the architect budget is a direct response to
+# silent max_turns exits on large-scope tasks: the architect now has headroom
+# to verify premises and produce a plan without the CLI truncating mid-tool-call.
+max_turns:
+  architect: 120
+
 # Usage cap / multi-account failover
 usage_cap:
   enabled: true
