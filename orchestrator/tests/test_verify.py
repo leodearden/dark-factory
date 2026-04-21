@@ -1004,6 +1004,19 @@ class TestApplyCargoScopePolyglotGuard:
         assert result.test_command == 'cargo test --workspace'
         assert result.lint_command == 'cargo clippy --workspace'
 
+    def test_rs_plus_uv_lock_bails(self):
+        """.rs + uv.lock bails to --workspace.
+
+        The ``.lock`` extension is NOT globally safe — it is shared by non-Rust
+        ecosystem lockfiles (``yarn.lock``, ``poetry.lock``, ``uv.lock``).  Only
+        ``Cargo.lock`` by exact filename is allowed; a bare ``.lock`` suffix must
+        keep triggering the polyglot guard so that chained commands such as
+        ``cargo test --workspace && uv run pytest`` are not silently under-protected.
+        """
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'uv.lock'])
+        assert result.test_command == 'cargo test --workspace'
+        assert result.lint_command == 'cargo clippy --workspace'
+
     # -- baseline regression --
 
     def test_only_rs_still_scopes(self):

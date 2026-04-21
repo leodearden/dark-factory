@@ -210,7 +210,7 @@ def _apply_cargo_scope(
     - *task_files* contains no ``.rs`` files (no Rust source touched)
     - any non-``.rs`` file has an extension outside the safe config/data whitelist
       (``.toml``, ``.yaml``, ``.yml``, ``.json``, ``.md``) AND its basename is not
-      in the filename allowlist (``Cargo.lock``); this prevents under-protecting
+      in the filename allowlist (``Cargo.lock``, ``rust-toolchain``); this prevents under-protecting
       the non-Rust side of polyglot tasks with chained commands such as
       ``cargo test --workspace && uv run pytest``
     - the workspace has no discoverable crates
@@ -234,9 +234,10 @@ def _apply_cargo_scope(
     # from being silently skipped when only some crates are scoped.
     non_rs = [f for f in task_files if not f.endswith('.rs')]
     for f in non_rs:
+        p = Path(f)
         if (
-            Path(f).suffix.lower() not in _CARGO_SCOPE_SAFE_NON_RS_EXTS
-            and Path(f).name not in _CARGO_SCOPE_SAFE_NON_RS_NAMES
+            p.suffix.lower() not in _CARGO_SCOPE_SAFE_NON_RS_EXTS
+            and p.name not in _CARGO_SCOPE_SAFE_NON_RS_NAMES
         ):
             return mc
 
