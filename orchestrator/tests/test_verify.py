@@ -9,6 +9,7 @@ import pytest
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
     _apply_cargo_scope,
+    _extract_cause_hint,
     _run_cmd,
     _scope_cargo_workspace,
     run_scoped_verification,
@@ -1176,3 +1177,112 @@ class TestScopeCargoWorkspaceRewrite:
         assert '--exclude' not in rewritten, (
             f'--exclude token found in rewritten segment: {rewritten!r}'
         )
+
+
+class TestExtractCauseHint:
+    """Tests for the ``_extract_cause_hint(output: str) -> str`` helper.
+
+    These tests will *fail* until step 3 implements the helper — the import
+    itself triggers an ImportError on the current codebase.
+    """
+
+    # (a) cargo/clippy surface error → first ``error: …`` line returned
+    def test_cargo_error_line_returned(self):
+        """A cargo/clippy ``error: …`` line is detected and returned."""
+        output = (
+            'Compiling my-crate v0.1.0\n'
+            'error: --exclude can only be used together with --workspace\n'
+            'error[E0308]: mismatched types\n'
+            'Other noise\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == 'error: --exclude can only be used together with --workspace', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    # (b) Rust test runner FAILED line
+    def test_rust_test_failed_line_returned(self):
+        """A ``test my::mod::it FAILED`` line is detected and returned."""
+        output = (
+            'running 3 tests\n'
+            'test my::mod::passes ... ok\n'
+            'test my::mod::it FAILED\n'
+            'test my::mod::another ... ok\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == 'test my::mod::it FAILED', f'Unexpected hint: {hint!r}'
+
+    # (c) our own timeout message
+    def test_timeout_message_returned(self):
+        """``Command timed out after Ns: …`` is returned directly."""
+        output = 'Command timed out after 1800s: cargo test --workspace'
+        hint = _extract_cause_hint(output)
+        assert hint == 'Command timed out after 1800s: cargo test --workspace', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    # (d) flock/wrapper ERROR: line
+    def test_flock_error_line_returned(self):
+        """A flock/wrapper ``ERROR: …`` line is detected and returned."""
+        output = (
+            'Starting cargo test...\n'
+            'ERROR: cargo-test-occt-gated.sh: timed out\n'
+            'Cleanup done.\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == 'ERROR: cargo-test-occt-gated.sh: timed out', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    # (e) npm ERR! / npm error
+    def test_npm_err_line_returned(self):
+        """An ``npm ERR!`` line is detected and returned."""
+        output = (
+            'running build...\n'
+            'npm ERR! code ELIFECYCLE\n'
+            'npm ERR! errno 1\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert 'npm ERR!' in hint, f'Unexpected hint: {hint!r}'
+
+    def test_npm_error_lowercase_returned(self):
+        """An ``npm error …`` line (lowercase) is also detected."""
+        output = 'npm error peer dep missing: react@^18\n'
+        hint = _extract_cause_hint(output)
+        assert 'npm error' in hint, f'Unexpected hint: {hint!r}'
+
+    # (f) fallback — last non-blank line when no pattern matches
+    def test_fallback_last_nonblank_line(self):
+        """When no pattern matches, the last non-blank line is returned."""
+        output = 'Line one\nLine two\nLine three\n\n'
+        hint = _extract_cause_hint(output)
+        assert hint == 'Line three', f'Unexpected hint: {hint!r}'
+
+    # (g) empty / whitespace-only input → returns ''
+    def test_empty_input_returns_empty_string(self):
+        """Empty input returns ''."""
+        assert _extract_cause_hint('') == ''
+
+    def test_whitespace_only_returns_empty_string(self):
+        """Whitespace-only input returns ''."""
+        assert _extract_cause_hint('   \n\n\t  \n') == ''
+
+    # (h) a 500-char line is truncated to 200 chars
+    def test_long_line_truncated_to_200_chars(self):
+        """A line longer than 200 chars is capped at 200 characters."""
+        long_line = 'error: ' + 'x' * 500
+        output = long_line + '\n'
+        hint = _extract_cause_hint(output)
+        assert len(hint) == 200, f'Expected 200 chars, got {len(hint)}: {hint!r}'
+        assert hint == long_line[:200]
+
+    # (i) when multiple ``error:`` lines exist, the FIRST one is returned
+    def test_first_error_line_returned_when_multiple(self):
+        """When multiple ``error: …`` lines exist, the first one wins."""
+        output = (
+            'error: first error here\n'
+            'error: second error here\n'
+            'error: third error here\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == 'error: first error here', f'Unexpected hint: {hint!r}'
