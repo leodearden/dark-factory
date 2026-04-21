@@ -143,8 +143,10 @@ class TestForceExitWatchdog:
             time.sleep(0.05)
 
         output = stream.getvalue()
-        # Sentinel header must be present
-        assert 'SHUTDOWN WATCHDOG FIRED' in output, (
+        # Sentinel header must be present — match the full happy-path string so
+        # a silent fall-through into the except branch (which emits a different
+        # sentinel) is caught rather than masked by the shorter prefix.
+        assert 'SHUTDOWN WATCHDOG FIRED — process hung after asyncio.run() returned' in output, (
             f'sentinel missing from dump:\n{output!r}'
         )
         # The main thread should appear in the dump
@@ -191,6 +193,46 @@ class TestForceExitWatchdog:
         output = stream.getvalue()
         assert 'SHUTDOWN WATCHDOG FIRED (diagnostic dump failed)' in output, (
             f'fallback sentinel missing from dump-failure output:\n{output!r}'
+        )
+
+
+    def test_fallback_write_failure_still_fires_exit(self, monkeypatch):
+        """os._exit(137) is called even when both the dump AND the fallback write fail.
+
+        The watchdog comment explicitly promises: "Wrapped in its own try/except
+        so a stream-write failure still falls through to os._exit".  This test
+        locks in that doubly-defensive contract by making traceback.format_stack
+        *and* stream.write both raise unconditionally.  If the nested try/except
+        is ever removed, this test fails before the force-exit guarantee is silently
+        dropped.
+        """
+        calls = []
+        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+
+        # Simulate partial interpreter shutdown where traceback internals are broken.
+        def _raise_on_format(*args, **kwargs):
+            raise RuntimeError('simulated shutdown tear-down of traceback module')
+
+        monkeypatch.setattr(traceback_module, 'format_stack', _raise_on_format)
+
+        # A stream whose write() always raises — exercises the inner try/except that
+        # wraps the fallback sentinel write.
+        class _BrokenStream:
+            def write(self, _s):
+                raise OSError('simulated torn-down stderr')
+
+            def flush(self):
+                raise OSError('simulated torn-down stderr')
+
+        _force_exit_after_delay(timeout_secs=0.05, stream=_BrokenStream())
+
+        # Poll with deadline — os._exit must fire even when the fallback write also fails.
+        deadline = time.monotonic() + 5.0
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        assert calls == [137], (
+            f'expected os._exit(137) even when fallback write fails, got {calls}'
         )
 
 
