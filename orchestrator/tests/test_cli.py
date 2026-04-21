@@ -400,3 +400,65 @@ class TestRunArmsWatchdog:
             f"expected armed_with={SHUTDOWN_WATCHDOG_TIMEOUT_SECS} after asyncio.run returned, "
             f"got {state['armed_with']}"
         )
+
+    def test_report_emitted_before_watchdog_armed(self, monkeypatch):
+        """click.echo(report.summary()) must run BEFORE _force_exit_after_delay on normal path.
+
+        On the current (unfixed) code the arm runs before click.echo(report.summary()), so
+        report formatting and stdout I/O are covered by the 30-second timer. Moving the arm
+        after all user-visible work limits the watchdog scope to interpreter shutdown only.
+
+        This test FAILS on current code (arm at line 208 precedes echo at line 209).
+        """
+        events: list[str] = []
+        state = {'armed_with': None}
+
+        def recording_force_exit(timeout_secs, exit_code=137, *, stream=None):
+            state['armed_with'] = timeout_secs
+            events.append('arm')
+            return lambda: None
+
+        monkeypatch.setattr(cli_module, '_force_exit_after_delay', recording_force_exit)
+
+        original_echo = cli_module.click.echo
+
+        def recording_echo(msg=None, **kwargs):
+            if msg == 'all done':
+                events.append('echo_summary')
+            return original_echo(msg, **kwargs)
+
+        monkeypatch.setattr(cli_module.click, 'echo', recording_echo)
+
+        fake_config = MagicMock()
+        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+
+        fake_harness = MagicMock()
+        fake_report = MagicMock()
+        fake_report.blocked = 0
+        fake_report.summary.return_value = 'all done'
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+
+        def fake_asyncio_run(coro):
+            coro.close()
+            return fake_report
+
+        monkeypatch.setattr(cli_module.asyncio, 'run', fake_asyncio_run)
+
+        CliRunner().invoke(main, ['run', '--config', '/dev/null'])
+
+        assert 'echo_summary' in events, (
+            "click.echo(report.summary()) was never called — can't check ordering"
+        )
+        assert 'arm' in events, (
+            '_force_exit_after_delay was never called — watchdog not armed at all'
+        )
+        echo_idx = events.index('echo_summary')
+        arm_idx = events.index('arm')
+        assert echo_idx < arm_idx, (
+            f'click.echo(report.summary()) must run BEFORE _force_exit_after_delay, '
+            f'but got order: {events!r}'
+        )
+        # Arm must still happen (just after user-visible work).
+        assert state['armed_with'] == SHUTDOWN_WATCHDOG_TIMEOUT_SECS, (
+            f"expected armed_with={SHUTDOWN_WATCHDOG_TIMEOUT_SECS}, got {state['armed_with']}"
+        )
