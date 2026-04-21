@@ -640,6 +640,35 @@ class EventBuffer:
             for row in rows
         ]
 
+    async def delete_deferred_write(self, write_id: str) -> None:
+        """Delete a single deferred write by primary key (no-op if not found)."""
+        async with self._txn() as db:
+            await db.execute('DELETE FROM deferred_writes WHERE id = ?', (write_id,))
+
+    async def release_stale_claims(self, max_age_seconds: float) -> int:
+        """Reset claimed_at to NULL for rows claimed longer ago than max_age_seconds.
+
+        Returns the number of rows re-queued.  Log at INFO when non-zero so
+        operators can observe recovery events.
+        """
+        cutoff_iso = datetime.fromtimestamp(
+            datetime.now(UTC).timestamp() - max_age_seconds,
+            tz=UTC,
+        ).isoformat()
+        async with self._txn() as db:
+            cursor = await db.execute(
+                'UPDATE deferred_writes SET claimed_at = NULL'
+                ' WHERE claimed_at IS NOT NULL AND claimed_at < ?',
+                (cutoff_iso,),
+            )
+            rowcount = cursor.rowcount
+        if rowcount:
+            logger.info(
+                f'release_stale_claims: re-queued {rowcount} deferred write(s)'
+                f' (cutoff={cutoff_iso})'
+            )
+        return rowcount
+
     async def pop_deferred_writes(self, project_id: str) -> list[dict]:
         """Atomically pop all deferred writes for a project.
 
