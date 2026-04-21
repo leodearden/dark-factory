@@ -201,6 +201,26 @@ class ModuleLockTable:
         if modules:
             logger.info(f'Task {task_id} released locks: {list(modules)}')
 
+    def release_subset(self, task_id: str, modules: list[str]) -> list[str]:
+        """Drop a subset of the task's held modules. Returns the normalized
+        modules actually released (may be empty). Removes the task's entry
+        entirely when no held modules remain so downstream iteration over
+        ``_held`` behaves the same as after a full ``release``.
+        """
+        held = self._held.get(task_id)
+        if not held:
+            return []
+        depth = self._config.lock_depth
+        to_drop = {normalize_lock(m, depth) for m in modules} & held
+        if not to_drop:
+            return []
+        held.difference_update(to_drop)
+        if not held:
+            del self._held[task_id]
+        released = sorted(to_drop)
+        logger.info(f'Task {task_id} released subset: {released}')
+        return released
+
     def try_acquire_additional(self, task_id: str, additional: list[str]) -> bool:
         """Non-blocking attempt to expand lock set for a task."""
         depth = self._config.lock_depth
@@ -843,20 +863,31 @@ class Scheduler:
         current: list[str],
         needed: list[str],
     ) -> bool:
-        """Handle plan discovering wider blast radius.
+        """Handle plan refining blast radius (widening, narrowing, or shift).
 
-        1. Try acquire additional locks
-        2. If success: return True (proceed)
-        3. If fail: update task with new modules, reset to pending, release current locks
+        1. Try acquire any additional locks (needed − current)
+        2. On success, release any stale locks (current − needed) so other
+           tasks can acquire modules the refined plan no longer touches
+        3. On acquire failure: update task with new modules, reset to pending,
+           release current locks
         """
         depth = self.config.lock_depth
-        current_normalized = [normalize_lock(m, depth) for m in current]
-        needed_normalized = [normalize_lock(m, depth) for m in needed]
-        additional = [m for m in needed_normalized if m not in current_normalized]
-        if not additional:
+        current_set = {normalize_lock(m, depth) for m in current}
+        needed_set = {normalize_lock(m, depth) for m in needed}
+        additional = sorted(needed_set - current_set)
+        stale = sorted(current_set - needed_set)
+        if not additional and not stale:
             return True
 
-        if self.lock_table.try_acquire_additional(task_id, additional):
+        if not additional or self.lock_table.try_acquire_additional(task_id, additional):
+            if stale:
+                released = self.lock_table.release_subset(task_id, stale)
+                if released and self.event_store:
+                    self.event_store.emit(
+                        EventType.lock_released,
+                        task_id=task_id,
+                        data={'modules': released, 'reason': 'plan_refinement'},
+                    )
             logger.info(f'Task {task_id} expanded to modules: {needed}')
             return True
 
@@ -865,7 +896,7 @@ class Scheduler:
             f'Task {task_id} needs modules {needed} but locks unavailable. Requeuing.'
         )
         # Cache expanded modules in memory so _get_modules uses them on retry
-        self._module_cache[task_id] = needed_normalized
+        self._module_cache[task_id] = sorted(needed_set)
         updated = await self.update_task(task_id, {'modules': needed})
         if not updated:
             logger.warning(
