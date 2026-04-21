@@ -220,10 +220,7 @@ class AgentLoop:
             return await self._call_openai(messages, tool_schemas)
         elif provider == 'claude_cli':
             content = messages[-1]['content']
-            if isinstance(content, str):
-                prompt = content
-            else:
-                prompt = self._serialize_tool_results(content)
+            prompt = content if isinstance(content, str) else self._serialize_tool_results(content)
             return await self._call_claude_cli(prompt=prompt, tools=tool_schemas)
         else:
             raise ValueError(f'Unsupported agent LLM provider: {provider}')
@@ -326,7 +323,7 @@ class AgentLoop:
                 )
         return '\n\n'.join(parts)
 
-    async def _call_claude_cli(self, prompt: str, tools: list[ToolParam]) -> '_CLIResponseAdapter':
+    async def _call_claude_cli(self, prompt: str, tools: list[ToolParam]) -> _CLIResponseAdapter:
         """Delegate to shared.cli_invoke.invoke_with_cap_retry.
 
         Multi-turn is handled by passing ``resume_session_id`` on subsequent
