@@ -10,6 +10,7 @@ query each project's runs.db in parallel and merge the results.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -138,9 +139,13 @@ async def get_cost_by_account(
 ) -> dict[str, dict]:
     """Per-account cost summary with cap status.
 
-    Returns {account_name: {spend, invocations, cap_events, last_cap, status}}.
-    *status* is 'capped' if the most recent account_event is 'cap_hit' with no
-    subsequent 'resumed'; otherwise 'active'.
+    Returns {account_name: {spend, invocations, cap_events, last_cap, status,
+                            resets_at}}.
+    *status* is 'capped' when the latest in-window ``cap_hit`` has no subsequent
+    ``resumed`` event; otherwise 'active'. Other event types (``auth_failed``,
+    ``failover``, ``near_cap``, ``auth_resumed``) do not affect cap status.
+    *resets_at* is the parsed cap-reset ISO timestamp from the latest cap_hit's
+    details payload (or None when unknown / not capped).
     """
     since = _cutoff(days)
 
@@ -154,27 +159,33 @@ async def get_cost_by_account(
             (since,),
         )
 
-        # Cap event counts and most-recent event per account.
-        # Use a CTE with ROW_NUMBER() OVER (...) to rank events per account once
-        # (single-pass), then LEFT JOIN to retrieve the most-recent event_type.
-        # Use MAX(CASE WHEN event_type='cap_hit' ...) so last_cap_at only holds
-        # cap_hit timestamps (never resumed). Both CTE and outer WHERE use the
-        # same since cutoff so status is derived from in-window events only.
+        # Per-account cap / resumed timestamps plus the latest cap_hit's
+        # details payload (for resets_at extraction).
+        #
+        # latest_cap picks the newest cap_hit row per account and carries its
+        # `details` field forward. The outer query computes per-account:
+        #   - cap_count: how many cap_hits in the window
+        #   - last_cap_at: timestamp of the most recent cap_hit
+        #   - last_resumed_at: timestamp of the most recent 'resumed' event
+        #     (used to decide whether the last cap is still in effect)
+        # Status comparison uses only 'cap_hit'/'resumed' — unrelated events
+        # like auth_failed/failover must not flip a capped account to active.
         evt_rows = await db.execute_fetchall(
-            'WITH latest AS ( '
-            '  SELECT account_name, event_type, '
+            'WITH latest_cap AS ( '
+            '  SELECT account_name, details, '
             '         ROW_NUMBER() OVER '
             '           (PARTITION BY account_name ORDER BY created_at DESC) AS rn '
             '    FROM account_events '
-            '   WHERE created_at >= ? '
+            "   WHERE event_type = 'cap_hit' AND created_at >= ? "
             ') '
             'SELECT ae.account_name, '
             "       SUM(CASE WHEN ae.event_type = 'cap_hit' THEN 1 ELSE 0 END) AS cap_count, "
             "       MAX(CASE WHEN ae.event_type = 'cap_hit' THEN ae.created_at END) AS last_cap_at, "
-            '       le.event_type AS last_event_type '
+            "       MAX(CASE WHEN ae.event_type = 'resumed' THEN ae.created_at END) AS last_resumed_at, "
+            '       lc.details AS last_cap_details '
             '  FROM account_events ae '
-            '  LEFT JOIN latest le '
-            '    ON ae.account_name = le.account_name AND le.rn = 1 '
+            '  LEFT JOIN latest_cap lc '
+            '    ON ae.account_name = lc.account_name AND lc.rn = 1 '
             ' WHERE ae.created_at >= ? '
             ' GROUP BY ae.account_name',
             (since, since),
@@ -184,10 +195,20 @@ async def get_cost_by_account(
         caps: dict[str, dict] = {}
         for row in evt_rows:
             account_name = row['account_name']
+            last_cap_at = row['last_cap_at']
+            last_resumed_at = row['last_resumed_at']
+            # Capped iff a cap_hit exists in window with no later 'resumed'.
+            is_capped = last_cap_at is not None and (
+                last_resumed_at is None or last_cap_at > last_resumed_at
+            )
+            resets_at = (
+                _extract_resets_at(row['last_cap_details']) if is_capped else None
+            )
             caps[account_name] = {
                 'cap_events': row['cap_count'] or 0,
-                'last_cap': row['last_cap_at'],  # NULL when no cap_hit in window
-                'status': 'capped' if row['last_event_type'] == 'cap_hit' else 'active',
+                'last_cap': last_cap_at,  # NULL when no cap_hit in window
+                'status': 'capped' if is_capped else 'active',
+                'resets_at': resets_at,
             }
 
         result: dict[str, dict] = {}
@@ -195,7 +216,7 @@ async def get_cost_by_account(
             account_name = row['account_name']
             cap_info = caps.get(
                 account_name,
-                {'cap_events': 0, 'last_cap': None, 'status': 'active'},
+                {'cap_events': 0, 'last_cap': None, 'status': 'active', 'resets_at': None},
             )
             result[account_name] = {
                 'spend': row['spend'] or 0.0,
@@ -203,6 +224,7 @@ async def get_cost_by_account(
                 'cap_events': cap_info['cap_events'],
                 'last_cap': cap_info['last_cap'],
                 'status': cap_info['status'],
+                'resets_at': cap_info['resets_at'],
             }
 
         # Second pass: emit cap-only accounts (cap events but no invocations).
@@ -216,10 +238,33 @@ async def get_cost_by_account(
                     'cap_events': cap_info['cap_events'],
                     'last_cap': cap_info['last_cap'],
                     'status': cap_info['status'],
+                    'resets_at': cap_info['resets_at'],
                 }
         return result
 
     return await with_db(db, _query, {})
+
+
+def _extract_resets_at(details: str | None) -> str | None:
+    """Return the ISO resets_at string from a cap_hit details payload.
+
+    Legacy events (persisted before usage_gate started writing resets_at) return
+    None and the UI shows a dash. No reason-string parsing here: the source of
+    truth is the shared parser in usage_gate; duplicating it in the dashboard
+    invites drift.
+    """
+    if not details:
+        return None
+    try:
+        payload = json.loads(details)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get('resets_at')
+    if not isinstance(value, str) or not value:
+        return None
+    return value
 
 # ---------------------------------------------------------------------------
 # 4. Cost by role
@@ -514,7 +559,8 @@ async def aggregate_cost_by_account(
     summed.  Status uses a conservative one-way latch: ``'capped'`` if *any*
     source reports capped (the per-DB function doesn't expose the resumed
     timestamp, so we can't determine global ordering).
-    ``last_cap`` takes the most recent timestamp.
+    ``last_cap`` takes the most recent timestamp. ``resets_at`` is taken from
+    the DB whose ``last_cap`` wins (i.e. the latest cap_hit globally).
     """
     results = await asyncio.gather(*(get_cost_by_account(db, days=days) for db in dbs))
     merged: dict[str, dict] = {}
@@ -529,6 +575,9 @@ async def aggregate_cost_by_account(
                 m['cap_events'] += info['cap_events']
                 if info['last_cap'] and (not m['last_cap'] or info['last_cap'] > m['last_cap']):
                     m['last_cap'] = info['last_cap']
+                    # resets_at is meaningful only when paired with its cap_hit,
+                    # so it travels with the winning last_cap.
+                    m['resets_at'] = info.get('resets_at')
                 if info['status'] == 'capped':
                     m['status'] = 'capped'
     return merged

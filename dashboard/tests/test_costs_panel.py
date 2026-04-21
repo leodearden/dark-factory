@@ -56,6 +56,7 @@ _MOCK_BY_ACCOUNT = {
         'cap_events': 1,
         'last_cap': '2026-03-30T10:00:00+00:00',
         'status': 'capped',
+        'resets_at': None,
     },
     'account-B': {
         'spend': 3.20,
@@ -63,6 +64,7 @@ _MOCK_BY_ACCOUNT = {
         'cap_events': 0,
         'last_cap': None,
         'status': 'active',
+        'resets_at': None,
     },
 }
 
@@ -661,6 +663,40 @@ class TestChartCanvases:
         with _patch_cost_data():
             html = client.get('/costs/partials/by-account').text
         assert 'new Chart' in html
+
+    def test_by_account_renders_uncaps_in_column(self, client):
+        """The account table exposes an 'Uncaps In' column populated for
+        capped rows via the timeuntil filter."""
+        from datetime import UTC, datetime, timedelta
+
+        # +30s padding avoids sub-second clock drift crossing the hour
+        # boundary between timeuntil's now() and the test's now().
+        reset_iso = (datetime.now(UTC) + timedelta(hours=4, seconds=30)).isoformat()
+        mock = {
+            'capped-acct': {
+                'spend': 1.0, 'invocations': 5, 'cap_events': 1,
+                'last_cap': '2026-04-20T10:00:00+00:00',
+                'status': 'capped', 'resets_at': reset_iso,
+            },
+        }
+        with _patch_cost_data(by_account=mock):
+            html = client.get('/costs/partials/by-account').text
+        assert 'Uncaps In' in html
+        assert 'in 4h' in html
+        # Header line shows earliest reset across capped accounts.
+        assert 'Next uncap' in html
+
+    def test_by_account_hides_next_uncap_when_all_active(self, client):
+        """No capped accounts → the Next uncap header line is omitted."""
+        mock = {
+            'active-acct': {
+                'spend': 1.0, 'invocations': 5, 'cap_events': 0,
+                'last_cap': None, 'status': 'active', 'resets_at': None,
+            },
+        }
+        with _patch_cost_data(by_account=mock):
+            html = client.get('/costs/partials/by-account').text
+        assert 'Next uncap' not in html
 
     def test_by_role_canvas_id_prefix(self, client):
         """by-role partial uses project-key-derived canvas IDs like costByRoleChart_dark_factory."""

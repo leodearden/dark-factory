@@ -434,7 +434,12 @@ class UsageGate:
             acct.pause_started_at = datetime.now(UTC)
         logger.warning(f'Account {acct.name} CAPPED: {reason}')
         if self._cost_store:
-            self._fire_cost_event(acct.name, 'cap_hit', json.dumps({'reason': reason}))
+            # Persist resets_at alongside reason so the dashboard can surface
+            # per-account uncap ETAs without re-parsing the reason string.
+            details: dict[str, str] = {'reason': reason}
+            if resets_at is not None:
+                details['resets_at'] = resets_at.isoformat()
+            self._fire_cost_event(acct.name, 'cap_hit', json.dumps(details))
         self._start_account_resume_probe(acct)
 
         # If all accounts are now unavailable (capped or auth_failed), close the global gate

@@ -143,6 +143,36 @@ def timeago(value: str | None) -> str:
 
 templates.env.filters['timeago'] = timeago
 
+
+def timeuntil(value: str | None) -> str:
+    """Convert a future ISO timestamp to a human-friendly countdown.
+
+    Returns 'now' when the timestamp is in the past or exactly now.
+    Returns '—' when the input is missing or unparseable, so template cells
+    can render uniformly regardless of source data quality.
+    """
+    if value is None:
+        return '—'
+    try:
+        parsed = parse_utc(value).astimezone(UTC)
+    except (ValueError, TypeError):
+        return '—'
+    delta = parsed - datetime.now(UTC)
+    total_seconds = delta.total_seconds()
+    if total_seconds <= 0:
+        return 'now'
+    total_minutes = int(total_seconds // 60)
+    if total_minutes >= 1440:
+        return f'in {total_minutes // 1440}d'
+    if total_minutes >= 60:
+        return f'in {total_minutes // 60}h {total_minutes % 60}m'
+    if total_minutes == 0:
+        return 'in <1m'
+    return f'in {total_minutes}m'
+
+
+templates.env.filters['timeuntil'] = timeuntil
+
 _TRIGGER_TYPE_MAP = {
     'max_staleness': 'staleness',
     'buffer_size': 'buffer',
@@ -654,9 +684,16 @@ async def costs_partials_by_account(request: Request):
     except Exception as exc:
         logger.warning('Error fetching cost by account: %s', exc)
         by_account = {}
+    # Earliest reset across currently-capped accounts — surfaced as a
+    # header line above the account table.
+    reset_candidates = [
+        d['resets_at'] for d in by_account.values()
+        if d.get('status') == 'capped' and d.get('resets_at')
+    ]
+    next_uncap_at = min(reset_candidates) if reset_candidates else None
     return templates.TemplateResponse(
         request, 'partials/costs/by_account.html',
-        context={'by_account': by_account},
+        context={'by_account': by_account, 'next_uncap_at': next_uncap_at},
     )
 
 

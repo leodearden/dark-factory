@@ -668,6 +668,151 @@ class TestCostByAccount:
             f"expected last_cap={cap_ts!r}, got {mg['last_cap']!r}"
         )
 
+    @pytest.mark.asyncio
+    async def test_unrelated_event_after_cap_hit_stays_capped(self, tmp_path):
+        """cap_hit followed by auth_failed/failover must stay 'capped'.
+
+        Regression: previous logic picked the latest event of ANY type and
+        treated a non-cap_hit latest event as 'active', which wrongly flipped
+        accounts back to active when the only thing that had happened was a
+        later auth failure or failover.  Only a 'resumed' event clears a cap.
+        """
+        db_path = tmp_path / 'post_cap_events.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+
+        now = datetime.now(UTC)
+        cap_ts = (now - timedelta(hours=4)).isoformat()
+        auth_fail_ts = (now - timedelta(hours=2)).isoformat()  # later, non-cap
+        failover_ts = (now - timedelta(hours=1)).isoformat()   # later, non-cap
+
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                ('test-acc', 'cap_hit', 'proj', 'r1', None, cap_ts),
+                ('test-acc', 'auth_failed', 'proj', 'r1', None, auth_fail_ts),
+                ('test-acc', 'failover', 'proj', 'r1', None, failover_ts),
+            ],
+        )
+        conn.execute(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('r1', 't1', 'proj', 'test-acc', 'claude-opus-4-5', 'implementer',
+             1.0, 0,
+             (now - timedelta(hours=5)).isoformat(),
+             (now - timedelta(hours=1)).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn)
+
+        ta = result['test-acc']
+        assert ta['status'] == 'capped', (
+            'cap_hit with later auth_failed/failover but no resumed must stay capped'
+        )
+        assert ta['last_cap'] == cap_ts
+
+    @pytest.mark.asyncio
+    async def test_resets_at_extracted_from_details(self, tmp_path):
+        """resets_at JSON field in cap_hit details is surfaced on the row."""
+        db_path = tmp_path / 'resets_at.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+
+        now = datetime.now(UTC)
+        cap_ts = (now - timedelta(hours=1)).isoformat()
+        reset_iso = (now + timedelta(hours=3)).isoformat()
+        details = '{"reason": "You\'ve hit your limit", "resets_at": "' + reset_iso + '"}'
+
+        conn.execute(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            ('test-acc', 'cap_hit', 'proj', 'r1', details, cap_ts),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn)
+
+        ta = result['test-acc']
+        assert ta['status'] == 'capped'
+        assert ta['resets_at'] == reset_iso
+
+    @pytest.mark.asyncio
+    async def test_resets_at_none_for_legacy_details(self, tmp_path):
+        """Legacy cap_hit rows without resets_at field expose resets_at=None."""
+        db_path = tmp_path / 'legacy_details.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+
+        now = datetime.now(UTC)
+        cap_ts = (now - timedelta(hours=1)).isoformat()
+        # Legacy shape: only reason, no resets_at
+        legacy_details = '{"reason": "You\'ve hit your limit"}'
+
+        conn.execute(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            ('test-acc', 'cap_hit', 'proj', 'r1', legacy_details, cap_ts),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn)
+
+        ta = result['test-acc']
+        assert ta['status'] == 'capped'
+        assert ta['resets_at'] is None
+
+    @pytest.mark.asyncio
+    async def test_resets_at_none_when_active(self, tmp_path):
+        """An account that ended 'active' exposes resets_at=None even if its
+        latest cap_hit carried a resets_at — the value is only meaningful for
+        currently-capped accounts.
+        """
+        db_path = tmp_path / 'active_resets_at.db'
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(COSTS_SCHEMA)
+
+        now = datetime.now(UTC)
+        cap_ts = (now - timedelta(hours=3)).isoformat()
+        resumed_ts = (now - timedelta(hours=1)).isoformat()  # later → active
+        reset_iso = (now + timedelta(hours=3)).isoformat()
+        details = '{"reason": "limit", "resets_at": "' + reset_iso + '"}'
+
+        conn.executemany(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                ('test-acc', 'cap_hit', 'proj', 'r1', details, cap_ts),
+                ('test-acc', 'resumed', 'proj', 'r1', None, resumed_ts),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as aconn:
+            aconn.row_factory = aiosqlite.Row
+            result = await get_cost_by_account(aconn)
+
+        ta = result['test-acc']
+        assert ta['status'] == 'active'
+        assert ta['resets_at'] is None
+
 
 # ---------------------------------------------------------------------------
 # Tests: get_cost_by_role
