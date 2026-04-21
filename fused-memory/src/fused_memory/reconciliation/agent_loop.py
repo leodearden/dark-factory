@@ -335,33 +335,45 @@ class AgentLoop:
         Multi-turn is handled by passing ``resume_session_id`` on subsequent
         calls; ``_call_llm`` is responsible for serialising tool results into
         the next turn's prompt before calling this method.
-        """
-        result: AgentResult = await invoke_with_cap_retry(
-            usage_gate=self._usage_gate,
-            label=f'Reconciliation agent ({self.config.agent_llm_model})',
-            prompt=prompt,
-            system_prompt=self._build_cli_system_prompt(tools),
-            output_schema=CLAUDE_CLI_RESPONSE_SCHEMA,
-            disallowed_tools=['*'],
-            model=self.config.agent_llm_model,
-            # max_turns=1: AgentLoop.run() drives multi-turn externally by calling
-            # _call_claude_cli again with resume_session_id.  A single CLI
-            # invocation only needs one assistant turn (schema tool-use → JSON
-            # response happens within the same turn when --json-schema is used).
-            max_turns=1,
-            permission_mode='bypassPermissions',
-            timeout_seconds=float(self.config.agent_cli_timeout_seconds),
-            resume_session_id=self._cli_session_id,
-            cwd=Path(self.config.explore_codebase_root),
-        )
 
-        if not result.success:
-            # schema_salvaged=True implies success=True (cli_invoke.py:749-751),
-            # so `not result.success` is the complete failure guard.
-            cls = classify_agent_failure(result)
-            raise RuntimeError(
-                f'Claude CLI agent failed: {cls.summary}\n{cls.diagnostic_detail}'
+        ``_cli_session_id`` is cleared to ``None`` before any exception propagates
+        out of this method — whether from ``invoke_with_cap_retry`` itself (e.g.
+        ``AllAccountsCappedException`` after the retry loop gives up) or from the
+        ``not result.success`` failure guard below — so that a subsequent
+        reconciliation retry on the same ``AgentLoop`` instance does not attempt to
+        ``--resume`` an abandoned or capped session.
+        """
+        try:
+            result: AgentResult = await invoke_with_cap_retry(
+                usage_gate=self._usage_gate,
+                label=f'Reconciliation agent ({self.config.agent_llm_model})',
+                prompt=prompt,
+                system_prompt=self._build_cli_system_prompt(tools),
+                output_schema=CLAUDE_CLI_RESPONSE_SCHEMA,
+                disallowed_tools=['*'],
+                model=self.config.agent_llm_model,
+                # max_turns=1: AgentLoop.run() drives multi-turn externally by calling
+                # _call_claude_cli again with resume_session_id.  A single CLI
+                # invocation only needs one assistant turn (schema tool-use → JSON
+                # response happens within the same turn when --json-schema is used).
+                max_turns=1,
+                permission_mode='bypassPermissions',
+                timeout_seconds=float(self.config.agent_cli_timeout_seconds),
+                resume_session_id=self._cli_session_id,
+                cwd=Path(self.config.explore_codebase_root),
             )
+
+            if not result.success:
+                # schema_salvaged=True implies success=True (cli_invoke.py:749-751),
+                # so `not result.success` is the complete failure guard.
+                cls = classify_agent_failure(result)
+                raise RuntimeError(
+                    f'Claude CLI agent failed: {cls.summary}\n{cls.diagnostic_detail}'
+                )
+        except Exception:
+            # Clear stale session id so callers that retry don't --resume an abandoned session.
+            self._cli_session_id = None
+            raise
 
         self._cli_session_id = result.session_id or self._cli_session_id
         self.llm_call_count += 1
