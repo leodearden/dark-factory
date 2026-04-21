@@ -831,3 +831,64 @@ class TestRunScopedVerificationSkipsUntouched:
         assert test_calls == 3, (
             f'default should retry per config; got {test_calls} invocations'
         )
+
+
+class TestApplyCargoScopePolyglotGuard:
+    """_apply_cargo_scope polyglot-diff guard: whitelist safe non-.rs extensions.
+
+    A diff mixing .rs files with executable source (.py, .ts, .js, .go) or
+    unknown extensions must bail to --workspace so chained non-Rust commands
+    (e.g. ``cargo test --workspace && uv run pytest``) are not under-protected.
+    A diff mixing .rs with safe config/data files (.toml, .yaml, .yml, .json,
+    .md) should still scope to the affected crates.
+    """
+
+    # -----------------------------------------------------------------------
+    # Shared helpers
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _make_mc() -> ModuleConfig:
+        return ModuleConfig(
+            prefix='crates',
+            test_command='cargo test --workspace',
+            lint_command='cargo clippy --workspace',
+        )
+
+    @staticmethod
+    def _call_scoped(task_files: list[str]) -> ModuleConfig:
+        """Call _apply_cargo_scope with mocked workspace, primed to scope if guard passes."""
+        from unittest.mock import patch
+
+        from orchestrator.verify import _apply_cargo_scope
+
+        mc = TestApplyCargoScopePolyglotGuard._make_mc()
+        with (
+            patch(
+                'orchestrator.verify.discover_workspace_crates',
+                return_value={'crates/foo': 'foo'},
+            ),
+            patch('orchestrator.verify.files_to_crates', return_value=['foo']),
+        ):
+            return _apply_cargo_scope(
+                mc,
+                task_files=task_files,
+                project_root=Path('/fake/root'),
+                scope_cargo_enabled=True,
+            )
+
+    # -----------------------------------------------------------------------
+    # TDD driver — must FAIL on pre-guard code, PASS after step-2 impl
+    # -----------------------------------------------------------------------
+
+    def test_rs_plus_py_bails_to_workspace(self):
+        """.rs + .py diff must return mc unchanged (polyglot executable guard)."""
+        result = self._call_scoped(
+            ['crates/foo/src/lib.rs', 'orchestrator/src/foo.py']
+        )
+        assert result.test_command == 'cargo test --workspace', (
+            f'expected unchanged --workspace, got {result.test_command!r}'
+        )
+        assert result.lint_command == 'cargo clippy --workspace', (
+            f'expected unchanged --workspace, got {result.lint_command!r}'
+        )
