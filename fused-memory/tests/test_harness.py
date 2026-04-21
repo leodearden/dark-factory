@@ -2277,3 +2277,77 @@ class TestConfigureTaskSync:
             inspect.getattr_static(ReconciliationHarness, '_configure_task_sync'),
             staticmethod,
         ), '_configure_task_sync must be a @staticmethod on ReconciliationHarness'
+
+
+# ── Deferred-write replay durability ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_replay_deletes_successful_and_preserves_failed(
+    journal, event_buffer, mock_memory_service
+):
+    """_replay_deferred_writes deletes only successful writes; failed write stays in SQLite."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # add_memory raises only when content == 'bad'
+    call_log: list[str] = []
+
+    async def add_memory_side_effect(**kwargs):
+        content = kwargs.get('content', '')
+        call_log.append(content)
+        if content == 'bad':
+            raise RuntimeError('boom')
+
+    mock_memory_service.add_memory = AsyncMock(side_effect=add_memory_side_effect)
+
+    # Defer three writes
+    await event_buffer.defer_write('test-project', 'good-1', 'cat', {})
+    await event_buffer.defer_write('test-project', 'bad', 'cat', {})
+    await event_buffer.defer_write('test-project', 'good-3', 'cat', {})
+
+    # Should not raise — per-item exception is swallowed
+    await harness._replay_deferred_writes('test-project')
+
+    # add_memory was called for every claimed row
+    assert len(call_log) == 3
+    assert set(call_log) == {'good-1', 'bad', 'good-3'}
+
+    # Only the failed write remains in SQLite
+    # Re-queue any still-claimed rows so we can re-claim them
+    await event_buffer.release_stale_claims(0.0)
+    remaining = await event_buffer.claim_deferred_writes('test-project')
+    assert len(remaining) == 1
+    assert remaining[0]['content'] == 'bad'
+
+
+@pytest.mark.asyncio
+async def test_replay_propagates_cancellation_and_preserves_claims(
+    journal, event_buffer, mock_memory_service
+):
+    """CancelledError propagates out of _replay_deferred_writes; unprocessed rows survive."""
+    import asyncio
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    call_count = 0
+
+    async def add_memory_side_effect(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise asyncio.CancelledError()
+
+    mock_memory_service.add_memory = AsyncMock(side_effect=add_memory_side_effect)
+
+    await event_buffer.defer_write('test-project', 'a', 'cat', {})
+    await event_buffer.defer_write('test-project', 'b', 'cat', {})
+    await event_buffer.defer_write('test-project', 'c', 'cat', {})
+
+    with pytest.raises(asyncio.CancelledError):
+        await harness._replay_deferred_writes('test-project')
+
+    # 'a' was successfully written and deleted; 'b' and 'c' remain claimed
+    await event_buffer.release_stale_claims(0.0)
+    remaining = await event_buffer.claim_deferred_writes('test-project')
+    assert len(remaining) == 2
+    assert [r['content'] for r in remaining] == ['b', 'c']
