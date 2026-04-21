@@ -56,10 +56,16 @@ CREATE TABLE IF NOT EXISTS deferred_writes (
     category TEXT NOT NULL,
     metadata TEXT NOT NULL DEFAULT '{}',
     agent_id TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    claimed_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_dw_project ON deferred_writes(project_id);
+CREATE INDEX IF NOT EXISTS idx_dw_project_claimed ON deferred_writes(project_id, claimed_at);
 """
+
+# Maximum number of replay attempts before a deferred write is treated as a poison-pill
+# and permanently dropped (logged at ERROR).
+_MAX_DEFERRED_WRITE_ATTEMPTS: int = 5
 
 
 class EventBuffer:
@@ -108,7 +114,58 @@ class EventBuffer:
         await self._db.execute('PRAGMA synchronous=NORMAL')
         await self._db.executescript(_BUFFER_SCHEMA_SQL)
         await self._db.commit()
+        # Idempotent migration: add claimed_at column for pre-existing DBs.
+        await self._migrate()
         logger.info(f'EventBuffer initialized (db={self._db_path}, instance={self.instance_id})')
+
+    async def _migrate(self) -> None:
+        """Add new columns to pre-existing DBs (idempotent).
+
+        Each ALTER TABLE is:
+        * Guarded by a PRAGMA table_info check so we only run it when the column
+          is missing.
+        * Wrapped in try/except to survive the narrow race where two processes both
+          call initialize() on the same file concurrently — SQLite's ALTER TABLE
+          has no IF NOT EXISTS syntax, so the second writer would otherwise fail
+          with 'duplicate column name'.
+        """
+        db = self._require_db()
+        async with db.execute('PRAGMA table_info(deferred_writes)') as cursor:
+            columns = {row['name'] async for row in cursor}
+
+        # Drop the now-redundant single-column project index.  idx_dw_project_claimed
+        # (project_id, claimed_at) is a strict superset that covers every query
+        # idx_dw_project covered, so keeping both wastes write IOPS and disk.
+        await db.execute('DROP INDEX IF EXISTS idx_dw_project')
+
+        # Add claimed_at if missing.
+        if 'claimed_at' not in columns:
+            try:
+                await db.execute('ALTER TABLE deferred_writes ADD COLUMN claimed_at TEXT')
+                await db.execute(
+                    'CREATE INDEX IF NOT EXISTS idx_dw_project_claimed'
+                    ' ON deferred_writes(project_id, claimed_at)'
+                )
+                logger.info('EventBuffer: migrated deferred_writes — added claimed_at column')
+            except Exception as exc:
+                if 'duplicate column name' not in str(exc).lower():
+                    raise
+                logger.debug('EventBuffer: claimed_at already exists (concurrent init)')
+
+        # Add attempt_count if missing — tracks poison-pill detection across restarts.
+        if 'attempt_count' not in columns:
+            try:
+                await db.execute(
+                    'ALTER TABLE deferred_writes'
+                    ' ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0'
+                )
+                logger.info('EventBuffer: migrated deferred_writes — added attempt_count column')
+            except Exception as exc:
+                if 'duplicate column name' not in str(exc).lower():
+                    raise
+                logger.debug('EventBuffer: attempt_count already exists (concurrent init)')
+
+        await db.commit()
 
     def _require_db(self) -> aiosqlite.Connection:
         if self._db is None:
@@ -581,31 +638,47 @@ class EventBuffer:
         )
         return write_id
 
-    async def pop_deferred_writes(self, project_id: str) -> list[dict]:
-        """Atomically pop all deferred writes for a project.
+    async def claim_deferred_writes(self, project_id: str) -> list[dict]:
+        """Atomically claim all pending (unclaimed) deferred writes for a project.
 
-        Returns list of ``{content, category, metadata, agent_id}`` dicts.
+        Returns list of ``{id, content, category, metadata, agent_id}`` dicts,
+        ordered by created_at ASC.  Claimed rows have ``claimed_at`` set to now
+        and are excluded from subsequent calls until released or deleted.
+
+        **Concurrency note**: the SELECT + UPDATE are issued inside a single
+        writer transaction, which is sufficient when there is at most one
+        concurrent writer per project.  Two processes that both SELECT before
+        either issues the UPDATE would see the same pending rows and both claim
+        them, resulting in duplicate replay.  Correctness relies on the caller
+        holding the per-project reconciliation lock so that only one process
+        replays each project's writes at a time.
         """
-        db = self._require_db()
-        async with db.execute(
-            'SELECT * FROM deferred_writes WHERE project_id = ? ORDER BY created_at',
-            (project_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-
-        if not rows:
-            return []
-
-        ids = [row['id'] for row in rows]
-        placeholders = ','.join('?' for _ in ids)
+        now_iso = datetime.now(UTC).isoformat()
         async with self._txn() as db:
+            # Fetch pending rows inside the transaction
+            async with db.execute(
+                """SELECT id, content, category, metadata, agent_id, created_at
+                   FROM deferred_writes
+                   WHERE project_id = ? AND claimed_at IS NULL
+                   ORDER BY created_at""",
+                (project_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+            if not rows:
+                return []
+
+            # Atomically mark them all as claimed
+            ids = [row['id'] for row in rows]
+            placeholders = ','.join('?' for _ in ids)
             await db.execute(
-                f'DELETE FROM deferred_writes WHERE id IN ({placeholders})',
-                ids,
+                f'UPDATE deferred_writes SET claimed_at = ? WHERE id IN ({placeholders})',
+                [now_iso, *ids],
             )
 
         return [
             {
+                'id': row['id'],
                 'content': row['content'],
                 'category': row['category'],
                 'metadata': json.loads(row['metadata']),
@@ -613,6 +686,78 @@ class EventBuffer:
             }
             for row in rows
         ]
+
+    async def delete_deferred_write(self, write_id: str) -> None:
+        """Delete a single deferred write by primary key (no-op if not found)."""
+        async with self._txn() as db:
+            await db.execute('DELETE FROM deferred_writes WHERE id = ?', (write_id,))
+
+    async def release_stale_claims(self, max_age_seconds: float) -> int:
+        """Reset claimed_at to NULL for rows claimed longer ago than max_age_seconds.
+
+        The comparison is ``<=`` so that ``max_age_seconds=0.0`` is supported as
+        "release everything currently claimed" (any row whose claimed_at is at
+        most *now* qualifies).
+
+        For each re-queued row ``attempt_count`` is incremented.  Rows that have
+        already exhausted ``_MAX_DEFERRED_WRITE_ATTEMPTS`` are treated as
+        poison-pills: they are deleted and logged at ERROR so they cannot cause an
+        unbounded retry loop across restarts.
+
+        Returns the number of rows re-queued (exhausted rows are not counted).
+        """
+        cutoff_iso = datetime.fromtimestamp(
+            datetime.now(UTC).timestamp() - max_age_seconds,
+            tz=UTC,
+        ).isoformat()
+        async with self._txn() as db:
+            # Fetch all stale rows to split recoverable vs. exhausted.
+            async with db.execute(
+                'SELECT id, content, attempt_count FROM deferred_writes'
+                ' WHERE claimed_at IS NOT NULL AND claimed_at <= ?',
+                (cutoff_iso,),
+            ) as cursor:
+                stale = await cursor.fetchall()
+
+            if not stale:
+                return 0
+
+            exhausted = [r for r in stale if r['attempt_count'] >= _MAX_DEFERRED_WRITE_ATTEMPTS]
+            recoverable = [r for r in stale if r['attempt_count'] < _MAX_DEFERRED_WRITE_ATTEMPTS]
+
+            if exhausted:
+                for r in exhausted:
+                    logger.error(
+                        'EventBuffer: deferred write %s exhausted %d replay attempts'
+                        ' — dropping permanently: %.120r',
+                        r['id'],
+                        _MAX_DEFERRED_WRITE_ATTEMPTS,
+                        r['content'],
+                    )
+                placeholders = ','.join('?' * len(exhausted))
+                await db.execute(
+                    f'DELETE FROM deferred_writes WHERE id IN ({placeholders})',
+                    [r['id'] for r in exhausted],
+                )
+
+            rowcount = 0
+            if recoverable:
+                placeholders = ','.join('?' * len(recoverable))
+                cursor = await db.execute(
+                    f'UPDATE deferred_writes'
+                    f' SET claimed_at = NULL, attempt_count = attempt_count + 1'
+                    f' WHERE id IN ({placeholders})',
+                    [r['id'] for r in recoverable],
+                )
+                rowcount = cursor.rowcount
+
+        if rowcount:
+            logger.info(
+                'release_stale_claims: re-queued %d deferred write(s) (cutoff=%s)',
+                rowcount,
+                cutoff_iso,
+            )
+        return rowcount
 
     # ── Queries ────────────────────────────────────────────────────────
 

@@ -633,8 +633,140 @@ async def test_cleanup_drained(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_defer_write_and_pop(buf):
-    """Deferred write should be retrievable via pop."""
+async def test_claim_deferred_writes_returns_pending_with_ids(buf):
+    """claim_deferred_writes should return pending rows with ids, and second call returns []."""
+    await buf.defer_write(
+        project_id='test-project',
+        content='write-one',
+        category='observations_and_summaries',
+        metadata={'k': 'v1'},
+        agent_id='agent-1',
+    )
+    await buf.defer_write(
+        project_id='test-project',
+        content='write-two',
+        category='entities_and_relations',
+        metadata={'k': 'v2'},
+        agent_id=None,
+    )
+
+    claimed = await buf.claim_deferred_writes('test-project')
+    assert len(claimed) == 2
+    expected_keys = {'id', 'content', 'category', 'metadata', 'agent_id'}
+    for item in claimed:
+        assert set(item.keys()) == expected_keys
+
+    contents = {item['content'] for item in claimed}
+    assert contents == {'write-one', 'write-two'}
+
+    item_one = next(i for i in claimed if i['content'] == 'write-one')
+    assert item_one['category'] == 'observations_and_summaries'
+    assert item_one['metadata'] == {'k': 'v1'}
+    assert item_one['agent_id'] == 'agent-1'
+    assert item_one['id']  # non-empty
+
+    item_two = next(i for i in claimed if i['content'] == 'write-two')
+    assert item_two['agent_id'] is None
+
+    # Second call returns [] — rows are now in-progress (claimed_at IS NOT NULL)
+    second = await buf.claim_deferred_writes('test-project')
+    assert second == []
+
+
+@pytest.mark.asyncio
+async def test_claim_deferred_writes_project_isolation_and_ordering(buf):
+    """claim_deferred_writes respects project_id isolation and returns rows oldest-first."""
+    # Insert project-a rows with explicit, deterministic past timestamps so the
+    # ordering assertion cannot flake due to same-microsecond created_at values.
+    base = datetime(2020, 1, 1, tzinfo=UTC)
+    db = buf._require_db()
+    for i, content in enumerate(['a-first', 'a-second', 'a-third']):
+        await db.execute(
+            'INSERT INTO deferred_writes'
+            ' (id, project_id, content, category, metadata, created_at)'
+            " VALUES (?, 'project-a', ?, 'cat', '{}', ?)",
+            (str(uuid.uuid4()), content, (base + timedelta(seconds=i)).isoformat()),
+        )
+    await db.commit()
+
+    # One write to project-b (uses the normal defer_write path)
+    await buf.defer_write('project-b', 'b-only', 'cat', {})
+
+    # Claim project-a — should get exactly 3 rows
+    claimed_a = await buf.claim_deferred_writes('project-a')
+    assert len(claimed_a) == 3
+    assert all(item['content'].startswith('a-') for item in claimed_a)
+    assert [item['content'] for item in claimed_a] == ['a-first', 'a-second', 'a-third']
+
+    # project-b must be unaffected — its row is still pending
+    claimed_b = await buf.claim_deferred_writes('project-b')
+    assert len(claimed_b) == 1
+    assert claimed_b[0]['content'] == 'b-only'
+
+
+@pytest.mark.asyncio
+async def test_delete_deferred_write_removes_only_target(buf):
+    """delete_deferred_write removes exactly the targeted row; others survive."""
+    await buf.defer_write('test-project', 'a', 'cat', {})
+    await buf.defer_write('test-project', 'b', 'cat', {})
+    await buf.defer_write('test-project', 'c', 'cat', {})
+
+    claimed = await buf.claim_deferred_writes('test-project')
+    assert len(claimed) == 3
+
+    # Delete only the middle row
+    middle = next(item for item in claimed if item['content'] == 'b')
+    await buf.delete_deferred_write(middle['id'])
+
+    # Re-queue the still-claimed (non-deleted) rows via release_stale_claims(0)
+    released = await buf.release_stale_claims(0.0)
+    assert released == 2  # 'a' and 'c' were re-queued
+
+    # Re-claim and check exactly 'a' and 'c' remain
+    reclaimed = await buf.claim_deferred_writes('test-project')
+    assert len(reclaimed) == 2
+    assert {item['content'] for item in reclaimed} == {'a', 'c'}
+
+
+@pytest.mark.asyncio
+async def test_release_stale_claims_boundary(buf):
+    """release_stale_claims re-queues old claims but preserves recent ones."""
+    from datetime import UTC, datetime, timedelta
+
+    await buf.defer_write('test-project', 'old', 'cat', {})
+    await buf.defer_write('test-project', 'fresh', 'cat', {})
+
+    # Claim both rows (claimed_at = now)
+    claimed = await buf.claim_deferred_writes('test-project')
+    assert len(claimed) == 2
+
+    # Backdate the 'old' row's claimed_at to 200 seconds ago via direct SQL
+    old_item = next(item for item in claimed if item['content'] == 'old')
+    stale_ts = (datetime.now(UTC) - timedelta(seconds=200)).isoformat()
+    db = buf._require_db()
+    await db.execute(
+        'UPDATE deferred_writes SET claimed_at = ? WHERE id = ?',
+        (stale_ts, old_item['id']),
+    )
+    await db.commit()
+
+    # With 60s cutoff, only the 200s-old claim should be released
+    released = await buf.release_stale_claims(60.0)
+    assert released == 1
+
+    # Re-claim: only the formerly-stale 'old' row is returned (fresh is still claimed)
+    reclaimed = await buf.claim_deferred_writes('test-project')
+    assert len(reclaimed) == 1
+    assert reclaimed[0]['content'] == 'old'
+
+    # Calling again with no additional changes: 0 rows released (fresh is still within 60s)
+    released2 = await buf.release_stale_claims(60.0)
+    assert released2 == 0
+
+
+@pytest.mark.asyncio
+async def test_defer_write_and_claim(buf):
+    """Deferred write should be retrievable via claim."""
     write_id = await buf.defer_write(
         project_id='test-project',
         content='Task X completed',
@@ -644,7 +776,7 @@ async def test_defer_write_and_pop(buf):
     )
     assert write_id  # non-empty string
 
-    writes = await buf.pop_deferred_writes('test-project')
+    writes = await buf.claim_deferred_writes('test-project')
     assert len(writes) == 1
     assert writes[0]['content'] == 'Task X completed'
     assert writes[0]['category'] == 'observations_and_summaries'
@@ -653,36 +785,36 @@ async def test_defer_write_and_pop(buf):
 
 
 @pytest.mark.asyncio
-async def test_pop_deferred_writes_empty(buf):
-    """Pop on empty table returns empty list."""
-    writes = await buf.pop_deferred_writes('test-project')
+async def test_claim_deferred_writes_empty(buf):
+    """Claim on empty table returns empty list."""
+    writes = await buf.claim_deferred_writes('test-project')
     assert writes == []
 
 
 @pytest.mark.asyncio
-async def test_pop_deferred_writes_clears(buf):
-    """Second pop returns empty after first pop consumed all writes."""
+async def test_claim_deferred_writes_clears(buf):
+    """Second claim returns empty after first claim marked all writes in-progress."""
     await buf.defer_write('test-project', 'content1', 'cat1', {})
     await buf.defer_write('test-project', 'content2', 'cat2', {})
 
-    first_pop = await buf.pop_deferred_writes('test-project')
-    assert len(first_pop) == 2
+    first_claim = await buf.claim_deferred_writes('test-project')
+    assert len(first_claim) == 2
 
-    second_pop = await buf.pop_deferred_writes('test-project')
-    assert second_pop == []
+    second_claim = await buf.claim_deferred_writes('test-project')
+    assert second_claim == []
 
 
 @pytest.mark.asyncio
-async def test_pop_deferred_writes_project_isolation(buf):
+async def test_claim_deferred_writes_project_isolation(buf):
     """Deferred writes are scoped to project_id."""
     await buf.defer_write('project-a', 'content-a', 'cat', {})
     await buf.defer_write('project-b', 'content-b', 'cat', {})
 
-    writes_a = await buf.pop_deferred_writes('project-a')
+    writes_a = await buf.claim_deferred_writes('project-a')
     assert len(writes_a) == 1
     assert writes_a[0]['content'] == 'content-a'
 
-    writes_b = await buf.pop_deferred_writes('project-b')
+    writes_b = await buf.claim_deferred_writes('project-b')
     assert len(writes_b) == 1
     assert writes_b[0]['content'] == 'content-b'
 
@@ -705,14 +837,60 @@ async def test_is_full_recon_active_with_lock(buf):
 
 
 @pytest.mark.asyncio
-async def test_deferred_writes_ordering(buf):
-    """Pop returns deferred writes in creation order."""
+async def test_claim_deferred_writes_ordering(buf):
+    """Claim returns deferred writes in creation order."""
     await buf.defer_write('test-project', 'first', 'cat', {})
     await buf.defer_write('test-project', 'second', 'cat', {})
     await buf.defer_write('test-project', 'third', 'cat', {})
 
-    writes = await buf.pop_deferred_writes('test-project')
+    writes = await buf.claim_deferred_writes('test-project')
     assert [w['content'] for w in writes] == ['first', 'second', 'third']
+
+
+@pytest.mark.asyncio
+async def test_claim_survives_connection_reopen(tmp_path):
+    """Claimed rows survive a process crash: a new EventBuffer can recover them.
+
+    This is the end-to-end crash-survival proxy for the durable-queue guarantee:
+    even if process #1 claimed-then-died (without calling delete_deferred_write),
+    process #2 can call release_stale_claims(0) to re-queue them and then claim.
+    """
+    db_path = tmp_path / 'crash_test.db'
+
+    # --- Process #1: defer writes and claim them (simulating mid-crash state) ---
+    buf1 = EventBuffer(db_path=db_path, buffer_size_threshold=100)
+    await buf1.initialize()
+
+    await buf1.defer_write('test-project', 'write-1', 'observations_and_summaries', {'n': 1})
+    await buf1.defer_write('test-project', 'write-2', 'entities_and_relations', {'n': 2})
+    await buf1.defer_write('test-project', 'write-3', 'observations_and_summaries', {'n': 3})
+
+    claimed = await buf1.claim_deferred_writes('test-project')
+    assert len(claimed) == 3  # all three claimed, none deleted yet (simulating mid-crash)
+
+    # Close the first buffer — simulating process exit without deleting claimed rows
+    await buf1.close()
+
+    # --- Process #2: open a fresh EventBuffer on the same on-disk DB ---
+    buf2 = EventBuffer(db_path=db_path, buffer_size_threshold=100)
+    await buf2.initialize()
+
+    # release_stale_claims(0.0) re-queues ALL currently claimed rows (cutoff = now, so all qualify)
+    released = await buf2.release_stale_claims(0.0)
+    assert released == 3
+
+    # All three writes are now recoverable
+    recovered = await buf2.claim_deferred_writes('test-project')
+    assert len(recovered) == 3
+    recovered_contents = {item['content'] for item in recovered}
+    assert recovered_contents == {'write-1', 'write-2', 'write-3'}
+
+    # Metadata is preserved faithfully across the reopen
+    for item in recovered:
+        n = int(item['content'].split('-')[1])
+        assert item['metadata'] == {'n': n}
+
+    await buf2.close()
 
 
 # ── Peek and targeted drain ────────────────────────────────────────

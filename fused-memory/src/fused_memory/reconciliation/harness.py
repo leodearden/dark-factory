@@ -300,8 +300,14 @@ class ReconciliationHarness:
     # ── Deferred write replay ─────────────────────────────────────────
 
     async def _replay_deferred_writes(self, project_id: str) -> None:
-        """Replay targeted-recon writes that were deferred during a full cycle."""
-        deferred = await self.buffer.pop_deferred_writes(project_id)
+        """Replay targeted-recon writes that were deferred during a full cycle.
+
+        Uses a claim → replay-one → delete-on-success pattern so that
+        cancellation or process crash mid-loop does not lose any writes:
+        claimed-but-not-deleted rows remain in SQLite and are recovered
+        on next startup by `release_stale_claims`.
+        """
+        deferred = await self.buffer.claim_deferred_writes(project_id)
         if not deferred:
             return
         logger.info(f'Replaying {len(deferred)} deferred writes for {project_id}')
@@ -315,7 +321,11 @@ class ReconciliationHarness:
                     _source='targeted_recon',
                 )
             except Exception as e:
-                logger.warning(f'Failed to replay deferred write: {e}')
+                # Leave the row claimed so it isn't retried in this process;
+                # release_stale_claims at next startup will re-queue it.
+                logger.warning(f'Failed to replay deferred write {write["id"]}: {e}')
+                continue
+            await self.buffer.delete_deferred_write(write['id'])
 
     # ── Escalation support ─────────────────────────────────────────────
 
@@ -418,6 +428,18 @@ class ReconciliationHarness:
             await self.judge.initialize()
 
         await self._start_escalation_server()
+
+        # Re-queue any deferred writes left in-progress by a crashed prior process.
+        try:
+            released = await self.buffer.release_stale_claims(
+                self.config.stale_run_recovery_seconds,
+            )
+            if released:
+                logger.info(
+                    f'Recovered {released} stale deferred write claim(s) on startup'
+                )
+        except Exception as e:
+            logger.warning(f'release_stale_claims at startup failed: {e}')
 
         loop_count = 0
         try:
