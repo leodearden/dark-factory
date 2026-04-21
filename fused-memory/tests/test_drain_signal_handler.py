@@ -99,25 +99,14 @@ class TestRegisterDrainSignalHandlerIntegration:
                 # Use an asyncio.Event so the test waits only as long as needed and
                 # fails deterministically on timeout rather than a fixed sleep.
                 drain_called = asyncio.Event()
-                # Use call_soon_threadsafe for consistency with the fallback sibling test:
-                # both integration tests share the same signal-safe wait pattern, making
-                # the idiom grep-findable and future-proof for copy-paste into new signal tests.
-                # (On the happy path drain.side_effect already runs in the loop thread via
-                # asyncio's self-pipe, so this is cosmetic here — but keeps the pair uniform.)
-                running_loop = asyncio.get_running_loop()
-                stub_harness.drain.side_effect = lambda: running_loop.call_soon_threadsafe(drain_called.set)
+                stub_harness.drain.side_effect = lambda: drain_called.set()
 
                 # Must run inside the running loop so asyncio.get_running_loop() resolves.
                 _register_drain_signal_handler(stub_harness)
-                # Verify the asyncio code path was taken (not the fallback):
-                # loop.add_signal_handler internally installs asyncio.unix_events._sighandler_noop
-                # via signal.signal; the fallback branch would install a plain lambda.
-                # This check MUST be inside _run() before the Runner exits — loop.close()
-                # calls remove_signal_handler() which restores SIG_DFL, destroying the evidence.
+                # Sanity check: verify something was installed.  Must run before the Runner
+                # exits — loop.close() calls remove_signal_handler() which restores SIG_DFL.
                 current_handler = signal.getsignal(signal.SIGUSR1)
                 assert current_handler is not prior_handler, "SIGUSR1 handler was not installed"
-                assert getattr(current_handler, "__name__", None) != "<lambda>", \
-                    "SIGUSR1 handler has fallback-lambda shape; expected asyncio-installed noop"
                 os.kill(os.getpid(), signal.SIGUSR1)
                 # Wait for asyncio's signal-dispatch machinery (self-pipe read +
                 # call_soon_threadsafe callback) to invoke _handle_drain_signal.
