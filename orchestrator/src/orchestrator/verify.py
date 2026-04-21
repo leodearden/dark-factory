@@ -401,6 +401,7 @@ class VerifyResult:
     type_output: str
     summary: str
     timed_out: bool = False
+    cause_hint: str = ''
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
@@ -751,6 +752,18 @@ async def run_verification(
             parts.append('type errors')
         summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
 
+    # Build cause_hint from each failing check's output; join with ' | '.
+    if passed:
+        cause_hint = ''
+    else:
+        hint_parts = []
+        for rc, out in ((test_rc, test_out), (lint_rc, lint_out), (type_rc, type_out)):
+            if rc != 0:
+                h = _extract_cause_hint(out)
+                if h:
+                    hint_parts.append(h)
+        cause_hint = ' | '.join(hint_parts)
+
     result = VerifyResult(
         passed=passed,
         test_output=test_out,
@@ -758,6 +771,7 @@ async def run_verification(
         type_output=type_out if type_rc != 0 else '',
         summary=summary,
         timed_out=timed_out,
+        cause_hint=cause_hint,
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -807,6 +821,9 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
             parts.append('type errors')
         summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
 
+    # Collect cause_hint from failing child results; join with ' | '.
+    cause_hint = ' | '.join(r.cause_hint for r in results if r.cause_hint)
+
     return VerifyResult(
         passed=passed,
         test_output=test_output,
@@ -814,6 +831,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         type_output=type_output,
         summary=summary,
         timed_out=timed_out,
+        cause_hint=cause_hint,
     )
 
 
