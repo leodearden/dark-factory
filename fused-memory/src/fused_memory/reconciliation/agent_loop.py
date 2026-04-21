@@ -26,6 +26,11 @@ CLAUDE_CLI_RESPONSE_SCHEMA = {
     'type': 'object',
     'properties': {
         'thinking': {'type': 'string'},
+        # Optional free-form assistant reply (distinct from thinking: thinking is
+        # private reasoning; response is the visible answer when no tool calls
+        # are needed).  Not required by the schema — most turns only produce
+        # tool_calls.
+        'response': {'type': 'string'},
         'tool_calls': {
             'type': 'array',
             'items': {
@@ -338,17 +343,24 @@ class AgentLoop:
             output_schema=CLAUDE_CLI_RESPONSE_SCHEMA,
             disallowed_tools=['*'],
             model=self.config.agent_llm_model,
-            max_turns=3,
+            # max_turns=1: AgentLoop.run() drives multi-turn externally by calling
+            # _call_claude_cli again with resume_session_id.  A single CLI
+            # invocation only needs one assistant turn (schema tool-use → JSON
+            # response happens within the same turn when --json-schema is used).
+            max_turns=1,
             permission_mode='bypassPermissions',
             timeout_seconds=float(self.config.stage_timeout_seconds),
             resume_session_id=self._cli_session_id,
         )
 
-        if not result.success and not result.schema_salvaged:
+        if not result.success:
+            # schema_salvaged=True implies success=True (cli_invoke.py:749-751),
+            # so `not result.success` is the complete failure guard.
             raise RuntimeError(f'Claude CLI agent failed: {result.output[:500]}')
 
         self._cli_session_id = result.session_id or self._cli_session_id
         self.llm_call_count += 1
+        self.token_count += (result.input_tokens or 0) + (result.output_tokens or 0)
 
         structured = result.structured_output
         if isinstance(structured, str):

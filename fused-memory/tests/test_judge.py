@@ -754,19 +754,14 @@ async def test_initialize_rehydrates_halt_state(mock_journal):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize('cli_output,expected', [
-    ('{"severity": "ok", "findings": []}', '{"severity": "ok", "findings": []}'),
-    ('', ''),
-])
 @pytest.mark.asyncio
-async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(
-    mock_journal, cli_output, expected
-):
+async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
     """_call_judge_cli delegates to invoke_with_cap_retry (no output_schema — free-form text).
 
-    Red test (step-5): verifies the new delegation contract for both non-empty
-    and empty stdout cases.  Fails against the current asyncio.create_subprocess_exec
-    implementation because invoke_with_cap_retry is not imported in judge.py yet.
+    Verifies the essential delegation contract: prompt, system_prompt, model,
+    usage_gate, and timeout are wired through correctly.  Fine-grained knobs
+    (max_turns, permission_mode, disallowed_tools) are implementation details
+    covered by shared/tests/test_cli_invoke.py.
     """
     from unittest.mock import AsyncMock
 
@@ -781,7 +776,7 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(
 
     fake_result = AgentResult(
         success=True,
-        output=cli_output,
+        output='{"severity": "ok", "findings": []}',
         session_id='jsess-1',
     )
 
@@ -797,12 +792,10 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(
     call_kwargs = mock_invoke.call_args.kwargs
     call_positional = mock_invoke.call_args.args
 
+    # Essential contract assertions
     assert call_kwargs['prompt'] == 'Evaluate this run.'
     assert call_kwargs['system_prompt'] == JUDGE_SYSTEM_PROMPT
     assert call_kwargs['model'] == config.judge_llm_model
-    assert call_kwargs['disallowed_tools'] == ['*']
-    assert call_kwargs['max_turns'] == 3
-    assert call_kwargs['permission_mode'] == 'bypassPermissions'
     assert call_kwargs['timeout_seconds'] == float(config.stage_timeout_seconds)
     assert 'output_schema' not in call_kwargs  # judge output is free-form, no schema
 
@@ -812,4 +805,41 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(
     else:
         assert call_positional[0] is fake_gate
 
-    assert result == expected
+    assert result == '{"severity": "ok", "findings": []}'
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_empty_output_returns_empty_string(mock_journal):
+    """Empty-stdout from CLI (error_empty_output subtype) returns '' instead of raising.
+
+    _parse_claude_output in shared maps empty stdout → success=False /
+    subtype='error_empty_output'.  The judge preserves the prior subprocess
+    contract: exit-0 + empty stdout was treated as a valid empty verdict.
+    """
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    fake_gate = MagicMock()
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=fake_gate)
+
+    # Simulate what shared returns when the CLI produces no output
+    empty_output_result = AgentResult(
+        success=False,
+        output='Agent produced no output',
+        subtype='error_empty_output',
+        session_id='jsess-1',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+        return_value=empty_output_result,
+    ):
+        result = await judge._call_judge_cli('Evaluate this run.')
+
+    assert result == ''

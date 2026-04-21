@@ -246,10 +246,21 @@ Review this run and provide your verdict as JSON.
             system_prompt=JUDGE_SYSTEM_PROMPT,
             model=self.config.judge_llm_model,
             disallowed_tools=['*'],
-            max_turns=3,
+            # max_turns=1: the judge is deliberately single-shot.  One turn is
+            # sufficient to produce a free-form verdict; allowing more would
+            # widen cost/duration exposure with no benefit.
+            max_turns=1,
             permission_mode='bypassPermissions',
             timeout_seconds=float(self.config.stage_timeout_seconds),
         )
+
+        # Preserve legacy "empty stdout = valid empty verdict" semantics.
+        # _parse_claude_output maps empty stdout → success=False / subtype
+        # 'error_empty_output'.  Treat that as a benign empty string rather
+        # than an error so callers remain consistent with the prior subprocess
+        # implementation that returned '' on exit-0 + empty stdout.
+        if not result.success and result.subtype == 'error_empty_output':
+            return ''
 
         if not result.success:
             raise RuntimeError(f'Claude CLI judge failed: {result.output[:500]}')
