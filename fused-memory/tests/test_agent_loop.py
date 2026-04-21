@@ -1427,3 +1427,77 @@ async def test_call_claude_cli_empty_stdout_releases_probe():
 
     gate.release_probe_slot.assert_called_once_with('token-empty')
     gate.confirm_account_ok.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Delegation to invoke_with_cap_retry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
+    """_call_claude_cli delegates to invoke_with_cap_retry instead of managing subprocess.
+
+    Red test (step-1): confirms that the new interface passes `prompt` and `tools`
+    kwargs and that the returned adapter exposes `.thinking`, `.response`,
+    `.tool_calls`, and `.session_id`.
+    """
+    from unittest.mock import AsyncMock
+    from shared.cli_invoke import AgentResult
+    from fused_memory.reconciliation.agent_loop import CLAUDE_CLI_RESPONSE_SCHEMA
+
+    fake_gate = MagicMock()
+    config = _make_cli_config()
+    tools = [{'name': 'read_file', 'description': 'read', 'input_schema': {}}]
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-1',
+        structured_output={
+            'thinking': 'reasoning',
+            'response': 'output text',
+            'tool_calls': [],
+        },
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = fake_result
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test system prompt',
+            tools={},
+            usage_gate=fake_gate,
+        )
+
+        result = await agent._call_claude_cli(prompt='hi', tools=tools)
+
+    mock_invoke.assert_called_once()
+    call_kwargs = mock_invoke.call_args.kwargs
+    call_positional = mock_invoke.call_args.args
+
+    assert call_kwargs['prompt'] == 'hi'
+    assert 'read_file' in call_kwargs['system_prompt']
+    assert call_kwargs['output_schema'] == CLAUDE_CLI_RESPONSE_SCHEMA
+    assert call_kwargs['disallowed_tools'] == ['*']
+    assert call_kwargs['model'] == config.agent_llm_model
+    assert call_kwargs['max_turns'] == 3
+    assert call_kwargs['permission_mode'] == 'bypassPermissions'
+    assert call_kwargs['timeout_seconds'] == float(config.stage_timeout_seconds)
+    assert call_kwargs['resume_session_id'] is None  # first turn: no prior session
+
+    # usage_gate may be positional or keyword — accept either
+    if 'usage_gate' in call_kwargs:
+        assert call_kwargs['usage_gate'] is fake_gate
+    else:
+        assert call_positional[0] is fake_gate
+
+    # Adapter must expose direct attribute access for thinking/response/tool_calls/session_id
+    assert result.thinking == 'reasoning'
+    assert result.response == 'output text'
+    assert result.tool_calls == []
+    assert result.session_id == 'sess-1'
