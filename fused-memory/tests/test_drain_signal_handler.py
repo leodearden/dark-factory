@@ -1,6 +1,9 @@
 """Tests for the _register_drain_signal_handler helper in fused_memory.server.main."""
 
+import asyncio
+import os
 import signal
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -74,3 +77,28 @@ class TestRegisterDrainSignalHandlerNoLoop:
         reconciliation_harness.drain.assert_not_called()
         # A warning should have been logged
         mock_logger.warning.assert_called_once()
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='SIGUSR1 and loop.add_signal_handler are POSIX-only')
+class TestRegisterDrainSignalHandlerIntegration:
+    def test_real_sigusr1_dispatch_triggers_drain(self):
+        """Integration: a real SIGUSR1 delivered via os.kill reaches harness.drain() through asyncio."""
+        stub_harness = MagicMock()
+        stub_harness.drain = MagicMock()
+
+        prior_handler = signal.getsignal(signal.SIGUSR1)
+        loop = asyncio.new_event_loop()
+        try:
+            async def _run() -> None:
+                # Must run inside the running loop so asyncio.get_running_loop() resolves.
+                _register_drain_signal_handler(stub_harness)
+                os.kill(os.getpid(), signal.SIGUSR1)
+                # Yield control so asyncio's signal-dispatch machinery (self-pipe read +
+                # call_soon_threadsafe callback) can invoke _handle_drain_signal.
+                await asyncio.sleep(0.05)
+
+            loop.run_until_complete(_run())
+            stub_harness.drain.assert_called_once()
+        finally:
+            loop.close()
+            signal.signal(signal.SIGUSR1, prior_handler)
