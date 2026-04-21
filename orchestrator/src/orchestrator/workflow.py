@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from shared.cli_invoke import classify_agent_failure, invoke_with_cap_retry
+from shared.cli_invoke import AllAccountsCappedException, classify_agent_failure, invoke_with_cap_retry
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
 
@@ -582,6 +582,15 @@ class TaskWorkflow:
                 f'invocations={self.metrics.agent_invocations}'
             )
             return WorkflowOutcome.DONE
+
+        except AllAccountsCappedException as e:
+            logger.warning(
+                f'Task {self.task_id}: all accounts capped — '
+                f'{e.retries} retries in {e.elapsed_secs:.1f}s (label={e.label!r})'
+            )
+            return await self._mark_blocked(
+                f'All accounts capped: {e.label} — {e.retries} retries in {e.elapsed_secs:.1f}s'
+            )
 
         except _SessionBudgetExhausted:
             logger.warning(f'Task {self.task_id}: session budget exhausted')
