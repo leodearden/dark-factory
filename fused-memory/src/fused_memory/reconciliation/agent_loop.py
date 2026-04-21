@@ -350,7 +350,7 @@ class AgentLoop:
             # response happens within the same turn when --json-schema is used).
             max_turns=1,
             permission_mode='bypassPermissions',
-            timeout_seconds=float(self.config.stage_timeout_seconds),
+            timeout_seconds=float(self.config.agent_cli_timeout_seconds),
             resume_session_id=self._cli_session_id,
             cwd=Path(self.config.explore_codebase_root),
         )
