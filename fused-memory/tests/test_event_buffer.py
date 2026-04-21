@@ -843,6 +843,52 @@ async def test_claim_deferred_writes_ordering(buf):
     assert [w['content'] for w in writes] == ['first', 'second', 'third']
 
 
+@pytest.mark.asyncio
+async def test_claim_survives_connection_reopen(tmp_path):
+    """Claimed rows survive a process crash: a new EventBuffer can recover them.
+
+    This is the end-to-end crash-survival proxy for the durable-queue guarantee:
+    even if process #1 claimed-then-died (without calling delete_deferred_write),
+    process #2 can call release_stale_claims(0) to re-queue them and then claim.
+    """
+    db_path = tmp_path / 'crash_test.db'
+
+    # --- Process #1: defer writes and claim them (simulating mid-crash state) ---
+    buf1 = EventBuffer(db_path=db_path, buffer_size_threshold=100)
+    await buf1.initialize()
+
+    await buf1.defer_write('test-project', 'write-1', 'observations_and_summaries', {'n': 1})
+    await buf1.defer_write('test-project', 'write-2', 'entities_and_relations', {'n': 2})
+    await buf1.defer_write('test-project', 'write-3', 'observations_and_summaries', {'n': 3})
+
+    claimed = await buf1.claim_deferred_writes('test-project')
+    assert len(claimed) == 3  # all three claimed, none deleted yet (simulating mid-crash)
+
+    # Close the first buffer — simulating process exit without deleting claimed rows
+    await buf1.close()
+
+    # --- Process #2: open a fresh EventBuffer on the same on-disk DB ---
+    buf2 = EventBuffer(db_path=db_path, buffer_size_threshold=100)
+    await buf2.initialize()
+
+    # release_stale_claims(0.0) re-queues ALL currently claimed rows (cutoff = now, so all qualify)
+    released = await buf2.release_stale_claims(0.0)
+    assert released == 3
+
+    # All three writes are now recoverable
+    recovered = await buf2.claim_deferred_writes('test-project')
+    assert len(recovered) == 3
+    recovered_contents = {item['content'] for item in recovered}
+    assert recovered_contents == {'write-1', 'write-2', 'write-3'}
+
+    # Metadata is preserved faithfully across the reopen
+    for item in recovered:
+        n = int(item['content'].split('-')[1])
+        assert item['metadata'] == {'n': n}
+
+    await buf2.close()
+
+
 # ── Peek and targeted drain ────────────────────────────────────────
 
 
