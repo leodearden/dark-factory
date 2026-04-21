@@ -128,20 +128,21 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
    - Files: `Read` them or run `git ls-files -- <path>` in the worktree.
    - Symbols/functions: use `mcp__jcodemunch__search_symbols` or grep.
    If a referenced file or symbol is missing, do NOT silently create it from scratch. Escalate via `escalate_blocker` with `category='missing_premise'`, naming the missing artifact and why the task assumed it existed. Silent "create from scratch" of assumed-existing artifacts is how parallel-implementation mismatches grow.
-3. **TDD order.** Steps alternate: write a failing test, then implement to make it pass. Every behavior gets a test first.
-4. **Test scope — skip documentation meta-tests.** "Every behavior gets a test" means *runtime behavior*, not documentation wording. Do NOT plan test steps that:
+3. **Don't exit silently at max_turns.** If you're approaching your turn budget without having successfully called `create_plan`, call `escalate_blocker` with `category='planning_stalled'` and a structured reason (e.g. "spent N turns verifying premises but dep X's artifacts are missing"). Do NOT let the CLI reach max_turns mid-tool-call — that produces an empty-output failure that is indistinguishable from a real tool crash to the steward.
+4. **TDD order.** Steps alternate: write a failing test, then implement to make it pass. Every behavior gets a test first.
+5. **Test scope — skip documentation meta-tests.** "Every behavior gets a test" means *runtime behavior*, not documentation wording. Do NOT plan test steps that:
    - Assert on `__doc__` strings, docstring prose, comment contents, or module-level string literals
    - Verify function names, parameter names, or type-annotation strings via introspection (linters and type-checkers already cover this)
    - Read sibling test files to pin the wording of *other* tests' docstrings
    - Grep source files for "did the author mention X" strings
 
    If a task description asks you to "ensure the docstring says …", "pin the wording of …", "align the comment with …", or similar, that is documentation work, not TDD work. Plan a single `impl` step that edits the doc/comment (no test), or `escalate_blocker` with `category='out_of_scope'` if the task is wholly about documentation wording. One-line `assert Foo.__doc__` existence checks inside an API-surface contract test are fine; 50-line substring/regex pins of prose are not.
-5. **Maximize reuse.** Identify existing utilities, patterns, and code that can be reused. Record with `add_reuse_item`.
-6. **Prerequisites first.** If setup work (config files, fixtures, etc.) is needed before TDD steps, add them with `add_prerequisite`.
-7. **Small steps.** Each step should be a single, atomic change that can be committed independently.
-8. **File listing.** List ALL files this task will create or modify in the `files` parameter of `create_plan`. Use paths relative to the worktree root. Be exhaustive — this is used to derive concurrency locks. Include test files.
-9. **Module identification.** List all code modules/directories this task will touch in the `modules` parameter of `create_plan`.
-10. **Design decisions.** Document non-obvious choices with `add_design_decision`.
+6. **Maximize reuse.** Identify existing utilities, patterns, and code that can be reused. Record with `add_reuse_item`.
+7. **Prerequisites first.** If setup work (config files, fixtures, etc.) is needed before TDD steps, add them with `add_prerequisite`.
+8. **Small steps.** Each step should be a single, atomic change that can be committed independently.
+9. **File listing.** List ALL files this task will create or modify in the `files` parameter of `create_plan`. Use paths relative to the worktree root. Be exhaustive — this is used to derive concurrency locks. Include test files.
+10. **Module identification.** List all code modules/directories this task will touch in the `modules` parameter of `create_plan`.
+11. **Design decisions.** Document non-obvious choices with `add_design_decision`.
 
 ## Important
 
@@ -587,6 +588,27 @@ git add -- . ':!.task'
 You have a persistent session. Previous escalation context is in your conversation
 history — you remember what you tried, what you fixed, and what the code looked like.
 Use this accumulated context when handling new escalations.
+
+## Interpreting Agent Failure Classifications
+
+Escalation details produced by the orchestrator include a classification line
+(e.g. `subtype='error_max_turns'`) and a kind in the summary. Use the kind to
+choose your response:
+
+- **MAX_TURNS** — the agent ran out of its turn budget without completing.
+  This is NOT transient. Retrying the same inputs will fail the same way.
+  Either the task is under-specified, the agent is thrashing, or the budget
+  is too low. Prefer re-escalating to level=1 unless you can narrow the task
+  or raise the budget deliberately.
+- **EMPTY_OUTPUT** — the agent returned nothing. This may be transient (CLI
+  glitch); one retry is reasonable before re-escalating.
+- **API_ERROR** — HTTP error from the provider. Usually transient; account
+  failover often helps. Retry is reasonable.
+- **TIMED_OUT** — subprocess wall-clock timeout. Inspect whether the task
+  genuinely needs more time; a blind retry rarely succeeds.
+- **STRUCTURAL** — agent succeeded via schema salvage; usually treated as
+  success upstream — shouldn't reach you, but if it does, investigate.
+- **UNKNOWN** — no specific signal. Use the full diagnostic_detail to decide.
 """ + _ESCALATION_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',

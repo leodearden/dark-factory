@@ -2706,6 +2706,245 @@ class TestPlanDoneEarlyReturn:
         assert outcome == WorkflowOutcome.DONE
         workflow._execute_iterations.assert_not_called()
 
+    async def test_successful_plan_returns_PLANNED_and_continues_to_execute(
+        self, config, git_ops, task_assignment
+    ):
+        """Regression for b242030313: _plan success returns PLANNED, not DONE.
+
+        If _plan returns DONE on successful planning, the DONE early-return
+        at the _plan outcome handler short-circuits execute/verify/review/
+        merge entirely — every post-plan workflow exits with zero execute
+        iterations and no code merged.  This is the b242 regression that
+        corrupted 40+ tasks across three projects.
+
+        This test asserts the fallthrough: when _plan returns PLANNED the
+        outcome-handler block does NOT early-return, and
+        _execute_verify_review_loop is invoked.
+        """
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        # Simulate successful planning
+        workflow._plan = AsyncMock(return_value=WorkflowOutcome.PLANNED)
+        # Capture that execute was reached; short-circuit to BLOCKED to keep
+        # the test self-contained (we only care that fallthrough happened).
+        workflow._execute_verify_review_loop = AsyncMock(
+            return_value=WorkflowOutcome.BLOCKED,
+        )
+
+        outcome = await workflow.run()
+
+        # The test asserts the *path*: _execute_verify_review_loop was called.
+        # The ultimate outcome (BLOCKED here) is incidental to the path check.
+        workflow._execute_verify_review_loop.assert_called_once()
+        assert outcome == WorkflowOutcome.BLOCKED
+
+
+def _make_status_setting_steward(
+    queue: EscalationQueue, scheduler, task_id: str, final_status: str,
+) -> type:
+    """FakeSteward that resolves L0s and then sets task status to final_status.
+
+    Simulates a steward that marked the task deferred/blocked after inspecting
+    the escalation — the workflow must NOT overwrite that decision with
+    pending on its auto-requeue path.
+    """
+
+    class _FakeSteward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            pass
+
+        async def start(self) -> None:
+            pending = queue.get_by_task(task_id, status='pending', level=0)
+            for esc in pending:
+                queue.resolve(esc.id, 'Resolved', resolved_by='fake-steward')
+            await scheduler.set_task_status(task_id, final_status)
+
+        async def stop(self) -> None:
+            pass
+
+    return _FakeSteward
+
+
+def _make_l1_escalating_steward(
+    queue: EscalationQueue, task_id: str,
+) -> type:
+    """FakeSteward that resolves L0s and then submits an L1 escalation.
+
+    Models the 'steward gave up, handed off to human' path.  The workflow
+    must NOT auto-requeue when an L1 is pending.
+    """
+
+    class _FakeSteward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            pass
+
+        async def start(self) -> None:
+            pending = queue.get_by_task(task_id, status='pending', level=0)
+            for esc in pending:
+                queue.resolve(
+                    esc.id, 'Re-escalated to human', resolved_by='fake-steward',
+                )
+            from escalation.models import Escalation
+
+            l1 = Escalation(
+                id=queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='steward',
+                severity='blocking',
+                category='task_failure',
+                summary='Steward handed off to human',
+                detail='Not obvious how to unblock',
+                suggested_action='manual_intervention',
+                level=1,
+            )
+            queue.submit(l1)
+
+        async def stop(self) -> None:
+            pass
+
+    return _FakeSteward
+
+
+@pytest.mark.asyncio
+class TestMarkBlockedPreservesStewardStatus:
+    """Regression: _mark_blocked must not overwrite steward-set deferred/blocked.
+
+    Before the WORKFLOW_PRESERVE_STATUSES fix, the post-steward branch only
+    checked TERMINAL_STATUSES ({'done', 'cancelled'}) — 'deferred' and
+    'blocked' fell through to the auto-requeue and got clobbered with
+    'pending', re-entering the task into the scheduler loop and burning
+    $7-8 per cycle.
+    """
+
+    async def test_mark_blocked_preserves_deferred_status(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Steward sets status='deferred' → workflow must NOT requeue."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt_info.path
+        workflow.artifacts = TaskArtifacts(wt_info.path)
+        workflow._steward_factory = _make_status_setting_steward(
+            queue, scheduler, task_assignment.task_id, 'deferred',
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED when steward set deferred, got {outcome!r}. '
+            'WORKFLOW_PRESERVE_STATUSES must include deferred.'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        # The last status must still be deferred — not overwritten by pending.
+        assert statuses[-1] == 'deferred', (
+            f"Last status must be 'deferred' (steward's decision), got: {statuses}"
+        )
+        assert 'pending' not in statuses[statuses.index('deferred'):], (
+            f'Workflow must not overwrite steward-set deferred with pending: '
+            f'{statuses}'
+        )
+
+    async def test_mark_blocked_preserves_steward_set_cancelled(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Steward sets status='cancelled' → workflow must NOT requeue.
+
+        A companion to the deferred case: 'cancelled' is in
+        WORKFLOW_PRESERVE_STATUSES (and is already terminal, so the scheduler
+        would reject a pending overwrite anyway — but the workflow should not
+        even attempt it).  This test locks in the second non-terminal-looking
+        preserve value so a future regression on the preserve set is caught.
+
+        We don't add a 'blocked' case here because the value-diff based
+        preservation can't distinguish "steward re-asserts blocked" from
+        "steward left our own 'blocked' write alone" — both snapshot as
+        ``blocked → blocked`` with no diff.  The 'blocked' cell of
+        WORKFLOW_PRESERVE_STATUSES is belt-and-braces coverage, not a
+        runtime-tested path.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt_info.path
+        workflow.artifacts = TaskArtifacts(wt_info.path)
+        workflow._steward_factory = _make_status_setting_steward(
+            queue, scheduler, task_assignment.task_id, 'cancelled',
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert statuses[-1] == 'cancelled', (
+            f"Last status must be 'cancelled' (steward's decision), got: {statuses}"
+        )
+        # After the steward's cancelled write there must be no 'pending' write.
+        assert 'pending' not in statuses, (
+            f'Workflow must not overwrite steward-set cancelled with pending: '
+            f'{statuses}'
+        )
+
+
+@pytest.mark.asyncio
+class TestMarkBlockedRespectsOpenL1:
+    """Regression: _mark_blocked must not auto-requeue when L1 is open.
+
+    Before the has_open_l1 guard the workflow treated L0-empty as "all clear"
+    and set status back to pending — even when the steward had just re-
+    escalated to level 1 (human-only).  The scheduler would then re-pick the
+    task and the cycle burned cost on every round.
+    """
+
+    async def test_mark_blocked_respects_open_l1_escalation(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """L0 resolved but L1 open → ESCALATED, no set_task_status('pending').
+
+        Uses ``merge_phase=True`` so the initial _mark_blocked does NOT write
+        'blocked' to the scheduler cache — otherwise the D preservation check
+        short-circuits before reaching the L1 guard.  This is the realistic
+        merge-time path where the caller manages status transitions itself.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt_info.path
+        workflow.artifacts = TaskArtifacts(wt_info.path)
+        # Pre-seed an in-progress status so the cache has a non-preserve value
+        # when the L1 guard is hit.
+        await scheduler.set_task_status(task_assignment.task_id, 'in-progress')
+        workflow._steward_factory = _make_l1_escalating_steward(
+            queue, task_assignment.task_id,
+        )
+
+        outcome = await workflow._mark_blocked(
+            'synthetic failure', merge_phase=True,
+        )
+
+        assert outcome == WorkflowOutcome.ESCALATED, (
+            f'Expected ESCALATED when steward re-escalated to L1, '
+            f'got {outcome!r}.'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        # No 'pending' must appear — the L1 guard must short-circuit before
+        # the auto-requeue that would re-feed the scheduler loop.
+        assert 'pending' not in statuses, (
+            f'Workflow must not requeue when L1 is open. Statuses: {statuses}'
+        )
+        # An L1 escalation is pending in the queue.
+        pending_l1 = queue.get_by_task(
+            task_assignment.task_id, status='pending', level=1,
+        )
+        assert len(pending_l1) == 1
+
 
 # ---------------------------------------------------------------------------
 # Tests: _escalate_plan_overwrite message variants

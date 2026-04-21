@@ -16,11 +16,13 @@ from shared.cli_invoke import (
     _CAP_HIT_COOLDOWN_SECS,
     _MAX_CAP_COOLDOWN_SECS,
     CAP_HIT_RESUME_PROMPT,
+    AgentFailureKind,
     AgentResult,
     _parse_claude_output,
     _run_subprocess,
     _SubprocessResult,
     _to_token_count,
+    classify_agent_failure,
     invoke_claude_agent,
     invoke_with_cap_retry,
 )
@@ -1665,3 +1667,57 @@ class TestRunSubprocessProcessGroup:
             await _run_subprocess(['echo', 'hi'], tmp_path, env={}, model='test')
 
         assert captured_kwargs.get('start_new_session') is True
+
+
+class TestClassifyAgentFailure:
+    """Regression coverage for the classifier added to stop empty-output
+    escalations from being indistinguishable from real tool crashes to the
+    steward.  Ordering of rules matters: TIMED_OUT is checked before MAX_TURNS,
+    and API_ERROR before EMPTY_OUTPUT."""
+
+    def test_classify_agent_failure_success(self):
+        """A successful result is classified as SUCCESS regardless of other signals."""
+        result = AgentResult(success=True, output='done', subtype='success', turns=3)
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.SUCCESS
+        # diagnostic still populated so upstream logging never loses signal
+        assert 'turns=3' in cls.diagnostic_detail
+
+    def test_classify_agent_failure_max_turns(self):
+        """subtype=error_max_turns with empty output → MAX_TURNS."""
+        result = AgentResult(
+            success=False, output='', subtype='error_max_turns',
+            turns=75, output_tokens=12345,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.MAX_TURNS
+        assert '75 turns' in cls.summary
+        assert 'output_tokens=12345' in cls.summary
+
+    def test_classify_agent_failure_empty_output(self):
+        """subtype=error_empty_output → EMPTY_OUTPUT (distinct from MAX_TURNS)."""
+        result = AgentResult(
+            success=False, output='', subtype='error_empty_output', turns=1,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.EMPTY_OUTPUT
+
+    def test_classify_agent_failure_api_error(self):
+        """api_error_status populated → API_ERROR with status in summary."""
+        result = AgentResult(
+            success=False, output='Overloaded', subtype='',
+            api_error_status=529,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.API_ERROR
+        assert '529' in cls.summary
+
+    def test_classify_agent_failure_timed_out(self):
+        """timed_out=True beats error subtypes — wall-clock kill dominates."""
+        result = AgentResult(
+            success=False, output='', subtype='error_max_turns',
+            turns=50, duration_ms=1_800_000, timed_out=True,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.TIMED_OUT
+        assert '1800000ms' in cls.summary
