@@ -42,13 +42,19 @@ def _extract_message_regex(entry: str, *, expected_category: str) -> str:
 
 
 def test_unraisable_coroutine_filter_matches_pytest_wrapper_text():
-    """The PytestUnraisableExceptionWarning filter must match the EXACT wrapper
-    text pytest emits via sys.unraisablehook.
+    """The PytestUnraisableExceptionWarning filter must match the wrapper text
+    pytest emits via sys.unraisablehook across CPython versions.
 
     Pytest formats the message as `f"{err_msg}: {unraisable.object!r}"` where
-    err_msg defaults to `"Exception ignored in"` (see
-    _pytest/unraisableexception.py).  For a GC'd AsyncMock coroutine the repr
-    is `<coroutine object AsyncMockMixin._execute_mock_call at 0x...>`.
+    err_msg comes from `unraisable.err_msg` (see _pytest/unraisableexception.py).
+    The exact prefix varies by CPython version:
+    - Python <3.14: err_msg is None → prefix is "Exception ignored in"
+      → full text: "Exception ignored in: <coroutine object ...>"
+    - Python 3.14+: err_msg is set by CPython to include the coroutine repr
+      → full text: "Exception ignored while finalizing coroutine
+                    <coroutine object ...>: None"
+
+    The filter regex must match both forms.
     """
     filters = _load_filterwarnings()
     unraisable_entries = [
@@ -61,16 +67,23 @@ def test_unraisable_coroutine_filter_matches_pytest_wrapper_text():
     message_regex = _extract_message_regex(
         unraisable_entries[0], expected_category='pytest.PytestUnraisableExceptionWarning'
     )
-    actual_pytest_text = (
+    # Python <3.14 format: err_msg is None → pytest uses "Exception ignored in"
+    text_pre314 = (
         'Exception ignored in: <coroutine object '
         'AsyncMockMixin._execute_mock_call at 0x7f0000000000>'
     )
-    assert re.search(message_regex, actual_pytest_text), (
-        f'filterwarnings regex {message_regex!r} does not match the actual '
-        f'pytest-emitted unraisable-warning text {actual_pytest_text!r}. '
-        f'This means the guardrail is dead code — a late-GC AsyncMock '
-        f'coroutine leak will print a warning but will NOT fail CI.'
+    # Python 3.14+ format: CPython passes custom err_msg with coroutine repr
+    text_314 = (
+        'Exception ignored while finalizing coroutine '
+        '<coroutine object AsyncMockMixin._execute_mock_call at 0x3741a326500>: None'
     )
+    for actual_text in (text_pre314, text_314):
+        assert re.search(message_regex, actual_text), (
+            f'filterwarnings regex {message_regex!r} does not match the '
+            f'pytest-emitted unraisable-warning text {actual_text!r}. '
+            f'This means the guardrail is dead code — a late-GC AsyncMock '
+            f'coroutine leak will print a warning but will NOT fail CI.'
+        )
 
 
 def test_unraisable_coroutine_filter_has_no_literal_colon_in_message():

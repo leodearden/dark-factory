@@ -57,11 +57,21 @@ docstring-code-format = true
 # stop matching — revisit on pytest/Python/pytest-asyncio upgrades.
 filterwarnings = [
     # AsyncMock coroutine leak: coroutine created by mock.return_value.some_method()
-    # is never awaited; GC fires inline during test (RuntimeWarning) or after
-    # teardown (PytestUnraisableExceptionWarning wrapping the same message).
-    # Pins: unittest.mock / CPython warnings machinery.
+    # is never awaited.  Two emission paths with distinct message shapes:
+    #   (1) GC fires inline during the test — CPython emits
+    #       RuntimeWarning("coroutine 'X' was never awaited") directly.
+    #   (2) GC fires after teardown — pytest's sys.unraisablehook wraps the
+    #       event as PytestUnraisableExceptionWarning.  The exact prefix varies
+    #       by CPython version (unraisable.err_msg may be None or a custom
+    #       "Exception ignored while finalizing coroutine <...>" string):
+    #         Python <3.14: "Exception ignored in: <coroutine object ...>"
+    #         Python  3.14: "Exception ignored while finalizing coroutine
+    #                         <coroutine object ...>: None"
+    #       Using `Exception ignored.*<coroutine object` covers both forms
+    #       without a literal `:` (filterwarnings uses `:` as field separator,
+    #       so a literal `:` in the message regex would misparse the entry).
     "error:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited:RuntimeWarning",
-    "error:Exception ignored while finalizing coroutine <coroutine object AsyncMockMixin._execute_mock_call:pytest.PytestUnraisableExceptionWarning",
+    "error:Exception ignored.*<coroutine object AsyncMockMixin._execute_mock_call:pytest.PytestUnraisableExceptionWarning",
     # Sync def collected inside an @pytest.mark.asyncio class: mark mismatch.
     # Pins: pytest_asyncio/plugin.py (message emitted at the collection phase).
     "error:The test .* is marked with '@pytest.mark.asyncio' but it is not an async function:pytest.PytestWarning",
