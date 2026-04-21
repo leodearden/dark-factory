@@ -418,3 +418,23 @@ class TestReconciliationConfigTimeouts:
     def test_stale_claim_recovery_negative_rejected(self):
         with pytest.raises(ValidationError):
             ReconciliationConfig(stale_claim_recovery_seconds=-5)
+
+    # --- gt=0 bounds: stage_timeout_seconds (consistency extension) ---
+
+    def test_stage_timeout_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(stage_timeout_seconds=0)
+
+    def test_stage_timeout_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(stage_timeout_seconds=-1)
+
+    # --- gt=0 bounds: stale_run_recovery_seconds (consistency extension) ---
+
+    def test_stale_run_recovery_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(stale_run_recovery_seconds=0)
+
+    def test_stale_run_recovery_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(stale_run_recovery_seconds=-1)
