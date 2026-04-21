@@ -104,7 +104,7 @@ class TestForceExitWatchdog:
         calls = []
         monkeypatch.setattr('os._exit', lambda code: calls.append(code))
 
-        _force_exit_after_delay(timeout_secs=0.05)
+        handle = _force_exit_after_delay(timeout_secs=0.05)
 
         # Poll with a deadline instead of a fixed sleep to avoid spurious
         # failures under CI scheduler stalls (GC, container contention, etc.).
@@ -113,6 +113,10 @@ class TestForceExitWatchdog:
             time.sleep(0.05)
 
         assert calls == [137], f'expected [137], got {calls}'
+        handle.thread.join(timeout=1.0)
+        assert not handle.thread.is_alive(), (
+            'watchdog thread did not exit after firing os._exit replacement'
+        )
 
     def test_disarm_prevents_force_exit(self, monkeypatch):
         """Calling disarm() before timeout prevents os._exit from being called."""
@@ -127,6 +131,10 @@ class TestForceExitWatchdog:
         time.sleep(2.0)
 
         assert calls == [], f'expected no calls, got {calls}'
+        handle.thread.join(timeout=1.0)
+        assert not handle.thread.is_alive(), (
+            'watchdog thread did not exit after disarm'
+        )
 
     def test_diagnostic_dump_lists_live_threads(self, monkeypatch):
         """When the watchdog fires, it writes a diagnostic dump to the stream."""
@@ -134,7 +142,7 @@ class TestForceExitWatchdog:
         monkeypatch.setattr('os._exit', lambda code: calls.append(code))
 
         stream = io.StringIO()
-        _force_exit_after_delay(timeout_secs=0.05, stream=stream)
+        handle = _force_exit_after_delay(timeout_secs=0.05, stream=stream)
 
         # Poll with a deadline — stream is written before os._exit is called,
         # so once calls is non-empty the output is already available.
@@ -159,6 +167,10 @@ class TestForceExitWatchdog:
             f'no frame lines in dump:\n{output!r}'
         )
         assert calls == [137]
+        handle.thread.join(timeout=1.0)
+        assert not handle.thread.is_alive(), (
+            'watchdog thread did not exit after firing os._exit replacement'
+        )
 
     def test_dump_failure_still_fires_exit(self, monkeypatch):
         """os._exit(137) is called even when the diagnostic dump itself fails.
@@ -179,7 +191,7 @@ class TestForceExitWatchdog:
         monkeypatch.setattr(traceback_module, 'format_stack', _raise_on_format)
 
         stream = io.StringIO()
-        _force_exit_after_delay(timeout_secs=0.05, stream=stream)
+        handle = _force_exit_after_delay(timeout_secs=0.05, stream=stream)
 
         # Poll with deadline — os._exit must be called even though the dump failed.
         deadline = time.monotonic() + 5.0
@@ -193,6 +205,10 @@ class TestForceExitWatchdog:
         output = stream.getvalue()
         assert 'SHUTDOWN WATCHDOG FIRED (diagnostic dump failed)' in output, (
             f'fallback sentinel missing from dump-failure output:\n{output!r}'
+        )
+        handle.thread.join(timeout=1.0)
+        assert not handle.thread.is_alive(), (
+            'watchdog thread did not exit after firing os._exit replacement'
         )
 
 
@@ -259,7 +275,7 @@ class TestForceExitWatchdog:
             def flush(self):
                 raise OSError('simulated torn-down stderr')
 
-        _force_exit_after_delay(timeout_secs=0.05, stream=_BrokenStream())
+        handle = _force_exit_after_delay(timeout_secs=0.05, stream=_BrokenStream())
 
         # Poll with deadline — os._exit must fire even when the fallback write also fails.
         deadline = time.monotonic() + 5.0
@@ -269,17 +285,27 @@ class TestForceExitWatchdog:
         assert calls == [137], (
             f'expected os._exit(137) even when fallback write fails, got {calls}'
         )
+        handle.thread.join(timeout=1.0)
+        assert not handle.thread.is_alive(), (
+            'watchdog thread did not exit after firing os._exit replacement'
+        )
 
 
 class TestRunArmsWatchdog:
     """run() must arm the shutdown watchdog and disarm it on both exit paths."""
 
-    def _fake_watchdog_factory(self):
+    def _fake_watchdog_factory(self, events: list | None = None):
         """Returns (recorder, fake_force_exit_after_delay).
 
         recorder has:
           .armed_with       – the timeout_secs passed on arming
           .disarm_called    – True once disarm() is called
+
+        Optional `events` list: when provided, the fake appends the string
+        ``'arm'`` to `events` on each arming call, enabling ordering assertions
+        (e.g., that echo precedes arm).  The echo-side recording is NOT handled
+        here — callers that need it (test_report_emitted_before_watchdog_armed)
+        wrap click.echo themselves, keeping factory concerns minimal.
         """
         state = {'armed_with': None, 'disarm_called': False}
 
@@ -287,6 +313,8 @@ class TestRunArmsWatchdog:
             state['disarm_called'] = True
 
         def fake_force_exit(timeout_secs, exit_code=137, *, stream=None):
+            if events is not None:
+                events.append('arm')
             state['armed_with'] = timeout_secs
             # A non-started thread satisfies the WatchdogHandle.thread type
             # structurally without actually spawning a background thread.
@@ -449,14 +477,8 @@ class TestRunArmsWatchdog:
         only (atexit callbacks + threading._shutdown() joining non-daemon threads).
         """
         events: list[str | tuple[str, str | None]] = []
-        state = {'armed_with': None}
-
-        def recording_force_exit(timeout_secs, exit_code=137, *, stream=None):
-            state['armed_with'] = timeout_secs
-            events.append('arm')
-            return lambda: None
-
-        monkeypatch.setattr(cli_module, '_force_exit_after_delay', recording_force_exit)
+        state, fake_force_exit = self._fake_watchdog_factory(events=events)
+        monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
 
         original_echo = cli_module.click.echo
 
