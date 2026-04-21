@@ -1015,3 +1015,128 @@ async def test_peek_then_drain_by_ids_workflow(buf):
     count = await buf.drain_by_ids('test-project', selected_ids)
     assert count == 3
     assert (await buf.get_buffer_stats('test-project'))['size'] == 2
+
+
+# ── _debug_get_deferred_row tests ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_debug_get_deferred_row_returns_full_row(buf):
+    """_debug_get_deferred_row returns a dict with all expected columns.
+
+    Verifies the happy path: defer a write, query via the debug accessor, and
+    check that the returned dict contains all nine expected keys with the
+    correct values.  Then claim the row and re-query to confirm claimed_at is
+    set while attempt_count remains 0.
+    """
+    write_id = await buf.defer_write(
+        project_id='test-project',
+        content='debug content',
+        category='observations_and_summaries',
+        metadata={'key': 'value'},
+        agent_id='test-agent',
+    )
+
+    row = await buf._debug_get_deferred_row(write_id)
+    assert row is not None, 'row must be returned for a known write_id'
+
+    # All nine columns must be present.
+    expected_keys = {
+        'id', 'project_id', 'content', 'category', 'metadata',
+        'agent_id', 'created_at', 'claimed_at', 'attempt_count',
+    }
+    assert expected_keys.issubset(row.keys()), (
+        f'Missing keys: {expected_keys - row.keys()}'
+    )
+
+    # Values round-trip correctly.
+    assert row['id'] == write_id
+    assert row['project_id'] == 'test-project'
+    assert row['content'] == 'debug content'
+    assert row['category'] == 'observations_and_summaries'
+    assert row['metadata'] == {'key': 'value'}
+    assert row['agent_id'] == 'test-agent'
+    assert row['claimed_at'] is None, 'claimed_at must be None before claiming'
+    assert row['attempt_count'] == 0
+
+    # After claiming, claimed_at is set but attempt_count stays 0.
+    await buf.claim_deferred_writes('test-project')
+    row_after = await buf._debug_get_deferred_row(write_id)
+    assert row_after is not None
+    assert row_after['claimed_at'] is not None, 'claimed_at must be an ISO string after claim'
+    assert isinstance(row_after['claimed_at'], str)
+    assert row_after['attempt_count'] == 0
+
+
+@pytest.mark.asyncio
+async def test_debug_get_deferred_row_returns_none_for_unknown_id(buf):
+    """_debug_get_deferred_row returns None for an unknown write_id."""
+    result = await buf._debug_get_deferred_row('does-not-exist')
+    assert result is None
+
+
+# ── Migration tests ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_migrate_drops_legacy_idx_dw_project(tmp_path):
+    """Regression: _migrate() drops the legacy idx_dw_project single-column index.
+
+    Seeds an intermediate-migration schema — deferred_writes already has
+    claimed_at and attempt_count (so executescript's CREATE INDEX IF NOT EXISTS
+    idx_dw_project_claimed can succeed), but the old single-column
+    idx_dw_project index has not yet been removed.  This represents a DB
+    created by a code version that added claimed_at without also dropping the
+    now-redundant index.
+
+    After initialize():
+    * idx_dw_project must be absent.
+    * idx_dw_project_claimed (project_id, claimed_at) must be present.
+    """
+    import aiosqlite
+
+    db_path = tmp_path / 'legacy.db'
+
+    # Seed an intermediate-migration state: the full current column set is
+    # present (claimed_at, attempt_count) so executescript won't fail when it
+    # tries to CREATE INDEX IF NOT EXISTS idx_dw_project_claimed, but the old
+    # single-column index idx_dw_project has NOT been dropped yet.
+    intermediate_schema = """
+    CREATE TABLE deferred_writes (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        category TEXT NOT NULL,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        agent_id TEXT,
+        created_at TEXT NOT NULL,
+        claimed_at TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX idx_dw_project ON deferred_writes(project_id);
+    """
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.executescript(intermediate_schema)
+        await db.commit()
+
+    # Initialise EventBuffer — _migrate() should drop idx_dw_project.
+    buf = EventBuffer(db_path=db_path)
+    await buf.initialize()
+
+    db_inner = buf._require_db()
+
+    # Legacy single-column index must be gone.
+    async with db_inner.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dw_project'"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is None, 'idx_dw_project should have been dropped by _migrate()'
+
+    # Replacement covering index must exist (created by executescript or _migrate).
+    async with db_inner.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dw_project_claimed'"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None, 'idx_dw_project_claimed should be present after migration'
+
+    await buf.close()

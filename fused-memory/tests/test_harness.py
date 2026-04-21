@@ -2433,16 +2433,9 @@ async def test_run_loop_fast_restart_releases_recent_claims(
 
     # release_stale_claims must also increment attempt_count so the poison-pill
     # mechanism (delete after _MAX_DEFERRED_WRITE_ATTEMPTS) works correctly across
-    # restarts.  Query the DB directly because claim_deferred_writes doesn't expose
-    # this field.
-    import aiosqlite
-    async with aiosqlite.connect(event_buffer._db_path) as _db:
-        _db.row_factory = aiosqlite.Row
-        async with _db.execute(
-            'SELECT attempt_count FROM deferred_writes WHERE id = ?',
-            (reclaimed[0]['id'],),
-        ) as _cur:
-            _row = await _cur.fetchone()
+    # restarts.  Use the debug accessor rather than a raw aiosqlite connection so
+    # tests don't leak the _db_path attribute or the deferred_writes schema.
+    _row = await event_buffer._debug_get_deferred_row(reclaimed[0]['id'])
     assert _row is not None
     assert _row['attempt_count'] == 1, (
         'release_stale_claims must increment attempt_count on re-queue '

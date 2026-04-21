@@ -4,7 +4,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -134,8 +134,9 @@ class EventBuffer:
             columns = {row['name'] async for row in cursor}
 
         # Drop the now-redundant single-column project index.  idx_dw_project_claimed
-        # (project_id, claimed_at) is a strict superset that covers every query
-        # idx_dw_project covered, so keeping both wastes write IOPS and disk.
+        # (project_id, claimed_at) is a strict superset; keeping both wastes write
+        # IOPS and disk.  IF EXISTS makes this a no-op for fresh DBs that never
+        # had idx_dw_project.
         await db.execute('DROP INDEX IF EXISTS idx_dw_project')
 
         # Add claimed_at if missing.
@@ -692,6 +693,40 @@ class EventBuffer:
         async with self._txn() as db:
             await db.execute('DELETE FROM deferred_writes WHERE id = ?', (write_id,))
 
+    async def _debug_get_deferred_row(self, write_id: str) -> dict | None:
+        """Debug accessor — returns the full deferred_writes row as a dict, or None.
+
+        Intended for tests that need to inspect columns not exposed by
+        ``claim_deferred_writes`` (e.g. ``attempt_count``, ``claimed_at``).
+        ``metadata`` is parsed with ``json.loads`` to match the shape returned
+        by ``claim_deferred_writes``, so callers can compare values from both
+        APIs without shape mismatches.
+
+        The leading underscore marks this as a test-support API, not part of
+        EventBuffer's production interface.
+        """
+        db = self._require_db()
+        async with db.execute(
+            'SELECT id, project_id, content, category, metadata, agent_id,'
+            '       created_at, claimed_at, attempt_count'
+            ' FROM deferred_writes WHERE id = ?',
+            (write_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            'id': row['id'],
+            'project_id': row['project_id'],
+            'content': row['content'],
+            'category': row['category'],
+            'metadata': json.loads(row['metadata']),
+            'agent_id': row['agent_id'],
+            'created_at': row['created_at'],
+            'claimed_at': row['claimed_at'],
+            'attempt_count': row['attempt_count'],
+        }
+
     async def release_stale_claims(self, max_age_seconds: float) -> int:
         """Reset claimed_at to NULL for rows claimed longer ago than max_age_seconds.
 
@@ -706,10 +741,7 @@ class EventBuffer:
 
         Returns the number of rows re-queued (exhausted rows are not counted).
         """
-        cutoff_iso = datetime.fromtimestamp(
-            datetime.now(UTC).timestamp() - max_age_seconds,
-            tz=UTC,
-        ).isoformat()
+        cutoff_iso = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).isoformat()
         async with self._txn() as db:
             # Fetch all stale rows to split recoverable vs. exhausted.
             async with db.execute(
