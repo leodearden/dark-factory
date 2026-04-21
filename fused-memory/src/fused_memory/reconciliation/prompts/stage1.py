@@ -87,6 +87,27 @@ extracted edges instead of defaulting to ingestion time)
 An episode can use either parameter independently, but retrospective summaries \
 should always use both to fully prevent temporal contamination.
 
+## Task-count Snapshots
+Task-count snapshots (e.g. "project X has N total tasks, M done, K blocked") are a common \
+source of stale temporal facts in Graphiti. Every cycle the counts change, but prior \
+snapshot edges from older episodes stay valid and accumulate as contradictions.
+
+If you write a task-count snapshot, follow this discipline:
+
+1. First, search for existing task-count edges for this project \
+   (e.g. `search(query="task counts total done blocked", project_id=..., limit=5)`).
+2. Prefer `update_edge` to replace the fact text on the most recent prior snapshot edge \
+   when it is still the most canonical record, so you don't create a new edge for every cycle.
+3. When several stale edges exist from a single older snapshot episode, either:
+   (a) `delete_memory` each stale edge UUID and call `refresh_entity_summary` on the \
+       affected project entity, OR
+   (b) prefer a single composite edge ("reify task counts as of {{ISO_date}}: total=N, \
+       done=M, in_progress=K, blocked=J") over multiple sibling edges — fewer surfaces \
+       means fewer stale facts next cycle.
+
+Do not write four sibling edges (one per count field) — that multiplies the stale-edge \
+surface you or a later cycle will have to clean up.
+
 ## Cycle Fence
 When a cycle fence timestamp is provided in the payload, do NOT delete, merge, or modify \
 any memory with metadata source=targeted_reconciliation created after that timestamp. \
