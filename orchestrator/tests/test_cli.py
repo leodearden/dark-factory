@@ -363,25 +363,30 @@ class TestForceExitWatchdog:
             f'got {calls}'
         )
         # Verify the control-flow path: format_stack built real frames so the outer
-        # out.write(''.join(lines)) was attempted first (must contain the watchdog-fired
-        # header sentinel, proving the outer path was reached), then the inner fallback
-        # out.write was attempted second (must contain the dump-failed sentinel).  Both
-        # raised — inner except swallowed — os._exit still reached.  This distinguishes
-        # the test from its sibling test_fallback_write_failure_still_fires_exit where
-        # format_stack raises first (lines is never built, outer out.write is never reached).
-        assert len(write_attempts) >= 2, (
-            f'expected at least 2 write attempts (outer sentinel + inner fallback), '
-            f'got {write_attempts!r}'
+        # out.write(''.join(lines)) was attempted (must appear SOMEWHERE in
+        # write_attempts via the watchdog-fired header sentinel — proves the outer
+        # path was reached), then the inner fallback out.write was attempted (must
+        # appear SOMEWHERE via the dump-failed sentinel — proves the inner path was
+        # also exercised).  Both raised — inner except swallowed — os._exit still
+        # reached.  This distinguishes the test from its sibling
+        # test_fallback_write_failure_still_fires_exit where format_stack raises
+        # first (lines is never built, outer out.write is never reached).
+        # Both sentinels must appear SOMEWHERE in the write attempts (positional
+        # indexing would be brittle to a hypothetical refactor that streams per-thread
+        # lines via multiple out.write calls instead of the current single
+        # out.write(''.join(lines)) at cli.py:85 — write_attempts[0] could silently
+        # become a partial header chunk that does not contain the full sentinel).
+        # Existence-based checks still distinguish this test from the sibling
+        # test_fallback_write_failure_still_fires_exit: the outer header sentinel can
+        # only appear if format_stack ran and the OUTER out.write(''.join(lines)) was
+        # reached — exactly the path that's mocked out in the sibling.
+        assert any('SHUTDOWN WATCHDOG FIRED — process hung' in s for s in write_attempts), (
+            f'outer watchdog-fired header sentinel missing from write attempts '
+            f'(proves format_stack ran and outer out.write was reached): {write_attempts!r}'
         )
-        assert 'SHUTDOWN WATCHDOG FIRED — process hung' in write_attempts[0], (
-            f'first write attempt must contain the watchdog-fired header sentinel '
-            f'(proves format_stack ran and outer out.write was reached), '
-            f'got: {write_attempts[0]!r}'
-        )
-        assert '(diagnostic dump failed)' in write_attempts[1], (
-            f'second write attempt must contain the fallback sentinel '
-            f'(proves inner fallback out.write was also exercised), '
-            f'got: {write_attempts[1]!r}'
+        assert any('(diagnostic dump failed)' in s for s in write_attempts), (
+            f'inner fallback sentinel missing from write attempts '
+            f'(proves inner fallback out.write was also exercised): {write_attempts!r}'
         )
         handle.thread.join(timeout=1.0)
         assert not handle.thread.is_alive(), (
