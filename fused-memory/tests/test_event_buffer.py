@@ -1017,6 +1017,64 @@ async def test_peek_then_drain_by_ids_workflow(buf):
     assert (await buf.get_buffer_stats('test-project'))['size'] == 2
 
 
+# ── _debug_get_deferred_row tests ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_debug_get_deferred_row_returns_full_row(buf):
+    """_debug_get_deferred_row returns a dict with all expected columns.
+
+    Verifies the happy path: defer a write, query via the debug accessor, and
+    check that the returned dict contains all nine expected keys with the
+    correct values.  Then claim the row and re-query to confirm claimed_at is
+    set while attempt_count remains 0.
+    """
+    write_id = await buf.defer_write(
+        project_id='test-project',
+        content='debug content',
+        category='observations_and_summaries',
+        metadata={'key': 'value'},
+        agent_id='test-agent',
+    )
+
+    row = await buf._debug_get_deferred_row(write_id)
+    assert row is not None, 'row must be returned for a known write_id'
+
+    # All nine columns must be present.
+    expected_keys = {
+        'id', 'project_id', 'content', 'category', 'metadata',
+        'agent_id', 'created_at', 'claimed_at', 'attempt_count',
+    }
+    assert expected_keys.issubset(row.keys()), (
+        f'Missing keys: {expected_keys - row.keys()}'
+    )
+
+    # Values round-trip correctly.
+    assert row['id'] == write_id
+    assert row['project_id'] == 'test-project'
+    assert row['content'] == 'debug content'
+    assert row['category'] == 'observations_and_summaries'
+    assert row['metadata'] == {'key': 'value'}
+    assert row['agent_id'] == 'test-agent'
+    assert row['claimed_at'] is None, 'claimed_at must be None before claiming'
+    assert row['attempt_count'] == 0
+
+    # After claiming, claimed_at is set but attempt_count stays 0.
+    await buf.claim_deferred_writes('test-project')
+    row_after = await buf._debug_get_deferred_row(write_id)
+    assert row_after is not None
+    assert row_after['claimed_at'] is not None, 'claimed_at must be an ISO string after claim'
+    assert isinstance(row_after['claimed_at'], str)
+    assert row_after['attempt_count'] == 0
+
+
+@pytest.mark.asyncio
+async def test_debug_get_deferred_row_returns_none_for_unknown_id(buf):
+    """_debug_get_deferred_row returns None for an unknown write_id."""
+    result = await buf._debug_get_deferred_row('does-not-exist')
+    assert result is None
+
+
 # ── Migration tests ────────────────────────────────────────────────────
 
 
