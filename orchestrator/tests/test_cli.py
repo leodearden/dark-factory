@@ -176,7 +176,8 @@ class TestForceExitWatchdog:
 
         monkeypatch.setattr(traceback_module, 'format_stack', _raise_on_format)
 
-        _force_exit_after_delay(timeout_secs=0.05)
+        stream = io.StringIO()
+        _force_exit_after_delay(timeout_secs=0.05, stream=stream)
 
         # Poll with deadline — os._exit must be called even though the dump failed.
         deadline = time.monotonic() + 5.0
@@ -185,6 +186,11 @@ class TestForceExitWatchdog:
 
         assert calls == [137], (
             f'expected os._exit(137) even when dump fails, got {calls}'
+        )
+
+        output = stream.getvalue()
+        assert 'SHUTDOWN WATCHDOG FIRED (diagnostic dump failed)' in output, (
+            f'fallback sentinel missing from dump-failure output:\n{output!r}'
         )
 
 
