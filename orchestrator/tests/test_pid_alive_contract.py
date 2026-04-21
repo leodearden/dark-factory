@@ -15,7 +15,6 @@ _pid_alive function.
 
 import importlib.util
 import os
-import sys
 import types
 import unittest.mock
 from pathlib import Path
