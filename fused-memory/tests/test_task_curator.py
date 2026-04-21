@@ -5,7 +5,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from shared.cli_invoke import AgentResult
+from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.task_curator import (
@@ -641,6 +641,65 @@ class TestCurateFallbacks:
             )
         _, kwargs = mock.call_args
         assert kwargs['max_turns'] >= 3
+
+
+class TestCuratorCapHandling:
+    """Verify TaskCurator.curate() handles AllAccountsCappedException gracefully."""
+
+    @pytest.mark.asyncio
+    async def test_curate_handles_all_accounts_capped_without_escalator(self):
+        """Cap exception → action='create', justification='all-accounts-capped', no raise."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        cap_exc = AllAccountsCappedException(
+            retries=3, elapsed_secs=90.0, label='task-curator[p]'
+        )
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(side_effect=cap_exc)):
+            result = await curator.curate(
+                CandidateTask(title='T'), project_id='p', project_root='/x',
+            )
+
+        assert result.action == 'create'
+        assert result.justification == 'all-accounts-capped'
+
+    @pytest.mark.asyncio
+    async def test_curate_handles_all_accounts_capped_with_escalator(self):
+        """Cap exception with escalator → escalator.report_failure called with cap justification."""
+        config = _make_config()
+
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        cap_exc = AllAccountsCappedException(
+            retries=3, elapsed_secs=90.0, label='task-curator[p]'
+        )
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(side_effect=cap_exc)):
+            result = await curator.curate(
+                CandidateTask(title='T'), project_id='p', project_root='/x',
+            )
+
+        assert result.action == 'create'
+        assert result.justification == 'all-accounts-capped'
+        escalator.report_failure.assert_awaited_once()
+        kwargs = escalator.report_failure.await_args.kwargs
+        assert 'all-accounts-capped' in kwargs['justification']
+        assert kwargs['project_id'] == 'p'
+        assert kwargs['candidate_title'] == 'T'
 
 
 class TestCurateHappyPath:
