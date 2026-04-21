@@ -3,7 +3,7 @@
 Tests are organized to mirror the implementation steps:
   - step-1/2:  Reify accounts YAML structure (UsageCapConfig parsing)
   - step-3/4:  Config loading via load_config() with accounts_file
-  - step-5/6:  UsageGate initialization from 5-account config
+  - step-5/6:  UsageGate initialization from 4-account config
   - step-7/8:  Cap hit on first account rotates to second
   - step-9/10: All accounts capped → blocks → one uncapped → resumes
 """
@@ -24,23 +24,21 @@ from shared.usage_gate import UsageGate
 from tests.conftest import build_usage_gate
 
 # ---------------------------------------------------------------------------
-# Constants — expected reify automation account pool (F→E→C→B→D)
+# Constants — expected reify automation account pool (F→E→C→D)
 # ---------------------------------------------------------------------------
 
 REIFY_ACCOUNT_DEFS = [
     {'name': 'max-f', 'oauth_token_env': 'CLAUDE_OAUTH_TOKEN_F'},
     {'name': 'max-e', 'oauth_token_env': 'CLAUDE_OAUTH_TOKEN_E'},
     {'name': 'max-c', 'oauth_token_env': 'CLAUDE_OAUTH_TOKEN_C'},
-    {'name': 'max-b', 'oauth_token_env': 'CLAUDE_OAUTH_TOKEN_B'},
     {'name': 'max-d', 'oauth_token_env': 'CLAUDE_OAUTH_TOKEN_D'},
 ]
 
-REIFY_ACCOUNT_NAMES = ['max-f', 'max-e', 'max-c', 'max-b', 'max-d']
+REIFY_ACCOUNT_NAMES = ['max-f', 'max-e', 'max-c', 'max-d']
 REIFY_ENV_VARS = [
     'CLAUDE_OAUTH_TOKEN_F',
     'CLAUDE_OAUTH_TOKEN_E',
     'CLAUDE_OAUTH_TOKEN_C',
-    'CLAUDE_OAUTH_TOKEN_B',
     'CLAUDE_OAUTH_TOKEN_D',
 ]
 
@@ -50,7 +48,7 @@ REIFY_ENV_VARS = [
 # ---------------------------------------------------------------------------
 
 def _make_reify_gate(wait_for_reset: bool = False) -> UsageGate:
-    """Create a UsageGate with reify's 5 automation accounts.
+    """Create a UsageGate with reify's 4 automation accounts.
 
     Tokens are injected directly (no env var lookup) for test isolation.
     Delegates to the shared build_usage_gate() helper in conftest.py.
@@ -66,17 +64,17 @@ def _make_reify_gate(wait_for_reset: bool = False) -> UsageGate:
 
 
 class TestReifyAccountsYaml:
-    """Validates that a reify-style accounts YAML parses into 5 AccountConfig entries."""
+    """Validates that a reify-style accounts YAML parses into 4 AccountConfig entries."""
 
-    def test_reify_accounts_yaml_has_five_automation_accounts(self, tmp_path):
-        """A YAML fixture with reify's 5 accounts parses correctly via UsageCapConfig."""
+    def test_reify_accounts_yaml_has_four_automation_accounts(self, tmp_path):
+        """A YAML fixture with reify's 4 accounts parses correctly via UsageCapConfig."""
         fixture = tmp_path / 'usage-accounts.yaml'
         fixture.write_text(yaml.dump({'accounts': REIFY_ACCOUNT_DEFS}))
 
         config = UsageCapConfig(accounts_file=str(fixture))
 
-        assert len(config.accounts) == 5, (
-            f"Expected 5 accounts, got {len(config.accounts)}"
+        assert len(config.accounts) == 4, (
+            f"Expected 4 accounts, got {len(config.accounts)}"
         )
 
         names = [a.name for a in config.accounts]
@@ -137,7 +135,7 @@ class TestReifyConfigLoadsUsageCap:
     """Validates that a reify-style orchestrator YAML with usage_cap section loads correctly."""
 
     def test_reify_config_loads_usage_cap_with_accounts_file(self, tmp_path):
-        """An orchestrator YAML with usage_cap.accounts_file loads 5 accounts."""
+        """An orchestrator YAML with usage_cap.accounts_file loads 4 accounts."""
         from orchestrator.config import load_config
 
         # Create the accounts file
@@ -166,8 +164,8 @@ class TestReifyConfigLoadsUsageCap:
         assert config.usage_cap.wait_for_reset is True
         assert config.usage_cap.probe_interval_secs == 300
         assert config.usage_cap.max_probe_interval_secs == 1800
-        assert len(config.usage_cap.accounts) == 5, (
-            f"Expected 5 accounts, got {len(config.usage_cap.accounts)}"
+        assert len(config.usage_cap.accounts) == 4, (
+            f"Expected 4 accounts, got {len(config.usage_cap.accounts)}"
         )
 
     def test_usage_cap_accounts_have_correct_names_after_loading(self, tmp_path):
@@ -198,10 +196,10 @@ class TestReifyConfigLoadsUsageCap:
 
 
 class TestGateFromReifyConfig:
-    """Validates UsageGate initializes correctly from a 5-account config."""
+    """Validates UsageGate initializes correctly from a 4-account config."""
 
-    def test_gate_from_reify_config_initializes_five_accounts(self):
-        """UsageGate with all 5 tokens set initializes 5 AccountState entries."""
+    def test_gate_from_reify_config_initializes_four_accounts(self):
+        """UsageGate with all 4 tokens set initializes 4 AccountState entries."""
         acct_cfgs = [AccountConfig(**d) for d in REIFY_ACCOUNT_DEFS]
         config = UsageCapConfig(accounts=acct_cfgs)
 
@@ -210,8 +208,8 @@ class TestGateFromReifyConfig:
         with patch.dict(os.environ, env_vars):
             gate = UsageGate(config)
 
-        assert len(gate._accounts) == 5, (
-            f"Expected 5 AccountState entries, got {len(gate._accounts)}"
+        assert len(gate._accounts) == 4, (
+            f"Expected 4 AccountState entries, got {len(gate._accounts)}"
         )
         for state, defn in zip(gate._accounts, REIFY_ACCOUNT_DEFS, strict=True):
             assert state.name == defn['name']
@@ -225,24 +223,23 @@ class TestGateFromReifyConfig:
         acct_cfgs = [AccountConfig(**d) for d in REIFY_ACCOUNT_DEFS]
         config = UsageCapConfig(accounts=acct_cfgs)
 
-        # Set only the 3 present tokens; explicitly delete the 2 missing ones so
+        # Set only 3 present tokens; explicitly delete the 1 missing one so
         # ambient environment values (if any) don't accidentally satisfy the lookup.
         # monkeypatch restores the original env on test teardown automatically.
         monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_F', 'token-f')
         monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_E', 'token-e')
         monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_C', 'token-c')
-        monkeypatch.delenv('CLAUDE_OAUTH_TOKEN_B', raising=False)
         monkeypatch.delenv('CLAUDE_OAUTH_TOKEN_D', raising=False)
 
         gate = UsageGate(config)
 
-        # Should have exactly 3 accounts (skipped B and D)
+        # Should have exactly 3 accounts (3 present tokens; 1 missing: D)
         assert len(gate._accounts) == 3
         names = [a.name for a in gate._accounts]
         assert names == ['max-f', 'max-e', 'max-c']
 
     def test_gate_account_names_match_reify_pool(self):
-        """Gate._accounts names match reify's 5-account pool in correct order."""
+        """Gate._accounts names match reify's 4-account pool in correct order."""
         gate = _make_reify_gate()
 
         names = [a.name for a in gate._accounts]
@@ -300,11 +297,11 @@ class TestCapHitRotation:
         assert token == 'token-max-c', f"Expected 'token-max-c', got {token!r}"
 
     @pytest.mark.asyncio
-    async def test_failover_chain_full_f_e_c_b_to_d(self):
-        """Capping F, E, C, B causes before_invoke() to return D's token."""
+    async def test_failover_chain_full_f_e_c_to_d(self):
+        """Capping F, E, C causes before_invoke() to return D's token."""
         gate = _make_reify_gate()
 
-        for acct_name in ('max-f', 'max-e', 'max-c', 'max-b'):
+        for acct_name in ('max-f', 'max-e', 'max-c'):
             gate._handle_cap_detected(
                 reason=f'cap-{acct_name}',
                 resets_at=datetime.now(UTC) + timedelta(hours=1),
@@ -316,19 +313,19 @@ class TestCapHitRotation:
 
 
 # ---------------------------------------------------------------------------
-# step-9: All five accounts capped → gate blocks → one uncapped → resumes
+# step-9: All four accounts capped → gate blocks → one uncapped → resumes
 # ---------------------------------------------------------------------------
 
 
 class TestAllCappedBlockResume:
-    """Validates full block-and-resume cycle with reify's 5-account set."""
+    """Validates full block-and-resume cycle with reify's 4-account set."""
 
     @pytest.mark.asyncio
-    async def test_all_five_reify_accounts_capped_blocks_then_resumes(self):
-        """Capping all 5 accounts blocks gate; uncapping one lets it resume."""
+    async def test_all_four_reify_accounts_capped_blocks_then_resumes(self):
+        """Capping all 4 accounts blocks gate; uncapping one lets it resume."""
         gate = _make_reify_gate()
 
-        # Cap all 5 accounts
+        # Cap all 4 accounts
         for defn in REIFY_ACCOUNT_DEFS:
             gate._handle_cap_detected(
                 reason=f'cap-{defn["name"]}',
@@ -359,10 +356,10 @@ class TestAllCappedBlockResume:
 
     @pytest.mark.asyncio
     async def test_gate_blocks_while_all_capped(self):
-        """before_invoke() blocks (asyncio.TimeoutError) when all 5 are capped."""
+        """before_invoke() blocks (asyncio.TimeoutError) when all 4 are capped."""
         gate = _make_reify_gate()
 
-        # Cap all 5 — resets_at in future so auto-resume won't trigger
+        # Cap all 4 — resets_at in future so auto-resume won't trigger
         for defn in REIFY_ACCOUNT_DEFS:
             gate._handle_cap_detected(
                 reason=f'cap-{defn["name"]}',
@@ -396,7 +393,7 @@ class TestAllCappedBlockResume:
         assert token == 'token-max-f'
 
     def test_is_paused_reflects_all_capped_state(self):
-        """gate.is_paused is True only when all 5 accounts are capped."""
+        """gate.is_paused is True only when all 4 accounts are capped."""
         gate = _make_reify_gate()
 
         # Not paused initially
@@ -407,10 +404,10 @@ class TestAllCappedBlockResume:
             gate._accounts[i].capped = True
             if i < len(REIFY_ACCOUNT_DEFS) - 1:
                 assert not gate.is_paused, (
-                    f"Gate should not be paused after capping only {i+1} of 5 accounts"
+                    f"Gate should not be paused after capping only {i+1} of 4 accounts"
                 )
             else:
-                assert gate.is_paused, "Gate should be paused when all 5 accounts are capped"
+                assert gate.is_paused, "Gate should be paused when all 4 accounts are capped"
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +426,7 @@ class TestCapDetectedUnknownToken:
 
     def test_unknown_token_does_not_cap_any_account(self):
         """Unknown token: no account is capped and gate is not paused."""
-        gate = _make_reify_gate()  # all 5 accounts uncapped
+        gate = _make_reify_gate()  # all 4 accounts uncapped
 
         gate._handle_cap_detected(
             reason='unknown-token-cap',
@@ -442,16 +439,16 @@ class TestCapDetectedUnknownToken:
             assert not acct.capped, (
                 f"{acct.name} should remain uncapped after unknown-token call"
             )
-        # Gate is not paused because all 5 accounts remain available
+        # Gate is not paused because all 4 accounts remain available
         assert not gate.is_paused, (
-            "Gate should not be paused: all 5 accounts are still available"
+            "Gate should not be paused: all 4 accounts are still available"
         )
 
     def test_unknown_token_when_all_capped_is_noop(self):
         """Unknown token with all accounts capped is a no-op (logs warning, no state change)."""
         gate = _make_reify_gate()
 
-        # Cap all 5 accounts using the same loop pattern as test_gate_blocks_while_all_capped
+        # Cap all 4 accounts using the same loop pattern as test_gate_blocks_while_all_capped
         future_reset = datetime.now(UTC) + timedelta(hours=1)
         for defn in REIFY_ACCOUNT_DEFS:
             gate._handle_cap_detected(
@@ -460,9 +457,9 @@ class TestCapDetectedUnknownToken:
                 oauth_token=f'token-{defn["name"]}',
             )
 
-        assert gate.is_paused, "Gate should be paused after capping all 5 accounts"
+        assert gate.is_paused, "Gate should be paused after capping all 4 accounts"
 
-        # Snapshot the state of all 5 accounts before the unknown-token call
+        # Snapshot the state of all 4 accounts before the unknown-token call
         snapshot = [
             (a.name, a.capped, a.resets_at)
             for a in gate._accounts
@@ -475,8 +472,8 @@ class TestCapDetectedUnknownToken:
             oauth_token='not-a-real-token',
         )
 
-        # All 5 accounts must still be capped
-        assert len(gate._accounts) == 5
+        # All 4 accounts must still be capped
+        assert len(gate._accounts) == 4
         for acct in gate._accounts:
             assert acct.capped, (
                 f"{acct.name} should still be capped after noop unknown-token call"
