@@ -183,3 +183,42 @@ class TestMissingFifo:
         assert jobserver_warnings == [], (
             f'Missing-FIFO path must not log warnings, got: {jobserver_warnings}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Unconfigure-after-timeout safety test
+# ---------------------------------------------------------------------------
+
+
+class TestUnconfigureAfterTimeout:
+    def test_pytest_unconfigure_after_timeout_is_safe(
+        self, fifo_path, monkeypatch
+    ):
+        """pytest_unconfigure must be safe to call after the timeout path.
+
+        The timeout path leaves _fd/_tok as None. Calling pytest_unconfigure
+        afterwards must not raise and must leave _fd/_tok as None, guarding
+        against half-initialised state bugs.
+        """
+        monkeypatch.setenv('PYTEST_JOBSERVER_FIFO', fifo_path)
+        monkeypatch.setenv('PYTEST_JOBSERVER_TIMEOUT', '0.1')
+
+        # Trigger the timeout path (run on daemon thread to avoid hanging)
+        thread = threading.Thread(
+            target=_js.pytest_configure,
+            kwargs={'config': None},
+            daemon=True,
+        )
+        thread.start()
+        thread.join(5.0)
+        assert not thread.is_alive(), 'pytest_configure hung unexpectedly'
+
+        # State after timeout: _fd and _tok must both be None
+        assert _js._fd is None
+        assert _js._tok is None
+
+        # Calling unconfigure on this state must not raise
+        _js.pytest_unconfigure(config=None)
+
+        assert _js._fd is None, '_fd should remain None after unconfigure'
+        assert _js._tok is None, '_tok should remain None after unconfigure'
