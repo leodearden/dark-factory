@@ -453,3 +453,45 @@ class TestReconciliationConfigTimeouts:
         # inner == outer is the degenerate-but-valid co-terminal case
         cfg = ReconciliationConfig(agent_cli_timeout_seconds=3600, stage_timeout_seconds=3600)
         assert cfg.agent_cli_timeout_seconds == 3600
+
+    def test_judge_cli_timeout_equal_to_stage_accepted(self):
+        # inner == outer is the degenerate-but-valid co-terminal case (judge parallel)
+        cfg = ReconciliationConfig(judge_cli_timeout_seconds=3600, stage_timeout_seconds=3600)
+        assert cfg.judge_cli_timeout_seconds == 3600
+
+    def test_defaults_pass_validator(self):
+        # Shipped defaults: agent=180, judge=600, stage=3600 — all satisfy inner<=outer
+        cfg = ReconciliationConfig()
+        assert cfg.agent_cli_timeout_seconds <= cfg.stage_timeout_seconds
+        assert cfg.judge_cli_timeout_seconds <= cfg.stage_timeout_seconds
+
+    # --- gt=0 bounds: tool_timeout_seconds (consistency extension) ---
+
+    def test_tool_timeout_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(tool_timeout_seconds=0)
+
+    def test_tool_timeout_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(tool_timeout_seconds=-1.0)
+
+    # --- gt=0 bounds: cycle_timeout_seconds (consistency extension) ---
+
+    def test_cycle_timeout_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(cycle_timeout_seconds=0)
+
+    def test_cycle_timeout_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(cycle_timeout_seconds=-1)
+
+    # --- cross-field stage <= cycle validator ---
+
+    def test_stage_timeout_exceeds_cycle_rejected(self):
+        with pytest.raises(ValidationError, match='stage_timeout_seconds'):
+            ReconciliationConfig(stage_timeout_seconds=86400, cycle_timeout_seconds=3600)
+
+    def test_stage_timeout_equal_to_cycle_accepted(self):
+        # stage == cycle is the degenerate-but-valid co-terminal case
+        cfg = ReconciliationConfig(stage_timeout_seconds=3600, cycle_timeout_seconds=3600)
+        assert cfg.stage_timeout_seconds == 3600
