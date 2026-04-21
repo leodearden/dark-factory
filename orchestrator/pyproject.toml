@@ -50,6 +50,7 @@ docstring-code-format = true
 filterwarnings = [
     "error:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited:RuntimeWarning",
     "error:Exception ignored while finalizing coroutine <coroutine object AsyncMockMixin._execute_mock_call:pytest.PytestUnraisableExceptionWarning",
+    "error:The test .* is marked with '@pytest.mark.asyncio' but it is not an async function:pytest.PytestWarning",
 ]
 
 [dependency-groups]
