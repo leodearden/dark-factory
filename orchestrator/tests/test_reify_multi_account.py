@@ -27,6 +27,9 @@ from tests.conftest import build_usage_gate
 # Constants — expected reify automation account pool (F→E→C→D)
 # ---------------------------------------------------------------------------
 
+# NOTE: This is the reify-automation subset (4 accounts, F→E→C→D). It deliberately
+# excludes max-g, which is reserved for other workloads. See TestDarkFactoryProductionPool
+# below for the full 5-account production pool (G→F→E→C→D).
 REIFY_ACCOUNT_DEFS = [
     {'name': 'max-f', 'oauth_token_env': 'CLAUDE_OAUTH_TOKEN_F'},
     {'name': 'max-e', 'oauth_token_env': 'CLAUDE_OAUTH_TOKEN_E'},
