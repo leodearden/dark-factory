@@ -701,6 +701,30 @@ async def test_claim_deferred_writes_project_isolation_and_ordering(buf):
 
 
 @pytest.mark.asyncio
+async def test_delete_deferred_write_removes_only_target(buf):
+    """delete_deferred_write removes exactly the targeted row; others survive."""
+    await buf.defer_write('test-project', 'a', 'cat', {})
+    await buf.defer_write('test-project', 'b', 'cat', {})
+    await buf.defer_write('test-project', 'c', 'cat', {})
+
+    claimed = await buf.claim_deferred_writes('test-project')
+    assert len(claimed) == 3
+
+    # Delete only the middle row
+    middle = next(item for item in claimed if item['content'] == 'b')
+    await buf.delete_deferred_write(middle['id'])
+
+    # Re-queue the still-claimed (non-deleted) rows via release_stale_claims(0)
+    released = await buf.release_stale_claims(0.0)
+    assert released == 2  # 'a' and 'c' were re-queued
+
+    # Re-claim and check exactly 'a' and 'c' remain
+    reclaimed = await buf.claim_deferred_writes('test-project')
+    assert len(reclaimed) == 2
+    assert {item['content'] for item in reclaimed} == {'a', 'c'}
+
+
+@pytest.mark.asyncio
 async def test_defer_write_and_pop(buf):
     """Deferred write should be retrievable via pop."""
     write_id = await buf.defer_write(
