@@ -1729,15 +1729,135 @@ class TestAggregateCostByAccount:
         assert result['max-a']['invocations'] == 3
 
     @pytest.mark.asyncio
-    async def test_cap_status_conservative_latch(self, two_conns):
-        """If any source reports capped, merged status is capped (conservative).
+    async def test_cross_db_resumed_clears_cap(self, two_conns):
+        """A resumed event in one DB clears a cap observed in another.
 
-        The per-DB function doesn't expose the resumed timestamp, so the merge
-        can't determine global event ordering — it latches on capped.
+        The fixture has max-a cap_hit in DB A at *now* and resumed in DB B at
+        *now + 5min*. Accounts are global (same OAuth token), so the later
+        resumed clears the cap even though no single DB sees both events. The
+        aggregator must compute global ordering, not latch on per-DB status.
+        Regression: prior code latched 'capped' on any source, masking the
+        globally-newer resumed.
         """
         result = await aggregate_cost_by_account(two_conns, days=30)
-        assert result['max-a']['status'] == 'capped'
+        assert result['max-a']['status'] == 'active'
         assert result['max-a']['cap_events'] == 1
+        # resets_at is meaningless once we know the cap was resumed.
+        assert result['max-a']['resets_at'] is None
+
+    @pytest.mark.asyncio
+    async def test_stale_db_cap_without_resumed_wins(self, tmp_path):
+        """If the globally-newest cap_hit has no later resumed anywhere,
+        status is capped — even if another DB shows an older resumed.
+
+        Setup:
+          - DB A: max-a resumed at T1
+          - DB B: max-a cap_hit at T2 (T2 > T1), no resumed
+        Expected: capped (the T2 cap is newer than any resumed).
+        """
+        now = datetime.now(UTC)
+        t1 = (now - timedelta(hours=3)).isoformat()
+        t2 = (now - timedelta(hours=1)).isoformat()
+
+        db_a = tmp_path / 'stale_a.db'
+        db_b = tmp_path / 'stale_b.db'
+        for p in (db_a, db_b):
+            conn = sqlite3.connect(str(p))
+            conn.executescript(MINIMAL_SCHEMA)
+            conn.close()
+
+        conn = sqlite3.connect(str(db_a))
+        conn.execute(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            ('max-a', 'resumed', 'pa', 'r1', None, t1),
+        )
+        conn.execute(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('r1', 't1', 'pa', 'max-a', 'opus', 'implementer',
+             0.1, 0, t1, t1),
+        )
+        conn.commit()
+        conn.close()
+
+        conn = sqlite3.connect(str(db_b))
+        conn.execute(
+            'INSERT INTO account_events '
+            '(account_name, event_type, project_id, run_id, details, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            ('max-a', 'cap_hit', 'pb', 'r2', '{"reason": "limit"}', t2),
+        )
+        conn.execute(
+            'INSERT INTO invocations '
+            '(run_id, task_id, project_id, account_name, model, role, '
+            ' cost_usd, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('r2', 't2', 'pb', 'max-a', 'opus', 'implementer',
+             0.1, 0, t2, t2),
+        )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db_a)) as a, aiosqlite.connect(str(db_b)) as b:
+            a.row_factory = aiosqlite.Row
+            b.row_factory = aiosqlite.Row
+            result = await aggregate_cost_by_account([a, b], days=7)
+
+        assert result['max-a']['status'] == 'capped'
+        assert result['max-a']['last_cap'] == t2
+
+    @pytest.mark.asyncio
+    async def test_resets_at_travels_with_winning_last_cap(self, tmp_path):
+        """When one DB supplies the globally-newest cap_hit, its resets_at
+        (and only its) attaches to the merged row.
+        """
+        now = datetime.now(UTC)
+        t_old = (now - timedelta(hours=3)).isoformat()
+        t_new = (now - timedelta(hours=1)).isoformat()
+        new_resets_at = (now + timedelta(hours=2)).isoformat()
+
+        db_a = tmp_path / 'resets_a.db'
+        db_b = tmp_path / 'resets_b.db'
+        for p in (db_a, db_b):
+            conn = sqlite3.connect(str(p))
+            conn.executescript(MINIMAL_SCHEMA)
+            conn.close()
+
+        old_details = '{"reason": "old limit", "resets_at": "' \
+            + (now - timedelta(hours=1)).isoformat() + '"}'
+        new_details = '{"reason": "new limit", "resets_at": "' + new_resets_at + '"}'
+
+        for p, cap_ts, details in [(db_a, t_old, old_details), (db_b, t_new, new_details)]:
+            conn = sqlite3.connect(str(p))
+            conn.execute(
+                'INSERT INTO account_events '
+                '(account_name, event_type, project_id, run_id, details, created_at) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                ('max-a', 'cap_hit', 'p', f'r-{cap_ts}', details, cap_ts),
+            )
+            conn.execute(
+                'INSERT INTO invocations '
+                '(run_id, task_id, project_id, account_name, model, role, '
+                ' cost_usd, capped, started_at, completed_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (f'r-{cap_ts}', 't', 'p', 'max-a', 'opus', 'implementer',
+                 0.1, 0, cap_ts, cap_ts),
+            )
+            conn.commit()
+            conn.close()
+
+        async with aiosqlite.connect(str(db_a)) as a, aiosqlite.connect(str(db_b)) as b:
+            a.row_factory = aiosqlite.Row
+            b.row_factory = aiosqlite.Row
+            result = await aggregate_cost_by_account([a, b], days=7)
+
+        assert result['max-a']['status'] == 'capped'
+        assert result['max-a']['last_cap'] == t_new
+        assert result['max-a']['resets_at'] == new_resets_at
 
     @pytest.mark.asyncio
     async def test_unique_account(self, two_conns):
