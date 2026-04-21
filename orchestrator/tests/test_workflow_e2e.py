@@ -3007,6 +3007,66 @@ class TestEscalatePlanOverwriteMessage:
         assert 'duplicate workflow' in detail
 
 
+@pytest.mark.asyncio
+class TestAllAccountsCappedExceptionBoundary:
+    """Verify AllAccountsCappedException is caught at the workflow boundary.
+
+    Before the explicit handler is added in step-2, the generic
+    ``except Exception`` catches the exception but creates a reason of
+    ``'Workflow error: ...'`` — the discriminating assertion (reason starts
+    with ``'all accounts capped'``) fails, proving the test is red before impl.
+    """
+
+    async def test_workflow_boundary_stops_propagation(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        from shared.cli_invoke import AllAccountsCappedException
+
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        # Spy on _mark_blocked: record the reason while still calling the real method.
+        captured_reasons: list[str] = []
+        original_mark_blocked = workflow._mark_blocked
+
+        async def spy_mark_blocked(reason: str, **kwargs):
+            captured_reasons.append(reason)
+            return await original_mark_blocked(reason, **kwargs)
+
+        monkeypatch.setattr(workflow, '_mark_blocked', spy_mark_blocked)
+
+        # Patch invoke_agent so the architect call raises AllAccountsCappedException.
+        # NOTE: patch the name in orchestrator.workflow (not in orchestrator.agents.invoke)
+        # because workflow.py uses `from orchestrator.agents.invoke import invoke_agent`
+        # which creates a local binding unaffected by patching the source module.
+        async def raise_cap_exc(*args, **kwargs):
+            raise AllAccountsCappedException(
+                retries=3, elapsed_secs=120.0, label='Task 42 [architect]'
+            )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', raise_cap_exc)
+
+        # Patch run_scoped_verification — should never be reached, but protect
+        # against accidental execution.
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+
+        outcome = await workflow.run()
+
+        # Outcome and state
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert workflow.state == WorkflowState.BLOCKED
+
+        # The specific catch must use a cap-exhaustion reason, NOT the generic
+        # 'Workflow error: ...' from the broad except-Exception handler.
+        assert captured_reasons, '_mark_blocked was never called'
+        assert captured_reasons[0].lower().startswith('all accounts capped'), (
+            f'Expected reason starting with "all accounts capped", got: {captured_reasons[0]!r}'
+        )
+
+
 if TYPE_CHECKING:
     from orchestrator.evals.runner import _EvalScheduler as _EvalSchedulerStatic
     from orchestrator.workflow import _SchedulerLike
