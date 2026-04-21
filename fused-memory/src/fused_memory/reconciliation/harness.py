@@ -429,6 +429,18 @@ class ReconciliationHarness:
 
         await self._start_escalation_server()
 
+        # Re-queue any deferred writes left in-progress by a crashed prior process.
+        try:
+            released = await self.buffer.release_stale_claims(
+                self.config.stale_run_recovery_seconds,
+            )
+            if released:
+                logger.info(
+                    f'Recovered {released} stale deferred write claim(s) on startup'
+                )
+        except Exception as e:
+            logger.warning(f'release_stale_claims at startup failed: {e}')
+
         loop_count = 0
         try:
             while True:
