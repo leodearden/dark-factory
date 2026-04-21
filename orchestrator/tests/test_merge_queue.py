@@ -1162,6 +1162,9 @@ class TestSpeculativeMergeWorker:
         async def _fail_n_pass_n1(merge_wt, cfg, module_configs, task_files=None):
             n_present = (merge_wt / 'file_ev_n.py').exists()
             n1_present = (merge_wt / 'file_ev_n1.py').exists()
+            # Speculative verify of N: N present, N+1 not yet merged → fail.
+            # Re-merge of N+1: N absent, N+1 present → pass (not reached here
+            # since N+1 is discarded after N fails, but the guard is explicit).
             if n_present and not n1_present:
                 return MagicMock(passed=False, summary='N failed')
             return MagicMock(passed=True, summary='')
