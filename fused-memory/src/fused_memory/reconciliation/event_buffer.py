@@ -56,9 +56,11 @@ CREATE TABLE IF NOT EXISTS deferred_writes (
     category TEXT NOT NULL,
     metadata TEXT NOT NULL DEFAULT '{}',
     agent_id TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    claimed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_dw_project ON deferred_writes(project_id);
+CREATE INDEX IF NOT EXISTS idx_dw_project_claimed ON deferred_writes(project_id, claimed_at);
 """
 
 
@@ -108,7 +110,23 @@ class EventBuffer:
         await self._db.execute('PRAGMA synchronous=NORMAL')
         await self._db.executescript(_BUFFER_SCHEMA_SQL)
         await self._db.commit()
+        # Idempotent migration: add claimed_at column for pre-existing DBs.
+        await self._migrate()
         logger.info(f'EventBuffer initialized (db={self._db_path}, instance={self.instance_id})')
+
+    async def _migrate(self) -> None:
+        """Add new columns to pre-existing DBs (idempotent, matches write_journal pattern)."""
+        db = self._require_db()
+        async with db.execute('PRAGMA table_info(deferred_writes)') as cursor:
+            columns = {row['name'] async for row in cursor}
+        if 'claimed_at' not in columns:
+            await db.execute('ALTER TABLE deferred_writes ADD COLUMN claimed_at TEXT')
+            await db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_dw_project_claimed'
+                ' ON deferred_writes(project_id, claimed_at)'
+            )
+            await db.commit()
+            logger.info('EventBuffer: migrated deferred_writes — added claimed_at column')
 
     def _require_db(self) -> aiosqlite.Connection:
         if self._db is None:
@@ -580,6 +598,47 @@ class EventBuffer:
             extra={'project_id': project_id, 'category': category, 'write_id': write_id},
         )
         return write_id
+
+    async def claim_deferred_writes(self, project_id: str) -> list[dict]:
+        """Atomically claim all pending (unclaimed) deferred writes for a project.
+
+        Returns list of ``{id, content, category, metadata, agent_id}`` dicts,
+        ordered by created_at ASC.  Claimed rows have ``claimed_at`` set to now
+        and are excluded from subsequent calls until released or deleted.
+        """
+        now_iso = datetime.now(UTC).isoformat()
+        async with self._txn() as db:
+            # Fetch pending rows inside the transaction
+            async with db.execute(
+                """SELECT id, content, category, metadata, agent_id, created_at
+                   FROM deferred_writes
+                   WHERE project_id = ? AND claimed_at IS NULL
+                   ORDER BY created_at""",
+                (project_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+            if not rows:
+                return []
+
+            # Atomically mark them all as claimed
+            ids = [row['id'] for row in rows]
+            placeholders = ','.join('?' for _ in ids)
+            await db.execute(
+                f'UPDATE deferred_writes SET claimed_at = ? WHERE id IN ({placeholders})',
+                [now_iso, *ids],
+            )
+
+        return [
+            {
+                'id': row['id'],
+                'content': row['content'],
+                'category': row['category'],
+                'metadata': json.loads(row['metadata']),
+                'agent_id': row['agent_id'],
+            }
+            for row in rows
+        ]
 
     async def pop_deferred_writes(self, project_id: str) -> list[dict]:
         """Atomically pop all deferred writes for a project.
