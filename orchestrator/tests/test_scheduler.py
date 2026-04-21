@@ -99,6 +99,30 @@ class TestModuleLockTable:
         lock_table.release('task-1')
         assert lock_table.is_held('task-1') is False
 
+    def test_release_subset_drops_only_named(self, lock_table: ModuleLockTable):
+        assert lock_table.try_acquire('task-1', ['backend', 'server'])
+        released = lock_table.release_subset('task-1', ['backend'])
+        assert released == ['backend']
+        # server still held by task-1, backend now free for task-2
+        assert lock_table.try_acquire('task-2', ['backend'])
+        assert not lock_table.try_acquire('task-3', ['server'])
+
+    def test_release_subset_clears_entry_when_empty(self, lock_table: ModuleLockTable):
+        assert lock_table.try_acquire('task-1', ['backend'])
+        released = lock_table.release_subset('task-1', ['backend'])
+        assert released == ['backend']
+        # Task no longer tracked in _held
+        assert lock_table.is_held('task-1') is False
+
+    def test_release_subset_ignores_unheld_modules(self, lock_table: ModuleLockTable):
+        assert lock_table.try_acquire('task-1', ['backend'])
+        released = lock_table.release_subset('task-1', ['server', 'frontend'])
+        assert released == []
+        assert lock_table.is_held('task-1') is True
+
+    def test_release_subset_nonexistent_task_is_noop(self, lock_table: ModuleLockTable):
+        assert lock_table.release_subset('never-acquired', ['backend']) == []
+
 
 class TestHierarchicalLocking:
     """Test that parent/child modules conflict but siblings don't."""
@@ -2292,3 +2316,128 @@ class TestDispatchPriorityBookkeeping:
         assert result is not None and result.task_id == '1'
         # Task 1 was dispatched as critical (inherited from dependent).
         assert scheduler._dispatched_priority['1'] == 'critical'
+
+
+class TestBlastRadiusRefinement:
+    """handle_blast_radius_expansion must treat the plan's file list as a
+    replacement, not a union: acquire new modules AND release stale ones so
+    other tasks aren't starved behind a lock the refined plan no longer needs.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        event_store = _RecordingEventStore()
+        sched = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        return sched
+
+    @pytest.mark.asyncio
+    async def test_narrowing_releases_stale(self, scheduler: Scheduler):
+        """Plan scope narrows to a sibling file — the initial lock is freed."""
+        lt = scheduler.lock_table
+        assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        ok = await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=['crates/reify-compiler/src/lib.rs'],
+            needed=['crates/reify-compiler/src/conformance.rs'],
+        )
+        assert ok is True
+        # lib.rs is free for another task
+        assert lt.try_acquire('2035', ['crates/reify-compiler/src/lib.rs'])
+        # 936 now holds conformance.rs, not lib.rs
+        assert not lt.try_acquire('9999', ['crates/reify-compiler/src/conformance.rs'])
+        # Event emitted with plan_refinement reason
+        event_store = scheduler.event_store
+        assert event_store is not None
+        released_events = [
+            e for e in event_store.events  # type: ignore[attr-defined]
+            if 'lock_released' in e[0]
+            and e[1]['data'].get('reason') == 'plan_refinement'
+        ]
+        assert len(released_events) == 1
+        assert released_events[0][1]['task_id'] == '936'
+        assert released_events[0][1]['data']['modules'] == [
+            'crates/reify-compiler/src/lib.rs',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_shift_releases_and_acquires(self, scheduler: Scheduler):
+        """Plan refines to a mixed set: acquire new, release stale."""
+        lt = scheduler.lock_table
+        assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        ok = await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=['crates/reify-compiler/src/lib.rs'],
+            needed=[
+                'crates/reify-compiler/src/conformance.rs',
+                'crates/reify-compiler/tests/trait_conformance_tests.rs',
+            ],
+        )
+        assert ok is True
+        held = lt._held['936']
+        assert held == {
+            'crates/reify-compiler/src/conformance.rs',
+            'crates/reify-compiler/tests/trait_conformance_tests.rs',
+        }
+        assert lt.try_acquire('2035', ['crates/reify-compiler/src/lib.rs'])
+
+    @pytest.mark.asyncio
+    async def test_pure_expansion_keeps_current(self, scheduler: Scheduler):
+        """Regression: when needed is a superset of current, held grows to
+        match needed and no spurious lock_released event fires."""
+        lt = scheduler.lock_table
+        assert lt.try_acquire('T', ['a/lib.rs'])
+        ok = await scheduler.handle_blast_radius_expansion(
+            'T',
+            current=['a/lib.rs'],
+            needed=['a/lib.rs', 'a/other.rs'],
+        )
+        assert ok is True
+        assert lt._held['T'] == {'a/lib.rs', 'a/other.rs'}
+        event_store = scheduler.event_store
+        assert event_store is not None
+        released_events = [
+            e for e in event_store.events  # type: ignore[attr-defined]
+            if 'lock_released' in e[0]
+        ]
+        assert released_events == []
+
+    @pytest.mark.asyncio
+    async def test_same_set_is_noop(self, scheduler: Scheduler):
+        """needed == current: return True without mutating _held or emitting."""
+        lt = scheduler.lock_table
+        assert lt.try_acquire('T', ['a/lib.rs', 'a/other.rs'])
+        ok = await scheduler.handle_blast_radius_expansion(
+            'T',
+            current=['a/lib.rs', 'a/other.rs'],
+            needed=['a/other.rs', 'a/lib.rs'],  # order differs, set equal
+        )
+        assert ok is True
+        assert lt._held['T'] == {'a/lib.rs', 'a/other.rs'}
+        event_store = scheduler.event_store
+        assert event_store is not None
+        assert event_store.events == []  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_acquire_failure_preserves_stale(self, scheduler: Scheduler):
+        """If additions conflict with another task, return False without
+        touching _held — caller falls through to the full-release requeue path.
+        """
+        lt = scheduler.lock_table
+        assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        # Another task grabs the module 936 would expand into
+        assert lt.try_acquire(
+            'other', ['crates/reify-compiler/src/conformance.rs']
+        )
+        # 936 can't expand; since update_task → set_task_status hit MCP,
+        # patch scheduler methods to no-ops for this assertion scope.
+        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        ok = await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=['crates/reify-compiler/src/lib.rs'],
+            needed=['crates/reify-compiler/src/conformance.rs'],
+        )
+        assert ok is False
+        # Full release ran: 936 should no longer hold anything
+        assert '936' not in lt._held
