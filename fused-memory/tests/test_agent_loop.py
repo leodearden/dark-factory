@@ -1103,7 +1103,7 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     assert 'read_file' in call_kwargs['system_prompt']
     assert call_kwargs['output_schema'] == CLAUDE_CLI_RESPONSE_SCHEMA
     assert call_kwargs['model'] == config.agent_llm_model
-    assert call_kwargs['timeout_seconds'] == float(config.stage_timeout_seconds)
+    assert call_kwargs['timeout_seconds'] == float(config.agent_cli_timeout_seconds)
     assert call_kwargs['resume_session_id'] is None  # first turn: no prior session
     assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
 
