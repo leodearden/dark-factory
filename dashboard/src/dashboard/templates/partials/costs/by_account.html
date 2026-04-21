@@ -1,6 +1,14 @@
 {# Cost by account partial — doughnut chart + account table #}
 <div>
-  <h3 class="text-sm font-semibold text-gray-300 mb-4">Cost by Account</h3>
+  <div class="flex items-baseline justify-between mb-4">
+    <h3 class="text-sm font-semibold text-gray-300">Cost by Account</h3>
+    {% if next_uncap_at %}
+      <p class="text-xs text-gray-400">
+        Next uncap
+        <span class="text-white font-medium">{{ next_uncap_at | timeuntil }}</span>
+      </p>
+    {% endif %}
+  </div>
   {% if by_account %}
     <div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
 
@@ -19,6 +27,7 @@
               <th class="text-right py-2 pr-3">Inv.</th>
               <th class="text-right py-2 pr-3">Caps</th>
               <th class="text-right py-2 pr-3">Last Cap</th>
+              <th class="text-right py-2 pr-3">Uncaps In</th>
               <th class="text-right py-2">Status</th>
             </tr>
           </thead>
@@ -32,6 +41,9 @@
                 {{ data.cap_events }}
               </td>
               <td class="py-2 pr-3 text-right text-gray-400 text-xs">{{ data.last_cap | timeago }}</td>
+              <td class="py-2 pr-3 text-right text-gray-400 text-xs">
+                {% if data.status == 'capped' %}{{ data.resets_at | timeuntil }}{% else %}—{% endif %}
+              </td>
               <td class="py-2 text-right">
                 {% if data.status == 'capped' %}
                   <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-900/50 text-red-300 border border-red-700">

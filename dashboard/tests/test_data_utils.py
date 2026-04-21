@@ -123,3 +123,54 @@ class TestTimeagoUsesParseUtc:
         ts = five_min_ago_ist.isoformat()
         assert timeago(ts) == '5m ago'
 
+
+class TestTimeuntilFilter:
+    """Tests for the `timeuntil` template filter used by the Uncaps In column."""
+
+    def test_future_minutes(self):
+        from datetime import UTC, datetime, timedelta
+
+        from dashboard.app import timeuntil
+
+        # +30s padding so sub-second clock drift between the test's now() and
+        # timeuntil's now() doesn't knock this over the minute boundary.
+        ts = (datetime.now(UTC) + timedelta(minutes=45, seconds=30)).isoformat()
+        assert timeuntil(ts) == 'in 45m'
+
+    def test_future_hours_and_minutes(self):
+        from datetime import UTC, datetime, timedelta
+
+        from dashboard.app import timeuntil
+
+        ts = (datetime.now(UTC) + timedelta(hours=2, minutes=30, seconds=30)).isoformat()
+        # 2h 30m → 'in 2h 30m'
+        assert timeuntil(ts) == 'in 2h 30m'
+
+    def test_future_days(self):
+        from datetime import UTC, datetime, timedelta
+
+        from dashboard.app import timeuntil
+
+        ts = (datetime.now(UTC) + timedelta(days=3, seconds=30)).isoformat()
+        assert timeuntil(ts) == 'in 3d'
+
+    def test_past_returns_now(self):
+        """A timestamp already in the past (cap that should have reset)
+        renders as 'now' so the row still reads naturally."""
+        from datetime import UTC, datetime, timedelta
+
+        from dashboard.app import timeuntil
+
+        ts = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+        assert timeuntil(ts) == 'now'
+
+    def test_none_returns_dash(self):
+        from dashboard.app import timeuntil
+
+        assert timeuntil(None) == '—'
+
+    def test_unparseable_returns_dash(self):
+        from dashboard.app import timeuntil
+
+        assert timeuntil('not-a-timestamp') == '—'
+
