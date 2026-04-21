@@ -136,6 +136,9 @@ class TestRegisterDrainSignalHandlerIntegration:
                 # so _register_drain_signal_handler falls back to signal.signal.
                 with patch.object(running_loop, 'add_signal_handler', side_effect=RuntimeError):
                     _register_drain_signal_handler(stub_harness)
+                    signal_signal_spy.assert_called_once()
+                    assert signal_signal_spy.call_args.args[0] == signal.SIGUSR1
+                    assert callable(signal_signal_spy.call_args.args[1])
 
                 os.kill(os.getpid(), signal.SIGUSR1)
                 # The signal.signal handler is invoked synchronously at the next safe
