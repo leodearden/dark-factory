@@ -1,6 +1,8 @@
 """Tests for CLI helpers."""
 
+import io
 import logging
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -107,3 +109,28 @@ class TestForceExitWatchdog:
         time.sleep(0.6)
 
         assert calls == [], f'expected no calls, got {calls}'
+
+    def test_diagnostic_dump_lists_live_threads(self, monkeypatch):
+        """When the watchdog fires, it writes a diagnostic dump to the stream."""
+        calls = []
+        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+
+        stream = io.StringIO()
+        _force_exit_after_delay(timeout_secs=0.05, stream=stream)
+        time.sleep(0.3)
+
+        output = stream.getvalue()
+        # Sentinel header must be present
+        assert 'SHUTDOWN WATCHDOG FIRED' in output, (
+            f'sentinel missing from dump:\n{output!r}'
+        )
+        # The main thread should appear in the dump
+        main_thread_name = threading.main_thread().name  # typically 'MainThread'
+        assert main_thread_name in output, (
+            f'main thread {main_thread_name!r} not in dump:\n{output!r}'
+        )
+        # At least one stack frame line (traceback.format_stack produces "  File ..." lines)
+        assert '  File ' in output, (
+            f'no frame lines in dump:\n{output!r}'
+        )
+        assert calls == [137]
