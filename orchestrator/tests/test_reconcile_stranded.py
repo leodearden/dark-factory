@@ -64,3 +64,25 @@ def harness(tmp_path: Path, git_config: GitConfig):
     h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
 
     return h
+
+
+# ---------------------------------------------------------------------------
+# _reconcile_stranded_in_progress tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestReconcileStrandedInProgress:
+    async def test_orphan_without_worktree_reverted(self, harness: Harness):
+        """In-progress task with no worktree dir → reverted to pending (no-lock)."""
+        harness.scheduler.get_tasks.return_value = [
+            {'id': 5, 'status': 'in-progress'},
+            {'id': 6, 'status': 'pending'},
+        ]
+        # No worktree directory for task 5 exists (worktree_base not even created)
+
+        await harness._reconcile_stranded_in_progress()
+
+        calls = harness.scheduler.set_task_status.call_args_list
+        assert len(calls) == 1
+        assert calls[0].args[0] == '5'
+        assert calls[0].args[1] == 'pending'
