@@ -388,3 +388,110 @@ class TestReconciliationConfigTimeouts:
 
     def test_explicit_stale_claim_recovery_override_accepted(self):
         assert ReconciliationConfig(stale_claim_recovery_seconds=10).stale_claim_recovery_seconds == 10
+
+    # --- gt=0 bounds: agent_cli_timeout_seconds ---
+
+    def test_agent_cli_timeout_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(agent_cli_timeout_seconds=0)
+
+    def test_agent_cli_timeout_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(agent_cli_timeout_seconds=-1)
+
+    # --- gt=0 bounds: judge_cli_timeout_seconds ---
+
+    def test_judge_cli_timeout_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(judge_cli_timeout_seconds=0)
+
+    def test_judge_cli_timeout_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(judge_cli_timeout_seconds=-1)
+
+    # --- gt=0 bounds: stale_claim_recovery_seconds ---
+
+    def test_stale_claim_recovery_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(stale_claim_recovery_seconds=0)
+
+    def test_stale_claim_recovery_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(stale_claim_recovery_seconds=-5)
+
+    # --- gt=0 bounds: stage_timeout_seconds (consistency extension) ---
+
+    def test_stage_timeout_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(stage_timeout_seconds=0)
+
+    def test_stage_timeout_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(stage_timeout_seconds=-1)
+
+    # --- gt=0 bounds: stale_run_recovery_seconds (consistency extension) ---
+
+    def test_stale_run_recovery_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(stale_run_recovery_seconds=0)
+
+    def test_stale_run_recovery_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(stale_run_recovery_seconds=-1)
+
+    # --- cross-field inner <= outer validator ---
+
+    def test_agent_cli_timeout_exceeds_stage_rejected(self):
+        with pytest.raises(ValidationError, match='agent_cli_timeout_seconds'):
+            ReconciliationConfig(agent_cli_timeout_seconds=5000, stage_timeout_seconds=3000)
+
+    def test_judge_cli_timeout_exceeds_stage_rejected(self):
+        with pytest.raises(ValidationError, match='judge_cli_timeout_seconds'):
+            ReconciliationConfig(judge_cli_timeout_seconds=5000, stage_timeout_seconds=3000)
+
+    def test_agent_cli_timeout_equal_to_stage_accepted(self):
+        # inner == outer is the degenerate-but-valid co-terminal case
+        cfg = ReconciliationConfig(agent_cli_timeout_seconds=3600, stage_timeout_seconds=3600)
+        assert cfg.agent_cli_timeout_seconds == 3600
+
+    def test_judge_cli_timeout_equal_to_stage_accepted(self):
+        # inner == outer is the degenerate-but-valid co-terminal case (judge parallel)
+        cfg = ReconciliationConfig(judge_cli_timeout_seconds=3600, stage_timeout_seconds=3600)
+        assert cfg.judge_cli_timeout_seconds == 3600
+
+    def test_defaults_pass_validator(self):
+        # Shipped defaults: agent=180, judge=600, stage=3600 — all satisfy inner<=outer
+        cfg = ReconciliationConfig()
+        assert cfg.agent_cli_timeout_seconds <= cfg.stage_timeout_seconds
+        assert cfg.judge_cli_timeout_seconds <= cfg.stage_timeout_seconds
+
+    # --- gt=0 bounds: tool_timeout_seconds (consistency extension) ---
+
+    def test_tool_timeout_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(tool_timeout_seconds=0)
+
+    def test_tool_timeout_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(tool_timeout_seconds=-1.0)
+
+    # --- gt=0 bounds: cycle_timeout_seconds (consistency extension) ---
+
+    def test_cycle_timeout_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(cycle_timeout_seconds=0)
+
+    def test_cycle_timeout_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(cycle_timeout_seconds=-1)
+
+    # --- cross-field stage <= cycle validator ---
+
+    def test_stage_timeout_exceeds_cycle_rejected(self):
+        with pytest.raises(ValidationError, match='stage_timeout_seconds'):
+            ReconciliationConfig(stage_timeout_seconds=86400, cycle_timeout_seconds=3600)
+
+    def test_stage_timeout_equal_to_cycle_accepted(self):
+        # stage == cycle is the degenerate-but-valid co-terminal case
+        cfg = ReconciliationConfig(stage_timeout_seconds=3600, cycle_timeout_seconds=3600)
+        assert cfg.stage_timeout_seconds == 3600

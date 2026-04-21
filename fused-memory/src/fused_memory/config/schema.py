@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
@@ -256,11 +256,12 @@ class ReconciliationConfig(BaseModel):
     stale_lock_seconds: float = Field(default=7200.0)
 
     # Timeouts
-    tool_timeout_seconds: float = Field(default=120.0)
-    stage_timeout_seconds: int = Field(default=3600)
-    cycle_timeout_seconds: int = Field(default=21600)
+    tool_timeout_seconds: float = Field(default=120.0, gt=0)
+    stage_timeout_seconds: int = Field(default=3600, gt=0)
+    cycle_timeout_seconds: int = Field(default=21600, gt=0)
     stale_run_recovery_seconds: int = Field(
         default=600,
+        gt=0,
         description='Runs with started_at older than this are recovered on startup if their lock is stale',
     )
     # Per-CLI-invocation wall-clock budgets — semantically distinct from
@@ -269,6 +270,7 @@ class ReconciliationConfig(BaseModel):
     # restore the pre-881 per-call ceilings independently.
     agent_cli_timeout_seconds: int = Field(
         default=180,
+        gt=0,
         description=(
             'Wall-clock budget for a single agent_loop._call_claude_cli invocation. '
             'Distinct from stage_timeout_seconds (outer stage guard). '
@@ -277,6 +279,7 @@ class ReconciliationConfig(BaseModel):
     )
     judge_cli_timeout_seconds: int = Field(
         default=600,
+        gt=0,
         description=(
             'Wall-clock budget for a single judge._call_judge_cli invocation. '
             'Distinct from stage_timeout_seconds (outer stage guard). '
@@ -289,12 +292,36 @@ class ReconciliationConfig(BaseModel):
     # process from leaving claims stuck for ten minutes.
     stale_claim_recovery_seconds: int = Field(
         default=60,
+        gt=0,
         description=(
             'Deferred-write claims older than this are re-queued on startup. '
             'Claims are held for seconds; use a much shorter horizon than '
             'stale_run_recovery_seconds (600s, for minute-scale run recovery).'
         ),
     )
+
+    @model_validator(mode='after')
+    def _validate_cli_timeouts_within_stage(self) -> 'ReconciliationConfig':
+        """Enforce timeout hierarchy: per-CLI budgets ≤ stage guard ≤ cycle guard."""
+        if self.agent_cli_timeout_seconds > self.stage_timeout_seconds:
+            raise ValueError(
+                f'agent_cli_timeout_seconds ({self.agent_cli_timeout_seconds}) must be '
+                f'<= stage_timeout_seconds ({self.stage_timeout_seconds}): '
+                'the per-call budget cannot exceed the outer stage guard.'
+            )
+        if self.judge_cli_timeout_seconds > self.stage_timeout_seconds:
+            raise ValueError(
+                f'judge_cli_timeout_seconds ({self.judge_cli_timeout_seconds}) must be '
+                f'<= stage_timeout_seconds ({self.stage_timeout_seconds}): '
+                'the per-call budget cannot exceed the outer stage guard.'
+            )
+        if self.stage_timeout_seconds > self.cycle_timeout_seconds:
+            raise ValueError(
+                f'stage_timeout_seconds ({self.stage_timeout_seconds}) must be '
+                f'<= cycle_timeout_seconds ({self.cycle_timeout_seconds}): '
+                'a stage that outlives its enclosing cycle is nonsensical.'
+            )
+        return self
 
     # Safety
     max_mutations_per_stage: int = Field(default=50)
