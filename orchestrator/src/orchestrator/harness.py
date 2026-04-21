@@ -873,6 +873,39 @@ Output JSON matching the schema. Every task must appear in the output.
                 f'{cleaned} worktrees cleaned, {reset_count} tasks reset'
             )
 
+    async def _reconcile_stranded_in_progress(self) -> None:
+        """Startup sweep: revert stranded in-progress tasks to pending.
+
+        Examines every task that is currently in-progress and checks whether
+        it has a live claimant via plan.lock / owner_pid.  Any task without a
+        live claimant is reverted to pending so the scheduler can re-acquire it.
+
+        This method is called AFTER _recover_crashed_tasks() (which may unlink
+        plan.lock for recovered worktrees) and BEFORE the first
+        scheduler.acquire_next() call, so self._dispatched is always empty here.
+        """
+        tasks = await self.scheduler.get_tasks()
+        reverted = 0
+
+        for t in tasks:
+            if t.get('status') != 'in-progress':
+                continue
+
+            tid = str(t.get('id', ''))
+            worktree_path = self.git_ops.worktree_base / tid
+            lock_path = worktree_path / '.task' / 'plan.lock'
+
+            if not lock_path.exists():
+                # No worktree or no lock → orphan, revert.
+                await self.scheduler.set_task_status(tid, 'pending')
+                logger.info(
+                    'Reconcile: reverted task %s to pending (reason=no-lock)', tid
+                )
+                reverted += 1
+
+        if reverted:
+            logger.info('Reconcile: %d stranded task(s) reverted to pending', reverted)
+
     async def _run_slot(
         self, assignment, sem: asyncio.Semaphore
     ) -> TaskReport | None:
