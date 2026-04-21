@@ -47,9 +47,23 @@ indent-style = "space"
 docstring-code-format = true
 
 [tool.pytest.ini_options]
+# Each filter pins the exact upstream message emitted by the relevant library
+# so that only this specific anti-pattern is fatal.  These strings are
+# intentionally narrow (message-anchored, not class-only) to avoid breaking
+# unrelated RuntimeWarning / PytestWarning emissions elsewhere in the suite.
+# NOTE: If Python/pytest/pytest-asyncio changes the wording (e.g. drops
+# apostrophes around _execute_mock_call, adjusts coroutine-object formatting,
+# or rewrites the asyncio-mark diagnostic text), these regexes will silently
+# stop matching — revisit on pytest/Python/pytest-asyncio upgrades.
 filterwarnings = [
+    # AsyncMock coroutine leak: coroutine created by mock.return_value.some_method()
+    # is never awaited; GC fires inline during test (RuntimeWarning) or after
+    # teardown (PytestUnraisableExceptionWarning wrapping the same message).
+    # Pins: unittest.mock / CPython warnings machinery.
     "error:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited:RuntimeWarning",
     "error:Exception ignored while finalizing coroutine <coroutine object AsyncMockMixin._execute_mock_call:pytest.PytestUnraisableExceptionWarning",
+    # Sync def collected inside an @pytest.mark.asyncio class: mark mismatch.
+    # Pins: pytest_asyncio/plugin.py (message emitted at the collection phase).
     "error:The test .* is marked with '@pytest.mark.asyncio' but it is not an async function:pytest.PytestWarning",
 ]
 

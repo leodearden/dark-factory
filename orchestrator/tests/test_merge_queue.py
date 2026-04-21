@@ -89,10 +89,7 @@ def _make_request(
 
 def _mock_verify_pass():
     """Return a mock that makes run_scoped_verification always pass."""
-    mock = AsyncMock()
-    mock.return_value.passed = True
-    mock.return_value.summary = ''
-    return mock
+    return AsyncMock(return_value=MagicMock(passed=True, summary=''))
 
 
 # ---------------------------------------------------------------------------
