@@ -325,6 +325,50 @@ class TestForceExitWatchdog:
             'watchdog thread did not exit after firing os._exit replacement'
         )
 
+    def test_outer_write_failure_still_fires_exit(self, monkeypatch):
+        """os._exit(137) is called even when out.write(''.join(lines)) raises with format_stack intact.
+
+        Closes the coverage gap in test_fallback_write_failure_still_fires_exit: that sibling
+        test mocks traceback.format_stack to raise FIRST, so `lines` is never built and the
+        outer out.write(''.join(lines)) call is never reached.  This test covers the complement:
+        format_stack succeeds, `lines` is populated with real frames, but out.write raises
+        (outer except catches), then the inner fallback write also raises (_OuterBrokenStream
+        makes every write raise), the inner except swallows, and execution falls through to
+        os._exit(137).
+
+        If the outer try/except wrapping out.write is ever removed, this test will fail before
+        the force-exit guarantee is silently dropped — mirroring the sibling test's contract
+        for the nested try/except.
+        """
+        calls = []
+        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+
+        # Does NOT mock traceback.format_stack — it runs normally, producing real frames.
+        # A stream whose every write and flush raises — exercises the outer try/except that
+        # wraps out.write(''.join(lines)) AND the inner fallback write.
+        class _OuterBrokenStream:
+            def write(self, _s):
+                raise OSError('outer write broken')
+
+            def flush(self):
+                raise OSError('outer flush broken')
+
+        handle = _force_exit_after_delay(timeout_secs=0.05, stream=_OuterBrokenStream())
+
+        # Poll with deadline — os._exit must fire even when the outer write fails.
+        deadline = time.monotonic() + 5.0
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        assert calls == [137], (
+            f'expected os._exit(137) even when outer write fails with format_stack intact, '
+            f'got {calls}'
+        )
+        handle.thread.join(timeout=1.0)
+        assert not handle.thread.is_alive(), (
+            'watchdog thread did not exit after firing os._exit replacement'
+        )
+
 
 class TestRunArmsWatchdog:
     """run() must arm the shutdown watchdog and disarm it on both exit paths."""
