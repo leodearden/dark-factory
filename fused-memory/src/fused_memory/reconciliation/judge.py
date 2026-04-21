@@ -2,9 +2,10 @@
 
 import json
 import logging
-import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+
+from shared.cli_invoke import invoke_with_cap_retry
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
@@ -233,88 +234,27 @@ Review this run and provide your verdict as JSON.
             return response.choices[0].message.content or ''
 
     async def _call_judge_cli(self, prompt: str) -> str:
-        """Single-shot Claude CLI call for judge evaluation.
+        """Delegate to shared.cli_invoke.invoke_with_cap_retry for judge evaluation.
 
-        Includes: stdin isolation, stdout+stderr error reading, and usage-cap
-        retry with account failover when a UsageGate is attached.
+        Judge output is free-form text — no output_schema is passed.
+        InvokeSlot owns probe-slot release and terminate_process_group on timeout.
         """
-        import asyncio as _asyncio
+        result = await invoke_with_cap_retry(
+            usage_gate=self._usage_gate,
+            label=f'Reconciliation judge ({self.config.judge_llm_model})',
+            prompt=prompt,
+            system_prompt=JUDGE_SYSTEM_PROMPT,
+            model=self.config.judge_llm_model,
+            disallowed_tools=['*'],
+            max_turns=3,
+            permission_mode='bypassPermissions',
+            timeout_seconds=float(self.config.stage_timeout_seconds),
+        )
 
-        while True:
-            # Gate: get OAuth token (or None)
-            oauth_token = None
-            if self._usage_gate:
-                oauth_token = await self._usage_gate.before_invoke()
+        if not result.success:
+            raise RuntimeError(f'Claude CLI judge failed: {result.output[:500]}')
 
-            cmd = [
-                'claude', '--print', '--output-format', 'json',
-                '--model', self.config.judge_llm_model,
-                '--system-prompt', JUDGE_SYSTEM_PROMPT,
-                '--permission-mode', 'bypassPermissions',
-                '--', prompt,
-            ]
-
-            # Build env: strip ANTHROPIC_API_KEY, inject OAuth token
-            env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
-            if oauth_token:
-                env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
-
-            try:
-                try:
-                    proc = await _asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdin=_asyncio.subprocess.DEVNULL,
-                        stdout=_asyncio.subprocess.PIPE,
-                        stderr=_asyncio.subprocess.PIPE,
-                        env=env,
-                    )
-                except FileNotFoundError as exc:
-                    raise RuntimeError(
-                        'Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code'
-                    ) from exc
-
-                try:
-                    stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=600)
-                except TimeoutError as exc:
-                    proc.kill()
-                    raise RuntimeError('Claude CLI timed out after 600 seconds') from exc
-
-                stdout_text = stdout.decode()
-                stderr_text = stderr.decode()
-
-                # Check for cap hit before processing results
-                if self._usage_gate and self._usage_gate.detect_cap_hit(
-                    stderr_text, stdout_text, 'claude', oauth_token=oauth_token,
-                ):
-                    logger.warning('Usage cap hit during judge CLI call, retrying')
-                    continue
-
-                if proc.returncode != 0:
-                    error_detail = stderr_text[-500:] if stderr_text.strip() else stdout_text[-500:]
-                    raise RuntimeError(
-                        f'Claude CLI exited with code {proc.returncode}: {error_detail}'
-                    )
-
-                if not stdout_text.strip():
-                    if self._usage_gate:
-                        self._usage_gate.confirm_account_ok(oauth_token)
-                        self._usage_gate.on_agent_complete(0.0)
-                    return ''
-
-                result = json.loads(stdout_text)
-                if self._usage_gate:
-                    cost_usd = float(result.get('cost_usd', result.get('total_cost_usd', 0.0)))
-                    self._usage_gate.confirm_account_ok(oauth_token)
-                    self._usage_gate.on_agent_complete(cost_usd)
-                return result.get('result', '')
-
-            except BaseException:
-                if self._usage_gate is not None:
-                    try:
-                        self._usage_gate.release_probe_slot(oauth_token)
-                    except Exception:
-                        logger.warning('release_probe_slot failed', exc_info=True)
-                raise
+        return result.output.strip()
 
     def _parse_verdict(self, response_text: str, run_id: str) -> JudgeVerdict:
         """Parse judge response into JudgeVerdict."""
