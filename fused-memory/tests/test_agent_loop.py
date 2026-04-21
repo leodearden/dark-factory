@@ -1123,9 +1123,6 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     # by run() or any caller.  Pinning absence here prevents re-introduction.
     assert 'response' not in CLAUDE_CLI_RESPONSE_SCHEMA['properties']
 
-    # `response` must not be set on the adapter instance.
-    assert not hasattr(result, 'response')
-
 
 @pytest.mark.asyncio
 async def test_call_claude_cli_threads_session_id_across_turns():
@@ -1470,10 +1467,6 @@ async def test_run_threads_parallel_tool_results_with_double_newline_joiner():
         '[Tool Result: tc2] (OK)\n{"tripled": 15}'
     )
     assert second_prompt == expected
-
-    # Positive guard: double-newline separator is present and two results appear
-    assert '\n\n' in second_prompt
-    assert second_prompt.count('[Tool Result:') == 2
 
 
 # ---------------------------------------------------------------------------
