@@ -400,3 +400,119 @@ class TestRunArmsWatchdog:
             f"expected armed_with={SHUTDOWN_WATCHDOG_TIMEOUT_SECS} after asyncio.run returned, "
             f"got {state['armed_with']}"
         )
+
+    def test_report_emitted_before_watchdog_armed(self, monkeypatch):
+        """click.echo(report.summary()) must run BEFORE _force_exit_after_delay on normal path.
+
+        On the current (unfixed) code the arm runs before click.echo(report.summary()), so
+        report formatting and stdout I/O are covered by the 30-second timer. Moving the arm
+        after all user-visible work limits the watchdog scope to interpreter shutdown only.
+
+        This test FAILS on current code (arm at line 208 precedes echo at line 209).
+        """
+        events: list[str | tuple[str, str | None]] = []
+        state = {'armed_with': None}
+
+        def recording_force_exit(timeout_secs, exit_code=137, *, stream=None):
+            state['armed_with'] = timeout_secs
+            events.append('arm')
+            return lambda: None
+
+        monkeypatch.setattr(cli_module, '_force_exit_after_delay', recording_force_exit)
+
+        original_echo = cli_module.click.echo
+
+        def recording_echo(msg=None, **kwargs):
+            # Record every echo call so failures show what actually happened
+            # and the test is robust to changes in the fake summary string.
+            events.append(('echo', msg))
+            return original_echo(msg, **kwargs)
+
+        monkeypatch.setattr(cli_module.click, 'echo', recording_echo)
+
+        fake_config = MagicMock()
+        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+
+        fake_harness = MagicMock()
+        fake_report = MagicMock()
+        fake_report.blocked = 0
+        fake_report.summary.return_value = 'all done'
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+
+        def fake_asyncio_run(coro):
+            coro.close()
+            return fake_report
+
+        monkeypatch.setattr(cli_module.asyncio, 'run', fake_asyncio_run)
+
+        CliRunner().invoke(main, ['run', '--config', '/dev/null'])
+
+        summary_str = fake_report.summary.return_value
+        echo_indices = [i for i, e in enumerate(events) if e == ('echo', summary_str)]
+        assert echo_indices, (
+            f"click.echo(report.summary()) was never called — can't check ordering. "
+            f"events: {events!r}"
+        )
+        arm_indices = [i for i, e in enumerate(events) if e == 'arm']
+        assert arm_indices, (
+            f'_force_exit_after_delay was never called — watchdog not armed at all. '
+            f'events: {events!r}'
+        )
+        echo_idx = echo_indices[0]
+        arm_idx = arm_indices[0]
+        assert echo_idx < arm_idx, (
+            f'click.echo(report.summary()) must run BEFORE _force_exit_after_delay, '
+            f'but got order: {events!r}'
+        )
+        # Arm must still happen (just after user-visible work).
+        assert state['armed_with'] == SHUTDOWN_WATCHDOG_TIMEOUT_SECS, (
+            f"expected armed_with={SHUTDOWN_WATCHDOG_TIMEOUT_SECS}, got {state['armed_with']}"
+        )
+
+    def test_watchdog_armed_before_blocked_exit(self, monkeypatch):
+        """_force_exit_after_delay must be called even when report.blocked > 0.
+
+        The blocked-task exit (sys.exit(1)) goes through the same interpreter
+        shutdown as the clean exit — atexit callbacks run and
+        threading._shutdown() joins non-daemon threads from harness.run().
+        Both paths carry identical hang risk, so the watchdog must guard both.
+
+        The arm is placed AFTER click.echo(report.summary()) (not before, so
+        user-visible output is not covered) but BEFORE the
+        `if report.blocked > 0: sys.exit(1)` branch so the blocked path is
+        covered too, matching the CancelledError branch's pattern.
+        """
+        state, fake_force_exit = self._fake_watchdog_factory()
+        monkeypatch.setattr(cli_module, '_force_exit_after_delay', fake_force_exit)
+
+        fake_config = MagicMock()
+        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+
+        fake_harness = MagicMock()
+        fake_report = MagicMock()
+        fake_report.blocked = 3  # non-zero forces the sys.exit(1) branch
+        fake_report.summary.return_value = 'blocked'
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+
+        def fake_asyncio_run(coro):
+            coro.close()
+            return fake_report
+
+        monkeypatch.setattr(cli_module.asyncio, 'run', fake_asyncio_run)
+
+        result = CliRunner().invoke(main, ['run', '--config', '/dev/null'])
+
+        assert result.exit_code == 1, (
+            f'expected exit_code 1 (blocked tasks), got {result.exit_code}'
+        )
+        # Watchdog must be armed even on the blocked exit path.
+        assert state['armed_with'] == SHUTDOWN_WATCHDOG_TIMEOUT_SECS, (
+            f'_force_exit_after_delay was not called on the blocked>0 path — '
+            f'watchdog must guard interpreter shutdown on both clean and blocked exits. '
+            f'got armed_with={state["armed_with"]!r}'
+        )
+        # Watchdog must NOT be disarmed — it guards interpreter shutdown after sys.exit(1).
+        assert not state['disarm_called'], (
+            'disarm() was called on the blocked>0 path — watchdog must remain armed to '
+            'guard interpreter shutdown (threading._shutdown() joining non-daemon threads)'
+        )
