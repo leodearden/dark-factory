@@ -1099,12 +1099,15 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     # timeout, and session-threading are wired through correctly.
     # Fine-grained knobs (max_turns, permission_mode, disallowed_tools) are
     # implementation details covered by shared/tests/test_cli_invoke.py.
+    from pathlib import Path
+
     assert call_kwargs['prompt'] == 'hi'
     assert 'read_file' in call_kwargs['system_prompt']
     assert call_kwargs['output_schema'] == CLAUDE_CLI_RESPONSE_SCHEMA
     assert call_kwargs['model'] == config.agent_llm_model
     assert call_kwargs['timeout_seconds'] == float(config.stage_timeout_seconds)
     assert call_kwargs['resume_session_id'] is None  # first turn: no prior session
+    assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
 
     # usage_gate may be positional or keyword — accept either
     if 'usage_gate' in call_kwargs:
@@ -1164,3 +1167,52 @@ async def test_call_claude_cli_threads_session_id_across_turns():
     second_kwargs = mock_invoke.call_args_list[1].kwargs
     assert first_kwargs['resume_session_id'] is None
     assert second_kwargs['resume_session_id'] == 'sess-A'
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
+    """_call_claude_cli passes cwd all the way through to invoke_claude_agent.
+
+    Step-7 (b): patches invoke_claude_agent (one level below invoke_with_cap_retry)
+    so that the kwargs-forwarding layer is exercised.  Omitting cwd from the
+    invoke_with_cap_retry call would raise TypeError at runtime; this test
+    catches that regression without requiring a live Claude CLI.
+    """
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    # Use tmp_path so the cwd Path actually exists on disk.
+    explore_root = str(tmp_path)
+    config = _make_cli_config(explore_codebase_root=explore_root)
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-cwd',
+        structured_output={'thinking': '', 'tool_calls': []},
+    )
+
+    # Patch at the level below invoke_with_cap_retry — this exercises the
+    # kwargs-forwarding path that the higher-level mock skips.
+    # usage_gate=None takes the fast path in invoke_with_cap_retry
+    # (single invocation, no cap retry), so the real forwarding code runs.
+    with patch(
+        'shared.cli_invoke.invoke_claude_agent',
+        new_callable=AsyncMock,
+    ) as mock_agent:
+        mock_agent.return_value = fake_result
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test',
+            tools={},
+            usage_gate=None,  # fast path: real invoke_with_cap_retry, real forwarding
+        )
+
+        await agent._call_claude_cli(prompt='hello', tools=[])
+
+    mock_agent.assert_called_once()
+    call_kwargs = mock_agent.call_args.kwargs
+    assert call_kwargs['cwd'] == Path(explore_root)
