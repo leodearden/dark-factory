@@ -674,6 +674,33 @@ async def test_claim_deferred_writes_returns_pending_with_ids(buf):
 
 
 @pytest.mark.asyncio
+async def test_claim_deferred_writes_project_isolation_and_ordering(buf):
+    """claim_deferred_writes respects project_id isolation and returns rows oldest-first."""
+    import asyncio
+
+    # Defer three writes to project-a (with tiny sleeps to force distinct created_at)
+    await buf.defer_write('project-a', 'a-first', 'cat', {})
+    await asyncio.sleep(0.01)
+    await buf.defer_write('project-a', 'a-second', 'cat', {})
+    await asyncio.sleep(0.01)
+    await buf.defer_write('project-a', 'a-third', 'cat', {})
+
+    # One write to project-b
+    await buf.defer_write('project-b', 'b-only', 'cat', {})
+
+    # Claim project-a — should get exactly 3 rows
+    claimed_a = await buf.claim_deferred_writes('project-a')
+    assert len(claimed_a) == 3
+    assert all(item['content'].startswith('a-') for item in claimed_a)
+    assert [item['content'] for item in claimed_a] == ['a-first', 'a-second', 'a-third']
+
+    # project-b must be unaffected — its row is still pending
+    claimed_b = await buf.claim_deferred_writes('project-b')
+    assert len(claimed_b) == 1
+    assert claimed_b[0]['content'] == 'b-only'
+
+
+@pytest.mark.asyncio
 async def test_defer_write_and_pop(buf):
     """Deferred write should be retrievable via pop."""
     write_id = await buf.defer_write(
