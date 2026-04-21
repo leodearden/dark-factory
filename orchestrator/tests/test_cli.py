@@ -193,7 +193,7 @@ class TestRunArmsWatchdog:
         monkeypatch.setattr(cli_module.asyncio, 'run', fake_asyncio_run)
 
         runner = CliRunner()
-        result = runner.invoke(main, ['run', '--config', '/dev/null'])
+        runner.invoke(main, ['run', '--config', '/dev/null'])
 
         # Watchdog must have been armed with the module constant
         assert state['armed_with'] == SHUTDOWN_WATCHDOG_TIMEOUT_SECS, (

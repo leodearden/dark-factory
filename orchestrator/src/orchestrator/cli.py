@@ -7,8 +7,8 @@ import os
 import signal
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import click
 from dotenv import load_dotenv
@@ -64,7 +64,7 @@ def _force_exit_after_delay(
             lines = ['SHUTDOWN WATCHDOG FIRED — process hung after asyncio.run() returned\n']
             frames = sys._current_frames()
             for t in threading.enumerate():
-                frame = frames.get(t.ident)
+                frame = frames.get(t.ident) if t.ident is not None else None
                 lines.append(f'\n--- Thread {t.name!r} (daemon={t.daemon}, ident={t.ident}) ---\n')
                 if frame is not None:
                     lines.extend(traceback.format_stack(frame))
