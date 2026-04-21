@@ -176,11 +176,16 @@ class TestReconcileStrandedInProgress:
                 id='corrupt-json',
             ),
             # (b) Missing owner_pid key → task NOT reverted, lock preserved
-            #     RED case against current code (which incorrectly reverts + unlinks)
+            #     Legacy format: task left untouched, WARNING emitted
             pytest.param(
                 json.dumps({'session_id': 'test-10', 'locked_at': '2026-01-01T00:00:00+00:00'}),
                 '10', False, True, r'owner_pid|legacy',
                 id='missing-owner-pid',
+            ),
+            # (e) Non-dict JSON (list) → treated as corruption → revert + unlink
+            pytest.param(
+                '["not", "an", "object"]', 14, True, False, None,
+                id='non-dict-json',
             ),
             # (c) Numeric-string owner_pid of a live process → task NOT reverted
             #     Exercises the int(owner_pid) cast path with a string value
@@ -252,6 +257,9 @@ class TestReconcileStrandedInProgress:
             assert len(matching) >= 1, (
                 f'Expected WARNING matching {warn_pattern!r} in orchestrator.harness logs, '
                 f'got: {[r.message for r in caplog.records]}'
+            )
+            assert matching[0].levelno == logging.WARNING, (
+                f'Expected WARNING level, got {logging.getLevelName(matching[0].levelno)}'
             )
 
     async def test_unexpected_exception_propagates_out_of_reconcile(
