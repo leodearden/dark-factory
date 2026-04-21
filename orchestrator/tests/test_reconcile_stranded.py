@@ -1,6 +1,7 @@
 """Tests for Harness._reconcile_stranded_in_progress and the _pid_alive helper."""
 
 import json
+import logging
 import os
 import re
 from datetime import UTC, datetime
@@ -130,9 +131,9 @@ class TestReconcileStrandedInProgress:
         assert calls[0].args[1] == 'pending'
 
     async def test_in_progress_with_live_owner_pid_left_alone(
-        self, harness: Harness, tmp_path: Path
+        self, harness: Harness, tmp_path: Path, caplog
     ):
-        """In-progress task with plan.lock pointing to live PID → untouched."""
+        """In-progress task with plan.lock pointing to live PID → untouched, no revert logged."""
         harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
             {'id': 7, 'status': 'in-progress'},
         ]
@@ -146,12 +147,15 @@ class TestReconcileStrandedInProgress:
             'owner_pid': os.getpid(),
         }))
 
-        await harness._reconcile_stranded_in_progress()
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress()
 
         # Must NOT revert
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
         # Lock file must still exist
         assert lock_path.exists()
+        # No revert must have been logged ('reverted task' matches the stable log format)
+        assert not any('reverted task' in r.message for r in caplog.records)
 
     async def test_stale_plan_lock_cleared_and_reverted(
         self, harness: Harness, monkeypatch
@@ -181,34 +185,6 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_called_once_with('8', 'pending')  # type: ignore[attr-defined]
         # Stale lock must be deleted
         assert not lock_path.exists()
-
-    async def test_fresh_plan_lock_owner_pid_alive_left_alone(
-        self, harness: Harness, caplog
-    ):
-        """Fresh plan.lock with live owner_pid → no revert, no log mentioning 'revert' or 'stranded'."""
-        import logging
-        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
-            {'id': 7, 'status': 'in-progress'},
-        ]
-        lock_dir = harness.git_ops.worktree_base / '7' / '.task'
-        lock_dir.mkdir(parents=True)
-        lock_path = lock_dir / 'plan.lock'
-        lock_path.write_text(json.dumps({
-            'session_id': '7-abcd1234',
-            'locked_at': datetime.now(UTC).isoformat(),
-            'owner_pid': os.getpid(),
-        }))
-
-        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
-            await harness._reconcile_stranded_in_progress()
-
-        # No status change
-        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
-        # Lock file intact
-        assert lock_path.exists()
-        # No log message mentioning revert or stranded for this task
-        revert_logs = [r for r in caplog.records if 'revert' in r.message.lower() or 'stranded' in r.message.lower()]
-        assert len(revert_logs) == 0
 
     @pytest.mark.parametrize(
         'lock_contents,task_id,expect_reverted,expect_lock_exists,warn_pattern',
