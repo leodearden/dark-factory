@@ -177,11 +177,15 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
             retag_modules=retag_modules,
         )
 
+    disarm = _force_exit_after_delay(SHUTDOWN_WATCHDOG_TIMEOUT_SECS)
     try:
-        report = asyncio.run(_main())
-    except asyncio.CancelledError:
-        click.echo('Orchestrator cancelled', err=True)
-        sys.exit(130)
+        try:
+            report = asyncio.run(_main())
+        except asyncio.CancelledError:
+            click.echo('Orchestrator cancelled', err=True)
+            sys.exit(130)
+    finally:
+        disarm()
 
     click.echo(report.summary())
 
