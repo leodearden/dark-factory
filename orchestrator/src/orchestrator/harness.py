@@ -913,10 +913,8 @@ Output JSON matching the schema. Every task must appear in the output.
                 continue
 
             # Stale lock — clear it and revert.
-            try:
+            with contextlib.suppress(OSError):
                 lock_path.unlink()
-            except OSError:
-                pass
             await self.scheduler.set_task_status(tid, 'pending')
             logger.info(
                 'Reconcile: reverted task %s to pending (reason=stale-lock)', tid
