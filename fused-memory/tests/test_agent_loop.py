@@ -1166,6 +1166,51 @@ async def test_call_claude_cli_threads_session_id_across_turns():
 
 
 @pytest.mark.asyncio
+async def test_call_claude_cli_clears_session_id_on_exception():
+    """_call_claude_cli clears _cli_session_id when invoke_with_cap_retry raises.
+
+    Red test (step-1): after a successful first call establishes session 'sess-A',
+    a second call that raises AllAccountsCappedException must leave
+    agent._cli_session_id as None — not the stale 'sess-A' — so that a retry
+    attempt doesn't --resume an abandoned session.
+    """
+    from shared.cli_invoke import AgentResult, AllAccountsCappedException
+
+    fake_gate = MagicMock()
+    config = _make_cli_config()
+    tools: list = []
+    structured = {'thinking': '', 'tool_calls': []}
+
+    first_result = AgentResult(
+        success=True, output='', session_id='sess-A', structured_output=structured
+    )
+    cap_exc = AllAccountsCappedException(retries=5, elapsed_secs=100.0, label='test')
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.side_effect = [first_result, cap_exc]
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test',
+            tools={},
+            usage_gate=fake_gate,
+        )
+
+        # First call succeeds and establishes the session id.
+        await agent._call_claude_cli(prompt='turn-1', tools=tools)
+        assert agent._cli_session_id == 'sess-A'
+
+        # Second call raises — the stale session id must be cleared.
+        with pytest.raises(AllAccountsCappedException):
+            await agent._call_claude_cli(prompt='turn-2', tools=tools)
+
+    assert agent._cli_session_id is None
+
+
+@pytest.mark.asyncio
 async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
     """_call_claude_cli passes cwd all the way through to invoke_claude_agent.
 
