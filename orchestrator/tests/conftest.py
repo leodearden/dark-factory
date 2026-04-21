@@ -156,6 +156,30 @@ def build_usage_gate(
     return gate
 
 
+@pytest.fixture(scope="session")
+def repo_root() -> Path | None:
+    """Walk up from this conftest to find the repo root anchored by a .git entry.
+
+    Returns the repo-root Path if found, or None when not running inside a git
+    checkout (e.g. a packaged wheel, partial mirror, or isolated test run).
+
+    Works for both normal checkouts (.git directory) and git worktrees (.git
+    file) because ``Path.exists()`` matches either.
+
+    Consumers should call ``pytest.skip(...)`` when None is returned rather than
+    failing — the absence of a git sentinel means the repo-root-dependent tests
+    are not applicable to this environment (e.g. CI running from a sdist).
+    Consumers may also ``pytest.fail(...)`` when the sentinel is found but a
+    required file within the repo is absent, so a genuinely missing file cannot
+    silently hide behind a skip.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / '.git').exists():
+            return parent
+    return None
+
+
 @pytest.fixture(autouse=True)
 def _clear_orch_config_path(monkeypatch):
     """Remove ORCH_CONFIG_PATH so tests don't inadvertently load the real config."""
