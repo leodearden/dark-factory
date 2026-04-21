@@ -99,7 +99,13 @@ class TestRegisterDrainSignalHandlerIntegration:
                 # Use an asyncio.Event so the test waits only as long as needed and
                 # fails deterministically on timeout rather than a fixed sleep.
                 drain_called = asyncio.Event()
-                stub_harness.drain.side_effect = lambda: drain_called.set()
+                # Use call_soon_threadsafe for consistency with the fallback sibling test:
+                # both integration tests share the same signal-safe wait pattern, making
+                # the idiom grep-findable and future-proof for copy-paste into new signal tests.
+                # (On the happy path drain.side_effect already runs in the loop thread via
+                # asyncio's self-pipe, so this is cosmetic here — but keeps the pair uniform.)
+                running_loop = asyncio.get_running_loop()
+                stub_harness.drain.side_effect = lambda: running_loop.call_soon_threadsafe(drain_called.set)
 
                 # Must run inside the running loop so asyncio.get_running_loop() resolves.
                 _register_drain_signal_handler(stub_harness)
