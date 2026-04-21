@@ -2368,11 +2368,10 @@ async def test_run_loop_releases_stale_claims_on_startup(
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
 
-    # Spy on release_stale_claims
+    # Spy on release_stale_claims: side_effect passes through to the real method,
+    # so return_value is intentionally omitted (side_effect takes precedence).
     original_release = event_buffer.release_stale_claims
-    harness.buffer.release_stale_claims = AsyncMock(
-        side_effect=original_release, return_value=0
-    )
+    harness.buffer.release_stale_claims = AsyncMock(side_effect=original_release)
 
     with contextlib.suppress(TimeoutError):
         await asyncio.wait_for(harness.run_loop(), timeout=0.2)

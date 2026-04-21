@@ -676,16 +676,20 @@ async def test_claim_deferred_writes_returns_pending_with_ids(buf):
 @pytest.mark.asyncio
 async def test_claim_deferred_writes_project_isolation_and_ordering(buf):
     """claim_deferred_writes respects project_id isolation and returns rows oldest-first."""
-    import asyncio
+    # Insert project-a rows with explicit, deterministic past timestamps so the
+    # ordering assertion cannot flake due to same-microsecond created_at values.
+    base = datetime(2020, 1, 1, tzinfo=UTC)
+    db = buf._require_db()
+    for i, content in enumerate(['a-first', 'a-second', 'a-third']):
+        await db.execute(
+            'INSERT INTO deferred_writes'
+            ' (id, project_id, content, category, metadata, created_at)'
+            " VALUES (?, 'project-a', ?, 'cat', '{}', ?)",
+            (str(uuid.uuid4()), content, (base + timedelta(seconds=i)).isoformat()),
+        )
+    await db.commit()
 
-    # Defer three writes to project-a (with tiny sleeps to force distinct created_at)
-    await buf.defer_write('project-a', 'a-first', 'cat', {})
-    await asyncio.sleep(0.01)
-    await buf.defer_write('project-a', 'a-second', 'cat', {})
-    await asyncio.sleep(0.01)
-    await buf.defer_write('project-a', 'a-third', 'cat', {})
-
-    # One write to project-b
+    # One write to project-b (uses the normal defer_write path)
     await buf.defer_write('project-b', 'b-only', 'cat', {})
 
     # Claim project-a — should get exactly 3 rows
