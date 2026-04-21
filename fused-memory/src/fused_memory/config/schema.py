@@ -274,6 +274,24 @@ class ReconciliationConfig(BaseModel):
     # sessions) can be updated to pass provenance before enforcement flips on.
     require_done_provenance: bool = Field(default=False)
 
+    # Judge-halt trend detector. A halt fires when the most recent
+    # `halt_trend_consecutive_required` verdicts are all non-ok AND at least
+    # `halt_trend_moderate_count` non-ok verdicts sit within the last
+    # `halt_trend_window_hours`. Consecutive-most-recent is what prevents a
+    # single scattered history of old moderates from keeping a project halted
+    # forever; the time window bounds blast radius to the recent past.
+    halt_trend_window_hours: float = Field(default=6.0)
+    halt_trend_moderate_count: int = Field(default=5)
+    halt_trend_consecutive_required: int = Field(default=3)
+    # Post-unhalt grace: the first N cycles after an unhalt skip the trend
+    # detector, so a manual unhalt has a chance to accumulate fresh verdicts
+    # instead of re-halting on the next tick from stale history.
+    halt_grace_cycles: int = Field(default=3)
+    # Cooldown after a halt fires: even if the trend condition is still true,
+    # do not re-halt within this window. Belt-and-braces on top of grace_cycles
+    # in case the operator intervenes mid-cycle.
+    halt_cooldown_seconds: float = Field(default=1800.0)
+
     # Escalation
     escalation_port: int = Field(default=8103)
     escalation_host: str = Field(default='127.0.0.1')

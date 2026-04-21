@@ -1019,12 +1019,15 @@ def create_mcp_server(
                 'error_type': 'ConfigurationError',
             }
         was_halted = reconciliation_harness.judge.is_halted(project_id)
-        reconciliation_harness.judge.unhalt(project_id)
+        await reconciliation_harness.judge.unhalt(project_id)
+        grace = reconciliation_harness.judge.unhalt_grace_remaining(project_id)
         return {
             'status': 'unhalted' if was_halted else 'already_running',
             'project_id': project_id,
+            'grace_cycles_remaining': grace,
             'message': (
-                f'Reconciliation unhalted for {project_id}. Next cycle will run within ~5 seconds.'
+                f'Reconciliation unhalted for {project_id}. Next cycle will run '
+                f'within ~5 seconds; trend detector suppressed for {grace} cycles.'
                 if was_halted
                 else f'Project {project_id} was not halted.'
             ),

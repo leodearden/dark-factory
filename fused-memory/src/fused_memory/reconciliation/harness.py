@@ -104,9 +104,14 @@ class ReconciliationHarness:
 
         self.stages = [stage1, stage2, stage3]
 
-        # Judge
+        # Judge — receives a callback that clears _halt_escalated so a
+        # subsequent halt in the same process re-fires the escalation.
         self.judge = (
-            Judge(self.config, journal, usage_gate=self.usage_gate)
+            Judge(
+                self.config, journal,
+                usage_gate=self.usage_gate,
+                on_unhalt_cb=self._on_judge_unhalt,
+            )
             if self.config.judge_enabled else None
         )
 
@@ -138,6 +143,15 @@ class ReconciliationHarness:
             logger.exception(
                 'harness: backlog_policy.on_judge_halt raised for %s', project_id,
             )
+
+    def _on_judge_unhalt(self, project_id: str) -> None:
+        """Callback invoked by Judge.unhalt so a subsequent halt re-escalates.
+
+        Without clearing the escalation sentinel, a manual unhalt followed by
+        the halt re-firing (for whatever reason) would silently skip the
+        escalation path because _notify_judge_halt dedupes per-process.
+        """
+        self._halt_escalated.discard(project_id)
 
     def drain(self) -> None:
         """Signal the harness to stop starting new reconciliation cycles.
@@ -397,6 +411,12 @@ class ReconciliationHarness:
         if self.usage_gate:
             await self.usage_gate.check_at_startup()
 
+        # Rehydrate persistent halt state from the journal so a restart cannot
+        # silently clear a halt that hasn't been explicitly cleared by an
+        # operator. Called once at startup.
+        if self.judge is not None:
+            await self.judge.initialize()
+
         await self._start_escalation_server()
 
         loop_count = 0
@@ -488,6 +508,18 @@ class ReconciliationHarness:
                     await self.buffer.mark_run_complete(project_id)
                     await self._replay_deferred_writes(project_id)
                     return  # Don't keep spinning on a halted project
+
+                # Decrement post-unhalt grace counter. A just-unhalted project
+                # runs `halt_grace_cycles` cycles with trend detection skipped,
+                # so stale moderates in the DB can age out before the detector
+                # re-engages.
+                if self.judge is not None:
+                    remaining = await self.judge.consume_grace_cycle(project_id)
+                    if remaining > 0:
+                        logger.info(
+                            f'Running {project_id} within post-unhalt grace '
+                            f'({remaining} cycles remaining)'
+                        )
 
                 tier = await self._select_tier(project_id)
                 iterator = BacklogIterator(self.config, self.journal, self.buffer, self)
