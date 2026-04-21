@@ -10,6 +10,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
     _apply_cargo_scope,
     _run_cmd,
+    _scope_cargo_workspace,
     run_scoped_verification,
     run_verification,
     scope_module_config,
@@ -1030,3 +1031,148 @@ class TestApplyCargoScopePolyglotGuard:
         result = self._call_scoped(['Cargo.toml'])
         assert result.test_command == 'cargo test --workspace'
         assert result.lint_command == 'cargo clippy --workspace'
+
+
+class TestScopeCargoWorkspaceRewrite:
+    """Regression guards for `_scope_cargo_workspace` — the --workspace rewriter.
+
+    The fix that strips ``--exclude`` flags after rewriting ``--workspace`` →
+    ``-p <crate>`` landed in commit fd4758fcff.  These tests keep it from
+    regressing.  They invoke `_scope_cargo_workspace` directly (pure function,
+    no mocks needed).
+    """
+
+    # A1: single --exclude stripped
+    def test_single_exclude_stripped(self):
+        """A single ``--exclude foo`` is stripped after ``--workspace`` rewrite."""
+        cmd = 'cargo test --workspace --exclude foo -- --test-threads=1'
+        result = _scope_cargo_workspace(cmd, ['bar'])
+        assert result is not None
+        assert '-p bar' in result
+        assert '--workspace' not in result
+        assert '--exclude' not in result
+        assert 'foo' not in result  # the excluded crate name is gone too
+        assert '-- --test-threads=1' in result
+
+    # A2: three chained --exclude flags all stripped via the while-loop
+    def test_multiple_excludes_all_stripped(self):
+        """Three consecutive ``--exclude`` flags are all removed by the while-loop."""
+        cmd = (
+            'cargo test --workspace '
+            '--exclude alpha --exclude beta --exclude gamma '
+            '-- --test-threads=1'
+        )
+        result = _scope_cargo_workspace(cmd, ['delta'])
+        assert result is not None
+        assert '-p delta' in result
+        assert '--workspace' not in result
+        assert '--exclude' not in result
+        assert 'alpha' not in result
+        assert 'beta' not in result
+        assert 'gamma' not in result
+
+    # A3: --exclude=foo equals-form stripped
+    def test_exclude_equals_form_stripped(self):
+        """``--exclude=foo`` (equals-sign form) is also stripped."""
+        cmd = 'cargo test --workspace --exclude=foo -- --test-threads=1'
+        result = _scope_cargo_workspace(cmd, ['bar'])
+        assert result is not None
+        assert '-p bar' in result
+        assert '--workspace' not in result
+        assert '--exclude' not in result
+
+    # A4: full reify orchestrator.yaml 4-segment command
+    def test_reify_chained_command_rewrites_ungated_segments_only(self):
+        """Four-segment command: gated wrappers untouched, ungated segments rewritten.
+
+        This mirrors the real-world ``orchestrator.yaml`` test_command from the
+        reify project: two gated wrapper segments (no ``--workspace``) followed
+        by two ungated segments (with ``--workspace --exclude ...``).
+        Rewriting for ``crates=['reify-compiler']`` must:
+          - leave the gated segments byte-identical
+          - rewrite both ungated segments to ``-p reify-compiler``
+          - strip ALL ``--exclude`` flags from the ungated segments
+        """
+        gated_1 = (
+            './scripts/cargo-test-occt-gated.sh cargo test '
+            '-p reify-kernel-occt -p reify-eval -p reify-cli'
+        )
+        gated_2 = (
+            './scripts/cargo-test-occt-gated.sh cargo test '
+            '-p reify-kernel-occt-extra'
+        )
+        ungated_excludes = (
+            '--exclude reify-kernel-occt --exclude reify-eval '
+            '--exclude reify-cli --exclude reify-kernel-occt-extra'
+        )
+        ungated_1 = f'cargo test --workspace {ungated_excludes} -- --test-threads=1'
+        ungated_2 = f'cargo test --workspace {ungated_excludes} -- --test-threads=1'
+        cmd = f'{gated_1} && {gated_2} && {ungated_1} && {ungated_2}'
+
+        result = _scope_cargo_workspace(cmd, ['reify-compiler'])
+
+        assert result is not None
+        # Gated segments must be present verbatim
+        assert gated_1 in result, f'gated_1 missing from result: {result!r}'
+        assert gated_2 in result, f'gated_2 missing from result: {result!r}'
+        # Ungated segments must have been rewritten
+        assert '--workspace' not in result, f'--workspace still present: {result!r}'
+        assert '-p reify-compiler' in result
+        # Trailing args preserved in the rewritten segments
+        assert '-- --test-threads=1' in result
+
+    # A5: non-cargo --exclude in a chained command is NOT stripped
+    def test_non_cargo_exclude_not_stripped(self):
+        """A trailing ``npm test --exclude foo`` must not have its ``--exclude`` removed.
+
+        ``_CARGO_EXCLUDE_RE`` is anchored to ``cargo <subcmd>`` so it must not
+        bleed into adjacent non-cargo shell segments.
+        """
+        cmd = (
+            'cargo test --workspace --exclude some-crate -- --test-threads=1'
+            ' && npm test --exclude foo'
+        )
+        result = _scope_cargo_workspace(cmd, ['my-crate'])
+        assert result is not None
+        # The npm segment must be intact
+        assert 'npm test --exclude foo' in result, (
+            f'npm --exclude was incorrectly removed: {result!r}'
+        )
+        # But the cargo --exclude must be gone
+        # (the cargo segment is the only one _CARGO_EXCLUDE_RE touches)
+        # Split on '&&' to isolate the cargo part
+        cargo_part = result.split('&&')[0]
+        assert '--exclude' not in cargo_part, (
+            f'cargo --exclude not stripped from: {cargo_part!r}'
+        )
+
+    # A6: idempotency — already -p-scoped command returns byte-identical
+    def test_idempotent_on_already_scoped_command(self):
+        """Rewriting a command that is already ``-p``-scoped (no ``--workspace``) is a no-op."""
+        cmd = 'cargo test -p my-crate -- --test-threads=1'
+        result = _scope_cargo_workspace(cmd, ['my-crate'])
+        assert result == cmd, f'Expected unchanged cmd, got {result!r}'
+
+    # A7: no --exclude substring in the rewritten A4 cargo segments
+    def test_no_exclude_token_in_rewritten_ungated_segments(self):
+        """After rewrite, neither ``--exclude`` nor any excluded crate name appears in the ungated cargo segments."""
+        gated = (
+            './scripts/cargo-test-occt-gated.sh cargo test '
+            '-p reify-kernel-occt -p reify-eval -p reify-cli'
+        )
+        ungated = (
+            'cargo test --workspace '
+            '--exclude reify-kernel-occt --exclude reify-eval --exclude reify-cli '
+            '-- --test-threads=1'
+        )
+        cmd = f'{gated} && {ungated}'
+        result = _scope_cargo_workspace(cmd, ['reify-compiler'])
+
+        assert result is not None
+        # Split on && to isolate the rewritten cargo segment
+        segments = [s.strip() for s in result.split('&&')]
+        # The last segment is the rewritten ungated cargo test
+        rewritten = segments[-1]
+        assert '--exclude' not in rewritten, (
+            f'--exclude token found in rewritten segment: {rewritten!r}'
+        )
