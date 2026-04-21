@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import contextlib
 from pathlib import Path
 from typing import Self
 
@@ -82,10 +83,8 @@ class AsyncSqliteBase(abc.ABC):
             # threading._shutdown(). WAL mode makes this safe: committed
             # data is durable; only in-flight uncommitted transactions
             # are lost, which is already the contract of forced shutdown.
-            try:
+            with contextlib.suppress(AttributeError, RuntimeError):
                 conn_awaitable._thread.daemon = True
-            except (AttributeError, RuntimeError):
-                pass
             conn = await conn_awaitable
             try:
                 await apply_wal_pragmas(conn, busy_timeout_ms=self.busy_timeout_ms)
