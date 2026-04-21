@@ -133,10 +133,20 @@ class EventBuffer:
         async with db.execute('PRAGMA table_info(deferred_writes)') as cursor:
             columns = {row['name'] async for row in cursor}
 
-        # Drop the now-redundant single-column project index.  idx_dw_project_claimed
-        # (project_id, claimed_at) is a strict superset that covers every query
-        # idx_dw_project covered, so keeping both wastes write IOPS and disk.
-        await db.execute('DROP INDEX IF EXISTS idx_dw_project')
+        # Drop the now-redundant single-column project index — but only when it
+        # actually exists, so this guard matches the docstring contract that every
+        # migration step is conditional.  idx_dw_project_claimed (project_id,
+        # claimed_at) is a strict superset that covers every query idx_dw_project
+        # covered, so keeping both wastes write IOPS and disk.  Fresh DBs created
+        # from _BUFFER_SCHEMA_SQL never had idx_dw_project, so the DROP is a
+        # no-op for them without this guard; legacy DBs (created by an intermediate
+        # code version) may still carry it.
+        async with db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_dw_project'"
+        ) as _cursor:
+            _legacy_index_row = await _cursor.fetchone()
+        if _legacy_index_row is not None:
+            await db.execute('DROP INDEX idx_dw_project')
 
         # Add claimed_at if missing.
         if 'claimed_at' not in columns:
