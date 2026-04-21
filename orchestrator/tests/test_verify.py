@@ -962,6 +962,22 @@ class TestApplyCargoScopePolyglotGuard:
             f'expected --workspace absent in lint_command, got {result.lint_command!r}'
         )
 
+    def test_rs_plus_rust_toolchain_scopes(self):
+        """.rs + rust-toolchain must scope to crate (rustup pin file, no extension)."""
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'rust-toolchain'])
+        assert '-p foo' in (result.test_command or ''), (
+            f'expected -p foo in test_command, got {result.test_command!r}'
+        )
+        assert '--workspace' not in (result.test_command or ''), (
+            f'expected --workspace absent in test_command, got {result.test_command!r}'
+        )
+        assert '-p foo' in (result.lint_command or ''), (
+            f'expected -p foo in lint_command, got {result.lint_command!r}'
+        )
+        assert '--workspace' not in (result.lint_command or ''), (
+            f'expected --workspace absent in lint_command, got {result.lint_command!r}'
+        )
+
     # -- should BAIL (extension outside whitelist) --
 
     def test_rs_plus_ts_bails(self):
