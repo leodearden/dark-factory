@@ -410,7 +410,7 @@ class TestRunArmsWatchdog:
 
         This test FAILS on current code (arm at line 208 precedes echo at line 209).
         """
-        events: list[str] = []
+        events: list[str | tuple[str, str | None]] = []
         state = {'armed_with': None}
 
         def recording_force_exit(timeout_secs, exit_code=137, *, stream=None):
