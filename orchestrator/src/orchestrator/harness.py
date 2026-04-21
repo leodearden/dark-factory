@@ -381,6 +381,9 @@ class Harness:
             # 2c. Recover crashed tasks from surviving worktrees
             await self._recover_crashed_tasks()
 
+            # 2d. Reconcile stranded in-progress tasks (live-claimant-aware)
+            await self._reconcile_stranded_in_progress()
+
             tasks = await self.scheduler.get_tasks()
             self.report.total_tasks = len([t for t in tasks if t.get('status') == 'pending'])
             logger.info(f'Task tree populated: {self.report.total_tasks} pending tasks')

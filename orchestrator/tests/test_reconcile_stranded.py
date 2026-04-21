@@ -5,7 +5,7 @@ import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -167,3 +167,87 @@ class TestReconcileStrandedInProgress:
         # No log message mentioning revert or stranded for this task
         revert_logs = [r for r in caplog.records if 'revert' in r.message.lower() or 'stranded' in r.message.lower()]
         assert len(revert_logs) == 0
+
+
+# ---------------------------------------------------------------------------
+# Harness.run() call-order test
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_harness_run_invokes_reconcile_before_scheduler_loop(
+    tmp_path: Path,
+):
+    """run() must call _recover_crashed_tasks → _reconcile_stranded_in_progress
+    → scheduler.acquire_next in that order.
+    """
+    call_order: list[str] = []
+
+    git_cfg = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+    )
+    config = MagicMock()
+    config.git = git_cfg
+    config.project_root = tmp_path
+    config.usage_cap.enabled = False
+    config.review.enabled = False
+    config.max_concurrent_tasks = 2
+    config.fused_memory.project_id = 'test'
+
+    with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
+         patch('orchestrator.harness.Scheduler'), \
+         patch('orchestrator.harness.BriefingAssembler'):
+        h = Harness(config)
+
+    # --- mock infrastructure methods so run() doesn't fail early ---
+    h.git_ops = MagicMock()
+    h.git_ops.has_dirty_working_tree = AsyncMock(return_value=None)
+    h.git_ops.worktree_base = tmp_path / '.worktrees'
+
+    mock_mcp = mock_mcp_cls.return_value
+    mock_mcp.start = AsyncMock()
+    mock_mcp.stop = AsyncMock()
+
+    h._start_escalation_server = AsyncMock()
+    h._start_merge_worker = AsyncMock()
+    h._dismiss_stale_escalations = AsyncMock()
+    h._start_orphan_l0_reaper = MagicMock()
+    h._tag_task_modules = AsyncMock()
+
+    # Provide one pending task so the "no pending tasks" check passes
+    h.scheduler = MagicMock()
+    h.scheduler.get_tasks = AsyncMock(return_value=[
+        {'id': 1, 'status': 'pending', 'title': 'A task'},
+    ])
+    h.scheduler.set_task_status = AsyncMock()
+
+    # Track ordering: _recover_crashed_tasks
+    async def _fake_recover():
+        call_order.append('recover')
+    h._recover_crashed_tasks = _fake_recover
+
+    # Track ordering: _reconcile_stranded_in_progress
+    async def _fake_reconcile():
+        call_order.append('reconcile')
+    h._reconcile_stranded_in_progress = _fake_reconcile
+
+    # Track ordering: acquire_next — append then raise to break the loop
+    async def _fake_acquire():
+        call_order.append('acquire')
+        raise RuntimeError('stop the loop')
+    h.scheduler.acquire_next = _fake_acquire
+
+    with pytest.raises(RuntimeError, match='stop the loop'):
+        await h.run(prd_path=None)
+
+    # _recover_crashed_tasks then _reconcile_stranded_in_progress then acquire_next
+    assert 'recover' in call_order, "_recover_crashed_tasks was not called"
+    assert 'reconcile' in call_order, "_reconcile_stranded_in_progress was not called"
+    assert 'acquire' in call_order, "scheduler.acquire_next was not called"
+    recover_idx = call_order.index('recover')
+    reconcile_idx = call_order.index('reconcile')
+    acquire_idx = call_order.index('acquire')
+    assert recover_idx < reconcile_idx, "_recover_crashed_tasks must precede _reconcile_stranded_in_progress"
+    assert reconcile_idx < acquire_idx, "_reconcile_stranded_in_progress must precede scheduler.acquire_next"
