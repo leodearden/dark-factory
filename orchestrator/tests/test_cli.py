@@ -246,7 +246,6 @@ class TestForceExitWatchdog:
             'watchdog thread did not exit after firing os._exit replacement'
         )
 
-
     def test_force_exit_returns_handle_with_disarm_and_thread(self, monkeypatch):
         """_force_exit_after_delay returns a WatchdogHandle with .disarm and .thread.
 
@@ -344,10 +343,14 @@ class TestForceExitWatchdog:
         monkeypatch.setattr('os._exit', lambda code: calls.append(code))
 
         # Does NOT mock traceback.format_stack — it runs normally, producing real frames.
-        # A stream whose every write and flush raises — exercises the outer try/except that
-        # wraps out.write(''.join(lines)) AND the inner fallback write.
+        # Records every write attempt (payload captured before OSError is raised) so we
+        # can assert which sentinel strings the watchdog tried to write, proving exactly
+        # which control-flow paths were traversed.
+        write_attempts: list[str] = []
+
         class _OuterBrokenStream:
-            def write(self, _s):
+            def write(self, s):
+                write_attempts.append(s)  # record before raising
                 raise OSError('outer write broken')
 
             def flush(self):
@@ -363,6 +366,27 @@ class TestForceExitWatchdog:
         assert calls == [137], (
             f'expected os._exit(137) even when outer write fails with format_stack intact, '
             f'got {calls}'
+        )
+        # Verify the control-flow path: format_stack built real frames so the outer
+        # out.write(''.join(lines)) was attempted first (must contain the watchdog-fired
+        # header sentinel, proving the outer path was reached), then the inner fallback
+        # out.write was attempted second (must contain the dump-failed sentinel).  Both
+        # raised — inner except swallowed — os._exit still reached.  This distinguishes
+        # the test from its sibling test_fallback_write_failure_still_fires_exit where
+        # format_stack raises first (lines is never built, outer out.write is never reached).
+        assert len(write_attempts) >= 2, (
+            f'expected at least 2 write attempts (outer sentinel + inner fallback), '
+            f'got {write_attempts!r}'
+        )
+        assert 'SHUTDOWN WATCHDOG FIRED — process hung' in write_attempts[0], (
+            f'first write attempt must contain the watchdog-fired header sentinel '
+            f'(proves format_stack ran and outer out.write was reached), '
+            f'got: {write_attempts[0]!r}'
+        )
+        assert '(diagnostic dump failed)' in write_attempts[1], (
+            f'second write attempt must contain the fallback sentinel '
+            f'(proves inner fallback out.write was also exercised), '
+            f'got: {write_attempts[1]!r}'
         )
         handle.thread.join(timeout=1.0)
         assert not handle.thread.is_alive(), (
@@ -385,6 +409,15 @@ class TestRunArmsWatchdog:
         (e.g., that echo precedes arm).  The echo-side recording is NOT handled
         here — callers that need it (test_report_emitted_before_watchdog_armed)
         wrap click.echo themselves, keeping factory concerns minimal.
+
+        The ``thread`` field of the returned ``WatchdogHandle`` is a
+        ``MagicMock(spec=threading.Thread)`` — a type-structural placeholder
+        that never spawns a real thread.  The spec constraint means any attempt
+        to access an attribute that does not exist on ``threading.Thread``
+        raises ``AttributeError`` immediately, so accidental misuse is caught
+        loudly.  ``TestRunArmsWatchdog`` callers never call ``.join()`` or
+        ``.is_alive()`` on the fake; those are exercised only by
+        ``TestForceExitWatchdog`` tests that use the real implementation.
         """
         state = {'armed_with': None, 'disarm_called': False}
 
@@ -395,11 +428,10 @@ class TestRunArmsWatchdog:
             if events is not None:
                 events.append('arm')
             state['armed_with'] = timeout_secs
-            # A non-started thread satisfies the WatchdogHandle.thread type
-            # structurally without actually spawning a background thread.
-            fake_thread = threading.Thread(
-                target=lambda: None, name='fake-shutdown-watchdog', daemon=True,
-            )
+            # MagicMock(spec=threading.Thread) satisfies the WatchdogHandle.thread
+            # type structurally without spawning a background thread.  spec= ensures
+            # any accidental access to a non-Thread attribute raises AttributeError.
+            fake_thread = MagicMock(spec=threading.Thread)
             return cli_module.WatchdogHandle(disarm=fake_disarm, thread=fake_thread)
 
         return state, fake_force_exit
