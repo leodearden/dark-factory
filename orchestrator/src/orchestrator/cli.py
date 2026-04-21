@@ -76,7 +76,16 @@ def _force_exit_after_delay(
             out.write(''.join(lines))
             out.flush()
         except Exception:
-            pass
+            # Diagnostic dump failed (e.g. traceback or sys._current_frames
+            # torn down during interpreter shutdown). Emit a fallback sentinel
+            # so operators still see a log line before exit 137. Wrapped in
+            # its own try/except so a stream-write failure still falls through
+            # to os._exit — the force-exit guarantee must never be weakened.
+            try:
+                out.write('SHUTDOWN WATCHDOG FIRED (diagnostic dump failed)\n')
+                out.flush()
+            except Exception:
+                pass
         os._exit(exit_code)
 
     thread = threading.Thread(target=_watchdog, name='shutdown-watchdog', daemon=True)
