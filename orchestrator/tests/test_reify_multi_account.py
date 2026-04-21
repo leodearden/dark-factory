@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -27,6 +26,9 @@ from tests.conftest import build_usage_gate
 # Constants — expected reify automation account pool (F→E→C→D)
 # ---------------------------------------------------------------------------
 
+# NOTE: This is the reify-automation subset (4 accounts, F→E→C→D). It deliberately
+# excludes max-g, which is reserved for other workloads. See TestDarkFactoryProductionPool
+# below for the full 5-account production pool (G→F→E→C→D).
 REIFY_ACCOUNT_DEFS = [
     {'name': 'max-f', 'oauth_token_env': 'CLAUDE_OAUTH_TOKEN_F'},
     {'name': 'max-e', 'oauth_token_env': 'CLAUDE_OAUTH_TOKEN_E'},
@@ -512,22 +514,8 @@ class TestDarkFactoryProductionPool:
     so a truly missing config cannot silently hide behind a skip.
     """
 
-    @staticmethod
-    def _find_repo_root() -> Path | None:
-        """Walk up from this file to find the repo root anchored by a .git entry.
-
-        Returns the repo-root Path if found, or None when not running inside a
-        git checkout (e.g. packaged wheel, partial mirror, or isolated test run).
-        Works for both normal checkouts (.git directory) and git worktrees (.git file).
-        """
-        here = Path(__file__).resolve()
-        for parent in here.parents:
-            if (parent / '.git').exists():
-                return parent
-        return None
-
     @pytest.fixture
-    def production_config(self):
+    def production_config(self, repo_root):
         """Load config/usage-accounts.yaml from the repo root.
 
         Skips when no .git sentinel is found (not a full checkout).
@@ -535,7 +523,6 @@ class TestDarkFactoryProductionPool:
         so that a missing file inside the repo surfaces as an error rather than a
         silent skip that defeats the regression guard.
         """
-        repo_root = self._find_repo_root()
         if repo_root is None:
             pytest.skip("Not inside a git checkout — skipping production-pool tests")
         accounts_file = repo_root / 'config' / 'usage-accounts.yaml'
@@ -550,7 +537,8 @@ class TestDarkFactoryProductionPool:
         names = [a.name for a in production_config.accounts]
         assert names == ['max-g', 'max-f', 'max-e', 'max-c', 'max-d'], (
             f"Production pool mismatch. Got: {names!r}. "
-            "Expected max-b to be removed (permanently dead HTTP 403)."
+            "Expected [max-g, max-f, max-e, max-c, max-d]. "
+            "Do not re-add max-b (permanently dead HTTP 403 since 2026-04-20)."
         )
 
     def test_reserved_accounts_absent(self, production_config):
