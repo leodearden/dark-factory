@@ -203,10 +203,12 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
         _force_exit_after_delay(SHUTDOWN_WATCHDOG_TIMEOUT_SECS)
         sys.exit(130)
 
-    # asyncio.run() has returned normally — arm the watchdog to guard interpreter
-    # shutdown. Intentionally left armed (see CancelledError path for rationale).
-    _force_exit_after_delay(SHUTDOWN_WATCHDOG_TIMEOUT_SECS)
     click.echo(report.summary())
+
+    # asyncio.run() has returned and the report has been emitted — arm the watchdog
+    # now so only interpreter shutdown (atexit + threading._shutdown) is covered.
+    # Intentionally left armed (see CancelledError path for rationale).
+    _force_exit_after_delay(SHUTDOWN_WATCHDOG_TIMEOUT_SECS)
 
     if report.blocked > 0:
         sys.exit(1)
