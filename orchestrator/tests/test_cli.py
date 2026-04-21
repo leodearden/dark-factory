@@ -247,30 +247,25 @@ class TestForceExitWatchdog:
         )
 
     def test_force_exit_returns_handle_with_disarm_and_thread(self, monkeypatch):
-        """_force_exit_after_delay returns a WatchdogHandle with .disarm and .thread.
+        """_force_exit_after_delay returns a WatchdogHandle whose thread is a live daemon
+        and whose disarm() stops the thread.
 
-        The returned handle must have:
-        - a callable .disarm attribute
-        - a threading.Thread .thread attribute that is daemonised, named
-          'shutdown-watchdog', and already alive after arming.
-        Calling disarm() must stop the thread within a reasonable timeout.
+        Pins only the behavioral contract of WatchdogHandle:
+        - .thread is a daemon (load-bearing — non-daemon threads block interpreter shutdown)
+        - .thread is alive immediately after arming (proves thread.start() ran)
+        - Calling disarm() stops the thread within a reasonable timeout
+
+        NamedTuple shape (.disarm is callable, .thread is threading.Thread) is guaranteed
+        by construction in cli.py and not re-asserted here. Thread name is cosmetic and
+        intentionally unpinned — rename-friendly.
         """
         calls = []
         monkeypatch.setattr('os._exit', lambda code: calls.append(code))
 
         handle = _force_exit_after_delay(timeout_secs=5.0)
 
-        assert callable(handle.disarm), (
-            f'handle.disarm must be callable, got {handle.disarm!r}'
-        )
-        assert isinstance(handle.thread, threading.Thread), (
-            f'handle.thread must be threading.Thread, got {type(handle.thread)}'
-        )
         assert handle.thread.daemon is True, (
             'handle.thread must be a daemon thread'
-        )
-        assert handle.thread.name == 'shutdown-watchdog', (
-            f'expected thread name "shutdown-watchdog", got {handle.thread.name!r}'
         )
         assert handle.thread.is_alive(), (
             'handle.thread must be alive immediately after arming'
