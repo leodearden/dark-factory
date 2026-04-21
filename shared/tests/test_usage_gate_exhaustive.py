@@ -1020,6 +1020,36 @@ class TestHandleCapDetected:
             gate._handle_cap_detected('reason', None, token)
         mock_fire.assert_called_once()
 
+    def test_cost_event_details_include_resets_at(self):
+        """cap_hit details JSON carries resets_at so the dashboard can surface
+        per-account uncap ETAs without re-parsing the reason string.
+        """
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['a'], cost_store=cost_store)
+        token = gate._accounts[0].token
+        target = datetime(2026, 5, 1, 18, 0, tzinfo=UTC)
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._handle_cap_detected('reason', target, token)
+        (_, event_type, details_json), _ = mock_fire.call_args
+        assert event_type == 'cap_hit'
+        details = json.loads(details_json)
+        assert details['reason'] == 'reason'
+        assert details['resets_at'] == target.isoformat()
+
+    def test_cost_event_details_omit_resets_at_when_unknown(self):
+        """When resets_at isn't parsed, it stays out of the JSON payload so
+        legacy dashboard code never sees a null field it has to special-case.
+        """
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['a'], cost_store=cost_store)
+        token = gate._accounts[0].token
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._handle_cap_detected('reason', None, token)
+        (_, _, details_json), _ = mock_fire.call_args
+        details = json.loads(details_json)
+        assert 'resets_at' not in details
+        assert details == {'reason': 'reason'}
+
     def test_no_cost_event_without_cost_store(self):
         gate = make_gate(['a'], cost_store=None)
         token = gate._accounts[0].token
