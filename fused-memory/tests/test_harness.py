@@ -2359,7 +2359,7 @@ async def test_run_loop_releases_stale_claims_on_startup(
 ):
     """run_loop() must call release_stale_claims once during startup (not per iteration)."""
     import asyncio
-    from unittest.mock import AsyncMock, patch
+    from unittest.mock import AsyncMock
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
