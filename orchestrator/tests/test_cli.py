@@ -1,8 +1,11 @@
 """Tests for CLI helpers."""
 
+import logging
+from unittest.mock import MagicMock
+
 import pytest
 
-from orchestrator.cli import _parse_duration
+from orchestrator.cli import _make_cancel_handler, _parse_duration
 
 
 class TestParseDuration:
@@ -27,3 +30,54 @@ class TestParseDuration:
     def test_invalid(self):
         with pytest.raises(ValueError):
             _parse_duration("abc")
+
+
+class TestSignalHandlerIdempotence:
+    """_make_cancel_handler returns an idempotent SIGTERM/SIGINT callback.
+
+    Rationale: a second signal during shutdown cleanup was observed to
+    re-cancel the main task mid-finally, skipping cost_store.close() and
+    leaving aiosqlite's non-daemon worker thread alive → interpreter hang.
+    """
+
+    def test_first_signal_cancels_main_task(self):
+        main_task = MagicMock()
+        logger = logging.getLogger('test.cli')
+        handler = _make_cancel_handler(main_task, logger)
+
+        handler('SIGTERM')
+
+        main_task.cancel.assert_called_once()
+
+    def test_second_signal_does_not_re_cancel(self, caplog):
+        main_task = MagicMock()
+        logger = logging.getLogger('orchestrator.cli.test')
+        handler = _make_cancel_handler(main_task, logger)
+
+        handler('SIGTERM')
+        with caplog.at_level(logging.INFO, logger=logger.name):
+            handler('SIGTERM')
+
+        # cancel() must still be called exactly once — the second signal is a no-op
+        main_task.cancel.assert_called_once()
+        # Second invocation logs at INFO level so operators see it wasn't ignored silently
+        info_records = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and 'already in progress' in r.message
+        ]
+        assert len(info_records) == 1
+        assert 'SIGTERM' in info_records[0].message
+
+    def test_each_handler_instance_is_independent(self):
+        """Two handlers from two _make_cancel_handler calls don't share state."""
+        task_a = MagicMock()
+        task_b = MagicMock()
+        logger = logging.getLogger('test.cli')
+        handler_a = _make_cancel_handler(task_a, logger)
+        handler_b = _make_cancel_handler(task_b, logger)
+
+        handler_a('SIGTERM')
+        handler_b('SIGINT')
+
+        task_a.cancel.assert_called_once()
+        task_b.cancel.assert_called_once()

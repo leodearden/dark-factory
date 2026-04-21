@@ -18,6 +18,31 @@ LOG_FORMAT = '%(asctime)s %(levelname)-8s [%(name)s] %(message)s'
 DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 
 
+def _make_cancel_handler(main_task, logger):
+    """Build an idempotent SIGTERM/SIGINT handler.
+
+    The first signal cancels the main task; subsequent signals are logged
+    and ignored so they cannot re-cancel the task mid-cleanup. SIGKILL
+    remains the operator escape hatch if cleanup itself ever wedges.
+    """
+    # Mutable single-element list so the nested closure can mutate it
+    # without needing nonlocal (simplifies making this a module-level
+    # factory that's testable in isolation).
+    fired = [False]
+
+    def _cancel(sig_name: str) -> None:
+        if fired[0]:
+            logger.info(
+                f'{sig_name} received — shutdown already in progress, ignoring'
+            )
+            return
+        fired[0] = True
+        logger.warning(f'{sig_name} received — cancelling main task')
+        main_task.cancel()
+
+    return _cancel
+
+
 @click.group()
 @click.option('--verbose', is_flag=True, help='Enable debug logging')
 def main(verbose: bool):
@@ -70,9 +95,7 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
         main_task = asyncio.current_task()
         assert main_task is not None
 
-        def _cancel(sig_name: str) -> None:
-            logger.warning(f'{sig_name} received — cancelling main task')
-            main_task.cancel()
+        _cancel = _make_cancel_handler(main_task, logger)
 
         for sig_name in ('SIGTERM', 'SIGINT'):
             sig = getattr(signal, sig_name)
@@ -80,7 +103,7 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
                 loop.add_signal_handler(sig, _cancel, sig_name)
             except (NotImplementedError, RuntimeError):
                 # Fallback for platforms where add_signal_handler is unsupported
-                signal.signal(sig, lambda *_: main_task.cancel())
+                signal.signal(sig, lambda *_: _cancel('signal'))
 
         return await harness.run(
             prd, dry_run=dry_run, delay_secs=delay_secs,

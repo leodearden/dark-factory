@@ -75,7 +75,18 @@ class AsyncSqliteBase(abc.ABC):
             if self._conn is not None:
                 raise RuntimeError(f'{type(self).__name__} already opened')
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            conn = await aiosqlite.connect(str(self.db_path))
+            conn_awaitable = aiosqlite.connect(str(self.db_path))
+            # Mark the worker thread as daemon before it starts, so a
+            # leaked connection (e.g. graceful-shutdown cleanup aborted
+            # by a second SIGTERM) can never block interpreter exit in
+            # threading._shutdown(). WAL mode makes this safe: committed
+            # data is durable; only in-flight uncommitted transactions
+            # are lost, which is already the contract of forced shutdown.
+            try:
+                conn_awaitable._thread.daemon = True
+            except (AttributeError, RuntimeError):
+                pass
+            conn = await conn_awaitable
             try:
                 await apply_wal_pragmas(conn, busy_timeout_ms=self.busy_timeout_ms)
                 await conn.executescript(self._schema)

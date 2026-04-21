@@ -518,3 +518,37 @@ class TestAsyncSqliteBaseCloseExceptionSafety:
         assert row is not None and row[0] == 1
 
         await store.close()
+
+
+# ---------------------------------------------------------------------------
+# Daemon-thread guarantee: interpreter shutdown never blocks on a leaked conn
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestWorkerThreadIsDaemon:
+    """AsyncSqliteBase.open() marks aiosqlite's worker thread as daemon.
+
+    Rationale: if graceful shutdown is interrupted (e.g. by a second SIGTERM)
+    and close() never runs, a non-daemon worker thread will wedge
+    threading._shutdown() forever. Marking it daemon lets the interpreter exit
+    cleanly in that case. WAL-mode + per-write commits mean committed data is
+    durable regardless.
+    """
+
+    async def test_worker_thread_is_daemon_after_open(self, tmp_path: Path):
+        store = _SimpleStore(tmp_path / 'daemon_check.db')
+        await store.open()
+        try:
+            assert store._conn is not None
+            # aiosqlite Connection stores its worker as ._thread (private).
+            # If aiosqlite ever renames this, the guard in open() silently
+            # degrades — this test fails loudly so we notice.
+            thread = store._conn._thread
+            assert thread.is_alive()
+            assert thread.daemon is True, (
+                'aiosqlite worker thread must be daemon so a leaked '
+                'connection cannot block interpreter shutdown'
+            )
+        finally:
+            await store.close()
