@@ -200,6 +200,9 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
         # threads). The watchdog is intentionally NOT disarmed: if shutdown
         # completes cleanly, the daemon thread is killed with the process;
         # if shutdown hangs, the daemon thread fires os._exit(137).
+        # Same unbounded-echo tradeoff applies to the `Orchestrator cancelled`
+        # message above — a stuck stderr can hang it indefinitely outside the
+        # watchdog window. Accepted for the same reason as the normal path.
         _force_exit_after_delay(SHUTDOWN_WATCHDOG_TIMEOUT_SECS)
         sys.exit(130)
 
@@ -213,6 +216,13 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
     # harness.run() can linger regardless of whether tasks were blocked.
     # Intentionally left armed: if shutdown completes cleanly the daemon thread
     # is killed with the process; if shutdown hangs it fires os._exit(137).
+    # Note the deliberate tradeoff — placing the arm AFTER click.echo(report.summary())
+    # means a stuck stdout (full pipe, blocked terminal, slow tty) can hang the report
+    # write INDEFINITELY, outside the 30-second watchdog window. We accept that:
+    # hanging visibly in click.echo while the operator sees partial output is preferable
+    # to force-killing the process before the report is emitted at all. The watchdog's
+    # scope is interpreter shutdown (atexit + threading._shutdown joining non-daemon
+    # threads), not user-visible I/O.
     _force_exit_after_delay(SHUTDOWN_WATCHDOG_TIMEOUT_SECS)
 
     if report.blocked > 0:
