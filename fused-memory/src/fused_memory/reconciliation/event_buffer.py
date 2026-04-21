@@ -669,39 +669,6 @@ class EventBuffer:
             )
         return rowcount
 
-    async def pop_deferred_writes(self, project_id: str) -> list[dict]:
-        """Atomically pop all deferred writes for a project.
-
-        Returns list of ``{content, category, metadata, agent_id}`` dicts.
-        """
-        db = self._require_db()
-        async with db.execute(
-            'SELECT * FROM deferred_writes WHERE project_id = ? ORDER BY created_at',
-            (project_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-
-        if not rows:
-            return []
-
-        ids = [row['id'] for row in rows]
-        placeholders = ','.join('?' for _ in ids)
-        async with self._txn() as db:
-            await db.execute(
-                f'DELETE FROM deferred_writes WHERE id IN ({placeholders})',
-                ids,
-            )
-
-        return [
-            {
-                'content': row['content'],
-                'category': row['category'],
-                'metadata': json.loads(row['metadata']),
-                'agent_id': row['agent_id'],
-            }
-            for row in rows
-        ]
-
     # ── Queries ────────────────────────────────────────────────────────
 
     async def get_active_projects(self) -> list[str]:
