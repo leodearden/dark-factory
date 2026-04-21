@@ -1,11 +1,12 @@
 """Tests for CLI helpers."""
 
 import logging
+import time
 from unittest.mock import MagicMock
 
 import pytest
 
-from orchestrator.cli import _make_cancel_handler, _parse_duration
+from orchestrator.cli import _force_exit_after_delay, _make_cancel_handler, _parse_duration
 
 
 class TestParseDuration:
@@ -81,3 +82,17 @@ class TestSignalHandlerIdempotence:
 
         task_a.cancel.assert_called_once()
         task_b.cancel.assert_called_once()
+
+
+class TestForceExitWatchdog:
+    """Tests for _force_exit_after_delay shutdown watchdog helper."""
+
+    def test_fires_after_timeout(self, monkeypatch):
+        """Watchdog calls os._exit(137) after the timeout elapses."""
+        calls = []
+        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+
+        _force_exit_after_delay(timeout_secs=0.05)
+        time.sleep(0.3)
+
+        assert calls == [137], f'expected [137], got {calls}'
