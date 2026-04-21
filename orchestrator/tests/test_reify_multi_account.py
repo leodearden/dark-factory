@@ -557,7 +557,8 @@ class TestDarkFactoryProductionPool:
         names = [a.name for a in production_config.accounts]
         assert names == ['max-g', 'max-f', 'max-e', 'max-c', 'max-d'], (
             f"Production pool mismatch. Got: {names!r}. "
-            "Expected max-b to be removed (permanently dead HTTP 403)."
+            "Expected [max-g, max-f, max-e, max-c, max-d]. "
+            "Do not re-add max-b (permanently dead HTTP 403 since 2026-04-20)."
         )
 
     def test_reserved_accounts_absent(self, production_config):
