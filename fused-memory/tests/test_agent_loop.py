@@ -1052,9 +1052,10 @@ async def test_claude_cli_tool_results_serialization():
 async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     """_call_claude_cli delegates to invoke_with_cap_retry instead of managing subprocess.
 
-    Red test (step-1): confirms that the new interface passes `prompt` and `tools`
-    kwargs and that the returned adapter exposes `.thinking`, `.response`,
-    `.tool_calls`, and `.session_id`.
+    Confirms that the new interface passes `prompt` and `tools` kwargs and that
+    the returned adapter exposes `.thinking`, `.tool_calls`, and `.session_id`.
+    The dead `response` field has been dropped from both the schema and the
+    adapter (Task 899 step-1/step-2).
     """
     from shared.cli_invoke import AgentResult
 
@@ -1070,7 +1071,6 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
         session_id='sess-1',
         structured_output={
             'thinking': 'reasoning',
-            'response': 'output text',
             'tool_calls': [],
         },
     )
@@ -1114,11 +1114,17 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     else:
         assert call_positional[0] is fake_gate
 
-    # Adapter must expose direct attribute access for thinking/response/tool_calls/session_id
+    # Adapter must expose direct attribute access for thinking/tool_calls/session_id.
     assert result.thinking == 'reasoning'
-    assert result.response == 'output text'
     assert result.tool_calls == []
     assert result.session_id == 'sess-1'
+
+    # `response` must be absent from the schema — it was a dead field never read
+    # by run() or any caller.  Pinning absence here prevents re-introduction.
+    assert 'response' not in CLAUDE_CLI_RESPONSE_SCHEMA['properties']
+
+    # `response` must not be set on the adapter instance.
+    assert not hasattr(result, 'response')
 
 
 @pytest.mark.asyncio
