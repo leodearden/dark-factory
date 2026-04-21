@@ -196,6 +196,41 @@ class TestForceExitWatchdog:
         )
 
 
+    def test_force_exit_returns_handle_with_disarm_and_thread(self, monkeypatch):
+        """_force_exit_after_delay returns a WatchdogHandle with .disarm and .thread.
+
+        The returned handle must have:
+        - a callable .disarm attribute
+        - a threading.Thread .thread attribute that is daemonised, named
+          'shutdown-watchdog', and already alive after arming.
+        Calling disarm() must stop the thread within a reasonable timeout.
+        """
+        calls = []
+        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+
+        handle = _force_exit_after_delay(timeout_secs=5.0)
+
+        assert callable(handle.disarm), (
+            f'handle.disarm must be callable, got {handle.disarm!r}'
+        )
+        assert isinstance(handle.thread, threading.Thread), (
+            f'handle.thread must be threading.Thread, got {type(handle.thread)}'
+        )
+        assert handle.thread.daemon is True, (
+            'handle.thread must be a daemon thread'
+        )
+        assert handle.thread.name == 'shutdown-watchdog', (
+            f'expected thread name "shutdown-watchdog", got {handle.thread.name!r}'
+        )
+        assert handle.thread.is_alive(), (
+            'handle.thread must be alive immediately after arming'
+        )
+
+        # Cleanup: disarm and join to confirm thread exits cleanly.
+        handle.disarm()
+        handle.thread.join(timeout=1.0)
+        assert not handle.thread.is_alive(), 'thread did not exit after disarm'
+
     def test_fallback_write_failure_still_fires_exit(self, monkeypatch):
         """os._exit(137) is called even when both the dump AND the fallback write fail.
 
