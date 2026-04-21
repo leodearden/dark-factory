@@ -2357,7 +2357,13 @@ async def test_replay_propagates_cancellation_and_preserves_claims(
 async def test_run_loop_releases_stale_claims_on_startup(
     journal, event_buffer, mock_memory_service
 ):
-    """run_loop() must call release_stale_claims once during startup (not per iteration)."""
+    """run_loop() calls release_stale_claims(0) once at startup (fast-restart safe).
+
+    Cutoff is 0 (not stale_claim_recovery_seconds) so every currently-claimed row
+    is released unconditionally.  The per-project reconciliation lock guarantees
+    at most one active replayer per project, so there is nothing to race with at
+    startup before any project loop has spawned.
+    """
     import asyncio
     from unittest.mock import AsyncMock
 
@@ -2377,6 +2383,50 @@ async def test_run_loop_releases_stale_claims_on_startup(
         await asyncio.wait_for(harness.run_loop(), timeout=0.2)
 
     # Must be called exactly once (startup, not per loop iteration)
-    harness.buffer.release_stale_claims.assert_called_once_with(
-        harness.config.stale_claim_recovery_seconds
+    # Cutoff must be 0 so even a freshly-claimed row is re-queued on fast restart.
+    harness.buffer.release_stale_claims.assert_called_once_with(0)
+
+
+@pytest.mark.asyncio
+async def test_run_loop_fast_restart_releases_recent_claims(
+    journal, event_buffer, mock_memory_service
+):
+    """A freshly-claimed row (simulating a crashed process) is re-queued on startup.
+
+    Regression test for the fast-restart edge case: if the harness is restarted
+    within stale_claim_recovery_seconds of the previous crash, the claimed row
+    would NOT be released when the cutoff is stale_claim_recovery_seconds, because
+    the row's claimed_at is younger than the cutoff.
+
+    With cutoff=0, every currently-claimed row is released unconditionally, so the
+    row is always available for the new process to pick up.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # Defer a write and immediately claim it — simulating what a dead process left
+    # behind.  The row is claimed_at≈now, which is well within the 60s default
+    # stale_claim_recovery_seconds horizon (i.e. current code would NOT release it).
+    await event_buffer.defer_write('test-project', 'payload-a', 'cat', {})
+    claimed_before = await event_buffer.claim_deferred_writes('test-project')
+    assert len(claimed_before) == 1, 'precondition: row should be claimed'
+
+    # Patch side-effect dependencies to avoid network/filesystem calls
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+
+    # Run the loop just long enough to execute the startup sweep, then let it
+    # time out in the main loop body.
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+
+    # The startup sweep must have released the freshly-claimed row so a new
+    # claim_deferred_writes call returns it.
+    reclaimed = await event_buffer.claim_deferred_writes('test-project')
+    assert len(reclaimed) == 1, (
+        'run_loop startup sweep should have re-queued the freshly-claimed row'
     )
+    assert reclaimed[0]['content'] == 'payload-a'
