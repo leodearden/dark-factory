@@ -1454,3 +1454,82 @@ class TestVerifyResultCauseHint:
         assert 'Command timed out after' in result.cause_hint, (
             f'Expected timeout hint in cause_hint, got {result.cause_hint!r}'
         )
+
+
+class TestVerificationFailedLogCauseHint:
+    """The 'Verification failed' log line should carry the cause hint.
+
+    Tests will fail until step 7 appends `` — {cause_hint}`` to the log format.
+    """
+
+    @pytest.mark.asyncio
+    async def test_verification_failed_log_line_contains_cause_hint(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """When tests fail, the log record contains both the bucket label and the hint."""
+        import logging
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cargo test' in cmd:
+                return 1, test_output, False
+            return 0, '', False
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.verify'),
+            patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd),
+        ):
+            await run_verification(tmp_path, config, max_retries=0)
+
+        # At least one log record must carry both the bucket label and the hint.
+        matching = [
+            r for r in caplog.records
+            if 'tests failed' in r.getMessage() and 'error: --exclude' in r.getMessage()
+        ]
+        assert matching, (
+            f'Expected a log record containing "tests failed" AND "error: --exclude"; '
+            f'got records: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_verification_passed_log_unchanged_when_hint_empty(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """When verification passes, the log line does not contain ' — ' or double spaces."""
+        import logging
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='echo ok',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            return 0, '', False
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.verify'),
+            patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd),
+        ):
+            result = await run_verification(tmp_path, config, max_retries=0)
+
+        assert result.passed
+        # The 'Verification passed' log line must not contain a trailing '—' dash
+        for r in caplog.records:
+            msg = r.getMessage()
+            if 'Verification passed' in msg:
+                assert ' — ' not in msg, (
+                    f'Passed log line should not have " — " hint: {msg!r}'
+                )
+                assert '  ' not in msg, (
+                    f'Passed log line should not have double spaces: {msg!r}'
+                )
