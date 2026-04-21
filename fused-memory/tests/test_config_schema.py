@@ -17,6 +17,7 @@ from fused_memory.config.schema import (
     FusedMemoryConfig,
     GraphitiBackendConfig,
     LLMConfig,
+    ReconciliationConfig,
     ServerConfig,
     YamlSettingsSource,
 )
@@ -365,3 +366,25 @@ class TestConfigYamlReconciliationFlags:
             'reconciliation.require_done_provenance: true to enable Phase 2 '
             'enforcement of the done_provenance gate.'
         )
+
+
+class TestReconciliationConfigTimeouts:
+    """Tests for the three dedicated CLI-timeout / claim-recovery fields on ReconciliationConfig."""
+
+    def test_default_agent_cli_timeout_is_180(self):
+        assert ReconciliationConfig().agent_cli_timeout_seconds == 180
+
+    def test_default_judge_cli_timeout_is_600(self):
+        assert ReconciliationConfig().judge_cli_timeout_seconds == 600
+
+    def test_default_stale_claim_recovery_is_60(self):
+        assert ReconciliationConfig().stale_claim_recovery_seconds == 60
+
+    def test_explicit_agent_cli_timeout_override_accepted(self):
+        assert ReconciliationConfig(agent_cli_timeout_seconds=30).agent_cli_timeout_seconds == 30
+
+    def test_explicit_judge_cli_timeout_override_accepted(self):
+        assert ReconciliationConfig(judge_cli_timeout_seconds=120).judge_cli_timeout_seconds == 120
+
+    def test_explicit_stale_claim_recovery_override_accepted(self):
+        assert ReconciliationConfig(stale_claim_recovery_seconds=10).stale_claim_recovery_seconds == 10
