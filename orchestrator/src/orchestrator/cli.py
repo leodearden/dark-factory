@@ -22,8 +22,7 @@ DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 
 # How long after asyncio.run() returns to wait before force-exiting.
 # The watchdog is armed AFTER asyncio.run() returns (not before) so that
-# long orchestration runs are never affected. Armed post-return, not before,
-# so long orchestration runs are unaffected. After this deadline a diagnostic
+# long orchestration runs are never affected. After this deadline a diagnostic
 # dump is written to stderr and os._exit(137) fires.
 SHUTDOWN_WATCHDOG_TIMEOUT_SECS = 30
 
@@ -50,7 +49,10 @@ def _force_exit_after_delay(
     130 (SIGINT) and 143 (SIGTERM) in operator logs.
 
     Returns a *disarm* callable.  Calling it (even multiple times) is safe
-    and prevents the watchdog from firing.
+    and prevents the watchdog from firing.  The disarm handle is provided for
+    tests and future use; the orchestrator intentionally never disarms so the
+    watchdog guards interpreter shutdown (atexit callbacks +
+    ``threading._shutdown()`` joining non-daemon threads).
     """
     _event = threading.Event()
 

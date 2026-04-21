@@ -5,6 +5,7 @@ import io
 import logging
 import threading
 import time
+import traceback as traceback_module
 from unittest.mock import MagicMock
 
 import pytest
@@ -104,7 +105,12 @@ class TestForceExitWatchdog:
         monkeypatch.setattr('os._exit', lambda code: calls.append(code))
 
         _force_exit_after_delay(timeout_secs=0.05)
-        time.sleep(0.3)
+
+        # Poll with a deadline instead of a fixed sleep to avoid spurious
+        # failures under CI scheduler stalls (GC, container contention, etc.).
+        deadline = time.monotonic() + 5.0
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.05)
 
         assert calls == [137], f'expected [137], got {calls}'
 
@@ -113,9 +119,12 @@ class TestForceExitWatchdog:
         calls = []
         monkeypatch.setattr('os._exit', lambda code: calls.append(code))
 
-        disarm = _force_exit_after_delay(timeout_secs=0.3)
+        # Use 0.2s timeout and a 2.0s wait to give ample margin under CI load;
+        # disarm() sets the event immediately so the watchdog thread returns
+        # without calling os._exit even if the scheduler is delayed.
+        disarm = _force_exit_after_delay(timeout_secs=0.2)
         disarm()
-        time.sleep(0.6)
+        time.sleep(2.0)
 
         assert calls == [], f'expected no calls, got {calls}'
 
@@ -126,7 +135,12 @@ class TestForceExitWatchdog:
 
         stream = io.StringIO()
         _force_exit_after_delay(timeout_secs=0.05, stream=stream)
-        time.sleep(0.3)
+
+        # Poll with a deadline — stream is written before os._exit is called,
+        # so once calls is non-empty the output is already available.
+        deadline = time.monotonic() + 5.0
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.05)
 
         output = stream.getvalue()
         # Sentinel header must be present
@@ -143,6 +157,35 @@ class TestForceExitWatchdog:
             f'no frame lines in dump:\n{output!r}'
         )
         assert calls == [137]
+
+    def test_dump_failure_still_fires_exit(self, monkeypatch):
+        """os._exit(137) is called even when the diagnostic dump itself fails.
+
+        During interpreter shutdown, sys._current_frames, traceback internals,
+        or sys.stderr may be partially torn down.  The outer try/except Exception
+        in the watchdog catches any failure and still reaches os._exit — so the
+        process always escapes a hang even if the diagnostic output is lost.
+        This test locks in the 'fail-open to force-exit' guarantee.
+        """
+        calls = []
+        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+
+        # Simulate partial interpreter shutdown where traceback.format_stack is broken.
+        def _raise_on_format(*args, **kwargs):
+            raise RuntimeError('simulated shutdown tear-down of traceback module')
+
+        monkeypatch.setattr(traceback_module, 'format_stack', _raise_on_format)
+
+        _force_exit_after_delay(timeout_secs=0.05)
+
+        # Poll with deadline — os._exit must be called even though the dump failed.
+        deadline = time.monotonic() + 5.0
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        assert calls == [137], (
+            f'expected os._exit(137) even when dump fails, got {calls}'
+        )
 
 
 class TestRunArmsWatchdog:
