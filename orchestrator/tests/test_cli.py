@@ -402,13 +402,11 @@ class TestRunArmsWatchdog:
         )
 
     def test_report_emitted_before_watchdog_armed(self, monkeypatch):
-        """click.echo(report.summary()) must run BEFORE _force_exit_after_delay on normal path.
+        """click.echo(report.summary()) must run BEFORE _force_exit_after_delay on the normal path.
 
-        On the current (unfixed) code the arm runs before click.echo(report.summary()), so
-        report formatting and stdout I/O are covered by the 30-second timer. Moving the arm
-        after all user-visible work limits the watchdog scope to interpreter shutdown only.
-
-        This test FAILS on current code (arm at line 208 precedes echo at line 209).
+        Report formatting and stdout I/O (arbitrary size, arbitrary latency) must NOT be
+        covered by the 30-second watchdog timer.  Scope the watchdog to interpreter shutdown
+        only (atexit callbacks + threading._shutdown() joining non-daemon threads).
         """
         events: list[str | tuple[str, str | None]] = []
         state = {'armed_with': None}
