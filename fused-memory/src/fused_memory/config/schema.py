@@ -263,6 +263,38 @@ class ReconciliationConfig(BaseModel):
         default=600,
         description='Runs with started_at older than this are recovered on startup if their lock is stale',
     )
+    # Per-CLI-invocation wall-clock budgets — semantically distinct from
+    # stage_timeout_seconds (the outer stage-level guard).  Task 881 accidentally
+    # widened these to 3600s by delegating to stage_timeout_seconds; these fields
+    # restore the pre-881 per-call ceilings independently.
+    agent_cli_timeout_seconds: int = Field(
+        default=180,
+        description=(
+            'Wall-clock budget for a single agent_loop._call_claude_cli invocation. '
+            'Distinct from stage_timeout_seconds (outer stage guard). '
+            'Restores the pre-881 hard-coded 180s ceiling.'
+        ),
+    )
+    judge_cli_timeout_seconds: int = Field(
+        default=600,
+        description=(
+            'Wall-clock budget for a single judge._call_judge_cli invocation. '
+            'Distinct from stage_timeout_seconds (outer stage guard). '
+            'Restores the pre-881 hard-coded 600s ceiling.'
+        ),
+    )
+    # Claim-scale recovery window — intentionally an order of magnitude shorter
+    # than stale_run_recovery_seconds (600s).  Deferred-write claims are typically
+    # held for seconds; 60s is a conservative cutoff that prevents a crashed prior
+    # process from leaving claims stuck for ten minutes.
+    stale_claim_recovery_seconds: int = Field(
+        default=60,
+        description=(
+            'Deferred-write claims older than this are re-queued on startup. '
+            'Claims are held for seconds; use a much shorter horizon than '
+            'stale_run_recovery_seconds (600s, for minute-scale run recovery).'
+        ),
+    )
 
     # Safety
     max_mutations_per_stage: int = Field(default=50)

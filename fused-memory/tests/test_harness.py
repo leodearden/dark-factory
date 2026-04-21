@@ -2378,5 +2378,5 @@ async def test_run_loop_releases_stale_claims_on_startup(
 
     # Must be called exactly once (startup, not per loop iteration)
     harness.buffer.release_stale_claims.assert_called_once_with(
-        harness.config.stale_run_recovery_seconds
+        harness.config.stale_claim_recovery_seconds
     )

@@ -430,13 +430,20 @@ class ReconciliationHarness:
         await self._start_escalation_server()
 
         # Re-queue any deferred writes left in-progress by a crashed prior process.
+        # This call runs before any in-process claim is issued, so there is no
+        # live claim holder that could race with the release.  Claims are held
+        # for seconds (one memory_service.add_memory call per row), so the
+        # claim-scale horizon (stale_claim_recovery_seconds, default 60s) is
+        # intentionally much shorter than the run-scale horizon used by
+        # _recover_stale_runs (stale_run_recovery_seconds, default 600s).
         try:
             released = await self.buffer.release_stale_claims(
-                self.config.stale_run_recovery_seconds,
+                self.config.stale_claim_recovery_seconds,
             )
             if released:
                 logger.info(
                     f'Recovered {released} stale deferred write claim(s) on startup'
+                    f' (claim recovery horizon: {self.config.stale_claim_recovery_seconds}s)'
                 )
         except Exception as e:
             logger.warning(f'release_stale_claims at startup failed: {e}')

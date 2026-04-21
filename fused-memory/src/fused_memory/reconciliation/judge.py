@@ -252,7 +252,7 @@ Review this run and provide your verdict as JSON.
             # widen cost/duration exposure with no benefit.
             max_turns=1,
             permission_mode='bypassPermissions',
-            timeout_seconds=float(self.config.stage_timeout_seconds),
+            timeout_seconds=float(self.config.judge_cli_timeout_seconds),
             cwd=Path(self.config.explore_codebase_root),
         )
 
