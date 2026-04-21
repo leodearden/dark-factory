@@ -82,6 +82,15 @@ def _strip_directory_flag(cmd: str | None, module_prefix: str) -> str | None:
 # cargo subcommands (doc, bench, ...) are left alone to avoid semantic drift.
 _CARGO_SUBCMDS = ('test', 'clippy', 'check', 'build', 'run')
 
+# Non-.rs file extensions that are safe to ignore when deciding whether to scope
+# cargo commands to individual crates.  These are pure config/data files that
+# do not contain executable source code and therefore don't require running a
+# non-Rust toolchain alongside cargo.  Any extension NOT in this set (including
+# the empty string for files like Dockerfile or LICENSE) triggers a fallthrough
+# to ``--workspace`` — the conservative default protects chained commands such
+# as ``cargo test --workspace && uv run pytest``.
+_CARGO_SCOPE_SAFE_NON_RS_EXTS = frozenset({'.toml', '.yaml', '.yml', '.json', '.md'})
+
 # Pre-compiled regex that matches ``cargo <subcmd> ...--workspace`` where
 # ``...`` does not cross a shell delimiter (``&&``, ``||``, ``;``, ``|``),
 # so chained non-cargo commands (like ``cd gui && npm test``) are left alone.
@@ -189,8 +198,11 @@ def _apply_cargo_scope(
     Guard conditions — returns *mc* unchanged when any fail:
     - ``scope_cargo_enabled`` is False, or ``mc.scope_cargo`` is explicitly False
     - *task_files* is empty
-    - any file in *task_files* is not a ``.rs`` file (mixed-language guard;
-      prevents under-protecting the JS/TS portion of a polyglot task)
+    - *task_files* contains no ``.rs`` files (no Rust source touched)
+    - any non-``.rs`` file has an extension outside the safe config/data whitelist
+      (``.toml``, ``.yaml``, ``.yml``, ``.json``, ``.md``); this prevents
+      under-protecting the non-Rust side of polyglot tasks with chained commands
+      such as ``cargo test --workspace && uv run pytest``
     - the workspace has no discoverable crates
     - ``files_to_crates`` returns ``None`` (a file lives outside all crates)
     - the rewritten commands are byte-identical to the originals
@@ -201,12 +213,19 @@ def _apply_cargo_scope(
         return mc
     if not task_files:
         return mc
-    # Filter to .rs files for crate mapping — non-Rust files (e.g. .ri, .toml,
-    # .js) don't affect which cargo crates need testing.  Non-cargo commands
-    # chained with && (cd gui && npm test) are left untouched by the regex.
+    # Filter to .rs files for crate mapping — only Rust files determine which
+    # crates need testing.
     rs_files = [f for f in task_files if f.endswith('.rs')]
     if not rs_files:
         return mc
+    # Polyglot guard: if any non-.rs file has an extension outside the safe
+    # config/data whitelist, bail to --workspace.  This protects chained
+    # non-Rust commands (e.g. ``cargo test --workspace && uv run pytest``)
+    # from being silently skipped when only some crates are scoped.
+    non_rs = [f for f in task_files if not f.endswith('.rs')]
+    for f in non_rs:
+        if Path(f).suffix.lower() not in _CARGO_SCOPE_SAFE_NON_RS_EXTS:
+            return mc
 
     crates_map = discover_workspace_crates(project_root)
     if not crates_map:
