@@ -2384,7 +2384,7 @@ async def test_run_loop_releases_stale_claims_on_startup(
 
     # Must be called exactly once (startup, not per loop iteration)
     # Cutoff must be 0 so even a freshly-claimed row is re-queued on fast restart.
-    harness.buffer.release_stale_claims.assert_called_once_with(0)
+    harness.buffer.release_stale_claims.assert_called_once_with(0.0)
 
 
 @pytest.mark.asyncio
@@ -2430,3 +2430,21 @@ async def test_run_loop_fast_restart_releases_recent_claims(
         'run_loop startup sweep should have re-queued the freshly-claimed row'
     )
     assert reclaimed[0]['content'] == 'payload-a'
+
+    # release_stale_claims must also increment attempt_count so the poison-pill
+    # mechanism (delete after _MAX_DEFERRED_WRITE_ATTEMPTS) works correctly across
+    # restarts.  Query the DB directly because claim_deferred_writes doesn't expose
+    # this field.
+    import aiosqlite
+    async with aiosqlite.connect(event_buffer._db_path) as _db:
+        _db.row_factory = aiosqlite.Row
+        async with _db.execute(
+            'SELECT attempt_count FROM deferred_writes WHERE id = ?',
+            (reclaimed[0]['id'],),
+        ) as _cur:
+            _row = await _cur.fetchone()
+    assert _row is not None
+    assert _row['attempt_count'] == 1, (
+        'release_stale_claims must increment attempt_count on re-queue '
+        '(contract: event_buffer.py:702-707)'
+    )
