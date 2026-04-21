@@ -134,7 +134,10 @@ class TestRegisterDrainSignalHandlerIntegration:
                 running_loop = asyncio.get_running_loop()
                 # Force the fallback branch: make loop.add_signal_handler raise RuntimeError
                 # so _register_drain_signal_handler falls back to signal.signal.
-                with patch.object(running_loop, 'add_signal_handler', side_effect=RuntimeError):
+                # Spy on signal.signal with wraps= so the real installation still happens
+                # (os.kill must actually dispatch to our handler below).
+                with patch('fused_memory.server.main.signal.signal', wraps=signal.signal) as signal_signal_spy, \
+                        patch.object(running_loop, 'add_signal_handler', side_effect=RuntimeError):
                     _register_drain_signal_handler(stub_harness)
                     signal_signal_spy.assert_called_once()
                     assert signal_signal_spy.call_args.args[0] == signal.SIGUSR1
