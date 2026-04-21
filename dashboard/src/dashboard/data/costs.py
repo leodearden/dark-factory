@@ -207,6 +207,7 @@ async def get_cost_by_account(
             caps[account_name] = {
                 'cap_events': row['cap_count'] or 0,
                 'last_cap': last_cap_at,  # NULL when no cap_hit in window
+                'last_resumed': last_resumed_at,  # NULL when no resumed in window
                 'status': 'capped' if is_capped else 'active',
                 'resets_at': resets_at,
             }
@@ -216,13 +217,15 @@ async def get_cost_by_account(
             account_name = row['account_name']
             cap_info = caps.get(
                 account_name,
-                {'cap_events': 0, 'last_cap': None, 'status': 'active', 'resets_at': None},
+                {'cap_events': 0, 'last_cap': None, 'last_resumed': None,
+                 'status': 'active', 'resets_at': None},
             )
             result[account_name] = {
                 'spend': row['spend'] or 0.0,
                 'invocations': row['cnt'] or 0,
                 'cap_events': cap_info['cap_events'],
                 'last_cap': cap_info['last_cap'],
+                'last_resumed': cap_info['last_resumed'],
                 'status': cap_info['status'],
                 'resets_at': cap_info['resets_at'],
             }
@@ -237,6 +240,7 @@ async def get_cost_by_account(
                     'invocations': 0,
                     'cap_events': cap_info['cap_events'],
                     'last_cap': cap_info['last_cap'],
+                    'last_resumed': cap_info['last_resumed'],
                     'status': cap_info['status'],
                     'resets_at': cap_info['resets_at'],
                 }
@@ -555,12 +559,18 @@ async def aggregate_cost_by_account(
 ) -> dict[str, dict]:
     """Merge :func:`get_cost_by_account` across databases.
 
-    Accounts are shared across projects, so spend/invocations/cap_events are
-    summed.  Status uses a conservative one-way latch: ``'capped'`` if *any*
-    source reports capped (the per-DB function doesn't expose the resumed
-    timestamp, so we can't determine global ordering).
-    ``last_cap`` takes the most recent timestamp. ``resets_at`` is taken from
-    the DB whose ``last_cap`` wins (i.e. the latest cap_hit globally).
+    Accounts are shared across projects (same OAuth token, same Max
+    subscription), so cap state is a single global thing — even though each
+    project's orchestrator writes its own events. This aggregator computes
+    the global ordering from ``max(last_cap)`` and ``max(last_resumed)``
+    across all source DBs. An account is ``'capped'`` iff the globally
+    newest cap_hit has no later ``'resumed'`` event in ANY DB — so a stale
+    orchestrator that saw a cap and then stopped no longer masks a resumed
+    observed by another running orchestrator.
+
+    ``last_cap`` takes the globally most recent cap_hit timestamp; its paired
+    ``resets_at`` travels with it. ``last_resumed`` takes the globally most
+    recent resumed timestamp. Spend/invocations/cap_events are summed.
     """
     results = await asyncio.gather(*(get_cost_by_account(db, days=days) for db in dbs))
     merged: dict[str, dict] = {}
@@ -578,8 +588,25 @@ async def aggregate_cost_by_account(
                     # resets_at is meaningful only when paired with its cap_hit,
                     # so it travels with the winning last_cap.
                     m['resets_at'] = info.get('resets_at')
-                if info['status'] == 'capped':
-                    m['status'] = 'capped'
+                info_resumed = info.get('last_resumed')
+                if info_resumed and (
+                    not m.get('last_resumed') or info_resumed > m['last_resumed']
+                ):
+                    m['last_resumed'] = info_resumed
+
+    # Recompute status globally now that last_cap and last_resumed reflect
+    # the max across all DBs. Per-DB status latch would mis-report capped
+    # when one stale DB saw a cap_hit but never saw the resumed that another
+    # DB observed later.
+    for m in merged.values():
+        last_cap = m.get('last_cap')
+        last_resumed = m.get('last_resumed')
+        if last_cap and (not last_resumed or last_cap > last_resumed):
+            m['status'] = 'capped'
+        else:
+            m['status'] = 'active'
+            # resets_at is stale once we know a later resumed cleared the cap.
+            m['resets_at'] = None
     return merged
 
 
