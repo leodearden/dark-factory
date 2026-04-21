@@ -367,8 +367,15 @@ def _register_drain_signal_handler(reconciliation_harness: object) -> None:
 
     Uses loop.add_signal_handler (asyncio-safe) when a running event loop is
     available.  Falls back to signal.signal when add_signal_handler raises
-    NotImplementedError (Windows) or RuntimeError (not on the main OS thread).
+    NotImplementedError (Windows only — no add_signal_handler support there).
     If no running event loop is found, logs a warning and installs no handler.
+
+    RuntimeError from add_signal_handler is NOT caught: that error means we are
+    not on the main OS thread, and signal.signal would itself raise ValueError in
+    that scenario — attempting the fallback would trade one exception for another.
+    Since this helper is only invoked from run_server() on the main asyncio thread,
+    the RuntimeError path should be unreachable in production; if it is hit, loud
+    propagation is preferable to a misleading crash from the fallback.
     """
     try:
         loop = asyncio.get_running_loop()
@@ -382,10 +389,11 @@ def _register_drain_signal_handler(reconciliation_harness: object) -> None:
 
     try:
         loop.add_signal_handler(signal.SIGUSR1, _handle_drain_signal)
-    except (NotImplementedError, RuntimeError):
+    except NotImplementedError:
         # NotImplementedError: Windows (no add_signal_handler support).
-        # RuntimeError: not in the main OS thread.
-        # Fall back to signal.signal — preserves pre-fix behaviour on those paths.
+        # NOTE: RuntimeError is intentionally NOT caught here — it means we are not on
+        # the main OS thread, and signal.signal would itself raise ValueError in that case.
+        # Let the RuntimeError propagate for an honest failure rather than an unrecoverable fallback.
         logger.debug('loop.add_signal_handler unavailable; falling back to signal.signal for SIGUSR1')
         signal.signal(signal.SIGUSR1, lambda signum, frame: _handle_drain_signal())
 
