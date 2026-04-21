@@ -1,12 +1,10 @@
 """Tests for the agent loop."""
 
-import asyncio
 import json
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 from fused_memory.config.schema import ReconciliationConfig
@@ -1174,7 +1172,7 @@ async def test_call_claude_cli_threads_session_id_across_turns():
     [
         AllAccountsCappedException(retries=5, elapsed_secs=100.0, label='test'),
         RuntimeError('boom'),
-        asyncio.TimeoutError(),
+        TimeoutError(),
     ],
     ids=['AllAccountsCappedException', 'RuntimeError', 'TimeoutError'],
 )
