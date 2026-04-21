@@ -96,7 +96,9 @@ _CARGO_SCOPE_SAFE_NON_RS_EXTS = frozenset({'.toml', '.yaml', '.yml', '.json', '.
 # ecosystem lockfiles (``yarn.lock``, ``poetry.lock``, ``uv.lock``), so adding
 # ``.lock`` to ``_CARGO_SCOPE_SAFE_NON_RS_EXTS`` would silently admit those
 # files and break the polyglot guard for mixed-ecosystem diffs.
-_CARGO_SCOPE_SAFE_NON_RS_NAMES = frozenset({'Cargo.lock'})
+# ``rust-toolchain`` is a rustup toolchain pin file with no extension (unlike
+# ``rust-toolchain.toml``, which is already handled by the ``.toml`` whitelist).
+_CARGO_SCOPE_SAFE_NON_RS_NAMES = frozenset({'Cargo.lock', 'rust-toolchain'})
 
 # Pre-compiled regex that matches ``cargo <subcmd> ...--workspace`` where
 # ``...`` does not cross a shell delimiter (``&&``, ``||``, ``;``, ``|``),
