@@ -336,11 +336,12 @@ class AgentLoop:
         calls; ``_call_llm`` is responsible for serialising tool results into
         the next turn's prompt before calling this method.
 
-        If ``invoke_with_cap_retry`` raises for any reason (e.g.
-        ``AllAccountsCappedException`` after the retry loop gives up),
-        ``_cli_session_id`` is cleared to ``None`` before re-raising so that a
-        subsequent reconciliation retry on the same ``AgentLoop`` instance does
-        not attempt to ``--resume`` an abandoned or capped session.
+        ``_cli_session_id`` is cleared to ``None`` before any exception propagates
+        out of this method — whether from ``invoke_with_cap_retry`` itself (e.g.
+        ``AllAccountsCappedException`` after the retry loop gives up) or from the
+        ``not result.success`` failure guard below — so that a subsequent
+        reconciliation retry on the same ``AgentLoop`` instance does not attempt to
+        ``--resume`` an abandoned or capped session.
         """
         try:
             result: AgentResult = await invoke_with_cap_retry(
@@ -361,18 +362,18 @@ class AgentLoop:
                 resume_session_id=self._cli_session_id,
                 cwd=Path(self.config.explore_codebase_root),
             )
+
+            if not result.success:
+                # schema_salvaged=True implies success=True (cli_invoke.py:749-751),
+                # so `not result.success` is the complete failure guard.
+                cls = classify_agent_failure(result)
+                raise RuntimeError(
+                    f'Claude CLI agent failed: {cls.summary}\n{cls.diagnostic_detail}'
+                )
         except Exception:
             # Clear stale session id so callers that retry don't --resume an abandoned session.
             self._cli_session_id = None
             raise
-
-        if not result.success:
-            # schema_salvaged=True implies success=True (cli_invoke.py:749-751),
-            # so `not result.success` is the complete failure guard.
-            cls = classify_agent_failure(result)
-            raise RuntimeError(
-                f'Claude CLI agent failed: {cls.summary}\n{cls.diagnostic_detail}'
-            )
 
         self._cli_session_id = result.session_id or self._cli_session_id
         self.llm_call_count += 1

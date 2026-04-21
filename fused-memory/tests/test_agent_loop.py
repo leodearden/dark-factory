@@ -1,10 +1,13 @@
 """Tests for the agent loop."""
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.reconciliation.agent_loop import (
@@ -1166,16 +1169,26 @@ async def test_call_claude_cli_threads_session_id_across_turns():
 
 
 @pytest.mark.asyncio
-async def test_call_claude_cli_clears_session_id_on_exception():
+@pytest.mark.parametrize(
+    'raised_exc',
+    [
+        AllAccountsCappedException(retries=5, elapsed_secs=100.0, label='test'),
+        RuntimeError('boom'),
+        asyncio.TimeoutError(),
+    ],
+    ids=['AllAccountsCappedException', 'RuntimeError', 'TimeoutError'],
+)
+async def test_call_claude_cli_clears_session_id_on_exception(raised_exc):
     """_call_claude_cli clears _cli_session_id when invoke_with_cap_retry raises.
 
-    Red test (step-1): after a successful first call establishes session 'sess-A',
-    a second call that raises AllAccountsCappedException must leave
-    agent._cli_session_id as None — not the stale 'sess-A' — so that a retry
-    attempt doesn't --resume an abandoned session.
-    """
-    from shared.cli_invoke import AgentResult, AllAccountsCappedException
+    Parametrized over AllAccountsCappedException (the primary cap-retry failure),
+    a generic RuntimeError, and asyncio.TimeoutError — locking in the 'any exception
+    clears the session id' contract described in the method docstring.
 
+    After a successful first call establishes session 'sess-A', a second call that
+    raises must leave agent._cli_session_id as None — not the stale 'sess-A' — so
+    that a retry attempt doesn't --resume an abandoned session.
+    """
     fake_gate = MagicMock()
     config = _make_cli_config()
     tools: list = []
@@ -1184,13 +1197,12 @@ async def test_call_claude_cli_clears_session_id_on_exception():
     first_result = AgentResult(
         success=True, output='', session_id='sess-A', structured_output=structured
     )
-    cap_exc = AllAccountsCappedException(retries=5, elapsed_secs=100.0, label='test')
 
     with patch(
         'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
         new_callable=AsyncMock,
     ) as mock_invoke:
-        mock_invoke.side_effect = [first_result, cap_exc]
+        mock_invoke.side_effect = [first_result, raised_exc]
 
         agent = AgentLoop(
             config=config,
@@ -1204,7 +1216,7 @@ async def test_call_claude_cli_clears_session_id_on_exception():
         assert agent._cli_session_id == 'sess-A'
 
         # Second call raises — the stale session id must be cleared.
-        with pytest.raises(AllAccountsCappedException):
+        with pytest.raises(type(raised_exc)):
             await agent._call_claude_cli(prompt='turn-2', tools=tools)
 
     assert agent._cli_session_id is None
