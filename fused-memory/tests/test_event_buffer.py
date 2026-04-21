@@ -633,6 +633,47 @@ async def test_cleanup_drained(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_claim_deferred_writes_returns_pending_with_ids(buf):
+    """claim_deferred_writes should return pending rows with ids, and second call returns []."""
+    await buf.defer_write(
+        project_id='test-project',
+        content='write-one',
+        category='observations_and_summaries',
+        metadata={'k': 'v1'},
+        agent_id='agent-1',
+    )
+    await buf.defer_write(
+        project_id='test-project',
+        content='write-two',
+        category='entities_and_relations',
+        metadata={'k': 'v2'},
+        agent_id=None,
+    )
+
+    claimed = await buf.claim_deferred_writes('test-project')
+    assert len(claimed) == 2
+    expected_keys = {'id', 'content', 'category', 'metadata', 'agent_id'}
+    for item in claimed:
+        assert set(item.keys()) == expected_keys
+
+    contents = {item['content'] for item in claimed}
+    assert contents == {'write-one', 'write-two'}
+
+    item_one = next(i for i in claimed if i['content'] == 'write-one')
+    assert item_one['category'] == 'observations_and_summaries'
+    assert item_one['metadata'] == {'k': 'v1'}
+    assert item_one['agent_id'] == 'agent-1'
+    assert item_one['id']  # non-empty
+
+    item_two = next(i for i in claimed if i['content'] == 'write-two')
+    assert item_two['agent_id'] is None
+
+    # Second call returns [] — rows are now in-progress (claimed_at IS NOT NULL)
+    second = await buf.claim_deferred_writes('test-project')
+    assert second == []
+
+
+@pytest.mark.asyncio
 async def test_defer_write_and_pop(buf):
     """Deferred write should be retrievable via pop."""
     write_id = await buf.defer_write(
