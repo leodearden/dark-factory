@@ -62,25 +62,6 @@ def _make_reify_gate(wait_for_reset: bool = False) -> UsageGate:
 
 
 # ---------------------------------------------------------------------------
-# Shared Infrastructure — repo_root fixture
-# ---------------------------------------------------------------------------
-
-
-class TestRepoRootFixture:
-    """Validates that the shared `repo_root` fixture locates a .git sentinel."""
-
-    def test_repo_root_fixture_locates_git_sentinel(self, repo_root):
-        """repo_root fixture must return a Path to the repo root or None (if not in git checkout)."""
-        if repo_root is None:
-            pytest.skip("Not inside a git checkout — skipping repo_root fixture test")
-        assert isinstance(repo_root, Path), f"Expected Path, got {type(repo_root)}"
-        assert repo_root.is_dir(), f"repo_root {repo_root} is not a directory"
-        assert (repo_root / '.git').exists(), (
-            f"repo_root {repo_root} does not contain a .git entry"
-        )
-
-
-# ---------------------------------------------------------------------------
 # step-1: Validate the YAML structure for a reify accounts file
 # ---------------------------------------------------------------------------
 

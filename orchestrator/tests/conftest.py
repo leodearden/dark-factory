@@ -160,6 +160,10 @@ def build_usage_gate(
 def repo_root() -> Path | None:
     """Walk up from this conftest to find the repo root anchored by a .git entry.
 
+    Scoped to orchestrator/tests.  If this fixture is ever needed by other test
+    packages (reify, fused-memory, shared, …) it should be hoisted to a
+    top-level conftest.py or a shared test-helpers module rather than duplicated.
+
     Returns the repo-root Path if found, or None when not running inside a git
     checkout (e.g. a packaged wheel, partial mirror, or isolated test run).
 
