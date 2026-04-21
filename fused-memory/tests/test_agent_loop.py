@@ -1371,7 +1371,7 @@ async def test_run_threads_parallel_tool_results_with_double_newline_joiner():
     in turn 2's content → _serialize_tool_results joins them with '\\n\\n' →
     exact-equality assertion on the resulting prompt pins the separator.
 
-    References _serialize_tool_results at agent_loop.py:325 ('\\n\\n'.join(parts)).
+    References _serialize_tool_results in agent_loop.py — '\\n\\n'.join(parts).
     Any change to the separator (e.g. '\\n' or ', ') will fail this test.
     """
     from shared.cli_invoke import AgentResult
