@@ -274,9 +274,8 @@ class TestReconcileStrandedInProgress:
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text('{"session_id": "15-xyz", "owner_pid": 1}')  # valid-looking
 
-        with _patch('orchestrator.harness.json.loads', side_effect=TypeError('unexpected')):
-            with pytest.raises(TypeError, match='unexpected'):
-                await harness._reconcile_stranded_in_progress()
+        with _patch('orchestrator.harness.json.loads', side_effect=TypeError('unexpected')), pytest.raises(TypeError, match='unexpected'):
+            await harness._reconcile_stranded_in_progress()
 
         # No revert must have happened
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
