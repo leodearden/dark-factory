@@ -113,3 +113,37 @@ class TestRegisterDrainSignalHandlerIntegration:
             stub_harness.drain.assert_called_once()
         finally:
             signal.signal(signal.SIGUSR1, prior_handler)
+
+    def test_real_sigusr1_fallback_dispatch_triggers_drain(self):
+        """Integration: SIGUSR1 via the signal.signal fallback path reaches harness.drain().
+
+        Forces the fallback branch by patching loop.add_signal_handler on the running loop
+        to raise RuntimeError, then delivers a real signal and verifies end-to-end dispatch
+        through the signal.signal code path (not the asyncio machinery).
+        """
+        stub_harness = MagicMock()
+        stub_harness.drain = MagicMock()
+
+        prior_handler = signal.getsignal(signal.SIGUSR1)
+        try:
+            async def _run() -> None:
+                # Use an asyncio.Event for deterministic waiting (same as the happy-path test).
+                drain_called = asyncio.Event()
+                stub_harness.drain.side_effect = lambda: drain_called.set()
+
+                running_loop = asyncio.get_running_loop()
+                # Force the fallback branch: make loop.add_signal_handler raise RuntimeError
+                # so _register_drain_signal_handler falls back to signal.signal.
+                with patch.object(running_loop, 'add_signal_handler', side_effect=RuntimeError):
+                    _register_drain_signal_handler(stub_harness)
+
+                os.kill(os.getpid(), signal.SIGUSR1)
+                # The signal.signal handler is invoked synchronously at the next safe
+                # bytecode boundary; wait_for handles both immediate and slightly deferred cases.
+                await asyncio.wait_for(drain_called.wait(), timeout=2.0)
+
+            with asyncio.Runner() as runner:
+                runner.run(_run())
+            stub_harness.drain.assert_called_once()
+        finally:
+            signal.signal(signal.SIGUSR1, prior_handler)
