@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -252,10 +253,10 @@ async def get_cost_by_account(
 def _extract_resets_at(details: str | None) -> str | None:
     """Return the ISO resets_at string from a cap_hit details payload.
 
-    Legacy events (persisted before usage_gate started writing resets_at) return
-    None and the UI shows a dash. No reason-string parsing here: the source of
-    truth is the shared parser in usage_gate; duplicating it in the dashboard
-    invites drift.
+    Prefers the persisted ``resets_at`` field (written by shared.usage_gate
+    since 2026-04-21). For older cap_hit rows — and rows written by orchestrator
+    processes that haven't yet restarted to pick up the new shared code — falls
+    back to parsing the reason string.
     """
     if not details:
         return None
@@ -266,9 +267,71 @@ def _extract_resets_at(details: str | None) -> str | None:
     if not isinstance(payload, dict):
         return None
     value = payload.get('resets_at')
-    if not isinstance(value, str) or not value:
-        return None
-    return value
+    if isinstance(value, str) and value:
+        return value
+    # TRANSITIONAL FALLBACK — REMOVE ON 2026-04-28.
+    # Long-running orchestrators started before 2026-04-21 still write cap_hit
+    # details without the persisted resets_at field. Until they cycle naturally,
+    # derive the timestamp from the reason string so the Uncaps In column isn't
+    # blank. Duplicates a subset of shared.usage_gate._parse_resets_at; kept
+    # minimal so drift is visible if Anthropic changes the wording.
+    reason = payload.get('reason')
+    if isinstance(reason, str) and reason:
+        parsed = _parse_resets_from_reason(reason)
+        if parsed is not None:
+            return parsed.isoformat()
+    return None
+
+
+# TRANSITIONAL — REMOVE ON 2026-04-28 along with the fallback branch above.
+def _parse_resets_from_reason(text: str) -> datetime | None:
+    """Minimal mirror of shared.usage_gate._parse_resets_at.
+
+    Handles the two formats observed in production cap_hit reason strings:
+      - "resets in 3h" / "resets in 45m" / "resets in 2d"
+      - "resets 7pm (Europe/London)" / "resets 3:00 AM (US/Pacific)"
+    Returns None when no recognised form is present — unlike the shared parser
+    we deliberately don't fall back to "1 hour from now", because a bogus
+    countdown in the UI is worse than a dash.
+    """
+    m = re.search(r'resets\s+in\s+(\d+)\s*([hmd])', text, re.IGNORECASE)
+    if m:
+        amount = int(m.group(1))
+        delta = {
+            'h': timedelta(hours=amount),
+            'm': timedelta(minutes=amount),
+            'd': timedelta(days=amount),
+        }[m.group(2).lower()]
+        return datetime.now(UTC) + delta
+
+    m = re.search(
+        r'resets\s+(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)',
+        text, re.IGNORECASE,
+    )
+    if m:
+        try:
+            import zoneinfo
+            tz = zoneinfo.ZoneInfo(m.group(2).strip())
+            time_str = m.group(1).strip()
+            for fmt in ('%I:%M %p', '%I%p', '%I:%M%p', '%I %p'):
+                try:
+                    parsed_time = datetime.strptime(time_str, fmt).time()
+                    break
+                except ValueError:
+                    continue
+            else:
+                return None
+            now_in_tz = datetime.now(tz)
+            target = now_in_tz.replace(
+                hour=parsed_time.hour, minute=parsed_time.minute,
+                second=0, microsecond=0,
+            )
+            if target <= now_in_tz:
+                target += timedelta(days=1)
+            return target.astimezone(UTC)
+        except Exception:
+            return None
+    return None
 
 # ---------------------------------------------------------------------------
 # 4. Cost by role
