@@ -9,6 +9,7 @@ import uuid as uuid_mod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
@@ -351,6 +352,7 @@ class AgentLoop:
             permission_mode='bypassPermissions',
             timeout_seconds=float(self.config.stage_timeout_seconds),
             resume_session_id=self._cli_session_id,
+            cwd=Path(self.config.explore_codebase_root),
         )
 
         if not result.success:
