@@ -377,17 +377,11 @@ class TestReconciliationConfigTimeouts:
     def test_default_judge_cli_timeout_is_600(self):
         assert ReconciliationConfig().judge_cli_timeout_seconds == 600
 
-    def test_default_stale_claim_recovery_is_60(self):
-        assert ReconciliationConfig().stale_claim_recovery_seconds == 60
-
     def test_explicit_agent_cli_timeout_override_accepted(self):
         assert ReconciliationConfig(agent_cli_timeout_seconds=30).agent_cli_timeout_seconds == 30
 
     def test_explicit_judge_cli_timeout_override_accepted(self):
         assert ReconciliationConfig(judge_cli_timeout_seconds=120).judge_cli_timeout_seconds == 120
-
-    def test_explicit_stale_claim_recovery_override_accepted(self):
-        assert ReconciliationConfig(stale_claim_recovery_seconds=10).stale_claim_recovery_seconds == 10
 
     # --- gt=0 bounds: agent_cli_timeout_seconds ---
 
@@ -409,15 +403,14 @@ class TestReconciliationConfigTimeouts:
         with pytest.raises(ValidationError):
             ReconciliationConfig(judge_cli_timeout_seconds=-1)
 
-    # --- gt=0 bounds: stale_claim_recovery_seconds ---
+    def test_stale_claim_recovery_seconds_field_removed(self):
+        """stale_claim_recovery_seconds must not exist on ReconciliationConfig.
 
-    def test_stale_claim_recovery_zero_rejected(self):
-        with pytest.raises(ValidationError):
-            ReconciliationConfig(stale_claim_recovery_seconds=0)
-
-    def test_stale_claim_recovery_negative_rejected(self):
-        with pytest.raises(ValidationError):
-            ReconciliationConfig(stale_claim_recovery_seconds=-5)
+        Task 905 made release_stale_claims(0) unconditional on startup, so the
+        field no longer influences any production behaviour.  Task 909 removed it
+        to prevent operators from tuning a knob that has no effect.
+        """
+        assert 'stale_claim_recovery_seconds' not in ReconciliationConfig.model_fields
 
     # --- gt=0 bounds: stage_timeout_seconds (consistency extension) ---
 
