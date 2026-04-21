@@ -438,3 +438,18 @@ class TestReconciliationConfigTimeouts:
     def test_stale_run_recovery_negative_rejected(self):
         with pytest.raises(ValidationError):
             ReconciliationConfig(stale_run_recovery_seconds=-1)
+
+    # --- cross-field inner <= outer validator ---
+
+    def test_agent_cli_timeout_exceeds_stage_rejected(self):
+        with pytest.raises(ValidationError, match='agent_cli_timeout_seconds'):
+            ReconciliationConfig(agent_cli_timeout_seconds=5000, stage_timeout_seconds=3000)
+
+    def test_judge_cli_timeout_exceeds_stage_rejected(self):
+        with pytest.raises(ValidationError, match='judge_cli_timeout_seconds'):
+            ReconciliationConfig(judge_cli_timeout_seconds=5000, stage_timeout_seconds=3000)
+
+    def test_agent_cli_timeout_equal_to_stage_accepted(self):
+        # inner == outer is the degenerate-but-valid co-terminal case
+        cfg = ReconciliationConfig(agent_cli_timeout_seconds=3600, stage_timeout_seconds=3600)
+        assert cfg.agent_cli_timeout_seconds == 3600
