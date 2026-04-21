@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING
 
-from shared.cli_invoke import invoke_with_cap_retry
+from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
 
 from orchestrator.agents.briefing import BriefingAssembler
@@ -718,18 +718,25 @@ The `modules` field should list directory-level groupings (e.g. "src/backends",
 Output JSON matching the schema. Every task must appear in the output.
 """
 
-        result = await invoke_with_cap_retry(
-            usage_gate=self.usage_gate,
-            label='Module tagging',
-            invoke_fn=invoke_agent,
-            prompt=prompt,
-            system_prompt='You are a code module classifier. Given task descriptions and a codebase structure, determine which code modules each task will modify. Be precise and conservative.',
-            cwd=self.config.project_root,
-            model=self.config.models.module_tagger,
-            max_turns=self.config.max_turns.module_tagger,
-            max_budget_usd=self.config.budgets.module_tagger,
-            output_schema=schema,
-        )
+        try:
+            result = await invoke_with_cap_retry(
+                usage_gate=self.usage_gate,
+                label='Module tagging',
+                invoke_fn=invoke_agent,
+                prompt=prompt,
+                system_prompt='You are a code module classifier. Given task descriptions and a codebase structure, determine which code modules each task will modify. Be precise and conservative.',
+                cwd=self.config.project_root,
+                model=self.config.models.module_tagger,
+                max_turns=self.config.max_turns.module_tagger,
+                max_budget_usd=self.config.budgets.module_tagger,
+                output_schema=schema,
+            )
+        except AllAccountsCappedException as e:
+            logger.warning(
+                f'Module tagging skipped: all accounts capped '
+                f'({e.retries} retries in {e.elapsed_secs:.1f}s)'
+            )
+            return
 
         if not result.success:
             logger.warning(f'Module tagger agent failed: {result.output[:200]}')
