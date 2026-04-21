@@ -2391,15 +2391,11 @@ async def test_run_loop_releases_stale_claims_on_startup(
 async def test_run_loop_fast_restart_releases_recent_claims(
     journal, event_buffer, mock_memory_service
 ):
-    """A freshly-claimed row (simulating a crashed process) is re-queued on startup.
+    """A freshly-claimed row (claimed_at≈now) is still released on startup.
 
-    Regression test for the fast-restart edge case: if the harness is restarted
-    within the old time-based recovery horizon (60s pre-task-905) of the previous
-    crash, the claimed row would NOT be released by a time-based cutoff, because
-    the row's claimed_at is younger than the horizon.
-
-    With cutoff=0, every currently-claimed row is released unconditionally, so the
-    row is always available for the new process to pick up.
+    cutoff=0 unconditionally re-queues every currently-claimed row, so a row
+    claimed immediately before a crash is always available for the new process
+    to pick up — a time-based cutoff would silently skip it.
     """
     import asyncio
     from unittest.mock import AsyncMock
@@ -2407,8 +2403,8 @@ async def test_run_loop_fast_restart_releases_recent_claims(
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     # Defer a write and immediately claim it — simulating what a dead process left
-    # behind.  The row is claimed_at≈now, which is well within the 60s horizon
-    # the pre-task-905 code would have used (i.e. old code would NOT release it).
+    # behind.  The row is claimed_at≈now; a time-based cutoff would not release
+    # it, but cutoff=0 does.
     await event_buffer.defer_write('test-project', 'payload-a', 'cat', {})
     claimed_before = await event_buffer.claim_deferred_writes('test-project')
     assert len(claimed_before) == 1, 'precondition: row should be claimed'
