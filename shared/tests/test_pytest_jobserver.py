@@ -82,3 +82,27 @@ class TestTimeoutFallback:
         assert any('0.1' in m for m in msgs), (
             f'Expected timeout value in warning message, got: {msgs}'
         )
+
+
+# ---------------------------------------------------------------------------
+# _acquire_timeout_secs unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestAcquireTimeoutSecs:
+    """Unit-test env-var parsing without measuring wall time."""
+
+    def test_default_when_key_absent(self):
+        assert _js._acquire_timeout_secs({}) == 60.0
+
+    def test_valid_float_string(self):
+        assert _js._acquire_timeout_secs({'PYTEST_JOBSERVER_TIMEOUT': '0.25'}) == 0.25
+
+    def test_invalid_string_falls_back_to_default(self):
+        assert _js._acquire_timeout_secs({'PYTEST_JOBSERVER_TIMEOUT': 'abc'}) == 60.0
+
+    def test_empty_string_falls_back_to_default(self):
+        assert _js._acquire_timeout_secs({'PYTEST_JOBSERVER_TIMEOUT': ''}) == 60.0
+
+    def test_integer_looking_string(self):
+        assert _js._acquire_timeout_secs({'PYTEST_JOBSERVER_TIMEOUT': '5'}) == 5.0
