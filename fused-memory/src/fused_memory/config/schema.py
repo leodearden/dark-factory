@@ -257,10 +257,11 @@ class ReconciliationConfig(BaseModel):
 
     # Timeouts
     tool_timeout_seconds: float = Field(default=120.0)
-    stage_timeout_seconds: int = Field(default=3600)
+    stage_timeout_seconds: int = Field(default=3600, gt=0)
     cycle_timeout_seconds: int = Field(default=21600)
     stale_run_recovery_seconds: int = Field(
         default=600,
+        gt=0,
         description='Runs with started_at older than this are recovered on startup if their lock is stale',
     )
     # Per-CLI-invocation wall-clock budgets — semantically distinct from
