@@ -4,7 +4,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -716,10 +716,7 @@ class EventBuffer:
 
         Returns the number of rows re-queued (exhausted rows are not counted).
         """
-        cutoff_iso = datetime.fromtimestamp(
-            datetime.now(UTC).timestamp() - max_age_seconds,
-            tz=UTC,
-        ).isoformat()
+        cutoff_iso = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).isoformat()
         async with self._txn() as db:
             # Fetch all stale rows to split recoverable vs. exhausted.
             async with db.execute(
