@@ -119,6 +119,44 @@ _CARGO_EXCLUDE_RE = re.compile(
 )
 
 
+def _extract_cause_hint(output: str) -> str:
+    """Extract a one-line failure hint from command output.
+
+    Uses a pattern ladder (first match wins):
+    1. ``error: …``         — cargo/clippy surface errors
+    2. ``… FAILED``         — Rust test runner failure lines
+    3. ``Command timed out after Ns: …`` — our own timeout wrapper
+    4. ``ERROR: …``         — flock/script wrapper errors
+    5. ``… npm (ERR!|error) …`` — npm errors
+    6. fallback: last non-blank line of output
+
+    Returns ``''`` for None, empty, or whitespace-only input.
+    Result is stripped to a single line and capped at 200 chars.
+    """
+    if not output or not output.strip():
+        return ''
+
+    _HINT_PATTERNS = [
+        re.compile(r'^error: .+$', re.MULTILINE),
+        re.compile(r'^.+\s+FAILED$', re.MULTILINE),
+        re.compile(r'^Command timed out after \d+s:.+$', re.MULTILINE),
+        re.compile(r'^ERROR: .+$', re.MULTILINE),
+        re.compile(r'^.*npm (ERR!|error).*$', re.MULTILINE),
+    ]
+
+    for pattern in _HINT_PATTERNS:
+        m = pattern.search(output)
+        if m:
+            return m.group(0).strip()[:200]
+
+    # Fallback: last non-blank line
+    last = next(
+        (line for line in reversed(output.splitlines()) if line.strip()),
+        '',
+    )
+    return last.strip()[:200]
+
+
 async def _derive_task_files_from_git(
     worktree: Path, config: OrchestratorConfig,
 ) -> list[str] | None:
