@@ -892,3 +892,57 @@ async def test_call_judge_cli_forwards_cwd_to_invoke_claude_agent(mock_journal, 
     mock_agent.assert_called_once()
     call_kwargs = mock_agent.call_args.kwargs
     assert call_kwargs['cwd'] == Path(explore_root)
+
+
+# ---------------------------------------------------------------------------
+# CLI failure path surfaces stderr + summary in RuntimeError
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_runtime_error(
+    mock_journal,
+):
+    """_call_judge_cli embeds stderr and classify_agent_failure summary in the RuntimeError.
+
+    Red test (step-3): the current code raises RuntimeError(f'Claude CLI judge
+    failed: {result.output[:500]}').  When result.output is '' (e.g. a JSON
+    parse crash), the message is empty and the diagnostic signal lives in
+    result.stderr.  This test asserts the RuntimeError message after the fix:
+      - starts with 'Claude CLI judge failed:'
+      - contains the stderr content ('Traceback: JSONDecodeError in line 42')
+      - contains 'error_unexpected' (the subtype, present in diagnostic_detail)
+    The subtype is NOT 'error_empty_output', so the early-return on lines
+    264-265 does not apply — the not-result.success branch must fire.
+    """
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    fake_gate = MagicMock()
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=fake_gate)
+
+    failing_result = AgentResult(
+        success=False,
+        output='',
+        stderr='Traceback: JSONDecodeError in line 42',
+        subtype='error_unexpected',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = failing_result
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await judge._call_judge_cli('Evaluate this run.')
+
+    msg = str(excinfo.value)
+    assert msg.startswith('Claude CLI judge failed:'), f'unexpected prefix: {msg!r}'
+    assert 'Traceback: JSONDecodeError in line 42' in msg, f'stderr missing from: {msg!r}'
+    assert 'error_unexpected' in msg, f'subtype missing from: {msg!r}'
