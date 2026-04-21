@@ -106,3 +106,44 @@ class TestAcquireTimeoutSecs:
 
     def test_integer_looking_string(self):
         assert _js._acquire_timeout_secs({'PYTEST_JOBSERVER_TIMEOUT': '5'}) == 5.0
+
+
+# ---------------------------------------------------------------------------
+# Happy-path regression test
+# ---------------------------------------------------------------------------
+
+
+class TestHappyPath:
+    def test_acquires_token_when_fifo_is_seeded(
+        self, fifo_path, monkeypatch, caplog
+    ):
+        """pytest_configure should acquire the token and register cleanup."""
+        monkeypatch.setenv('PYTEST_JOBSERVER_FIFO', fifo_path)
+        # Use a generous timeout so the happy path never races
+        monkeypatch.setenv('PYTEST_JOBSERVER_TIMEOUT', '5.0')
+
+        # Seed one token into the FIFO before calling configure.
+        # Open O_RDWR so the open itself doesn't block (same trick as the plugin),
+        # then write a single byte.
+        seed_fd = os.open(fifo_path, os.O_RDWR)
+        os.write(seed_fd, b'x')
+
+        try:
+            with caplog.at_level(logging.WARNING, logger='shared.pytest_jobserver'):
+                _js.pytest_configure(config=None)
+        finally:
+            os.close(seed_fd)
+
+        assert _js._tok == b'x', f'Expected token b"x", got {_js._tok!r}'
+        assert _js._fd is not None, 'Expected _fd to be set after successful acquire'
+
+        # No timeout warning should have been emitted
+        msgs = [r.getMessage() for r in caplog.records]
+        assert not any('timed out' in m for m in msgs), (
+            f'Unexpected timeout warning on happy path: {msgs}'
+        )
+
+        # Cleanup: unconfigure should return the token and reset state
+        _js.pytest_unconfigure(config=None)
+        assert _js._fd is None
+        assert _js._tok is None
