@@ -423,6 +423,8 @@ class VerifyResult:
                 f'genuinely hanging command — inspect the output below before '
                 f'treating it as a real failure.'
             )
+        if self.cause_hint:
+            sections.append(f'## Failure Cause\n\n{self.cause_hint}')
         if self.test_output and 'FAILED' in self.test_output:
             sections.append(f'## Test Failures\n\n```\n{self.test_output[-3000:]}\n```')
         if self.lint_output and self.lint_output.strip():
