@@ -254,6 +254,35 @@ class TestReconcileStrandedInProgress:
                 f'got: {[r.message for r in caplog.records]}'
             )
 
+    async def test_unexpected_exception_propagates_out_of_reconcile(
+        self, harness: Harness
+    ):
+        """TypeError from json.loads must propagate — not be silently swallowed.
+
+        RED against current code: `except Exception:` catches TypeError and
+        treats the lock as stale (task reverted, lock deleted, no exception).
+        After the fix (narrow to OSError/JSONDecodeError/ValueError), TypeError
+        propagates out, set_task_status is never called, and the lock survives.
+        """
+        from unittest.mock import patch as _patch
+
+        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
+            {'id': 15, 'status': 'in-progress'},
+        ]
+        lock_dir = harness.git_ops.worktree_base / '15' / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text('{"session_id": "15-xyz", "owner_pid": 1}')  # valid-looking
+
+        with _patch('orchestrator.harness.json.loads', side_effect=TypeError('unexpected')):
+            with pytest.raises(TypeError, match='unexpected'):
+                await harness._reconcile_stranded_in_progress()
+
+        # No revert must have happened
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        # Lock file must not have been deleted
+        assert lock_path.exists(), 'Lock file must survive when an unexpected exception propagates'
+
 
 # ---------------------------------------------------------------------------
 # Harness.run() call-order test
