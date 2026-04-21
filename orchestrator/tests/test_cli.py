@@ -118,6 +118,41 @@ class TestForceExitWatchdog:
             'watchdog thread did not exit after firing os._exit replacement'
         )
 
+    def test_does_not_fire_before_timeout(self, monkeypatch):
+        """Watchdog does not call os._exit before its timeout elapses.
+
+        This pins the 'never fires on clean exit' guarantee at the unit layer —
+        if the process terminates before timeout_secs (daemon thread killed by
+        interpreter shutdown on clean exit), the watchdog is still inside its
+        `_event.wait` and has not yet reached the os._exit call site.
+
+        Together with test_fires_after_timeout (fires AFTER timeout) and
+        test_disarm_prevents_force_exit (never fires after disarm), this closes
+        the timing-contract circle: fires exactly once, after the timeout, and
+        only if not disarmed.
+
+        The subprocess-level counterpart (`test_shutdown_watchdog_force_exits_on_thread_leak`
+        in test_shutdown.py) pins the opposite — fires when a non-daemon thread is leaked.
+        """
+        calls = []
+        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+
+        handle = _force_exit_after_delay(timeout_secs=2.0)
+
+        # Sleep well within the timeout — 0.2s is 10x margin under any scheduler load.
+        time.sleep(0.2)
+
+        assert calls == [], (
+            f'watchdog fired before timeout elapsed (clean-exit window): {calls}'
+        )
+
+        # Cleanup: disarm and join to guarantee thread exits cleanly.
+        handle.disarm()
+        handle.thread.join(timeout=1.0)
+        assert not handle.thread.is_alive(), (
+            'watchdog thread did not exit after disarm'
+        )
+
     def test_disarm_prevents_force_exit(self, monkeypatch):
         """Calling disarm() before timeout prevents os._exit from being called."""
         calls = []
