@@ -358,7 +358,7 @@ def _default_curator_usage_cap() -> UsageCapConfig:
     Reads ``USAGE_ACCOUNTS_FILE`` if set (aligns with the orchestrator / eval
     runner), otherwise falls back to the canonical shared accounts file. The
     fused-memory server inherits the unset shell env, so it gets the shared
-    G→F→E→C→B→D pool used by the orchestrator — see memory note
+    G→F→E→C→D pool used by the orchestrator — see memory note
     ``project_eval_account_isolation.md``.
     """
     return UsageCapConfig(
