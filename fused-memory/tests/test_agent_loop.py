@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import dataclass, field
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1055,8 +1055,6 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     kwargs and that the returned adapter exposes `.thinking`, `.response`,
     `.tool_calls`, and `.session_id`.
     """
-    from unittest.mock import AsyncMock
-
     from shared.cli_invoke import AgentResult
 
     from fused_memory.reconciliation.agent_loop import CLAUDE_CLI_RESPONSE_SCHEMA
@@ -1130,8 +1128,6 @@ async def test_call_claude_cli_threads_session_id_across_turns():
     integration. First call must use resume_session_id=None; second call must use
     resume_session_id='sess-A' (the session_id returned by the first call).
     """
-    from unittest.mock import AsyncMock
-
     from shared.cli_invoke import AgentResult
 
     fake_gate = MagicMock()
@@ -1179,7 +1175,6 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
     catches that regression without requiring a live Claude CLI.
     """
     from pathlib import Path
-    from unittest.mock import AsyncMock
 
     from shared.cli_invoke import AgentResult
 
@@ -1220,27 +1215,11 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
 
 @pytest.mark.asyncio
 async def test_run_threads_serialized_tool_results_into_claude_cli_prompt():
-    """AgentLoop.run() serializes tool results into the claude_cli prompt on the second turn.
+    """Guards that run() routes tool_results through _serialize_tool_results on follow-up turns.
 
-    Closes the coverage gap left by task 881, which deleted
-    test_claude_cli_provider_first_call and test_claude_cli_provider_resume.
-    Those tests exercised the full run() -> _call_llm -> _serialize_tool_results
-    -> _call_claude_cli pipeline.  The replacement tests added by task 881 only
-    exercise _call_claude_cli directly (skipping _call_llm) or
-    _serialize_tool_results as a static method — none of them pass through the
-    claude_cli branch at agent_loop.py:227-230:
-
-        elif provider == 'claude_cli':
-            content = messages[-1]['content']
-            prompt = content if isinstance(content, str) else self._serialize_tool_results(content)
-            return await self._call_claude_cli(prompt=prompt, tools=tool_schemas)
-
-    A regression that passed the raw tool_results list, swapped the OK/ERROR
-    marker, or dropped the isinstance guard would pass every existing test.
-    This test guards that contract.
+    Closes the coverage gap left by task 881 (deleted test_claude_cli_provider_first_call and
+    test_claude_cli_provider_resume) for the _call_llm claude_cli branch.
     """
-    from unittest.mock import AsyncMock
-
     from shared.cli_invoke import AgentResult
 
     fake_gate = MagicMock()
@@ -1315,6 +1294,7 @@ async def test_run_threads_serialized_tool_results_into_claude_cli_prompt():
 
     # Turn 2: tool_results list is serialized via _serialize_tool_results
     # before being passed as prompt — the core contract this test guards.
+    # Exact equality catches regressions that swap the \n separator, drop the
+    # [Tool Result: ...] prefix, or subtly reorder fields.
     second_prompt = mock_invoke.call_args_list[1].kwargs['prompt']
-    assert '[Tool Result: tc1] (OK)' in second_prompt
-    assert '"doubled": 14' in second_prompt
+    assert second_prompt == '[Tool Result: tc1] (OK)\n{"doubled": 14}'
