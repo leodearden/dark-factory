@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
@@ -299,6 +299,23 @@ class ReconciliationConfig(BaseModel):
             'stale_run_recovery_seconds (600s, for minute-scale run recovery).'
         ),
     )
+
+    @model_validator(mode='after')
+    def _validate_cli_timeouts_within_stage(self) -> 'ReconciliationConfig':
+        """Enforce that per-CLI-call budgets do not exceed the outer stage guard."""
+        if self.agent_cli_timeout_seconds > self.stage_timeout_seconds:
+            raise ValueError(
+                f'agent_cli_timeout_seconds ({self.agent_cli_timeout_seconds}) must be '
+                f'<= stage_timeout_seconds ({self.stage_timeout_seconds}): '
+                'the per-call budget cannot exceed the outer stage guard.'
+            )
+        if self.judge_cli_timeout_seconds > self.stage_timeout_seconds:
+            raise ValueError(
+                f'judge_cli_timeout_seconds ({self.judge_cli_timeout_seconds}) must be '
+                f'<= stage_timeout_seconds ({self.stage_timeout_seconds}): '
+                'the per-call budget cannot exceed the outer stage guard.'
+            )
+        return self
 
     # Safety
     max_mutations_per_stage: int = Field(default=50)
