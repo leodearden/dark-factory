@@ -902,6 +902,33 @@ Output JSON matching the schema. Every task must appear in the output.
                     'Reconcile: reverted task %s to pending (reason=no-lock)', tid
                 )
                 reverted += 1
+                continue
+
+            # Lock exists — check whether the owner is still alive.
+            owner_alive = False
+            try:
+                lock_data = json.loads(lock_path.read_text())
+                owner_pid = lock_data.get('owner_pid')
+                if owner_pid is not None:
+                    owner_alive = _pid_alive(int(owner_pid))
+            except Exception:
+                # Corrupt/unreadable lock — treat as stale.
+                owner_alive = False
+
+            if owner_alive:
+                # Live claimant — leave the task alone.
+                continue
+
+            # Stale lock — clear it and revert.
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+            await self.scheduler.set_task_status(tid, 'pending')
+            logger.info(
+                'Reconcile: reverted task %s to pending (reason=stale-lock)', tid
+            )
+            reverted += 1
 
         if reverted:
             logger.info('Reconcile: %d stranded task(s) reverted to pending', reverted)
