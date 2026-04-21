@@ -47,6 +47,31 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return True if the process identified by *pid* is alive.
+
+    Mirrors the semantics of
+    fused-memory/src/fused_memory/services/orchestrator_detector.py:58-72
+    without introducing a cross-package import edge.
+
+    - Returns False for pid <= 0 (invalid).
+    - Uses os.kill(pid, 0): success → alive; ProcessLookupError → dead;
+      PermissionError → alive (we can see it but lack permission to signal it);
+      other OSError → treat as dead.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def _acquire_project_lock(project_root: Path) -> IO:
     """Acquire an exclusive flock on a per-project lockfile.
 
