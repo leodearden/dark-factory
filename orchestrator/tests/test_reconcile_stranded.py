@@ -26,6 +26,50 @@ class TestPidAlive:
         # 2**31-1 is always invalid on all Linux systems.
         assert _pid_alive(2**31 - 1) is False
 
+    # ------------------------------------------------------------------
+    # Branch-mocked tests — each covers exactly one code path in _pid_alive
+    # ------------------------------------------------------------------
+
+    def test_pid_zero_returns_false_without_calling_os_kill(self, monkeypatch):
+        """pid=0 guard → returns False before os.kill is ever called."""
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, 'kill', lambda pid, sig: calls.append((pid, sig)))
+        assert _pid_alive(0) is False
+        assert calls == [], 'os.kill must not be called for pid=0'
+
+    def test_negative_pid_returns_false_without_calling_os_kill(self, monkeypatch):
+        """pid=-1 guard → returns False before os.kill is ever called."""
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, 'kill', lambda pid, sig: calls.append((pid, sig)))
+        assert _pid_alive(-1) is False
+        assert calls == [], 'os.kill must not be called for pid=-1'
+
+    def test_process_lookup_error_returns_false(self, monkeypatch):
+        """os.kill raises ProcessLookupError → process is dead → False."""
+        def _raise(pid: int, sig: int) -> None:
+            raise ProcessLookupError()
+        monkeypatch.setattr(os, 'kill', _raise)
+        assert _pid_alive(12345) is False
+
+    def test_permission_error_returns_true(self, monkeypatch):
+        """os.kill raises PermissionError → process exists (no permission to signal) → True."""
+        def _raise(pid: int, sig: int) -> None:
+            raise PermissionError()
+        monkeypatch.setattr(os, 'kill', _raise)
+        assert _pid_alive(12345) is True
+
+    def test_generic_oserror_returns_false(self, monkeypatch):
+        """os.kill raises generic OSError → treat as dead → False."""
+        def _raise(pid: int, sig: int) -> None:
+            raise OSError(5, 'io error')
+        monkeypatch.setattr(os, 'kill', _raise)
+        assert _pid_alive(12345) is False
+
+    def test_successful_signal_returns_true(self, monkeypatch):
+        """os.kill succeeds → process is alive → True."""
+        monkeypatch.setattr(os, 'kill', lambda pid, sig: None)
+        assert _pid_alive(12345) is True
+
 
 # ---------------------------------------------------------------------------
 # Harness fixture (mirrors test_crash_recovery.py)
