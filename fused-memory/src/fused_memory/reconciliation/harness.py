@@ -432,7 +432,7 @@ class ReconciliationHarness:
         # Re-queue any deferred writes left in-progress by a crashed prior process.
         try:
             released = await self.buffer.release_stale_claims(
-                self.config.stale_run_recovery_seconds,
+                self.config.stale_claim_recovery_seconds,
             )
             if released:
                 logger.info(
