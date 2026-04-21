@@ -798,7 +798,7 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
     assert call_kwargs['prompt'] == 'Evaluate this run.'
     assert call_kwargs['system_prompt'] == JUDGE_SYSTEM_PROMPT
     assert call_kwargs['model'] == config.judge_llm_model
-    assert call_kwargs['timeout_seconds'] == float(config.stage_timeout_seconds)
+    assert call_kwargs['timeout_seconds'] == float(config.judge_cli_timeout_seconds)
     assert 'output_schema' not in call_kwargs  # judge output is free-form, no schema
     assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
 
