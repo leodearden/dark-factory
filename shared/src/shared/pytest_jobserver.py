@@ -1,8 +1,21 @@
 """Cooperative pytest jobserver client.
 
-At session start, blocks on a FIFO until a token is available; at session
-end (or SIGTERM), returns the token. If ``PYTEST_JOBSERVER_FIFO`` is unset or
-the FIFO is missing, the plugin is a no-op — tests run unthrottled.
+At session start, waits up to ``PYTEST_JOBSERVER_TIMEOUT`` seconds (default
+60.0) for a token to become available on the FIFO.  If the wait times out,
+the plugin falls back to unthrottled execution — the same no-op behaviour as
+when ``PYTEST_JOBSERVER_FIFO`` is unset or the FIFO is missing.  At session
+end (or SIGTERM), a successfully acquired token is returned to the FIFO.
+
+**Environment variables**
+
+``PYTEST_JOBSERVER_FIFO``
+    Path to the jobserver FIFO (default ``/tmp/pytest-jobserver``).  If unset
+    or the path does not exist, the plugin is a silent no-op.
+
+``PYTEST_JOBSERVER_TIMEOUT``
+    Maximum seconds to wait for a token (float, default ``60.0``).  Invalid
+    values (non-float, empty string) fall back to the default.  Set to ``0``
+    to skip the wait entirely and always run unthrottled.
 
 Modelled on GNU make's jobserver protocol; compatible in spirit with the
 reify-jobserver.service FIFO (``/tmp/reify-jobserver``). Each pytest process
@@ -32,7 +45,7 @@ _fd: int | None = None
 _tok: bytes | None = None
 
 
-def _acquire_timeout_secs(env: Mapping[str, str] | None = None) -> float:
+def _read_timeout_secs(env: Mapping[str, str] | None = None) -> float:
     """Return the configured FIFO-wait timeout in seconds.
 
     Reads ``PYTEST_JOBSERVER_TIMEOUT`` from *env* (defaults to ``os.environ``).
@@ -68,7 +81,7 @@ def pytest_configure(config) -> None:
         return
     try:
         _fd = os.open(path, os.O_RDWR)
-        timeout = _acquire_timeout_secs()
+        timeout = _read_timeout_secs()
         ready, _, _ = select.select([_fd], [], [], timeout)
         if not ready:
             logger.warning(
