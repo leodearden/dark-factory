@@ -373,9 +373,11 @@ class TestForceExitWatchdog:
         # test_fallback_write_failure_still_fires_exit is that the outer header sentinel
         # can only appear if format_stack ran and outer out.write was reached — which is
         # exactly the path mocked out in the sibling.
-        assert any('SHUTDOWN WATCHDOG FIRED' in s for s in write_attempts), (
+        assert any('process hung after asyncio.run()' in s for s in write_attempts), (
             f'outer watchdog-fired header sentinel missing from write attempts '
-            f'(proves format_stack ran and outer out.write was reached): {write_attempts!r}'
+            f"(proves format_stack ran and outer out.write was reached — "
+            f"'process hung after asyncio.run()' appears only in the cli.py:78 "
+            f'outer header, not in the cli.py:94 fallback sentinel): {write_attempts!r}'
         )
         assert any('(diagnostic dump failed)' in s for s in write_attempts), (
             f'inner fallback sentinel missing from write attempts '
