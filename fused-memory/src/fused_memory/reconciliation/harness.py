@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from shared.cli_invoke import AllAccountsCappedException
 from shared.usage_gate import UsageGate
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
@@ -766,6 +767,21 @@ class ReconciliationHarness:
                 f'(stage: {current_stage_name})'
             )
             raise
+        except AllAccountsCappedException as e:
+            run.status = RunStatus.failed
+            run.stage_reports['_error'] = {
+                'error_type': 'AllAccountsCappedException',
+                'error_message': str(e),
+                'failed_stage': current_stage_name,
+                'deferred': True,
+            }
+            await self.journal.complete_run(run_id, 'failed')
+            await self.buffer.restore_drained(project_id)
+            logger.warning(
+                f'Reconciliation deferred: all accounts capped during stage '
+                f'{current_stage_name} ({e.retries} retries in {e.elapsed_secs:.1f}s)'
+            )
+            return run
         except Exception as e:
             run.status = RunStatus.failed
             run.stage_reports['_error'] = {
@@ -977,6 +993,21 @@ class ReconciliationHarness:
                 extra={'run_id': run_id, 'parent_run_id': parent_run_id},
             )
 
+        except AllAccountsCappedException as e:
+            run.status = RunStatus.failed
+            run.stage_reports['_error'] = {
+                'error_type': 'AllAccountsCappedException',
+                'error_message': str(e),
+                'failed_stage': current_stage_name,
+                'deferred': True,
+            }
+            await self.journal.complete_run(run_id, 'failed')
+            # Do NOT re-raise — parent run already completed
+            # Do NOT restore events — there are none (remediation has no drained events)
+            logger.warning(
+                f'Remediation deferred: all accounts capped during stage '
+                f'{current_stage_name} ({e.retries} retries in {e.elapsed_secs:.1f}s)'
+            )
         except Exception as e:
             run.status = RunStatus.failed
             run.stage_reports['_error'] = {
