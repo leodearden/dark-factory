@@ -734,6 +734,72 @@ async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_ser
 
 
 @pytest.mark.asyncio
+async def test_judge_unhalt_clears_halt_escalated(journal, event_buffer, mock_memory_service):
+    """Judge.unhalt must clear harness._halt_escalated so the next halt re-fires.
+
+    Without this wiring, a manual unhalt followed by another halt wouldn't
+    produce a fresh escalation because _notify_judge_halt dedupes per-process.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.judge is not None
+
+    # Simulate a prior halt that's been escalated once
+    harness._halt_escalated.add('test-project')
+    await harness.judge._apply_halt('test-project', reason='seed')
+    assert harness.judge.is_halted('test-project')
+
+    await harness.judge.unhalt('test-project')
+
+    assert not harness.judge.is_halted('test-project')
+    # Harness callback must have fired and cleared the sentinel
+    assert 'test-project' not in harness._halt_escalated
+
+
+@pytest.mark.asyncio
+async def test_project_loop_consumes_unhalt_grace(journal, event_buffer, mock_memory_service):
+    """_project_loop decrements post-unhalt grace before running a cycle."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.judge is not None
+
+    # Seed grace counter (simulates a prior halt + unhalt with halt_grace_cycles>0)
+    harness.judge._unhalt_grace_remaining['test-project'] = 2
+    # The journal mock should return decremented values
+    harness.journal.decrement_unhalt_grace = AsyncMock(return_value=1)
+
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    # Short-circuit run_full_cycle so the loop returns quickly
+    async def fake_rfc(*_a, **_k):
+        from fused_memory.models.reconciliation import ReconciliationRun, RunStatus, RunType
+        return ReconciliationRun(
+            id=str(uuid.uuid4()),
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='buffer_size:3',
+            started_at=datetime.now(UTC),
+            events_processed=3,
+            status=RunStatus.completed,
+        )
+
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+
+    with (
+        patch.object(harness, 'run_full_cycle', side_effect=fake_rfc),
+        contextlib.suppress(TimeoutError),
+    ):
+        await asyncio.wait_for(harness.run_loop(), timeout=0.5)
+
+    harness.journal.decrement_unhalt_grace.assert_awaited()
+    assert harness.judge.unhalt_grace_remaining('test-project') == 1
+
+
+@pytest.mark.asyncio
 async def test_make_stages_returns_clean_instances(journal, event_buffer, mock_memory_service):
     """_make_stages() returns fresh stage instances with no leftover per-run state.
 

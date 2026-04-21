@@ -3,7 +3,8 @@
 import json
 import logging
 import os
-from datetime import UTC, datetime
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
@@ -18,15 +19,54 @@ from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
 
 
+UnhaltCallback = Callable[[str], Awaitable[None] | None]
+
+
 class Judge:
     """Async LLM reviewer that evaluates reconciliation run quality."""
 
-    def __init__(self, config: ReconciliationConfig, journal: ReconciliationJournal,
-                 usage_gate=None):
+    def __init__(
+        self,
+        config: ReconciliationConfig,
+        journal: ReconciliationJournal,
+        usage_gate=None,
+        *,
+        on_unhalt_cb: UnhaltCallback | None = None,
+    ):
         self.config = config
         self.journal = journal
         self._halted_projects: set[str] = set()
+        self._halt_cooldown_until: dict[str, datetime] = {}
+        self._unhalt_grace_remaining: dict[str, int] = {}
         self._usage_gate = usage_gate
+        self._on_unhalt_cb = on_unhalt_cb
+
+    async def initialize(self) -> None:
+        """Rehydrate halt state from the journal.
+
+        Without this, a service restart would silently clear all halts —
+        exactly the self-latching-halt workaround that Apr 2026 debug turned
+        up. Persisting means a genuine halt survives restarts and can only be
+        cleared via unhalt_reconciliation.
+        """
+        try:
+            rows = await self.journal.get_halt_states()
+        except Exception:
+            logger.warning('Judge.initialize: get_halt_states failed', exc_info=True)
+            return
+        for row in rows:
+            pid = row['project_id']
+            if row['unhalted_at'] is None:
+                self._halted_projects.add(pid)
+                if row['cooldown_until'] is not None:
+                    self._halt_cooldown_until[pid] = row['cooldown_until']
+            if (row['unhalt_grace_remaining'] or 0) > 0:
+                self._unhalt_grace_remaining[pid] = row['unhalt_grace_remaining']
+        if self._halted_projects or self._unhalt_grace_remaining:
+            logger.info(
+                f'Judge: rehydrated halt state — halted={sorted(self._halted_projects)} '
+                f'grace={dict(self._unhalt_grace_remaining)}'
+            )
 
     async def review_run(self, run_id: str) -> JudgeVerdict | None:
         """Review a completed reconciliation run asynchronously."""
@@ -45,6 +85,16 @@ class Judge:
             recent_verdicts = await self.journal.get_recent_verdicts(
                 run.project_id, limit=10
             )
+            # Trend detection uses a time-windowed query so old moderates
+            # outside the window cannot influence the halt decision. Separate
+            # from ``recent_verdicts`` (which feeds the prompt) so the judge
+            # still sees short-term history regardless of window length.
+            trend_window_hours = float(self.config.halt_trend_window_hours)
+            trend_verdicts = await self.journal.get_recent_verdicts(
+                run.project_id,
+                limit=50,
+                since=datetime.now(UTC) - timedelta(hours=trend_window_hours),
+            )
 
             prompt = self._build_review_prompt(run, entries, recent_verdicts, combined_actions)
             response_text = await self._call_llm(prompt)
@@ -57,8 +107,11 @@ class Judge:
                 logger.warning(f'Judge: moderate issues in run {run_id}, recommending rollback')
             elif verdict.severity == 'serious':
                 if self.config.halt_on_judge_serious:
-                    self._halted_projects.add(run.project_id)
                     verdict.action_taken = VerdictAction.halt
+                    await self._apply_halt(
+                        run.project_id,
+                        reason=f'Serious verdict in run {run_id}',
+                    )
                     logger.error(
                         f'Judge: SERIOUS issues in run {run_id}, halting project {run.project_id}'
                     )
@@ -75,9 +128,8 @@ class Judge:
                 },
             )
 
-            # Check error trends
-            all_verdicts = recent_verdicts + [verdict]
-            await self._check_error_trends(run.project_id, all_verdicts)
+            # Check error trends using the windowed verdicts + the fresh one
+            await self._check_error_trends(run.project_id, trend_verdicts + [verdict])
 
             return verdict
 
@@ -296,19 +348,149 @@ Review this run and provide your verdict as JSON.
                 action_taken=VerdictAction.none,
             )
 
-    async def _check_error_trends(self, project_id: str, verdicts: list[JudgeVerdict]) -> None:
-        """Detect rising error rates across recent runs."""
-        recent = verdicts[-10:]
-        non_ok = [v for v in recent if v.severity in ('moderate', 'serious')]
-        if len(non_ok) >= 5 and self.config.halt_on_judge_serious:
-                self._halted_projects.add(project_id)
-                logger.error(
-                    f'Judge: error trend detected for project {project_id} '
-                    f'({len(non_ok)}/10 non-ok verdicts), halting'
-                )
+    async def _check_error_trends(
+        self, project_id: str, verdicts: list[JudgeVerdict],
+    ) -> None:
+        """Detect clustered, recent, and consecutive non-ok verdicts.
+
+        Three gates must all hold:
+
+        1. **Time window**: at least ``halt_trend_moderate_count`` non-ok verdicts
+           within the last ``halt_trend_window_hours``. Old moderates from days
+           ago cannot hold a project halted forever.
+        2. **Consecutive most-recent**: the first ``halt_trend_consecutive_required``
+           verdicts (newest-first) must all be non-ok. One ok/minor breaks the
+           streak — this is what allows a stuck halt to clear naturally once
+           the pipeline produces a clean verdict.
+        3. **No post-unhalt grace, no active cooldown**: operator intervention
+           gets breathing room before the detector re-fires.
+        """
+        if not self.config.halt_on_judge_serious:
+            return
+
+        if self._unhalt_grace_remaining.get(project_id, 0) > 0:
+            logger.debug(
+                f'Judge: skipping trend check for {project_id} — '
+                f'post-unhalt grace has {self._unhalt_grace_remaining[project_id]} '
+                f'cycles remaining'
+            )
+            return
+
+        now = datetime.now(UTC)
+        cooldown_until = self._halt_cooldown_until.get(project_id)
+        if cooldown_until and cooldown_until > now:
+            logger.debug(
+                f'Judge: halt cooldown for {project_id} active until '
+                f'{cooldown_until.isoformat()}'
+            )
+            return
+
+        window_hours = float(self.config.halt_trend_window_hours)
+        window_start = now - timedelta(hours=window_hours)
+        windowed = sorted(
+            (v for v in verdicts if v.reviewed_at >= window_start),
+            key=lambda v: v.reviewed_at,
+            reverse=True,
+        )
+
+        consecutive_required = max(1, self.config.halt_trend_consecutive_required)
+        if len(windowed) < consecutive_required:
+            return
+        if not all(
+            v.severity in ('moderate', 'serious')
+            for v in windowed[:consecutive_required]
+        ):
+            return
+
+        non_ok_in_window = [
+            v for v in windowed if v.severity in ('moderate', 'serious')
+        ]
+        if len(non_ok_in_window) < self.config.halt_trend_moderate_count:
+            return
+
+        reason = (
+            f'Trend: {len(non_ok_in_window)} non-ok verdicts in last '
+            f'{window_hours:g}h; {consecutive_required} consecutive most-recent'
+        )
+        await self._apply_halt(project_id, reason=reason)
+        logger.error(f'Judge: error trend detected for project {project_id} — {reason}')
+
+    async def _apply_halt(self, project_id: str, *, reason: str) -> None:
+        """Common path for trend-halt and serious-verdict-halt."""
+        now = datetime.now(UTC)
+        cooldown_until = now + timedelta(seconds=float(self.config.halt_cooldown_seconds))
+        self._halted_projects.add(project_id)
+        self._halt_cooldown_until[project_id] = cooldown_until
+        self._unhalt_grace_remaining.pop(project_id, None)
+        try:
+            await self.journal.set_halt(
+                project_id,
+                halted_at=now,
+                cooldown_until=cooldown_until,
+                reason=reason,
+            )
+        except Exception:
+            logger.warning('Judge._apply_halt: journal.set_halt failed', exc_info=True)
 
     def is_halted(self, project_id: str) -> bool:
         return project_id in self._halted_projects
 
-    def unhalt(self, project_id: str) -> None:
+    def unhalt_grace_remaining(self, project_id: str) -> int:
+        return self._unhalt_grace_remaining.get(project_id, 0)
+
+    async def consume_grace_cycle(self, project_id: str) -> int:
+        """Decrement post-unhalt grace counter by one cycle.
+
+        Returns the remaining count AFTER the decrement (0 if already expired).
+        Callers (the harness) invoke this at the start of a cycle so grace is
+        measured in cycles actually attempted, not real time.
+        """
+        if self._unhalt_grace_remaining.get(project_id, 0) <= 0:
+            return 0
+        try:
+            remaining = await self.journal.decrement_unhalt_grace(project_id)
+        except Exception:
+            logger.warning(
+                'Judge.consume_grace_cycle: journal decrement failed', exc_info=True,
+            )
+            remaining = max(0, self._unhalt_grace_remaining[project_id] - 1)
+        if remaining <= 0:
+            self._unhalt_grace_remaining.pop(project_id, None)
+        else:
+            self._unhalt_grace_remaining[project_id] = remaining
+        return remaining
+
+    async def unhalt(self, project_id: str) -> None:
+        """Clear the halt and seed the post-unhalt grace counter.
+
+        Grace is measured in cycles (decremented by the harness) so a manual
+        unhalt gets a fixed number of fresh cycles to accumulate clean verdicts
+        before the trend detector re-engages. Without this, historical moderates
+        immediately re-halt on the next cycle.
+        """
+        was_halted = project_id in self._halted_projects
         self._halted_projects.discard(project_id)
+        self._halt_cooldown_until.pop(project_id, None)
+
+        grace = max(int(self.config.halt_grace_cycles), 0)
+        if grace > 0:
+            self._unhalt_grace_remaining[project_id] = grace
+        else:
+            self._unhalt_grace_remaining.pop(project_id, None)
+
+        try:
+            await self.journal.clear_halt(
+                project_id,
+                unhalted_at=datetime.now(UTC),
+                grace_cycles=grace,
+            )
+        except Exception:
+            logger.warning('Judge.unhalt: journal.clear_halt failed', exc_info=True)
+
+        if was_halted and self._on_unhalt_cb is not None:
+            try:
+                result = self._on_unhalt_cb(project_id)
+                if hasattr(result, '__await__'):
+                    await result  # type: ignore[misc]
+            except Exception:
+                logger.warning('Judge.unhalt: on_unhalt_cb raised', exc_info=True)

@@ -90,6 +90,10 @@ def mock_journal():
     journal.get_entries = AsyncMock(return_value=[])
     journal.get_recent_verdicts = AsyncMock(return_value=[])
     journal.add_verdict = AsyncMock(return_value=None)
+    journal.get_halt_states = AsyncMock(return_value=[])
+    journal.set_halt = AsyncMock(return_value=None)
+    journal.clear_halt = AsyncMock(return_value=None)
+    journal.decrement_unhalt_grace = AsyncMock(return_value=0)
     return journal
 
 
@@ -481,12 +485,18 @@ async def test_judge_call_llm_openai_none_content(mock_journal):
 # --- Error trend detection tests ---
 
 
-def _make_verdicts(severities: list[str]):
-    """Build a list of JudgeVerdict objects from severity strings."""
+def _make_verdicts(severities: list[str], *, spacing_seconds: float = 60.0):
+    """Build a list of JudgeVerdict objects, oldest first.
+
+    Successive verdicts are spaced ``spacing_seconds`` apart so tests exercising
+    time-windowed logic have a well-defined ordering.
+    """
+    from datetime import timedelta as _td
+    base = datetime.now(tz=UTC)
     return [
         JudgeVerdict(
             run_id=f'run-{i}',
-            reviewed_at=datetime.now(tz=UTC),
+            reviewed_at=base + _td(seconds=i * spacing_seconds),
             severity=VerdictSeverity(s),
         )
         for i, s in enumerate(severities)
@@ -495,7 +505,7 @@ def _make_verdicts(severities: list[str]):
 
 @pytest.mark.asyncio
 async def test_error_trend_minor_only_does_not_halt(mock_journal):
-    """5+ minor verdicts should NOT trigger a halt (the bug fix)."""
+    """10 minor verdicts should NOT trigger a halt (minor counts as ok for trend)."""
     config = _make_judge_config(halt_on_judge_serious=True)
     judge = Judge(config=config, journal=mock_journal)
 
@@ -506,36 +516,73 @@ async def test_error_trend_minor_only_does_not_halt(mock_journal):
 
 
 @pytest.mark.asyncio
-async def test_error_trend_moderate_triggers_halt(mock_journal):
-    """5+ moderate verdicts should trigger a halt."""
-    config = _make_judge_config(halt_on_judge_serious=True)
+async def test_error_trend_moderates_consecutive_most_recent_halt(mock_journal):
+    """5 moderates, with the 3 most recent all moderate, should halt."""
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
     judge = Judge(config=config, journal=mock_journal)
 
-    verdicts = _make_verdicts(['moderate'] * 5 + ['ok'] * 5)
+    # ok, ok, ok, ok, ok, M, M, M, M, M (oldest → newest)
+    # newest three are moderate → consecutive check passes; 5 moderates in window.
+    verdicts = _make_verdicts(['ok'] * 5 + ['moderate'] * 5)
+    await judge._check_error_trends('proj', verdicts)
+
+    assert judge.is_halted('proj')
+    mock_journal.set_halt.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_error_trend_moderates_old_does_not_halt(mock_journal):
+    """5 moderates followed by ok should NOT halt — the ok breaks the consecutive streak."""
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    # Moderates are old, ok is newest → consecutive-most-recent check bails.
+    # This is the core of the self-latching-halt fix.
+    verdicts = _make_verdicts(['moderate'] * 5 + ['ok'] * 1)
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+
+
+@pytest.mark.asyncio
+async def test_error_trend_mixed_moderate_serious_halt(mock_journal):
+    """Mix of moderate+serious, consecutive most recent, triggers halt."""
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    verdicts = _make_verdicts(['ok'] * 5 + ['moderate'] * 3 + ['serious'] * 2)
     await judge._check_error_trends('proj', verdicts)
 
     assert judge.is_halted('proj')
 
 
 @pytest.mark.asyncio
-async def test_error_trend_mixed_moderate_serious_triggers_halt(mock_journal):
-    """Mix of moderate+serious at threshold triggers halt."""
-    config = _make_judge_config(halt_on_judge_serious=True)
+async def test_error_trend_under_count_no_halt(mock_journal):
+    """4 moderate + 6 ok should NOT trigger a halt (below count threshold)."""
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+    )
     judge = Judge(config=config, journal=mock_journal)
 
-    verdicts = _make_verdicts(['moderate'] * 3 + ['serious'] * 2 + ['ok'] * 5)
-    await judge._check_error_trends('proj', verdicts)
-
-    assert judge.is_halted('proj')
-
-
-@pytest.mark.asyncio
-async def test_error_trend_under_threshold_no_halt(mock_journal):
-    """4 moderate + 6 ok should NOT trigger a halt."""
-    config = _make_judge_config(halt_on_judge_serious=True)
-    judge = Judge(config=config, journal=mock_journal)
-
-    verdicts = _make_verdicts(['moderate'] * 4 + ['ok'] * 6)
+    verdicts = _make_verdicts(['ok'] * 6 + ['moderate'] * 4)
     await judge._check_error_trends('proj', verdicts)
 
     assert not judge.is_halted('proj')
@@ -551,6 +598,156 @@ async def test_error_trend_disabled_config_no_halt(mock_journal):
     await judge._check_error_trends('proj', verdicts)
 
     assert not judge.is_halted('proj')
+
+
+@pytest.mark.asyncio
+async def test_error_trend_outside_window_no_halt(mock_journal):
+    """Moderates outside the time window are ignored even if consecutive-most-recent."""
+    from datetime import timedelta as _td
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=6.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    # All verdicts 48 hours old — outside the 6h window → no halt
+    old = datetime.now(tz=UTC) - _td(hours=48)
+    verdicts = [
+        JudgeVerdict(
+            run_id=f'run-{i}',
+            reviewed_at=old + _td(seconds=i * 60),
+            severity=VerdictSeverity.moderate,
+        )
+        for i in range(10)
+    ]
+    await judge._check_error_trends('proj', verdicts)
+
+    assert not judge.is_halted('proj')
+
+
+@pytest.mark.asyncio
+async def test_grace_cycles_suppress_trend_check(mock_journal):
+    """After unhalt seeds grace, trend check is skipped until grace is consumed."""
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+        halt_grace_cycles=2,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    # Seed: halt → unhalt → grace=2
+    await judge._apply_halt('proj', reason='seed')
+    assert judge.is_halted('proj')
+
+    mock_journal.decrement_unhalt_grace = AsyncMock(side_effect=[1, 0])
+    await judge.unhalt('proj')
+    assert not judge.is_halted('proj')
+    assert judge.unhalt_grace_remaining('proj') == 2
+
+    # Even with a full trend-condition set of verdicts, no halt while grace > 0
+    verdicts = _make_verdicts(['ok'] * 5 + ['moderate'] * 5)
+    await judge._check_error_trends('proj', verdicts)
+    assert not judge.is_halted('proj')
+
+    # Consume one cycle — grace now 1 — still suppressed
+    remaining = await judge.consume_grace_cycle('proj')
+    assert remaining == 1
+    await judge._check_error_trends('proj', verdicts)
+    assert not judge.is_halted('proj')
+
+    # Consume the second cycle — grace now 0 — trend check resumes
+    remaining = await judge.consume_grace_cycle('proj')
+    assert remaining == 0
+    await judge._check_error_trends('proj', verdicts)
+    assert judge.is_halted('proj')
+
+
+@pytest.mark.asyncio
+async def test_cooldown_suppresses_immediate_rehalt(mock_journal):
+    """After a halt, trend check is suppressed during the cooldown window."""
+    config = _make_judge_config(
+        halt_on_judge_serious=True,
+        halt_trend_moderate_count=5,
+        halt_trend_consecutive_required=3,
+        halt_trend_window_hours=24.0,
+        halt_grace_cycles=0,
+        halt_cooldown_seconds=3600.0,
+    )
+    judge = Judge(config=config, journal=mock_journal)
+
+    verdicts = _make_verdicts(['ok'] * 5 + ['moderate'] * 5)
+    await judge._check_error_trends('proj', verdicts)
+    assert judge.is_halted('proj')
+    first_set_halt = mock_journal.set_halt.call_count
+
+    # Simulate operator unhalt (no grace), cooldown still active from _apply_halt
+    judge._halted_projects.discard('proj')
+    # Cooldown is still in _halt_cooldown_until
+    await judge._check_error_trends('proj', verdicts)
+    # No second halt because cooldown suppresses re-halt
+    assert not judge.is_halted('proj')
+    assert mock_journal.set_halt.call_count == first_set_halt
+
+
+@pytest.mark.asyncio
+async def test_unhalt_invokes_callback_and_journal(mock_journal):
+    """unhalt() clears halt, writes journal, and invokes on_unhalt_cb."""
+    called_with: list[str] = []
+
+    def cb(project_id: str) -> None:
+        called_with.append(project_id)
+
+    config = _make_judge_config(
+        halt_on_judge_serious=True, halt_grace_cycles=3, halt_cooldown_seconds=100.0,
+    )
+    judge = Judge(config=config, journal=mock_journal, on_unhalt_cb=cb)
+
+    await judge._apply_halt('proj', reason='seed')
+    assert judge.is_halted('proj')
+
+    await judge.unhalt('proj')
+    assert not judge.is_halted('proj')
+    assert judge.unhalt_grace_remaining('proj') == 3
+    mock_journal.clear_halt.assert_called_once()
+    assert called_with == ['proj']
+
+
+@pytest.mark.asyncio
+async def test_initialize_rehydrates_halt_state(mock_journal):
+    """Judge.initialize() restores halt state from the journal after a restart."""
+    from datetime import timedelta as _td
+
+    now = datetime.now(tz=UTC)
+    mock_journal.get_halt_states = AsyncMock(return_value=[
+        {
+            'project_id': 'halted-proj',
+            'halted_at': now,
+            'cooldown_until': now + _td(seconds=300),
+            'reason': 'persistent halt',
+            'unhalted_at': None,
+            'unhalt_grace_remaining': 0,
+        },
+        {
+            'project_id': 'grace-proj',
+            'halted_at': now - _td(hours=1),
+            'cooldown_until': None,
+            'reason': '',
+            'unhalted_at': now - _td(minutes=5),
+            'unhalt_grace_remaining': 2,
+        },
+    ])
+
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+    await judge.initialize()
+
+    assert judge.is_halted('halted-proj')
+    assert not judge.is_halted('grace-proj')
+    assert judge.unhalt_grace_remaining('grace-proj') == 2
 
 
 # ---------------------------------------------------------------------------

@@ -123,6 +123,15 @@ CREATE TABLE IF NOT EXISTS run_actions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ra_run ON run_actions(run_id);
+
+CREATE TABLE IF NOT EXISTS halt_state (
+    project_id TEXT PRIMARY KEY,
+    halted_at TEXT NOT NULL,
+    cooldown_until TEXT,
+    reason TEXT DEFAULT '',
+    unhalted_at TEXT,
+    unhalt_grace_remaining INTEGER DEFAULT 0
+);
 """
 
 
@@ -460,16 +469,31 @@ class ReconciliationJournal:
             )
 
     async def get_recent_verdicts(
-        self, project_id: str, limit: int = 10
+        self, project_id: str, limit: int = 10, since: datetime | None = None,
     ) -> list[JudgeVerdict]:
+        """Return up to ``limit`` verdicts for ``project_id``, newest first.
+
+        When ``since`` is provided, only verdicts reviewed at or after that
+        timestamp are returned (still bounded by ``limit``).
+        """
         db = self._require_db()
-        async with db.execute(
-            """SELECT jv.* FROM judge_verdicts jv
-               JOIN runs r ON jv.run_id = r.id
-               WHERE r.project_id = ?
-               ORDER BY jv.reviewed_at DESC LIMIT ?""",
-            (project_id, limit),
-        ) as cursor:
+        if since is not None:
+            query = (
+                """SELECT jv.* FROM judge_verdicts jv
+                   JOIN runs r ON jv.run_id = r.id
+                   WHERE r.project_id = ? AND jv.reviewed_at >= ?
+                   ORDER BY jv.reviewed_at DESC LIMIT ?"""
+            )
+            params: tuple = (project_id, _fmt_dt(since), limit)
+        else:
+            query = (
+                """SELECT jv.* FROM judge_verdicts jv
+                   JOIN runs r ON jv.run_id = r.id
+                   WHERE r.project_id = ?
+                   ORDER BY jv.reviewed_at DESC LIMIT ?"""
+            )
+            params = (project_id, limit)
+        async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
         return [
             JudgeVerdict(
@@ -481,6 +505,101 @@ class ReconciliationJournal:
             )
             for row in rows
         ]
+
+    # ── Halt state (persistent across service restarts) ─────────────────
+
+    async def get_halt_states(self) -> list[dict]:
+        """Return one dict per project in halt_state (not filtered).
+
+        Callers decide whether a project is effectively halted by comparing
+        `unhalt_grace_remaining` and other fields against their own policy —
+        the journal just stores the raw rows.
+        """
+        db = self._require_db()
+        async with db.execute('SELECT * FROM halt_state') as cursor:
+            rows = await cursor.fetchall()
+        return [
+            {
+                'project_id': row['project_id'],
+                'halted_at': _parse_dt(row['halted_at']),
+                'cooldown_until': _parse_dt(row['cooldown_until']),
+                'reason': row['reason'] or '',
+                'unhalted_at': _parse_dt(row['unhalted_at']),
+                'unhalt_grace_remaining': row['unhalt_grace_remaining'] or 0,
+            }
+            for row in rows
+        ]
+
+    async def set_halt(
+        self,
+        project_id: str,
+        halted_at: datetime,
+        cooldown_until: datetime | None,
+        reason: str,
+    ) -> None:
+        """Record (or refresh) a halt. Clears any prior unhalt_grace counter."""
+        async with self._txn() as db:
+            await db.execute(
+                """INSERT INTO halt_state
+                   (project_id, halted_at, cooldown_until, reason,
+                    unhalted_at, unhalt_grace_remaining)
+                   VALUES (?, ?, ?, ?, NULL, 0)
+                   ON CONFLICT(project_id) DO UPDATE SET
+                     halted_at = excluded.halted_at,
+                     cooldown_until = excluded.cooldown_until,
+                     reason = excluded.reason,
+                     unhalted_at = NULL,
+                     unhalt_grace_remaining = 0
+                """,
+                (
+                    project_id,
+                    _fmt_dt(halted_at),
+                    _fmt_dt(cooldown_until),
+                    reason,
+                ),
+            )
+
+    async def clear_halt(
+        self,
+        project_id: str,
+        *,
+        unhalted_at: datetime,
+        grace_cycles: int,
+    ) -> None:
+        """Mark the project as unhalted and seed the post-unhalt grace counter.
+
+        The row is kept (not deleted) so the grace counter is queryable and so
+        we retain the halt history for diagnostics. A subsequent halt overwrites
+        the row via set_halt.
+        """
+        async with self._txn() as db:
+            await db.execute(
+                """UPDATE halt_state
+                   SET unhalted_at = ?,
+                       unhalt_grace_remaining = ?,
+                       cooldown_until = NULL
+                   WHERE project_id = ?""",
+                (_fmt_dt(unhalted_at), grace_cycles, project_id),
+            )
+
+    async def decrement_unhalt_grace(self, project_id: str) -> int:
+        """Atomically decrement the grace counter; returns the value AFTER the decrement.
+
+        Returns 0 if no row exists or the counter was already 0.
+        """
+        async with self._txn() as db:
+            await db.execute(
+                """UPDATE halt_state
+                   SET unhalt_grace_remaining = MAX(unhalt_grace_remaining - 1, 0)
+                   WHERE project_id = ? AND unhalt_grace_remaining > 0""",
+                (project_id,),
+            )
+            async with db.execute(
+                'SELECT unhalt_grace_remaining FROM halt_state WHERE project_id = ?',
+                (project_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return int(row['unhalt_grace_remaining']) if row else 0
 
     # ── Stale-run recovery ──────────────────────────────────────────────
 
