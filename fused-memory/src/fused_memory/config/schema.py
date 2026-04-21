@@ -256,9 +256,9 @@ class ReconciliationConfig(BaseModel):
     stale_lock_seconds: float = Field(default=7200.0)
 
     # Timeouts
-    tool_timeout_seconds: float = Field(default=120.0)
+    tool_timeout_seconds: float = Field(default=120.0, gt=0)
     stage_timeout_seconds: int = Field(default=3600, gt=0)
-    cycle_timeout_seconds: int = Field(default=21600)
+    cycle_timeout_seconds: int = Field(default=21600, gt=0)
     stale_run_recovery_seconds: int = Field(
         default=600,
         gt=0,
@@ -302,7 +302,7 @@ class ReconciliationConfig(BaseModel):
 
     @model_validator(mode='after')
     def _validate_cli_timeouts_within_stage(self) -> 'ReconciliationConfig':
-        """Enforce that per-CLI-call budgets do not exceed the outer stage guard."""
+        """Enforce timeout hierarchy: per-CLI budgets ≤ stage guard ≤ cycle guard."""
         if self.agent_cli_timeout_seconds > self.stage_timeout_seconds:
             raise ValueError(
                 f'agent_cli_timeout_seconds ({self.agent_cli_timeout_seconds}) must be '
@@ -314,6 +314,12 @@ class ReconciliationConfig(BaseModel):
                 f'judge_cli_timeout_seconds ({self.judge_cli_timeout_seconds}) must be '
                 f'<= stage_timeout_seconds ({self.stage_timeout_seconds}): '
                 'the per-call budget cannot exceed the outer stage guard.'
+            )
+        if self.stage_timeout_seconds > self.cycle_timeout_seconds:
+            raise ValueError(
+                f'stage_timeout_seconds ({self.stage_timeout_seconds}) must be '
+                f'<= cycle_timeout_seconds ({self.cycle_timeout_seconds}): '
+                'a stage that outlives its enclosing cycle is nonsensical.'
             )
         return self
 
