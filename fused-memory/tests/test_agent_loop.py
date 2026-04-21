@@ -1361,6 +1361,121 @@ async def test_run_threads_serialized_tool_results_into_claude_cli_prompt():
     assert second_prompt == '[Tool Result: tc1] (OK)\n{"doubled": 14}'
 
 
+@pytest.mark.asyncio
+async def test_run_threads_parallel_tool_results_with_double_newline_joiner():
+    """Pins the '\\n\\n' join separator in _serialize_tool_results at integration scope.
+
+    Companion to test_run_threads_serialized_tool_results_into_claude_cli_prompt
+    (the single-result sibling added by Task 897).  That test exercises the
+    per-result format `[Tool Result: <id>] (<status>)\\n<content>` but uses a
+    single tool_use block in turn 1, making the '\\n\\n'.join(parts) call a
+    no-op (len(parts)==1).  This test closes the coverage gap identified by
+    Task 899: two parallel tool_use blocks in turn 1 → two tool_result entries
+    in turn 2's content → _serialize_tool_results joins them with '\\n\\n' →
+    exact-equality assertion on the resulting prompt pins the separator.
+
+    References _serialize_tool_results at agent_loop.py:325 ('\\n\\n'.join(parts)).
+    Any change to the separator (e.g. '\\n' or ', ') will fail this test.
+    """
+    from shared.cli_invoke import AgentResult
+
+    fake_gate = MagicMock()
+    config = _make_cli_config()
+
+    async def my_tool_fn(x: int = 0):
+        return {'doubled': x * 2}
+
+    async def other_tool_fn(x: int = 0):
+        return {'tripled': x * 3}
+
+    tools = {
+        'my_tool': ToolDefinition(
+            name='my_tool',
+            description='Doubles the input',
+            parameters={'type': 'object', 'properties': {'x': {'type': 'integer'}}},
+            function=my_tool_fn,
+        ),
+        'other_tool': ToolDefinition(
+            name='other_tool',
+            description='Triples the input',
+            parameters={'type': 'object', 'properties': {'x': {'type': 'integer'}}},
+            function=other_tool_fn,
+        ),
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Signals completion',
+            parameters={'type': 'object', 'properties': {'report': {'type': 'object'}}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    # Turn 1: agent calls both my_tool and other_tool in the same response
+    first_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-1',
+        structured_output={
+            'thinking': 'calling two tools',
+            'tool_calls': [
+                {'id': 'tc1', 'name': 'my_tool', 'input': {'x': 7}},
+                {'id': 'tc2', 'name': 'other_tool', 'input': {'x': 5}},
+            ],
+        },
+    )
+    # Turn 2: agent calls stage_complete to terminate
+    second_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-1',
+        structured_output={
+            'thinking': 'done',
+            'tool_calls': [
+                {'id': 'tc3', 'name': 'stage_complete', 'input': {'report': {'ok': True}}}
+            ],
+        },
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.side_effect = [first_result, second_result]
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='You are a test agent.',
+            tools=tools,
+            terminal_tool='stage_complete',
+            usage_gate=fake_gate,
+        )
+
+        result, _journal = await agent.run('initial payload')
+
+    # Terminal tool input round-trips through run()
+    assert result == {'report': {'ok': True}}
+
+    # Both LLM turns must have fired
+    assert mock_invoke.call_count == 2
+
+    # Turn 1: initial string payload is passed straight through
+    first_prompt = mock_invoke.call_args_list[0].kwargs['prompt']
+    assert first_prompt == 'initial payload'
+
+    # Turn 2: two tool_results are serialized and joined by '\n\n'.
+    # Exact equality pins the separator — any change (e.g. '\n' or ', ') fails here.
+    second_prompt = mock_invoke.call_args_list[1].kwargs['prompt']
+    expected = (
+        '[Tool Result: tc1] (OK)\n{"doubled": 14}'
+        '\n\n'
+        '[Tool Result: tc2] (OK)\n{"tripled": 15}'
+    )
+    assert second_prompt == expected
+
+    # Positive guard: double-newline separator is present and two results appear
+    assert '\n\n' in second_prompt
+    assert second_prompt.count('[Tool Result:') == 2
+
+
 # ---------------------------------------------------------------------------
 # CLI failure path surfaces stderr + summary in RuntimeError
 # ---------------------------------------------------------------------------
