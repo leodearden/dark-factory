@@ -787,10 +787,12 @@ async def run_verification(
 
     if passed:
         logger.info('Verification passed: %s', summary)
-    elif timed_out:
-        logger.warning('Verification failed: %s', summary)
     else:
-        logger.info('Verification failed: %s', summary)
+        detail_tail = f' — {cause_hint}' if cause_hint else ''
+        if timed_out:
+            logger.warning('Verification failed: %s%s', summary, detail_tail)
+        else:
+            logger.info('Verification failed: %s%s', summary, detail_tail)
     return result
 
 
