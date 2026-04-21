@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -165,6 +166,129 @@ class TestReconcileStrandedInProgress:
         # No log message mentioning revert or stranded for this task
         revert_logs = [r for r in caplog.records if 'revert' in r.message.lower() or 'stranded' in r.message.lower()]
         assert len(revert_logs) == 0
+
+    @pytest.mark.parametrize(
+        'lock_contents,task_id,expect_reverted,expect_lock_exists,warn_pattern',
+        [
+            # (a) Corrupt JSON → revert + unlink (JSONDecodeError still caught)
+            pytest.param(
+                'not-valid-json', 9, True, False, None,
+                id='corrupt-json',
+            ),
+            # (b) Missing owner_pid key → task NOT reverted, lock preserved
+            #     Legacy format: task left untouched, WARNING emitted
+            pytest.param(
+                json.dumps({'session_id': 'test-10', 'locked_at': '2026-01-01T00:00:00+00:00'}),
+                '10', False, True, r'owner_pid|legacy',
+                id='missing-owner-pid',
+            ),
+            # (e) Non-dict JSON (list) → treated as corruption → revert + unlink
+            pytest.param(
+                '["not", "an", "object"]', 14, True, False, None,
+                id='non-dict-json',
+            ),
+            # (c) Numeric-string owner_pid of a live process → task NOT reverted
+            #     Exercises the int(owner_pid) cast path with a string value
+            pytest.param(
+                'LIVE_PID', 11, False, True, None,
+                id='live-pid-as-string',
+            ),
+            # (d1) No lock file, id as int → reverted via no-lock branch
+            pytest.param(None, 12, True, False, None, id='no-lock-int-id'),
+            # (d2) No lock file, id as str → reverted via no-lock branch
+            pytest.param(None, '13', True, False, None, id='no-lock-str-id'),
+        ],
+    )
+    async def test_reconcile_lock_format_variants(
+        self,
+        harness: Harness,
+        caplog,
+        lock_contents,
+        task_id,
+        expect_reverted: bool,
+        expect_lock_exists: bool,
+        warn_pattern,
+    ):
+        """Parametrized coverage of plan.lock format edge cases."""
+        import logging
+
+        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
+            {'id': task_id, 'status': 'in-progress'},
+        ]
+
+        tid_str = str(task_id)
+        lock_dir = harness.git_ops.worktree_base / tid_str / '.task'
+        lock_path = lock_dir / 'plan.lock'
+
+        if lock_contents is not None:
+            # Resolve sentinel for live-PID case
+            if lock_contents == 'LIVE_PID':
+                lock_contents = json.dumps({
+                    'session_id': f'{tid_str}-live',
+                    'locked_at': '2026-01-01T00:00:00+00:00',
+                    'owner_pid': str(os.getpid()),
+                })
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text(lock_contents)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress()
+
+        calls = harness.scheduler.set_task_status.call_args_list  # type: ignore[attr-defined]
+        if expect_reverted:
+            assert len(calls) == 1, f'Expected 1 revert call, got: {calls}'
+            assert calls[0].args[0] == tid_str, (
+                f'Expected set_task_status called with id={tid_str!r}, got {calls[0].args[0]!r}'
+            )
+            assert calls[0].args[1] == 'pending'
+        else:
+            assert len(calls) == 0, f'Expected no calls (task untouched), got: {calls}'
+
+        assert lock_path.exists() == expect_lock_exists, (
+            f'Lock file existence mismatch: expected {expect_lock_exists}, '
+            f'got {lock_path.exists()}'
+        )
+
+        if warn_pattern is not None:
+            matching = [
+                r for r in caplog.records
+                if re.search(warn_pattern, r.message, re.IGNORECASE)
+            ]
+            assert len(matching) >= 1, (
+                f'Expected WARNING matching {warn_pattern!r} in orchestrator.harness logs, '
+                f'got: {[r.message for r in caplog.records]}'
+            )
+            assert matching[0].levelno == logging.WARNING, (
+                f'Expected WARNING level, got {logging.getLevelName(matching[0].levelno)}'
+            )
+
+    async def test_unexpected_exception_propagates_out_of_reconcile(
+        self, harness: Harness
+    ):
+        """TypeError from json.loads must propagate — not be silently swallowed.
+
+        RED against current code: `except Exception:` catches TypeError and
+        treats the lock as stale (task reverted, lock deleted, no exception).
+        After the fix (narrow to OSError/JSONDecodeError/ValueError), TypeError
+        propagates out, set_task_status is never called, and the lock survives.
+        """
+        from unittest.mock import patch as _patch
+
+        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
+            {'id': 15, 'status': 'in-progress'},
+        ]
+        lock_dir = harness.git_ops.worktree_base / '15' / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text('{"session_id": "15-xyz", "owner_pid": 1}')  # valid-looking
+
+        with _patch('orchestrator.harness.json.loads', side_effect=TypeError('unexpected')), pytest.raises(TypeError, match='unexpected'):
+            await harness._reconcile_stranded_in_progress()
+
+        # No revert must have happened
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        # Lock file must not have been deleted
+        assert lock_path.exists(), 'Lock file must survive when an unexpected exception propagates'
 
 
 # ---------------------------------------------------------------------------

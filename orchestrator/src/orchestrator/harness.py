@@ -901,11 +901,28 @@ Output JSON matching the schema. Every task must appear in the output.
             owner_alive = False
             try:
                 lock_data = json.loads(lock_path.read_text())
+                if not isinstance(lock_data, dict):
+                    raise ValueError('plan.lock is not a JSON object')
+                if 'owner_pid' not in lock_data:
+                    logger.warning(
+                        'Reconcile: task %s has plan.lock without owner_pid '
+                        '(legacy format) — leaving task untouched to avoid '
+                        'stealing work from a live legacy instance',
+                        tid,
+                    )
+                    continue
                 owner_pid = lock_data.get('owner_pid')
                 if owner_pid is not None:
-                    owner_alive = _pid_alive(int(owner_pid))
-            except Exception:
-                # Corrupt/unreadable lock — treat as stale.
+                    try:
+                        owner_alive = _pid_alive(int(owner_pid))
+                    except (TypeError, ValueError):
+                        # owner_pid is non-numeric — treat lock as stale.
+                        owner_alive = False
+            except (OSError, json.JSONDecodeError, ValueError):
+                # OSError: file read failure.
+                # JSONDecodeError: malformed JSON text.
+                # ValueError: malformed lock structure (non-dict JSON value).
+                # (Unexpected exception types propagate — they indicate a bug.)
                 owner_alive = False
 
             if owner_alive:
