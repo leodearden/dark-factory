@@ -110,3 +110,32 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_not_called()
         # Lock file must still exist
         assert lock_path.exists()
+
+    async def test_stale_plan_lock_cleared_and_reverted(
+        self, harness: Harness
+    ):
+        """In-progress task with stale plan.lock (dead PID) → lock cleared and task reverted."""
+        harness.scheduler.get_tasks.return_value = [
+            {'id': 8, 'status': 'in-progress'},
+        ]
+        # Spawn a process and reap it to get a guaranteed-dead PID
+        proc = subprocess.Popen(['true'])
+        proc.wait()
+        dead_pid = proc.pid
+
+        # Create worktree with plan.lock referencing the dead PID
+        lock_dir = harness.git_ops.worktree_base / '8' / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': '8-dead0001',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': dead_pid,
+        }))
+
+        await harness._reconcile_stranded_in_progress()
+
+        # Task must be reverted to pending
+        harness.scheduler.set_task_status.assert_called_once_with('8', 'pending')
+        # Stale lock must be deleted
+        assert not lock_path.exists()
