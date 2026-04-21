@@ -452,6 +452,7 @@ class TaskArtifacts:
             data = json.dumps({
                 'session_id': session_id,
                 'locked_at': datetime.now(UTC).isoformat(),
+                'owner_pid': os.getpid(),
             })
             os.write(fd, data.encode())
         finally:

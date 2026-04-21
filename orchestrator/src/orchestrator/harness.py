@@ -47,6 +47,31 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return True if the process identified by *pid* is alive.
+
+    Mirrors the semantics of
+    fused-memory/src/fused_memory/services/orchestrator_detector.py:58-72
+    without introducing a cross-package import edge.
+
+    - Returns False for pid <= 0 (invalid).
+    - Uses os.kill(pid, 0): success → alive; ProcessLookupError → dead;
+      PermissionError → alive (we can see it but lack permission to signal it);
+      other OSError → treat as dead.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def _acquire_project_lock(project_root: Path) -> IO:
     """Acquire an exclusive flock on a per-project lockfile.
 
@@ -355,6 +380,9 @@ class Harness:
 
             # 2c. Recover crashed tasks from surviving worktrees
             await self._recover_crashed_tasks()
+
+            # 2d. Reconcile stranded in-progress tasks (live-claimant-aware)
+            await self._reconcile_stranded_in_progress()
 
             tasks = await self.scheduler.get_tasks()
             self.report.total_tasks = len([t for t in tasks if t.get('status') == 'pending'])
@@ -832,21 +860,69 @@ Output JSON matching the schema. Every task must appear in the output.
                 logger.info(f'Recovery: cleared stale plan.lock for task {task_id}')
             recovered += 1
 
-        # Reset in-progress tasks to pending
-        tasks = await self.scheduler.get_tasks()
-        reset_count = 0
-        for t in tasks:
-            if t.get('status') == 'in-progress':
-                tid = str(t.get('id', ''))
-                await self.scheduler.set_task_status(tid, 'pending')
-                logger.info(f'Recovery: reset task {tid} from in-progress to pending')
-                reset_count += 1
-
-        if recovered or cleaned or reset_count:
+        if recovered or cleaned:
             logger.info(
                 f'Crash recovery: {recovered} plans recovered, '
-                f'{cleaned} worktrees cleaned, {reset_count} tasks reset'
+                f'{cleaned} worktrees cleaned'
             )
+
+    async def _reconcile_stranded_in_progress(self) -> None:
+        """Startup sweep: revert stranded in-progress tasks to pending.
+
+        Examines every task that is currently in-progress and checks whether
+        it has a live claimant via plan.lock / owner_pid.  Any task without a
+        live claimant is reverted to pending so the scheduler can re-acquire it.
+
+        This method is called AFTER _recover_crashed_tasks() (which may unlink
+        plan.lock for recovered worktrees) and BEFORE the first
+        scheduler.acquire_next() call, so self._dispatched is always empty here.
+        """
+        tasks = await self.scheduler.get_tasks()
+        reverted = 0
+
+        for t in tasks:
+            if t.get('status') != 'in-progress':
+                continue
+
+            tid = str(t.get('id', ''))
+            worktree_path = self.git_ops.worktree_base / tid
+            lock_path = worktree_path / '.task' / 'plan.lock'
+
+            if not lock_path.exists():
+                # No worktree or no lock → orphan, revert.
+                await self.scheduler.set_task_status(tid, 'pending')
+                logger.info(
+                    'Reconcile: reverted task %s to pending (reason=no-lock)', tid
+                )
+                reverted += 1
+                continue
+
+            # Lock exists — check whether the owner is still alive.
+            owner_alive = False
+            try:
+                lock_data = json.loads(lock_path.read_text())
+                owner_pid = lock_data.get('owner_pid')
+                if owner_pid is not None:
+                    owner_alive = _pid_alive(int(owner_pid))
+            except Exception:
+                # Corrupt/unreadable lock — treat as stale.
+                owner_alive = False
+
+            if owner_alive:
+                # Live claimant — leave the task alone.
+                continue
+
+            # Stale lock — clear it and revert.
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
+            await self.scheduler.set_task_status(tid, 'pending')
+            logger.info(
+                'Reconcile: reverted task %s to pending (reason=stale-lock)', tid
+            )
+            reverted += 1
+
+        if reverted:
+            logger.info('Reconcile: %d stranded task(s) reverted to pending', reverted)
 
     async def _run_slot(
         self, assignment, sem: asyncio.Semaphore
