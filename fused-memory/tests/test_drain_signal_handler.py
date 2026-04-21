@@ -103,6 +103,10 @@ class TestRegisterDrainSignalHandlerIntegration:
 
                 # Must run inside the running loop so asyncio.get_running_loop() resolves.
                 _register_drain_signal_handler(stub_harness)
+                # Sanity check: verify something was installed.  Must run before the Runner
+                # exits — loop.close() calls remove_signal_handler() which restores SIG_DFL.
+                current_handler = signal.getsignal(signal.SIGUSR1)
+                assert current_handler is not prior_handler, "SIGUSR1 handler was not installed"
                 os.kill(os.getpid(), signal.SIGUSR1)
                 # Wait for asyncio's signal-dispatch machinery (self-pipe read +
                 # call_soon_threadsafe callback) to invoke _handle_drain_signal.
@@ -129,13 +133,23 @@ class TestRegisterDrainSignalHandlerIntegration:
             async def _run() -> None:
                 # Use an asyncio.Event for deterministic waiting (same as the happy-path test).
                 drain_called = asyncio.Event()
-                stub_harness.drain.side_effect = lambda: drain_called.set()
-
+                # Capture the running loop before setting side_effect: on the fallback path
+                # the side_effect runs inside a real Python signal handler, so we must use
+                # call_soon_threadsafe (asyncio.Event.set() internally uses loop.call_soon,
+                # which is NOT signal-safe per CPython docs).
                 running_loop = asyncio.get_running_loop()
+                stub_harness.drain.side_effect = lambda: running_loop.call_soon_threadsafe(drain_called.set)
+
                 # Force the fallback branch: make loop.add_signal_handler raise NotImplementedError
                 # (Windows) so _register_drain_signal_handler falls back to signal.signal.
-                with patch.object(running_loop, 'add_signal_handler', side_effect=NotImplementedError):
+                # Spy on signal.signal with wraps= so the real installation still happens
+                # (os.kill must actually dispatch to our handler below).
+                with patch('fused_memory.server.main.signal.signal', wraps=signal.signal) as signal_signal_spy, \
+                        patch.object(running_loop, 'add_signal_handler', side_effect=NotImplementedError):
                     _register_drain_signal_handler(stub_harness)
+                    signal_signal_spy.assert_called_once()
+                    assert signal_signal_spy.call_args.args[0] == signal.SIGUSR1
+                    assert callable(signal_signal_spy.call_args.args[1])
 
                 os.kill(os.getpid(), signal.SIGUSR1)
                 # The signal.signal handler is invoked synchronously at the next safe
