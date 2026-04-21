@@ -7,11 +7,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from shared.cli_invoke import AllAccountsCappedException
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
-from shared.cli_invoke import AllAccountsCappedException
 
 
 @pytest.fixture
@@ -195,12 +195,11 @@ async def test_tag_task_modules_handles_all_accounts_capped(harness, caplog):
         retries=5, elapsed_secs=60.0, label='Module tagging'
     )
 
-    with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-        with patch(
-            'orchestrator.harness.invoke_with_cap_retry',
-            AsyncMock(side_effect=cap_exc),
-        ):
-            result = await harness._tag_task_modules()
+    with caplog.at_level(logging.WARNING, logger='orchestrator.harness'), patch(
+        'orchestrator.harness.invoke_with_cap_retry',
+        AsyncMock(side_effect=cap_exc),
+    ):
+        result = await harness._tag_task_modules()
 
     # Must return None (no exception propagation)
     assert result is None

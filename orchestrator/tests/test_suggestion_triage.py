@@ -9,7 +9,6 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
 
 import pytest
-
 from shared.cli_invoke import AllAccountsCappedException
 
 # ---------------------------------------------------------------------------

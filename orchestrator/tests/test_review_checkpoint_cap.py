@@ -12,10 +12,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from shared.cli_invoke import AllAccountsCappedException
 
 from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
 from orchestrator.verify import VerifyResult
-from shared.cli_invoke import AllAccountsCappedException
 
 
 def _make_checkpoint() -> ReviewCheckpoint:

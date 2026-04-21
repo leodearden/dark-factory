@@ -13,7 +13,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from shared.cli_invoke import AllAccountsCappedException, classify_agent_failure, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AllAccountsCappedException,
+    classify_agent_failure,
+    invoke_with_cap_retry,
+)
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
 
