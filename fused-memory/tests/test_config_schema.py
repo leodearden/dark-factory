@@ -409,6 +409,15 @@ class TestReconciliationConfigTimeouts:
         with pytest.raises(ValidationError):
             ReconciliationConfig(judge_cli_timeout_seconds=-1)
 
+    def test_stale_claim_recovery_seconds_field_removed(self):
+        """stale_claim_recovery_seconds must not exist on ReconciliationConfig.
+
+        Task 905 made release_stale_claims(0) unconditional on startup, so the
+        field no longer influences any production behaviour.  Task 909 removed it
+        to prevent operators from tuning a knob that has no effect.
+        """
+        assert 'stale_claim_recovery_seconds' not in ReconciliationConfig.model_fields
+
     # --- gt=0 bounds: stale_claim_recovery_seconds ---
 
     def test_stale_claim_recovery_zero_rejected(self):
