@@ -1114,3 +1114,49 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     assert result.response == 'output text'
     assert result.tool_calls == []
     assert result.session_id == 'sess-1'
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_threads_session_id_across_turns():
+    """Session ID is stored after the first call and passed as resume_session_id on subsequent calls.
+
+    Red test (step-3): verifies the session-threading contract without end-to-end
+    integration. First call must use resume_session_id=None; second call must use
+    resume_session_id='sess-A' (the session_id returned by the first call).
+    """
+    from unittest.mock import AsyncMock, call as mock_call
+    from shared.cli_invoke import AgentResult
+
+    fake_gate = MagicMock()
+    config = _make_cli_config()
+    tools: list = []
+    structured = {'thinking': '', 'tool_calls': []}
+
+    first_result = AgentResult(
+        success=True, output='', session_id='sess-A', structured_output=structured
+    )
+    second_result = AgentResult(
+        success=True, output='', session_id='sess-A', structured_output=structured
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.side_effect = [first_result, second_result]
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test',
+            tools={},
+            usage_gate=fake_gate,
+        )
+
+        await agent._call_claude_cli(prompt='turn-1', tools=tools)
+        await agent._call_claude_cli(prompt='turn-2', tools=tools)
+
+    assert mock_invoke.call_count == 2
+    first_kwargs = mock_invoke.call_args_list[0].kwargs
+    second_kwargs = mock_invoke.call_args_list[1].kwargs
+    assert first_kwargs['resume_session_id'] is None
+    assert second_kwargs['resume_session_id'] == 'sess-A'
