@@ -246,6 +246,119 @@ def test_sigterm_reaps_subprocess_and_no_stragglers(tmp_path: Path):
 # Integration test: SIGTERM propagates through verify._run_cmd subprocess tree
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Integration test: shutdown watchdog force-exits when thread is leaked
+# ---------------------------------------------------------------------------
+
+# Script template for test_shutdown_watchdog_force_exits_on_thread_leak.
+# Paths to orchestrator/src and shared/src are injected at test time via
+# .format(paths=...) so this module-level string doesn't need to be
+# evaluated at import time.
+_WATCHDOG_SHUTDOWN_SCRIPT = """\
+# Integration test: watchdog fires when a non-daemon thread is leaked post-asyncio.run().
+import asyncio
+import sys
+import threading
+import time
+
+# Inject package source paths so orchestrator and shared are importable.
+for _p in {paths!r}:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from orchestrator.cli import _force_exit_after_delay
+
+# Leak a non-daemon thread that sleeps forever — this is what blocks
+# CPython's threading._shutdown() after asyncio.run() returns.
+leak = threading.Thread(target=lambda: time.sleep(3600), name='leaked-thread')
+leak.daemon = False  # explicit: non-daemon so interpreter hangs without watchdog
+leak.start()
+
+# Print READY so the test knows the thread is live.
+print('READY', flush=True)
+sys.stdout.flush()
+
+# Arm the watchdog with a short timeout.  After timeout_secs the watchdog thread
+# will write the diagnostic dump and call os._exit(137).
+_force_exit_after_delay(timeout_secs=1.5)
+
+# Return from main — simulates asyncio.run() finishing.
+# Without the watchdog, the interpreter would hang here forever in
+# threading._shutdown() waiting for the leaked thread.
+"""
+
+
+@pytest.mark.timeout(30)
+def test_shutdown_watchdog_force_exits_on_thread_leak(tmp_path: Path):
+    """Watchdog fires os._exit(137) when a non-daemon thread is leaked.
+
+    Spawns a python child that:
+    1. Starts a non-daemon thread that sleeps 3600s (intentional leak).
+    2. Arms _force_exit_after_delay(timeout_secs=1.5).
+    3. Returns from main — without the watchdog, CPython's
+       threading._shutdown() would block on the leaked thread forever.
+
+    Asserts:
+    - Child exits within 10s (watchdog fires after ~1.5s).
+    - rc == 137 (the watchdog's forced exit code).
+    - stderr contains the 'SHUTDOWN WATCHDOG FIRED' sentinel.
+    """
+    here = Path(__file__).resolve().parent
+    orch_src = str(here.parent / 'src')
+    shared_src = str(here.parent.parent / 'shared' / 'src')
+    paths = [orch_src, shared_src]
+
+    script = tmp_path / 'watchdog_shutdown.py'
+    script.write_text(_WATCHDOG_SHUTDOWN_SCRIPT.format(paths=paths))
+
+    proc = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        # New process group so we can reap strays deterministically.
+        start_new_session=True,
+    )
+    # start_new_session=True guarantees pgid == pid at spawn; frozen int
+    # avoids PID-reuse foot-gun after proc.wait().
+    pgid = proc.pid
+
+    try:
+        # Wait for the script to print READY so the thread is running and
+        # the watchdog is armed.
+        deadline = time.monotonic() + 10.0
+        ready = False
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline() if proc.stdout else b''
+            if line.strip() == b'READY':
+                ready = True
+                break
+        assert ready, 'watchdog_shutdown.py never reached READY'
+
+        try:
+            rc = proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired as exc:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+            proc.wait(timeout=5.0)
+            raise AssertionError(
+                'Watchdog did not fire: python did not exit within 10s'
+            ) from exc
+
+        stderr_text = proc.stderr.read().decode(errors='replace') if proc.stderr else ''
+
+        assert rc == 137, (
+            f'expected rc=137 (watchdog force-exit), got rc={rc}\nstderr:\n{stderr_text}'
+        )
+        assert 'SHUTDOWN WATCHDOG FIRED' in stderr_text, (
+            f'sentinel not in stderr:\n{stderr_text!r}'
+        )
+    finally:
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+            proc.wait(timeout=5.0)
+
+
 # Script template for test_sigterm_reaps_verify_subprocess_tree.
 # Paths to orchestrator/src and shared/src are injected at test time via
 # .format(paths=...) so this module-level string doesn't need to be

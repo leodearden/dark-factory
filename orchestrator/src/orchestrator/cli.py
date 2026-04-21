@@ -3,8 +3,11 @@
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import click
@@ -16,6 +19,74 @@ load_dotenv()  # loads .env into os.environ (e.g. CLAUDE_OAUTH_TOKEN_A/B)
 
 LOG_FORMAT = '%(asctime)s %(levelname)-8s [%(name)s] %(message)s'
 DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
+
+# How long after asyncio.run() returns to wait before force-exiting.
+# The watchdog is armed AFTER asyncio.run() returns (not before) so that
+# long orchestration runs are never affected. After this deadline a diagnostic
+# dump is written to stderr and os._exit(137) fires.
+SHUTDOWN_WATCHDOG_TIMEOUT_SECS = 30
+
+
+def _force_exit_after_delay(
+    timeout_secs: float,
+    exit_code: int = 137,
+    *,
+    stream=None,
+) -> Callable[[], None]:
+    """Arm a daemon-thread watchdog that force-exits if not disarmed in time.
+
+    Spawns a daemon thread (cannot block interpreter shutdown) that waits
+    ``timeout_secs`` seconds.  If the ``disarm`` callable returned by this
+    function is NOT called before the timeout, the thread writes a diagnostic
+    dump of live threads/frames to *stream* (defaulting to ``sys.stderr`` at
+    fire time) then calls ``os._exit(exit_code)``.
+
+    ``os._exit`` is used (not ``sys.exit``) so that ``threading._shutdown``
+    and atexit callbacks are bypassed entirely — exactly the stuck path we
+    need to escape.
+
+    Exit code 137 = 128 + 9 (SIGKILL convention); distinguishable from
+    130 (SIGINT) and 143 (SIGTERM) in operator logs.
+
+    Returns a *disarm* callable.  Calling it (even multiple times) is safe
+    and prevents the watchdog from firing.  The disarm handle is provided for
+    tests and future use; the orchestrator intentionally never disarms so the
+    watchdog guards interpreter shutdown (atexit callbacks +
+    ``threading._shutdown()`` joining non-daemon threads).
+    """
+    _event = threading.Event()
+
+    def _watchdog() -> None:
+        fired = not _event.wait(timeout_secs)
+        if not fired:
+            # Disarmed normally — exit without doing anything.
+            return
+        # Timeout reached without disarm: write diagnostic and force-exit.
+        out = stream if stream is not None else sys.stderr
+        try:
+            import traceback
+
+            lines = ['SHUTDOWN WATCHDOG FIRED — process hung after asyncio.run() returned\n']
+            frames = sys._current_frames()
+            for t in threading.enumerate():
+                frame = frames.get(t.ident) if t.ident is not None else None
+                lines.append(f'\n--- Thread {t.name!r} (daemon={t.daemon}, ident={t.ident}) ---\n')
+                if frame is not None:
+                    lines.extend(traceback.format_stack(frame))
+            out.write(''.join(lines))
+            out.flush()
+        except Exception:
+            pass
+        os._exit(exit_code)
+
+    thread = threading.Thread(target=_watchdog, name='shutdown-watchdog', daemon=True)
+    thread.start()
+
+    def disarm() -> None:
+        """Signal the watchdog not to fire."""
+        _event.set()
+
+    return disarm
 
 
 def _make_cancel_handler(main_task, logger):
@@ -115,8 +186,17 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
         report = asyncio.run(_main())
     except asyncio.CancelledError:
         click.echo('Orchestrator cancelled', err=True)
+        # asyncio.run() has returned — arm the watchdog NOW to guard interpreter
+        # shutdown (atexit callbacks + threading._shutdown() joining non-daemon
+        # threads). The watchdog is intentionally NOT disarmed: if shutdown
+        # completes cleanly, the daemon thread is killed with the process;
+        # if shutdown hangs, the daemon thread fires os._exit(137).
+        _force_exit_after_delay(SHUTDOWN_WATCHDOG_TIMEOUT_SECS)
         sys.exit(130)
 
+    # asyncio.run() has returned normally — arm the watchdog to guard interpreter
+    # shutdown. Intentionally left armed (see CancelledError path for rationale).
+    _force_exit_after_delay(SHUTDOWN_WATCHDOG_TIMEOUT_SECS)
     click.echo(report.summary())
 
     if report.blocked > 0:
