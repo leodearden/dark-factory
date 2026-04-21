@@ -91,6 +91,13 @@ _CARGO_SUBCMDS = ('test', 'clippy', 'check', 'build', 'run')
 # as ``cargo test --workspace && uv run pytest``.
 _CARGO_SCOPE_SAFE_NON_RS_EXTS = frozenset({'.toml', '.yaml', '.yml', '.json', '.md'})
 
+# Rust-specific filenames whose extensions can't be globally whitelisted.
+# ``Cargo.lock`` has the ``.lock`` extension, which is also used by non-Rust
+# ecosystem lockfiles (``yarn.lock``, ``poetry.lock``, ``uv.lock``), so adding
+# ``.lock`` to ``_CARGO_SCOPE_SAFE_NON_RS_EXTS`` would silently admit those
+# files and break the polyglot guard for mixed-ecosystem diffs.
+_CARGO_SCOPE_SAFE_NON_RS_NAMES = frozenset({'Cargo.lock'})
+
 # Pre-compiled regex that matches ``cargo <subcmd> ...--workspace`` where
 # ``...`` does not cross a shell delimiter (``&&``, ``||``, ``;``, ``|``),
 # so chained non-cargo commands (like ``cd gui && npm test``) are left alone.
@@ -200,9 +207,10 @@ def _apply_cargo_scope(
     - *task_files* is empty
     - *task_files* contains no ``.rs`` files (no Rust source touched)
     - any non-``.rs`` file has an extension outside the safe config/data whitelist
-      (``.toml``, ``.yaml``, ``.yml``, ``.json``, ``.md``); this prevents
-      under-protecting the non-Rust side of polyglot tasks with chained commands
-      such as ``cargo test --workspace && uv run pytest``
+      (``.toml``, ``.yaml``, ``.yml``, ``.json``, ``.md``) AND its basename is not
+      in the filename allowlist (``Cargo.lock``); this prevents under-protecting
+      the non-Rust side of polyglot tasks with chained commands such as
+      ``cargo test --workspace && uv run pytest``
     - the workspace has no discoverable crates
     - ``files_to_crates`` returns ``None`` (a file lives outside all crates)
     - the rewritten commands are byte-identical to the originals
@@ -224,7 +232,10 @@ def _apply_cargo_scope(
     # from being silently skipped when only some crates are scoped.
     non_rs = [f for f in task_files if not f.endswith('.rs')]
     for f in non_rs:
-        if Path(f).suffix.lower() not in _CARGO_SCOPE_SAFE_NON_RS_EXTS:
+        if (
+            Path(f).suffix.lower() not in _CARGO_SCOPE_SAFE_NON_RS_EXTS
+            and Path(f).name not in _CARGO_SCOPE_SAFE_NON_RS_NAMES
+        ):
             return mc
 
     crates_map = discover_workspace_crates(project_root)
