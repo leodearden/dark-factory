@@ -27,11 +27,6 @@ CLAUDE_CLI_RESPONSE_SCHEMA = {
     'type': 'object',
     'properties': {
         'thinking': {'type': 'string'},
-        # Optional free-form assistant reply (distinct from thinking: thinking is
-        # private reasoning; response is the visible answer when no tool calls
-        # are needed).  Not required by the schema — most turns only produce
-        # tool_calls.
-        'response': {'type': 'string'},
         'tool_calls': {
             'type': 'array',
             'items': {
@@ -419,7 +414,7 @@ class _CLIResponseAdapter:
     Exposes both the legacy ``.content`` list (for drop-in compatibility with
     the anthropic/openai branches) and direct attribute access (for
     delegation-level tests and future callers that don't need the block list):
-    ``.thinking``, ``.response``, ``.tool_calls``, ``.session_id``.
+    ``.thinking``, ``.tool_calls``, ``.session_id``.
     """
 
     def __init__(self, structured_output: dict, session_id: str = ''):
@@ -428,7 +423,6 @@ class _CLIResponseAdapter:
 
         # Direct attribute access
         self.thinking: str = structured_output.get('thinking', '')
-        self.response: str = structured_output.get('response', '')
         self.tool_calls: list = structured_output.get('tool_calls', [])
         self.session_id: str = session_id
 
