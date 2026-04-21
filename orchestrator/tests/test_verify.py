@@ -8,6 +8,7 @@ import pytest
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
+    _aggregate_results,
     _apply_cargo_scope,
     _extract_cause_hint,
     _run_cmd,
@@ -15,6 +16,7 @@ from orchestrator.verify import (
     run_scoped_verification,
     run_verification,
     scope_module_config,
+    VerifyResult,
 )
 
 
@@ -1286,3 +1288,169 @@ class TestExtractCauseHint:
         )
         hint = _extract_cause_hint(output)
         assert hint == 'error: first error here', f'Unexpected hint: {hint!r}'
+
+
+class TestVerifyResultCauseHint:
+    """Tests for the ``cause_hint`` field on ``VerifyResult`` and its population.
+
+    Tests (a) will fail until step 5 adds ``cause_hint`` to ``VerifyResult``.
+    Tests (b)–(f) will also fail until step 5 wires hint population into
+    ``run_verification`` and ``_aggregate_results``.
+    """
+
+    # (a) VerifyResult accepts cause_hint kwarg with default ''
+    def test_verify_result_accepts_cause_hint_field(self):
+        """VerifyResult can be constructed with cause_hint kwarg; default is ''."""
+        vr_default = VerifyResult(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='All checks passed',
+        )
+        assert vr_default.cause_hint == '', (
+            f'Default cause_hint should be empty, got {vr_default.cause_hint!r}'
+        )
+
+        vr_explicit = VerifyResult(
+            passed=False,
+            test_output='error: bad',
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            cause_hint='error: bad',
+        )
+        assert vr_explicit.cause_hint == 'error: bad', (
+            f'Explicit cause_hint mismatch: {vr_explicit.cause_hint!r}'
+        )
+
+    # (b) run_verification populates cause_hint from test output when test_rc != 0
+    @pytest.mark.asyncio
+    async def test_run_verification_populates_cause_hint_from_test_failure(
+        self, tmp_path: Path,
+    ):
+        """run_verification sets cause_hint from _extract_cause_hint(test_output) when test fails."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cargo test' in cmd:
+                return 1, test_output, False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, config, max_retries=0)
+
+        assert not result.passed
+        assert result.cause_hint.startswith('error: --exclude'), (
+            f'Expected cause_hint to start with error: --exclude, got {result.cause_hint!r}'
+        )
+
+    # (c) both test and lint fail → cause_hint has both hints joined by ' | '
+    @pytest.mark.asyncio
+    async def test_run_verification_joins_hints_from_multiple_failures(
+        self, tmp_path: Path,
+    ):
+        """When test and lint both fail, cause_hint joins their hints with ' | '."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='ruff check src/',
+            type_check_command='echo ok',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cargo test' in cmd:
+                return 1, 'error: cargo-bad', False
+            if 'ruff' in cmd:
+                return 1, 'error: ruff-bad', False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, config, max_retries=0)
+
+        assert not result.passed
+        assert ' | ' in result.cause_hint, (
+            f'Expected " | " separator in cause_hint, got {result.cause_hint!r}'
+        )
+        assert 'cargo-bad' in result.cause_hint
+        assert 'ruff-bad' in result.cause_hint
+
+    # (d) _aggregate_results surfaces first non-empty cause_hint from failing children
+    def test_aggregate_results_surfaces_cause_hint_from_children(self):
+        """_aggregate_results joins cause_hint from failing child results."""
+        child1 = VerifyResult(
+            passed=False,
+            test_output='error: bad in child1',
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            cause_hint='error: bad in child1',
+        )
+        child2 = VerifyResult(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='All checks passed',
+            cause_hint='',
+        )
+        agg = _aggregate_results([child1, child2])
+        assert agg.cause_hint, (
+            f'Expected non-empty cause_hint in aggregated result, got {agg.cause_hint!r}'
+        )
+        assert 'bad in child1' in agg.cause_hint
+
+    # (e) passed=True → cause_hint is ''
+    @pytest.mark.asyncio
+    async def test_run_verification_cause_hint_empty_on_pass(self, tmp_path: Path):
+        """When verification passes, cause_hint must be ''."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='echo ok',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, config, max_retries=0)
+
+        assert result.passed
+        assert result.cause_hint == '', (
+            f'Passed verification should have empty cause_hint, got {result.cause_hint!r}'
+        )
+
+    # (f) pure timeout failure → cause_hint contains 'Command timed out after'
+    @pytest.mark.asyncio
+    async def test_run_verification_cause_hint_from_timeout(self, tmp_path: Path):
+        """When failure is a pure timeout, cause_hint contains 'Command timed out after'."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+            verify_command_timeout_secs=0.1,
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cargo test' in cmd:
+                return 1, f'Command timed out after {timeout}s: {cmd}', True
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, config, max_retries=0)
+
+        assert not result.passed
+        assert result.timed_out
+        assert 'Command timed out after' in result.cause_hint, (
+            f'Expected timeout hint in cause_hint, got {result.cause_hint!r}'
+        )
