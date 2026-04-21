@@ -2351,3 +2351,33 @@ async def test_replay_propagates_cancellation_and_preserves_claims(
     remaining = await event_buffer.claim_deferred_writes('test-project')
     assert len(remaining) == 2
     assert [r['content'] for r in remaining] == ['b', 'c']
+
+
+@pytest.mark.asyncio
+async def test_run_loop_releases_stale_claims_on_startup(
+    journal, event_buffer, mock_memory_service
+):
+    """run_loop() must call release_stale_claims once during startup (not per iteration)."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # Patch side-effect dependencies to avoid network/filesystem calls
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+
+    # Spy on release_stale_claims
+    original_release = event_buffer.release_stale_claims
+    harness.buffer.release_stale_claims = AsyncMock(
+        side_effect=original_release, return_value=0
+    )
+
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+
+    # Must be called exactly once (startup, not per loop iteration)
+    harness.buffer.release_stale_claims.assert_called_once_with(
+        harness.config.stale_run_recovery_seconds
+    )
