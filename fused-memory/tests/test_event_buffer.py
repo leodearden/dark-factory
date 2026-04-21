@@ -1015,3 +1015,75 @@ async def test_peek_then_drain_by_ids_workflow(buf):
     count = await buf.drain_by_ids('test-project', selected_ids)
     assert count == 3
     assert (await buf.get_buffer_stats('test-project'))['size'] == 2
+
+
+# ── Migration tests ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_migrate_drops_legacy_idx_dw_project(tmp_path):
+    """_migrate() drops the legacy idx_dw_project single-column index.
+
+    Seeds an intermediate-migration schema — deferred_writes already has
+    claimed_at and attempt_count (so executescript's CREATE INDEX IF NOT EXISTS
+    idx_dw_project_claimed can succeed), but the old single-column
+    idx_dw_project index has not yet been removed.  This represents a DB
+    created by a code version that added claimed_at without also dropping the
+    now-redundant index.
+
+    After initialize():
+    * idx_dw_project must be absent.
+    * idx_dw_project_claimed (project_id, claimed_at) must be present.
+
+    This test would FAIL if _migrate() never issued DROP INDEX for
+    idx_dw_project (e.g. an implementation that gates the drop on a
+    sqlite_master check but then evaluates the condition incorrectly and skips
+    the DROP for legacy DBs where the index does exist).
+    """
+    import aiosqlite
+
+    db_path = tmp_path / 'legacy.db'
+
+    # Seed an intermediate-migration state: the full current column set is
+    # present (claimed_at, attempt_count) so executescript won't fail when it
+    # tries to CREATE INDEX IF NOT EXISTS idx_dw_project_claimed, but the old
+    # single-column index idx_dw_project has NOT been dropped yet.
+    intermediate_schema = """
+    CREATE TABLE deferred_writes (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        category TEXT NOT NULL,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        agent_id TEXT,
+        created_at TEXT NOT NULL,
+        claimed_at TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX idx_dw_project ON deferred_writes(project_id);
+    """
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.executescript(intermediate_schema)
+        await db.commit()
+
+    # Initialise EventBuffer — _migrate() should drop idx_dw_project.
+    buf = EventBuffer(db_path=db_path)
+    await buf.initialize()
+
+    db_inner = buf._require_db()
+
+    # Legacy single-column index must be gone.
+    async with db_inner.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dw_project'"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is None, 'idx_dw_project should have been dropped by _migrate()'
+
+    # Replacement covering index must exist (created by executescript or _migrate).
+    async with db_inner.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dw_project_claimed'"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None, 'idx_dw_project_claimed should be present after migration'
+
+    await buf.close()
