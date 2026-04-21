@@ -378,7 +378,14 @@ def _register_drain_signal_handler(reconciliation_harness: object) -> None:
         logger.info('SIGUSR1 received — triggering harness drain')
         reconciliation_harness.drain()  # type: ignore[attr-defined]
 
-    loop.add_signal_handler(signal.SIGUSR1, _handle_drain_signal)
+    try:
+        loop.add_signal_handler(signal.SIGUSR1, _handle_drain_signal)
+    except (NotImplementedError, RuntimeError):
+        # NotImplementedError: Windows (no add_signal_handler support).
+        # RuntimeError: not in the main OS thread.
+        # Fall back to signal.signal — preserves pre-fix behaviour on those paths.
+        logger.debug('loop.add_signal_handler unavailable; falling back to signal.signal for SIGUSR1')
+        signal.signal(signal.SIGUSR1, lambda signum, frame: _handle_drain_signal())
 
 
 async def _graceful_shutdown(
