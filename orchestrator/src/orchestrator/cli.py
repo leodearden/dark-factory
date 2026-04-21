@@ -20,8 +20,11 @@ load_dotenv()  # loads .env into os.environ (e.g. CLAUDE_OAUTH_TOKEN_A/B)
 LOG_FORMAT = '%(asctime)s %(levelname)-8s [%(name)s] %(message)s'
 DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 
-# How long to wait after asyncio.run() returns before force-exiting.
-# After this deadline a diagnostic dump is written and os._exit(137) fires.
+# How long after asyncio.run() returns to wait before force-exiting.
+# The watchdog is armed AFTER asyncio.run() returns (not before) so that
+# long orchestration runs are never affected. Armed post-return, not before,
+# so long orchestration runs are unaffected. After this deadline a diagnostic
+# dump is written to stderr and os._exit(137) fires.
 SHUTDOWN_WATCHDOG_TIMEOUT_SECS = 30
 
 
@@ -177,16 +180,21 @@ def run(prd: Path | None, config_path: Path | None, dry_run: bool, delay: str | 
             retag_modules=retag_modules,
         )
 
-    disarm = _force_exit_after_delay(SHUTDOWN_WATCHDOG_TIMEOUT_SECS)
     try:
-        try:
-            report = asyncio.run(_main())
-        except asyncio.CancelledError:
-            click.echo('Orchestrator cancelled', err=True)
-            sys.exit(130)
-    finally:
-        disarm()
+        report = asyncio.run(_main())
+    except asyncio.CancelledError:
+        click.echo('Orchestrator cancelled', err=True)
+        # asyncio.run() has returned — arm the watchdog NOW to guard interpreter
+        # shutdown (atexit callbacks + threading._shutdown() joining non-daemon
+        # threads). The watchdog is intentionally NOT disarmed: if shutdown
+        # completes cleanly, the daemon thread is killed with the process;
+        # if shutdown hangs, the daemon thread fires os._exit(137).
+        _force_exit_after_delay(SHUTDOWN_WATCHDOG_TIMEOUT_SECS)
+        sys.exit(130)
 
+    # asyncio.run() has returned normally — arm the watchdog to guard interpreter
+    # shutdown. Intentionally left armed (see CancelledError path for rationale).
+    _force_exit_after_delay(SHUTDOWN_WATCHDOG_TIMEOUT_SECS)
     click.echo(report.summary())
 
     if report.blocked > 0:
