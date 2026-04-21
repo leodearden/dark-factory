@@ -285,6 +285,13 @@ class TestForceExitWatchdog:
         *and* stream.write both raise unconditionally.  If the nested try/except
         is ever removed, this test fails before the force-exit guarantee is silently
         dropped.
+
+        Coverage split: this test mocks traceback.format_stack to raise BEFORE
+        out.write(''.join(lines)) on cli.py:85 is reached — so only the INNER
+        try/except that wraps the fallback-sentinel write is exercised here.  The
+        complement case (format_stack intact, the OUTER out.write raises first,
+        fallback also fails) is covered by test_outer_write_failure_still_fires_exit.
+        Together the pair pins both entry points into the nested try/except.
         """
         calls = []
         monkeypatch.setattr('os._exit', lambda code: calls.append(code))
