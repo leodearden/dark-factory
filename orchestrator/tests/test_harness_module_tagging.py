@@ -11,6 +11,7 @@ import pytest
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
+from shared.cli_invoke import AllAccountsCappedException
 
 
 @pytest.fixture
@@ -176,3 +177,39 @@ async def test_tag_task_modules_uses_correct_config(harness, config):
         assert call_kwargs['model'] == config.models.module_tagger
         assert call_kwargs['max_turns'] == config.max_turns.module_tagger
         assert call_kwargs['max_budget_usd'] == config.budgets.module_tagger
+
+
+@pytest.mark.asyncio
+async def test_tag_task_modules_handles_all_accounts_capped(harness, caplog):
+    """AllAccountsCappedException from invoke_with_cap_retry must return None gracefully.
+
+    Before the explicit handler is added (step-4), the exception propagates and
+    crashes _tag_task_modules, causing it to raise rather than return None.
+    """
+    import logging
+
+    harness.scheduler.get_tasks = AsyncMock(return_value=SAMPLE_TASKS)
+    harness.scheduler.update_task = AsyncMock()
+
+    cap_exc = AllAccountsCappedException(
+        retries=5, elapsed_secs=60.0, label='Module tagging'
+    )
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+        with patch(
+            'orchestrator.harness.invoke_with_cap_retry',
+            AsyncMock(side_effect=cap_exc),
+        ):
+            result = await harness._tag_task_modules()
+
+    # Must return None (no exception propagation)
+    assert result is None
+
+    # Must NOT have tagged any tasks
+    harness.scheduler.update_task.assert_not_called()
+
+    # Must emit a warning containing 'all accounts capped' (case-insensitive)
+    warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        'all accounts capped' in t.lower() for t in warning_texts
+    ), f'Expected warning containing "all accounts capped", got: {warning_texts}'
