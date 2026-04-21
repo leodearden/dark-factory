@@ -531,22 +531,8 @@ class TestDarkFactoryProductionPool:
     so a truly missing config cannot silently hide behind a skip.
     """
 
-    @staticmethod
-    def _find_repo_root() -> Path | None:
-        """Walk up from this file to find the repo root anchored by a .git entry.
-
-        Returns the repo-root Path if found, or None when not running inside a
-        git checkout (e.g. packaged wheel, partial mirror, or isolated test run).
-        Works for both normal checkouts (.git directory) and git worktrees (.git file).
-        """
-        here = Path(__file__).resolve()
-        for parent in here.parents:
-            if (parent / '.git').exists():
-                return parent
-        return None
-
     @pytest.fixture
-    def production_config(self):
+    def production_config(self, repo_root):
         """Load config/usage-accounts.yaml from the repo root.
 
         Skips when no .git sentinel is found (not a full checkout).
@@ -554,7 +540,6 @@ class TestDarkFactoryProductionPool:
         so that a missing file inside the repo surfaces as an error rather than a
         silent skip that defeats the regression guard.
         """
-        repo_root = self._find_repo_root()
         if repo_root is None:
             pytest.skip("Not inside a git checkout — skipping production-pool tests")
         accounts_file = repo_root / 'config' / 'usage-accounts.yaml'
