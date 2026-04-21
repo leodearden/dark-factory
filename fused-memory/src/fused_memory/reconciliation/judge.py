@@ -4,6 +4,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from shared.cli_invoke import invoke_with_cap_retry
 
@@ -252,6 +253,7 @@ Review this run and provide your verdict as JSON.
             max_turns=1,
             permission_mode='bypassPermissions',
             timeout_seconds=float(self.config.stage_timeout_seconds),
+            cwd=Path(self.config.explore_codebase_root),
         )
 
         # Preserve legacy "empty stdout = valid empty verdict" semantics.
