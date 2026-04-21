@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import dataclass, field
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1055,8 +1055,6 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     kwargs and that the returned adapter exposes `.thinking`, `.response`,
     `.tool_calls`, and `.session_id`.
     """
-    from unittest.mock import AsyncMock
-
     from shared.cli_invoke import AgentResult
 
     from fused_memory.reconciliation.agent_loop import CLAUDE_CLI_RESPONSE_SCHEMA
@@ -1130,8 +1128,6 @@ async def test_call_claude_cli_threads_session_id_across_turns():
     integration. First call must use resume_session_id=None; second call must use
     resume_session_id='sess-A' (the session_id returned by the first call).
     """
-    from unittest.mock import AsyncMock
-
     from shared.cli_invoke import AgentResult
 
     fake_gate = MagicMock()
@@ -1179,7 +1175,6 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
     catches that regression without requiring a live Claude CLI.
     """
     from pathlib import Path
-    from unittest.mock import AsyncMock
 
     from shared.cli_invoke import AgentResult
 
@@ -1216,3 +1211,90 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
     mock_agent.assert_called_once()
     call_kwargs = mock_agent.call_args.kwargs
     assert call_kwargs['cwd'] == Path(explore_root)
+
+
+@pytest.mark.asyncio
+async def test_run_threads_serialized_tool_results_into_claude_cli_prompt():
+    """Guards that run() routes tool_results through _serialize_tool_results on follow-up turns.
+
+    Closes the coverage gap left by task 881 (deleted test_claude_cli_provider_first_call and
+    test_claude_cli_provider_resume) for the _call_llm claude_cli branch.
+    """
+    from shared.cli_invoke import AgentResult
+
+    fake_gate = MagicMock()
+    config = _make_cli_config()
+
+    async def my_tool_fn(x: int = 0):
+        return {'doubled': x * 2}
+
+    tools = {
+        'my_tool': ToolDefinition(
+            name='my_tool',
+            description='Doubles the input',
+            parameters={'type': 'object', 'properties': {'x': {'type': 'integer'}}},
+            function=my_tool_fn,
+        ),
+        'stage_complete': ToolDefinition(
+            name='stage_complete',
+            description='Signals completion',
+            parameters={'type': 'object', 'properties': {'report': {'type': 'object'}}},
+            function=lambda **kw: kw,
+        ),
+    }
+
+    # Turn 1: agent calls my_tool with x=7
+    first_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-1',
+        structured_output={
+            'thinking': 'calling my_tool',
+            'tool_calls': [{'id': 'tc1', 'name': 'my_tool', 'input': {'x': 7}}],
+        },
+    )
+    # Turn 2: agent calls stage_complete with the result
+    second_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-1',
+        structured_output={
+            'thinking': 'done',
+            'tool_calls': [
+                {'id': 'tc2', 'name': 'stage_complete', 'input': {'report': {'result': 14}}}
+            ],
+        },
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.side_effect = [first_result, second_result]
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='You are a test agent.',
+            tools=tools,
+            terminal_tool='stage_complete',
+            usage_gate=fake_gate,
+        )
+
+        result, _journal = await agent.run('initial payload')
+
+    # Terminal tool input round-trips through run()
+    assert result == {'report': {'result': 14}}
+
+    # Both LLM turns must have fired
+    assert mock_invoke.call_count == 2
+
+    # Turn 1: initial string payload is passed straight through (_call_llm string branch)
+    first_prompt = mock_invoke.call_args_list[0].kwargs['prompt']
+    assert first_prompt == 'initial payload'
+
+    # Turn 2: tool_results list is serialized via _serialize_tool_results
+    # before being passed as prompt — the core contract this test guards.
+    # Exact equality catches regressions that swap the \n separator, drop the
+    # [Tool Result: ...] prefix, or subtly reorder fields.
+    second_prompt = mock_invoke.call_args_list[1].kwargs['prompt']
+    assert second_prompt == '[Tool Result: tc1] (OK)\n{"doubled": 14}'
