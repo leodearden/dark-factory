@@ -857,20 +857,10 @@ Output JSON matching the schema. Every task must appear in the output.
                 logger.info(f'Recovery: cleared stale plan.lock for task {task_id}')
             recovered += 1
 
-        # Reset in-progress tasks to pending
-        tasks = await self.scheduler.get_tasks()
-        reset_count = 0
-        for t in tasks:
-            if t.get('status') == 'in-progress':
-                tid = str(t.get('id', ''))
-                await self.scheduler.set_task_status(tid, 'pending')
-                logger.info(f'Recovery: reset task {tid} from in-progress to pending')
-                reset_count += 1
-
-        if recovered or cleaned or reset_count:
+        if recovered or cleaned:
             logger.info(
                 f'Crash recovery: {recovered} plans recovered, '
-                f'{cleaned} worktrees cleaned, {reset_count} tasks reset'
+                f'{cleaned} worktrees cleaned'
             )
 
     async def _reconcile_stranded_in_progress(self) -> None:

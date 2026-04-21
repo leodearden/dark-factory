@@ -131,8 +131,13 @@ class TestRecoverCrashedTasks:
         assert harness._recovered_plans == {}
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
-    async def test_in_progress_tasks_reset_to_pending(self, harness: Harness):
-        """In-progress tasks are reset to pending."""
+    async def test_in_progress_tasks_left_for_reconcile_sweep(self, harness: Harness):
+        """_recover_crashed_tasks does NOT reset in-progress tasks to pending.
+
+        Status reconciliation for stranded in-progress tasks is handled by the
+        separate _reconcile_stranded_in_progress() sweep that runs immediately
+        after this method in Harness.run().
+        """
         harness.git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
         harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
             {'id': 10, 'status': 'in-progress', 'title': 'Stuck task'},
@@ -143,12 +148,9 @@ class TestRecoverCrashedTasks:
 
         await harness._recover_crashed_tasks()
 
-        calls = harness.scheduler.set_task_status.call_args_list  # type: ignore[attr-defined]
-        assert len(calls) == 2
-        reset_ids = {c.args[0] for c in calls}
-        assert reset_ids == {'10', '13'}
-        for c in calls:
-            assert c.args[1] == 'pending'
+        # set_task_status must NOT be called — status reconciliation is
+        # delegated to _reconcile_stranded_in_progress.
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
     async def test_recovered_plan_injected_in_run_slot(self, harness: Harness):
         """Plan consumed from _recovered_plans and passed as initial_plan."""
