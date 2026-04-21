@@ -19,9 +19,14 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import logging
 import os
+import select
 import signal
 
+logger = logging.getLogger(__name__)
+
+_DEFAULT_TIMEOUT_SECS = 60.0
 _fd: int | None = None
 _tok: bytes | None = None
 
@@ -44,6 +49,24 @@ def pytest_configure(config) -> None:
         return
     try:
         _fd = os.open(path, os.O_RDWR)
+        raw = os.environ.get('PYTEST_JOBSERVER_TIMEOUT', '')
+        try:
+            timeout = float(raw) if raw else _DEFAULT_TIMEOUT_SECS
+        except (ValueError, TypeError):
+            timeout = _DEFAULT_TIMEOUT_SECS
+        ready, _, _ = select.select([_fd], [], [], timeout)
+        if not ready:
+            logger.warning(
+                'pytest_jobserver: timed out waiting %.1fs for token on %s; '
+                'running unthrottled (jobserver may be down or saturated)',
+                timeout,
+                path,
+            )
+            with contextlib.suppress(OSError):
+                os.close(_fd)
+            _fd = None
+            _tok = None
+            return
         _tok = os.read(_fd, 1)
     except OSError:
         _release()
