@@ -96,3 +96,14 @@ class TestForceExitWatchdog:
         time.sleep(0.3)
 
         assert calls == [137], f'expected [137], got {calls}'
+
+    def test_disarm_prevents_force_exit(self, monkeypatch):
+        """Calling disarm() before timeout prevents os._exit from being called."""
+        calls = []
+        monkeypatch.setattr('os._exit', lambda code: calls.append(code))
+
+        disarm = _force_exit_after_delay(timeout_secs=0.3)
+        disarm()
+        time.sleep(0.6)
+
+        assert calls == [], f'expected no calls, got {calls}'
