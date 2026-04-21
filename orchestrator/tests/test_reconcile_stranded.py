@@ -3,7 +3,6 @@
 import json
 import os
 import re
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -155,25 +154,25 @@ class TestReconcileStrandedInProgress:
         assert lock_path.exists()
 
     async def test_stale_plan_lock_cleared_and_reverted(
-        self, harness: Harness
+        self, harness: Harness, monkeypatch
     ):
         """In-progress task with stale plan.lock (dead PID) → lock cleared and task reverted."""
         harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
             {'id': 8, 'status': 'in-progress'},
         ]
-        # Spawn a process and reap it to get a guaranteed-dead PID
-        proc = subprocess.Popen(['true'])
-        proc.wait()
-        dead_pid = proc.pid
+        # Use a synthetic owner_pid — _pid_alive is mocked to always return False,
+        # so no real PID is needed and there is no kernel-recycle race.
+        owner_pid = 99999
+        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
-        # Create worktree with plan.lock referencing the dead PID
+        # Create worktree with plan.lock referencing the synthetic dead PID
         lock_dir = harness.git_ops.worktree_base / '8' / '.task'
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
             'session_id': '8-dead0001',
             'locked_at': datetime.now(UTC).isoformat(),
-            'owner_pid': dead_pid,
+            'owner_pid': owner_pid,
         }))
 
         await harness._reconcile_stranded_in_progress()
