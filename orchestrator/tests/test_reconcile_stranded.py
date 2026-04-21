@@ -251,3 +251,29 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     acquire_idx = call_order.index('acquire')
     assert recover_idx < reconcile_idx, "_recover_crashed_tasks must precede _reconcile_stranded_in_progress"
     assert reconcile_idx < acquire_idx, "_reconcile_stranded_in_progress must precede scheduler.acquire_next"
+
+
+# ---------------------------------------------------------------------------
+# Non-in-progress statuses are ignored (regression guard for non-goal)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_non_in_progress_statuses_ignored(harness: Harness):
+    """The sweep only touches in-progress tasks; other statuses are untouched."""
+    # Only the 'in-progress' task has no lock (worktree doesn't exist)
+    harness.scheduler.get_tasks.return_value = [
+        {'id': 20, 'status': 'pending'},
+        {'id': 21, 'status': 'done'},
+        {'id': 22, 'status': 'blocked'},
+        {'id': 23, 'status': 'cancelled'},
+        {'id': 24, 'status': 'review'},
+        {'id': 25, 'status': 'in-progress'},  # <-- only this one
+    ]
+    # No worktree for task 25 (orphan)
+
+    await harness._reconcile_stranded_in_progress()
+
+    calls = harness.scheduler.set_task_status.call_args_list
+    assert len(calls) == 1, f"Expected exactly 1 call, got: {calls}"
+    assert calls[0].args[0] == '25'
+    assert calls[0].args[1] == 'pending'
