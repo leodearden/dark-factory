@@ -139,3 +139,31 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_called_once_with('8', 'pending')
         # Stale lock must be deleted
         assert not lock_path.exists()
+
+    async def test_fresh_plan_lock_owner_pid_alive_left_alone(
+        self, harness: Harness, caplog
+    ):
+        """Fresh plan.lock with live owner_pid → no revert, no log mentioning 'revert' or 'stranded'."""
+        import logging
+        harness.scheduler.get_tasks.return_value = [
+            {'id': 7, 'status': 'in-progress'},
+        ]
+        lock_dir = harness.git_ops.worktree_base / '7' / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': '7-abcd1234',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': os.getpid(),
+        }))
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress()
+
+        # No status change
+        harness.scheduler.set_task_status.assert_not_called()
+        # Lock file intact
+        assert lock_path.exists()
+        # No log message mentioning revert or stranded for this task
+        revert_logs = [r for r in caplog.records if 'revert' in r.message.lower() or 'stranded' in r.message.lower()]
+        assert len(revert_logs) == 0
