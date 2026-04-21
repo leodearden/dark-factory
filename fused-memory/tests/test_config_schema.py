@@ -388,3 +388,33 @@ class TestReconciliationConfigTimeouts:
 
     def test_explicit_stale_claim_recovery_override_accepted(self):
         assert ReconciliationConfig(stale_claim_recovery_seconds=10).stale_claim_recovery_seconds == 10
+
+    # --- gt=0 bounds: agent_cli_timeout_seconds ---
+
+    def test_agent_cli_timeout_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(agent_cli_timeout_seconds=0)
+
+    def test_agent_cli_timeout_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(agent_cli_timeout_seconds=-1)
+
+    # --- gt=0 bounds: judge_cli_timeout_seconds ---
+
+    def test_judge_cli_timeout_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(judge_cli_timeout_seconds=0)
+
+    def test_judge_cli_timeout_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(judge_cli_timeout_seconds=-1)
+
+    # --- gt=0 bounds: stale_claim_recovery_seconds ---
+
+    def test_stale_claim_recovery_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(stale_claim_recovery_seconds=0)
+
+    def test_stale_claim_recovery_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(stale_claim_recovery_seconds=-5)
