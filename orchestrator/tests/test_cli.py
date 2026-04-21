@@ -184,8 +184,13 @@ class TestRunArmsWatchdog:
 
         monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
 
-        # asyncio.run returns fake_report (bypasses _main entirely)
-        monkeypatch.setattr(cli_module.asyncio, 'run', lambda coro: fake_report)
+        # asyncio.run returns fake_report (bypasses _main entirely).
+        # Close the coroutine to avoid "coroutine was never awaited" warnings.
+        def fake_asyncio_run(coro):
+            coro.close()
+            return fake_report
+
+        monkeypatch.setattr(cli_module.asyncio, 'run', fake_asyncio_run)
 
         runner = CliRunner()
         result = runner.invoke(main, ['run', '--config', '/dev/null'])
@@ -208,8 +213,10 @@ class TestRunArmsWatchdog:
         fake_harness = MagicMock()
         monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
 
-        # asyncio.run raises CancelledError to simulate SIGTERM path
+        # asyncio.run raises CancelledError to simulate SIGTERM path.
+        # Close the coroutine to avoid "coroutine was never awaited" warnings.
         def raise_cancelled(coro):
+            coro.close()
             raise asyncio.CancelledError()
 
         monkeypatch.setattr(cli_module.asyncio, 'run', raise_cancelled)
