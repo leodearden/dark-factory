@@ -271,11 +271,7 @@ async def run_server():
         logger.info('  Reconciliation: enabled (background loop started)')
 
         # SIGUSR1 triggers harness drain (stop new cycles, let current ones finish)
-        def _handle_drain_signal(signum: int, frame: object) -> None:
-            logger.info('SIGUSR1 received — triggering harness drain')
-            reconciliation_harness.drain()
-
-        signal.signal(signal.SIGUSR1, _handle_drain_signal)
+        _register_drain_signal_handler(reconciliation_harness)
     else:
         # Always create task_interceptor for tool registration
         from fused_memory.middleware.task_file_committer import TaskFileCommitter
@@ -364,6 +360,25 @@ async def run_server():
             event_queue=event_queue,
             sqlite_watchdog=sqlite_watchdog,
         )
+
+
+def _register_drain_signal_handler(reconciliation_harness: object) -> None:
+    """Register a SIGUSR1 handler that triggers reconciliation_harness.drain().
+
+    Uses loop.add_signal_handler (asyncio-safe) when a running event loop is
+    available.  Falls back to signal.signal on non-POSIX platforms or when
+    called outside the main OS thread (see step-4 for the full fallback path).
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    def _handle_drain_signal() -> None:
+        logger.info('SIGUSR1 received — triggering harness drain')
+        reconciliation_harness.drain()  # type: ignore[attr-defined]
+
+    loop.add_signal_handler(signal.SIGUSR1, _handle_drain_signal)
 
 
 async def _graceful_shutdown(
