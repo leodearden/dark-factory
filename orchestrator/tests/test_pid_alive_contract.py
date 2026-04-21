@@ -15,7 +15,6 @@ _pid_alive function.
 
 import importlib.util
 import os
-import types
 import unittest.mock
 from pathlib import Path
 
@@ -32,11 +31,15 @@ _FM_DETECTOR_PATH = (
     / 'fused-memory' / 'src'
     / 'fused_memory' / 'services' / 'orchestrator_detector.py'
 )
+assert _FM_DETECTOR_PATH.exists(), (
+    f'orchestrator_detector.py not found at expected path: {_FM_DETECTOR_PATH}\n'
+    f'Check that fused-memory/ is a sibling of orchestrator/ in the monorepo layout.'
+)
 _spec = importlib.util.spec_from_file_location('_fm_orchestrator_detector', _FM_DETECTOR_PATH)
 assert _spec is not None and _spec.loader is not None, (
-    f'Cannot find orchestrator_detector at {_FM_DETECTOR_PATH}'
+    f'Cannot create module spec for orchestrator_detector at {_FM_DETECTOR_PATH}'
 )
-_detector_mod = types.ModuleType('_fm_orchestrator_detector')
+_detector_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_detector_mod)  # type: ignore[union-attr]
 detector_pid_alive = _detector_mod._pid_alive
 
@@ -45,19 +48,32 @@ detector_pid_alive = _detector_mod._pid_alive
 # (1) Real os.kill — both copies must agree for these PID values
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize('pid', [
-    0,
-    -1,
-    os.getpid(),
-    2 ** 31 - 1,
-])
+# Known absolute answers for deterministic PID inputs — evaluated at
+# collection time so os.getpid() is stable for the full test session.
+_KNOWN_PID_ANSWERS: dict[int, bool] = {
+    0: False,
+    -1: False,
+    os.getpid(): True,
+    2 ** 31 - 1: False,  # ~2.1 B — not a valid live PID on any standard Linux
+}
+
+
+@pytest.mark.parametrize('pid', list(_KNOWN_PID_ANSWERS))
 def test_matching_return_for_real_pids(pid: int):
-    """Both _pid_alive copies return the same bool for the given pid."""
+    """Both _pid_alive copies return the same bool for the given pid,
+    and the result matches the known-correct answer for each deterministic input."""
     harness_result = harness_pid_alive(pid)
     detector_result = detector_pid_alive(pid)
     assert harness_result == detector_result, (
         f'_pid_alive({pid!r}) diverged: '
         f'harness={harness_result!r}, detector={detector_result!r}'
+    )
+    expected = _KNOWN_PID_ANSWERS[pid]
+    assert harness_result is expected, (
+        f'harness _pid_alive({pid!r}): expected {expected!r}, got {harness_result!r}'
+    )
+    assert detector_result is expected, (
+        f'detector _pid_alive({pid!r}): expected {expected!r}, got {detector_result!r}'
     )
 
 
