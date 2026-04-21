@@ -247,30 +247,25 @@ class TestForceExitWatchdog:
         )
 
     def test_force_exit_returns_handle_with_disarm_and_thread(self, monkeypatch):
-        """_force_exit_after_delay returns a WatchdogHandle with .disarm and .thread.
+        """_force_exit_after_delay returns a WatchdogHandle whose thread is a live daemon
+        and whose disarm() stops the thread.
 
-        The returned handle must have:
-        - a callable .disarm attribute
-        - a threading.Thread .thread attribute that is daemonised, named
-          'shutdown-watchdog', and already alive after arming.
-        Calling disarm() must stop the thread within a reasonable timeout.
+        Pins only the behavioral contract of WatchdogHandle:
+        - .thread is a daemon (load-bearing — non-daemon threads block interpreter shutdown)
+        - .thread is alive immediately after arming (proves thread.start() ran)
+        - Calling disarm() stops the thread within a reasonable timeout
+
+        NamedTuple shape (.disarm is callable, .thread is threading.Thread) is guaranteed
+        by construction in cli.py and not re-asserted here. Thread name is cosmetic and
+        intentionally unpinned — rename-friendly.
         """
         calls = []
         monkeypatch.setattr('os._exit', lambda code: calls.append(code))
 
         handle = _force_exit_after_delay(timeout_secs=5.0)
 
-        assert callable(handle.disarm), (
-            f'handle.disarm must be callable, got {handle.disarm!r}'
-        )
-        assert isinstance(handle.thread, threading.Thread), (
-            f'handle.thread must be threading.Thread, got {type(handle.thread)}'
-        )
         assert handle.thread.daemon is True, (
             'handle.thread must be a daemon thread'
-        )
-        assert handle.thread.name == 'shutdown-watchdog', (
-            f'expected thread name "shutdown-watchdog", got {handle.thread.name!r}'
         )
         assert handle.thread.is_alive(), (
             'handle.thread must be alive immediately after arming'
@@ -290,6 +285,13 @@ class TestForceExitWatchdog:
         *and* stream.write both raise unconditionally.  If the nested try/except
         is ever removed, this test fails before the force-exit guarantee is silently
         dropped.
+
+        Coverage split: this test mocks traceback.format_stack to raise BEFORE
+        out.write(''.join(lines)) on cli.py:85 is reached — so only the INNER
+        try/except that wraps the fallback-sentinel write is exercised here.  The
+        complement case (format_stack intact, the OUTER out.write raises first,
+        fallback also fails) is covered by test_outer_write_failure_still_fires_exit.
+        Together the pair pins both entry points into the nested try/except.
         """
         calls = []
         monkeypatch.setattr('os._exit', lambda code: calls.append(code))
@@ -367,26 +369,19 @@ class TestForceExitWatchdog:
             f'expected os._exit(137) even when outer write fails with format_stack intact, '
             f'got {calls}'
         )
-        # Verify the control-flow path: format_stack built real frames so the outer
-        # out.write(''.join(lines)) was attempted first (must contain the watchdog-fired
-        # header sentinel, proving the outer path was reached), then the inner fallback
-        # out.write was attempted second (must contain the dump-failed sentinel).  Both
-        # raised — inner except swallowed — os._exit still reached.  This distinguishes
-        # the test from its sibling test_fallback_write_failure_still_fires_exit where
-        # format_stack raises first (lines is never built, outer out.write is never reached).
-        assert len(write_attempts) >= 2, (
-            f'expected at least 2 write attempts (outer sentinel + inner fallback), '
-            f'got {write_attempts!r}'
+        # Existence checks rather than positional: the distinguishing invariant vs.
+        # test_fallback_write_failure_still_fires_exit is that the outer header sentinel
+        # can only appear if format_stack ran and outer out.write was reached — which is
+        # exactly the path mocked out in the sibling.
+        assert any('process hung after asyncio.run()' in s for s in write_attempts), (
+            f'outer watchdog-fired header sentinel missing from write attempts '
+            f"(proves format_stack ran and outer out.write was reached — "
+            f"'process hung after asyncio.run()' appears only in the cli.py:78 "
+            f'outer header, not in the cli.py:94 fallback sentinel): {write_attempts!r}'
         )
-        assert 'SHUTDOWN WATCHDOG FIRED — process hung' in write_attempts[0], (
-            f'first write attempt must contain the watchdog-fired header sentinel '
-            f'(proves format_stack ran and outer out.write was reached), '
-            f'got: {write_attempts[0]!r}'
-        )
-        assert '(diagnostic dump failed)' in write_attempts[1], (
-            f'second write attempt must contain the fallback sentinel '
-            f'(proves inner fallback out.write was also exercised), '
-            f'got: {write_attempts[1]!r}'
+        assert any('(diagnostic dump failed)' in s for s in write_attempts), (
+            f'inner fallback sentinel missing from write attempts '
+            f'(proves inner fallback out.write was also exercised): {write_attempts!r}'
         )
         handle.thread.join(timeout=1.0)
         assert not handle.thread.is_alive(), (
