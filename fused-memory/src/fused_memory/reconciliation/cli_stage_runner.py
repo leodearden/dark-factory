@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from shared.cli_invoke import AgentResult, invoke_with_cap_retry
+from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
 
 if TYPE_CHECKING:
     from shared.usage_gate import UsageGate
@@ -193,6 +193,12 @@ async def run_stage_via_cli(
             permission_mode='bypassPermissions',
             timeout_seconds=float(config.stage_timeout_seconds),
         )
+    except AllAccountsCappedException:
+        logger.warning(
+            'Stage %s: all accounts capped — propagating to harness for deferral',
+            effective_model,
+        )
+        raise
     except Exception as e:
         duration_ms = int(time.monotonic() * 1000) - start_ms
         return StageResult(
