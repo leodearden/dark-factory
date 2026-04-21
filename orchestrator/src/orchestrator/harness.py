@@ -901,6 +901,14 @@ Output JSON matching the schema. Every task must appear in the output.
             owner_alive = False
             try:
                 lock_data = json.loads(lock_path.read_text())
+                if 'owner_pid' not in lock_data:
+                    logger.warning(
+                        'Reconcile: task %s has plan.lock without owner_pid '
+                        '(legacy format) — leaving task untouched to avoid '
+                        'stealing work from a live legacy instance',
+                        tid,
+                    )
+                    continue
                 owner_pid = lock_data.get('owner_pid')
                 if owner_pid is not None:
                     owner_alive = _pid_alive(int(owner_pid))
