@@ -366,12 +366,14 @@ def _register_drain_signal_handler(reconciliation_harness: object) -> None:
     """Register a SIGUSR1 handler that triggers reconciliation_harness.drain().
 
     Uses loop.add_signal_handler (asyncio-safe) when a running event loop is
-    available.  Falls back to signal.signal on non-POSIX platforms or when
-    called outside the main OS thread (see step-4 for the full fallback path).
+    available.  Falls back to signal.signal when add_signal_handler raises
+    NotImplementedError (Windows) or RuntimeError (not on the main OS thread).
+    If no running event loop is found, logs a warning and installs no handler.
     """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
+        logger.warning('_register_drain_signal_handler: no running event loop; SIGUSR1 handler not installed')
         return
 
     def _handle_drain_signal() -> None:

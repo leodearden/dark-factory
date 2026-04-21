@@ -9,8 +9,7 @@ from fused_memory.server.main import _register_drain_signal_handler
 
 
 class TestRegisterDrainSignalHandlerHappyPath:
-    @pytest.mark.asyncio
-    async def test_register_drain_signal_handler_uses_add_signal_handler(self):
+    def test_register_drain_signal_handler_uses_add_signal_handler(self):
         """Happy path: helper calls loop.add_signal_handler(SIGUSR1, cb) and cb triggers drain()."""
         reconciliation_harness = MagicMock()
         reconciliation_harness.drain = MagicMock()
@@ -32,14 +31,18 @@ class TestRegisterDrainSignalHandlerHappyPath:
 
 
 class TestRegisterDrainSignalHandlerFallback:
-    @pytest.mark.asyncio
-    async def test_register_drain_signal_handler_falls_back_on_not_implemented(self):
-        """Fallback: when add_signal_handler raises NotImplementedError, uses signal.signal."""
+    @pytest.mark.parametrize('exc', [NotImplementedError, RuntimeError])
+    def test_register_drain_signal_handler_falls_back_on_add_signal_handler_error(self, exc):
+        """Fallback: when add_signal_handler raises NotImplementedError or RuntimeError, uses signal.signal.
+
+        NotImplementedError covers Windows (no add_signal_handler support).
+        RuntimeError covers non-main-thread usage (nested event loops, thread pools).
+        """
         reconciliation_harness = MagicMock()
         reconciliation_harness.drain = MagicMock()
 
         mock_loop = MagicMock()
-        mock_loop.add_signal_handler.side_effect = NotImplementedError
+        mock_loop.add_signal_handler.side_effect = exc
 
         with patch('asyncio.get_running_loop', return_value=mock_loop), \
              patch('fused_memory.server.main.signal.signal') as mock_signal:
@@ -54,3 +57,20 @@ class TestRegisterDrainSignalHandlerFallback:
         fallback_cb = call_args.args[1]
         fallback_cb(signal.SIGUSR1, None)
         reconciliation_harness.drain.assert_called_once()
+
+
+class TestRegisterDrainSignalHandlerNoLoop:
+    def test_register_drain_signal_handler_no_running_loop_installs_nothing(self):
+        """When no event loop is running, no handler is installed and a warning is logged."""
+        reconciliation_harness = MagicMock()
+
+        with patch('asyncio.get_running_loop', side_effect=RuntimeError('no running event loop')), \
+             patch('fused_memory.server.main.signal.signal') as mock_signal, \
+             patch('fused_memory.server.main.logger') as mock_logger:
+            _register_drain_signal_handler(reconciliation_harness)
+
+        # No handler should be installed (early return)
+        mock_signal.assert_not_called()
+        reconciliation_harness.drain.assert_not_called()
+        # A warning should have been logged
+        mock_logger.warning.assert_called_once()
