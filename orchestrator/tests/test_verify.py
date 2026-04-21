@@ -892,3 +892,23 @@ class TestApplyCargoScopePolyglotGuard:
         assert result.lint_command == 'cargo clippy --workspace', (
             f'expected unchanged --workspace, got {result.lint_command!r}'
         )
+
+    # -----------------------------------------------------------------------
+    # Task-mandated regression net — .rs + .toml must still scope to crate
+    # -----------------------------------------------------------------------
+
+    def test_rs_plus_toml_scopes_to_crate(self):
+        """.rs + .toml diff must scope to the matched crate (safe whitelist ext)."""
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'Cargo.toml'])
+        assert '-p foo' in (result.test_command or ''), (
+            f'expected -p foo in test_command, got {result.test_command!r}'
+        )
+        assert '--workspace' not in (result.test_command or ''), (
+            f'expected --workspace absent in test_command, got {result.test_command!r}'
+        )
+        assert '-p foo' in (result.lint_command or ''), (
+            f'expected -p foo in lint_command, got {result.lint_command!r}'
+        )
+        assert '--workspace' not in (result.lint_command or ''), (
+            f'expected --workspace absent in lint_command, got {result.lint_command!r}'
+        )
