@@ -222,9 +222,8 @@ def _apply_cargo_scope(
     # config/data whitelist, bail to --workspace.  This protects chained
     # non-Rust commands (e.g. ``cargo test --workspace && uv run pytest``)
     # from being silently skipped when only some crates are scoped.
-    for f in task_files:
-        if f.endswith('.rs'):
-            continue
+    non_rs = [f for f in task_files if not f.endswith('.rs')]
+    for f in non_rs:
         if Path(f).suffix.lower() not in _CARGO_SCOPE_SAFE_NON_RS_EXTS:
             return mc
 

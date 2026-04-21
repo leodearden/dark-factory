@@ -8,6 +8,7 @@ import pytest
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
+    _apply_cargo_scope,
     _run_cmd,
     run_scoped_verification,
     run_verification,
@@ -858,10 +859,6 @@ class TestApplyCargoScopePolyglotGuard:
     @staticmethod
     def _call_scoped(task_files: list[str]) -> ModuleConfig:
         """Call _apply_cargo_scope with mocked workspace, primed to scope if guard passes."""
-        from unittest.mock import patch
-
-        from orchestrator.verify import _apply_cargo_scope
-
         mc = TestApplyCargoScopePolyglotGuard._make_mc()
         with (
             patch(
@@ -940,6 +937,12 @@ class TestApplyCargoScopePolyglotGuard:
     def test_rs_plus_md_scopes(self):
         """.rs + .md scopes to crate (safe documentation ext)."""
         result = self._call_scoped(['crates/foo/src/lib.rs', 'README.md'])
+        assert '-p foo' in (result.test_command or '')
+        assert '--workspace' not in (result.test_command or '')
+
+    def test_rs_plus_uppercase_ext_scopes(self):
+        """.rs + uppercase ext (e.g. README.MD) scopes — covers Path.suffix.lower() path."""
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'README.MD'])
         assert '-p foo' in (result.test_command or '')
         assert '--workspace' not in (result.test_command or '')
 
