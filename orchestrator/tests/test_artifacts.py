@@ -1,6 +1,7 @@
 """Tests for task artifacts management."""
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -358,6 +359,14 @@ class TestPlanLock:
 
     def test_read_plan_lock_returns_none_when_not_locked(self, artifacts: TaskArtifacts):
         assert artifacts.read_plan_lock() is None
+
+    def test_lock_plan_writes_owner_pid(self, artifacts: TaskArtifacts):
+        artifacts.lock_plan('session-abc123')
+        lock_data = artifacts.read_plan_lock()
+        assert lock_data is not None
+        assert lock_data['session_id'] == 'session-abc123'
+        assert 'locked_at' in lock_data
+        assert lock_data['owner_pid'] == os.getpid()
 
 
 class TestReviews:
