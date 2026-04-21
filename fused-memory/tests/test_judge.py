@@ -915,8 +915,6 @@ async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_runtime_err
     The subtype is NOT 'error_empty_output', so the early-return on lines
     264-265 does not apply — the not-result.success branch must fire.
     """
-    from unittest.mock import AsyncMock
-
     from shared.cli_invoke import AgentResult
 
     fake_gate = MagicMock()
@@ -945,4 +943,4 @@ async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_runtime_err
     msg = str(excinfo.value)
     assert msg.startswith('Claude CLI judge failed:'), f'unexpected prefix: {msg!r}'
     assert 'Traceback: JSONDecodeError in line 42' in msg, f'stderr missing from: {msg!r}'
-    assert 'error_unexpected' in msg, f'subtype missing from: {msg!r}'
+    assert "subtype='error_unexpected'" in msg, f'subtype missing from: {msg!r}'

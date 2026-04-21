@@ -1348,4 +1348,4 @@ async def test_call_claude_cli_failure_surfaces_stderr_and_summary_in_runtime_er
     msg = str(excinfo.value)
     assert msg.startswith('Claude CLI agent failed:'), f'unexpected prefix: {msg!r}'
     assert 'ENOENT: claude CLI binary not found' in msg, f'stderr missing from: {msg!r}'
-    assert 'error_unexpected' in msg, f'subtype missing from: {msg!r}'
+    assert "subtype='error_unexpected'" in msg, f'subtype missing from: {msg!r}'
