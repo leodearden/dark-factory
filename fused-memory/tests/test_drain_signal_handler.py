@@ -164,9 +164,9 @@ class TestRegisterDrainSignalHandlerRuntimeError:
         mock_loop.add_signal_handler.side_effect = RuntimeError('not in main thread')
 
         with patch('asyncio.get_running_loop', return_value=mock_loop), \
-             patch('fused_memory.server.main.signal.signal') as mock_signal:
-            with pytest.raises(RuntimeError):
-                _register_drain_signal_handler(reconciliation_harness)
+             patch('fused_memory.server.main.signal.signal') as mock_signal, \
+             pytest.raises(RuntimeError):
+            _register_drain_signal_handler(reconciliation_harness)
 
         # signal.signal must NOT be called — we don't attempt the fallback on RuntimeError
         mock_signal.assert_not_called()
