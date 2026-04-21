@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -494,3 +495,79 @@ class TestCapDetectedUnknownToken:
 
         # Gate remains paused
         assert gate.is_paused, "Gate must remain paused after noop unknown-token call"
+
+
+# ---------------------------------------------------------------------------
+# Production config pin: TestDarkFactoryProductionPool reads the REAL YAML
+# ---------------------------------------------------------------------------
+
+
+class TestDarkFactoryProductionPool:
+    """Pins the real config/usage-accounts.yaml to the expected production account pool.
+
+    Unlike the tests above (which use tmp_path fixtures), these tests load the
+    actual shared config file from the repository root. They serve as a regression
+    guard: if someone accidentally re-adds max-b or removes an active account
+    during a merge conflict, the test fails immediately.
+
+    Tests are skipped (not failed) when run outside a full repo checkout so that
+    CI environments without the config file are not broken.
+    """
+
+    @staticmethod
+    def _get_accounts_file():
+        """Walk up from this file to the repo root and return the config file path.
+
+        Returns None if the file is not found (e.g. in non-repo checkouts).
+        """
+        here = Path(__file__).resolve()
+        for parent in list(here.parents):
+            candidate = parent / 'config' / 'usage-accounts.yaml'
+            if candidate.exists():
+                return candidate
+        return None
+
+    def test_production_pool_accounts_in_expected_order(self):
+        """Real config/usage-accounts.yaml has exactly [max-g, max-f, max-e, max-c, max-d] in order."""
+        accounts_file = self._get_accounts_file()
+        if accounts_file is None:
+            pytest.skip("config/usage-accounts.yaml not found — not a full repo checkout")
+
+        config = UsageCapConfig(accounts_file=str(accounts_file))
+        names = [a.name for a in config.accounts]
+        assert names == ['max-g', 'max-f', 'max-e', 'max-c', 'max-d'], (
+            f"Production pool mismatch. Got: {names!r}. "
+            "Expected max-b to be removed (permanently dead HTTP 403)."
+        )
+
+    def test_max_b_removed_from_production_pool(self):
+        """max-b (permanently dead, HTTP 403 since 2026-04-20) must not appear in the pool."""
+        accounts_file = self._get_accounts_file()
+        if accounts_file is None:
+            pytest.skip("config/usage-accounts.yaml not found — not a full repo checkout")
+
+        config = UsageCapConfig(accounts_file=str(accounts_file))
+        names = [a.name for a in config.accounts]
+        env_vars = [a.oauth_token_env for a in config.accounts]
+        assert 'max-b' not in names, (
+            "max-b is permanently dead (HTTP 403) and must not be in the production pool"
+        )
+        assert 'CLAUDE_OAUTH_TOKEN_B' not in env_vars, (
+            "CLAUDE_OAUTH_TOKEN_B must not appear in production pool (max-b is dead)"
+        )
+
+    def test_max_a_excluded_from_production_pool(self):
+        """max-a (reserved for interactive/eval sessions) must not be in config/usage-accounts.yaml."""
+        accounts_file = self._get_accounts_file()
+        if accounts_file is None:
+            pytest.skip("config/usage-accounts.yaml not found — not a full repo checkout")
+
+        config = UsageCapConfig(accounts_file=str(accounts_file))
+        names = [a.name for a in config.accounts]
+        env_vars = [a.oauth_token_env for a in config.accounts]
+        assert 'max-a' not in names, (
+            "max-a (interactive account) must not be in the automation pool"
+        )
+        assert 'CLAUDE_OAUTH_TOKEN_A' not in env_vars, (
+            "CLAUDE_OAUTH_TOKEN_A must not appear in production pool"
+        )
