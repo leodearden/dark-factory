@@ -507,64 +507,63 @@ class TestDarkFactoryProductionPool:
     guard: if someone accidentally re-adds max-b or removes an active account
     during a merge conflict, the test fails immediately.
 
-    Tests are skipped (not failed) when run outside a full repo checkout so that
-    CI environments without the config file are not broken.
+    Tests are skipped when no git-repo sentinel is found (not a full checkout).
+    They fail (not skip) when the sentinel is found but the config file is absent,
+    so a truly missing config cannot silently hide behind a skip.
     """
 
     @staticmethod
-    def _get_accounts_file():
-        """Walk up from this file to the repo root and return the config file path.
+    def _find_repo_root() -> Path | None:
+        """Walk up from this file to find the repo root anchored by a .git entry.
 
-        Returns None if the file is not found (e.g. in non-repo checkouts).
+        Returns the repo-root Path if found, or None when not running inside a
+        git checkout (e.g. packaged wheel, partial mirror, or isolated test run).
+        Works for both normal checkouts (.git directory) and git worktrees (.git file).
         """
         here = Path(__file__).resolve()
-        for parent in list(here.parents):
-            candidate = parent / 'config' / 'usage-accounts.yaml'
-            if candidate.exists():
-                return candidate
+        for parent in here.parents:
+            if (parent / '.git').exists():
+                return parent
         return None
 
-    def test_production_pool_accounts_in_expected_order(self):
-        """Real config/usage-accounts.yaml has exactly [max-g, max-f, max-e, max-c, max-d] in order."""
-        accounts_file = self._get_accounts_file()
-        if accounts_file is None:
-            pytest.skip("config/usage-accounts.yaml not found — not a full repo checkout")
+    @pytest.fixture
+    def production_config(self):
+        """Load config/usage-accounts.yaml from the repo root.
 
-        config = UsageCapConfig(accounts_file=str(accounts_file))
-        names = [a.name for a in config.accounts]
+        Skips when no .git sentinel is found (not a full checkout).
+        Fails (not skips) when the sentinel is found but the config file is absent
+        so that a missing file inside the repo surfaces as an error rather than a
+        silent skip that defeats the regression guard.
+        """
+        repo_root = self._find_repo_root()
+        if repo_root is None:
+            pytest.skip("Not inside a git checkout — skipping production-pool tests")
+        accounts_file = repo_root / 'config' / 'usage-accounts.yaml'
+        if not accounts_file.exists():
+            pytest.fail(
+                f"Repo root found at {repo_root} but config/usage-accounts.yaml is missing"
+            )
+        return UsageCapConfig(accounts_file=str(accounts_file))
+
+    def test_production_pool_accounts_in_expected_order(self, production_config):
+        """Real config/usage-accounts.yaml has exactly [max-g, max-f, max-e, max-c, max-d] in order."""
+        names = [a.name for a in production_config.accounts]
         assert names == ['max-g', 'max-f', 'max-e', 'max-c', 'max-d'], (
             f"Production pool mismatch. Got: {names!r}. "
             "Expected max-b to be removed (permanently dead HTTP 403)."
         )
 
-    def test_max_b_removed_from_production_pool(self):
-        """max-b (permanently dead, HTTP 403 since 2026-04-20) must not appear in the pool."""
-        accounts_file = self._get_accounts_file()
-        if accounts_file is None:
-            pytest.skip("config/usage-accounts.yaml not found — not a full repo checkout")
-
-        config = UsageCapConfig(accounts_file=str(accounts_file))
-        names = [a.name for a in config.accounts]
-        env_vars = [a.oauth_token_env for a in config.accounts]
-        assert 'max-b' not in names, (
-            "max-b is permanently dead (HTTP 403) and must not be in the production pool"
-        )
-        assert 'CLAUDE_OAUTH_TOKEN_B' not in env_vars, (
-            "CLAUDE_OAUTH_TOKEN_B must not appear in production pool (max-b is dead)"
-        )
-
-    def test_max_a_excluded_from_production_pool(self):
-        """max-a (reserved for interactive/eval sessions) must not be in config/usage-accounts.yaml."""
-        accounts_file = self._get_accounts_file()
-        if accounts_file is None:
-            pytest.skip("config/usage-accounts.yaml not found — not a full repo checkout")
-
-        config = UsageCapConfig(accounts_file=str(accounts_file))
-        names = [a.name for a in config.accounts]
-        env_vars = [a.oauth_token_env for a in config.accounts]
-        assert 'max-a' not in names, (
-            "max-a (interactive account) must not be in the automation pool"
-        )
-        assert 'CLAUDE_OAUTH_TOKEN_A' not in env_vars, (
-            "CLAUDE_OAUTH_TOKEN_A must not appear in production pool"
-        )
+    def test_reserved_accounts_absent(self, production_config):
+        """max-a (reserved for interactive use) and max-b (permanently dead) must not appear."""
+        names = [a.name for a in production_config.accounts]
+        env_vars = [a.oauth_token_env for a in production_config.accounts]
+        for acct, env_var in [
+            ('max-a', 'CLAUDE_OAUTH_TOKEN_A'),   # reserved for interactive/eval sessions
+            ('max-b', 'CLAUDE_OAUTH_TOKEN_B'),   # permanently dead — HTTP 403 since 2026-04-20
+        ]:
+            assert acct not in names, (
+                f"{acct} must not be in the production automation pool"
+            )
+            assert env_var not in env_vars, (
+                f"{env_var} must not appear in the production pool"
+            )
