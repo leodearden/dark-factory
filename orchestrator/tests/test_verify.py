@@ -912,3 +912,73 @@ class TestApplyCargoScopePolyglotGuard:
         assert '--workspace' not in (result.lint_command or ''), (
             f'expected --workspace absent in lint_command, got {result.lint_command!r}'
         )
+
+    # -----------------------------------------------------------------------
+    # Extension-whitelist boundary coverage (step 4)
+    # -----------------------------------------------------------------------
+
+    # -- should SCOPE (extension in whitelist) --
+
+    def test_rs_plus_yaml_scopes(self):
+        """.rs + .yaml scopes to crate (safe config ext)."""
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'orchestrator.yaml'])
+        assert '-p foo' in (result.test_command or '')
+        assert '--workspace' not in (result.test_command or '')
+
+    def test_rs_plus_yml_scopes(self):
+        """.rs + .yml scopes to crate (safe config ext)."""
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'config.yml'])
+        assert '-p foo' in (result.test_command or '')
+        assert '--workspace' not in (result.test_command or '')
+
+    def test_rs_plus_json_scopes(self):
+        """.rs + .json scopes to crate (safe data ext)."""
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'package.json'])
+        assert '-p foo' in (result.test_command or '')
+        assert '--workspace' not in (result.test_command or '')
+
+    def test_rs_plus_md_scopes(self):
+        """.rs + .md scopes to crate (safe documentation ext)."""
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'README.md'])
+        assert '-p foo' in (result.test_command or '')
+        assert '--workspace' not in (result.test_command or '')
+
+    # -- should BAIL (extension outside whitelist) --
+
+    def test_rs_plus_ts_bails(self):
+        """.rs + .ts bails to --workspace (executable source)."""
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'gui/app.ts'])
+        assert result.test_command == 'cargo test --workspace'
+        assert result.lint_command == 'cargo clippy --workspace'
+
+    def test_rs_plus_js_bails(self):
+        """.rs + .js bails to --workspace (executable source)."""
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'scripts/build.js'])
+        assert result.test_command == 'cargo test --workspace'
+        assert result.lint_command == 'cargo clippy --workspace'
+
+    def test_rs_plus_no_extension_bails(self):
+        """.rs + Dockerfile (no suffix) bails to --workspace (conservative default)."""
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'Dockerfile'])
+        assert result.test_command == 'cargo test --workspace'
+        assert result.lint_command == 'cargo clippy --workspace'
+
+    def test_rs_plus_unknown_ext_bails(self):
+        """.rs + .rst bails to --workspace (unknown extension, conservative)."""
+        result = self._call_scoped(['crates/foo/src/lib.rs', 'notes.rst'])
+        assert result.test_command == 'cargo test --workspace'
+        assert result.lint_command == 'cargo clippy --workspace'
+
+    # -- baseline regression --
+
+    def test_only_rs_still_scopes(self):
+        """Pure .rs diff still scopes to crate (guard is transparent)."""
+        result = self._call_scoped(['crates/foo/src/lib.rs'])
+        assert '-p foo' in (result.test_command or '')
+        assert '--workspace' not in (result.test_command or '')
+
+    def test_no_rs_still_bails(self):
+        """No .rs files at all bails via the pre-existing early-exit guard."""
+        result = self._call_scoped(['Cargo.toml'])
+        assert result.test_command == 'cargo test --workspace'
+        assert result.lint_command == 'cargo clippy --workspace'
