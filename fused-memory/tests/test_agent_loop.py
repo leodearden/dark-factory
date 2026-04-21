@@ -978,128 +978,6 @@ def _cli_result_json(structured_output: dict, session_id: str = 'sess-1') -> byt
 
 
 @pytest.mark.asyncio
-async def test_claude_cli_provider_first_call():
-    """First CLI call uses --session-id and --system-prompt with tool schemas."""
-    config = _make_cli_config()
-
-    tools = {
-        'stage_complete': ToolDefinition(
-            name='stage_complete',
-            description='Complete',
-            parameters={'type': 'object', 'properties': {'report': {'type': 'object'}}},
-            function=lambda **kw: kw,
-        ),
-    }
-
-    agent = AgentLoop(
-        config=config,
-        system_prompt='Test system prompt',
-        tools=tools,
-        terminal_tool='stage_complete',
-    )
-
-    cli_output = _cli_result_json({
-        'thinking': 'All done.',
-        'tool_calls': [{'id': 'tc1', 'name': 'stage_complete', 'input': {'report': {}}}],
-    })
-
-    captured_cmd = []
-
-    async def fake_subprocess(*args, **kwargs):
-        captured_cmd.extend(args)
-        proc = MagicMock()
-        proc.returncode = 0
-
-        async def communicate():
-            return cli_output, b''
-        proc.communicate = communicate
-        return proc
-
-    with patch('asyncio.create_subprocess_exec', side_effect=fake_subprocess):
-        result, entries = await agent.run('initial payload')
-
-    assert result == {'report': {}}
-    cmd = captured_cmd
-    assert 'claude' in cmd[0]
-    assert '--session-id' in cmd
-    assert '--system-prompt' in cmd
-    # System prompt should include tool schemas
-    sp_idx = cmd.index('--system-prompt') + 1
-    assert 'stage_complete' in cmd[sp_idx]
-    assert '--tools' in cmd
-    # Prompt is last after --
-    assert cmd[-1] == 'initial payload'
-
-
-@pytest.mark.asyncio
-async def test_claude_cli_provider_resume():
-    """Second CLI call uses --resume instead of --session-id."""
-    config = _make_cli_config(agent_max_steps=5)
-
-    async def my_tool(**kwargs):
-        return {'ok': True}
-
-    tools = {
-        'my_tool': ToolDefinition(
-            name='my_tool',
-            description='Test tool',
-            parameters={'type': 'object', 'properties': {}},
-            function=my_tool,
-        ),
-        'stage_complete': ToolDefinition(
-            name='stage_complete',
-            description='Complete',
-            parameters={'type': 'object', 'properties': {}},
-            function=lambda **kw: kw,
-        ),
-    }
-
-    agent = AgentLoop(
-        config=config,
-        system_prompt='Test',
-        tools=tools,
-        terminal_tool='stage_complete',
-    )
-
-    call_count = 0
-    captured_cmds = []
-
-    async def fake_subprocess(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        captured_cmds.append(list(args))
-        proc = MagicMock()
-        proc.returncode = 0
-
-        if call_count == 1:
-            output = _cli_result_json({
-                'thinking': 'Calling tool.',
-                'tool_calls': [{'id': 'tc1', 'name': 'my_tool', 'input': {}}],
-            })
-        else:
-            output = _cli_result_json({
-                'thinking': 'Done.',
-                'tool_calls': [{'id': 'tc2', 'name': 'stage_complete', 'input': {}}],
-            })
-
-        async def communicate():
-            return output, b''
-        proc.communicate = communicate
-        return proc
-
-    with patch('asyncio.create_subprocess_exec', side_effect=fake_subprocess):
-        result, entries = await agent.run('payload')
-
-    assert call_count == 2
-    # First call has --session-id
-    assert '--session-id' in captured_cmds[0]
-    assert '--resume' not in captured_cmds[0]
-    # Second call has --resume
-    assert '--resume' in captured_cmds[1]
-    assert '--session-id' not in captured_cmds[1]
-
-
-@pytest.mark.asyncio
 async def test_claude_cli_response_adapter():
     """_CLIResponseAdapter produces correct _TextBlock/_ToolUseBlock."""
     structured = {
@@ -1163,267 +1041,178 @@ async def test_claude_cli_tool_results_serialization():
     assert '{"error": "not found"}' in text
 
 
+
+# ---------------------------------------------------------------------------
+# Delegation to invoke_with_cap_retry
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_claude_cli_not_installed():
-    """Clear error when Claude CLI is not installed."""
+async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
+    """_call_claude_cli delegates to invoke_with_cap_retry instead of managing subprocess.
+
+    Red test (step-1): confirms that the new interface passes `prompt` and `tools`
+    kwargs and that the returned adapter exposes `.thinking`, `.response`,
+    `.tool_calls`, and `.session_id`.
+    """
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    from fused_memory.reconciliation.agent_loop import CLAUDE_CLI_RESPONSE_SCHEMA
+
+    fake_gate = MagicMock()
     config = _make_cli_config()
+    tools = [{'name': 'read_file', 'description': 'read', 'input_schema': {}}]
 
-    tools = {
-        'stage_complete': ToolDefinition(
-            name='stage_complete',
-            description='Complete',
-            parameters={'type': 'object', 'properties': {}},
-            function=lambda **kw: kw,
-        ),
-    }
-
-    agent = AgentLoop(
-        config=config,
-        system_prompt='Test',
-        tools=tools,
-        terminal_tool='stage_complete',
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-1',
+        structured_output={
+            'thinking': 'reasoning',
+            'response': 'output text',
+            'tool_calls': [],
+        },
     )
 
-    with patch('asyncio.create_subprocess_exec', side_effect=FileNotFoundError), \
-         pytest.raises(RuntimeError, match='Claude CLI not found'):
-        await agent.run('test')
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = fake_result
 
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test system prompt',
+            tools={},
+            usage_gate=fake_gate,
+        )
 
-# ---------------------------------------------------------------------------
-# Cap-Hit Backoff
-# ---------------------------------------------------------------------------
+        result = await agent._call_claude_cli(prompt='hi', tools=tools)  # type: ignore[arg-type]
+
+    mock_invoke.assert_called_once()
+    call_kwargs = mock_invoke.call_args.kwargs
+    call_positional = mock_invoke.call_args.args
+
+    # Essential delegation contract: prompt, system prompt, schema, model,
+    # timeout, and session-threading are wired through correctly.
+    # Fine-grained knobs (max_turns, permission_mode, disallowed_tools) are
+    # implementation details covered by shared/tests/test_cli_invoke.py.
+    from pathlib import Path
+
+    assert call_kwargs['prompt'] == 'hi'
+    assert 'read_file' in call_kwargs['system_prompt']
+    assert call_kwargs['output_schema'] == CLAUDE_CLI_RESPONSE_SCHEMA
+    assert call_kwargs['model'] == config.agent_llm_model
+    assert call_kwargs['timeout_seconds'] == float(config.stage_timeout_seconds)
+    assert call_kwargs['resume_session_id'] is None  # first turn: no prior session
+    assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
+
+    # usage_gate may be positional or keyword — accept either
+    if 'usage_gate' in call_kwargs:
+        assert call_kwargs['usage_gate'] is fake_gate
+    else:
+        assert call_positional[0] is fake_gate
+
+    # Adapter must expose direct attribute access for thinking/response/tool_calls/session_id
+    assert result.thinking == 'reasoning'
+    assert result.response == 'output text'
+    assert result.tool_calls == []
+    assert result.session_id == 'sess-1'
 
 
 @pytest.mark.asyncio
-async def test_call_claude_cli_sleeps_on_cap_hit():
-    """_call_claude_cli sleeps before retrying on cap hit."""
+async def test_call_claude_cli_threads_session_id_across_turns():
+    """Session ID is stored after the first call and passed as resume_session_id on subsequent calls.
+
+    Red test (step-3): verifies the session-threading contract without end-to-end
+    integration. First call must use resume_session_id=None; second call must use
+    resume_session_id='sess-A' (the session_id returned by the first call).
+    """
     from unittest.mock import AsyncMock
 
-    from fused_memory.reconciliation.agent_loop import _CAP_HIT_COOLDOWN_SECS
+    from shared.cli_invoke import AgentResult
 
-    config = _make_config(agent_llm_provider='claude-cli', agent_llm_model='opus')
+    fake_gate = MagicMock()
+    config = _make_cli_config()
+    tools: list = []
+    structured = {'thinking': '', 'tool_calls': []}
 
-    tools = {
-        'stage_complete': ToolDefinition(
-            name='stage_complete',
-            description='Complete',
-            parameters={'type': 'object', 'properties': {}},
-            function=lambda **kw: kw,
-        ),
-    }
-
-    agent = AgentLoop(
-        config=config,
-        system_prompt='Test',
-        tools=tools,
-        terminal_tool='stage_complete',
+    first_result = AgentResult(
+        success=True, output='', session_id='sess-A', structured_output=structured
+    )
+    second_result = AgentResult(
+        success=True, output='', session_id='sess-A', structured_output=structured
     )
 
-    # Wire up a mock usage gate
-    gate = MagicMock()
-    gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-    cap_call_count = 0
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.side_effect = [first_result, second_result]
 
-    def detect_side_effect(*args, **kwargs):
-        nonlocal cap_call_count
-        cap_call_count += 1
-        return cap_call_count == 1  # cap hit first time only
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test',
+            tools={},
+            usage_gate=fake_gate,
+        )
 
-    gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
-    agent._usage_gate = gate
+        await agent._call_claude_cli(prompt='turn-1', tools=tools)
+        await agent._call_claude_cli(prompt='turn-2', tools=tools)
 
-    # Build a JSON result the CLI would produce
-    cli_result = json.dumps({
-        'result': '',
-        'session_id': 'sess-1',
-        'num_input_tokens': 100,
-        'num_output_tokens': 50,
-        'structured_output': json.dumps({
-            'thinking': 'done',
-            'tool_calls': [{'name': 'stage_complete', 'arguments': {}}],
-        }),
-    })
-
-    mock_proc = AsyncMock()
-    mock_proc.returncode = 0
-    mock_proc.communicate = AsyncMock(return_value=(
-        cli_result.encode(), b'',
-    ))
-
-    messages = [{'role': 'user', 'content': 'test prompt'}]
-    tool_schemas: list = []
-
-    with (
-        patch('asyncio.create_subprocess_exec', new_callable=AsyncMock, return_value=mock_proc),
-        patch('asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
-    ):
-        await agent._call_claude_cli(messages, tool_schemas)
-
-        mock_sleep.assert_called_once_with(_CAP_HIT_COOLDOWN_SECS)
-        assert gate.before_invoke.call_count == 2
+    assert mock_invoke.call_count == 2
+    first_kwargs = mock_invoke.call_args_list[0].kwargs
+    second_kwargs = mock_invoke.call_args_list[1].kwargs
+    assert first_kwargs['resume_session_id'] is None
+    assert second_kwargs['resume_session_id'] == 'sess-A'
 
 
-# ---------------------------------------------------------------------------
-# UsageGate lifecycle: confirm_account_ok / on_agent_complete / release_probe_slot
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
+    """_call_claude_cli passes cwd all the way through to invoke_claude_agent.
 
+    Step-7 (b): patches invoke_claude_agent (one level below invoke_with_cap_retry)
+    so that the kwargs-forwarding layer is exercised.  Omitting cwd from the
+    invoke_with_cap_retry call would raise TypeError at runtime; this test
+    catches that regression without requiring a live Claude CLI.
+    """
+    from pathlib import Path
+    from unittest.mock import AsyncMock
 
-def _make_gated_agent_loop(token: str = 'token-a'):
-    """Return (agent, gate) with a mock usage gate pre-wired into the agent."""
-    from unittest.mock import AsyncMock as _AsyncMock
-    config = _make_config(agent_llm_provider='claude-cli', agent_llm_model='opus')
-    tools = {
-        'stage_complete': ToolDefinition(
-            name='stage_complete',
-            description='Complete',
-            parameters={'type': 'object', 'properties': {}},
-            function=lambda **kw: kw,
-        ),
-    }
-    agent = AgentLoop(
-        config=config,
-        system_prompt='Test',
-        tools=tools,
-        terminal_tool='stage_complete',
+    from shared.cli_invoke import AgentResult
+
+    # Use tmp_path so the cwd Path actually exists on disk.
+    explore_root = str(tmp_path)
+    config = _make_cli_config(explore_codebase_root=explore_root)
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-cwd',
+        structured_output={'thinking': '', 'tool_calls': []},
     )
-    gate = MagicMock()
-    gate.before_invoke = _AsyncMock(return_value=token)
-    gate.detect_cap_hit = MagicMock(return_value=False)
-    agent._usage_gate = gate
-    return agent, gate
 
+    # Patch at the level below invoke_with_cap_retry — this exercises the
+    # kwargs-forwarding path that the higher-level mock skips.
+    # usage_gate=None takes the fast path in invoke_with_cap_retry
+    # (single invocation, no cap retry), so the real forwarding code runs.
+    with patch(
+        'shared.cli_invoke.invoke_claude_agent',
+        new_callable=AsyncMock,
+    ) as mock_agent:
+        mock_agent.return_value = fake_result
 
-def _make_success_proc(cost_usd: float = 0.0042):
-    """Return a mock subprocess that exits 0 with a valid CLI JSON response."""
-    from unittest.mock import AsyncMock as _AsyncMock
-    cli_result = json.dumps({
-        'result': '',
-        'session_id': 'sess-1',
-        'num_input_tokens': 100,
-        'num_output_tokens': 50,
-        'cost_usd': cost_usd,
-        'structured_output': json.dumps({
-            'thinking': 'done',
-            'tool_calls': [{'name': 'stage_complete', 'arguments': {}}],
-        }),
-    })
-    mock_proc = _AsyncMock()
-    mock_proc.returncode = 0
-    mock_proc.communicate = _AsyncMock(return_value=(cli_result.encode(), b''))
-    return mock_proc
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test',
+            tools={},
+            usage_gate=None,  # fast path: real invoke_with_cap_retry, real forwarding
+        )
 
+        await agent._call_claude_cli(prompt='hello', tools=[])
 
-_MESSAGES = [{'role': 'user', 'content': 'test prompt'}]
-_TOOL_SCHEMAS: list = []
-
-
-@pytest.mark.asyncio
-async def test_call_claude_cli_confirms_account_ok_on_success():
-    """_call_claude_cli calls confirm_account_ok and on_agent_complete on success."""
-    agent, gate = _make_gated_agent_loop(token='token-a')
-    mock_proc = _make_success_proc(cost_usd=0.0042)
-
-    with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
-        await agent._call_claude_cli(_MESSAGES, _TOOL_SCHEMAS)
-
-    gate.confirm_account_ok.assert_called_once_with('token-a')
-    gate.on_agent_complete.assert_called_once_with(0.0042)
-
-
-@pytest.mark.asyncio
-async def test_call_claude_cli_no_confirm_on_cap_hit():
-    """confirm_account_ok is NOT called on the cap-hit iteration, only on success."""
-    from unittest.mock import AsyncMock
-    agent, gate = _make_gated_agent_loop()
-    gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-
-    cap_call_count = 0
-
-    def detect_side_effect(*args, **kwargs):
-        nonlocal cap_call_count
-        cap_call_count += 1
-        return cap_call_count == 1  # cap hit first time only
-
-    gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
-    mock_proc = _make_success_proc(cost_usd=0.0077)
-
-    with (
-        patch('asyncio.create_subprocess_exec', return_value=mock_proc),
-        patch('asyncio.sleep'),
-    ):
-        await agent._call_claude_cli(_MESSAGES, _TOOL_SCHEMAS)
-
-    # Exactly once — for the success iteration, NOT for the cap-hit iteration
-    gate.confirm_account_ok.assert_called_once_with('token-b')
-    gate.on_agent_complete.assert_called_once_with(0.0077)
-    gate.release_probe_slot.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_call_claude_cli_releases_probe_on_file_not_found():
-    """release_probe_slot is called when create_subprocess_exec raises FileNotFoundError."""
-    agent, gate = _make_gated_agent_loop(token='token-x')
-
-    with (
-        patch('asyncio.create_subprocess_exec', side_effect=FileNotFoundError),
-        pytest.raises(RuntimeError, match='Claude CLI not found'),
-    ):
-        await agent._call_claude_cli(_MESSAGES, _TOOL_SCHEMAS)
-
-    gate.release_probe_slot.assert_called_once_with('token-x')
-
-
-@pytest.mark.asyncio
-async def test_call_claude_cli_releases_probe_on_timeout():
-    """release_probe_slot is called when wait_for raises TimeoutError."""
-    from unittest.mock import AsyncMock
-    agent, gate = _make_gated_agent_loop(token='token-y')
-    mock_proc = AsyncMock()
-    mock_proc.returncode = 0
-    mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
-
-    with (
-        patch('asyncio.create_subprocess_exec', return_value=mock_proc),
-        pytest.raises(RuntimeError, match='timed out'),
-    ):
-        await agent._call_claude_cli(_MESSAGES, _TOOL_SCHEMAS)
-
-    gate.release_probe_slot.assert_called_once_with('token-y')
-
-
-@pytest.mark.asyncio
-async def test_call_claude_cli_releases_probe_on_nonzero_exit():
-    """release_probe_slot is called when the CLI exits with a non-zero return code."""
-    from unittest.mock import AsyncMock
-    agent, gate = _make_gated_agent_loop(token='token-z')
-    mock_proc = AsyncMock()
-    mock_proc.returncode = 1
-    mock_proc.communicate = AsyncMock(return_value=(b'', b'some error output'))
-
-    with (
-        patch('asyncio.create_subprocess_exec', return_value=mock_proc),
-        pytest.raises(RuntimeError, match='exited with code 1'),
-    ):
-        await agent._call_claude_cli(_MESSAGES, _TOOL_SCHEMAS)
-
-    gate.release_probe_slot.assert_called_once_with('token-z')
-    gate.confirm_account_ok.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_call_claude_cli_empty_stdout_releases_probe():
-    """release_probe_slot is called (not confirm_account_ok) when stdout is empty."""
-    from unittest.mock import AsyncMock as _AsyncMock
-    agent, gate = _make_gated_agent_loop(token='token-empty')
-    mock_proc = _AsyncMock()
-    mock_proc.returncode = 0
-    mock_proc.communicate = _AsyncMock(return_value=(b'', b''))
-
-    with (
-        patch('asyncio.create_subprocess_exec', return_value=mock_proc),
-        pytest.raises(RuntimeError, match='Claude CLI produced no output'),
-    ):
-        await agent._call_claude_cli(_MESSAGES, _TOOL_SCHEMAS)
-
-    gate.release_probe_slot.assert_called_once_with('token-empty')
-    gate.confirm_account_ok.assert_not_called()
+    mock_agent.assert_called_once()
+    call_kwargs = mock_agent.call_args.kwargs
+    assert call_kwargs['cwd'] == Path(explore_root)

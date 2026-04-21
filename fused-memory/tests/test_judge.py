@@ -1,6 +1,5 @@
 """Tests for the LLM-as-judge module (judge.py)."""
 
-import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -751,155 +750,145 @@ async def test_initialize_rehydrates_halt_state(mock_journal):
 
 
 # ---------------------------------------------------------------------------
-# UsageGate lifecycle: confirm_account_ok / on_agent_complete / release_probe_slot
+# Delegation to invoke_with_cap_retry
 # ---------------------------------------------------------------------------
 
 
-def _make_gated_judge(mock_journal, token: str = 'token-j'):
-    """Return (judge, gate) with a mock usage gate pre-wired."""
-    config = _make_judge_config(judge_llm_provider='claude-cli', judge_llm_model='sonnet')
-    judge = Judge(config=config, journal=mock_journal)
-    gate = MagicMock()
-    gate.before_invoke = AsyncMock(return_value=token)
-    gate.detect_cap_hit = MagicMock(return_value=False)
-    judge._usage_gate = gate
-    return judge, gate
+@pytest.mark.asyncio
+async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
+    """_call_judge_cli delegates to invoke_with_cap_retry (no output_schema — free-form text).
 
+    Verifies the essential delegation contract: prompt, system_prompt, model,
+    usage_gate, and timeout are wired through correctly.  Fine-grained knobs
+    (max_turns, permission_mode, disallowed_tools) are implementation details
+    covered by shared/tests/test_cli_invoke.py.
+    """
+    from unittest.mock import AsyncMock
 
-def _make_judge_success_proc(result_text: str = 'The verdict is ok.', cost_usd: float = 0.0055):
-    """Return a mock subprocess that exits 0 with a valid judge CLI JSON response."""
-    cli_result = json.dumps({
-        'result': result_text,
-        'session_id': 'sess-j1',
-        'num_input_tokens': 80,
-        'num_output_tokens': 40,
-        'cost_usd': cost_usd,
-    })
-    mock_proc = AsyncMock()
-    mock_proc.returncode = 0
-    mock_proc.communicate = AsyncMock(return_value=(cli_result.encode(), b''))
-    return mock_proc
+    from shared.cli_invoke import AgentResult
+
+    fake_gate = MagicMock()
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=fake_gate)
+
+    fake_result = AgentResult(
+        success=True,
+        output='{"severity": "ok", "findings": []}',
+        session_id='jsess-1',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = fake_result
+
+        result = await judge._call_judge_cli('Evaluate this run.')
+
+    mock_invoke.assert_called_once()
+    call_kwargs = mock_invoke.call_args.kwargs
+    call_positional = mock_invoke.call_args.args
+
+    from pathlib import Path
+
+    # Essential contract assertions
+    assert call_kwargs['prompt'] == 'Evaluate this run.'
+    assert call_kwargs['system_prompt'] == JUDGE_SYSTEM_PROMPT
+    assert call_kwargs['model'] == config.judge_llm_model
+    assert call_kwargs['timeout_seconds'] == float(config.stage_timeout_seconds)
+    assert 'output_schema' not in call_kwargs  # judge output is free-form, no schema
+    assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
+
+    # usage_gate may be positional or keyword — accept either
+    if 'usage_gate' in call_kwargs:
+        assert call_kwargs['usage_gate'] is fake_gate
+    else:
+        assert call_positional[0] is fake_gate
+
+    assert result == '{"severity": "ok", "findings": []}'
 
 
 @pytest.mark.asyncio
-async def test_call_judge_cli_confirms_account_ok_on_success(mock_journal):
-    """_call_judge_cli calls confirm_account_ok and on_agent_complete on success."""
-    judge, gate = _make_gated_judge(mock_journal, token='token-j')
-    mock_proc = _make_judge_success_proc(result_text='The verdict is ok.', cost_usd=0.0055)
+async def test_call_judge_cli_empty_output_returns_empty_string(mock_journal):
+    """Empty-stdout from CLI (error_empty_output subtype) returns '' instead of raising.
 
-    with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
-        result = await judge._call_judge_cli('Evaluate this.')
+    _parse_claude_output in shared maps empty stdout → success=False /
+    subtype='error_empty_output'.  The judge preserves the prior subprocess
+    contract: exit-0 + empty stdout was treated as a valid empty verdict.
+    """
+    from unittest.mock import AsyncMock
 
-    assert result == 'The verdict is ok.'
-    gate.confirm_account_ok.assert_called_once_with('token-j')
-    gate.on_agent_complete.assert_called_once_with(0.0055)
+    from shared.cli_invoke import AgentResult
 
+    fake_gate = MagicMock()
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=fake_gate)
 
-@pytest.mark.asyncio
-async def test_call_judge_cli_releases_probe_on_file_not_found(mock_journal):
-    """release_probe_slot is called when create_subprocess_exec raises FileNotFoundError."""
-    judge, gate = _make_gated_judge(mock_journal, token='token-jx')
+    # Simulate what shared returns when the CLI produces no output
+    empty_output_result = AgentResult(
+        success=False,
+        output='Agent produced no output',
+        subtype='error_empty_output',
+        session_id='jsess-1',
+    )
 
-    with (
-        patch('asyncio.create_subprocess_exec', side_effect=FileNotFoundError),
-        pytest.raises(RuntimeError, match='Claude CLI not found'),
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+        return_value=empty_output_result,
     ):
-        await judge._call_judge_cli('Evaluate this.')
-
-    gate.release_probe_slot.assert_called_once_with('token-jx')
-
-
-@pytest.mark.asyncio
-async def test_call_judge_cli_releases_probe_on_timeout(mock_journal):
-    """release_probe_slot is called when wait_for raises TimeoutError."""
-    judge, gate = _make_gated_judge(mock_journal, token='token-jy')
-    mock_proc = AsyncMock()
-    mock_proc.returncode = 0
-    mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
-
-    with (
-        patch('asyncio.create_subprocess_exec', return_value=mock_proc),
-        pytest.raises(RuntimeError, match='timed out'),
-    ):
-        await judge._call_judge_cli('Evaluate this.')
-
-    gate.release_probe_slot.assert_called_once_with('token-jy')
-
-
-@pytest.mark.asyncio
-async def test_call_judge_cli_no_confirm_on_cap_hit(mock_journal):
-    """confirm_account_ok is NOT called on the cap-hit iteration, only on success."""
-    judge, gate = _make_gated_judge(mock_journal)
-    gate.before_invoke = AsyncMock(side_effect=['token-ja', 'token-jb'])
-
-    cap_call_count = 0
-
-    def detect_side_effect(*args, **kwargs):
-        nonlocal cap_call_count
-        cap_call_count += 1
-        return cap_call_count == 1  # cap hit first time only
-
-    gate.detect_cap_hit = MagicMock(side_effect=detect_side_effect)
-    mock_proc = _make_judge_success_proc(result_text='Judge output.', cost_usd=0.0099)
-
-    with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
-        result = await judge._call_judge_cli('Evaluate this.')
-
-    assert result == 'Judge output.'
-    # Exactly once — for the success iteration, NOT for the cap-hit iteration
-    gate.confirm_account_ok.assert_called_once_with('token-jb')
-    gate.on_agent_complete.assert_called_once_with(0.0099)
-    gate.release_probe_slot.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_call_judge_cli_releases_probe_on_nonzero_exit(mock_journal):
-    """release_probe_slot is called when the CLI exits with a non-zero return code."""
-    judge, gate = _make_gated_judge(mock_journal, token='token-jz')
-    mock_proc = AsyncMock()
-    mock_proc.returncode = 2
-    mock_proc.communicate = AsyncMock(return_value=(b'', b'judge error output'))
-
-    with (
-        patch('asyncio.create_subprocess_exec', return_value=mock_proc),
-        pytest.raises(RuntimeError, match='exited with code 2'),
-    ):
-        await judge._call_judge_cli('Evaluate this.')
-
-    gate.release_probe_slot.assert_called_once_with('token-jz')
-    gate.confirm_account_ok.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_call_judge_cli_empty_stdout_confirms_gate(mock_journal):
-    """Empty stdout (exit 0) calls confirm_account_ok and on_agent_complete but not release_probe_slot."""
-    judge, gate = _make_gated_judge(mock_journal, token='token-je')
-    mock_proc = AsyncMock()
-    mock_proc.returncode = 0
-    mock_proc.communicate = AsyncMock(return_value=(b'', b''))
-
-    with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
-        result = await judge._call_judge_cli('Evaluate this.')
+        result = await judge._call_judge_cli('Evaluate this run.')
 
     assert result == ''
-    gate.confirm_account_ok.assert_called_once_with('token-je')
-    gate.on_agent_complete.assert_called_once_with(0.0)
-    gate.release_probe_slot.assert_not_called()
-    mock_journal.write.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_call_judge_cli_empty_stdout_with_stderr_confirms_gate(mock_journal):
-    """Empty stdout (exit 0) still confirms gate even when stderr contains warnings."""
-    judge, gate = _make_gated_judge(mock_journal, token='token-jw')
-    mock_proc = AsyncMock()
-    mock_proc.returncode = 0
-    mock_proc.communicate = AsyncMock(return_value=(b'', b'some warning'))
+async def test_call_judge_cli_forwards_cwd_to_invoke_claude_agent(mock_journal, tmp_path):
+    """_call_judge_cli passes cwd all the way through to invoke_claude_agent.
 
-    with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
-        result = await judge._call_judge_cli('Evaluate this.')
+    Step-9 (b): patches invoke_claude_agent (one level below invoke_with_cap_retry)
+    so the kwargs-forwarding layer is exercised.  Omitting cwd from the
+    invoke_with_cap_retry call would raise TypeError at runtime; this test
+    catches that regression without requiring a live Claude CLI.
+    """
+    from pathlib import Path
+    from unittest.mock import AsyncMock
 
-    assert result == ''
-    gate.confirm_account_ok.assert_called_once_with('token-jw')
-    gate.on_agent_complete.assert_called_once_with(0.0)
-    gate.release_probe_slot.assert_not_called()
+    from shared.cli_invoke import AgentResult
+
+    # Use tmp_path so the cwd Path actually exists on disk.
+    explore_root = str(tmp_path)
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+        explore_codebase_root=explore_root,
+    )
+
+    fake_result = AgentResult(
+        success=True,
+        output='{"severity": "ok"}',
+        session_id='jsess-cwd',
+    )
+
+    # Patch at the level below invoke_with_cap_retry — this exercises the
+    # kwargs-forwarding path that the higher-level mock skips.
+    # usage_gate=None takes the fast path in invoke_with_cap_retry
+    # (single invocation, no cap retry), so the real forwarding code runs.
+    with patch(
+        'shared.cli_invoke.invoke_claude_agent',
+        new_callable=AsyncMock,
+    ) as mock_agent:
+        mock_agent.return_value = fake_result
+
+        judge = Judge(config=config, journal=mock_journal, usage_gate=None)
+        await judge._call_judge_cli('Evaluate this run.')
+
+    mock_agent.assert_called_once()
+    call_kwargs = mock_agent.call_args.kwargs
+    assert call_kwargs['cwd'] == Path(explore_root)

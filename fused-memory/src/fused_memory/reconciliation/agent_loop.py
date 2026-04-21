@@ -5,28 +5,33 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import uuid as uuid_mod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from anthropic.types import MessageParam, ToolParam
     from openai.types.chat import ChatCompletionMessageParam
 
+from shared.cli_invoke import AgentResult, invoke_with_cap_retry
+
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import JournalEntry
 
 logger = logging.getLogger(__name__)
 
-_CAP_HIT_COOLDOWN_SECS = 5.0
-
 CLAUDE_CLI_RESPONSE_SCHEMA = {
     'type': 'object',
     'properties': {
         'thinking': {'type': 'string'},
+        # Optional free-form assistant reply (distinct from thinking: thinking is
+        # private reasoning; response is the visible answer when no tool calls
+        # are needed).  Not required by the schema — most turns only produce
+        # tool_calls.
+        'response': {'type': 'string'},
         'tool_calls': {
             'type': 'array',
             'items': {
@@ -220,7 +225,9 @@ class AgentLoop:
         elif provider == 'openai':
             return await self._call_openai(messages, tool_schemas)
         elif provider == 'claude_cli':
-            return await self._call_claude_cli(messages, tool_schemas)
+            content = messages[-1]['content']
+            prompt = content if isinstance(content, str) else self._serialize_tool_results(content)
+            return await self._call_claude_cli(prompt=prompt, tools=tool_schemas)
         else:
             raise ValueError(f'Unsupported agent LLM provider: {provider}')
 
@@ -322,135 +329,51 @@ class AgentLoop:
                 )
         return '\n\n'.join(parts)
 
-    async def _call_claude_cli(self, messages: list[dict[str, Any]], tool_schemas: list[ToolParam]) -> Any:
-        """Call Claude via CLI subprocess with --resume for multi-turn.
+    async def _call_claude_cli(self, prompt: str, tools: list[ToolParam]) -> _CLIResponseAdapter:
+        """Delegate to shared.cli_invoke.invoke_with_cap_retry.
 
-        Includes: stdin isolation, stdout+stderr error reading, and usage-cap
-        retry with account failover when a UsageGate is attached.
+        Multi-turn is handled by passing ``resume_session_id`` on subsequent
+        calls; ``_call_llm`` is responsible for serialising tool results into
+        the next turn's prompt before calling this method.
         """
-        import asyncio as _asyncio
+        result: AgentResult = await invoke_with_cap_retry(
+            usage_gate=self._usage_gate,
+            label=f'Reconciliation agent ({self.config.agent_llm_model})',
+            prompt=prompt,
+            system_prompt=self._build_cli_system_prompt(tools),
+            output_schema=CLAUDE_CLI_RESPONSE_SCHEMA,
+            disallowed_tools=['*'],
+            model=self.config.agent_llm_model,
+            # max_turns=1: AgentLoop.run() drives multi-turn externally by calling
+            # _call_claude_cli again with resume_session_id.  A single CLI
+            # invocation only needs one assistant turn (schema tool-use → JSON
+            # response happens within the same turn when --json-schema is used).
+            max_turns=1,
+            permission_mode='bypassPermissions',
+            timeout_seconds=float(self.config.stage_timeout_seconds),
+            resume_session_id=self._cli_session_id,
+            cwd=Path(self.config.explore_codebase_root),
+        )
 
-        while True:
-            # 1. Gate: get OAuth token (or None)
-            oauth_token = None
-            if self._usage_gate:
-                oauth_token = await self._usage_gate.before_invoke()
+        if not result.success:
+            # schema_salvaged=True implies success=True (cli_invoke.py:749-751),
+            # so `not result.success` is the complete failure guard.
+            raise RuntimeError(f'Claude CLI agent failed: {result.output[:500]}')
 
-            is_first_call = self._cli_session_id is None
-            if is_first_call:
-                self._cli_session_id = str(uuid_mod.uuid4())
+        self._cli_session_id = result.session_id or self._cli_session_id
+        self.llm_call_count += 1
+        self.token_count += (result.input_tokens or 0) + (result.output_tokens or 0)
 
-            cmd = [
-                'claude', '--print', '--output-format', 'json',
-                '--model', self.config.agent_llm_model,
-                '--json-schema', json.dumps(CLAUDE_CLI_RESPONSE_SCHEMA),
-                '--permission-mode', 'bypassPermissions',
-                '--tools', '',
-            ]
-
-            assert self._cli_session_id is not None
-            if is_first_call:
-                cmd.extend(['--system-prompt', self._build_cli_system_prompt(tool_schemas)])
-                cmd.extend(['--session-id', self._cli_session_id])
-                prompt = messages[-1]['content']  # Initial payload string
-            else:
-                cmd.extend(['--resume', self._cli_session_id])
-                prompt = self._serialize_tool_results(messages[-1]['content'])
-
-            cmd.extend(['--', prompt])
-
-            # 2. Build env: strip ANTHROPIC_API_KEY, inject OAuth token
-            env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
-            if oauth_token:
-                env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
-
+        structured = result.structured_output
+        if isinstance(structured, str):
             try:
-                try:
-                    proc = await _asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdin=_asyncio.subprocess.DEVNULL,
-                        stdout=_asyncio.subprocess.PIPE,
-                        stderr=_asyncio.subprocess.PIPE,
-                        env=env,
-                    )
-                except FileNotFoundError as exc:
-                    raise RuntimeError(
-                        'Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code'
-                    ) from exc
+                structured = json.loads(structured)
+            except json.JSONDecodeError:
+                structured = {'thinking': structured, 'tool_calls': []}
+        if not structured:
+            structured = {'thinking': '', 'tool_calls': []}
 
-                try:
-                    stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=180)
-                except TimeoutError as exc:
-                    proc.kill()
-                    raise RuntimeError('Claude CLI timed out after 180 seconds') from exc
-
-                stdout_text = stdout.decode()
-                stderr_text = stderr.decode()
-
-                # 3. Check for cap hit before processing results
-                if self._usage_gate and self._usage_gate.detect_cap_hit(
-                    stderr_text, stdout_text, 'claude', oauth_token=oauth_token,
-                ):
-                    logger.warning(
-                        f'Usage cap hit during CLI call, sleeping '
-                        f'{_CAP_HIT_COOLDOWN_SECS}s before retrying',
-                    )
-                    # Reset session so next call starts fresh (can't --resume a capped session)
-                    if is_first_call:
-                        self._cli_session_id = None
-                    await asyncio.sleep(_CAP_HIT_COOLDOWN_SECS)
-                    continue
-
-                # 4. Non-zero exit: include both stdout and stderr in error
-                if proc.returncode != 0:
-                    error_detail = stderr_text[-500:] if stderr_text.strip() else stdout_text[-500:]
-                    raise RuntimeError(
-                        f'Claude CLI exited with code {proc.returncode}: {error_detail}'
-                    )
-
-                if not stdout_text.strip():
-                    raise RuntimeError('Claude CLI produced no output')
-
-                result = json.loads(stdout_text)
-
-                # Update session_id from result if available
-                if result.get('session_id'):
-                    self._cli_session_id = result['session_id']
-
-                # Extract structured output
-                structured = result.get('structured_output')
-                if isinstance(structured, str):
-                    structured = json.loads(structured)
-                if not structured:
-                    result_text = result.get('result', '')
-                    if result_text:
-                        try:
-                            structured = json.loads(result_text)
-                        except (json.JSONDecodeError, TypeError):
-                            structured = {'thinking': result_text, 'tool_calls': []}
-                    else:
-                        structured = {'thinking': '', 'tool_calls': []}
-
-                self.llm_call_count += 1
-                self.token_count += (
-                    int(result.get('num_input_tokens', 0))
-                    + int(result.get('num_output_tokens', 0))
-                )
-
-                if self._usage_gate:
-                    cost_usd = float(result.get('cost_usd', result.get('total_cost_usd', 0.0)))
-                    self._usage_gate.confirm_account_ok(oauth_token)
-                    self._usage_gate.on_agent_complete(cost_usd)
-
-                return _CLIResponseAdapter(structured)
-
-            except BaseException:
-                if self._usage_gate is not None:
-                    try:
-                        self._usage_gate.release_probe_slot(oauth_token)
-                    except Exception:
-                        logger.warning('release_probe_slot failed', exc_info=True)
-                raise
+        return _CLIResponseAdapter(structured, session_id=result.session_id)
 
 
 class _OpenAIResponseAdapter:
@@ -476,17 +399,28 @@ class _OpenAIResponseAdapter:
 
 
 class _CLIResponseAdapter:
-    """Adapts Claude CLI structured output to look like Anthropic Messages response."""
+    """Adapts Claude CLI structured output to look like Anthropic Messages response.
 
-    def __init__(self, structured_output: dict):
+    Exposes both the legacy ``.content`` list (for drop-in compatibility with
+    the anthropic/openai branches) and direct attribute access (for
+    delegation-level tests and future callers that don't need the block list):
+    ``.thinking``, ``.response``, ``.tool_calls``, ``.session_id``.
+    """
+
+    def __init__(self, structured_output: dict, session_id: str = ''):
         self.content = []
         self.usage = _CLIUsage()
 
-        thinking = structured_output.get('thinking', '')
-        if thinking:
-            self.content.append(_TextBlock(thinking))
+        # Direct attribute access
+        self.thinking: str = structured_output.get('thinking', '')
+        self.response: str = structured_output.get('response', '')
+        self.tool_calls: list = structured_output.get('tool_calls', [])
+        self.session_id: str = session_id
 
-        for tc in structured_output.get('tool_calls', []):
+        if self.thinking:
+            self.content.append(_TextBlock(self.thinking))
+
+        for tc in self.tool_calls:
             self.content.append(
                 _ToolUseBlock(
                     id=tc.get('id', str(uuid_mod.uuid4())),
