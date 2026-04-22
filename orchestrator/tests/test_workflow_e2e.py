@@ -2602,6 +2602,77 @@ class TestMarkBlockedFalseDoneGuard:
             f"Last status must be 'pending' after exception-path requeue: {statuses}"
         )
 
+    async def test_empty_branch_with_stale_iteration_log_still_requeues(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """SHA-primary guard must requeue even when a stale implementer entry is present.
+
+        On the baseline (entry-scan only) _has_prior_implementation(), the stale entry
+        causes it to return True.  Because the fresh worktree HEAD is trivially an
+        ancestor of main (wt_head == base_commit == main HEAD), the guard incorrectly
+        fast-paths to DONE.
+
+        After the SHA-primary refactor, the guard compares wt_head == base_commit and
+        returns (False, entries), falling through to the normal requeue path.
+
+        This test FAILS on unmodified code (step-1 TDD for SHA-primary signal).
+        """
+        import json as _json
+
+        # 1. Create a fresh worktree (no implementation commits — wt_head == base_commit)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Get the current HEAD SHA — this is also the base_commit
+        _, wt_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        wt_head = wt_head_raw.strip()
+
+        # 3. Stamp metadata.json with base_commit == wt_head
+        #    (mirrors what workflow._init_plan_artifacts does at task start)
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'metadata.json').write_text(
+            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': wt_head})
+        )
+
+        # 4. Write a stale implementer iteration entry.
+        #    On baseline code this alone makes _has_prior_implementation() return True.
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+
+        # 5. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 6. FakeSteward resolves all pending L0 escalations immediately in start()
+        workflow._steward_factory = _make_resolving_steward(
+            queue, task_assignment.task_id,
+        )
+
+        # 7. Call _mark_blocked directly
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        # 8. Assert REQUEUED — stale entry must not trigger false-done when wt_head == base_commit
+        assert outcome == WorkflowOutcome.REQUEUED, (
+            f'Expected REQUEUED but got {outcome!r} — '
+            'stale iteration entry triggered false-done despite wt_head == base_commit'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses: {statuses}"
+        )
+        assert statuses[-1] == 'pending', (
+            f"Last scheduler status must be 'pending' after requeue, got: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE: {workflow.state!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # File-structure invariants
