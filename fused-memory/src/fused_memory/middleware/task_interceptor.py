@@ -1107,7 +1107,9 @@ class TaskInterceptor:
 
         try:
             # ── R4: escalation-level idempotency ─────────────────────────
-            # (Steps 27-28 will populate this; stub returns None always)
+            # Short-circuits curator when (escalation_id, suggestion_hash) in
+            # metadata matches a non-cancelled existing task — avoids duplicate
+            # tasks when reconciliation retries an escalation suggestion.
             idempotency_hit = await self._check_escalation_idempotency(
                 project_root=project_root, metadata=metadata,
             )
