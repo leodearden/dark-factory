@@ -627,6 +627,8 @@ class TaskWorkflow:
 
     def _maybe_warn_missing_escalation(self, role_name: str) -> None:
         """Emit a single WARNING when an escalation-capable role is invoked without a queue."""
+        if self.escalation_queue is not None:
+            return
         logger.warning(
             'Task %s: escalation_queue is unavailable — agent role %r would normally'
             ' have escalation tools wired',
