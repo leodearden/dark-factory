@@ -454,7 +454,7 @@ async def test_worker_tm_add_task_failure_marks_ticket_failed(
     from fused_memory.models.reconciliation import EventType
     task_created_events = [
         e for e in journal_calls
-        if hasattr(e, 'event_type') and e.event_type == EventType.task_created
+        if e.type == EventType.task_created
     ]
     assert len(task_created_events) == 0, (
         f'No task_created event should be emitted on failure: {task_created_events}'
