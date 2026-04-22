@@ -461,3 +461,81 @@ async def test_worker_tm_add_task_failure_marks_ticket_failed(
     assert len(task_created_events) == 0, (
         f'No task_created event should be emitted on failure: {task_created_events}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-33: created path emits journal event and schedules commit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_created_path_emits_journal_event_and_schedules_commit(
+    interceptor_with_store, ticket_store, taskmaster, event_buffer,
+):
+    """Regression-pin: on create success, exactly one EventType.task_created
+    event is journalled with the task_id in its payload, and _schedule_commit
+    is called with operation='add_task' (i.e. task_committer.commit was called).
+    """
+    from fused_memory.models.reconciliation import EventType
+
+    # Wire a mock task_committer so _schedule_commit actually fires
+    mock_committer = MagicMock()
+    mock_committer.commit = AsyncMock(return_value=None)
+    interceptor_with_store.task_committer = mock_committer
+
+    # Capture journal calls
+    journal_calls = []
+    original_journal = interceptor_with_store._journal
+
+    async def capturing_journal(event):
+        journal_calls.append(event)
+        return await original_journal(event)
+
+    interceptor_with_store._journal = capturing_journal
+
+    mock_curator = MagicMock()
+    mock_curator.curate = AsyncMock(
+        return_value=CuratorDecision(action='create')
+    )
+    mock_curator.note_created = MagicMock()
+    mock_curator.record_task = AsyncMock()
+
+    with patch.object(
+        type(interceptor_with_store), '_get_curator',
+        new=AsyncMock(return_value=mock_curator),
+    ):
+        result = await interceptor_with_store.submit_task(
+            project_root='/project',
+            title='Journal Test Task',
+            description='Checking event emission',
+        )
+        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+        ticket_id = result['ticket']
+
+        # Let the worker drain and commit task fire
+        await asyncio.sleep(0.2)
+
+    # Exactly one task_created event must have been journalled
+    task_created_events = [
+        e for e in journal_calls
+        if hasattr(e, 'type') and e.type == EventType.task_created
+    ]
+    assert len(task_created_events) == 1, (
+        f'Expected exactly 1 task_created event, got: {task_created_events}'
+    )
+
+    # Payload must contain task_id
+    payload = task_created_events[0].payload
+    assert payload.get('task_id') == '42', (
+        f'task_created event payload must have task_id=42: {payload}'
+    )
+    assert payload.get('operation') == 'add_task', (
+        f'task_created event payload must have operation=add_task: {payload}'
+    )
+
+    # _schedule_commit must have been called with operation='add_task'
+    mock_committer.commit.assert_called_once()
+    call_args = mock_committer.commit.call_args
+    assert 'add_task' in str(call_args), (
+        f'task_committer.commit should be called with add_task: {call_args}'
+    )
