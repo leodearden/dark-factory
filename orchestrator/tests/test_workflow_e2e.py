@@ -3116,15 +3116,18 @@ class TestSessionBudgetExhaustionEscalation:
         esc = escalations[0]
         summary = esc.summary
 
-        # Summary must contain (a) canonical phrase, (b) budget limit, (c) cost spent
+        # Summary must contain (a) canonical phrase, (b) anchored budget label+value,
+        # (c) anchored spent label+value — anchoring prevents a label/value swap from
+        # silently passing (e.g. '$0.50 budget of $0.10 spent' would still satisfy
+        # bare '$0.10' and '$0.50' checks but is semantically wrong).
         assert 'Session budget exhausted' in summary, (
             f'Expected "Session budget exhausted" in summary, got: {summary!r}'
         )
-        assert '$0.10' in summary, (
-            f'Expected "$0.10" (budget limit) in summary, got: {summary!r}'
+        assert '$0.10 budget' in summary, (
+            f'Expected "$0.10 budget" in summary, got: {summary!r}'
         )
-        assert '$0.50' in summary, (
-            f'Expected "$0.50" (cost spent) in summary, got: {summary!r}'
+        assert '$0.50 spent' in summary, (
+            f'Expected "$0.50 spent" in summary, got: {summary!r}'
         )
 
     async def test_detail_contains_diagnostic_metrics(

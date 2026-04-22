@@ -600,23 +600,28 @@ class TaskWorkflow:
         except _SessionBudgetExhausted as e:
             last_role = self._last_invoked_role or 'n/a'
             budget_limit = self.config.usage_cap.session_budget_usd
-            cost_spent = self.metrics.total_cost_usd
+            # Use the gate's own cumulative figure for the summary — it is the
+            # value that actually exceeded the budget, whereas
+            # self.metrics.total_cost_usd only advances on successful returns
+            # and may lag the gate's running tally if a cap-retry or partial
+            # invocation contributed cost without completing.
             reason = (
-                f'Session budget exhausted: ${cost_spent:.2f} spent of '
+                f'Session budget exhausted: ${e.cumulative_cost:.2f} spent of '
                 f'${budget_limit:.2f} budget (last role: {last_role})'
             )
             detail = (
                 f'budget_limit=${budget_limit:.2f}\n'
-                f'total_cost_usd=${cost_spent:.2f}\n'
+                f'total_cost_usd=${self.metrics.total_cost_usd:.2f}\n'
                 f'cumulative_cost (gate)=${e.cumulative_cost:.2f}\n'
                 f'agent_invocations={self.metrics.agent_invocations}\n'
                 f'total_turns={self.metrics.total_turns}\n'
                 f'last_role={last_role}'
             )
-            logger.warning(
-                'Task %s: session budget exhausted — $%.2f spent of $%.2f budget'
-                ' (last role: %s, gate cumulative: $%.2f)',
-                self.task_id, cost_spent, budget_limit, last_role, e.cumulative_cost,
+            # _mark_blocked logs "Task %s BLOCKED: %s" — only log the
+            # gate-specific cross-check figure that's unique to this call site.
+            logger.info(
+                'Task %s: session budget exhausted (gate cumulative $%.2f)',
+                self.task_id, e.cumulative_cost,
             )
             return await self._mark_blocked(reason, detail=detail)
 
