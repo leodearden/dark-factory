@@ -327,3 +327,60 @@ async def test_set_task_status_all_trigger_statuses_pass_through(
     assert 'error' not in result, (
         f"STATUS_TRIGGERS value {status!r} should be accepted, got: {result}"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-17: ticket-shaped id rejection for all id-accepting tools
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tool_name,extra_kwargs', [
+    ('set_task_status', {'status': 'done'}),
+    ('update_task', {'title': 'new title'}),
+    ('add_subtask', {'title': 'sub'}),
+    ('remove_task', {}),
+    ('add_dependency', {'depends_on': '5'}),
+    ('remove_dependency', {'depends_on': '5'}),
+])
+async def test_id_accepting_tools_reject_ticket_shaped_ids(
+    tool_name, extra_kwargs, mcp_server_with_tasks, task_interceptor,
+):
+    """Tools that accept an ``id`` arg must reject tkt_-prefixed ids with a ValidationError."""
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+    task_interceptor.update_task = AsyncMock(return_value={'success': True})
+    task_interceptor.add_subtask = AsyncMock(return_value={'success': True})
+    task_interceptor.remove_task = AsyncMock(return_value={'success': True})
+    task_interceptor.add_dependency = AsyncMock(return_value={'success': True})
+    task_interceptor.remove_dependency = AsyncMock(return_value={'success': True})
+
+    args = {'id': 'tkt_abc', 'project_root': '/project', **extra_kwargs}
+    result = await mcp_server_with_tasks._tool_manager.call_tool(tool_name, args)
+
+    assert isinstance(result, dict), f'Expected dict, got {type(result)}: {result!r}'
+    assert result.get('error_type') == 'ValidationError', (
+        f'Expected ValidationError, got: {result}'
+    )
+    assert 'tkt_' in result.get('error', '') or 'ticket' in result.get('error', '').lower(), (
+        f'Error message should mention ticket resolution: {result.get("error")!r}'
+    )
+    # Must NOT have called the backend
+    getattr(task_interceptor, tool_name.replace('remove_', 'remove_')).assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tool_name', ['add_dependency', 'remove_dependency'])
+async def test_dependency_tools_reject_ticket_shaped_depends_on(
+    tool_name, mcp_server_with_tasks, task_interceptor,
+):
+    """Dependency tools must also reject tkt_-prefixed depends_on values."""
+    task_interceptor.add_dependency = AsyncMock(return_value={'success': True})
+    task_interceptor.remove_dependency = AsyncMock(return_value={'success': True})
+
+    args = {'id': '1', 'project_root': '/project', 'depends_on': 'tkt_abc'}
+    result = await mcp_server_with_tasks._tool_manager.call_tool(tool_name, args)
+
+    assert isinstance(result, dict)
+    assert result.get('error_type') == 'ValidationError', (
+        f'Expected ValidationError for ticket depends_on, got: {result}'
+    )
+    getattr(task_interceptor, tool_name).assert_not_called()
