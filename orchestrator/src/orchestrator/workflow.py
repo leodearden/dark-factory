@@ -218,6 +218,7 @@ class TaskWorkflow:
         # Escalation support
         self.escalation_queue = escalation_queue
         self._escalation_event = escalation_event
+        self._escalation_missing_warned: bool = False
 
         # Usage cap gate
         self.usage_gate = usage_gate
@@ -623,6 +624,14 @@ class TaskWorkflow:
                 self.task_id, missing,
             )
         return list(seen.values())
+
+    def _maybe_warn_missing_escalation(self, role_name: str) -> None:
+        """Emit a single WARNING when an escalation-capable role is invoked without a queue."""
+        logger.warning(
+            'Task %s: escalation_queue is unavailable — agent role %r would normally'
+            ' have escalation tools wired',
+            self.task_id, role_name,
+        )
 
     async def _sync_worktree_venvs(self) -> None:
         """Run ``uv sync`` for task subprojects in the worktree.
