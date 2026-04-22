@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
-import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from orchestrator.agents import landlock as landlock_mod
 from orchestrator.agents.landlock import (
     _reset_probe as _landlock_reset_probe,
+)
+from orchestrator.agents.landlock import (
     build_landlock_command,
     is_landlock_available,
 )
+from orchestrator.agents.sandbox_dispatch import Backend
 
 
 @pytest.fixture(autouse=True)
@@ -107,8 +113,6 @@ class TestLandlockEnforcement:
         # tmp_path lives under /tmp, where landlock_exec grants blanket write
         # access for agent scratch, so we can't use it as a worktree for
         # enforcement testing.
-        import tempfile
-        import shutil
         base = Path(tempfile.mkdtemp(prefix='landlock-test-', dir='/var/tmp'))
         try:
             worktree = base / 'wt'
@@ -161,7 +165,7 @@ class TestInvokeBackendDispatch:
         from orchestrator.agents import sandbox_dispatch
 
         # Set the backend preference (test fixture would normally reset this)
-        sandbox_dispatch.set_backend(backend)
+        sandbox_dispatch.set_backend(cast(Backend, backend))
         try:
             with patch(
                 'orchestrator.agents.sandbox.is_bwrap_available', return_value=True,
@@ -220,5 +224,5 @@ class TestSandboxConfigBackendField:
 
     def test_rejects_garbage(self):
         from orchestrator.config import SandboxConfig
-        with pytest.raises(Exception):  # pydantic ValidationError
+        with pytest.raises(ValidationError):
             SandboxConfig(backend='seccomp-magic')  # type: ignore[arg-type]
