@@ -2673,6 +2673,67 @@ class TestMarkBlockedFalseDoneGuard:
             f'workflow.state must not be DONE: {workflow.state!r}'
         )
 
+    async def test_artifacts_exception_logs_distinctly_and_requeues(
+        self, config, git_ops, task_assignment, tmp_path, caplog
+    ):
+        """Artifacts-layer exception in _has_prior_implementation must log distinctly.
+
+        When read_iteration_log raises (e.g. malformed JSON, filesystem error),
+        the exception must be caught by a separate artifacts-layer try/except that
+        logs a message containing 'artifacts' — distinct from the git-layer
+        'merge-check failed' message — so operators can diagnose the correct root
+        cause.  Both paths fall through to the normal requeue flow.
+
+        On unmodified code the single bare except catches the exception and logs
+        'merge-check failed', so the 'artifacts' assertion fails.
+        This test FAILS on unmodified code (step-3 TDD for distinct exception handling).
+        """
+        import logging
+
+        # 1. Create a fresh worktree (wt_head == base_commit — trivially is_ancestor True)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. FakeSteward resolves all pending L0 escalations immediately in start()
+        workflow._steward_factory = _make_resolving_steward(
+            queue, task_assignment.task_id,
+        )
+
+        # 4. Force read_iteration_log to raise — simulates corrupted iterations.jsonl
+        def _raise_artifacts():
+            raise RuntimeError('simulated artifacts failure')
+
+        workflow.artifacts.read_iteration_log = _raise_artifacts  # type: ignore[method-assign]
+
+        # 5. Call _mark_blocked, capturing WARNING-level logs
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+            outcome = await workflow._mark_blocked('synthetic failure')
+
+        # 6. Assertions: must REQUEUE with a distinct 'artifacts' log message
+        assert outcome == WorkflowOutcome.REQUEUED, (
+            f'Expected REQUEUED but got {outcome!r} — '
+            'artifacts exception must fall through to requeue'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear after an artifacts exception: {statuses}"
+        )
+        assert statuses[-1] == 'pending', (
+            f"Last status must be 'pending' after exception-path requeue: {statuses}"
+        )
+        assert any('artifacts' in r.message for r in caplog.records), (
+            f"Expected a log record containing 'artifacts' (distinct from 'merge-check failed')"
+            f" but caplog only has: {[r.message for r in caplog.records]}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # File-structure invariants
