@@ -21,11 +21,13 @@ import asyncio
 import logging
 import math
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import aiosqlite
 
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.db import with_db
+from dashboard.data.orchestrator import load_task_tree
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import parse_utc
 
@@ -511,6 +513,24 @@ def enrich_merges_with_titles(
         title = task_title_map.get(key, '') if key is not None else ''
         result.append({**row, 'title': title})
     return result
+
+
+def load_task_titles(tasks_json_path: Path) -> dict[str, str]:
+    """Return a {str(task_id): title} map from a Taskmaster tasks.json file.
+
+    Wraps :func:`dashboard.data.orchestrator.load_task_tree` and builds the
+    mapping needed by :func:`enrich_merges_with_titles`.  Tasks without a
+    title (``title=None`` or missing) are omitted.
+
+    Args:
+        tasks_json_path: Path to the ``.taskmaster/tasks/tasks.json`` file.
+
+    Returns:
+        Dict mapping ``str(task.id)`` to ``task.title``.  Returns ``{}`` on
+        missing file, invalid JSON, or missing tasks structure.
+    """
+    tasks = load_task_tree(tasks_json_path)
+    return {str(t['id']): t['title'] for t in tasks if t.get('title')}
 
 
 # ---------------------------------------------------------------------------
