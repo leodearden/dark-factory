@@ -2555,15 +2555,33 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     # main, transition to DONE instead of re-queueing —
                     # prevents stash_failed / advance_main ghost loops.
                     if self.worktree and self.git_ops:
+                        # ── Git layer ─────────────────────────────────────
+                        # Subprocess calls that can fail for git/infra reasons
+                        # (e.g. corrupted index, network mount offline).
+                        wt_head = ''
+                        main_sha = ''
+                        is_on_main = False
                         try:
                             _, wt_head, _ = await _run(
                                 ['git', 'rev-parse', 'HEAD'],
                                 cwd=self.worktree,
                             )
                             main_sha = await self.git_ops.get_main_sha()
-                            if await self.git_ops.is_ancestor(
+                            is_on_main = await self.git_ops.is_ancestor(
                                 wt_head.strip(), main_sha,
-                            ):
+                            )
+                        except Exception:
+                            logger.warning(
+                                'Task %s: merge-check failed, '
+                                'proceeding with requeue',
+                                self.task_id, exc_info=True,
+                            )
+
+                        # ── Artifacts layer ────────────────────────────────
+                        # Reads that can fail for filesystem/JSON reasons
+                        # (e.g. corrupted iterations.jsonl, missing metadata).
+                        if is_on_main:
+                            try:
                                 has_prior, entries = self._has_prior_implementation(
                                     wt_head.strip()
                                 )
@@ -2600,12 +2618,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                                         },
                                     )
                                     return WorkflowOutcome.DONE
-                        except Exception:
-                            logger.warning(
-                                'Task %s: merge-check failed, '
-                                'proceeding with requeue',
-                                self.task_id, exc_info=True,
-                            )
+                            except Exception:
+                                logger.warning(
+                                    'Task %s: artifacts read failed during '
+                                    'merge-check, proceeding with requeue',
+                                    self.task_id, exc_info=True,
+                                )
 
                     # Preserve steward-set deferred/blocked.  If the cached
                     # status differs from the snapshot taken before the
