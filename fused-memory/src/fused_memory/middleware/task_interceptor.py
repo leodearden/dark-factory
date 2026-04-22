@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.middleware.curator_escalator import CuratorEscalator
     from fused_memory.middleware.task_file_committer import TaskFileCommitter
+    from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.backlog_policy import BacklogPolicy
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.targeted import TargetedReconciler
@@ -60,6 +61,7 @@ class TaskInterceptor:
         event_queue: 'EventQueue | None' = None,
         backlog_policy: 'BacklogPolicy | None' = None,
         usage_gate: 'UsageGate | None' = None,
+        ticket_store: 'TicketStore | None' = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
@@ -114,6 +116,20 @@ class TaskInterceptor:
         self._backfill_triggered: bool = False
         # Set by close(); prevents _get_curator() from re-creating a curator.
         self._closed: bool = False
+        # Two-phase ticket store: persists submitted tickets across restarts.
+        self._ticket_store = ticket_store
+        # In-memory queue of ticket_ids pending worker processing. Lazily
+        # populated from submit_task; worker drains it one at a time so
+        # curator.curate() is called serially (no concurrent LLM calls per
+        # instance). Queue is created eagerly so submit_task can put() without
+        # waiting for the worker to start.
+        self._ticket_queue: asyncio.Queue[str] = asyncio.Queue()
+        # asyncio.Task handle for the curator worker. Lazily started on first
+        # submit_task call (when ticket_store is wired in). None until then.
+        self._worker_task: asyncio.Task | None = None
+        # Per-ticket asyncio.Events: resolve_ticket registers one so the
+        # worker can wake a waiting caller the moment a ticket is terminal.
+        self._ticket_events: dict[str, asyncio.Event] = {}
 
     async def _ensure_taskmaster(self) -> TaskmasterBackend:
         """Return a connected TaskmasterBackend, or raise with a structured error."""
@@ -958,6 +974,71 @@ class TaskInterceptor:
                 'reason': 'escalation+suggestion matched',
             }
         return None
+
+    async def submit_task(self, project_root: str, **kwargs: Any) -> dict:
+        """Phase-1 of the two-phase add: persist a ticket and return its id immediately.
+
+        The curator decision (drop / combine / create) is deferred to the
+        single-worker queue so concurrent callers never contend on a long LLM
+        round-trip. Use ``resolve_ticket`` to block until the worker decides.
+
+        Returns ``{'ticket': 'tkt_<id>'}`` so callers can poll or block via
+        ``resolve_ticket``. Does NOT call ``tm.add_task``.
+        """
+        if self._ticket_store is None:
+            return {'error': 'ticket_store not configured; cannot use submit_task', 'error_type': 'ConfigError'}
+
+        if err := await self._backlog_gate(project_root):
+            return err
+
+        project_id = resolve_project_id(project_root)
+
+        # Serialise the full call payload so the worker can reconstruct it.
+        # Stored as a canonical JSON blob: {project_root, kwargs, metadata}.
+        metadata = kwargs.pop('metadata', None)
+        blob = json.dumps({
+            'project_root': project_root,
+            'kwargs': kwargs,
+            'metadata': metadata,
+        }, default=str)
+
+        ticket_id = await self._ticket_store.submit(
+            project_id=project_id,
+            candidate_json=blob,
+            ttl_seconds=600,
+        )
+        await self._ticket_queue.put(ticket_id)
+        self._start_worker_if_needed()
+        return {'ticket': ticket_id}
+
+    def _start_worker_if_needed(self) -> None:
+        """Lazily start the curator worker asyncio.Task if not already running."""
+        if self._ticket_store is None:
+            return
+        if self._worker_task is None or self._worker_task.done():
+            loop = asyncio.get_event_loop()
+            self._worker_task = loop.create_task(
+                self._curator_worker(),
+                name='task-interceptor-curator-worker',
+            )
+            self._background_tasks.add(self._worker_task)
+            self._worker_task.add_done_callback(
+                lambda t: self._background_tasks.discard(t)
+            )
+
+    async def _curator_worker(self) -> None:
+        """Drain pending tickets from the queue, calling the curator per ticket.
+
+        Stub — full implementation added in step-22.  For now the worker just
+        discards queue items so submit_task tests can verify the store row
+        without side-effects.
+        """
+        try:
+            while True:
+                _ticket_id = await self._ticket_queue.get()
+                self._ticket_queue.task_done()
+        except asyncio.CancelledError:
+            pass
 
     async def add_task(self, project_root: str, **kwargs: Any) -> dict:
         if err := await self._backlog_gate(project_root):
