@@ -2314,3 +2314,18 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
     assert status_result.get('success') or status_result.get('no_op')
     taskmaster.add_task.assert_called_once()
     taskmaster.set_task_status.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# step-15: _is_ticket_id helper
+# ---------------------------------------------------------------------------
+def test_is_ticket_id_recognises_tkt_prefix():
+    """_is_ticket_id() returns True for tkt_-prefixed strings, False otherwise."""
+    from fused_memory.middleware.task_interceptor import _is_ticket_id
+
+    assert _is_ticket_id('tkt_0000000000000000000000000000') is True
+    assert _is_ticket_id('tkt_abc') is True
+    assert _is_ticket_id('') is False
+    assert _is_ticket_id('123') is False
+    assert _is_ticket_id('1.2') is False
+    assert _is_ticket_id(None) is False
