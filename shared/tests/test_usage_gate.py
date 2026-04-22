@@ -583,3 +583,89 @@ class TestUsageGateProbeProcessGroup:
 
         assert result is False  # timed out → False
         mock_tpg.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# _run_probe exit-code classification — distinguish local budget cap
+# (API accepted the request) from real Anthropic-side failures.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestUsageGateProbeExitCodeClassification:
+    """_run_probe must NOT treat local $0.01 budget exhaustion as a cap."""
+
+    @pytest.fixture
+    def gate_with_account(self) -> tuple[UsageGate, AccountState]:
+        """Return a (gate, acct) pair with _probe_config_dir mocked."""
+        gate = make_gate(['probe-acct'])
+        del gate._run_probe  # fall back to class method
+        acct = gate._accounts[0]
+        gate._probe_config_dir = MagicMock()
+        gate._probe_config_dir.path = Path('/tmp/probe-test')
+        gate._probe_config_dir.write_credentials = MagicMock()
+        return gate, acct
+
+    async def test_probe_local_budget_exhaustion_returns_true(
+        self, gate_with_account: tuple[UsageGate, AccountState]
+    ) -> None:
+        """Non-zero exit + subtype=error_max_budget_usd → success (API accepted)."""
+        gate, acct = gate_with_account
+        stdout = (
+            b'{"subtype":"error_max_budget_usd",'
+            b'"total_cost_usd":0.053,'
+            b'"errors":["Reached maximum budget ($0.01)"]}'
+        )
+        proc = MagicMock()
+        proc.returncode = 1
+        proc.pid = 12345
+        proc.communicate = AsyncMock(return_value=(stdout, b''))
+
+        with patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                   return_value=proc):
+            result = await gate._run_probe(acct)
+
+        assert result is True
+
+    async def test_probe_non_budget_error_still_returns_false(
+        self, gate_with_account: tuple[UsageGate, AccountState]
+    ) -> None:
+        """Non-zero exit + any other subtype → failure (unchanged behavior)."""
+        gate, acct = gate_with_account
+        stdout = b'{"subtype":"error_api","errors":["auth failed"]}'
+        proc = MagicMock()
+        proc.returncode = 1
+        proc.pid = 12345
+        proc.communicate = AsyncMock(return_value=(stdout, b''))
+
+        with patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                   return_value=proc):
+            result = await gate._run_probe(acct)
+
+        assert result is False
+
+    async def test_probe_cap_prefix_wins_over_budget_json(
+        self, gate_with_account: tuple[UsageGate, AccountState]
+    ) -> None:
+        """A cap prefix in stderr forces False even if stdout has budget JSON.
+
+        Preserves the conservative bias documented at usage_gate._run_probe —
+        any whiff of a real cap message keeps the account paused.
+        """
+        gate, acct = gate_with_account
+        stderr = b"You've hit your 5-hour usage limit. Resets at 3pm."
+        stdout = (
+            b'{"subtype":"error_max_budget_usd",'
+            b'"total_cost_usd":0.053,'
+            b'"errors":["Reached maximum budget ($0.01)"]}'
+        )
+        proc = MagicMock()
+        proc.returncode = 1
+        proc.pid = 12345
+        proc.communicate = AsyncMock(return_value=(stdout, stderr))
+
+        with patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                   return_value=proc):
+            result = await gate._run_probe(acct)
+
+        assert result is False
