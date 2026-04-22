@@ -2867,3 +2867,56 @@ async def test_main_wires_ticket_store_into_interceptor(
     )
 
     await store.close()
+
+
+# step-61: regression-guard — add_task no longer takes _curator_lock
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_task_no_longer_takes_curator_lock(
+    interceptor_facade, taskmaster,
+):
+    """Regression-guard: add_task facade must NOT acquire _curator_lock; add_subtask must.
+
+    Before the ticket-queue refactor (step-46), add_task held _curator_lock across
+    the entire curator.curate() LLM round-trip.  That acquisition is now removed;
+    the single-worker queue serialises add_task instead.
+
+    add_subtask intentionally retains _curator_lock (routing it through the worker
+    queue is out-of-scope for this task — see design decision in the plan).  This
+    test documents the scope boundary so a reviewer cannot misread the partial lock
+    removal as a bug.
+    """
+    acquisition_count = 0
+
+    class _CountingLock:
+        """asyncio.Lock wrapper that increments acquisition_count on __aenter__."""
+
+        def __init__(self):
+            self._lock = asyncio.Lock()
+
+        async def __aenter__(self):
+            nonlocal acquisition_count
+            acquisition_count += 1
+            await self._lock.acquire()
+            return self
+
+        async def __aexit__(self, *args):
+            self._lock.release()
+
+    counting_lock = _CountingLock()
+    # Replace the per-project lock factory with one that always returns our counter.
+    interceptor_facade._curator_lock = lambda project_id: counting_lock
+
+    # --- add_task (facade via submit_task → worker): must NOT touch curator_lock ---
+    await interceptor_facade.add_task(project_root='/project', title='CL guard test')
+    assert acquisition_count == 0, (
+        f'add_task should not acquire _curator_lock but got {acquisition_count} acquisition(s)'
+    )
+
+    # --- add_subtask: must still acquire curator_lock EXACTLY once ---
+    await interceptor_facade.add_subtask(parent_id='1', project_root='/project', title='Sub')
+    assert acquisition_count == 1, (
+        f'add_subtask should acquire _curator_lock exactly once; got {acquisition_count}'
+    )
