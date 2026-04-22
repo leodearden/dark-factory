@@ -276,6 +276,31 @@ class TaskInterceptor:
         if self._ticket_store is not None:
             await self._ticket_store.close()
 
+    async def start(self) -> None:
+        """Initialise runtime state after construction.
+
+        Call once after constructing the interceptor and before accepting
+        requests.  Idempotent: safe to call multiple times (the underlying
+        store operations only touch ``status='pending'`` rows so they are
+        no-ops on a clean store).
+
+        Performs:
+        - ``flush_pending_on_startup``: marks any pending tickets left from a
+          previous server run as ``failed/server_restart``.
+        - ``sweep_expired``: marks any expired pending tickets as
+          ``failed/expired``.
+
+        If no ``ticket_store`` is wired in, this is a no-op.
+        """
+        if self._ticket_store is None:
+            return
+        flushed = await self._ticket_store.flush_pending_on_startup()
+        if flushed:
+            logger.warning('start(): flushed %d orphaned pending ticket(s) from prior run', flushed)
+        swept = await self._ticket_store.sweep_expired()
+        if swept:
+            logger.info('start(): swept %d expired ticket(s)', swept)
+
     # ── Status transitions (with targeted reconciliation) ──────────────
 
     async def set_task_status(
