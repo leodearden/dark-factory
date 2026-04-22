@@ -332,3 +332,62 @@ async def test_worker_r4_escalation_idempotency_returns_existing_task(
     result_data = json.loads(row['result_json'])
     assert result_data.get('id') == '99'
     assert result_data.get('action') == 'idempotency_hit'
+
+
+# ---------------------------------------------------------------------------
+# step-29: worker degrades to create on CuratorFailureError
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_curator_failure_degrades_to_create(
+    interceptor_with_store, ticket_store, taskmaster,
+):
+    """When curator.curate raises CuratorFailureError, the worker falls through
+    to the create path:
+    - tm.add_task IS called
+    - ticket resolved status='created'
+    - result_json contains a justification indicating degrade-to-create
+    """
+    from fused_memory.middleware.task_curator import CuratorFailureError
+
+    mock_curator = MagicMock()
+    mock_curator.curate = AsyncMock(
+        side_effect=CuratorFailureError('boom', timed_out=False, duration_ms=100)
+    )
+    mock_curator.note_created = MagicMock()
+    mock_curator.record_task = AsyncMock()
+
+    with patch.object(
+        type(interceptor_with_store), '_get_curator',
+        new=AsyncMock(return_value=mock_curator),
+    ):
+        result = await interceptor_with_store.submit_task(
+            project_root='/project',
+            title='Degrade Test',
+            description='Should fall through to create',
+        )
+        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+        ticket_id = result['ticket']
+
+        # Let the worker drain
+        await asyncio.sleep(0.2)
+
+    # tm.add_task MUST have been called (fallback to create)
+    taskmaster.add_task.assert_called_once()
+
+    # Ticket must be terminal with status='created'
+    row = await ticket_store.get(ticket_id)
+    assert row is not None
+    assert row['status'] == 'created', f'Expected created, got {row["status"]}'
+    assert row['task_id'] == '42', f'Expected task_id=42, got {row["task_id"]}'
+    assert row['resolved_at'] is not None
+
+    # result_json contains a justification indicating degrade-to-create
+    result_data = json.loads(row['result_json'])
+    assert 'id' in result_data, f'result_json should have id: {result_data}'
+    # Must indicate that this was a curator-failure fallback
+    degrade_hint = result_data.get('curator_degrade_reason', '')
+    assert degrade_hint, (
+        f'result_json should indicate curator degrade-to-create: {result_data}'
+    )
