@@ -605,12 +605,20 @@ class TaskWorkflow:
                 f'Session budget exhausted: ${cost_spent:.2f} spent of '
                 f'${budget_limit:.2f} budget (last role: {last_role})'
             )
+            detail = (
+                f'budget_limit=${budget_limit:.2f}\n'
+                f'total_cost_usd=${cost_spent:.2f}\n'
+                f'cumulative_cost (gate)=${e.cumulative_cost:.2f}\n'
+                f'agent_invocations={self.metrics.agent_invocations}\n'
+                f'total_turns={self.metrics.total_turns}\n'
+                f'last_role={last_role}'
+            )
             logger.warning(
                 'Task %s: session budget exhausted — $%.2f spent of $%.2f budget'
                 ' (last role: %s, gate cumulative: $%.2f)',
                 self.task_id, cost_spent, budget_limit, last_role, e.cumulative_cost,
             )
-            return await self._mark_blocked(reason)
+            return await self._mark_blocked(reason, detail=detail)
 
         except Exception as e:
             logger.exception(f'Task {self.task_id} workflow error: {e}')
