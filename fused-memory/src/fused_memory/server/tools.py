@@ -1064,6 +1064,24 @@ def create_mcp_server(
         except ValueError as e:
             return {'error': str(e), 'error_type': 'ValidationError'}
 
+    def _reject_if_ticket_id(name: str, value: object) -> dict | None:
+        """Return a ValidationError dict if ``value`` is a ticket-shaped id.
+
+        Ticket ids (``tkt_`` prefix) are returned by ``submit_task`` and must
+        be resolved via ``resolve_ticket`` before being passed to id-accepting
+        task tools. Returning a clear error here prevents confusing downstream
+        failures inside the taskmaster backend.
+        """
+        if isinstance(value, str) and value.startswith('tkt_'):
+            return {
+                'error': (
+                    f'Ticket-shaped id {value!r} not allowed here; '
+                    'call resolve_ticket first to obtain a numeric task_id.'
+                ),
+                'error_type': 'ValidationError',
+            }
+        return None
+
     @mcp.tool()
     async def get_tasks(
         project_root: str,
@@ -1142,6 +1160,8 @@ def create_mcp_server(
                 (default False during rollout — missing provenance logs a
                 warning but does not block the transition).
         """
+        if err := _reject_if_ticket_id('id', id):
+            return err
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
@@ -1235,6 +1255,8 @@ def create_mcp_server(
             append: Append instead of full update
             tag: Tag context (optional)
         """
+        if err := _reject_if_ticket_id('id', id):
+            return err
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
@@ -1273,6 +1295,8 @@ def create_mcp_server(
             details: Subtask details
             tag: Tag context (optional)
         """
+        if err := _reject_if_ticket_id('id', id):
+            return err
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
@@ -1303,6 +1327,8 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
+        if err := _reject_if_ticket_id('id', id):
+            return err
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
@@ -1330,6 +1356,10 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
+        if err := _reject_if_ticket_id('id', id):
+            return err
+        if err := _reject_if_ticket_id('depends_on', depends_on):
+            return err
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
@@ -1360,6 +1390,10 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
+        if err := _reject_if_ticket_id('id', id):
+            return err
+        if err := _reject_if_ticket_id('depends_on', depends_on):
+            return err
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
