@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from dashboard.app import unique_css_ids
 from dashboard.config import DashboardConfig as _DashboardConfig
 from dashboard.data.merge_queue import _bucket_minutes_for_window
 from tests._dt_helpers import make_fixed_datetime_cls
@@ -932,3 +933,44 @@ class TestRecentMergesWindow:
         assert 'task-outside-4' not in html, (
             'task-outside-4 (30m ago) should be filtered out by the 15-minute window'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestUniqueCssIds — unit tests for unique_css_ids helper (step-1/2)
+# ---------------------------------------------------------------------------
+
+
+class TestUniqueCssIds:
+    """Unit tests for the unique_css_ids(values) helper in dashboard.app.
+
+    Each test drives a documented case from the plan.  All must fail with
+    ImportError or AttributeError until step-2 implements the helper.
+    """
+
+    def test_non_colliding_passthrough(self):
+        """Non-colliding inputs are returned unchanged."""
+        assert unique_css_ids(['a', 'b']) == ['a', 'b']
+
+    def test_two_way_collision(self):
+        """/tmp/dark-factory and /tmp/dark_factory both normalize to tmp_dark_factory."""
+        result = unique_css_ids(['/tmp/dark-factory', '/tmp/dark_factory'])
+        assert result == ['tmp_dark_factory', 'tmp_dark_factory_1']
+
+    def test_three_way_collision(self):
+        """Three inputs with the same css_id get _0 (no suffix), _1, _2."""
+        result = unique_css_ids(['a-b', 'a.b', 'a b'])
+        assert result == ['a_b', 'a_b_1', 'a_b_2']
+
+    def test_counter_collision_edge_case(self):
+        """Third 'foo' must skip already-taken foo_1 and land on foo_2."""
+        result = unique_css_ids(['foo', 'foo_1', 'foo'])
+        assert result == ['foo', 'foo_1', 'foo_2']
+
+    def test_empty_input(self):
+        """Empty sequence returns empty list."""
+        assert unique_css_ids([]) == []
+
+    def test_order_preserved_mixed(self):
+        """Non-colliding and colliding entries are interleaved correctly."""
+        result = unique_css_ids(['x', '/tmp/a', 'y', '/tmp/a'])
+        assert result == ['x', 'tmp_a', 'y', 'tmp_a_1']
