@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -538,7 +539,7 @@ def load_task_titles(tasks_json_path: Path) -> dict[str, str]:
 
 
 async def build_per_project_merge_queue(
-    project_dbs: list[tuple[str, aiosqlite.Connection | None]],
+    project_dbs: Sequence[tuple[str, aiosqlite.Connection | None]],
     *,
     hours: int,
     now: datetime,

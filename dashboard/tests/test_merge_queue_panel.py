@@ -7,8 +7,7 @@ import re
 import sqlite3
 from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 

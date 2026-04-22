@@ -41,11 +41,6 @@ from dashboard.data.costs import (
 )
 from dashboard.data.db import DbPool
 from dashboard.data.merge_queue import (
-    aggregate_latency_stats,
-    aggregate_outcome_distribution,
-    aggregate_queue_depth_timeseries,
-    aggregate_recent_merges,
-    aggregate_speculative_stats,
     build_per_project_merge_queue,
     enrich_merges_with_titles,
     load_task_titles,

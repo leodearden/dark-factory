@@ -2349,10 +2349,7 @@ class TestLoadTaskTitles:
     def _write_tasks_json(self, path, tasks, format='master'):
         """Write a tasks.json file in the given format."""
         import json
-        if format == 'master':
-            data = {'master': {'tasks': tasks}}
-        else:
-            data = {'tasks': tasks}
+        data = {'master': {'tasks': tasks}} if format == 'master' else {'tasks': tasks}
         path.write_text(json.dumps(data))
 
     def test_master_format_returns_str_keyed_dict(self, tmp_path):
