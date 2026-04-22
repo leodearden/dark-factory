@@ -193,3 +193,35 @@ async def test_flush_pending_on_startup_marks_all_pending_failed(store):
     # The already-resolved ticket must be untouched
     row1 = await store.get(t1)
     assert row1['status'] == 'created'
+
+
+@pytest.mark.asyncio
+async def test_sweep_expired_marks_only_expired_pending_failed(store):
+    """sweep_expired() marks pending expired tickets failed; leaves non-expired alone."""
+    now = datetime.now(UTC)
+    past = now - timedelta(seconds=1)
+    future = now + timedelta(seconds=600)
+
+    # Insert an already-expired ticket (expires_at in the past)
+    expired_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+    # Manually backdate the expires_at so it appears expired
+    db = store._db
+    await db.execute(
+        'UPDATE tickets SET expires_at = ? WHERE ticket_id = ?',
+        (past.isoformat(), expired_id),
+    )
+    await db.commit()
+
+    # Insert a ticket that won't expire yet
+    live_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)
+
+    count = await store.sweep_expired(now=now)
+    assert count == 1
+
+    expired_row = await store.get(expired_id)
+    assert expired_row['status'] == 'failed'
+    assert expired_row['reason'] == 'expired'
+    assert expired_row['resolved_at'] is not None
+
+    live_row = await store.get(live_id)
+    assert live_row['status'] == 'pending'  # untouched
