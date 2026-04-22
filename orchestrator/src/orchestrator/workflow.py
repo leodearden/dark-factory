@@ -44,6 +44,11 @@ from orchestrator.verify import run_scoped_verification
 # the plan-tools stdio MCP server.
 _ORCH_PROJECT_DIR = Path(__file__).resolve().parents[2]
 
+# Roles that have _ESCALATION_TOOLS in their allowed_tools (see roles.py:155, 221, 278, 494).
+# Judge is excluded: it appears in the mcp_config block only for jcodemunch, not for escalation.
+# Steward is excluded: it runs in its own TaskSteward dispatcher, not through TaskWorkflow._invoke.
+_ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset({'architect', 'implementer', 'debugger', 'merger'})
+
 
 class _StewardReescalated(Exception):
     """Raised when the steward re-escalates to level-1 (human intervention)."""
@@ -628,6 +633,8 @@ class TaskWorkflow:
     def _maybe_warn_missing_escalation(self, role_name: str) -> None:
         """Emit a single WARNING when an escalation-capable role is invoked without a queue."""
         if self.escalation_queue is not None:
+            return
+        if role_name not in _ESCALATION_CAPABLE_ROLES:
             return
         logger.warning(
             'Task %s: escalation_queue is unavailable — agent role %r would normally'
