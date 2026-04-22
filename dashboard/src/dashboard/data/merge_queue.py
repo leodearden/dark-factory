@@ -449,7 +449,44 @@ async def speculative_stats(
 
 
 # ---------------------------------------------------------------------------
-# 6. Multi-DB aggregation
+# 6. Per-project helpers
+# ---------------------------------------------------------------------------
+
+
+def filter_merges_within(
+    merges: list[dict],
+    *,
+    minutes: int,
+    now: datetime | None = None,
+) -> list[dict]:
+    """Return only the rows whose timestamp falls within the last *minutes*.
+
+    Args:
+        merges: List of merge-row dicts.  Each dict must have a 'timestamp' key
+            whose value is an ISO-8601 string parseable by :func:`parse_utc`.
+        minutes: Sliding-window width in minutes.  Rows older than
+            ``now - timedelta(minutes=minutes)`` are excluded.
+        now: Reference timestamp.  Defaults to ``datetime.now(UTC)`` when None.
+
+    Returns:
+        A new list preserving the input order.  Rows with missing or malformed
+        timestamps are silently dropped.
+    """
+    effective_now = now if now is not None else datetime.now(UTC)
+    cutoff = effective_now - timedelta(minutes=minutes)
+    result: list[dict] = []
+    for row in merges:
+        try:
+            ts = parse_utc(row.get('timestamp')).astimezone(UTC)
+            if ts >= cutoff:
+                result.append(row)
+        except (ValueError, TypeError):
+            pass  # malformed timestamp → drop row
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 7. Multi-DB aggregation
 # ---------------------------------------------------------------------------
 
 async def aggregate_queue_depth_timeseries(
