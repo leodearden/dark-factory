@@ -742,3 +742,24 @@ async def test_resolve_ticket_timeout_returns_failed_without_mutating_row(
     assert row['status'] == 'pending', (
         f'Ticket row should still be pending after timeout: {row["status"]!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-43: resolve_ticket unknown ticket returns failed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_ticket_unknown_ticket_returns_failed(
+    interceptor_with_store,
+):
+    """Calling resolve_ticket with an id that doesn't exist in the store
+    returns {status:failed, reason:unknown_ticket} without raising.
+    """
+    result = await interceptor_with_store.resolve_ticket(
+        'tkt_nonexistent', '/project',
+    )
+
+    assert result == {'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None}, (
+        f'Expected unknown_ticket response: {result}'
+    )
