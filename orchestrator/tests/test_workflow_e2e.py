@@ -3067,6 +3067,67 @@ class TestAllAccountsCappedExceptionBoundary:
         )
 
 
+@pytest.mark.asyncio
+class TestSessionBudgetExhaustionEscalation:
+    """Verify _SessionBudgetExhausted creates an L1 escalation with actionable budget metrics.
+
+    Before the enrichment (step-2 impl), the escalation ``summary`` is just the bare
+    literal ``'Session budget exhausted'`` with no figures — the budget and cost
+    assertions fail, proving the tests are red before impl.
+    """
+
+    async def test_summary_contains_budget_metrics(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """L1 escalation summary carries budget limit and cost-spent figures."""
+        from orchestrator.usage_gate import SessionBudgetExhausted
+
+        stub = AgentStub()
+        config.usage_cap.session_budget_usd = 0.10
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        # First call (architect) succeeds and writes plan.json;
+        # second call (implementer for step-1) raises SessionBudgetExhausted.
+        call_count = 0
+
+        async def invoke_with_budget_exhausted(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return await stub.invoke_agent(*args, **kwargs)
+            raise SessionBudgetExhausted(cumulative_cost=0.50)
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', invoke_with_budget_exhausted)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert workflow.state == WorkflowState.BLOCKED
+
+        # Check L1 escalation exists with expected fields
+        escalations = queue.get_by_task(task_assignment.task_id)
+        assert len(escalations) == 1, f'Expected 1 escalation, got {len(escalations)}'
+        esc = escalations[0]
+        summary = esc.summary
+
+        # Summary must contain (a) canonical phrase, (b) budget limit, (c) cost spent
+        assert 'Session budget exhausted' in summary, (
+            f'Expected "Session budget exhausted" in summary, got: {summary!r}'
+        )
+        assert '$0.10' in summary, (
+            f'Expected "$0.10" (budget limit) in summary, got: {summary!r}'
+        )
+        assert '$0.50' in summary, (
+            f'Expected "$0.50" (cost spent) in summary, got: {summary!r}'
+        )
+
+
 if TYPE_CHECKING:
     from orchestrator.evals.runner import _EvalScheduler as _EvalSchedulerStatic
     from orchestrator.workflow import _SchedulerLike
