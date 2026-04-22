@@ -155,6 +155,26 @@ class TicketStore:
                 return False
         return True
 
+    async def flush_pending_on_startup(self) -> int:
+        """Mark all pending tickets as failed/server_restart.
+
+        Called once at startup to clean up tickets left over from a previous
+        server run.  Returns the number of rows updated.
+        """
+        now = datetime.now(UTC).isoformat()
+        async with self._txn() as db:
+            cursor = await db.execute(
+                """
+                UPDATE tickets
+                SET status = 'failed', reason = 'server_restart', resolved_at = ?
+                WHERE status = 'pending'
+                """,
+                (now,),
+            )
+        count = cursor.rowcount
+        logger.info('flush_pending_on_startup: marked %d pending tickets as failed', count)
+        return count
+
     async def get(self, ticket_id: str) -> dict | None:
         """Return the ticket row as a plain dict, or None if not found."""
         db = self._require_db()
