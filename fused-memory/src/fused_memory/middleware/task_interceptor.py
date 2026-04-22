@@ -1027,18 +1027,264 @@ class TaskInterceptor:
             )
 
     async def _curator_worker(self) -> None:
-        """Drain pending tickets from the queue, calling the curator per ticket.
+        """Drain pending tickets from the queue one at a time.
 
-        Stub — full implementation added in step-22.  For now the worker just
-        discards queue items so submit_task tests can verify the store row
-        without side-effects.
+        Processes tickets serially so ``curator.curate()`` is never called
+        concurrently — the key property that obsoletes ``_curator_lock`` on the
+        add_task path.  Lifecycle: cancellable; ``close()`` cancels the task
+        and awaits it so in-flight work is not silently dropped.
         """
         try:
             while True:
-                _ticket_id = await self._ticket_queue.get()
-                self._ticket_queue.task_done()
+                ticket_id = await self._ticket_queue.get()
+                try:
+                    await self._process_add_ticket(ticket_id)
+                except Exception:
+                    logger.exception(
+                        '_curator_worker: unhandled error processing ticket %s',
+                        ticket_id,
+                    )
+                finally:
+                    self._ticket_queue.task_done()
         except asyncio.CancelledError:
             pass
+
+    async def _process_add_ticket(self, ticket_id: str) -> None:
+        """Run the full curator + write pipeline for a single ticket.
+
+        Mirrors ``_add_task_locked`` but persists outcomes to the ticket store
+        instead of returning them directly.  The worker calls this and the result
+        is read back by ``resolve_ticket``.
+
+        Terminal status values written:
+        - ``created``  — task was created via ``tm.add_task``
+        - ``combined`` — candidate was folded into an existing task (drop/combine/idempotency)
+        - ``failed``   — an unrecoverable error occurred
+
+        This step (step-22) implements the CREATE path only.  Drop / combine /
+        R4 idempotency / CuratorFailureError paths are added incrementally in
+        steps 23-30.
+        """
+        if self._ticket_store is None:
+            return
+
+        row = await self._ticket_store.get(ticket_id)
+        if row is None:
+            logger.warning('_process_add_ticket: ticket %s not found in store', ticket_id)
+            return
+        if row['status'] != 'pending':
+            logger.warning(
+                '_process_add_ticket: ticket %s already terminal (%s), skipping',
+                ticket_id, row['status'],
+            )
+            return
+
+        try:
+            blob = json.loads(row['candidate_json'])
+        except Exception:
+            logger.exception('_process_add_ticket: bad candidate_json for %s', ticket_id)
+            await self._ticket_store.mark_resolved(
+                ticket_id, status='failed', reason='bad_candidate_json',
+            )
+            self._signal_ticket_event(ticket_id)
+            return
+
+        project_root: str = blob['project_root']
+        kwargs: dict = dict(blob.get('kwargs', {}))
+        metadata = blob.get('metadata')
+        project_id = resolve_project_id(project_root)
+
+        # Rebuild candidate for curator
+        kwargs_for_candidate = dict(kwargs)
+        if metadata is not None:
+            kwargs_for_candidate['metadata'] = metadata
+        candidate = self._build_candidate(kwargs_for_candidate)
+
+        status = 'failed'
+        task_id: str | None = None
+        reason: str | None = None
+        result_dict: dict | None = None
+
+        try:
+            # ── R4: escalation-level idempotency ─────────────────────────
+            # (Steps 27-28 will populate this; stub returns None always)
+            idempotency_hit = await self._check_escalation_idempotency(
+                project_root=project_root, metadata=metadata,
+            )
+            if idempotency_hit is not None:
+                existing_task_id = str(idempotency_hit.get('id', ''))
+                await self._ticket_store.mark_resolved(
+                    ticket_id,
+                    status='combined',
+                    task_id=existing_task_id or None,
+                    reason='idempotency_hit',
+                    result_json=json.dumps(idempotency_hit),
+                )
+                self._signal_ticket_event(ticket_id)
+                return
+
+            # ── Curator gate ─────────────────────────────────────────────
+            curator = await self._get_curator()
+            decision: CuratorDecision | None = None
+            if curator is not None and candidate is not None:
+                try:
+                    decision = await curator.curate(candidate, project_id, project_root)
+                except Exception:
+                    logger.exception(
+                        '_process_add_ticket: curator.curate failed for %s; '
+                        'falling through to create', ticket_id,
+                    )
+                    # Steps 29-30 will handle CuratorFailureError explicitly;
+                    # for now fall through to create on any failure.
+                    decision = CuratorDecision(action='create')
+
+            if decision is not None and decision.action == 'drop' and decision.target_id:
+                # Steps 23-24: drop handling.  For now treat as combined.
+                result_dict = {
+                    'id': decision.target_id,
+                    'title': candidate.title if candidate else '',
+                    'deduplicated': True,
+                    'action': 'drop',
+                    'justification': decision.justification,
+                }
+                await self._ticket_store.mark_resolved(
+                    ticket_id,
+                    status='combined',
+                    task_id=decision.target_id,
+                    reason=f'drop: {decision.justification}',
+                    result_json=json.dumps(result_dict),
+                )
+                self._signal_ticket_event(ticket_id)
+                return
+
+            if decision is not None and decision.action == 'combine' and decision.target_id:
+                # Steps 25-26: combine handling.
+                async with self._write_lock(project_id):
+                    combine_result = await self._execute_combine(project_root, decision)
+                if combine_result is not None:
+                    if decision.rewritten_task is not None:
+                        rt = decision.rewritten_task
+                        rt_candidate = CandidateTask(
+                            title=rt.title,
+                            description=rt.description,
+                            details=rt.details,
+                            files_to_modify=rt.files_to_modify,
+                            priority=rt.priority,
+                        )
+                        bg = asyncio.create_task(
+                            curator.reembed_task(
+                                decision.target_id, rt_candidate, project_id,
+                            ),
+                            name=f'curator-reembed-{decision.target_id}',
+                        )
+                        self._background_tasks.add(bg)
+                        bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+                    result_dict = {
+                        'id': decision.target_id,
+                        'title': (
+                            decision.rewritten_task.title
+                            if decision.rewritten_task else (candidate.title if candidate else '')
+                        ),
+                        'deduplicated': True,
+                        'action': 'combine',
+                        'justification': decision.justification,
+                    }
+                    await self._ticket_store.mark_resolved(
+                        ticket_id,
+                        status='combined',
+                        task_id=decision.target_id,
+                        reason=f'combine: {decision.justification}',
+                        result_json=json.dumps(result_dict),
+                    )
+                    self._signal_ticket_event(ticket_id)
+                    return
+                # combine failed → fall through to create
+
+            # ── Create task ───────────────────────────────────────────────
+            tm = await self._ensure_taskmaster()
+            metadata_json: str | None = None
+            if metadata:
+                metadata_json = (
+                    metadata if isinstance(metadata, str) else json.dumps(metadata)
+                )
+
+            async with self._write_lock(project_id):
+                try:
+                    result = await tm.add_task(
+                        project_root=project_root,
+                        metadata=metadata_json,
+                        **kwargs,
+                    )
+                    atomic_metadata_written = metadata_json is not None
+                except TypeError:
+                    result = await tm.add_task(project_root=project_root, **kwargs)
+                    atomic_metadata_written = False
+
+                task_id_str: str = ''
+                if isinstance(result, dict):
+                    task_id_str = str(result.get('id', ''))
+                if metadata_json and task_id_str and not atomic_metadata_written:
+                    try:
+                        await tm.update_task(
+                            task_id=task_id_str,
+                            metadata=metadata_json,
+                            project_root=project_root,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            '_process_add_ticket: metadata follow-up for %s failed: %s',
+                            task_id_str, e,
+                        )
+
+                # note_created + record_task under write_lock (R3 invariant)
+                if curator is not None and candidate is not None and task_id_str:
+                    curator.note_created(project_id, candidate, task_id_str)
+                    try:
+                        await curator.record_task(task_id_str, candidate, project_id)
+                    except Exception:
+                        logger.warning(
+                            '_process_add_ticket: curator.record_task failed for %s',
+                            task_id_str, exc_info=True,
+                        )
+
+            task_id = task_id_str or None
+            status = 'created'
+            result_dict = result if isinstance(result, dict) else {}
+
+        except Exception as exc:
+            logger.exception(
+                '_process_add_ticket: unexpected error for ticket %s', ticket_id,
+            )
+            reason = str(exc)
+            status = 'failed'
+            result_dict = None
+
+        # ── Persist terminal state ────────────────────────────────────────
+        await self._ticket_store.mark_resolved(
+            ticket_id,
+            status=status,
+            task_id=task_id,
+            reason=reason,
+            result_json=json.dumps(result_dict) if result_dict is not None else None,
+        )
+
+        # ── Emit journal event and schedule commit (create path only) ────
+        if status == 'created' and task_id:
+            event = self._make_event(
+                EventType.task_created,
+                project_root,
+                {'operation': 'add_task', 'task_id': task_id},
+            )
+            await self._journal(event)
+            self._schedule_commit(project_root, 'add_task')
+
+        self._signal_ticket_event(ticket_id)
+
+    def _signal_ticket_event(self, ticket_id: str) -> None:
+        """Wake any caller waiting on resolve_ticket for this ticket."""
+        event = self._ticket_events.pop(ticket_id, None)
+        if event is not None:
+            event.set()
 
     async def add_task(self, project_root: str, **kwargs: Any) -> dict:
         if err := await self._backlog_gate(project_root):
