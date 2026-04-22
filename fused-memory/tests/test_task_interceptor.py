@@ -372,10 +372,19 @@ async def test_add_task_hot_path_immunity_with_queue(taskmaster, tmp_path):
         assert result == {'id': '2', 'title': 'New Task'}
         # Under 500ms budget even with SQLite pinned.
         assert elapsed < 0.5, f'hot path took {elapsed:.3f}s under lock'
-        # The event is either queued for retry or already dead-lettered,
-        # but NOT raised to the caller.
+        # The event is either queued, in-flight (being retried), dead-lettered,
+        # or committed — but NOT raised to the caller.  With the facade path,
+        # the worker emits the event during resolve, so multiple asyncio ticks
+        # pass before the assertion runs; the drain task typically dequeues the
+        # event before we get here, putting it in retry_in_flight.
         stats = queue.stats()
-        assert stats['queue_depth'] + stats['dead_letters'] + stats['events_committed'] >= 1
+        in_system = (
+            stats['queue_depth']
+            + stats['dead_letters']
+            + stats['events_committed']
+            + stats.get('retry_in_flight', 0)
+        )
+        assert in_system >= 1, f'event vanished from queue tracking: {stats}'
     finally:
         await store.close()
         if interceptor._worker_task and not interceptor._worker_task.done():
