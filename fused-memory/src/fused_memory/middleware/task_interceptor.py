@@ -1139,7 +1139,8 @@ class TaskInterceptor:
                     decision = CuratorDecision(action='create')
 
             if decision is not None and decision.action == 'drop' and decision.target_id:
-                # Steps 23-24: drop handling.  For now treat as combined.
+                # Drop: fold candidate into the existing target task (status='combined').
+                # Preserves legacy result shape for the add_task facade.
                 result_dict = {
                     'id': decision.target_id,
                     'title': candidate.title if candidate else '',
