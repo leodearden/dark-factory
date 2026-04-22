@@ -247,6 +247,59 @@ async def test_full_cycle_extracts_project_root_from_events(
         assert stage_state['project_root'] == '/home/leo/src/dark-factory'
 
 
+# ── Tests for Task 927: project_root fallback fix ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_harness_init_stores_project_root_from_taskmaster_config(
+    journal, event_buffer, mock_memory_service
+):
+    """ReconciliationHarness.__init__ should store _project_root from config.taskmaster."""
+    from unittest.mock import AsyncMock
+
+    from fused_memory.config.schema import (
+        FusedMemoryConfig,
+        ReconciliationConfig,
+        TaskmasterConfig,
+    )
+    from fused_memory.reconciliation.harness import ReconciliationHarness
+
+    recon_cfg = ReconciliationConfig(
+        enabled=True,
+        explore_codebase_root='/tmp/test',
+        agent_llm_provider='anthropic',
+        agent_llm_model='claude-sonnet-4-20250514',
+    )
+
+    # (a) With taskmaster configured: _project_root should come from config
+    config_with_taskmaster = FusedMemoryConfig(
+        taskmaster=TaskmasterConfig(project_root='/abs/from/config'),
+        reconciliation=recon_cfg,
+    )
+    harness_a = ReconciliationHarness(
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        journal=journal,
+        event_buffer=event_buffer,
+        config=config_with_taskmaster,
+    )
+    assert harness_a._project_root == '/abs/from/config'
+
+    # (b) With taskmaster=None: _project_root should default to ''
+    config_no_taskmaster = FusedMemoryConfig(
+        taskmaster=None,
+        reconciliation=recon_cfg,
+    )
+    harness_b = ReconciliationHarness(
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        journal=journal,
+        event_buffer=event_buffer,
+        config=config_no_taskmaster,
+    )
+    assert harness_b._project_root == ''
+
+
 # ── Tests for Task 74: Stage 3 findings feedback loop ────────────────
 
 
