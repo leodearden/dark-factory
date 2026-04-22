@@ -56,3 +56,14 @@ class TestMaybeWarnMissingEscalation:
             for rec in caplog.records
             if rec.levelno >= logging.WARNING
         ), 'expected a WARNING containing "escalation" and "architect"'
+
+    def test_no_warning_when_escalation_queue_present(self, caplog):
+        """No WARNING is emitted when the escalation_queue is non-None."""
+        wf = _make_workflow(escalation_queue=MagicMock())
+        with caplog.at_level(logging.WARNING):
+            wf._maybe_warn_missing_escalation('architect')
+        assert not any(
+            'escalation_queue is unavailable' in rec.message
+            for rec in caplog.records
+            if rec.levelno >= logging.WARNING
+        ), 'unexpected WARNING about missing escalation_queue when queue is present'
