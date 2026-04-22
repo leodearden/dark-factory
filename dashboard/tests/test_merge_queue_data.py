@@ -2337,3 +2337,74 @@ class TestEnrichMergesWithTitles:
         result = enrich_merges_with_titles(merges, {'7': 'Fix X'})
         assert result is not merges
 
+
+# ---------------------------------------------------------------------------
+# TestLoadTaskTitles (step-7)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadTaskTitles:
+    """Tests for merge_queue.load_task_titles."""
+
+    def _write_tasks_json(self, path, tasks, format='master'):
+        """Write a tasks.json file in the given format."""
+        import json
+        if format == 'master':
+            data = {'master': {'tasks': tasks}}
+        else:
+            data = {'tasks': tasks}
+        path.write_text(json.dumps(data))
+
+    def test_master_format_returns_str_keyed_dict(self, tmp_path):
+        """Reads {'master': {'tasks': [...]}} format and returns {str(id): title}."""
+        from dashboard.data.merge_queue import load_task_titles
+
+        tasks_path = tmp_path / 'tasks.json'
+        self._write_tasks_json(tasks_path, [
+            {'id': 1, 'title': 'A'},
+            {'id': 2, 'title': 'B'},
+        ])
+        result = load_task_titles(tasks_path)
+        assert result == {'1': 'A', '2': 'B'}
+
+    def test_flat_format_also_works(self, tmp_path):
+        """Reads {'tasks': [...]} format correctly."""
+        from dashboard.data.merge_queue import load_task_titles
+
+        tasks_path = tmp_path / 'tasks.json'
+        self._write_tasks_json(tasks_path, [
+            {'id': 1, 'title': 'A'},
+            {'id': 2, 'title': 'B'},
+        ], format='flat')
+        result = load_task_titles(tasks_path)
+        assert result == {'1': 'A', '2': 'B'}
+
+    def test_missing_file_returns_empty_dict(self, tmp_path):
+        """Returns {} when the file does not exist."""
+        from dashboard.data.merge_queue import load_task_titles
+
+        result = load_task_titles(tmp_path / 'nonexistent.json')
+        assert result == {}
+
+    def test_malformed_json_returns_empty_dict(self, tmp_path):
+        """Returns {} for invalid JSON."""
+        from dashboard.data.merge_queue import load_task_titles
+
+        tasks_path = tmp_path / 'tasks.json'
+        tasks_path.write_text('{ invalid json ]')
+        result = load_task_titles(tasks_path)
+        assert result == {}
+
+    def test_none_title_is_omitted(self, tmp_path):
+        """Tasks with title=None are omitted from the result."""
+        from dashboard.data.merge_queue import load_task_titles
+
+        tasks_path = tmp_path / 'tasks.json'
+        self._write_tasks_json(tasks_path, [
+            {'id': 1, 'title': None},
+            {'id': 2, 'title': 'B'},
+        ])
+        result = load_task_titles(tasks_path)
+        assert '1' not in result
+        assert result.get('2') == 'B'
+
