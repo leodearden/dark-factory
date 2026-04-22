@@ -355,6 +355,7 @@ async def recent_merges(
     *,
     limit: int = 20,
     hours: int = 168,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Most recent merge_attempt events, newest first.
 
@@ -363,6 +364,9 @@ async def recent_merges(
         limit: Maximum number of rows to return.
         hours: Look-back window in hours (default 168 = 7 days).  Only
             events with ``timestamp >= now - hours`` are included.
+        now: Reference timestamp for the cutoff window (default:
+            ``datetime.now(UTC)``).  Pass an explicit value in tests for
+            full determinism.
 
     Returns list of {'task_id', 'run_id', 'outcome', 'duration_ms',
                      'timestamp'} dicts.
@@ -371,7 +375,7 @@ async def recent_merges(
         return []
 
     async def _query(conn: aiosqlite.Connection) -> list[dict]:
-        since = _cutoff_iso(hours)
+        since = _cutoff_iso(hours, now=now)
         rows = await conn.execute_fetchall(
             "SELECT task_id, run_id, "
             "       json_extract(data, '$.outcome') AS outcome, "
@@ -531,6 +535,72 @@ def load_task_titles(tasks_json_path: Path) -> dict[str, str]:
     """
     tasks = load_task_tree(tasks_json_path)
     return {str(t['id']): t['title'] for t in tasks if t.get('title')}
+
+
+async def build_per_project_merge_queue(
+    project_dbs: list[tuple[str, aiosqlite.Connection | None]],
+    *,
+    hours: int,
+    now: datetime,
+    recent_window_minutes: int,
+) -> dict[str, dict]:
+    """Build per-project merge queue stats by querying each project's DB independently.
+
+    For each ``(pid, db)`` pair, gathers the 5 per-DB stats concurrently and
+    applies :func:`filter_merges_within` to the recent-merges list.  Pairs with
+    ``db=None`` produce empty/default stats (the per-DB functions handle None
+    gracefully by returning declared defaults).
+
+    Args:
+        project_dbs: List of ``(project_root_str, connection_or_None)`` tuples
+            from :func:`_project_scoped_dbs_labeled`.
+        hours: Look-back window in hours (forwarded to each per-DB function).
+        now: Shared reference timestamp captured once per request.
+        recent_window_minutes: Sliding window for recent-merges trimming.
+
+    Returns:
+        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, speculative}}``.
+    """
+    _DEFAULT_DEPTH: ChartData = {'labels': [], 'values': []}
+    _DEFAULT_OUTCOMES: ChartData = {'labels': [], 'values': []}
+    _DEFAULT_LATENCY = {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
+    _DEFAULT_SPEC = {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+
+    def _safe(result: object, default: object, label: str) -> object:
+        if isinstance(result, BaseException):
+            logger.warning('build_per_project_merge_queue %s: %s', label, result)
+            return default
+        return result
+
+    out: dict[str, dict] = {}
+    for pid, db in project_dbs:
+        depth_r, outcomes_r, latency_r, recent_r, spec_r = await asyncio.gather(
+            queue_depth_timeseries(db, hours=hours, now=now),
+            outcome_distribution(db, hours=hours, now=now),
+            latency_stats(db, hours=hours, now=now),
+            recent_merges(db, limit=50, hours=hours, now=now),
+            speculative_stats(db, hours=hours, now=now),
+            return_exceptions=True,
+        )
+        depth = _safe(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
+        outcomes = _safe(outcomes_r, _DEFAULT_OUTCOMES, f'{pid}/outcomes')
+        latency = _safe(latency_r, _DEFAULT_LATENCY, f'{pid}/latency')
+        recent_raw = _safe(recent_r, [], f'{pid}/recent')
+        spec = _safe(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
+
+        recent_trimmed = filter_merges_within(
+            recent_raw,  # type: ignore[arg-type]
+            minutes=recent_window_minutes,
+            now=now,
+        )
+        out[pid] = {
+            'depth_timeseries': depth,
+            'outcomes': outcomes,
+            'latency': latency,
+            'recent': recent_trimmed,
+            'speculative': spec,
+        }
+    return out
 
 
 # ---------------------------------------------------------------------------
