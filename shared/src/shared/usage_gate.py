@@ -93,6 +93,23 @@ GEMINI_CAP_PATTERNS = ['quota exceeded', 'rate limit', 'resource exhausted',
 CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
 
 
+def _probe_hit_local_budget_cap(stdout_bytes: bytes) -> bool:
+    """Return True iff the probe stdout is a CLI JSON result reporting that
+    the local ``--max-budget-usd`` cap was hit.
+
+    This indicates the Anthropic API accepted the request and consumed real
+    tokens — the account is NOT capped. Distinct from account-level cap hits
+    (which surface as text prefixes in stderr, not JSON subtypes).
+    """
+    if not stdout_bytes:
+        return False
+    try:
+        obj = json.loads(stdout_bytes.decode(errors='replace'))
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(obj, dict) and obj.get('subtype') == 'error_max_budget_usd'
+
+
 @dataclass
 class AccountState:
     """Per-account cap tracking."""
@@ -915,6 +932,19 @@ class UsageGate:
                     return False
 
         if proc.returncode != 0:
+            # Distinguish the probe's own $0.01 budget exhaustion from real
+            # Anthropic-side failures. A non-zero exit with subtype
+            # ``error_max_budget_usd`` means the API accepted the request and
+            # consumed real tokens — the account has capacity; the probe
+            # simply can't spend more than $0.01 per run. Cache-creation on a
+            # fresh session easily pushes total_cost past $0.01, so this is a
+            # routine outcome, not a cap hit.
+            if _probe_hit_local_budget_cap(stdout_bytes):
+                logger.info(
+                    f'Account {acct.name}: probe hit local $0.01 budget '
+                    f'cap (API accepted request) — treating as success',
+                )
+                return True
             logger.warning(
                 f'Account {acct.name}: probe exited {proc.returncode}',
             )
