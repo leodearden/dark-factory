@@ -816,7 +816,9 @@ async def partials_merge_queue(request: Request):
         project_dbs, hours=hours, now=effective_now, recent_window_minutes=15,
     )
 
-    # Apply trim + title enrichment per project
+    # Apply trim + title enrichment per project.
+    # Empty-state: template shows "No merge activity" when
+    # not any(p['latency']['count'] or p['recent'] for p in projects.values()).
     projects: dict[str, dict] = {}
     for pid, data in projects_raw.items():
         titles = await asyncio.to_thread(
