@@ -70,3 +70,53 @@ async def test_submit_task_mcp_tool_signature_and_forwarding(mcp_server, task_in
 
     # Return value flows back unchanged.
     assert result == {'ticket': 'tkt_ABCDEFGHIJKLMNOPQRSTUVWXYZ'}
+
+
+# ------------------------------------------------------------------
+# resolve_ticket MCP tool
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_ticket_mcp_tool_signature_and_forwarding(mcp_server, task_interceptor):
+    """resolve_ticket MCP tool forwards args to interceptor.resolve_ticket
+    and the returned {status, task_id} dict flows back unchanged.
+    """
+    result = await mcp_server._tool_manager.call_tool(
+        'resolve_ticket',
+        {
+            'ticket': 'tkt_ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+            'project_root': '/project',
+            'timeout_seconds': 10,
+        },
+    )
+
+    task_interceptor.resolve_ticket.assert_called_once()
+    call_kwargs = task_interceptor.resolve_ticket.call_args.kwargs
+    assert call_kwargs.get('ticket') == 'tkt_ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    assert call_kwargs.get('project_root') == '/project'
+    assert call_kwargs.get('timeout_seconds') == 10
+
+    # Return value flows back unchanged.
+    assert result == {'status': 'created', 'task_id': '5'}
+
+
+@pytest.mark.asyncio
+async def test_resolve_ticket_mcp_tool_rejects_non_prefixed_id(mcp_server, task_interceptor):
+    """resolve_ticket MCP tool returns ValidationError for non-tkt_ prefixed input."""
+    result = await mcp_server._tool_manager.call_tool(
+        'resolve_ticket',
+        {
+            'ticket': '42',
+            'project_root': '/project',
+        },
+    )
+
+    assert result.get('error_type') == 'ValidationError', (
+        f'Expected ValidationError, got: {result}'
+    )
+    assert 'tkt_' in result.get('error', ''), (
+        f'Error message should mention tkt_: {result}'
+    )
+    # Interceptor must NOT be called when the ticket id is invalid.
+    task_interceptor.resolve_ticket.assert_not_called()
