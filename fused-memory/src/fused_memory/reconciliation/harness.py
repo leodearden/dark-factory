@@ -430,11 +430,10 @@ class ReconciliationHarness:
         await self._start_escalation_server()
 
         # Re-queue any deferred writes left in-progress by a crashed prior process.
-        # Cutoff is 0 (release *every* currently-claimed row) rather than
-        # stale_claim_recovery_seconds.  This closes the fast-restart edge case:
-        # if a supervisor restarts the harness within stale_claim_recovery_seconds
-        # of the previous crash, a time-based cutoff would miss rows whose
-        # claimed_at is younger than the horizon, silently stalling those writes.
+        # Cutoff is 0 (release every currently-claimed row) rather than a
+        # time-based horizon.  A time-based horizon would miss rows whose
+        # claimed_at falls within that horizon on a fast restart, silently
+        # stalling those writes.
         # Safety: the per-project reconciliation lock (EventBuffer._is_run_locked /
         # mark_run_active) serialises replay — at startup no project loop has
         # spawned yet, so there is nothing to race with.

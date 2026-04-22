@@ -286,20 +286,6 @@ class ReconciliationConfig(BaseModel):
             'Restores the pre-881 hard-coded 600s ceiling.'
         ),
     )
-    # Claim-scale recovery window — intentionally an order of magnitude shorter
-    # than stale_run_recovery_seconds (600s).  Deferred-write claims are typically
-    # held for seconds; 60s is a conservative cutoff that prevents a crashed prior
-    # process from leaving claims stuck for ten minutes.
-    stale_claim_recovery_seconds: int = Field(
-        default=60,
-        gt=0,
-        description=(
-            'Deferred-write claims older than this are re-queued on startup. '
-            'Claims are held for seconds; use a much shorter horizon than '
-            'stale_run_recovery_seconds (600s, for minute-scale run recovery).'
-        ),
-    )
-
     @model_validator(mode='after')
     def _validate_cli_timeouts_within_stage(self) -> 'ReconciliationConfig':
         """Enforce timeout hierarchy: per-CLI budgets ≤ stage guard ≤ cycle guard."""
