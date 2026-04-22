@@ -638,3 +638,50 @@ async def test_resolve_ticket_returns_immediately_for_terminal_ticket(
     assert result['task_id'] == '42', f'Expected task_id=42: {result}'
     # result_json should NOT be exposed
     assert 'result_json' not in result, f'result_json should not be exposed: {result}'
+
+
+# ---------------------------------------------------------------------------
+# step-39: resolve_ticket wakes when worker completes the ticket
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_ticket_wakes_on_worker_completion(
+    interceptor_with_store, ticket_store, taskmaster,
+):
+    """When resolve_ticket is awaiting a pending ticket, the worker completing
+    that ticket wakes the caller promptly (well under the 5s timeout).
+    """
+    mock_curator = MagicMock()
+    mock_curator.curate = AsyncMock(return_value=CuratorDecision(action='create'))
+    mock_curator.note_created = MagicMock()
+    mock_curator.record_task = AsyncMock()
+
+    with patch.object(
+        type(interceptor_with_store), '_get_curator',
+        new=AsyncMock(return_value=mock_curator),
+    ):
+        # Submit the ticket (enqueues ticket_id, starts worker)
+        submit_result = await interceptor_with_store.submit_task(
+            project_root='/project',
+            title='Wake Test',
+            description='Checks that resolve wakes on completion',
+        )
+        assert submit_result.get('ticket', '').startswith('tkt_'), f'Got: {submit_result}'
+        ticket_id = submit_result['ticket']
+
+        # Await submit+resolve in parallel; worker should complete the ticket
+        # before the 5s timeout expires.
+        import time
+        start = time.monotonic()
+        resolve_result = await asyncio.wait_for(
+            interceptor_with_store.resolve_ticket(ticket_id, '/project', timeout_seconds=5.0),
+            timeout=6.0,  # outer safety bound
+        )
+        elapsed = time.monotonic() - start
+
+    assert resolve_result['status'] == 'created', f'Expected created: {resolve_result}'
+    assert resolve_result.get('task_id') == '42', f'Expected task_id=42: {resolve_result}'
+    assert 'result_json' not in resolve_result, f'result_json should not be exposed: {resolve_result}'
+    # Should complete quickly (worker processes immediately)
+    assert elapsed < 3.0, f'resolve_ticket took too long ({elapsed:.2f}s)'
