@@ -1075,9 +1075,9 @@ class BacklogIterator:
 
         # Extract project_root from first event (for taskmaster calls)
         peeked_first = await self.buffer.peek_buffered(project_id, limit=1, before=cutoff)
-        project_root = project_id
+        project_root = self.harness._project_root  # fallback to configured project_root (task 927)
         if peeked_first:
-            project_root = peeked_first[0].payload.get('_project_root', project_id)
+            project_root = peeked_first[0].payload.get('_project_root', self.harness._project_root)
 
         assembler = ContextAssembler(
             memory_service=self.harness.memory,
