@@ -651,7 +651,7 @@ class ReconciliationHarness:
         )
 
         # Extract project_root from event payloads (first event with _project_root key)
-        project_root = project_id  # fallback for backwards compatibility
+        project_root = self._project_root  # fallback to configured project_root (task 927)
         for ev in events:
             pr = ev.payload.get('_project_root')
             if pr:
