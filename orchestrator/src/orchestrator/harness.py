@@ -899,6 +899,11 @@ Output JSON matching the schema. Every task must appear in the output.
 
             if not lock_path.exists():
                 # No worktree or no lock → orphan, revert.
+                # If the worktree directory exists and we haven't promised to
+                # resume this task's plan, clean it up so the scheduler can
+                # create a fresh worktree on re-acquisition without colliding.
+                if worktree_path.exists() and tid not in self._recovered_plans:
+                    await self.git_ops.cleanup_worktree(worktree_path, tid)
                 await self.scheduler.set_task_status(tid, 'pending')
                 logger.info(
                     'Reconcile: reverted task %s to pending (reason=no-lock)', tid
