@@ -2264,3 +2264,76 @@ class TestFilterMergesWithin:
         assert len(result) == 1
         assert result[0]['task_id'] == 'recent'
 
+
+# ---------------------------------------------------------------------------
+# TestEnrichMergesWithTitles (step-5)
+# ---------------------------------------------------------------------------
+
+
+class TestEnrichMergesWithTitles:
+    """Tests for merge_queue.enrich_merges_with_titles."""
+
+    def test_maps_titles_by_task_id(self):
+        """task_id keys resolve to matching title values."""
+        from dashboard.data.merge_queue import enrich_merges_with_titles
+
+        merges = [
+            {'task_id': '7', 'outcome': 'done'},
+            {'task_id': '42', 'outcome': 'conflict'},
+        ]
+        title_map = {'7': 'Fix X', '42': 'Add Y'}
+        result = enrich_merges_with_titles(merges, title_map)
+        assert result[0]['title'] == 'Fix X'
+        assert result[1]['title'] == 'Add Y'
+
+    def test_none_task_id_gets_empty_title(self):
+        """task_id=None maps to empty string (no KeyError)."""
+        from dashboard.data.merge_queue import enrich_merges_with_titles
+
+        merges = [{'task_id': None, 'outcome': 'done'}]
+        result = enrich_merges_with_titles(merges, {'7': 'Fix X'})
+        assert result[0]['title'] == ''
+
+    def test_unknown_task_id_gets_empty_title(self):
+        """task_id not in title_map maps to empty string."""
+        from dashboard.data.merge_queue import enrich_merges_with_titles
+
+        merges = [{'task_id': '99', 'outcome': 'done'}]
+        result = enrich_merges_with_titles(merges, {'7': 'Fix X'})
+        assert result[0]['title'] == ''
+
+    def test_extra_title_map_keys_ignored(self):
+        """Keys in title_map absent from merges are ignored."""
+        from dashboard.data.merge_queue import enrich_merges_with_titles
+
+        merges = [{'task_id': '7', 'outcome': 'done'}]
+        title_map = {'7': 'Fix X', '99': 'Extra'}
+        result = enrich_merges_with_titles(merges, title_map)
+        assert len(result) == 1
+        assert result[0]['title'] == 'Fix X'
+
+    def test_does_not_mutate_input_rows(self):
+        """Input dicts are not modified (shallow-copy semantics)."""
+        from dashboard.data.merge_queue import enrich_merges_with_titles
+
+        original = {'task_id': '7', 'outcome': 'done'}
+        merges = [original]
+        enrich_merges_with_titles(merges, {'7': 'Fix X'})
+        assert 'title' not in original  # original row not mutated
+
+    def test_int_task_id_resolved_via_str_conversion(self):
+        """Integer task_id converts to str and resolves correctly."""
+        from dashboard.data.merge_queue import enrich_merges_with_titles
+
+        merges = [{'task_id': 7, 'outcome': 'done'}]  # int, not str
+        result = enrich_merges_with_titles(merges, {'7': 'Fix X'})
+        assert result[0]['title'] == 'Fix X'
+
+    def test_returns_new_list(self):
+        """Return value is a new list, not the input list."""
+        from dashboard.data.merge_queue import enrich_merges_with_titles
+
+        merges = [{'task_id': '7', 'outcome': 'done'}]
+        result = enrich_merges_with_titles(merges, {'7': 'Fix X'})
+        assert result is not merges
+
