@@ -1163,11 +1163,16 @@ class TestSpeculativeMergeWorker:
             n_present = (merge_wt / 'file_ev_n.py').exists()
             n1_present = (merge_wt / 'file_ev_n1.py').exists()
             # Speculative verify of N: N present, N+1 not yet merged → fail.
-            # Re-merge of N+1: N absent, N+1 present → pass (not reached here
-            # since N+1 is discarded after N fails, but the guard is explicit).
+            # Any other shape means N+1 was re-verified after N failed (which
+            # contradicts the discard-on-failure contract) — fail loudly
+            # rather than silently returning pass.
             if n_present and not n1_present:
                 return MagicMock(passed=False, summary='N failed')
-            return MagicMock(passed=True, summary='')
+            raise AssertionError(
+                f'unexpected verify call: n_present={n_present}, '
+                f'n1_present={n1_present} — N+1 should have been discarded '
+                f'after N failed, not re-verified'
+            )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
