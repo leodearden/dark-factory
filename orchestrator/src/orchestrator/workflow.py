@@ -395,7 +395,7 @@ class TaskWorkflow:
                 # satisfies the ancestor check.  Only skip if there's
                 # evidence of prior implementation work.
                 has_work = (
-                    self._has_prior_implementation()
+                    self._has_prior_implementation()[0]
                     or await self.git_ops.has_uncommitted_work(self.worktree)
                 )
                 if has_work:
@@ -473,7 +473,7 @@ class TaskWorkflow:
                     # Defense-in-depth: same stale-branch-point guard as
                     # the pre-EXECUTE check.  Should rarely fire since
                     # we just ran execute, but guards against edge cases.
-                    if already_merged and not self._has_prior_implementation():
+                    if already_merged and not self._has_prior_implementation()[0]:
                         logger.warning(
                             f'Task {self.task_id}: branch appears merged at '
                             f'merge phase but has no implementation entries '
@@ -2305,12 +2305,26 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         stdout, _ = await proc.communicate()
         return stdout.decode().strip()
 
-    def _has_prior_implementation(self) -> bool:
+    def _has_prior_implementation(self, wt_head: str | None = None) -> tuple[bool, list[dict]]:
         """Check whether a prior run did any implementation in this worktree.
 
-        Inspects .task/iterations.jsonl for implementer/debugger entries.
-        Planning-only runs don't write these, so absence means stale branch
-        point rather than a legitimately merged prior run.
+        When *wt_head* is provided (the post-execution branch HEAD), the primary
+        signal is a SHA comparison: the branch has advanced past its starting
+        point iff ``wt_head.strip() != base_commit``.  This is invariant to
+        iteration-log format changes and avoids the false-done regression where
+        a stale iteration entry triggers the guard on a branch with no commits.
+
+        When *wt_head* is not provided (or when base_commit is absent from
+        metadata.json), falls back to scanning .task/iterations.jsonl for
+        implementer/debugger entries.  Planning-only runs don't write these, so
+        absence means stale branch point rather than a legitimately merged prior
+        run.  This fallback is also used by the ghost-loop guard and the
+        merge-phase guard, where a post-rebase HEAD may coincide with
+        base_commit even on a genuinely-implemented branch.
+
+        Returns (has_prior_work, entries) where entries is the full iteration-log
+        list so the caller can include len(entries) in warning breadcrumbs without
+        a second read_iteration_log() call.
 
         Correctness assumption: worktrees are always created fresh per task run.
         If .task/iterations.jsonl were ever carried across a worktree recreation
@@ -2319,9 +2333,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         Any future change to create_worktree that enables reuse must revisit here.
         """
         if self.artifacts is None:
-            return False
+            return (False, [])
+        base_commit = self.artifacts.read_base_commit()
         entries, _ = self.artifacts.read_iteration_log()
-        return any(e.get('agent') in ('implementer', 'debugger') for e in entries)
+        if wt_head is not None and base_commit is not None:
+            return (wt_head.strip() != base_commit, entries)
+        # Fallback: no wt_head provided, or no base_commit stamp — use entry scan
+        return (
+            any(e.get('agent') in ('implementer', 'debugger') for e in entries),
+            entries,
+        )
 
     def _escalate_plan_overwrite(self) -> None:
         """Submit a blocking escalation when plan.json ownership doesn't match.
@@ -2543,14 +2564,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             if await self.git_ops.is_ancestor(
                                 wt_head.strip(), main_sha,
                             ):
-                                if not self._has_prior_implementation():
+                                has_prior, entries = self._has_prior_implementation(
+                                    wt_head.strip()
+                                )
+                                if not has_prior:
                                     _base = (
                                         self.artifacts.read_base_commit()
                                         if self.artifacts else None
-                                    )
-                                    _entries, _ = (
-                                        self.artifacts.read_iteration_log()
-                                        if self.artifacts else ([], [])
                                     )
                                     logger.warning(
                                         'Task %s: branch HEAD %s is ancestor '
@@ -2561,7 +2581,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                                         wt_head.strip()[:8],
                                         main_sha[:8],
                                         _base[:8] if _base else 'none',
-                                        len(_entries),
+                                        len(entries),
                                     )
                                 else:
                                     logger.info(
