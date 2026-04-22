@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import uuid as uuid_mod
+import warnings
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -144,6 +145,9 @@ class TaskInterceptor:
         # Per-ticket asyncio.Events: resolve_ticket registers one so the
         # worker can wake a waiting caller the moment a ticket is terminal.
         self._ticket_events: dict[str, asyncio.Event] = {}
+        # Tracks which project_ids have already received a DeprecationWarning
+        # from the add_task facade so we only warn once per project.
+        self._deprecation_warned_projects: set[str] = set()
 
     async def _ensure_taskmaster(self) -> TaskmasterBackend:
         """Return a connected TaskmasterBackend, or raise with a structured error."""
@@ -1371,6 +1375,24 @@ class TaskInterceptor:
         .. deprecated::
             Migrate callers to ``submit_task`` / ``resolve_ticket``.
         """
+        project_id = resolve_project_id(project_root)
+        # Always emit a logger.warning on every call.
+        logger.warning(
+            'add_task: deprecated facade — migrate to submit_task/resolve_ticket (project=%s)',
+            project_id,
+        )
+        # Emit a DeprecationWarning only on the FIRST call per project_id so
+        # tooling that converts warnings to errors (e.g. pytest -W error) isn't
+        # flooded by repeated calls.
+        if project_id not in self._deprecation_warned_projects:
+            self._deprecation_warned_projects.add(project_id)
+            warnings.warn(
+                f'TaskInterceptor.add_task is deprecated — migrate to '
+                f'submit_task/resolve_ticket (project={project_id})',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         # Delegate entirely to the two-phase path.
         submit_result = await self.submit_task(project_root, **kwargs)
         if 'error' in submit_result:
