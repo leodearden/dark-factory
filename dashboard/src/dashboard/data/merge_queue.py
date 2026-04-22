@@ -602,7 +602,7 @@ async def build_per_project_merge_queue(
         }
 
     results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])
-    return {pid: data for pid, data in results}
+    return dict(results)
 
 
 # ---------------------------------------------------------------------------
