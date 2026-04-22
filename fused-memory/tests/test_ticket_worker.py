@@ -685,3 +685,60 @@ async def test_resolve_ticket_wakes_on_worker_completion(
     assert 'result_json' not in resolve_result, f'result_json should not be exposed: {resolve_result}'
     # Should complete quickly (worker processes immediately)
     assert elapsed < 3.0, f'resolve_ticket took too long ({elapsed:.2f}s)'
+
+
+# ---------------------------------------------------------------------------
+# step-41: resolve_ticket timeout returns failed without mutating the row
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_ticket_timeout_returns_failed_without_mutating_row(
+    interceptor_with_store, ticket_store, taskmaster,
+):
+    """When resolve_ticket times out, it returns a synthetic failed dict
+    but the ticket row remains status='pending' (unchanged in the store).
+    """
+    # Block the worker by using a slow curator mock (won't be called because
+    # we block the worker via a never-resolving event, but we also need the
+    # ticket to be submitted and in pending state).
+    # Strategy: pause the curator so it never responds during our test window.
+    paused = asyncio.Event()  # never set during the test
+
+    async def blocking_curate(*args, **kwargs):
+        await paused.wait()  # blocks indefinitely during this test
+        return CuratorDecision(action='create')
+
+    mock_curator = MagicMock()
+    mock_curator.curate = blocking_curate
+    mock_curator.note_created = MagicMock()
+    mock_curator.record_task = AsyncMock()
+
+    with patch.object(
+        type(interceptor_with_store), '_get_curator',
+        new=AsyncMock(return_value=mock_curator),
+    ):
+        submit_result = await interceptor_with_store.submit_task(
+            project_root='/project',
+            title='Timeout Test',
+            description='Should time out',
+        )
+        assert submit_result.get('ticket', '').startswith('tkt_'), f'Got: {submit_result}'
+        ticket_id = submit_result['ticket']
+
+        # Call resolve_ticket with a very short timeout
+        result = await interceptor_with_store.resolve_ticket(
+            ticket_id, '/project', timeout_seconds=0.1,
+        )
+
+    # Result must indicate timeout failure (not raise)
+    assert result['status'] == 'failed', f'Expected failed: {result}'
+    assert result.get('reason') == 'timeout', f'Expected reason=timeout: {result}'
+    assert result.get('task_id') is None, f'Expected task_id=None: {result}'
+
+    # The ticket row must still be pending (no mutation)
+    row = await ticket_store.get(ticket_id)
+    assert row is not None
+    assert row['status'] == 'pending', (
+        f'Ticket row should still be pending after timeout: {row["status"]!r}'
+    )
