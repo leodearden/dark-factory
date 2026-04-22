@@ -1159,7 +1159,7 @@ class TaskInterceptor:
                 return
 
             if decision is not None and decision.action == 'combine' and decision.target_id:
-                # Steps 25-26: combine handling.
+                # Combine: rewrite target task under write_lock, spawn reembed background task.
                 async with self._write_lock(project_id):
                     combine_result = await self._execute_combine(project_root, decision)
                 if combine_result is not None:
