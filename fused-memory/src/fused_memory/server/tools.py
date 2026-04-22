@@ -1237,6 +1237,55 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    async def submit_task(
+        project_root: str,
+        title: str | None = None,
+        description: str | None = None,
+        details: str | None = None,
+        dependencies: str | None = None,
+        priority: str | None = None,
+        metadata: str | dict[str, Any] | None = None,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        """Phase-1 of two-phase task creation: persist a ticket and return its id immediately.
+
+        Returns ``{"ticket": "tkt_<id>"}`` so the caller can either poll or
+        block via ``resolve_ticket``.  Does NOT call the Taskmaster backend
+        directly — that happens asynchronously in the curator worker.
+
+        Callers should follow up with ``resolve_ticket`` to obtain the final
+        task_id once the curator has decided (create / drop / combine).
+
+        Args:
+            project_root: Absolute path to project root
+            title: Task title
+            description: Task description
+            details: Task details / implementation notes
+            dependencies: Comma-separated dependency task IDs
+            priority: critical, high, medium, low, or polish (default medium)
+            metadata: Task metadata (object or JSON string)
+            tag: Tag context (optional)
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        try:
+            return await task_interceptor.submit_task(
+                project_root=project_root,
+                title=title,
+                description=description,
+                details=details,
+                dependencies=dependencies,
+                priority=priority,
+                metadata=metadata,
+                tag=tag,
+            )
+        except Exception as e:
+            logger.error(f'submit_task error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
     async def update_task(
         id: str,
         project_root: str,
