@@ -52,6 +52,23 @@ def interceptor(taskmaster, reconciler, event_buffer):
     return TaskInterceptor(taskmaster, reconciler, event_buffer)
 
 
+@pytest_asyncio.fixture
+async def interceptor_facade(taskmaster, reconciler, event_buffer, tmp_path):
+    """Interceptor variant wired with a real TicketStore for facade tests."""
+    from fused_memory.middleware.ticket_store import TicketStore
+    store = TicketStore(tmp_path / 'facade_tickets.db')
+    await store.initialize()
+    ti = TaskInterceptor(taskmaster, reconciler, event_buffer, ticket_store=store)
+    yield ti
+    await store.close()
+    if ti._worker_task and not ti._worker_task.done():
+        ti._worker_task.cancel()
+        try:
+            await ti._worker_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 @pytest.mark.asyncio
 async def test_set_task_status_non_trigger(interceptor, taskmaster, reconciler, event_buffer):
     """Non-triggering status change: emits event, no reconciliation."""
@@ -108,25 +125,29 @@ async def test_read_operations_no_events(interceptor, taskmaster, event_buffer):
 
 
 @pytest.mark.asyncio
-async def test_add_task_emits_event(interceptor, event_buffer):
-    await interceptor.add_task('/project', prompt='Test')
+async def test_add_task_emits_event(interceptor_facade, event_buffer):
+    """add_task (facade path) emits a task_created event after the worker resolves."""
+    await interceptor_facade.add_task('/project', prompt='Test')
     stats = await event_buffer.get_buffer_stats('project')
     assert stats['size'] == 1
 
 
 @pytest.mark.asyncio
-async def test_add_task_persists_metadata_atomically(interceptor, taskmaster):
+async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmaster):
     """R5: add_task with metadata forwards it to tm.add_task in one call.
 
     The racy two-step pattern (add_task then update_task(metadata=...)) is
     gone; metadata must be written atomically to prevent a concurrent
     reader from observing a task without its files_to_modify — the bug
     that left #1922/#1923/#1924 running in parallel.
+
+    After step-46 (facade rewrite) this still goes through submit+resolve;
+    the worker writes metadata to tm.add_task inside _process_add_ticket.
     """
     import json
 
     metadata = {'source': 'review-cycle', 'modules': ['fused-memory/src']}
-    result = await interceptor.add_task('/project', prompt='Test', metadata=metadata)
+    result = await interceptor_facade.add_task('/project', prompt='Test', metadata=metadata)
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.add_task.assert_called_once()
     kwargs = taskmaster.add_task.call_args.kwargs
@@ -134,6 +155,47 @@ async def test_add_task_persists_metadata_atomically(interceptor, taskmaster):
     assert kwargs.get('metadata') == json.dumps(metadata)
     # No follow-up update_task for metadata — the atomic path wrote it.
     taskmaster.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_add_task_facade_delegates_to_submit_and_resolve(
+    interceptor_facade, taskmaster,
+):
+    """add_task facade calls submit_task then resolve_ticket in order,
+    passing the ticket from submit to resolve with a 115s timeout.
+    """
+    submit_calls = []
+    resolve_calls = []
+    original_submit = interceptor_facade.submit_task
+    original_resolve = interceptor_facade.resolve_ticket
+
+    async def spy_submit(*args, **kwargs):
+        submit_calls.append({'args': args, 'kwargs': kwargs})
+        return await original_submit(*args, **kwargs)
+
+    async def spy_resolve(*args, **kwargs):
+        resolve_calls.append({'args': args, 'kwargs': kwargs})
+        return await original_resolve(*args, **kwargs)
+
+    interceptor_facade.submit_task = spy_submit
+    interceptor_facade.resolve_ticket = spy_resolve
+
+    await interceptor_facade.add_task(project_root='/p', title='T')
+
+    # submit_task called once
+    assert len(submit_calls) == 1, f'submit_task should be called once: {submit_calls}'
+    # resolve_ticket called once
+    assert len(resolve_calls) == 1, f'resolve_ticket should be called once: {resolve_calls}'
+    # resolve_ticket should receive the ticket id from submit and timeout=115
+    resolve_entry = resolve_calls[0]
+    r_args = resolve_entry['args']
+    r_kwargs = resolve_entry['kwargs']
+    ticket = r_args[0] if r_args else r_kwargs.get('ticket')
+    assert ticket is not None and ticket.startswith('tkt_'), (
+        f'resolve_ticket first arg should be the ticket id: {resolve_entry}'
+    )
+    timeout = r_kwargs.get('timeout_seconds', r_args[2] if len(r_args) > 2 else None)
+    assert timeout == 115, f'resolve_ticket should be called with timeout_seconds=115: {resolve_entry}'
 
 
 @pytest.mark.asyncio
