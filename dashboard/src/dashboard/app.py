@@ -876,6 +876,10 @@ async def partials_merge_queue(request: Request):
             'recent': enrich_merges_with_titles(data['recent'], titles),
         }
 
+    canvas_ids = unique_css_ids(pids)
+    for pid, cid in zip(pids, canvas_ids, strict=True):
+        projects[pid]['canvas_id'] = cid
+
     return templates.TemplateResponse(
         request, 'partials/merge_queue.html',
         context={'projects': projects, 'window': window_raw},

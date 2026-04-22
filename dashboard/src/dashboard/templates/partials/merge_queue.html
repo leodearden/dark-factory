@@ -26,7 +26,7 @@
             <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-blue-500">
               <div class="text-xs text-gray-400 mb-3">Merge Attempts (15-min buckets)</div>
               <div style="height: 280px; position: relative">
-                <canvas id="mergeQueueDepthChart-{{ pid | css_id }}"></canvas>
+                <canvas id="mergeQueueDepthChart-{{ data.canvas_id }}"></canvas>
               </div>
             </div>
 
@@ -35,7 +35,7 @@
               <div class="text-xs text-gray-400 mb-3">Outcome Distribution</div>
               {% if data.outcomes.labels %}
                 <div style="height: 280px; position: relative">
-                  <canvas id="mergeOutcomeChart-{{ pid | css_id }}"></canvas>
+                  <canvas id="mergeOutcomeChart-{{ data.canvas_id }}"></canvas>
                 </div>
               {% else %}
                 <div class="text-gray-500 text-sm py-8 text-center">No outcome data.</div>
