@@ -1100,36 +1100,56 @@ class TaskInterceptor:
         and the TTL sweep cleans truly abandoned rows.
 
         Returns ``{status, task_id?, reason?}`` — does NOT expose ``result_json``.
+
+        Lost-wakeup safety
+        ------------------
+        The event is registered in ``_ticket_events`` BEFORE the first
+        ``ticket_store.get()`` call.  This closes the race where the worker
+        calls ``_signal_ticket_event`` between our terminal-status check and
+        our event registration: if that happens, ``_signal_ticket_event`` finds
+        the already-registered event and sets it, so the subsequent
+        ``event.wait()`` returns immediately instead of hanging.
+
+        Cleanup is centralised in a single ``finally`` block that runs on
+        every exit path (unknown, terminal-found, wait-success, timeout).
+        ``_signal_ticket_event`` may have already popped the key; the
+        ``pop(…, None)`` is a harmless no-op in that case.
         """
         if self._ticket_store is None:
             return {'status': 'failed', 'reason': 'ticket_store not configured', 'task_id': None}
 
-        row = await self._ticket_store.get(ticket)
-        if row is None:
-            return {'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None}
-
-        # Terminal already — return immediately.
-        if row['status'] != 'pending':
-            return _format_ticket_result(row)
-
-        # Pending — register an event and wait for the worker to signal it.
+        # (1) Register the event BEFORE reading the row.
         event = asyncio.Event()
         self._ticket_events[ticket] = event
         try:
-            if timeout_seconds is not None:
-                await asyncio.wait_for(event.wait(), timeout=timeout_seconds)
-            else:
-                await event.wait()
-        except TimeoutError:
-            # Clean up our event registration so a later caller can re-register.
-            self._ticket_events.pop(ticket, None)
-            return {'status': 'failed', 'reason': 'timeout', 'task_id': None}
+            # (2) Read the ticket row.
+            row = await self._ticket_store.get(ticket)
+            if row is None:
+                return {'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None}
 
-        # Re-load the now-terminal row.
-        row = await self._ticket_store.get(ticket)
-        if row is None:
-            return {'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None}
-        return _format_ticket_result(row)
+            # (3) Terminal already — return immediately (finally cleans up).
+            if row['status'] != 'pending':
+                return _format_ticket_result(row)
+
+            # (4) Still pending — wait for the worker to signal.  The event
+            # may already be set if the worker raced us between steps (1) and (2).
+            try:
+                if timeout_seconds is not None:
+                    await asyncio.wait_for(event.wait(), timeout=timeout_seconds)
+                else:
+                    await event.wait()
+            except TimeoutError:
+                return {'status': 'failed', 'reason': 'timeout', 'task_id': None}
+
+            # (5) Re-load the now-terminal row.
+            row = await self._ticket_store.get(ticket)
+            if row is None:
+                return {'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None}
+            return _format_ticket_result(row)
+        finally:
+            # (6) Uniform cleanup: remove the event on every exit path.
+            # _signal_ticket_event may have already popped it — no-op if so.
+            self._ticket_events.pop(ticket, None)
 
     def _start_worker_if_needed(self) -> None:
         """Lazily start the curator worker asyncio.Task if not already running.
