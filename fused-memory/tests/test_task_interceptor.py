@@ -2329,3 +2329,52 @@ def test_is_ticket_id_recognises_tkt_prefix():
     assert _is_ticket_id('123') is False
     assert _is_ticket_id('1.2') is False
     assert _is_ticket_id(None) is False
+
+
+# ---------------------------------------------------------------------------
+# step-19: submit_task persists a pending ticket and returns its id
+# ---------------------------------------------------------------------------
+
+@pytest_asyncio.fixture
+async def ticket_store(tmp_path):
+    """A real TicketStore backed by a temporary SQLite file."""
+    from fused_memory.middleware.ticket_store import TicketStore
+    store = TicketStore(tmp_path / 'tickets.db')
+    await store.initialize()
+    yield store
+    await store.close()
+
+
+@pytest_asyncio.fixture
+async def interceptor_with_store(taskmaster, reconciler, event_buffer, ticket_store):
+    """TaskInterceptor with a real TicketStore wired in."""
+    ti = TaskInterceptor(taskmaster, reconciler, event_buffer, ticket_store=ticket_store)
+    yield ti
+
+
+@pytest.mark.asyncio
+async def test_submit_task_persists_ticket_and_returns_id(
+    interceptor_with_store, ticket_store, taskmaster,
+):
+    """submit_task enqueues a ticket immediately and returns {'ticket': 'tkt_...'}.
+
+    The taskmaster backend must NOT be called — curator processing is deferred
+    to the worker.
+    """
+    result = await interceptor_with_store.submit_task(
+        project_root='/project', title='T', description='D'
+    )
+
+    assert isinstance(result, dict), f'Expected dict, got {result!r}'
+    assert 'ticket' in result, f'Expected ticket key in result: {result}'
+    ticket_id = result['ticket']
+    assert ticket_id.startswith('tkt_'), f'Ticket id should start with tkt_: {ticket_id!r}'
+
+    # Row should be persisted as pending
+    row = await ticket_store.get(ticket_id)
+    assert row is not None, 'Ticket row should exist in store'
+    assert row['status'] == 'pending'
+    assert row['project_id'] is not None
+
+    # The taskmaster backend must NOT have been called
+    taskmaster.add_task.assert_not_called()
