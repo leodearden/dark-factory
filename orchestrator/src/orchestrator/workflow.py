@@ -240,6 +240,7 @@ class TaskWorkflow:
         self._config_dir: TaskConfigDir | None = None
         self._old_plan_base: str | None = None  # base commit from prior session (for revalidation diff)
         self._merge_sha: str | None = None  # merge commit SHA set by _submit_to_merge_queue on success
+        self._last_invoked_role: str | None = None  # role of the last successful invocation
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -596,9 +597,33 @@ class TaskWorkflow:
                 f'All accounts capped: {e.label} — {e.retries} retries in {e.elapsed_secs:.1f}s'
             )
 
-        except _SessionBudgetExhausted:
-            logger.warning(f'Task {self.task_id}: session budget exhausted')
-            return await self._mark_blocked('Session budget exhausted')
+        except _SessionBudgetExhausted as e:
+            last_role = self._last_invoked_role or 'n/a'
+            budget_limit = self.config.usage_cap.session_budget_usd
+            # Use the gate's own cumulative figure for the summary — it is the
+            # value that actually exceeded the budget, whereas
+            # self.metrics.total_cost_usd only advances on successful returns
+            # and may lag the gate's running tally if a cap-retry or partial
+            # invocation contributed cost without completing.
+            reason = (
+                f'Session budget exhausted: ${e.cumulative_cost:.2f} spent of '
+                f'${budget_limit:.2f} budget (last role: {last_role})'
+            )
+            detail = (
+                f'budget_limit=${budget_limit:.2f}\n'
+                f'total_cost_usd=${self.metrics.total_cost_usd:.2f}\n'
+                f'cumulative_cost (gate)=${e.cumulative_cost:.2f}\n'
+                f'agent_invocations={self.metrics.agent_invocations}\n'
+                f'total_turns={self.metrics.total_turns}\n'
+                f'last_role={last_role}'
+            )
+            # _mark_blocked logs "Task %s BLOCKED: %s" — only log the
+            # gate-specific cross-check figure that's unique to this call site.
+            logger.info(
+                'Task %s: session budget exhausted (gate cumulative $%.2f)',
+                self.task_id, e.cumulative_cost,
+            )
+            return await self._mark_blocked(reason, detail=detail)
 
         except Exception as e:
             logger.exception(f'Task {self.task_id} workflow error: {e}')
@@ -2145,6 +2170,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             env_overrides=(self.config.env_overrides or None) if role.name in ('implementer', 'debugger') else None,
         )
         completed_at = datetime.now(UTC).isoformat()
+
+        # Record the last successfully-completed role (updated only on success,
+        # mirrors the cost-accumulation path below — failed/raised invocations
+        # do not advance either field).
+        self._last_invoked_role = role.name
 
         # Track metrics
         self.metrics.total_cost_usd += result.cost_usd

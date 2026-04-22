@@ -3067,6 +3067,120 @@ class TestAllAccountsCappedExceptionBoundary:
         )
 
 
+@pytest.mark.asyncio
+class TestSessionBudgetExhaustionEscalation:
+    """Verify _SessionBudgetExhausted creates an L1 escalation with actionable budget metrics.
+
+    Before the enrichment (step-2 impl), the escalation ``summary`` is just the bare
+    literal ``'Session budget exhausted'`` with no figures — the budget and cost
+    assertions fail, proving the tests are red before impl.
+    """
+
+    async def test_summary_contains_budget_metrics(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """L1 escalation summary carries budget limit and cost-spent figures."""
+        from orchestrator.usage_gate import SessionBudgetExhausted
+
+        stub = AgentStub()
+        config.usage_cap.session_budget_usd = 0.10
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        # First call (architect) succeeds and writes plan.json;
+        # second call (implementer for step-1) raises SessionBudgetExhausted.
+        call_count = 0
+
+        async def invoke_with_budget_exhausted(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return await stub.invoke_agent(*args, **kwargs)
+            raise SessionBudgetExhausted(cumulative_cost=0.50)
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', invoke_with_budget_exhausted)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert workflow.state == WorkflowState.BLOCKED
+
+        # Check L1 escalation exists with expected fields
+        escalations = queue.get_by_task(task_assignment.task_id)
+        assert len(escalations) == 1, f'Expected 1 escalation, got {len(escalations)}'
+        esc = escalations[0]
+        summary = esc.summary
+
+        # Summary must contain (a) canonical phrase, (b) anchored budget label+value,
+        # (c) anchored spent label+value — anchoring prevents a label/value swap from
+        # silently passing (e.g. '$0.50 budget of $0.10 spent' would still satisfy
+        # bare '$0.10' and '$0.50' checks but is semantically wrong).
+        assert 'Session budget exhausted' in summary, (
+            f'Expected "Session budget exhausted" in summary, got: {summary!r}'
+        )
+        assert '$0.10 budget' in summary, (
+            f'Expected "$0.10 budget" in summary, got: {summary!r}'
+        )
+        assert '$0.50 spent' in summary, (
+            f'Expected "$0.50 spent" in summary, got: {summary!r}'
+        )
+
+    async def test_detail_contains_diagnostic_metrics(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """L1 escalation detail carries labelled diagnostic metrics for operator triage.
+
+        Before step-4 impl, the detail defaults to the summary string (no separate
+        detail is passed to _mark_blocked), so the metric-label assertions fail.
+        """
+        from orchestrator.usage_gate import SessionBudgetExhausted
+
+        stub = AgentStub()
+        config.usage_cap.session_budget_usd = 0.10
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        call_count = 0
+
+        async def invoke_with_budget_exhausted(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return await stub.invoke_agent(*args, **kwargs)
+            raise SessionBudgetExhausted(cumulative_cost=0.50)
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', invoke_with_budget_exhausted)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        escalations = queue.get_by_task(task_assignment.task_id)
+        assert len(escalations) == 1, f'Expected 1 escalation, got {len(escalations)}'
+        detail = escalations[0].detail
+
+        # detail must carry labelled metric fields so operators can diagnose runaway cost
+        assert '$0.10' in detail, f'Expected budget limit "$0.10" in detail, got: {detail!r}'
+        assert '$0.50' in detail, f'Expected cost "$0.50" in detail, got: {detail!r}'
+        assert 'total_cost_usd' in detail, f'Expected "total_cost_usd" label in detail, got: {detail!r}'
+        assert 'agent_invocations=1' in detail, (
+            f'Expected "agent_invocations=1" in detail (only architect ran), got: {detail!r}'
+        )
+        assert 'total_turns=' in detail, f'Expected "total_turns=" label in detail, got: {detail!r}'
+        assert 'last_role' in detail, f'Expected "last_role" label in detail, got: {detail!r}'
+        assert 'architect' in detail, f'Expected "architect" (last role) in detail, got: {detail!r}'
+
+
 if TYPE_CHECKING:
     from orchestrator.evals.runner import _EvalScheduler as _EvalSchedulerStatic
     from orchestrator.workflow import _SchedulerLike
