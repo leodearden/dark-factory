@@ -80,3 +80,20 @@ class TestMaybeWarnMissingEscalation:
             for rec in caplog.records
             if rec.levelno >= logging.WARNING
         ), f'unexpected WARNING for non-escalation-capable role {role_name!r}'
+
+    def test_single_shot_across_multiple_invocations(self, caplog):
+        """WARNING fires exactly once even when called multiple times with different roles."""
+        wf = _make_workflow(escalation_queue=None)
+        with caplog.at_level(logging.WARNING):
+            wf._maybe_warn_missing_escalation('architect')
+            wf._maybe_warn_missing_escalation('implementer')
+            wf._maybe_warn_missing_escalation('merger')
+        matching = [
+            rec for rec in caplog.records
+            if rec.levelno >= logging.WARNING
+            and 'escalation_queue is unavailable' in rec.message
+        ]
+        assert len(matching) == 1, (
+            f'expected exactly 1 WARNING but got {len(matching)}: {[r.message for r in matching]}'
+        )
+        assert wf._escalation_missing_warned is True
