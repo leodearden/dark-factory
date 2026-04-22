@@ -749,3 +749,77 @@ class TestMergeQueuePerProject:
         assert re.search(r'<h3[^>]*>\s*other\s*<', html), (
             "Expected 'other' as h3 header in HTML"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestRecentMergesTitles — Title column in recent-merges table (step-13/14)
+# ---------------------------------------------------------------------------
+
+_NOW_ISO = '2026-04-22T12:00:00+00:00'
+
+
+class TestRecentMergesTitles:
+    """The recent-merges table has a Title column populated from task-title enrichment."""
+
+    def test_title_column_rendered(self, client):
+        """Task title from load_task_titles appears in the recent-merges row."""
+        recent_row = {
+            'task_id': '7',
+            'run_id': 'r1',
+            'outcome': 'done',
+            'duration_ms': 1000,
+            'timestamp': _NOW_ISO,
+            'title': 'Fix chart regression',  # pre-enriched (as route does it)
+        }
+        projects = {
+            _DEFAULT_PID: {
+                'depth_timeseries': MOCK_DEPTH,
+                'outcomes': MOCK_OUTCOMES,
+                'latency': MOCK_LATENCY,
+                'recent': [recent_row],
+                'speculative': MOCK_SPEC,
+            }
+        }
+        with patch('dashboard.app.build_per_project_merge_queue',
+                   new_callable=AsyncMock, return_value=projects), \
+             patch('dashboard.app.load_task_titles', return_value={'7': 'Fix chart regression'}):
+            resp = client.get('/partials/merge-queue')
+
+        assert resp.status_code == 200
+        html = resp.text
+
+        # (a) title text appears in the HTML next to task-id 7
+        assert 'Fix chart regression' in html, (
+            "Expected task title 'Fix chart regression' in HTML"
+        )
+
+        # (b) the table header has a 'Title' column
+        assert '<th' in html and 'Title' in html, (
+            "Expected 'Title' column header in recent-merges table"
+        )
+
+    def test_missing_title_renders_gracefully(self, client):
+        """A row with no title shows '—' or empty cell (not an error)."""
+        recent_row = {
+            'task_id': '99',
+            'run_id': 'r2',
+            'outcome': 'conflict',
+            'duration_ms': None,
+            'timestamp': _NOW_ISO,
+            'title': '',  # no match
+        }
+        projects = {
+            _DEFAULT_PID: {
+                'depth_timeseries': MOCK_DEPTH,
+                'outcomes': MOCK_OUTCOMES,
+                'latency': MOCK_LATENCY,
+                'recent': [recent_row],
+                'speculative': MOCK_SPEC,
+            }
+        }
+        with patch('dashboard.app.build_per_project_merge_queue',
+                   new_callable=AsyncMock, return_value=projects), \
+             patch('dashboard.app.load_task_titles', return_value={}):
+            resp = client.get('/partials/merge-queue')
+
+        assert resp.status_code == 200
