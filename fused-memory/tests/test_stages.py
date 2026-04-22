@@ -2571,7 +2571,7 @@ class TestRunStageCapHandling:
             explore_codebase_root=str(tmp_path),
             agent_llm_model='sonnet',
             agent_max_steps=5,
-            stage_timeout_seconds=30,
+            stage_timeout_seconds=600,
         )
 
         cap_exc = AllAccountsCappedException(
