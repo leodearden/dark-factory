@@ -899,6 +899,18 @@ Output JSON matching the schema. Every task must appear in the output.
 
             if not lock_path.exists():
                 # No worktree or no lock → orphan, revert.
+                # If the worktree directory exists and we haven't promised to
+                # resume this task's plan, clean it up so the scheduler can
+                # create a fresh worktree on re-acquisition without colliding.
+                if worktree_path.exists() and tid not in self._recovered_plans:
+                    try:
+                        await self.git_ops.cleanup_worktree(worktree_path, tid)
+                    except Exception:
+                        logger.warning(
+                            'Reconcile: cleanup_worktree failed for task %s'
+                            ' (no-lock); continuing',
+                            tid, exc_info=True,
+                        )
                 await self.scheduler.set_task_status(tid, 'pending')
                 logger.info(
                     'Reconcile: reverted task %s to pending (reason=no-lock)', tid
@@ -912,14 +924,10 @@ Output JSON matching the schema. Every task must appear in the output.
                 lock_data = json.loads(lock_path.read_text())
                 if not isinstance(lock_data, dict):
                     raise ValueError('plan.lock is not a JSON object')
-                if 'owner_pid' not in lock_data:
-                    logger.warning(
-                        'Reconcile: task %s has plan.lock without owner_pid '
-                        '(legacy format) — leaving task untouched to avoid '
-                        'stealing work from a live legacy instance',
-                        tid,
-                    )
-                    continue
+                # artifacts.py is the sole plan.lock writer and has always
+                # included owner_pid; no legacy format without this key exists
+                # in the current fleet.  Missing or null owner_pid is therefore
+                # treated identically to a stale lock (see Gap-2 analysis).
                 owner_pid = lock_data.get('owner_pid')
                 if owner_pid is not None:
                     try:
@@ -939,8 +947,21 @@ Output JSON matching the schema. Every task must appear in the output.
                 continue
 
             # Stale lock — clear it and revert.
-            with contextlib.suppress(OSError):
-                lock_path.unlink()
+            if tid not in self._recovered_plans:
+                # Full cleanup: remove worktree dir + branch so re-acquisition
+                # creates a fresh worktree without colliding.
+                try:
+                    await self.git_ops.cleanup_worktree(worktree_path, tid)
+                except Exception:
+                    logger.warning(
+                        'Reconcile: cleanup_worktree failed for task %s'
+                        ' (stale-lock); continuing',
+                        tid, exc_info=True,
+                    )
+            else:
+                # Plan will be resumed — preserve worktree, only clear stale lock.
+                with contextlib.suppress(OSError):
+                    lock_path.unlink()
             await self.scheduler.set_task_status(tid, 'pending')
             logger.info(
                 'Reconcile: reverted task %s to pending (reason=stale-lock)', tid
