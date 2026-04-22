@@ -112,9 +112,8 @@ class TestInvokeWiresWarning:
         stub_result = AgentResult(success=True, output='', cost_usd=0.0)
         wf = _make_workflow(escalation_queue=None)
 
-        with patch('orchestrator.workflow.invoke_with_cap_retry', new=AsyncMock(return_value=stub_result)):
-            with caplog.at_level(logging.WARNING):
-                await wf._invoke(ARCHITECT, prompt='x', cwd=Path('/tmp'))
+        with patch('orchestrator.workflow.invoke_with_cap_retry', new=AsyncMock(return_value=stub_result)), caplog.at_level(logging.WARNING):
+            await wf._invoke(ARCHITECT, prompt='x', cwd=Path('/tmp'))
 
         assert wf._escalation_missing_warned is True, (
             '_invoke did not set _escalation_missing_warned — helper was never called'
