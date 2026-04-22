@@ -8,6 +8,7 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -297,6 +298,43 @@ def css_id(value: str | None) -> str:
 
 
 templates.env.filters['css_id'] = css_id
+
+
+def unique_css_ids(values: Sequence[str | None]) -> list[str]:
+    """Return a list of collision-safe CSS IDs, one per input value, in order.
+
+    Each value is passed through ``css_id()`` to produce a base id.  If a base
+    id has already been used for an earlier entry the suffix ``_1``, ``_2``, …
+    is appended, incrementing until a candidate not yet in the seen-set is
+    found.
+
+    Counter-collision edge case:
+        If an input already produces a suffix that would otherwise be assigned
+        to a later duplicate, that suffix is skipped.  For example::
+
+            unique_css_ids(['foo', 'foo_1', 'foo'])
+            # → ['foo', 'foo_1', 'foo_2']
+
+        The third ``'foo'`` maps to base ``'foo'``, which is taken.  The first
+        candidate ``'foo_1'`` is also taken (produced organically by the second
+        input), so the counter advances to ``'foo_2'``.
+
+    Not registered as a Jinja filter — it operates on the full ordered list of
+    project ids (one pass over all pids) and must be called from the route, not
+    from templates.
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for v in values:
+        base = css_id(v)
+        candidate = base
+        n = 1
+        while candidate in seen:
+            candidate = f'{base}_{n}'
+            n += 1
+        seen.add(candidate)
+        result.append(candidate)
+    return result
 
 
 async def _burndown_loop(
