@@ -2626,3 +2626,67 @@ async def test_run_pipeline_defers_on_all_accounts_capped(
     assert any('all accounts capped' in msg for msg in log_messages), (
         f'Expected log containing "all accounts capped", got: {log_messages}'
     )
+
+
+# ── Tests for Task 927: BacklogIterator project_root fallback ─────────
+
+
+@pytest.mark.asyncio
+async def test_backlog_iterator_uses_harness_project_root_when_events_lack_override(
+    journal, event_buffer, mock_memory_service
+):
+    """BacklogIterator.run should pass self.harness._project_root to ContextAssembler
+    when peeked events carry no _project_root key in their payload."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from fused_memory.config.schema import (
+        FusedMemoryConfig,
+        ReconciliationConfig,
+        TaskmasterConfig,
+    )
+    from fused_memory.models.reconciliation import AssembledPayload
+    from fused_memory.reconciliation.harness import BacklogIterator, ReconciliationHarness
+
+    recon_cfg = ReconciliationConfig(
+        enabled=True,
+        explore_codebase_root='/tmp/test',
+        agent_llm_provider='anthropic',
+        agent_llm_model='claude-sonnet-4-20250514',
+    )
+    config = FusedMemoryConfig(
+        taskmaster=TaskmasterConfig(project_root='/abs/from/config'),
+        reconciliation=recon_cfg,
+    )
+
+    # Push one event with NO _project_root in payload
+    await event_buffer.push(_make_event('dark_factory'))
+
+    harness = ReconciliationHarness(
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        journal=journal,
+        event_buffer=event_buffer,
+        config=config,
+    )
+
+    captured: dict = {}
+
+    # Stub ContextAssembler: records project_root kwarg; assemble returns events=[] to exit loop
+    def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
+        captured['project_root'] = project_root
+        inst = MagicMock()
+        inst.assemble = AsyncMock(return_value=AssembledPayload(events=[]))
+        return inst
+
+    with patch(
+        'fused_memory.reconciliation.context_assembler.ContextAssembler',
+        side_effect=fake_assembler_factory,
+    ):
+        iterator = BacklogIterator(harness.config, harness.journal, harness.buffer, harness)
+        await iterator.run('dark_factory')
+
+    assert 'project_root' in captured, 'ContextAssembler was never constructed — iterator may not have run'
+    assert captured['project_root'] == '/abs/from/config', (
+        f"Expected project_root='/abs/from/config' but got '{captured['project_root']}'"
+        " — BacklogIterator fallback should use self.harness._project_root, not project_id"
+    )
