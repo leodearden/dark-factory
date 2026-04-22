@@ -65,6 +65,7 @@ from dashboard.data.reconciliation import (
     get_latest_verdict,
     get_recent_runs,
     get_watermarks,
+    partition_burst_state,
 )
 from dashboard.data.utils import parse_utc
 from dashboard.data.write_journal import (
@@ -485,7 +486,10 @@ async def partials_recon(request: Request):
     buffer_stats = _safe_gather_result(
         bs_r, {'buffered_count': 0, 'oldest_event_age_seconds': None}, 'buffer_stats',
     )
-    burst_state = _safe_gather_result(burst_r, [], 'burst_state')
+    burst_state_raw = _safe_gather_result(burst_r, [], 'burst_state')
+    # Drop stale idle agents: keep only agents with state != 'idle'
+    # OR last_write_at within the last hour (partition_burst_state threshold).
+    active_burst, _ = partition_burst_state(burst_state_raw)
     watermarks_list = _safe_gather_result(wm_r, [], 'watermarks')
     verdict = _safe_gather_result(verdict_r, None, 'latest_verdict')
     runs = _safe_gather_result(runs_r, [], 'recent_runs')
@@ -511,7 +515,7 @@ async def partials_recon(request: Request):
         request, 'partials/recon.html',
         context={
             'buffer_stats': buffer_stats,
-            'burst_state': burst_state,
+            'burst_state': active_burst,
             'projects': projects,
             'verdict': verdict,
             'runs': runs,

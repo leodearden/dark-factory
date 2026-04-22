@@ -193,20 +193,35 @@ class TestFormatDuration:
 
 MOCK_BUFFER_STATS = {'buffered_count': 3, 'oldest_event_age_seconds': 600.0}
 
-MOCK_BURST_STATE = [
-    {
-        'agent_id': 'agent-1',
-        'state': 'bursting',
-        'last_write_at': '2026-03-19T00:00:00+00:00',
-        'burst_started_at': '2026-03-19T00:00:00+00:00',
-    },
-    {
-        'agent_id': 'agent-2',
-        'state': 'idle',
-        'last_write_at': '2026-03-19T00:00:00+00:00',
-        'burst_started_at': None,
-    },
-]
+def mock_burst_state() -> list[dict]:
+    """Return a fresh list with recent timestamps (mutation-safe factory).
+
+    Both agents are active/recent so they survive the partition_burst_state
+    filter applied in partials_recon (1-hour active threshold):
+    - agent-1: state='bursting' (non-idle) → always kept.
+    - agent-2: state='idle', last_write_at=5m ago → kept (within 1h threshold).
+    """
+    now = datetime.now(UTC)
+    return [
+        {
+            'agent_id': 'agent-1',
+            'state': 'bursting',
+            'last_write_at': (now - timedelta(minutes=5)).isoformat(),
+            'burst_started_at': (now - timedelta(minutes=5)).isoformat(),
+        },
+        {
+            'agent_id': 'agent-2',
+            'state': 'idle',
+            'last_write_at': (now - timedelta(minutes=5)).isoformat(),
+            'burst_started_at': None,
+        },
+    ]
+
+
+# Kept for backwards compatibility — callers that need a static reference
+# should switch to mock_burst_state(); the variable is no longer used in
+# _patch_recon_data (which now calls the factory).
+MOCK_BURST_STATE = mock_burst_state()
 
 MOCK_WATERMARKS = [
     {
@@ -272,7 +287,7 @@ def _patch_recon_data(buffer_stats=_UNSET, burst_state=_UNSET, watermarks=_UNSET
     stack.enter_context(patch(
         'dashboard.app.get_burst_state',
         new_callable=AsyncMock,
-        return_value=burst_state if burst_state is not _UNSET else MOCK_BURST_STATE,
+        return_value=burst_state if burst_state is not _UNSET else mock_burst_state(),
     ))
     stack.enter_context(patch(
         'dashboard.app.get_watermarks',
