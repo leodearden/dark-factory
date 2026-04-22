@@ -297,6 +297,19 @@ class TestReconcileStrandedInProgress:
                 f'Expected WARNING level, got {logging.getLevelName(matching[0].levelno)}'
             )
 
+        # Verify cleanup_worktree call behavior.
+        # When a worktree was created on disk (lock_contents is not None) and the
+        # task was reverted, cleanup_worktree must have been called with the correct
+        # args.  When no worktree exists (no-lock-*-id cases, lock_contents=None) or
+        # the task was left alone (live-pid-as-string), cleanup_worktree must not fire.
+        worktree_path = harness.git_ops.worktree_base / tid_str
+        if expect_reverted and lock_contents is not None:
+            harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+                worktree_path, tid_str
+            )
+        else:
+            harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
     async def test_no_lock_worktree_cleaned_when_not_recovered(
         self, harness: Harness, tmp_path: Path
     ):
@@ -378,7 +391,14 @@ class TestReconcileStrandedInProgress:
         self, harness: Harness, monkeypatch
     ):
         """In-progress task with stale plan.lock (dead PID), task IS in _recovered_plans
-        → cleanup_worktree NOT called, worktree preserved, stale lock unlinked, task reverted."""
+        → cleanup_worktree NOT called, worktree preserved, stale lock unlinked, task reverted.
+
+        NOTE — defensive branch only: this combined state (recovered plan + stale lock still
+        present) is unreachable in the normal startup flow.  _recover_crashed_tasks always
+        unlinks plan.lock before adding a task to _recovered_plans (harness.py:864-868), so
+        in practice a recovered task arrives at the no-lock branch, not the stale-lock branch.
+        This test exists to lock the invariant against future drift in the recovery path.
+        """
         tid = 33
         harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
             {'id': tid, 'status': 'in-progress'},
