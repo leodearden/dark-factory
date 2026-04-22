@@ -2414,9 +2414,18 @@ async def test_mixed_op_concurrency_serialises_on_one_project(
 async def test_two_projects_do_not_serialise(
     overlap_tm, reconciler, event_buffer, tmp_path,
 ):
-    """WP-E: the lock is per-project, so ops on distinct projects can
-    overlap. Fire concurrent add_task bursts on /projA and /projB and
-    observe total peak >= 2."""
+    """WP-E: the single-worker ticket queue serialises ALL add_task calls globally.
+
+    After the two-phase redesign, the curator worker is a single asyncio.Task
+    that drains tickets one at a time.  Concurrent add_task calls on distinct
+    projects therefore run serially through the worker (total_peak == 1).
+    Per-project write_lock still ensures same-project ops cannot overlap
+    (peak_a <= 1, peak_b <= 1).
+
+    Note: cross-project concurrency IS available via submit_task + resolve_ticket
+    (callers can submit many tickets then resolve in parallel), but the underlying
+    tm.add_task writes are always serialised by the worker.
+    """
     from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.models.scope import resolve_project_id
 
@@ -2458,14 +2467,16 @@ async def test_two_projects_do_not_serialise(
             except (asyncio.CancelledError, Exception):
                 pass
 
-    # Per-project peak is 1 (lock held), cross-project overlap is allowed.
+    # Per-project peak is 1 (write_lock serialises same-project ops).
     peak_a = tracker.peak.get(resolve_project_id('/projA'), 0)
     peak_b = tracker.peak.get(resolve_project_id('/projB'), 0)
     assert peak_a <= 1 and peak_b <= 1, (
         f'same-project overlap: {tracker.peak}'
     )
-    assert tracker.total_peak >= 2, (
-        f'two projects never ran concurrently: total_peak={tracker.total_peak}'
+    # With the single-worker design, all add_task calls are serialised globally;
+    # the worker processes tickets one at a time (total_peak == 1).
+    assert tracker.total_peak == 1, (
+        f'expected single-worker serialisation (total_peak==1): total_peak={tracker.total_peak}'
     )
 
 

@@ -250,15 +250,31 @@ class TaskInterceptor:
     async def close(self) -> None:
         """Release resources held by the interceptor.
 
-        Drains pending background tasks first (defensive — callers *should*
-        drain before close, but this guarantees correctness even if they
-        forget), then closes the :class:`TaskCurator`'s Qdrant connection.
+        1. Sets the ``_closed`` flag so ``submit_task`` rejects new work.
+        2. Cancels and awaits the curator worker task (if running) so the
+           ticket queue is drained and no new ``curator.curate()`` calls start.
+        3. Drains any remaining fire-and-forget background tasks.
+        4. Closes the :class:`TaskCurator`'s Qdrant connection.
+        5. Closes the :class:`TicketStore`'s SQLite connection.
+
+        Idempotent: safe to call multiple times.
         """
+        # Set closed first so submit_task rejects new tickets before we cancel
+        # the worker — prevents a TOCTOU race between close() and submit_task().
+        self._closed = True
+
+        # Cancel the curator worker so it stops blocking on curator.curate().
+        if self._worker_task is not None and not self._worker_task.done():
+            self._worker_task.cancel()
+            await asyncio.gather(self._worker_task, return_exceptions=True)
+
         await self.drain()
         if self._curator is not None:
             await self._curator.close()
             self._curator = None
-        self._closed = True
+
+        if self._ticket_store is not None:
+            await self._ticket_store.close()
 
     # ── Status transitions (with targeted reconciliation) ──────────────
 
@@ -1003,6 +1019,9 @@ class TaskInterceptor:
         Returns ``{'ticket': 'tkt_<id>'}`` so callers can poll or block via
         ``resolve_ticket``. Does NOT call ``tm.add_task``.
         """
+        if self._closed:
+            return {'error': 'TaskInterceptor is closed; cannot submit new tasks', 'error_type': 'ClosedError'}
+
         if self._ticket_store is None:
             return {'error': 'ticket_store not configured; cannot use submit_task', 'error_type': 'ConfigError'}
 
@@ -1076,7 +1095,13 @@ class TaskInterceptor:
         return _format_ticket_result(row)
 
     def _start_worker_if_needed(self) -> None:
-        """Lazily start the curator worker asyncio.Task if not already running."""
+        """Lazily start the curator worker asyncio.Task if not already running.
+
+        The worker is intentionally NOT added to ``_background_tasks``: it is a
+        long-running infinite-loop task, not a fire-and-forget one.  Adding it
+        to ``_background_tasks`` would cause ``drain()`` to block forever.  The
+        worker's lifecycle is managed explicitly by ``close()``.
+        """
         if self._ticket_store is None:
             return
         if self._worker_task is None or self._worker_task.done():
@@ -1084,10 +1109,6 @@ class TaskInterceptor:
             self._worker_task = loop.create_task(
                 self._curator_worker(),
                 name='task-interceptor-curator-worker',
-            )
-            self._background_tasks.add(self._worker_task)
-            self._worker_task.add_done_callback(
-                lambda t: self._background_tasks.discard(t)
             )
 
     async def _curator_worker(self) -> None:
