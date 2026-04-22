@@ -203,12 +203,19 @@ class TestReconcileStrandedInProgress:
                 'not-valid-json', 9, True, False, None,
                 id='corrupt-json',
             ),
-            # (b) Missing owner_pid key → task NOT reverted, lock preserved
-            #     Legacy format: task left untouched, WARNING emitted
+            # (b) Missing owner_pid key → owner_pid=None via .get() → owner_alive=False
+            #     → stale-lock path: cleanup_worktree called, task reverted, lock gone
             pytest.param(
                 json.dumps({'session_id': 'test-10', 'locked_at': '2026-01-01T00:00:00+00:00'}),
-                '10', False, True, r'owner_pid|legacy',
+                '10', True, False, None,
                 id='missing-owner-pid',
+            ),
+            # (b2) Explicit null owner_pid → owner_pid=None → owner_alive=False
+            #      → stale-lock path: cleanup_worktree called, task reverted, lock gone
+            pytest.param(
+                json.dumps({'session_id': 'test-16', 'locked_at': '2026-01-01T00:00:00+00:00', 'owner_pid': None}),
+                16, True, False, None,
+                id='null-owner-pid',
             ),
             # (e) Non-dict JSON (list) → treated as corruption → revert + unlink
             pytest.param(
