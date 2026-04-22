@@ -391,3 +391,73 @@ async def test_worker_curator_failure_degrades_to_create(
     assert degrade_hint, (
         f'result_json should indicate curator degrade-to-create: {result_data}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-31: tm.add_task failure marks ticket failed (no journal event)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_tm_add_task_failure_marks_ticket_failed(
+    interceptor_with_store, ticket_store, taskmaster,
+):
+    """When tm.add_task raises, the ticket resolves as status='failed',
+    reason contains the error message, result_json is NULL, and no
+    task_created journal event is emitted.
+    """
+    taskmaster.add_task = AsyncMock(side_effect=RuntimeError('db locked'))
+
+    # Capture journal calls via the event buffer
+    journal_calls = []
+    original_journal = interceptor_with_store._journal
+
+    async def capturing_journal(event):
+        journal_calls.append(event)
+        return await original_journal(event)
+
+    interceptor_with_store._journal = capturing_journal
+
+    mock_curator = MagicMock()
+    mock_curator.curate = AsyncMock(
+        return_value=CuratorDecision(action='create')
+    )
+    mock_curator.note_created = MagicMock()
+    mock_curator.record_task = AsyncMock()
+
+    with patch.object(
+        type(interceptor_with_store), '_get_curator',
+        new=AsyncMock(return_value=mock_curator),
+    ):
+        result = await interceptor_with_store.submit_task(
+            project_root='/project',
+            title='Failing Task',
+            description='Should fail on add_task',
+        )
+        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+        ticket_id = result['ticket']
+
+        # Let the worker drain
+        await asyncio.sleep(0.2)
+
+    # Ticket must be terminal with status='failed'
+    row = await ticket_store.get(ticket_id)
+    assert row is not None
+    assert row['status'] == 'failed', f'Expected failed, got {row["status"]}'
+    assert 'db locked' in (row['reason'] or ''), (
+        f'reason should mention the error: {row["reason"]!r}'
+    )
+    assert row['result_json'] is None, (
+        f'result_json should be NULL on failure: {row["result_json"]!r}'
+    )
+    assert row['resolved_at'] is not None
+
+    # No task_created journal event should have been emitted
+    from fused_memory.models.reconciliation import EventType
+    task_created_events = [
+        e for e in journal_calls
+        if hasattr(e, 'event_type') and e.event_type == EventType.task_created
+    ]
+    assert len(task_created_events) == 0, (
+        f'No task_created event should be emitted on failure: {task_created_events}'
+    )
