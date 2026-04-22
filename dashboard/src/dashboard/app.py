@@ -597,6 +597,27 @@ async def _project_scoped_dbs(
     return [await pool.get(p) for p in paths]
 
 
+async def _project_scoped_dbs_labeled(
+    config: DashboardConfig,
+    pool: DbPool,
+    rel_path: Path,
+) -> list[tuple[str, aiosqlite.Connection | None]]:
+    """Return labeled (str(root), connection|None) pairs across all known project roots.
+
+    Mirrors :func:`_project_scoped_dbs` but tags each DB connection with its
+    canonical project-root string so callers can key per-project data sections.
+    Deduplication and ordering follow the same rules: the main ``project_root``
+    is always index 0; duplicate roots in ``known_project_roots`` are skipped.
+    """
+    seen: set[Path] = {config.project_root}
+    roots: list[Path] = [config.project_root]
+    for root in config.known_project_roots:
+        if root not in seen:
+            seen.add(root)
+            roots.append(root)
+    return [(str(root), await pool.get(root / rel_path)) for root in roots]
+
+
 async def _cost_dbs(
     config: DashboardConfig,
     pool: DbPool,
