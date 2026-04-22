@@ -138,9 +138,10 @@ async def _invoke_claude_with_sandbox(
     # For sandboxed invocations we need to build the command ourselves
     # and use the lower-level shared primitives
     if sandbox_modules is not None:
-        from orchestrator.agents.sandbox import build_bwrap_command, is_bwrap_available
-        if is_bwrap_available():
-            # Build command manually to wrap with bwrap
+        from orchestrator.agents.sandbox_dispatch import resolve_active_backend, wrap_command
+        active = resolve_active_backend()
+        if active != 'none':
+            # Build command manually to wrap with the chosen sandbox backend
             cmd = ['claude', '--print', '--output-format', 'json']
             cmd.extend(['--model', model])
             cmd.extend(['--max-budget-usd', str(max_budget_usd)])
@@ -178,7 +179,7 @@ async def _invoke_claude_with_sandbox(
             # User prompt piped via stdin to avoid ARG_MAX
             stdin_data = prompt.encode()
 
-            cmd = build_bwrap_command(cmd, cwd, sandbox_modules)
+            cmd = wrap_command(cmd, cwd, sandbox_modules)
 
             env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
             if env_overrides:
@@ -194,8 +195,6 @@ async def _invoke_claude_with_sandbox(
             finally:
                 for path in temp_files:
                     Path(path).unlink(missing_ok=True)
-        else:
-            logger.warning('Sandbox requested but bwrap unavailable — running unsandboxed')
 
     # No sandbox or bwrap unavailable — use shared invocation
     return await invoke_claude_agent(
@@ -250,11 +249,8 @@ async def _invoke_codex(
         cmd.append(prompt)
 
         if sandbox_modules is not None:
-            from orchestrator.agents.sandbox import build_bwrap_command, is_bwrap_available
-            if is_bwrap_available():
-                cmd = build_bwrap_command(cmd, cwd, sandbox_modules)
-            else:
-                logger.warning('Sandbox requested but bwrap unavailable — running unsandboxed')
+            from orchestrator.agents.sandbox_dispatch import wrap_command
+            cmd = wrap_command(cmd, cwd, sandbox_modules)
 
         # Strip OPENAI_API_KEY if using OAuth
         env = dict(os.environ)
@@ -420,11 +416,8 @@ async def _invoke_gemini(
         cmd = ['gemini', '-p', prompt, '-m', model, '-o', 'json', '--yolo']
 
         if sandbox_modules is not None:
-            from orchestrator.agents.sandbox import build_bwrap_command, is_bwrap_available
-            if is_bwrap_available():
-                cmd = build_bwrap_command(cmd, cwd, sandbox_modules)
-            else:
-                logger.warning('Sandbox requested but bwrap unavailable — running unsandboxed')
+            from orchestrator.agents.sandbox_dispatch import wrap_command
+            cmd = wrap_command(cmd, cwd, sandbox_modules)
 
         env = dict(os.environ)
 

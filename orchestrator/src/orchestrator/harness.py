@@ -151,6 +151,8 @@ class Harness:
 
     def __init__(self, config: OrchestratorConfig):
         self.config = config
+        from orchestrator.agents.sandbox_dispatch import set_backend
+        set_backend(config.sandbox.backend)
         self.mcp = McpLifecycle(config)
         self.git_ops = GitOps(config.git, config.project_root)
         self.scheduler = Scheduler(config)

@@ -102,13 +102,26 @@ class TestBuildLandlockCommand:
     reason='landlock not supported on this kernel',
 )
 class TestLandlockEnforcement:
-    def test_allowed_and_denied_writes(self, tmp_path: Path):
-        worktree = tmp_path / 'wt'
-        worktree.mkdir()
-        (worktree / 'mod_a').mkdir()
-        (worktree / 'mod_b').mkdir()  # sibling — must be denied
-        denied_parent = tmp_path / 'outside'
-        denied_parent.mkdir()
+    def test_allowed_and_denied_writes(self):
+        # /var/tmp — outside the wrapper's default writable /tmp. pytest's
+        # tmp_path lives under /tmp, where landlock_exec grants blanket write
+        # access for agent scratch, so we can't use it as a worktree for
+        # enforcement testing.
+        import tempfile
+        import shutil
+        base = Path(tempfile.mkdtemp(prefix='landlock-test-', dir='/var/tmp'))
+        try:
+            worktree = base / 'wt'
+            worktree.mkdir()
+            (worktree / 'mod_a').mkdir()
+            (worktree / 'mod_b').mkdir()  # sibling — must be denied
+            denied_parent = base / 'outside'
+            denied_parent.mkdir()
+            self._run_enforcement(worktree, denied_parent)
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def _run_enforcement(self, worktree: Path, denied_parent: Path) -> None:
 
         inner = [
             '/bin/sh', '-c',
