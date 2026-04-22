@@ -1,9 +1,9 @@
 """Tests for Harness._reconcile_stranded_in_progress and the _pid_alive helper."""
 
 import json
+import logging
 import os
 import re
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -25,6 +25,50 @@ class TestPidAlive:
         # PID well beyond the Linux kernel max (2^22 on 64-bit, 2^15 on 32-bit).
         # 2**31-1 is always invalid on all Linux systems.
         assert _pid_alive(2**31 - 1) is False
+
+    # ------------------------------------------------------------------
+    # Branch-mocked tests — each covers exactly one code path in _pid_alive
+    # ------------------------------------------------------------------
+
+    def test_pid_zero_returns_false_without_calling_os_kill(self, monkeypatch):
+        """pid=0 guard → returns False before os.kill is ever called."""
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, 'kill', lambda pid, sig: calls.append((pid, sig)))
+        assert _pid_alive(0) is False
+        assert calls == [], 'os.kill must not be called for pid=0'
+
+    def test_negative_pid_returns_false_without_calling_os_kill(self, monkeypatch):
+        """pid=-1 guard → returns False before os.kill is ever called."""
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, 'kill', lambda pid, sig: calls.append((pid, sig)))
+        assert _pid_alive(-1) is False
+        assert calls == [], 'os.kill must not be called for pid=-1'
+
+    def test_process_lookup_error_returns_false(self, monkeypatch):
+        """os.kill raises ProcessLookupError → process is dead → False."""
+        def _raise(pid: int, sig: int) -> None:
+            raise ProcessLookupError()
+        monkeypatch.setattr(os, 'kill', _raise)
+        assert _pid_alive(12345) is False
+
+    def test_permission_error_returns_true(self, monkeypatch):
+        """os.kill raises PermissionError → process exists (no permission to signal) → True."""
+        def _raise(pid: int, sig: int) -> None:
+            raise PermissionError()
+        monkeypatch.setattr(os, 'kill', _raise)
+        assert _pid_alive(12345) is True
+
+    def test_generic_oserror_returns_false(self, monkeypatch):
+        """os.kill raises generic OSError → treat as dead → False."""
+        def _raise(pid: int, sig: int) -> None:
+            raise OSError(5, 'io error')
+        monkeypatch.setattr(os, 'kill', _raise)
+        assert _pid_alive(12345) is False
+
+    def test_successful_signal_returns_true(self, monkeypatch):
+        """os.kill succeeds → process is alive → True."""
+        monkeypatch.setattr(os, 'kill', lambda pid, sig: None)
+        assert _pid_alive(12345) is True
 
 
 # ---------------------------------------------------------------------------
@@ -87,9 +131,9 @@ class TestReconcileStrandedInProgress:
         assert calls[0].args[1] == 'pending'
 
     async def test_in_progress_with_live_owner_pid_left_alone(
-        self, harness: Harness, tmp_path: Path
+        self, harness: Harness, tmp_path: Path, caplog
     ):
-        """In-progress task with plan.lock pointing to live PID → untouched."""
+        """In-progress task with plan.lock pointing to live PID → untouched, no revert logged."""
         harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
             {'id': 7, 'status': 'in-progress'},
         ]
@@ -103,33 +147,36 @@ class TestReconcileStrandedInProgress:
             'owner_pid': os.getpid(),
         }))
 
-        await harness._reconcile_stranded_in_progress()
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress()
 
         # Must NOT revert
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
         # Lock file must still exist
         assert lock_path.exists()
+        # No revert must have been logged ('reverted task' matches the stable log format)
+        assert not any('reverted task' in r.message for r in caplog.records)
 
     async def test_stale_plan_lock_cleared_and_reverted(
-        self, harness: Harness
+        self, harness: Harness, monkeypatch
     ):
         """In-progress task with stale plan.lock (dead PID) → lock cleared and task reverted."""
         harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
             {'id': 8, 'status': 'in-progress'},
         ]
-        # Spawn a process and reap it to get a guaranteed-dead PID
-        proc = subprocess.Popen(['true'])
-        proc.wait()
-        dead_pid = proc.pid
+        # Use a synthetic owner_pid — _pid_alive is mocked to always return False,
+        # so no real PID is needed and there is no kernel-recycle race.
+        owner_pid = 99999
+        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
-        # Create worktree with plan.lock referencing the dead PID
+        # Create worktree with plan.lock referencing the synthetic dead PID
         lock_dir = harness.git_ops.worktree_base / '8' / '.task'
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text(json.dumps({
             'session_id': '8-dead0001',
             'locked_at': datetime.now(UTC).isoformat(),
-            'owner_pid': dead_pid,
+            'owner_pid': owner_pid,
         }))
 
         await harness._reconcile_stranded_in_progress()
@@ -138,34 +185,6 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_called_once_with('8', 'pending')  # type: ignore[attr-defined]
         # Stale lock must be deleted
         assert not lock_path.exists()
-
-    async def test_fresh_plan_lock_owner_pid_alive_left_alone(
-        self, harness: Harness, caplog
-    ):
-        """Fresh plan.lock with live owner_pid → no revert, no log mentioning 'revert' or 'stranded'."""
-        import logging
-        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
-            {'id': 7, 'status': 'in-progress'},
-        ]
-        lock_dir = harness.git_ops.worktree_base / '7' / '.task'
-        lock_dir.mkdir(parents=True)
-        lock_path = lock_dir / 'plan.lock'
-        lock_path.write_text(json.dumps({
-            'session_id': '7-abcd1234',
-            'locked_at': datetime.now(UTC).isoformat(),
-            'owner_pid': os.getpid(),
-        }))
-
-        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
-            await harness._reconcile_stranded_in_progress()
-
-        # No status change
-        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
-        # Lock file intact
-        assert lock_path.exists()
-        # No log message mentioning revert or stranded for this task
-        revert_logs = [r for r in caplog.records if 'revert' in r.message.lower() or 'stranded' in r.message.lower()]
-        assert len(revert_logs) == 0
 
     @pytest.mark.parametrize(
         'lock_contents,task_id,expect_reverted,expect_lock_exists,warn_pattern',
