@@ -1403,6 +1403,17 @@ class TaskInterceptor:
             ticket, project_root, timeout_seconds=115,
         )
 
+        # Raise on timeout — no silent fallback.  Callers that need to
+        # tolerate long waits should migrate to submit_task+resolve_ticket.
+        if (
+            resolve_result.get('status') == 'failed'
+            and resolve_result.get('reason') == 'timeout'
+        ):
+            raise RuntimeError(
+                f'add_task facade timeout after 115 s waiting for ticket '
+                f'{ticket}; migrate to submit_task+resolve_ticket for explicit control'
+            )
+
         # Reconstruct the legacy result dict from result_json so in-flight
         # callers receive the same shape they observed before this rewrite.
         if self._ticket_store is not None:
