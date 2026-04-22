@@ -2408,3 +2408,124 @@ class TestLoadTaskTitles:
         assert '1' not in result
         assert result.get('2') == 'B'
 
+
+# ---------------------------------------------------------------------------
+# TestBuildPerProjectMergeQueue (step-9)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPerProjectMergeQueue:
+    """Tests for merge_queue.build_per_project_merge_queue."""
+
+    async def test_returns_dict_keyed_by_pid(self, tmp_path):
+        """Result dict has one entry per (pid, db) pair."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db1_path = _make_db(tmp_path, 'a.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
+             'task_id': 'task-A', 'run_id': 'rA', 'data': {'outcome': 'done'}, 'duration_ms': 1000},
+        ])
+        db2_path = _make_db(tmp_path, 'b.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=7),
+             'task_id': 'task-B', 'run_id': 'rB', 'data': {'outcome': 'conflict'}, 'duration_ms': 2000},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1_path)) as conn1,
+            aiosqlite.connect(str(db2_path)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            project_dbs = [('/tmp/A', conn1), ('/tmp/B', conn2)]
+            result = await build_per_project_merge_queue(
+                project_dbs, hours=24, now=now, recent_window_minutes=15,
+            )
+
+        # (a) dict with both pid keys
+        assert isinstance(result, dict)
+        assert set(result.keys()) == {'/tmp/A', '/tmp/B'}
+
+        # (b) each value has the expected keys
+        for pid_data in result.values():
+            assert set(pid_data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
+
+    async def test_per_project_isolation(self, tmp_path):
+        """Each project's stats reflect only its own DB rows."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db1_path = _make_db(tmp_path, 'a.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
+             'task_id': 'task-A1', 'run_id': 'rA1', 'data': {'outcome': 'done'}, 'duration_ms': 500},
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
+             'task_id': 'task-A2', 'run_id': 'rA2', 'data': {'outcome': 'done'}, 'duration_ms': 600},
+        ])
+        db2_path = _make_db(tmp_path, 'b.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=3),
+             'task_id': 'task-B1', 'run_id': 'rB1', 'data': {'outcome': 'conflict'}, 'duration_ms': 1000},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1_path)) as conn1,
+            aiosqlite.connect(str(db2_path)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            project_dbs = [('/tmp/A', conn1), ('/tmp/B', conn2)]
+            result = await build_per_project_merge_queue(
+                project_dbs, hours=24, now=now, recent_window_minutes=15,
+            )
+
+        # (c) '/tmp/A' stats reflect only db1's rows (2 attempts)
+        a_recent = result['/tmp/A']['recent']
+        b_recent = result['/tmp/B']['recent']
+        a_task_ids = {r['task_id'] for r in a_recent}
+        b_task_ids = {r['task_id'] for r in b_recent}
+        assert 'task-A1' in a_task_ids
+        assert 'task-A2' in a_task_ids
+        assert 'task-B1' not in a_task_ids
+        assert 'task-B1' in b_task_ids
+
+    async def test_recent_trimmed_to_window(self, tmp_path):
+        """The recent list is already filtered to recent_window_minutes."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'a.db', [
+            # within window (5 min ago)
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
+             'task_id': 'in-window', 'run_id': 'r1', 'data': {'outcome': 'done'}, 'duration_ms': 1000},
+            # outside window (30 min ago)
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=30),
+             'task_id': 'out-window', 'run_id': 'r2', 'data': {'outcome': 'done'}, 'duration_ms': 1000},
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            project_dbs = [('/tmp/A', conn)]
+            result = await build_per_project_merge_queue(
+                project_dbs, hours=24, now=now, recent_window_minutes=15,
+            )
+
+        # (d) only in-window row survives
+        recent = result['/tmp/A']['recent']
+        task_ids = {r['task_id'] for r in recent}
+        assert 'in-window' in task_ids
+        assert 'out-window' not in task_ids
+
+    async def test_none_db_entry_skipped(self, tmp_path):
+        """A (pid, None) pair results in empty/default stats for that project."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        project_dbs = [('/tmp/nofile', None)]
+        result = await build_per_project_merge_queue(
+            project_dbs, hours=24, now=now, recent_window_minutes=15,
+        )
+
+        assert '/tmp/nofile' in result
+        data = result['/tmp/nofile']
+        assert data['latency']['count'] == 0
+        assert data['recent'] == []
+
