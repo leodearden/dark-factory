@@ -1067,6 +1067,13 @@ async def test_debug_get_deferred_row_returns_full_row(buf):
     assert isinstance(row_after['claimed_at'], str)
     assert row_after['attempt_count'] == 0
 
+    # Payload columns must be untouched by the claim — claim_deferred_writes
+    # only writes claimed_at (UPDATE ... SET claimed_at = ? WHERE id IN (...)).
+    assert row_after['id'] == row['id'], 'id must not change on claim'
+    assert row_after['content'] == row['content'], 'content must not change on claim'
+    assert row_after['category'] == row['category'], 'category must not change on claim'
+    assert row_after['metadata'] == row['metadata'], 'metadata must not change on claim'
+
 
 @pytest.mark.asyncio
 async def test_debug_get_deferred_row_returns_none_for_unknown_id(buf):
