@@ -38,6 +38,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _is_ticket_id(value: object) -> bool:
+    """Return True when *value* looks like a two-phase ticket id (``tkt_…``)."""
+    return isinstance(value, str) and value.startswith('tkt_')
+
+
 class TaskInterceptor:
     """Wraps Taskmaster operations, intercepts state transitions for targeted reconciliation."""
 
