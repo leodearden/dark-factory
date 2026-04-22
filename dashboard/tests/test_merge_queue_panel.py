@@ -7,7 +7,8 @@ import re
 import sqlite3
 from contextlib import ExitStack
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, patch
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -101,6 +102,10 @@ def _extract_inline_script(html: str) -> str:
     )
 
 
+# Default project PID used by _patch_merge_queue_data (matches the app's default project root)
+_DEFAULT_PID = '/home/leo/src/dark-factory'
+
+
 def _patch_merge_queue_data(
     depth=_UNSET,
     outcomes=_UNSET,
@@ -108,32 +113,37 @@ def _patch_merge_queue_data(
     recent=_UNSET,
     spec=_UNSET,
 ):
-    """Return an ExitStack patching all 5 merge queue aggregate functions."""
+    """Return an ExitStack patching merge queue functions for a single default project.
+
+    After the per-project route rewrite (step-12), patches ``build_per_project_merge_queue``
+    with a single-project dict keyed by the app's default project root.  ``load_task_titles``
+    is patched to return ``{}`` so no filesystem reads happen during tests.
+    """
+    d = depth if depth is not _UNSET else MOCK_DEPTH
+    o = outcomes if outcomes is not _UNSET else MOCK_OUTCOMES
+    l_ = latency if latency is not _UNSET else MOCK_LATENCY
+    r = recent if recent is not _UNSET else MOCK_RECENT
+    s = spec if spec is not _UNSET else MOCK_SPEC
+
+    projects = {
+        _DEFAULT_PID: {
+            'depth_timeseries': d,
+            'outcomes': o,
+            'latency': l_,
+            'recent': r,
+            'speculative': s,
+        }
+    }
+
     stack = ExitStack()
     stack.enter_context(patch(
-        'dashboard.app.aggregate_queue_depth_timeseries',
+        'dashboard.app.build_per_project_merge_queue',
         new_callable=AsyncMock,
-        return_value=depth if depth is not _UNSET else MOCK_DEPTH,
+        return_value=projects,
     ))
     stack.enter_context(patch(
-        'dashboard.app.aggregate_outcome_distribution',
-        new_callable=AsyncMock,
-        return_value=outcomes if outcomes is not _UNSET else MOCK_OUTCOMES,
-    ))
-    stack.enter_context(patch(
-        'dashboard.app.aggregate_latency_stats',
-        new_callable=AsyncMock,
-        return_value=latency if latency is not _UNSET else MOCK_LATENCY,
-    ))
-    stack.enter_context(patch(
-        'dashboard.app.aggregate_recent_merges',
-        new_callable=AsyncMock,
-        return_value=recent if recent is not _UNSET else MOCK_RECENT,
-    ))
-    stack.enter_context(patch(
-        'dashboard.app.aggregate_speculative_stats',
-        new_callable=AsyncMock,
-        return_value=spec if spec is not _UNSET else MOCK_SPEC,
+        'dashboard.app.load_task_titles',
+        return_value={},
     ))
     return stack
 
@@ -210,68 +220,40 @@ class TestEmptyState:
 # ---------------------------------------------------------------------------
 
 class TestMergeQueueTimeWindow:
-    def _call_args_hours(self, mock_fn):
-        """Extract the hours kwarg from the most recent call to mock_fn."""
-        call = mock_fn.call_args
-        return call.kwargs.get('hours') or call.args[1]
+    """Verify that the hours window parameter is forwarded to build_per_project_merge_queue."""
+
+    def _bppq_hours(self, mock_bppq):
+        """Extract the hours kwarg from the most recent call to build_per_project_merge_queue."""
+        return mock_bppq.call_args.kwargs.get('hours')
 
     def test_window_24h_forwards_hours_24(self, client):
-        with _patch_merge_queue_data() as _, \
-             patch('dashboard.app.aggregate_queue_depth_timeseries',
-                   new_callable=AsyncMock,
-                   return_value=MOCK_DEPTH) as mock_depth:
+        with patch('dashboard.app.build_per_project_merge_queue',
+                   new_callable=AsyncMock, return_value={}) as mock_bppq, \
+             patch('dashboard.app.load_task_titles', return_value={}):
             client.get('/partials/merge-queue?window=24h')
-            hours = mock_depth.call_args.kwargs.get('hours')
-            assert hours == 24
+        assert self._bppq_hours(mock_bppq) == 24
 
     def test_window_7d_forwards_hours_168(self, client):
-        with patch('dashboard.app.aggregate_queue_depth_timeseries',
-                   new_callable=AsyncMock,
-                   return_value=MOCK_DEPTH) as mock_depth, \
-             patch('dashboard.app.aggregate_outcome_distribution',
-                   new_callable=AsyncMock, return_value=MOCK_OUTCOMES), \
-             patch('dashboard.app.aggregate_latency_stats',
-                   new_callable=AsyncMock, return_value=MOCK_LATENCY), \
-             patch('dashboard.app.aggregate_recent_merges',
-                   new_callable=AsyncMock, return_value=MOCK_RECENT), \
-             patch('dashboard.app.aggregate_speculative_stats',
-                   new_callable=AsyncMock, return_value=MOCK_SPEC):
+        with patch('dashboard.app.build_per_project_merge_queue',
+                   new_callable=AsyncMock, return_value={}) as mock_bppq, \
+             patch('dashboard.app.load_task_titles', return_value={}):
             client.get('/partials/merge-queue?window=7d')
-            hours = mock_depth.call_args.kwargs.get('hours')
-            assert hours == 168
+        assert self._bppq_hours(mock_bppq) == 168
 
     def test_window_30d_forwards_hours_720(self, client):
-        with patch('dashboard.app.aggregate_queue_depth_timeseries',
-                   new_callable=AsyncMock,
-                   return_value=MOCK_DEPTH) as mock_depth, \
-             patch('dashboard.app.aggregate_outcome_distribution',
-                   new_callable=AsyncMock, return_value=MOCK_OUTCOMES), \
-             patch('dashboard.app.aggregate_latency_stats',
-                   new_callable=AsyncMock, return_value=MOCK_LATENCY), \
-             patch('dashboard.app.aggregate_recent_merges',
-                   new_callable=AsyncMock, return_value=MOCK_RECENT), \
-             patch('dashboard.app.aggregate_speculative_stats',
-                   new_callable=AsyncMock, return_value=MOCK_SPEC):
+        with patch('dashboard.app.build_per_project_merge_queue',
+                   new_callable=AsyncMock, return_value={}) as mock_bppq, \
+             patch('dashboard.app.load_task_titles', return_value={}):
             client.get('/partials/merge-queue?window=30d')
-            hours = mock_depth.call_args.kwargs.get('hours')
-            assert hours == 720
+        assert self._bppq_hours(mock_bppq) == 720
 
-    def test_default_window_forwards_hours_168(self, client):
+    def test_default_window_forwards_hours_720(self, client):
         """No window param → default 30d → 720 hours (changed 7d→30d, task 841 UX fix)."""
-        with patch('dashboard.app.aggregate_queue_depth_timeseries',
-                   new_callable=AsyncMock,
-                   return_value=MOCK_DEPTH) as mock_depth, \
-             patch('dashboard.app.aggregate_outcome_distribution',
-                   new_callable=AsyncMock, return_value=MOCK_OUTCOMES), \
-             patch('dashboard.app.aggregate_latency_stats',
-                   new_callable=AsyncMock, return_value=MOCK_LATENCY), \
-             patch('dashboard.app.aggregate_recent_merges',
-                   new_callable=AsyncMock, return_value=MOCK_RECENT), \
-             patch('dashboard.app.aggregate_speculative_stats',
-                   new_callable=AsyncMock, return_value=MOCK_SPEC):
+        with patch('dashboard.app.build_per_project_merge_queue',
+                   new_callable=AsyncMock, return_value={}) as mock_bppq, \
+             patch('dashboard.app.load_task_titles', return_value={}):
             client.get('/partials/merge-queue')
-            hours = mock_depth.call_args.kwargs.get('hours')
-            assert hours == 720
+        assert self._bppq_hours(mock_bppq) == 720
 
 
 # ---------------------------------------------------------------------------
@@ -373,33 +355,28 @@ class TestMergeQueueWindowAll:
         """GET /partials/merge-queue?window=all must:
 
         1. Return 200 OK.
-        2. Call aggregate_queue_depth_timeseries with hours=87600.
-        3. Serve a depth payload whose length is bounded (< 10 000) —
+        2. Call build_per_project_merge_queue with hours=87600.
+        3. N = _bucket_minutes_for_window(87600) must be bounded (< 10 000) —
            regression guard against the 350 401-bucket blowup.
-
-        The test uses a side_effect mock that:
-        - Asserts the hours kwarg equals 87600.
-        - Computes N = _bucket_minutes_for_window(87600) → returns a
-          ChartData with N labels so the route can complete normally.
         """
         captured = {}
 
-        async def _mock_aggregate_depth(*args, **kwargs):
-            captured['hours'] = kwargs.get('hours')
-            bm = _bucket_minutes_for_window(87600)
-            N = (87600 * 60 // bm) + 1
-            return {'labels': [f'L{i}' for i in range(N)], 'values': [0] * N}
+        async def _mock_bppq(project_dbs, *, hours, now, recent_window_minutes):
+            captured['hours'] = hours
+            bm = _bucket_minutes_for_window(hours)
+            N = (hours * 60 // bm) + 1
+            return {
+                _DEFAULT_PID: {
+                    'depth_timeseries': {'labels': [f'L{i}' for i in range(N)], 'values': [0] * N},
+                    'outcomes': {'labels': [], 'values': []},
+                    'latency': {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0},
+                    'recent': [],
+                    'speculative': {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0},
+                }
+            }
 
-        with patch('dashboard.app.aggregate_queue_depth_timeseries',
-                   side_effect=_mock_aggregate_depth), \
-             patch('dashboard.app.aggregate_outcome_distribution',
-                   new_callable=AsyncMock, return_value=MOCK_OUTCOMES), \
-             patch('dashboard.app.aggregate_latency_stats',
-                   new_callable=AsyncMock, return_value=MOCK_LATENCY), \
-             patch('dashboard.app.aggregate_recent_merges',
-                   new_callable=AsyncMock, return_value=MOCK_RECENT), \
-             patch('dashboard.app.aggregate_speculative_stats',
-                   new_callable=AsyncMock, return_value=MOCK_SPEC):
+        with patch('dashboard.app.build_per_project_merge_queue', side_effect=_mock_bppq), \
+             patch('dashboard.app.load_task_titles', return_value={}):
             resp = client.get('/partials/merge-queue?window=all')
 
         assert resp.status_code == 200
@@ -410,18 +387,13 @@ class TestMergeQueueWindowAll:
         assert N < 10_000, f"_bucket_minutes_for_window(87600) yields {N} points — regression!"
 
     def test_window_all_real_aggregator_bounded_response(self, client, tmp_path):
-        """Integration: real aggregate_queue_depth_timeseries with a real empty DB.
+        """Integration: real queue_depth_timeseries (via build_per_project_merge_queue) on
+        an empty DB.
 
-        Does NOT mock the depth aggregator — the real code path runs and must
+        Does NOT mock build_per_project_merge_queue — the real code path runs and must
         return quickly.  Regression guard: the old hard-coded 15-min bucket
         would allocate 350 401 buckets in-memory even for an empty DB, causing
         this test to timeout or OOM; the adaptive ladder allocates ~3 651.
-
-        Only the four non-depth aggregators are mocked so the test does not
-        need to populate their respective data.  All five aggregators share the
-        same ``events`` table, so with the proper schema they would also work
-        on the empty DB — but mocking them keeps the test focused on the
-        depth-aggregator regression.
         """
         from dashboard.config import DashboardConfig
 
@@ -449,18 +421,10 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp);
         conn.commit()
         conn.close()
 
-        # Point the app at our temp project root so _cost_dbs opens the real DB.
+        # Point the app at our temp project root so _project_scoped_dbs_labeled opens the real DB.
         test_config = DashboardConfig(project_root=tmp_path)
 
-        with patch.object(client.app.state, 'config', test_config), \
-             patch('dashboard.app.aggregate_outcome_distribution',
-                   new_callable=AsyncMock, return_value=MOCK_OUTCOMES), \
-             patch('dashboard.app.aggregate_latency_stats',
-                   new_callable=AsyncMock, return_value=MOCK_LATENCY), \
-             patch('dashboard.app.aggregate_recent_merges',
-                   new_callable=AsyncMock, return_value=MOCK_RECENT), \
-             patch('dashboard.app.aggregate_speculative_stats',
-                   new_callable=AsyncMock, return_value=MOCK_SPEC):
+        with patch.object(client.app.state, 'config', test_config):
             resp = client.get('/partials/merge-queue?window=all')
 
         assert resp.status_code == 200
@@ -471,59 +435,35 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp);
 # ---------------------------------------------------------------------------
 
 class TestPartialsMergeQueueSharedNow:
-    def test_partials_merge_queue_passes_shared_now_to_all_aggregators(self, client):
-        """partials_merge_queue captures now once and forwards it to all time-windowed aggregators.
+    def test_partials_merge_queue_passes_shared_now_to_build_per_project(self, client):
+        """partials_merge_queue captures now once and forwards it to build_per_project_merge_queue.
 
-        After step-16 impl, aggregate_queue_depth_timeseries, aggregate_outcome_distribution,
-        aggregate_latency_stats, and aggregate_speculative_stats all receive the same `now` kwarg.
-        aggregate_recent_merges uses limit, not hours, so no `now` is expected there.
-
-        Will fail before step-16 because partials_merge_queue does not pass `now` yet.
+        After the per-project route rewrite (step-12), the shared ``now`` is passed as a kwarg
+        to ``build_per_project_merge_queue``.  That function threads it to all 5 per-DB queries
+        internally.  The test verifies the outer routing layer captures and forwards the fixed
+        clock value correctly.
         """
         FIXED_NOW = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
 
         _FixedDT = make_fixed_datetime_cls(FIXED_NOW)
 
-        mock_depth = AsyncMock(return_value=MOCK_DEPTH)
-        mock_outcomes = AsyncMock(return_value=MOCK_OUTCOMES)
-        mock_latency = AsyncMock(return_value=MOCK_LATENCY)
-        mock_recent = AsyncMock(return_value=MOCK_RECENT)
-        mock_spec = AsyncMock(return_value=MOCK_SPEC)
+        mock_bppq = AsyncMock(return_value={})
 
         with patch('dashboard.app.datetime', _FixedDT), \
-             patch('dashboard.app.aggregate_queue_depth_timeseries', mock_depth), \
-             patch('dashboard.app.aggregate_outcome_distribution', mock_outcomes), \
-             patch('dashboard.app.aggregate_latency_stats', mock_latency), \
-             patch('dashboard.app.aggregate_recent_merges', mock_recent), \
-             patch('dashboard.app.aggregate_speculative_stats', mock_spec):
+             patch('dashboard.app.build_per_project_merge_queue', mock_bppq), \
+             patch('dashboard.app.load_task_titles', return_value={}):
             resp = client.get('/partials/merge-queue')
 
         assert resp.status_code == 200
 
-        now_depth = mock_depth.call_args.kwargs.get('now')
-        now_outcomes = mock_outcomes.call_args.kwargs.get('now')
-        now_latency = mock_latency.call_args.kwargs.get('now')
-        now_spec = mock_spec.call_args.kwargs.get('now')
+        now_kwarg = mock_bppq.call_args.kwargs.get('now')
 
-        # All four time-windowed aggregators must receive a non-None now
-        assert now_depth is not None, "aggregate_queue_depth_timeseries was not passed `now`"
-        assert now_outcomes is not None, "aggregate_outcome_distribution was not passed `now`"
-        assert now_latency is not None, "aggregate_latency_stats was not passed `now`"
-        assert now_spec is not None, "aggregate_speculative_stats was not passed `now`"
-
-        # All four must share the exact same now value
-        assert now_depth == now_outcomes == now_latency == now_spec, (
-            f"Aggregators received different `now` values: "
-            f"depth={now_depth!r}, outcomes={now_outcomes!r}, "
-            f"latency={now_latency!r}, spec={now_spec!r}"
+        assert now_kwarg is not None, "build_per_project_merge_queue was not passed `now`"
+        assert isinstance(now_kwarg, datetime), (
+            f"Expected `now` to be a datetime, got {type(now_kwarg)!r}"
         )
-
-        # now must be a datetime and must equal the fixed value exactly
-        assert isinstance(now_depth, datetime), (
-            f"Expected `now` to be a datetime, got {type(now_depth)!r}"
-        )
-        assert now_depth == FIXED_NOW, (
-            f"`now` value does not match fixed clock: got {now_depth!r}"
+        assert now_kwarg == FIXED_NOW, (
+            f"`now` value does not match fixed clock: got {now_kwarg!r}"
         )
 
 
@@ -657,15 +597,24 @@ class TestExtractInlineScript:
 
 
 def _extract_depth_data(html: str) -> dict:
-    """Extract the depthData JSON object from the merge-queue partial's script block.
+    """Extract the depth_timeseries for the first project from the allProjects JSON object.
 
-    The template embeds ``var depthData = {{ depth_timeseries | tojson }};`` so
-    we look for the JSON literal that follows the ``depthData =`` assignment.
+    The template embeds ``var allProjects = {{ projects | tojson }};``.  This helper
+    locates that assignment, raw-decodes the JSON object, and returns the
+    ``depth_timeseries`` sub-dict for the first (and typically only) project.
+
+    Uses :class:`json.JSONDecoder` ``raw_decode`` rather than regex so that complex
+    nested JSON does not trip up a greedy pattern.
     """
     script = _extract_inline_script(html)
-    m = re.search(r'var depthData\s*=\s*(\{.*?\});', script, re.DOTALL)
-    assert m is not None, "Could not find 'var depthData = {...};' in script block"
-    return json.loads(m.group(1))
+    marker = 'var allProjects = '
+    idx = script.find(marker)
+    assert idx >= 0, f"Could not find '{marker}' in script block"
+    start = idx + len(marker)
+    all_projects, _ = json.JSONDecoder().raw_decode(script, start)
+    assert all_projects, "allProjects dict is empty"
+    first_pid = next(iter(all_projects))
+    return all_projects[first_pid]['depth_timeseries']
 
 
 class TestDepthTrimLeadingZeros:

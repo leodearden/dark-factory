@@ -46,6 +46,9 @@ from dashboard.data.merge_queue import (
     aggregate_queue_depth_timeseries,
     aggregate_recent_merges,
     aggregate_speculative_stats,
+    build_per_project_merge_queue,
+    enrich_merges_with_titles,
+    load_task_titles,
 )
 from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.performance import (
@@ -797,47 +800,40 @@ async def costs_partials_runs(request: Request):
 
 @app.get('/partials/merge-queue')
 async def partials_merge_queue(request: Request):
-    """Merge queue operational status card."""
+    """Merge queue operational status card — one section per project."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     hours = days * 24
     window_raw = request.query_params.get('window', '30d')
 
     effective_now = datetime.now(UTC)
-    depth, outcomes, latency, recent, spec = await asyncio.gather(
-        aggregate_queue_depth_timeseries(dbs, hours=hours, now=effective_now),
-        aggregate_outcome_distribution(dbs, hours=hours, now=effective_now),
-        aggregate_latency_stats(dbs, hours=hours, now=effective_now),
-        aggregate_recent_merges(dbs, limit=20, hours=hours),
-        aggregate_speculative_stats(dbs, hours=hours, now=effective_now),
-        return_exceptions=True,
+    project_dbs = await _project_scoped_dbs_labeled(
+        config, pool, Path('data/orchestrator/runs.db')
     )
 
-    depth = cast(ChartData, _safe_gather_result(depth, {'labels': [], 'values': []}, 'merge_queue.depth'))
-    depth = trim_leading_zero_buckets(depth)
-    outcomes = _safe_gather_result(outcomes, {'labels': [], 'values': []}, 'merge_queue.outcomes')
-    latency = _safe_gather_result(
-        latency, {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0},
-        'merge_queue.latency',
+    projects_raw = await build_per_project_merge_queue(
+        project_dbs, hours=hours, now=effective_now, recent_window_minutes=15,
     )
-    recent = _safe_gather_result(recent, [], 'merge_queue.recent')
-    spec = _safe_gather_result(
-        spec, {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0},
-        'merge_queue.speculative',
-    )
+
+    # Apply trim + title enrichment per project
+    projects: dict[str, dict] = {}
+    for pid, data in projects_raw.items():
+        titles = await asyncio.to_thread(
+            load_task_titles,
+            Path(pid) / '.taskmaster' / 'tasks' / 'tasks.json',
+        )
+        projects[pid] = {
+            **data,
+            'depth_timeseries': trim_leading_zero_buckets(
+                cast(ChartData, data['depth_timeseries'])
+            ),
+            'recent': enrich_merges_with_titles(data['recent'], titles),
+        }
 
     return templates.TemplateResponse(
         request, 'partials/merge_queue.html',
-        context={
-            'depth_timeseries': depth,
-            'outcomes': outcomes,
-            'latency': latency,
-            'recent': recent,
-            'speculative': spec,
-            'window': window_raw,
-        },
+        context={'projects': projects, 'window': window_raw},
     )
 
 
