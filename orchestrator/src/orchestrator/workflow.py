@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from shared.cli_invoke import (
     AllAccountsCappedException,
@@ -172,6 +172,23 @@ class WorkflowMetrics:
     judge_invocations: int = 0
     judge_cost_usd: float = 0.0
     judge_early_exits: int = 0
+
+
+class _PriorImplStatus(NamedTuple):
+    """Result of :meth:`TaskWorkflow._has_prior_implementation`.
+
+    Bundles the three pieces of information that the merge-check call-site
+    needs so it can avoid redundant artifact reads.
+    """
+
+    has_work: bool
+    """True iff the worktree has implementation commits beyond the base."""
+
+    entries: list[dict]
+    """Full parsed iteration-log entries (may be empty)."""
+
+    base_commit: str | None
+    """SHA read from metadata.json, or None if the file is absent."""
 
 
 class TaskWorkflow:
@@ -395,7 +412,7 @@ class TaskWorkflow:
                 # satisfies the ancestor check.  Only skip if there's
                 # evidence of prior implementation work.
                 has_work = (
-                    self._has_prior_implementation()
+                    self._has_prior_implementation().has_work
                     or await self.git_ops.has_uncommitted_work(self.worktree)
                 )
                 if has_work:
@@ -473,7 +490,7 @@ class TaskWorkflow:
                     # Defense-in-depth: same stale-branch-point guard as
                     # the pre-EXECUTE check.  Should rarely fire since
                     # we just ran execute, but guards against edge cases.
-                    if already_merged and not self._has_prior_implementation():
+                    if already_merged and not self._has_prior_implementation().has_work:
                         logger.warning(
                             f'Task {self.task_id}: branch appears merged at '
                             f'merge phase but has no implementation entries '
@@ -2305,12 +2322,27 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         stdout, _ = await proc.communicate()
         return stdout.decode().strip()
 
-    def _has_prior_implementation(self) -> bool:
+    def _has_prior_implementation(self, wt_head: str | None = None) -> _PriorImplStatus:
         """Check whether a prior run did any implementation in this worktree.
 
-        Inspects .task/iterations.jsonl for implementer/debugger entries.
-        Planning-only runs don't write these, so absence means stale branch
-        point rather than a legitimately merged prior run.
+        When *wt_head* is provided (the post-execution branch HEAD), the primary
+        signal is a SHA comparison: the branch has advanced past its starting
+        point iff ``wt_head.strip() != base_commit``.  This is invariant to
+        iteration-log format changes and avoids the false-done regression where
+        a stale iteration entry triggers the guard on a branch with no commits.
+
+        When *wt_head* is not provided (or when base_commit is absent from
+        metadata.json), falls back to scanning .task/iterations.jsonl for
+        implementer/debugger entries.  Planning-only runs don't write these, so
+        absence means stale branch point rather than a legitimately merged prior
+        run.  This fallback is also used by the ghost-loop guard and the
+        merge-phase guard, where a post-rebase HEAD may coincide with
+        base_commit even on a genuinely-implemented branch.
+
+        Returns a :class:`_PriorImplStatus` NamedTuple with ``has_work``,
+        ``entries`` (full iteration-log list — callers can use ``len(entries)``
+        in warning breadcrumbs without a second ``read_iteration_log()`` call),
+        and ``base_commit`` (may be ``None`` if metadata.json is absent).
 
         Correctness assumption: worktrees are always created fresh per task run.
         If .task/iterations.jsonl were ever carried across a worktree recreation
@@ -2319,9 +2351,21 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         Any future change to create_worktree that enables reuse must revisit here.
         """
         if self.artifacts is None:
-            return False
+            return _PriorImplStatus(has_work=False, entries=[], base_commit=None)
+        base_commit = self.artifacts.read_base_commit()
         entries, _ = self.artifacts.read_iteration_log()
-        return any(e.get('agent') in ('implementer', 'debugger') for e in entries)
+        if wt_head is not None and base_commit is not None:
+            return _PriorImplStatus(
+                has_work=wt_head.strip() != base_commit,
+                entries=entries,
+                base_commit=base_commit,
+            )
+        # Fallback: no wt_head provided, or no base_commit stamp — use entry scan
+        return _PriorImplStatus(
+            has_work=any(e.get('agent') in ('implementer', 'debugger') for e in entries),
+            entries=entries,
+            base_commit=base_commit,
+        )
 
     def _escalate_plan_overwrite(self) -> None:
         """Submit a blocking escalation when plan.json ownership doesn't match.
@@ -2534,34 +2578,50 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     # main, transition to DONE instead of re-queueing —
                     # prevents stash_failed / advance_main ghost loops.
                     if self.worktree and self.git_ops:
+                        # ── Git layer ─────────────────────────────────────
+                        # Subprocess calls that can fail for git/infra reasons
+                        # (e.g. corrupted index, network mount offline).
+                        # Returns (wt_head_stripped, main_sha) when the branch
+                        # is on main, None on failure or when not yet merged.
+                        # Using an Optional result eliminates dead '' initializers
+                        # that would never be used on the exception path.
+                        _git_check: tuple[str, str] | None = None
                         try:
-                            _, wt_head, _ = await _run(
+                            _, _wt_head_raw, _ = await _run(
                                 ['git', 'rev-parse', 'HEAD'],
                                 cwd=self.worktree,
                             )
-                            main_sha = await self.git_ops.get_main_sha()
+                            _main_sha = await self.git_ops.get_main_sha()
                             if await self.git_ops.is_ancestor(
-                                wt_head.strip(), main_sha,
+                                _wt_head_raw.strip(), _main_sha,
                             ):
-                                if not self._has_prior_implementation():
-                                    _base = (
-                                        self.artifacts.read_base_commit()
-                                        if self.artifacts else None
-                                    )
-                                    _entries, _ = (
-                                        self.artifacts.read_iteration_log()
-                                        if self.artifacts else ([], [])
-                                    )
+                                _git_check = (_wt_head_raw.strip(), _main_sha)
+                        except Exception:
+                            logger.warning(
+                                'Task %s: merge-check failed, '
+                                'proceeding with requeue',
+                                self.task_id, exc_info=True,
+                            )
+
+                        # ── Artifacts layer ────────────────────────────────
+                        # Reads that can fail for filesystem/JSON reasons
+                        # (e.g. corrupted iterations.jsonl, missing metadata).
+                        if _git_check is not None:
+                            wt_head, main_sha = _git_check
+                            try:
+                                status = self._has_prior_implementation(wt_head)
+                                if not status.has_work:
                                     logger.warning(
                                         'Task %s: branch HEAD %s is ancestor '
                                         'of main %s but no implementation '
                                         'entries (base=%s, entries=%d) — '
                                         'proceeding with requeue',
                                         self.task_id,
-                                        wt_head.strip()[:8],
+                                        wt_head[:8],
                                         main_sha[:8],
-                                        _base[:8] if _base else 'none',
-                                        len(_entries),
+                                        status.base_commit[:8]
+                                        if status.base_commit else 'none',
+                                        len(status.entries),
                                     )
                                 else:
                                     logger.info(
@@ -2580,12 +2640,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                                         },
                                     )
                                     return WorkflowOutcome.DONE
-                        except Exception:
-                            logger.warning(
-                                'Task %s: merge-check failed, '
-                                'proceeding with requeue',
-                                self.task_id, exc_info=True,
-                            )
+                            except Exception:
+                                logger.warning(
+                                    'Task %s: artifacts read failed during '
+                                    'merge-check, proceeding with requeue',
+                                    self.task_id, exc_info=True,
+                                )
 
                     # Preserve steward-set deferred/blocked.  If the cached
                     # status differs from the snapshot taken before the

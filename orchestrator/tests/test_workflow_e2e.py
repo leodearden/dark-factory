@@ -2602,6 +2602,221 @@ class TestMarkBlockedFalseDoneGuard:
             f"Last status must be 'pending' after exception-path requeue: {statuses}"
         )
 
+    async def test_empty_branch_with_stale_iteration_log_still_requeues(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """SHA-primary guard must requeue even when a stale implementer entry is present.
+
+        On the baseline (entry-scan only) _has_prior_implementation(), the stale entry
+        causes it to return True.  Because the fresh worktree HEAD is trivially an
+        ancestor of main (wt_head == base_commit == main HEAD), the guard incorrectly
+        fast-paths to DONE.
+
+        After the SHA-primary refactor, the guard compares wt_head == base_commit and
+        returns (False, entries), falling through to the normal requeue path.
+
+        This test FAILS on unmodified code (step-1 TDD for SHA-primary signal).
+        """
+        import json as _json
+
+        # 1. Create a fresh worktree (no implementation commits — wt_head == base_commit)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Get the current HEAD SHA — this is also the base_commit
+        _, wt_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        wt_head = wt_head_raw.strip()
+
+        # 3. Stamp metadata.json with base_commit == wt_head
+        #    (mirrors what workflow._init_plan_artifacts does at task start)
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'metadata.json').write_text(
+            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': wt_head})
+        )
+
+        # 4. Write a stale implementer iteration entry.
+        #    On baseline code this alone makes _has_prior_implementation() return True.
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+
+        # 5. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 6. FakeSteward resolves all pending L0 escalations immediately in start()
+        workflow._steward_factory = _make_resolving_steward(
+            queue, task_assignment.task_id,
+        )
+
+        # 7. Call _mark_blocked directly
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        # 8. Assert REQUEUED — stale entry must not trigger false-done when wt_head == base_commit
+        assert outcome == WorkflowOutcome.REQUEUED, (
+            f'Expected REQUEUED but got {outcome!r} — '
+            'stale iteration entry triggered false-done despite wt_head == base_commit'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses: {statuses}"
+        )
+        assert statuses[-1] == 'pending', (
+            f"Last scheduler status must be 'pending' after requeue, got: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE: {workflow.state!r}'
+        )
+
+    async def test_artifacts_exception_logs_distinctly_and_requeues(
+        self, config, git_ops, task_assignment, tmp_path, caplog
+    ):
+        """Artifacts-layer exception in _has_prior_implementation must log distinctly.
+
+        When read_iteration_log raises (e.g. malformed JSON, filesystem error),
+        the exception must be caught by a separate artifacts-layer try/except that
+        logs a message containing 'artifacts' — distinct from the git-layer
+        'merge-check failed' message — so operators can diagnose the correct root
+        cause.  Both paths fall through to the normal requeue flow.
+
+        On unmodified code the single bare except catches the exception and logs
+        'merge-check failed', so the 'artifacts' assertion fails.
+        This test FAILS on unmodified code (step-3 TDD for distinct exception handling).
+        """
+        import logging
+
+        # 1. Create a fresh worktree (wt_head == base_commit — trivially is_ancestor True)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. FakeSteward resolves all pending L0 escalations immediately in start()
+        workflow._steward_factory = _make_resolving_steward(
+            queue, task_assignment.task_id,
+        )
+
+        # 4. Force read_iteration_log to raise — simulates corrupted iterations.jsonl
+        def _raise_artifacts():
+            raise RuntimeError('simulated artifacts failure')
+
+        workflow.artifacts.read_iteration_log = _raise_artifacts  # type: ignore[method-assign]
+
+        # 5. Call _mark_blocked, capturing WARNING-level logs
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+            outcome = await workflow._mark_blocked('synthetic failure')
+
+        # 6. Assertions: must REQUEUE with a distinct 'artifacts' log message
+        assert outcome == WorkflowOutcome.REQUEUED, (
+            f'Expected REQUEUED but got {outcome!r} — '
+            'artifacts exception must fall through to requeue'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear after an artifacts exception: {statuses}"
+        )
+        assert statuses[-1] == 'pending', (
+            f"Last status must be 'pending' after exception-path requeue: {statuses}"
+        )
+        assert any(
+            'artifacts read failed during merge-check' in r.message
+            for r in caplog.records
+        ), (
+            f"Expected a log record containing 'artifacts read failed during merge-check' "
+            f"(distinct from 'merge-check failed') "
+            f"but caplog only has: {[r.message for r in caplog.records]}"
+        )
+
+    async def test_sha_primary_signal_fires_done_after_real_commit(
+        self, config, git_ops, task_assignment, tmp_path, caplog
+    ):
+        """SHA-primary signal must fire DONE when wt_head != base_commit after a real commit.
+
+        Stamps metadata.json with base_commit = X (the initial branch HEAD),
+        then makes a real implementation commit so HEAD advances to Y.
+        The SHA-primary guard sees wt_head (Y) != base_commit (X) → has_work=True.
+        The branch is merged to main so is_ancestor is True.
+        Expected: outcome == DONE and the 'completing instead of re-queueing' log fires.
+
+        This locks in the positive branch of the SHA-primary signal introduced in
+        step-2 — the complement to test_empty_branch_with_stale_iteration_log_still_requeues.
+        """
+        import json as _json
+        import logging
+
+        # 1. Create worktree — initial HEAD is base_commit
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        _, base_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        base_sha = base_sha_raw.strip()
+
+        # 2. Stamp metadata.json with base_commit = initial HEAD
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'metadata.json').write_text(
+            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': base_sha})
+        )
+        # No iterations.jsonl entry — SHA-primary path must not need it.
+
+        # 3. Make a real implementation commit (HEAD advances past base_commit)
+        (wt / 'farewell_sha.py').write_text(
+            'def farewell(name):\n    return f"Goodbye, {name}"\n'
+        )
+        await git_ops.commit(wt, 'Implement farewell (SHA-primary test)')
+
+        # 4. Merge the branch to main so is_ancestor(wt_head, main_sha) is True
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # 5. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 6. FakeSteward resolves all pending L0 escalations immediately in start()
+        workflow._steward_factory = _make_resolving_steward(
+            queue, task_assignment.task_id,
+        )
+
+        # 7. Call _mark_blocked, capturing INFO-level logs (completing log is INFO)
+        with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
+            outcome = await workflow._mark_blocked('synthetic failure')
+
+        # 8. Assert DONE with the 'completing instead of re-queueing' log
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE (wt_head != base_commit, merged) but got {outcome!r}'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert statuses[-1] == 'done', (
+            f"Last scheduler status must be 'done' after SHA-primary fast-path, got: {statuses}"
+        )
+        assert workflow.state == WorkflowState.DONE
+        assert any(
+            'completing instead of re-queueing' in r.message
+            for r in caplog.records
+        ), (
+            f"Expected 'completing instead of re-queueing' log but only got: "
+            f"{[r.message for r in caplog.records]}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # File-structure invariants
