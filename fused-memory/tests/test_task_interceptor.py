@@ -2830,3 +2830,40 @@ async def test_start_flushes_prior_pending_tickets(
         )
     finally:
         await ti.close()
+
+
+# step-59: server/main.py wires TicketStore into TaskInterceptor via helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_main_wires_ticket_store_into_interceptor(
+    taskmaster, reconciler, event_buffer, tmp_path,
+):
+    """_build_ticket_store (server.main helper) constructs and initialises a
+    TicketStore that main.py wires into TaskInterceptor.
+
+    Asserts:
+    1. _build_ticket_store returns a TicketStore backed by data_dir/tickets.db.
+    2. The returned store's _db is connected (not None) — initialize() was called.
+    3. A TaskInterceptor built with ticket_store=store exposes it as _ticket_store.
+    """
+    from fused_memory.server.main import _build_ticket_store  # noqa: PLC0415
+
+    store = await _build_ticket_store(tmp_path)
+
+    from fused_memory.middleware.ticket_store import TicketStore
+
+    assert isinstance(store, TicketStore)
+    assert store._db_path == tmp_path / 'tickets.db', (
+        f'Expected db path {tmp_path / "tickets.db"}, got {store._db_path}'
+    )
+    assert store._db is not None, 'TicketStore._db should be connected after _build_ticket_store'
+
+    # Verify TaskInterceptor accepts and stores the ticket_store kwarg correctly.
+    ti = TaskInterceptor(taskmaster, reconciler, event_buffer, ticket_store=store)
+    assert ti._ticket_store is store, (
+        'TaskInterceptor._ticket_store should be the store passed at construction'
+    )
+
+    await store.close()
