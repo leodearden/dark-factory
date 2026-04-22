@@ -123,6 +123,38 @@ class TicketStore:
             )
         return ticket_id
 
+    async def mark_resolved(
+        self,
+        ticket_id: str,
+        *,
+        status: str,
+        task_id: str | None = None,
+        reason: str | None = None,
+        result_json: str | None = None,
+    ) -> bool:
+        """Update the ticket to a terminal status.
+
+        Only updates rows that are still ``pending``; a double-resolve attempt
+        returns ``False`` without clobbering the existing terminal data.
+        """
+        now = datetime.now(UTC).isoformat()
+        async with self._txn() as db:
+            cursor = await db.execute(
+                """
+                UPDATE tickets
+                SET status = ?, task_id = ?, reason = ?, result_json = ?, resolved_at = ?
+                WHERE ticket_id = ? AND status = 'pending'
+                """,
+                (status, task_id, reason, result_json, now, ticket_id),
+            )
+            if cursor.rowcount == 0:
+                logger.warning(
+                    'mark_resolved: ticket %s not in pending state (double-resolve or unknown)',
+                    ticket_id,
+                )
+                return False
+        return True
+
     async def get(self, ticket_id: str) -> dict | None:
         """Return the ticket row as a plain dict, or None if not found."""
         db = self._require_db()
