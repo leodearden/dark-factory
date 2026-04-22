@@ -26,7 +26,7 @@ def _new_ticket_id() -> str:
     Composition: upper 6 bytes of ``time.time_ns()`` (big-endian, ~65 µs
     resolution) concatenated with 10 bytes of ``secrets.token_bytes``.
     The 16-byte payload is Crockford-base32 encoded into 26 characters.
-    Total length: 30 (prefix) + 26 = 30 characters.
+    Total length: 4 (prefix) + 26 = 30 characters.
     """
     # Upper 6 bytes of the nanosecond timestamp give ~65 µs resolution and
     # sort correctly for hundreds of years without wrapping.

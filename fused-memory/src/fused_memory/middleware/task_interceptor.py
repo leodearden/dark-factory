@@ -257,11 +257,18 @@ class TaskInterceptor:
         """Release resources held by the interceptor.
 
         1. Sets the ``_closed`` flag so ``submit_task`` rejects new work.
-        2. Cancels and awaits the curator worker task (if running) so the
-           ticket queue is drained and no new ``curator.curate()`` calls start.
-        3. Drains any remaining fire-and-forget background tasks.
-        4. Closes the :class:`TaskCurator`'s Qdrant connection.
-        5. Closes the :class:`TicketStore`'s SQLite connection.
+        2. Cancels and awaits the curator worker task (if running).  Note:
+           queued tickets that have not yet been dequeued remain ``pending``
+           in the store and will be marked ``failed/server_restart`` on the
+           next ``start()`` call.  In-flight callers waiting in
+           ``resolve_ticket`` are woken immediately (step 3) so they do not
+           hang indefinitely.
+        3. Signals all registered ``_ticket_events`` so any ``resolve_ticket``
+           callers that are blocked on ``event.wait()`` unblock and re-read
+           the (still-pending) ticket row, returning the timeout sentinel.
+        4. Drains any remaining fire-and-forget background tasks.
+        5. Closes the :class:`TaskCurator`'s Qdrant connection.
+        6. Closes the :class:`TicketStore`'s SQLite connection.
 
         Idempotent: safe to call multiple times.
         """
@@ -273,6 +280,13 @@ class TaskInterceptor:
         if self._worker_task is not None and not self._worker_task.done():
             self._worker_task.cancel()
             await asyncio.gather(self._worker_task, return_exceptions=True)
+
+        # Wake all resolve_ticket callers that are waiting on an event so they
+        # don't block forever after the worker has been cancelled.  The callers
+        # will re-read the ticket row (still 'pending') and return the
+        # {status: failed, reason: timeout} sentinel.
+        for event in list(self._ticket_events.values()):
+            event.set()
 
         await self.drain()
         if self._curator is not None:
@@ -1069,12 +1083,22 @@ class TaskInterceptor:
 
         # Serialise the full call payload so the worker can reconstruct it.
         # Stored as a canonical JSON blob: {project_root, kwargs, metadata}.
+        # No default=str: non-JSON-native values (e.g. datetime, Path, enum)
+        # must fail fast here with a TypeError so the caller gets a structured
+        # ValidationError rather than silently storing a mangled blob that the
+        # worker cannot faithfully execute.
         metadata = kwargs.pop('metadata', None)
-        blob = json.dumps({
-            'project_root': project_root,
-            'kwargs': kwargs,
-            'metadata': metadata,
-        }, default=str)
+        try:
+            blob = json.dumps({
+                'project_root': project_root,
+                'kwargs': kwargs,
+                'metadata': metadata,
+            })
+        except (TypeError, ValueError) as exc:
+            return {
+                'error': f'submit_task: non-serialisable argument — {exc}',
+                'error_type': 'ValidationError',
+            }
 
         ticket_id = await self._ticket_store.submit(
             project_id=project_id,
@@ -1114,6 +1138,16 @@ class TaskInterceptor:
         every exit path (unknown, terminal-found, wait-success, timeout).
         ``_signal_ticket_event`` may have already popped the key; the
         ``pop(…, None)`` is a harmless no-op in that case.
+
+        Single-waiter constraint
+        ------------------------
+        Only ONE caller may await a given ticket at a time.  A second
+        concurrent ``resolve_ticket`` call for the same ticket will overwrite
+        the first caller's event in ``_ticket_events``, leaving the first
+        caller's ``event.wait()`` stranded.  This is unlikely in normal use
+        (each MCP invocation gets its own ticket), but callers implementing
+        retry-on-reconnect or UI-polling patterns must not fan out multiple
+        concurrent ``resolve_ticket`` calls for the same ``ticket`` id.
         """
         if self._ticket_store is None:
             return {'status': 'failed', 'reason': 'ticket_store not configured', 'task_id': None}
@@ -1141,10 +1175,16 @@ class TaskInterceptor:
             except TimeoutError:
                 return {'status': 'failed', 'reason': 'timeout', 'task_id': None}
 
-            # (5) Re-load the now-terminal row.
+            # (5) Re-load the (hopefully) now-terminal row.
             row = await self._ticket_store.get(ticket)
             if row is None:
                 return {'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None}
+            # Guard: if the row is still 'pending' after the event was set, the
+            # worker was cancelled (close()) or raised before mark_resolved could
+            # run.  Return a server_closed failure so the caller always receives a
+            # terminal response — never a 'pending' state that could loop.
+            if row['status'] == 'pending':
+                return {'status': 'failed', 'reason': 'server_closed', 'task_id': None}
             return _format_ticket_result(row)
         finally:
             # (6) Uniform cleanup: remove the event on every exit path.
@@ -1162,8 +1202,7 @@ class TaskInterceptor:
         if self._ticket_store is None:
             return
         if self._worker_task is None or self._worker_task.done():
-            loop = asyncio.get_event_loop()
-            self._worker_task = loop.create_task(
+            self._worker_task = asyncio.create_task(
                 self._curator_worker(),
                 name='task-interceptor-curator-worker',
             )
@@ -1186,6 +1225,10 @@ class TaskInterceptor:
                         '_curator_worker: unhandled error processing ticket %s',
                         ticket_id,
                     )
+                    # Always wake resolve_ticket waiters even on unexpected errors
+                    # so callers never block forever when _process_add_ticket raises
+                    # before it can call _signal_ticket_event itself.
+                    self._signal_ticket_event(ticket_id)
                 finally:
                     self._ticket_queue.task_done()
         except asyncio.CancelledError:

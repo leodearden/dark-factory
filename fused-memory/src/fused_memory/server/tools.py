@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from fused_memory.middleware.task_interceptor import _is_ticket_id
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout
 from fused_memory.services.memory_service import MemoryService
@@ -1071,8 +1072,11 @@ def create_mcp_server(
         be resolved via ``resolve_ticket`` before being passed to id-accepting
         task tools. Returning a clear error here prevents confusing downstream
         failures inside the taskmaster backend.
+
+        Delegates to :func:`~fused_memory.middleware.task_interceptor._is_ticket_id`
+        so there is a single source of truth for the ticket-id prefix.
         """
-        if isinstance(value, str) and value.startswith('tkt_'):
+        if _is_ticket_id(value):
             return {
                 'error': (
                     f'Ticket-shaped id {value!r} not allowed here; '
@@ -1239,6 +1243,7 @@ def create_mcp_server(
     @mcp.tool()
     async def submit_task(
         project_root: str,
+        prompt: str | None = None,
         title: str | None = None,
         description: str | None = None,
         details: str | None = None,
@@ -1258,6 +1263,7 @@ def create_mcp_server(
 
         Args:
             project_root: Absolute path to project root
+            prompt: Task description for AI generation (forwarded to Taskmaster)
             title: Task title
             description: Task description
             details: Task details / implementation notes
@@ -1273,6 +1279,7 @@ def create_mcp_server(
         try:
             return await task_interceptor.submit_task(
                 project_root=project_root,
+                prompt=prompt,
                 title=title,
                 description=description,
                 details=details,
@@ -1310,9 +1317,11 @@ def create_mcp_server(
         Args:
             ticket: Ticket id returned by ``submit_task`` (must start with ``tkt_``)
             project_root: Absolute path to project root (same as supplied to submit_task)
-            timeout_seconds: Maximum seconds to wait (default: no timeout)
+            timeout_seconds: Maximum seconds to wait.  Defaults to 115 s (just
+                under the MCP 120 s hard limit) so external callers that omit this
+                parameter cannot hang indefinitely on an orphaned ticket.
         """
-        if not (isinstance(ticket, str) and ticket.startswith('tkt_')):
+        if not _is_ticket_id(ticket):
             return {
                 'error': f'ticket must start with tkt_ (got {ticket!r})',
                 'error_type': 'ValidationError',
@@ -1321,11 +1330,14 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
+        # Apply a safe default timeout at the MCP layer so external callers
+        # cannot block indefinitely — mirrors the add_task facade's 115 s budget.
+        effective_timeout = 115.0 if timeout_seconds is None else timeout_seconds
         try:
             return await task_interceptor.resolve_ticket(
                 ticket=ticket,
                 project_root=project_root,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=effective_timeout,
             )
         except Exception as e:
             logger.error(f'resolve_ticket error: {e}')
