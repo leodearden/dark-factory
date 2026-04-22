@@ -1062,9 +1062,10 @@ class TaskInterceptor:
         - ``combined`` — candidate was folded into an existing task (drop/combine/idempotency)
         - ``failed``   — an unrecoverable error occurred
 
-        This step (step-22) implements the CREATE path only.  Drop / combine /
-        R4 idempotency / CuratorFailureError paths are added incrementally in
-        steps 23-30.
+        Decision order: R4 idempotency check → curator decision (drop /
+        combine / create) → atomic write under ``_write_lock``.  On any
+        unhandled exception in the write section, ticket is marked ``failed``
+        and no ``task_created`` journal event is emitted.
         """
         if self._ticket_store is None:
             return
