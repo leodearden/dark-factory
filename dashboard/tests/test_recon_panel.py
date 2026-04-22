@@ -975,6 +975,69 @@ class TestPartitionBurstStateNoneGuard:
         assert active == []
 
 
+# ---------------------------------------------------------------------------
+# TestBurstStateStaleFilter — only active/recent agents shown (step-19/20)
+# ---------------------------------------------------------------------------
+
+class TestBurstStateStaleFilter:
+    """The recon partial must show only agents that are active or recently written."""
+
+    def test_old_idle_agent_hidden(self, client):
+        """Stale idle agent (last_write_at > 1h ago) must not appear in the rendered HTML.
+
+        Three agents:
+        - agent-active-bursting: state='bursting', last_write_at=2h ago.
+          Must appear: non-idle state overrides the staleness check.
+        - agent-active-idle-recent: state='idle', last_write_at=10m ago.
+          Must appear: within the 1-hour active threshold.
+        - agent-stale-idle: state='idle', last_write_at=2h ago.
+          Must NOT appear: idle AND last_write_at is older than 1 hour.
+
+        Before step-20 (partition_burst_state applied in route), the filter is
+        absent and all three agents are forwarded to the template, so this test
+        fails on the 'not in html' assertion.
+        """
+        two_hours_ago = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        ten_minutes_ago = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+
+        mock_burst = [
+            {
+                'agent_id': 'agent-active-bursting',
+                'state': 'bursting',
+                'last_write_at': two_hours_ago,
+                'burst_started_at': two_hours_ago,
+            },
+            {
+                'agent_id': 'agent-active-idle-recent',
+                'state': 'idle',
+                'last_write_at': ten_minutes_ago,
+                'burst_started_at': None,
+            },
+            {
+                'agent_id': 'agent-stale-idle',
+                'state': 'idle',
+                'last_write_at': two_hours_ago,
+                'burst_started_at': None,
+            },
+        ]
+
+        with _patch_recon_data(burst_state=mock_burst):
+            html = client.get('/partials/recon').text
+
+        # agent-active-bursting: non-idle state — must appear
+        assert 'agent-active-bursting' in html, (
+            'agent-active-bursting (bursting state) should appear regardless of last_write_at'
+        )
+        # agent-active-idle-recent: idle but recent — must appear
+        assert 'agent-active-idle-recent' in html, (
+            'agent-active-idle-recent (idle, 10m ago) should appear (within 1h threshold)'
+        )
+        # agent-stale-idle: idle AND stale — must NOT appear
+        assert 'agent-stale-idle' not in html, (
+            'agent-stale-idle (idle, 2h ago) should be filtered out by partition_burst_state'
+        )
+
+
 class TestRunPanelAlpineComponent:
     """Tests for the named Alpine.data('runPanel') component in recon.html."""
 
