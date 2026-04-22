@@ -13,6 +13,7 @@ from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
+    CuratorFailureError,
     TaskCurator,
     _to_pool_entry,
     flatten_task_tree,
@@ -1104,6 +1105,7 @@ class TaskInterceptor:
         task_id: str | None = None
         reason: str | None = None
         result_dict: dict | None = None
+        curator_degrade_reason: str | None = None
 
         try:
             # ── R4: escalation-level idempotency ─────────────────────────
@@ -1131,13 +1133,16 @@ class TaskInterceptor:
             if curator is not None and candidate is not None:
                 try:
                     decision = await curator.curate(candidate, project_id, project_root)
-                except Exception:
-                    logger.exception(
-                        '_process_add_ticket: curator.curate failed for %s; '
-                        'falling through to create', ticket_id,
+                except CuratorFailureError as exc:
+                    logger.warning(
+                        '_process_add_ticket: curator.curate raised CuratorFailureError '
+                        'for %s; degrading to create. reason=%s',
+                        ticket_id, exc,
                     )
-                    # Steps 29-30 will handle CuratorFailureError explicitly;
-                    # for now fall through to create on any failure.
+                    # Degrade gracefully to create — avoids losing the task on
+                    # transient LLM failures.  Record the failure so the facade
+                    # and callers can see it in result_json.
+                    curator_degrade_reason = str(exc)
                     decision = CuratorDecision(action='create')
 
             if decision is not None and decision.action == 'drop' and decision.target_id:
@@ -1253,6 +1258,8 @@ class TaskInterceptor:
             task_id = task_id_str or None
             status = 'created'
             result_dict = result if isinstance(result, dict) else {}
+            if curator_degrade_reason is not None:
+                result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
 
         except Exception as exc:
             logger.exception(
