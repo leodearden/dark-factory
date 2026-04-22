@@ -265,3 +265,70 @@ async def test_worker_processes_combine_decision(
 
     # reembed background task was spawned (curator.reembed_task was called)
     mock_curator.reembed_task.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# step-27: worker R4 escalation idempotency short-circuit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_r4_escalation_idempotency_returns_existing_task(
+    interceptor_with_store, ticket_store, taskmaster,
+):
+    """When metadata contains escalation_id + suggestion_hash that match an
+    existing non-cancelled task, the worker short-circuits:
+    - ticket resolves as status='combined' with task_id=<existing>
+    - curator.curate is NOT called
+    - tm.add_task is NOT called
+    """
+    existing_task = {
+        'id': '99',
+        'title': 'Existing Escalation Task',
+        'status': 'pending',
+        'metadata': {
+            'escalation_id': 'e1',
+            'suggestion_hash': 'h1',
+        },
+    }
+    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [existing_task]})
+
+    mock_curator = MagicMock()
+    mock_curator.curate = AsyncMock()  # should NOT be called
+    mock_curator.note_created = MagicMock()
+    mock_curator.record_task = AsyncMock()
+
+    with patch.object(
+        type(interceptor_with_store), '_get_curator',
+        new=AsyncMock(return_value=mock_curator),
+    ):
+        result = await interceptor_with_store.submit_task(
+            project_root='/project',
+            title='Escalation Task',
+            description='Should be idempotency-gated',
+            metadata={'escalation_id': 'e1', 'suggestion_hash': 'h1'},
+        )
+        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+        ticket_id = result['ticket']
+
+        # Let the worker drain
+        await asyncio.sleep(0.2)
+
+    # curator.curate must NOT have been called (short-circuit)
+    mock_curator.curate.assert_not_called()
+
+    # tm.add_task must NOT have been called
+    taskmaster.add_task.assert_not_called()
+
+    # Ticket must be terminal with status='combined'
+    row = await ticket_store.get(ticket_id)
+    assert row is not None
+    assert row['status'] == 'combined', f'Expected combined, got {row["status"]}'
+    assert row['task_id'] == '99', f'Expected task_id=99, got {row["task_id"]}'
+    assert row['resolved_at'] is not None
+    assert row['reason'] == 'idempotency_hit'
+
+    # result_json captures the idempotency hit details
+    result_data = json.loads(row['result_json'])
+    assert result_data.get('id') == '99'
+    assert result_data.get('action') == 'idempotency_hit'
