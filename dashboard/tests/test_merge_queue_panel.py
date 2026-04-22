@@ -716,3 +716,87 @@ class TestDepthTrimLeadingZeros:
         # Interior zero is preserved; no trimming happens.
         assert depth_data['labels'] == raw_depth['labels']
         assert depth_data['values'] == raw_depth['values']
+
+
+# ---------------------------------------------------------------------------
+# TestMergeQueuePerProject — per-project card layout (step-11/12)
+# ---------------------------------------------------------------------------
+
+_PID_A = '/tmp/dark-factory'
+_PID_B = '/tmp/other'
+
+# Expected css_id values for canvas id attributes:
+#   css_id('/tmp/dark-factory') → 'tmp_dark_factory'
+#   css_id('/tmp/other')        → 'tmp_other'
+_SAFE_A = 'tmp_dark_factory'
+_SAFE_B = 'tmp_other'
+
+_MOCK_PROJECT_DATA = {
+    _PID_A: {
+        'depth_timeseries': MOCK_DEPTH,
+        'outcomes': MOCK_OUTCOMES,
+        'latency': MOCK_LATENCY,
+        'recent': MOCK_RECENT,
+        'speculative': MOCK_SPEC,
+    },
+    _PID_B: {
+        'depth_timeseries': MOCK_DEPTH,
+        'outcomes': MOCK_OUTCOMES,
+        'latency': MOCK_LATENCY,
+        'recent': MOCK_RECENT,
+        'speculative': MOCK_SPEC,
+    },
+}
+
+
+def _patch_per_project_merge_data(projects=_UNSET, titles=_UNSET):
+    """Patch the new per-project route helpers.
+
+    Uses ``create=True`` so the test remains usable before the imports are wired
+    into app.py (the test will still FAIL on the html assertions at that point,
+    which is the desired TDD state).
+    """
+    stack = ExitStack()
+    stack.enter_context(patch(
+        'dashboard.app.build_per_project_merge_queue',
+        new_callable=AsyncMock,
+        create=True,
+        return_value=projects if projects is not _UNSET else _MOCK_PROJECT_DATA,
+    ))
+    stack.enter_context(patch(
+        'dashboard.app.load_task_titles',
+        create=True,
+        return_value=titles if titles is not _UNSET else {},
+    ))
+    return stack
+
+
+class TestMergeQueuePerProject:
+    """The /partials/merge-queue partial renders one card block per project."""
+
+    def test_renders_per_project_cards(self, client):
+        """Two-project mock produces depth/outcome canvas IDs for both projects."""
+        with _patch_per_project_merge_data():
+            resp = client.get('/partials/merge-queue')
+        assert resp.status_code == 200
+        html = resp.text
+
+        # (a) depth canvas for project A
+        assert f'id="mergeQueueDepthChart-{_SAFE_A}"' in html, (
+            f'Expected mergeQueueDepthChart-{_SAFE_A} canvas id in HTML'
+        )
+        # (b) depth canvas for project B
+        assert f'id="mergeQueueDepthChart-{_SAFE_B}"' in html, (
+            f'Expected mergeQueueDepthChart-{_SAFE_B} canvas id in HTML'
+        )
+        # (c) outcome canvas IDs
+        assert f'id="mergeOutcomeChart-{_SAFE_A}"' in html
+        assert f'id="mergeOutcomeChart-{_SAFE_B}"' in html
+
+        # (d) project display names appear as h3 headers (project_name filter: basename)
+        assert re.search(r'<h3[^>]*>\s*dark-factory\s*<', html), (
+            "Expected 'dark-factory' as h3 header in HTML"
+        )
+        assert re.search(r'<h3[^>]*>\s*other\s*<', html), (
+            "Expected 'other' as h3 header in HTML"
+        )
