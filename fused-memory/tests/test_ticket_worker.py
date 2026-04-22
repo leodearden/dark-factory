@@ -607,3 +607,34 @@ async def test_worker_note_created_and_record_task_run_under_write_lock(
     assert lock_held_at_record == [True], (
         f'write_lock should be held during record_task: {lock_held_at_record}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-37: resolve_ticket returns immediately for a terminal ticket
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_ticket_returns_immediately_for_terminal_ticket(
+    interceptor_with_store, ticket_store,
+):
+    """When the ticket is already in a terminal status, resolve_ticket
+    returns immediately with {status, task_id} without waiting on any event.
+    """
+    # Pre-populate a terminal ticket directly in the store
+    ticket_id = await ticket_store.submit(
+        project_id='project',
+        candidate_json='{}',
+        ttl_seconds=600,
+    )
+    await ticket_store.mark_resolved(
+        ticket_id, status='created', task_id='42',
+    )
+
+    # resolve_ticket should return promptly without blocking
+    result = await interceptor_with_store.resolve_ticket(ticket_id, '/project')
+
+    assert result['status'] == 'created', f'Expected status=created: {result}'
+    assert result['task_id'] == '42', f'Expected task_id=42: {result}'
+    # result_json should NOT be exposed
+    assert 'result_json' not in result, f'result_json should not be exposed: {result}'
