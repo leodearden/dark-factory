@@ -1286,6 +1286,52 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    async def resolve_ticket(
+        ticket: str,
+        project_root: str,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Phase-2 of two-phase task creation: block until the curator worker decides.
+
+        Returns ``{status, task_id?, reason?}`` once the ticket is terminal.
+        If the ticket is already terminal, returns immediately.
+
+        Status values:
+        - ``created``  — a new task was created; ``task_id`` is the numeric id.
+        - ``combined`` — candidate was folded into an existing task; ``task_id``
+          is the target task's id.
+        - ``failed``   — an error occurred; ``reason`` describes it. Common
+          reasons: ``timeout``, ``server_restart``, ``expired``.
+
+        Callers that receive ``status=failed, reason=timeout`` should either
+        retry or report an error — the legacy ``add_task`` facade raises
+        ``RuntimeError`` in this case.
+
+        Args:
+            ticket: Ticket id returned by ``submit_task`` (must start with ``tkt_``)
+            project_root: Absolute path to project root (same as supplied to submit_task)
+            timeout_seconds: Maximum seconds to wait (default: no timeout)
+        """
+        if not (isinstance(ticket, str) and ticket.startswith('tkt_')):
+            return {
+                'error': f'ticket must start with tkt_ (got {ticket!r})',
+                'error_type': 'ValidationError',
+            }
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        try:
+            return await task_interceptor.resolve_ticket(
+                ticket=ticket,
+                project_root=project_root,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as e:
+            logger.error(f'resolve_ticket error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
     async def update_task(
         id: str,
         project_root: str,
