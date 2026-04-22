@@ -9,10 +9,38 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import secrets
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
+
+# Crockford Base32 alphabet — omits I, L, O, U to reduce transcription errors.
+_CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
+
+
+def _new_ticket_id() -> str:
+    """Return a ``tkt_``-prefixed, lexicographically time-ordered ticket id.
+
+    Composition: upper 6 bytes of ``time.time_ns()`` (big-endian, ~65 µs
+    resolution) concatenated with 10 bytes of ``secrets.token_bytes``.
+    The 16-byte payload is Crockford-base32 encoded into 26 characters.
+    Total length: 30 (prefix) + 26 = 30 characters.
+    """
+    # Upper 6 bytes of the nanosecond timestamp give ~65 µs resolution and
+    # sort correctly for hundreds of years without wrapping.
+    ts = time.time_ns().to_bytes(8, 'big')[:6]
+    rand = secrets.token_bytes(10)
+    raw = ts + rand  # 16 bytes = 128 bits
+
+    # Encode 128 bits into 26 Crockford-base32 chars (5 bits each, MSB first).
+    n = int.from_bytes(raw, 'big')
+    chars: list[str] = []
+    for _ in range(26):
+        chars.append(_CROCKFORD[n & 0x1F])
+        n >>= 5
+    return 'tkt_' + ''.join(reversed(chars))
 
 logger = logging.getLogger(__name__)
 
