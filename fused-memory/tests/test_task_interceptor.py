@@ -2779,3 +2779,54 @@ async def test_submit_task_persists_ticket_and_returns_id(
 
     # The taskmaster backend must NOT have been called
     taskmaster.add_task.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# step-57: start() flushes prior pending tickets
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_flushes_prior_pending_tickets(
+    taskmaster, reconciler, event_buffer, tmp_path,
+):
+    """interceptor.start() flushes tickets left pending by a previous run.
+
+    Scenario: a previous server run submitted a ticket but crashed before
+    resolving it.  On restart, a fresh TaskInterceptor with the same
+    tickets.db calls start(), which marks the orphaned pending ticket as
+    failed with reason='server_restart'.
+    """
+    from fused_memory.middleware.ticket_store import TicketStore
+
+    # --- "previous run" ---
+    # Manually insert a pending ticket directly via the store API.
+    store = TicketStore(tmp_path / 'restart_tickets.db')
+    await store.initialize()
+    orphan_id = await store.submit(project_id='project', candidate_json='{}', ttl_seconds=600)
+    row_before = await store.get(orphan_id)
+    assert row_before is not None and row_before['status'] == 'pending', (
+        f'Setup: expected pending ticket, got {row_before}'
+    )
+    # Simulate the previous run finishing (store closed, process exited).
+    await store.close()
+
+    # --- "new run": fresh interceptor with the same on-disk db ---
+    fresh_store = TicketStore(tmp_path / 'restart_tickets.db')
+    await fresh_store.initialize()
+    ti = TaskInterceptor(taskmaster, reconciler, event_buffer, ticket_store=fresh_store)
+
+    try:
+        await ti.start()
+
+        # The orphaned ticket must now be failed with reason='server_restart'.
+        row_after = await fresh_store.get(orphan_id)
+        assert row_after is not None, 'Ticket row should still exist after start()'
+        assert row_after['status'] == 'failed', (
+            f'Expected status=failed after start(), got {row_after["status"]!r}'
+        )
+        assert row_after.get('reason') == 'server_restart', (
+            f'Expected reason=server_restart, got {row_after.get("reason")!r}'
+        )
+    finally:
+        await ti.close()
