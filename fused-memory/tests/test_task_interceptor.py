@@ -199,6 +199,65 @@ async def test_add_task_facade_delegates_to_submit_and_resolve(
 
 
 @pytest.mark.asyncio
+async def test_add_task_facade_emits_deprecation_warning_once_per_project(
+    interceptor_facade, caplog,
+):
+    """add_task emits a DeprecationWarning once per project_id, plus a logger.warning every time.
+
+    - First call on /p1 → DeprecationWarning raised + logger.warning
+    - Second call on /p1 → NO DeprecationWarning, but logger.warning still fired
+    - First call on /p2 → DeprecationWarning raised again + logger.warning
+    """
+    import logging
+    import warnings
+
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter('always')
+        # First call on /p1 — should warn.
+        await interceptor_facade.add_task('/p1', prompt='Task 1')
+    dep_warnings_p1_first = [
+        w for w in captured
+        if issubclass(w.category, DeprecationWarning)
+    ]
+    assert len(dep_warnings_p1_first) == 1, (
+        f'Expected exactly one DeprecationWarning on first /p1 call: {dep_warnings_p1_first}'
+    )
+    assert 'deprecated' in str(dep_warnings_p1_first[0].message).lower()
+
+    with warnings.catch_warnings(record=True) as captured2:
+        warnings.simplefilter('always')
+        # Second call on /p1 — should NOT re-warn.
+        await interceptor_facade.add_task('/p1', prompt='Task 2')
+    dep_warnings_p1_second = [
+        w for w in captured2
+        if issubclass(w.category, DeprecationWarning)
+    ]
+    assert len(dep_warnings_p1_second) == 0, (
+        f'Expected no DeprecationWarning on second /p1 call: {dep_warnings_p1_second}'
+    )
+
+    with warnings.catch_warnings(record=True) as captured3:
+        warnings.simplefilter('always')
+        # First call on /p2 — different project, should warn again.
+        await interceptor_facade.add_task('/p2', prompt='Task 3')
+    dep_warnings_p2 = [
+        w for w in captured3
+        if issubclass(w.category, DeprecationWarning)
+    ]
+    assert len(dep_warnings_p2) == 1, (
+        f'Expected exactly one DeprecationWarning on first /p2 call: {dep_warnings_p2}'
+    )
+
+    # logger.warning should appear on every call (3 total).
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        await interceptor_facade.add_task('/p1', prompt='Task 4')
+    deprecation_logs = [r for r in caplog.records if 'deprecated' in r.message.lower()]
+    assert len(deprecation_logs) >= 1, (
+        f'Expected at least one logger.warning mentioning deprecated: {caplog.records}'
+    )
+
+
+@pytest.mark.asyncio
 async def test_add_task_metadata_string_passed_through(interceptor_facade, taskmaster):
     """Pre-serialised metadata JSON is forwarded unchanged."""
     metadata_json = '{"escalation_id":"esc-1","suggestion_hash":"x"}'
