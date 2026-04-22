@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -105,6 +106,14 @@ def harness(tmp_path: Path, git_config: GitConfig):
 
     # Keep worktree_base real (under tmp_path) so we can create fake worktrees
     h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
+
+    # Mock cleanup_worktree: side_effect actually removes the directory so that
+    # existing assertions like `assert not lock_path.exists()` continue to hold
+    # after the impl switches from lock_path.unlink() to cleanup_worktree().
+    def _fake_cleanup(worktree_path, tid):
+        shutil.rmtree(worktree_path, ignore_errors=True)
+
+    h.git_ops.cleanup_worktree = AsyncMock(side_effect=_fake_cleanup)
 
     return h
 
@@ -280,6 +289,51 @@ class TestReconcileStrandedInProgress:
             assert matching[0].levelno == logging.WARNING, (
                 f'Expected WARNING level, got {logging.getLevelName(matching[0].levelno)}'
             )
+
+    async def test_no_lock_worktree_cleaned_when_not_recovered(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Worktree dir exists but has no plan.lock and task is NOT in _recovered_plans
+        → cleanup_worktree is called and task is reverted to pending."""
+        tid = 30
+        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
+            {'id': tid, 'status': 'in-progress'},
+        ]
+        # Create the worktree directory (no .task/plan.lock inside)
+        worktree_path = harness.git_ops.worktree_base / str(tid)
+        worktree_path.mkdir(parents=True)
+        # _recovered_plans is empty (default)
+
+        await harness._reconcile_stranded_in_progress()
+
+        # cleanup_worktree must have been called with the worktree path and tid
+        harness.git_ops.cleanup_worktree.assert_called_once_with(worktree_path, str(tid))  # type: ignore[attr-defined]
+        # Task must be reverted to pending
+        harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
+
+    async def test_no_lock_worktree_preserved_when_recovered(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Worktree dir exists but has no plan.lock and task IS in _recovered_plans
+        → cleanup_worktree is NOT called (worktree preserved), task still reverted."""
+        tid = 31
+        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
+            {'id': tid, 'status': 'in-progress'},
+        ]
+        # Create the worktree directory (no .task/plan.lock inside)
+        worktree_path = harness.git_ops.worktree_base / str(tid)
+        worktree_path.mkdir(parents=True)
+        # Mark task as recovered — worktree must be preserved for resumption
+        harness._recovered_plans[str(tid)] = {'task_id': str(tid), 'steps': []}
+
+        await harness._reconcile_stranded_in_progress()
+
+        # cleanup_worktree must NOT have been called
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        # Worktree directory must still exist
+        assert worktree_path.exists()
+        # Task must still be reverted to pending (recovery runs separately)
+        harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
 
     async def test_unexpected_exception_propagates_out_of_reconcile(
         self, harness: Harness
