@@ -46,6 +46,36 @@ quote-style = "single"
 indent-style = "space"
 docstring-code-format = true
 
+[tool.pytest.ini_options]
+# Filters are anchored on the *verb* of each anti-pattern, not on specific
+# internal symbol names, so that (a) they survive CPython/pytest renames of
+# internal coroutine methods and (b) they catch the same anti-pattern even
+# when it leaks through a different coroutine than AsyncMock's mixin.
+# NOTE: Still message-regex-based, so a wholesale rewrite of the upstream
+# wording would silently stop matching — revisit on pytest/Python/pytest-
+# asyncio upgrades.
+filterwarnings = [
+    # Unawaited coroutine leak (most commonly from AsyncMock misuse, but any
+    # forgotten `await` trips it).  Two emission paths with distinct shapes:
+    #   (1) GC fires inline during the test — CPython emits
+    #       RuntimeWarning("coroutine '<name>' was never awaited") directly.
+    #   (2) GC fires after teardown — pytest's sys.unraisablehook wraps the
+    #       event as PytestUnraisableExceptionWarning.  The exact prefix
+    #       varies by CPython version (unraisable.err_msg may be None or a
+    #       custom "Exception ignored while finalizing coroutine <...>"):
+    #         Python <3.14: "Exception ignored in: <coroutine object ...>"
+    #         Python  3.14: "Exception ignored while finalizing coroutine
+    #                         <coroutine object ...>: None"
+    #       `Exception ignored.*coroutine object` covers both forms without a
+    #       literal `:` (filterwarnings uses `:` as field separator, so a
+    #       literal `:` in the message regex would misparse the entry).
+    "error:coroutine .* was never awaited:RuntimeWarning",
+    "error:Exception ignored.*coroutine object:pytest.PytestUnraisableExceptionWarning",
+    # Sync def collected inside an @pytest.mark.asyncio class: mark mismatch.
+    # Pins: pytest_asyncio/plugin.py (message emitted at the collection phase).
+    "error:The test .* is marked with '@pytest.mark.asyncio' but it is not an async function:pytest.PytestWarning",
+]
+
 [dependency-groups]
 dev = [
     "pyright>=1.1.404",

@@ -1002,13 +1002,17 @@ class TestStewardTimeoutKillRecovery:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-class TestStewardTimeoutCap:
-    """_timeout_counts tracks cumulative per-escalation timeout-kills; cap triggers auto-escalation."""
+class TestStewardTimeoutCapInit:
+    """Sync init-state checks for _timeout_counts (no asyncio needed)."""
 
     def test_timeout_counts_dict_initialized_empty(self, steward):
         """_timeout_counts must be an empty dict right after construction."""
         assert steward._timeout_counts == {}
+
+
+@pytest.mark.asyncio
+class TestStewardTimeoutCap:
+    """_timeout_counts tracks cumulative per-escalation timeout-kills; cap triggers auto-escalation."""
 
     async def test_timeout_kill_increments_timeout_count(
         self, steward, mock_config, caplog,
