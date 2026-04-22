@@ -76,6 +76,7 @@ class ReconciliationHarness:
         self.taskmaster = taskmaster
         self.journal = journal
         self.buffer = event_buffer
+        self._project_root = config.taskmaster.project_root if config.taskmaster else ''
         self.config = config.reconciliation
         self._backlog_policy = backlog_policy
         # WP-D: track which halted projects we've already escalated so we
@@ -153,6 +154,39 @@ class ReconciliationHarness:
         escalation path because _notify_judge_halt dedupes per-process.
         """
         self._halt_escalated.discard(project_id)
+
+    @property
+    def project_root(self) -> str:
+        """Configured project root (from taskmaster config).
+
+        BacklogIterator and other internal helpers read this to obtain the
+        fallback project root when no event payload carries ``_project_root``.
+        Returns ``''`` when no taskmaster config is present — which is safe
+        because ``_fetch_filtered_task_tree`` short-circuits on empty strings.
+        """
+        return self._project_root
+
+    def _resolve_project_root(self, events: list[ReconciliationEvent]) -> str:
+        """Return the project root for a batch of events.
+
+        Scans *all* events for the first ``_project_root`` payload key; falls
+        back to ``self._project_root`` (the configured value) when none carry
+        it.  Using a shared helper keeps the fallback semantics identical
+        between ``run_full_cycle`` (which iterates the full drained list) and
+        ``BacklogIterator`` (which peeks a limited window of events).
+
+        Args:
+            events: Sequence of events to scan.  May be empty.
+
+        Returns:
+            A non-empty project root string if one was found in the payload or
+            configured at init time; otherwise ``''``.
+        """
+        for ev in events:
+            pr = ev.payload.get('_project_root')
+            if pr:
+                return pr
+        return self._project_root
 
     def drain(self) -> None:
         """Signal the harness to stop starting new reconciliation cycles.
@@ -649,13 +683,9 @@ class ReconciliationHarness:
             },
         )
 
-        # Extract project_root from event payloads (first event with _project_root key)
-        project_root = project_id  # fallback for backwards compatibility
-        for ev in events:
-            pr = ev.payload.get('_project_root')
-            if pr:
-                project_root = pr
-                break
+        # Resolve project_root: scan all events for the first _project_root payload
+        # key, fall back to the configured value via the shared helper (task 927).
+        project_root = self._resolve_project_root(events)
 
         # Load prior S3 findings from last completed run (backstop for normal pass)
         prior_s3_findings = await self._get_prior_s3_findings(project_id)
@@ -1072,11 +1102,12 @@ class BacklogIterator:
         # Snapshot: only process events that existed when we started.
         cutoff = datetime.now(UTC)
 
-        # Extract project_root from first event (for taskmaster calls)
-        peeked_first = await self.buffer.peek_buffered(project_id, limit=1, before=cutoff)
-        project_root = project_id
-        if peeked_first:
-            project_root = peeked_first[0].payload.get('_project_root', project_id)
+        # Resolve project_root: peek several events so that an older event
+        # lacking _project_root doesn't force a fallback when a later event in
+        # the buffer carries the key.  Uses the shared helper for identical
+        # fallback semantics as run_full_cycle (task 927).
+        peeked_for_root = await self.buffer.peek_buffered(project_id, limit=10, before=cutoff)
+        project_root = self.harness._resolve_project_root(peeked_for_root)
 
         assembler = ContextAssembler(
             memory_service=self.harness.memory,

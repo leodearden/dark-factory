@@ -247,6 +247,130 @@ async def test_full_cycle_extracts_project_root_from_events(
         assert stage_state['project_root'] == '/home/leo/src/dark-factory'
 
 
+# ── Tests for Task 927: project_root fallback fix ────────────────────
+
+
+def _make_config_927(project_root: str | None = '/abs/from/config'):
+    """Build a FusedMemoryConfig for task-927 tests.
+
+    Args:
+        project_root: If a string, wraps it in ``TaskmasterConfig``; if ``None``,
+            sets ``taskmaster=None`` so ``harness._project_root`` defaults to ``''``.
+    """
+    from fused_memory.config.schema import (
+        FusedMemoryConfig,
+        ReconciliationConfig,
+        TaskmasterConfig,
+    )
+
+    recon_cfg = ReconciliationConfig(
+        enabled=True,
+        explore_codebase_root='/tmp/test',
+        agent_llm_provider='anthropic',
+        agent_llm_model='claude-sonnet-4-20250514',
+    )
+    taskmaster_cfg = TaskmasterConfig(project_root=project_root) if project_root is not None else None
+    return FusedMemoryConfig(taskmaster=taskmaster_cfg, reconciliation=recon_cfg)
+
+
+def _make_harness_927(journal, event_buffer, mock_memory_service, project_root: str | None = '/abs/from/config'):
+    """Build a ReconciliationHarness with a configured project_root for task-927 tests."""
+    from unittest.mock import AsyncMock
+
+    from fused_memory.reconciliation.harness import ReconciliationHarness
+
+    harness = ReconciliationHarness(
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        journal=journal,
+        event_buffer=event_buffer,
+        config=_make_config_927(project_root),
+    )
+    harness._make_stages = lambda: harness.stages
+    return harness
+
+
+@pytest.mark.asyncio
+async def test_harness_init_stores_project_root_from_taskmaster_config(
+    journal, event_buffer, mock_memory_service
+):
+    """ReconciliationHarness.__init__ should store _project_root from config.taskmaster."""
+
+    # (a) With taskmaster configured: _project_root and property should come from config
+    harness_a = _make_harness_927(journal, event_buffer, mock_memory_service, '/abs/from/config')
+    assert harness_a._project_root == '/abs/from/config'
+    assert harness_a.project_root == '/abs/from/config'
+
+    # (b) With taskmaster=None: _project_root should default to ''
+    harness_b = _make_harness_927(journal, event_buffer, mock_memory_service, None)
+    assert harness_b._project_root == ''
+    assert harness_b.project_root == ''
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_uses_configured_project_root_when_events_lack_override(
+    journal, event_buffer, mock_memory_service
+):
+    """run_full_cycle should fall back to self._project_root, not project_id, when events lack _project_root."""
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service)
+
+    # Push events with NO _project_root key in payload
+    await event_buffer.push(_make_event('dark_factory'))
+    await event_buffer.push(_make_event('dark_factory'))
+
+    # Capture stage.project_root at the moment each stage.run fires
+    captured_roots: list[str] = []
+
+    async def capture_root(stage):
+        captured_roots.append(stage.project_root)
+
+    for stage in harness.stages:
+        _mock_stage_run(stage, before_return=capture_root)
+
+    await harness.run_full_cycle('dark_factory', 'buffer_size:2')
+
+    assert len(captured_roots) == 3
+    for root in captured_roots:
+        assert root == '/abs/from/config', (
+            f"Expected project_root='/abs/from/config' but got '{root}'"
+            " — fallback should use self._project_root, not project_id"
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_event_project_root_wins_over_configured(
+    journal, event_buffer, mock_memory_service
+):
+    """Event _project_root should override the configured project_root (precedence invariant).
+
+    This pins the guarantee that a configured project_root is only a fallback:
+    events that carry _project_root in their payload always take priority,
+    regardless of what TaskmasterConfig.project_root says.
+    """
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service, '/from/config')
+
+    # Push events whose payload carries a DIFFERENT project root
+    await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
+    await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
+
+    captured_roots: list[str] = []
+
+    async def capture_root(stage):
+        captured_roots.append(stage.project_root)
+
+    for stage in harness.stages:
+        _mock_stage_run(stage, before_return=capture_root)
+
+    await harness.run_full_cycle('dark_factory', 'buffer_size:2')
+
+    assert len(captured_roots) == 3
+    for root in captured_roots:
+        assert root == '/from/event', (
+            f"Expected project_root='/from/event' (from event payload) but got '{root}'"
+            " — event-provided root must win over the configured fallback"
+        )
+
+
 # ── Tests for Task 74: Stage 3 findings feedback loop ────────────────
 
 
@@ -2517,4 +2641,46 @@ async def test_run_pipeline_defers_on_all_accounts_capped(
     log_messages = [r.message.lower() for r in caplog.records]
     assert any('all accounts capped' in msg for msg in log_messages), (
         f'Expected log containing "all accounts capped", got: {log_messages}'
+    )
+
+
+# ── Tests for Task 927: BacklogIterator project_root fallback ─────────
+
+
+@pytest.mark.asyncio
+async def test_backlog_iterator_uses_harness_project_root_when_events_lack_override(
+    journal, event_buffer, mock_memory_service
+):
+    """BacklogIterator.run should pass harness.project_root to ContextAssembler
+    when peeked events carry no _project_root key in their payload."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from fused_memory.models.reconciliation import AssembledPayload
+    from fused_memory.reconciliation.harness import BacklogIterator
+
+    # Push one event with NO _project_root in payload
+    await event_buffer.push(_make_event('dark_factory'))
+
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service)
+
+    captured: dict = {}
+
+    # Stub ContextAssembler: records project_root kwarg; assemble returns events=[] to exit loop
+    def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
+        captured['project_root'] = project_root
+        inst = MagicMock()
+        inst.assemble = AsyncMock(return_value=AssembledPayload(events=[]))
+        return inst
+
+    with patch(
+        'fused_memory.reconciliation.context_assembler.ContextAssembler',
+        side_effect=fake_assembler_factory,
+    ):
+        iterator = BacklogIterator(harness.config, harness.journal, harness.buffer, harness)
+        await iterator.run('dark_factory')
+
+    assert 'project_root' in captured, 'ContextAssembler was never constructed — iterator may not have run'
+    assert captured['project_root'] == '/abs/from/config', (
+        f"Expected project_root='/abs/from/config' but got '{captured['project_root']}'"
+        " — BacklogIterator fallback should use harness.project_root, not project_id"
     )
