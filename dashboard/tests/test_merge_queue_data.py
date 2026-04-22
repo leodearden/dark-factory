@@ -2175,3 +2175,92 @@ class TestProjectScopedDbsLabeled:
         _pid, db = result[0]
         assert db is None  # file does not exist → None connection
 
+
+# ---------------------------------------------------------------------------
+# TestFilterMergesWithin (step-3)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterMergesWithin:
+    """Tests for merge_queue.filter_merges_within."""
+
+    def _make_row(self, offset_minutes, task_id='t1'):
+        """Build a merge row dict with timestamp = NOW - offset_minutes."""
+        ts = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC) - timedelta(minutes=offset_minutes)
+        return {'task_id': task_id, 'timestamp': ts.isoformat(), 'outcome': 'done'}
+
+    def test_keeps_rows_within_window(self):
+        """Rows at -5m, -10m, -14m59s survive a 15-minute window."""
+        from dashboard.data.merge_queue import filter_merges_within
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        rows = [
+            self._make_row(5),                    # 5m ago  → in
+            self._make_row(10),                   # 10m ago → in
+            {'task_id': 't3', 'timestamp': (now - timedelta(minutes=14, seconds=59)).isoformat(),
+             'outcome': 'done'},                   # 14m59s ago → in (< 15m)
+            self._make_row(20),                   # 20m ago → out
+            {'task_id': 't5', 'timestamp': (now - timedelta(minutes=15, seconds=1)).isoformat(),
+             'outcome': 'done'},                   # 15m01s ago → out
+        ]
+        result = filter_merges_within(rows, minutes=15, now=now)
+        task_ids = [r['task_id'] for r in result]
+        assert 't1' in task_ids   # 5m
+        assert 't1' in task_ids   # 10m (same task_id, first occurrence)
+        assert 't3' in task_ids   # 14m59s
+        assert 't5' not in task_ids  # 15m01s
+
+    def test_filters_out_old_rows(self):
+        """Rows older than the window are excluded."""
+        from dashboard.data.merge_queue import filter_merges_within
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        rows = [self._make_row(20), self._make_row(30)]
+        result = filter_merges_within(rows, minutes=15, now=now)
+        assert result == []
+
+    def test_empty_list_passthrough(self):
+        """Empty input returns empty output."""
+        from dashboard.data.merge_queue import filter_merges_within
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        assert filter_merges_within([], minutes=15, now=now) == []
+
+    def test_malformed_timestamp_filtered_out(self):
+        """A row with unparseable timestamp is dropped defensively."""
+        from dashboard.data.merge_queue import filter_merges_within
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        rows = [
+            {'task_id': 'bad', 'timestamp': 'not-a-date', 'outcome': 'done'},
+            self._make_row(5),  # valid, should survive
+        ]
+        result = filter_merges_within(rows, minutes=15, now=now)
+        task_ids = [r['task_id'] for r in result]
+        assert 'bad' not in task_ids
+        assert 't1' in task_ids
+
+    def test_preserves_input_order(self):
+        """Output order matches input order (no re-sorting)."""
+        from dashboard.data.merge_queue import filter_merges_within
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        rows = [
+            {'task_id': 'first', 'timestamp': (now - timedelta(minutes=1)).isoformat(), 'outcome': 'done'},
+            {'task_id': 'second', 'timestamp': (now - timedelta(minutes=2)).isoformat(), 'outcome': 'done'},
+            {'task_id': 'third', 'timestamp': (now - timedelta(minutes=3)).isoformat(), 'outcome': 'done'},
+        ]
+        result = filter_merges_within(rows, minutes=15, now=now)
+        assert [r['task_id'] for r in result] == ['first', 'second', 'third']
+
+    def test_now_defaults_to_current_time(self):
+        """When now=None, filter uses the current wall clock (smoke test)."""
+        from dashboard.data.merge_queue import filter_merges_within
+
+        # A row timestamped 2 minutes ago should survive a 15-minute window
+        ts = (datetime.now(UTC) - timedelta(minutes=2)).isoformat()
+        rows = [{'task_id': 'recent', 'timestamp': ts, 'outcome': 'done'}]
+        result = filter_merges_within(rows, minutes=15)
+        assert len(result) == 1
+        assert result[0]['task_id'] == 'recent'
+
