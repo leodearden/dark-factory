@@ -240,6 +240,7 @@ class TaskWorkflow:
         self._config_dir: TaskConfigDir | None = None
         self._old_plan_base: str | None = None  # base commit from prior session (for revalidation diff)
         self._merge_sha: str | None = None  # merge commit SHA set by _submit_to_merge_queue on success
+        self._last_invoked_role: str | None = None  # role of the last successful invocation
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -596,9 +597,20 @@ class TaskWorkflow:
                 f'All accounts capped: {e.label} — {e.retries} retries in {e.elapsed_secs:.1f}s'
             )
 
-        except _SessionBudgetExhausted:
-            logger.warning(f'Task {self.task_id}: session budget exhausted')
-            return await self._mark_blocked('Session budget exhausted')
+        except _SessionBudgetExhausted as e:
+            last_role = self._last_invoked_role or 'n/a'
+            budget_limit = self.config.usage_cap.session_budget_usd
+            cost_spent = self.metrics.total_cost_usd
+            reason = (
+                f'Session budget exhausted: ${cost_spent:.2f} spent of '
+                f'${budget_limit:.2f} budget (last role: {last_role})'
+            )
+            logger.warning(
+                'Task %s: session budget exhausted — $%.2f spent of $%.2f budget'
+                ' (last role: %s, gate cumulative: $%.2f)',
+                self.task_id, cost_spent, budget_limit, last_role, e.cumulative_cost,
+            )
+            return await self._mark_blocked(reason)
 
         except Exception as e:
             logger.exception(f'Task {self.task_id} workflow error: {e}')
@@ -2145,6 +2157,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             env_overrides=(self.config.env_overrides or None) if role.name in ('implementer', 'debugger') else None,
         )
         completed_at = datetime.now(UTC).isoformat()
+
+        # Record the last successfully-completed role (updated only on success,
+        # mirrors the cost-accumulation path below — failed/raised invocations
+        # do not advance either field).
+        self._last_invoked_role = role.name
 
         # Track metrics
         self.metrics.total_cost_usd += result.cost_usd
