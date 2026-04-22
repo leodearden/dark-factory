@@ -485,6 +485,34 @@ def filter_merges_within(
     return result
 
 
+def enrich_merges_with_titles(
+    merges: list[dict],
+    task_title_map: dict[str, str],
+) -> list[dict]:
+    """Return a new list of merge rows with a 'title' field added to each.
+
+    For each row, the key ``str(row['task_id'])`` is looked up in
+    *task_title_map*.  Rows with ``task_id=None`` or an unknown task_id get
+    ``title=''``.  Input rows are NOT mutated (a shallow copy is made for
+    each row).
+
+    Args:
+        merges: List of merge-row dicts (from :func:`recent_merges` or similar).
+        task_title_map: Mapping of ``str(task_id) → title`` built by
+            :func:`load_task_titles`.
+
+    Returns:
+        New list of dicts, each with an added 'title' key.
+    """
+    result: list[dict] = []
+    for row in merges:
+        raw_id = row.get('task_id')
+        key = str(raw_id) if raw_id is not None else None
+        title = task_title_map.get(key, '') if key is not None else ''
+        result.append({**row, 'title': title})
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 7. Multi-DB aggregation
 # ---------------------------------------------------------------------------
