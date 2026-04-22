@@ -472,7 +472,7 @@ class TestHappyPath:
 
         # Patch invoke_agent and run_verification
         monkeypatch.setattr(
-            'orchestrator.agents.invoke.invoke_agent', stub.invoke_agent
+            'orchestrator.workflow.invoke_agent', stub.invoke_agent
         )
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
@@ -493,7 +493,7 @@ class TestHappyPath:
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -513,7 +513,7 @@ class TestHappyPath:
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -535,7 +535,7 @@ class TestHappyPath:
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -561,7 +561,7 @@ class TestHappyPath:
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -582,7 +582,7 @@ class TestHappyPath:
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -632,7 +632,7 @@ class TestHappyPath:
             merge_queue=merge_queue,
         )
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -682,7 +682,7 @@ class TestCompletionJudge:
         }])
         workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -721,7 +721,7 @@ class TestCompletionJudge:
         ])
         workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -747,7 +747,7 @@ class TestCompletionJudge:
         stub = AgentStub(judge_verdicts=[ConnectionError('judge backend down')])
         workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -773,7 +773,7 @@ class TestCompletionJudge:
         ])
         workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -796,7 +796,7 @@ class TestCompletionJudge:
         stub = AgentStub()  # No verdicts queued; judge should never run
         workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -832,7 +832,7 @@ class TestCompletionJudge:
         }])
         workflow, _ = _build_workflow(judge_cfg, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -867,7 +867,7 @@ class TestVerifyDebugfixLoop:
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
 
         # First verify fails, second passes
         call_count = 0
@@ -909,7 +909,7 @@ class TestVerifyDebugfixLoop:
         )
         workflow, scheduler = _build_workflow(config_strict, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1016,7 +1016,7 @@ class TestReviewLoop:
         stub = ReviewAgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1077,7 +1077,7 @@ class TestBaseCommitDiff:
 
         # Mock verify to pass immediately
         monkeypatch.setattr(
-            'orchestrator.agents.invoke.invoke_agent', stub.invoke_agent
+            'orchestrator.workflow.invoke_agent', stub.invoke_agent
         )
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
@@ -1145,7 +1145,7 @@ class TestPostRebaseVerifyFailure:
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
 
         verify_call = 0
 
@@ -1202,7 +1202,7 @@ class TestBlastRadiusExpansion:
         stub = ExpandingArchitectStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1246,7 +1246,7 @@ class TestBlastRadiusExpansion:
             mcp=FakeMcp(),  # type: ignore[arg-type]
         )
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1275,7 +1275,7 @@ class TestArtifactsIntegrity:
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1309,7 +1309,7 @@ class TestArtifactsIntegrity:
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1363,7 +1363,7 @@ class TestPlanLockAndProvenance:
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1405,7 +1405,7 @@ class TestPlanLockAndProvenance:
         stub = OverwritingImplementerStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1426,7 +1426,7 @@ class TestPlanLockAndProvenance:
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1465,7 +1465,7 @@ class TestPlanLockAndProvenance:
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1508,7 +1508,7 @@ class TestPlanLockAndProvenance:
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1547,7 +1547,7 @@ class TestPlanLockAndProvenance:
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1685,7 +1685,7 @@ class TestTaskFailureEscalation:
             config, git_ops, task_assignment, stub, tmp_path,
         )
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1730,7 +1730,7 @@ class TestTaskFailureEscalation:
             config, git_ops, task_assignment, stub, tmp_path,
         )
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1757,7 +1757,7 @@ class TestTaskFailureEscalation:
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1807,7 +1807,7 @@ class TestCorruptedIterationLogEscalation:
             config, git_ops, task_assignment, stub, tmp_path,
         )
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1929,7 +1929,7 @@ class TestReviewerErrors:
             config, git_ops, task_assignment, stub, tmp_path,
         )
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -1964,7 +1964,7 @@ class TestReviewerErrors:
             config, git_ops, task_assignment, stub, tmp_path,
         )
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -2012,7 +2012,7 @@ class TestReviewerErrors:
         stub = RetryHealStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -2057,7 +2057,7 @@ class TestGhostLoopGuard:
         # 3. Build and run workflow — it should reuse the worktree and NOT skip
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -2103,7 +2103,7 @@ class TestGhostLoopGuard:
         # 3. Build and run workflow — should detect prior merge and skip
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -2141,7 +2141,7 @@ class TestWipRecoveryNoAdvance:
             config, git_ops, task_assignment, stub, tmp_path,
         )
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
@@ -2353,7 +2353,7 @@ class TestPrerequisitesValidation:
             config, git_ops, task_assignment, stub, tmp_path,
         )
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
