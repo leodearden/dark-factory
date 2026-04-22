@@ -2073,6 +2073,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if self.config.sandbox.enabled and role.name in ('implementer', 'debugger'):
             sandbox_modules = self.modules
 
+        # Warn once per workflow instance when an escalation-capable role is
+        # dispatched without an escalation queue wired up.
+        self._maybe_warn_missing_escalation(role.name)
+
         # Build MCP config — fused-memory always, escalation when available.
         # Judge gets MCP so its jcodemunch tools (in allowed_tools) actually
         # work; it does not use escalation tools but mcp_config_json handles
