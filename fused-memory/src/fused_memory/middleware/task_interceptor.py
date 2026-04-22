@@ -103,21 +103,27 @@ class TaskInterceptor:
         # shared account pool. ``None`` falls back to the legacy single-shot
         # path with no cap retry — preserved for tests.
         self._usage_gate = usage_gate
-        # Split per-project locks (2026-04-20):
+        # Split per-project locks (2026-04-20; updated 2026-04-22 for ticket queue):
         #
         # ``_write_locks`` (short, high-frequency) serialises tasks.json
         # mutations for every write op (set_task_status, update_task,
         # add_dependency, remove_dependency, and the actual tm.add_task
-        # write inside add_task). Held only across the fast Taskmaster
+        # write inside the worker). Held only across the fast Taskmaster
         # stdio call. Every mutation takes this lock.
         #
         # ``_curator_locks`` (long, curator-family) serialises the
-        # add_task / add_subtask / expand_task / parse_prd / remove_task
-        # flow so concurrent candidates can't both decide "create" for
-        # a duplicate. Held across ``curator.curate()`` (an LLM round-trip,
-        # 25-35s tail) plus the synchronous ``note_created`` + awaited
-        # ``record_task`` so the NEXT waiter on the curator lock sees the
-        # new entry on its pre-LLM check (R3).
+        # add_subtask / remove_task flow so concurrent candidates can't both
+        # decide "create" for a duplicate. Held across ``curator.curate()``
+        # (an LLM round-trip, 25-35s tail) plus the synchronous
+        # ``note_created`` + awaited ``record_task`` so the NEXT waiter on
+        # the curator lock sees the new entry on its pre-LLM check (R3).
+        #
+        # NOTE: add_task is NO LONGER in the _curator_locks scope.
+        # Serialisation for add_task is now provided by the single-worker
+        # ticket queue (_curator_worker), which processes tickets one at a
+        # time. This removes the long-held lock from the MCP hot path.
+        # add_subtask and remove_task retain _curator_lock (routing them
+        # through the worker queue is out-of-scope for this task).
         #
         # Lock ordering is always curator_lock BEFORE write_lock to avoid
         # deadlock. Write-only ops take just write_lock, so a long curator
@@ -951,10 +957,16 @@ class TaskInterceptor:
         post-write ``note_created``/``record_task`` steps so the next waiter
         on this lock sees the new entry on its pre-LLM check.
 
-        Taken by: add_task, add_subtask, remove_task (conservative: protects
+        Taken by: ``add_subtask``, ``remove_task`` (conservative: protects
         concurrent combine-target integrity). Lock order: curator_lock BEFORE
         write_lock. Short writes (set_task_status etc.) never take this lock
         and so are not blocked by an in-flight curator decision.
+
+        NOTE: ``add_task`` is **not** in this lock's scope.  The single-worker
+        ticket queue (``_curator_worker``) serialises add_task without holding
+        this lock, which obsoletes the long-held curator_lock on the hot MCP
+        path.  Routing ``add_subtask`` / ``remove_task`` through the worker
+        queue is a planned follow-up (out-of-scope for this task).
         """
         lock = self._curator_locks.get(project_id)
         if lock is None:
