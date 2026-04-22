@@ -8,6 +8,7 @@ first invoked while ``self.escalation_queue`` is None.
 from __future__ import annotations
 
 import logging
+import pytest
 from unittest.mock import MagicMock
 
 from orchestrator.workflow import TaskWorkflow
@@ -67,3 +68,15 @@ class TestMaybeWarnMissingEscalation:
             for rec in caplog.records
             if rec.levelno >= logging.WARNING
         ), 'unexpected WARNING about missing escalation_queue when queue is present'
+
+    @pytest.mark.parametrize('role_name', ['judge', 'reviewer_comprehensive'])
+    def test_no_warning_for_non_escalation_capable_role(self, caplog, role_name):
+        """No WARNING is emitted for roles that do not use escalation tools."""
+        wf = _make_workflow(escalation_queue=None)
+        with caplog.at_level(logging.WARNING):
+            wf._maybe_warn_missing_escalation(role_name)
+        assert not any(
+            'escalation_queue is unavailable' in rec.message
+            for rec in caplog.records
+            if rec.levelno >= logging.WARNING
+        ), f'unexpected WARNING for non-escalation-capable role {role_name!r}'
