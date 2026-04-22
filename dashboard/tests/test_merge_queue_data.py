@@ -2585,7 +2585,7 @@ class TestBuildPerProjectMergeQueue:
                     # Fails (TimeoutError) on sequential implementation;
                     # succeeds immediately on parallel implementation.
                     await asyncio.wait_for(all_entered.wait(), timeout=2.0)
-                except (asyncio.TimeoutError, TimeoutError):
+                except TimeoutError:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
                     raise
