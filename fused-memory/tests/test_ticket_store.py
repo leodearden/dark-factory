@@ -116,3 +116,50 @@ async def test_get_returns_row_or_none(store):
 
     missing = await store.get('tkt_nonexistent_000000000000')
     assert missing is None
+
+
+@pytest.mark.asyncio
+async def test_mark_resolved_sets_terminal_status_and_resolved_at(store):
+    """mark_resolved() sets status, resolved_at, task_id, reason, result_json."""
+    candidate = json.dumps({'title': 'T'})
+
+    # --- created ---
+    tid = await store.submit(project_id='p', candidate_json=candidate)
+    result = await store.mark_resolved(tid, status='created', task_id='42', result_json='{"id":"42"}')
+    assert result is True
+    row = await store.get(tid)
+    assert row['status'] == 'created'
+    assert row['task_id'] == '42'
+    assert row['result_json'] == '{"id":"42"}'
+    assert row['resolved_at'] is not None
+
+    # --- combined (task_id populated, reason optional) ---
+    tid2 = await store.submit(project_id='p', candidate_json=candidate)
+    await store.mark_resolved(tid2, status='combined', task_id='5', reason='dedup')
+    row2 = await store.get(tid2)
+    assert row2['status'] == 'combined'
+    assert row2['task_id'] == '5'
+    assert row2['reason'] == 'dedup'
+
+    # --- dropped (task_id None, reason populated) ---
+    tid3 = await store.submit(project_id='p', candidate_json=candidate)
+    await store.mark_resolved(tid3, status='dropped', reason='backlog_full')
+    row3 = await store.get(tid3)
+    assert row3['status'] == 'dropped'
+    assert row3['task_id'] is None
+    assert row3['reason'] == 'backlog_full'
+
+    # --- failed ---
+    tid4 = await store.submit(project_id='p', candidate_json=candidate)
+    await store.mark_resolved(tid4, status='failed', reason='db locked')
+    row4 = await store.get(tid4)
+    assert row4['status'] == 'failed'
+    assert row4['reason'] == 'db locked'
+    assert row4['resolved_at'] is not None
+
+    # Double-resolve attempt: mark_resolved on an already-resolved ticket
+    # returns False (no-op) without clobbering the existing data.
+    result_again = await store.mark_resolved(tid, status='failed', reason='clobber attempt')
+    assert result_again is False
+    row_after = await store.get(tid)
+    assert row_after['status'] == 'created'  # unchanged
