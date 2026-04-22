@@ -96,3 +96,23 @@ async def test_submit_persists_pending_ticket_and_returns_id(store):
     assert row['reason'] is None
     assert row['resolved_at'] is None
     assert row['result_json'] is None
+
+
+@pytest.mark.asyncio
+async def test_get_returns_row_or_none(store):
+    """get() returns a dict for known tickets and None for unknown ids."""
+    candidate = json.dumps({'title': 'T'})
+    ticket_id = await store.submit(project_id='proj', candidate_json=candidate)
+
+    row = await store.get(ticket_id)
+    assert row is not None
+    assert isinstance(row, dict)
+    expected_keys = {
+        'ticket_id', 'project_id', 'candidate_json', 'status',
+        'task_id', 'reason', 'result_json', 'created_at', 'resolved_at', 'expires_at',
+    }
+    assert expected_keys == set(row.keys())
+    assert row['ticket_id'] == ticket_id
+
+    missing = await store.get('tkt_nonexistent_000000000000')
+    assert missing is None
