@@ -8,9 +8,13 @@ first invoked while ``self.escalation_queue`` is None.
 from __future__ import annotations
 
 import logging
-import pytest
-from unittest.mock import MagicMock
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.roles import ARCHITECT
 from orchestrator.workflow import TaskWorkflow
 
 
@@ -97,3 +101,29 @@ class TestMaybeWarnMissingEscalation:
             f'expected exactly 1 WARNING but got {len(matching)}: {[r.message for r in matching]}'
         )
         assert wf._escalation_missing_warned is True
+
+
+class TestInvokeWiresWarning:
+    """Integration: ``_invoke`` calls ``_maybe_warn_missing_escalation``."""
+
+    @pytest.mark.asyncio
+    async def test_invoke_calls_maybe_warn_missing_escalation_for_architect(self, caplog):
+        """_invoke triggers the escalation warning for architect when queue is None."""
+        stub_result = AgentResult(success=True, output='', cost_usd=0.0)
+        wf = _make_workflow(escalation_queue=None)
+
+        with patch('orchestrator.workflow.invoke_with_cap_retry', new=AsyncMock(return_value=stub_result)):
+            with caplog.at_level(logging.WARNING):
+                await wf._invoke(ARCHITECT, prompt='x', cwd=Path('/tmp'))
+
+        assert wf._escalation_missing_warned is True, (
+            '_invoke did not set _escalation_missing_warned — helper was never called'
+        )
+        matching = [
+            rec for rec in caplog.records
+            if rec.levelno >= logging.WARNING
+            and 'escalation_queue is unavailable' in rec.message
+        ]
+        assert len(matching) == 1, (
+            f'expected exactly 1 escalation WARNING from _invoke, got {len(matching)}'
+        )
