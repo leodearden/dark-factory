@@ -6,7 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
@@ -352,9 +352,18 @@ class FusedMemoryConfig(BaseModel):
 
 
 class SandboxConfig(BaseModel):
-    """Bubblewrap filesystem sandbox configuration."""
+    """Filesystem sandbox configuration.
+
+    ``backend`` selects the enforcement mechanism:
+    - ``auto`` (default): prefer landlock if available, else bwrap, else unsandboxed
+    - ``landlock``: kernel LSM; works in all namespaces. Requires kernel 5.13+
+    - ``bwrap``: bubblewrap + user namespace. Bun v1.3.13 crashes under this
+      on kernel 6.17; prefer landlock on affected hosts
+    - ``none``: explicit opt-out — run unsandboxed (same effect as ``enabled: false``)
+    """
 
     enabled: bool = Field(default=True)
+    backend: Literal['auto', 'bwrap', 'landlock', 'none'] = Field(default='auto')
 
 
 class EscalationConfig(BaseModel):

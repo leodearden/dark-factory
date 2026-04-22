@@ -58,7 +58,9 @@ fused_memory:
     - "--transport"
     - "http"
 
-# Sandbox — disabled due to Bun segfault inside bwrap on this kernel (6.17)
+# Sandbox — disabled due to Bun segfault inside bwrap on this kernel (6.17).
+# A landlock backend now exists (SandboxConfig.backend: landlock) that sidesteps
+# the bwrap/userns issue — flip to `enabled: true, backend: landlock` when ready.
 sandbox:
   enabled: false
 
