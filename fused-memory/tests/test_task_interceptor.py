@@ -2886,3 +2886,80 @@ async def test_add_task_no_longer_takes_curator_lock(
     assert acquisition_count == 1, (
         f'add_subtask should acquire _curator_lock exactly once; got {acquisition_count}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-63: regression — no lost-wakeup between terminal-check and event-register
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_ticket_no_lost_wakeup_between_read_and_register(
+    interceptor_with_store, ticket_store,
+):
+    """Regression: worker completing between the initial row-read and event
+    registration must NOT cause resolve_ticket to hang.
+
+    The old flow (read → register) had a window where _signal_ticket_event
+    fires with no registered event, so the signal is lost and event.wait()
+    blocks indefinitely.  The fixed flow (register → read → re-check) closes
+    this: either the read already sees terminal, or the signal arrives after
+    registration and event.wait() returns immediately.
+
+    This test simulates the race by monkeypatching ticket_store.get so that
+    the first pending-returning call:
+      (a) marks the ticket resolved in the store, and
+      (b) calls interceptor._signal_ticket_event(ticket_id)
+    *before* returning the (now stale) pending row.
+
+    Under the OLD implementation _signal_ticket_event finds an empty
+    _ticket_events dict and the signal is lost, so event.wait() hangs and
+    asyncio.wait_for(timeout=2) raises TimeoutError.
+
+    Under the FIXED implementation the event is registered BEFORE the first
+    get() call, so _signal_ticket_event finds and sets the event; event.wait()
+    returns immediately and resolve_ticket returns the terminal result.
+    """
+    # Submit a ticket — creates a pending row in the store.
+    # Don't start the worker (don't call submit_task which would start it);
+    # we insert the ticket directly to avoid real worker interference.
+    ticket_id = await ticket_store.submit(
+        project_id='p',
+        candidate_json='{}',
+        ttl_seconds=600,
+    )
+
+    original_get = ticket_store.get
+    call_count = 0
+
+    async def racing_get(tid: str):
+        nonlocal call_count
+        row = await original_get(tid)
+        # On the first pending-returning call only: simulate the worker
+        # completing between the caller's terminal-check and event-registration.
+        if call_count == 0 and row is not None and row['status'] == 'pending':
+            call_count += 1
+            # Mark resolved in the store (worker's write).
+            await ticket_store.mark_resolved(tid, status='created', task_id='42')
+            # Signal the event — under the FIXED flow the event is already
+            # registered so the signal is not lost; under OLD flow it is lost.
+            interceptor_with_store._signal_ticket_event(tid)
+        # Return the stale row (as it was before mark_resolved) so the caller
+        # falls through to the wait path even under the fixed implementation.
+        return row
+
+    ticket_store.get = racing_get
+    try:
+        result = await asyncio.wait_for(
+            interceptor_with_store.resolve_ticket(ticket_id, '/p', timeout_seconds=None),
+            timeout=2.0,
+        )
+    finally:
+        ticket_store.get = original_get
+
+    assert result.get('status') == 'created', (
+        f'Expected status=created but got: {result!r}'
+    )
+    assert result.get('task_id') == '42', (
+        f'Expected task_id=42 but got: {result!r}'
+    )
