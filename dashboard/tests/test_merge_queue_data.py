@@ -2082,3 +2082,96 @@ class TestAggregateQueueDepthTimeseriesNow:
             f"result={result}"
         )
 
+
+# ---------------------------------------------------------------------------
+# TestProjectScopedDbsLabeled (step-1)
+# ---------------------------------------------------------------------------
+
+
+class TestProjectScopedDbsLabeled:
+    """Tests for app._project_scoped_dbs_labeled."""
+
+    async def test_returns_pid_db_pairs(self, tmp_path):
+        """Returns (str(root), connection|None) pairs, main project first."""
+        from pathlib import Path
+
+        from dashboard.app import _project_scoped_dbs_labeled
+        from dashboard.config import DashboardConfig
+        from dashboard.data.db import DbPool
+
+        root_a = tmp_path / 'A'
+        root_b = tmp_path / 'B'
+        root_a.mkdir()
+        root_b.mkdir()
+
+        config = DashboardConfig(
+            project_root=root_a,
+            known_project_roots=[root_b],
+        )
+        pool = DbPool()
+        try:
+            rel = Path('data/orchestrator/runs.db')
+            result = await _project_scoped_dbs_labeled(config, pool, rel)
+        finally:
+            await pool.close_all()
+
+        # (a) Returns list of 2 tuples
+        assert isinstance(result, list)
+        assert len(result) == 2
+
+        # (b) each element is a (str, ...) pair
+        for pid, _db in result:
+            assert isinstance(pid, str)
+
+        # (c) main project root is always index 0
+        pids = [pid for pid, _ in result]
+        assert pids[0] == str(config.project_root)
+        assert pids[1] == str(config.known_project_roots[0])
+
+    async def test_deduplicates_duplicate_roots(self, tmp_path):
+        """When known_project_roots contains the same path as project_root, only one entry."""
+        from pathlib import Path
+
+        from dashboard.app import _project_scoped_dbs_labeled
+        from dashboard.config import DashboardConfig
+        from dashboard.data.db import DbPool
+
+        root_a = tmp_path / 'A'
+        root_a.mkdir()
+
+        config = DashboardConfig(
+            project_root=root_a,
+            known_project_roots=[root_a],  # duplicate
+        )
+        pool = DbPool()
+        try:
+            rel = Path('data/orchestrator/runs.db')
+            result = await _project_scoped_dbs_labeled(config, pool, rel)
+        finally:
+            await pool.close_all()
+
+        assert len(result) == 1
+        assert result[0][0] == str(config.project_root)
+
+    async def test_db_is_none_when_file_missing(self, tmp_path):
+        """Returns None connection when the DB file does not exist."""
+        from pathlib import Path
+
+        from dashboard.app import _project_scoped_dbs_labeled
+        from dashboard.config import DashboardConfig
+        from dashboard.data.db import DbPool
+
+        root_a = tmp_path / 'A'
+        root_a.mkdir()
+        config = DashboardConfig(project_root=root_a)
+        pool = DbPool()
+        try:
+            rel = Path('data/orchestrator/runs.db')  # file not created
+            result = await _project_scoped_dbs_labeled(config, pool, rel)
+        finally:
+            await pool.close_all()
+
+        assert len(result) == 1
+        _pid, db = result[0]
+        assert db is None  # file does not exist → None connection
+
