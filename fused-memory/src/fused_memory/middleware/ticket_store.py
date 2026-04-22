@@ -175,6 +175,28 @@ class TicketStore:
         logger.info('flush_pending_on_startup: marked %d pending tickets as failed', count)
         return count
 
+    async def sweep_expired(self, now: datetime | None = None) -> int:
+        """Mark pending tickets past their ``expires_at`` as failed/expired.
+
+        Returns the number of rows updated.
+        """
+        if now is None:
+            now = datetime.now(UTC)
+        resolved_at = datetime.now(UTC).isoformat()
+        async with self._txn() as db:
+            cursor = await db.execute(
+                """
+                UPDATE tickets
+                SET status = 'failed', reason = 'expired', resolved_at = ?
+                WHERE status = 'pending' AND expires_at < ?
+                """,
+                (resolved_at, now.isoformat()),
+            )
+        count = cursor.rowcount
+        if count:
+            logger.info('sweep_expired: expired %d tickets', count)
+        return count
+
     async def get(self, ticket_id: str) -> dict | None:
         """Return the ticket row as a plain dict, or None if not found."""
         db = self._require_db()
