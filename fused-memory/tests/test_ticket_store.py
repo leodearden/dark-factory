@@ -1,6 +1,8 @@
 """Tests for the TicketStore SQLite persistence layer (two-phase add_task)."""
 
 import asyncio
+import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
@@ -66,3 +68,31 @@ async def test_new_ticket_id_has_tkt_prefix_and_sorts_by_time():
 
     # Later id sorts after the earlier one (monotonic time-ordered)
     assert id1 < id2, f"Expected id1 < id2 but got {id1!r} >= {id2!r}"
+
+
+@pytest.mark.asyncio
+async def test_submit_persists_pending_ticket_and_returns_id(store):
+    """submit() inserts a pending row and returns a tkt_-prefixed id."""
+    candidate = json.dumps({'title': 'Test Task', 'description': 'Do it'})
+    ticket_id = await store.submit(project_id='p', candidate_json=candidate, ttl_seconds=600)
+
+    assert ticket_id.startswith('tkt_')
+
+    # Verify the persisted row
+    row = await store.get(ticket_id)
+    assert row is not None
+    assert row['status'] == 'pending'
+    assert row['project_id'] == 'p'
+    assert row['candidate_json'] == candidate
+
+    # created_at and expires_at must be set
+    created_at = datetime.fromisoformat(row['created_at'])
+    expires_at = datetime.fromisoformat(row['expires_at'])
+    assert created_at.tzinfo is not None  # timezone-aware
+    assert expires_at == created_at + timedelta(seconds=600)
+
+    # Unresolved columns must be NULL
+    assert row['task_id'] is None
+    assert row['reason'] is None
+    assert row['resolved_at'] is None
+    assert row['result_json'] is None
