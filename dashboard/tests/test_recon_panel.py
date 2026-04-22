@@ -193,20 +193,35 @@ class TestFormatDuration:
 
 MOCK_BUFFER_STATS = {'buffered_count': 3, 'oldest_event_age_seconds': 600.0}
 
-MOCK_BURST_STATE = [
-    {
-        'agent_id': 'agent-1',
-        'state': 'bursting',
-        'last_write_at': '2026-03-19T00:00:00+00:00',
-        'burst_started_at': '2026-03-19T00:00:00+00:00',
-    },
-    {
-        'agent_id': 'agent-2',
-        'state': 'idle',
-        'last_write_at': '2026-03-19T00:00:00+00:00',
-        'burst_started_at': None,
-    },
-]
+def mock_burst_state() -> list[dict]:
+    """Return a fresh list with recent timestamps (mutation-safe factory).
+
+    Both agents are active/recent so they survive the partition_burst_state
+    filter applied in partials_recon (1-hour active threshold):
+    - agent-1: state='bursting' (non-idle) → always kept.
+    - agent-2: state='idle', last_write_at=5m ago → kept (within 1h threshold).
+    """
+    now = datetime.now(UTC)
+    return [
+        {
+            'agent_id': 'agent-1',
+            'state': 'bursting',
+            'last_write_at': (now - timedelta(minutes=5)).isoformat(),
+            'burst_started_at': (now - timedelta(minutes=5)).isoformat(),
+        },
+        {
+            'agent_id': 'agent-2',
+            'state': 'idle',
+            'last_write_at': (now - timedelta(minutes=5)).isoformat(),
+            'burst_started_at': None,
+        },
+    ]
+
+
+# Kept for backwards compatibility — callers that need a static reference
+# should switch to mock_burst_state(); the variable is no longer used in
+# _patch_recon_data (which now calls the factory).
+MOCK_BURST_STATE = mock_burst_state()
 
 MOCK_WATERMARKS = [
     {
@@ -272,7 +287,7 @@ def _patch_recon_data(buffer_stats=_UNSET, burst_state=_UNSET, watermarks=_UNSET
     stack.enter_context(patch(
         'dashboard.app.get_burst_state',
         new_callable=AsyncMock,
-        return_value=burst_state if burst_state is not _UNSET else MOCK_BURST_STATE,
+        return_value=burst_state if burst_state is not _UNSET else mock_burst_state(),
     ))
     stack.enter_context(patch(
         'dashboard.app.get_watermarks',
@@ -973,6 +988,69 @@ class TestPartitionBurstStateNoneGuard:
         active, idle = partition_burst_state([agent])
         assert idle == [agent]
         assert active == []
+
+
+# ---------------------------------------------------------------------------
+# TestBurstStateStaleFilter — only active/recent agents shown (step-19/20)
+# ---------------------------------------------------------------------------
+
+class TestBurstStateStaleFilter:
+    """The recon partial must show only agents that are active or recently written."""
+
+    def test_old_idle_agent_hidden(self, client):
+        """Stale idle agent (last_write_at > 1h ago) must not appear in the rendered HTML.
+
+        Three agents:
+        - agent-active-bursting: state='bursting', last_write_at=2h ago.
+          Must appear: non-idle state overrides the staleness check.
+        - agent-active-idle-recent: state='idle', last_write_at=10m ago.
+          Must appear: within the 1-hour active threshold.
+        - agent-stale-idle: state='idle', last_write_at=2h ago.
+          Must NOT appear: idle AND last_write_at is older than 1 hour.
+
+        Before step-20 (partition_burst_state applied in route), the filter is
+        absent and all three agents are forwarded to the template, so this test
+        fails on the 'not in html' assertion.
+        """
+        two_hours_ago = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        ten_minutes_ago = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+
+        mock_burst = [
+            {
+                'agent_id': 'agent-active-bursting',
+                'state': 'bursting',
+                'last_write_at': two_hours_ago,
+                'burst_started_at': two_hours_ago,
+            },
+            {
+                'agent_id': 'agent-active-idle-recent',
+                'state': 'idle',
+                'last_write_at': ten_minutes_ago,
+                'burst_started_at': None,
+            },
+            {
+                'agent_id': 'agent-stale-idle',
+                'state': 'idle',
+                'last_write_at': two_hours_ago,
+                'burst_started_at': None,
+            },
+        ]
+
+        with _patch_recon_data(burst_state=mock_burst):
+            html = client.get('/partials/recon').text
+
+        # agent-active-bursting: non-idle state — must appear
+        assert 'agent-active-bursting' in html, (
+            'agent-active-bursting (bursting state) should appear regardless of last_write_at'
+        )
+        # agent-active-idle-recent: idle but recent — must appear
+        assert 'agent-active-idle-recent' in html, (
+            'agent-active-idle-recent (idle, 10m ago) should appear (within 1h threshold)'
+        )
+        # agent-stale-idle: idle AND stale — must NOT appear
+        assert 'agent-stale-idle' not in html, (
+            'agent-stale-idle (idle, 2h ago) should be filtered out by partition_burst_state'
+        )
 
 
 class TestRunPanelAlpineComponent:

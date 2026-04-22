@@ -20,12 +20,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import aiosqlite
 
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.db import with_db
+from dashboard.data.orchestrator import load_task_tree
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import parse_utc
 
@@ -353,6 +356,7 @@ async def recent_merges(
     *,
     limit: int = 20,
     hours: int = 168,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Most recent merge_attempt events, newest first.
 
@@ -361,6 +365,9 @@ async def recent_merges(
         limit: Maximum number of rows to return.
         hours: Look-back window in hours (default 168 = 7 days).  Only
             events with ``timestamp >= now - hours`` are included.
+        now: Reference timestamp for the cutoff window (default:
+            ``datetime.now(UTC)``).  Pass an explicit value in tests for
+            full determinism.
 
     Returns list of {'task_id', 'run_id', 'outcome', 'duration_ms',
                      'timestamp'} dicts.
@@ -369,7 +376,7 @@ async def recent_merges(
         return []
 
     async def _query(conn: aiosqlite.Connection) -> list[dict]:
-        since = _cutoff_iso(hours)
+        since = _cutoff_iso(hours, now=now)
         rows = await conn.execute_fetchall(
             "SELECT task_id, run_id, "
             "       json_extract(data, '$.outcome') AS outcome, "
@@ -449,7 +456,161 @@ async def speculative_stats(
 
 
 # ---------------------------------------------------------------------------
-# 6. Multi-DB aggregation
+# 6. Per-project helpers
+# ---------------------------------------------------------------------------
+
+
+def filter_merges_within(
+    merges: list[dict],
+    *,
+    minutes: int,
+    now: datetime | None = None,
+) -> list[dict]:
+    """Return only the rows whose timestamp falls within the last *minutes*.
+
+    Args:
+        merges: List of merge-row dicts.  Each dict must have a 'timestamp' key
+            whose value is an ISO-8601 string parseable by :func:`parse_utc`.
+        minutes: Sliding-window width in minutes.  Rows older than
+            ``now - timedelta(minutes=minutes)`` are excluded.
+        now: Reference timestamp.  Defaults to ``datetime.now(UTC)`` when None.
+
+    Returns:
+        A new list preserving the input order.  Rows with missing or malformed
+        timestamps are silently dropped.
+    """
+    effective_now = now if now is not None else datetime.now(UTC)
+    cutoff = effective_now - timedelta(minutes=minutes)
+    result: list[dict] = []
+    for row in merges:
+        try:
+            ts = parse_utc(row.get('timestamp')).astimezone(UTC)
+            if ts >= cutoff:
+                result.append(row)
+        except (ValueError, TypeError, AttributeError):
+            pass  # malformed timestamp or parse_utc returned None → drop row
+    return result
+
+
+def enrich_merges_with_titles(
+    merges: list[dict],
+    task_title_map: dict[str, str],
+) -> list[dict]:
+    """Return a new list of merge rows with a 'title' field added to each.
+
+    For each row, the key ``str(row['task_id'])`` is looked up in
+    *task_title_map*.  Rows with ``task_id=None`` or an unknown task_id get
+    ``title=''``.  Input rows are NOT mutated (a shallow copy is made for
+    each row).
+
+    Args:
+        merges: List of merge-row dicts (from :func:`recent_merges` or similar).
+        task_title_map: Mapping of ``str(task_id) → title`` built by
+            :func:`load_task_titles`.
+
+    Returns:
+        New list of dicts, each with an added 'title' key.
+    """
+    result: list[dict] = []
+    for row in merges:
+        raw_id = row.get('task_id')
+        title = task_title_map.get(str(raw_id), '') if raw_id is not None else ''
+        result.append({**row, 'title': title})
+    return result
+
+
+def load_task_titles(tasks_json_path: Path) -> dict[str, str]:
+    """Return a {str(task_id): title} map from a Taskmaster tasks.json file.
+
+    Wraps :func:`dashboard.data.orchestrator.load_task_tree` and builds the
+    mapping needed by :func:`enrich_merges_with_titles`.  Tasks without a
+    title (``title=None`` or missing) are omitted.
+
+    Args:
+        tasks_json_path: Path to the ``.taskmaster/tasks/tasks.json`` file.
+
+    Returns:
+        Dict mapping ``str(task.id)`` to ``task.title``.  Returns ``{}`` on
+        missing file, invalid JSON, or missing tasks structure.
+    """
+    tasks = load_task_tree(tasks_json_path)
+    return {str(t['id']): t['title'] for t in tasks if t.get('title')}
+
+
+async def build_per_project_merge_queue(
+    project_dbs: Sequence[tuple[str, aiosqlite.Connection | None]],
+    *,
+    hours: int,
+    now: datetime,
+    recent_window_minutes: int,
+) -> dict[str, dict]:
+    """Build per-project merge queue stats by querying each project's DB independently.
+
+    For each ``(pid, db)`` pair, gathers the 5 per-DB stats concurrently and
+    applies :func:`filter_merges_within` to the recent-merges list.  Pairs with
+    ``db=None`` produce empty/default stats (the per-DB functions handle None
+    gracefully by returning declared defaults).
+
+    Args:
+        project_dbs: List of ``(project_root_str, connection_or_None)`` tuples
+            from :func:`_project_scoped_dbs_labeled`.
+        hours: Look-back window in hours (forwarded to each per-DB function).
+        now: Shared reference timestamp captured once per request.
+        recent_window_minutes: Sliding window for recent-merges trimming.
+
+    Returns:
+        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, speculative}}``.
+    """
+    _DEFAULT_DEPTH: ChartData = {'labels': [], 'values': []}
+    _DEFAULT_OUTCOMES: ChartData = {'labels': [], 'values': []}
+    _DEFAULT_LATENCY = {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
+    _DEFAULT_SPEC = {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+
+    def _safe(result: object, default: object, label: str) -> object:
+        if isinstance(result, BaseException):
+            logger.warning('build_per_project_merge_queue %s: %s', label, result)
+            return default
+        return result
+
+    out: dict[str, dict] = {}
+    for pid, db in project_dbs:
+        depth_r, outcomes_r, latency_r, recent_r, spec_r = await asyncio.gather(
+            queue_depth_timeseries(db, hours=hours, now=now),
+            outcome_distribution(db, hours=hours, now=now),
+            latency_stats(db, hours=hours, now=now),
+            recent_merges(db, limit=50, hours=hours, now=now),
+            speculative_stats(db, hours=hours, now=now),
+            return_exceptions=True,
+        )
+        depth = _safe(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
+        outcomes = _safe(outcomes_r, _DEFAULT_OUTCOMES, f'{pid}/outcomes')
+        latency = _safe(latency_r, _DEFAULT_LATENCY, f'{pid}/latency')
+        recent_raw = _safe(recent_r, [], f'{pid}/recent')
+        spec = _safe(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
+
+        recent_trimmed = filter_merges_within(
+            recent_raw,  # type: ignore[arg-type]
+            minutes=recent_window_minutes,
+            now=now,
+        )
+        out[pid] = {
+            'depth_timeseries': depth,
+            'outcomes': outcomes,
+            'latency': latency,
+            'recent': recent_trimmed,
+            'speculative': spec,
+        }
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 7. Multi-DB aggregation
+#
+# NOTE: These aggregate_* functions are no longer called by the partials_merge_queue
+# route (which now uses build_per_project_merge_queue for per-project isolation).
+# They are retained for future cross-project roll-up callers (e.g. a planned summary
+# panel or export endpoint).  If no such caller materialises, delete them and their
+# dedicated tests as dead code.
 # ---------------------------------------------------------------------------
 
 async def aggregate_queue_depth_timeseries(

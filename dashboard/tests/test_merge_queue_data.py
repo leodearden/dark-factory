@@ -2082,3 +2082,448 @@ class TestAggregateQueueDepthTimeseriesNow:
             f"result={result}"
         )
 
+
+# ---------------------------------------------------------------------------
+# TestProjectScopedDbsLabeled (step-1)
+# ---------------------------------------------------------------------------
+
+
+class TestProjectScopedDbsLabeled:
+    """Tests for app._project_scoped_dbs_labeled."""
+
+    async def test_returns_pid_db_pairs(self, tmp_path):
+        """Returns (str(root), connection|None) pairs, main project first."""
+        from pathlib import Path
+
+        from dashboard.app import _project_scoped_dbs_labeled
+        from dashboard.config import DashboardConfig
+        from dashboard.data.db import DbPool
+
+        root_a = tmp_path / 'A'
+        root_b = tmp_path / 'B'
+        root_a.mkdir()
+        root_b.mkdir()
+
+        config = DashboardConfig(
+            project_root=root_a,
+            known_project_roots=[root_b],
+        )
+        pool = DbPool()
+        try:
+            rel = Path('data/orchestrator/runs.db')
+            result = await _project_scoped_dbs_labeled(config, pool, rel)
+        finally:
+            await pool.close_all()
+
+        # (a) Returns list of 2 tuples
+        assert isinstance(result, list)
+        assert len(result) == 2
+
+        # (b) each element is a (str, ...) pair
+        for pid, _db in result:
+            assert isinstance(pid, str)
+
+        # (c) main project root is always index 0
+        pids = [pid for pid, _ in result]
+        assert pids[0] == str(config.project_root)
+        assert pids[1] == str(config.known_project_roots[0])
+
+    async def test_deduplicates_duplicate_roots(self, tmp_path):
+        """When known_project_roots contains the same path as project_root, only one entry."""
+        from pathlib import Path
+
+        from dashboard.app import _project_scoped_dbs_labeled
+        from dashboard.config import DashboardConfig
+        from dashboard.data.db import DbPool
+
+        root_a = tmp_path / 'A'
+        root_a.mkdir()
+
+        config = DashboardConfig(
+            project_root=root_a,
+            known_project_roots=[root_a],  # duplicate
+        )
+        pool = DbPool()
+        try:
+            rel = Path('data/orchestrator/runs.db')
+            result = await _project_scoped_dbs_labeled(config, pool, rel)
+        finally:
+            await pool.close_all()
+
+        assert len(result) == 1
+        assert result[0][0] == str(config.project_root)
+
+    async def test_db_is_none_when_file_missing(self, tmp_path):
+        """Returns None connection when the DB file does not exist."""
+        from pathlib import Path
+
+        from dashboard.app import _project_scoped_dbs_labeled
+        from dashboard.config import DashboardConfig
+        from dashboard.data.db import DbPool
+
+        root_a = tmp_path / 'A'
+        root_a.mkdir()
+        config = DashboardConfig(project_root=root_a)
+        pool = DbPool()
+        try:
+            rel = Path('data/orchestrator/runs.db')  # file not created
+            result = await _project_scoped_dbs_labeled(config, pool, rel)
+        finally:
+            await pool.close_all()
+
+        assert len(result) == 1
+        _pid, db = result[0]
+        assert db is None  # file does not exist → None connection
+
+
+# ---------------------------------------------------------------------------
+# TestFilterMergesWithin (step-3)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterMergesWithin:
+    """Tests for merge_queue.filter_merges_within."""
+
+    def _make_row(self, offset_minutes, task_id='t1'):
+        """Build a merge row dict with timestamp = NOW - offset_minutes."""
+        ts = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC) - timedelta(minutes=offset_minutes)
+        return {'task_id': task_id, 'timestamp': ts.isoformat(), 'outcome': 'done'}
+
+    def test_keeps_rows_within_window(self):
+        """Rows at -5m, -10m, -14m59s survive a 15-minute window."""
+        from dashboard.data.merge_queue import filter_merges_within
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        rows = [
+            self._make_row(5, task_id='t_5m'),    # 5m ago  → in
+            self._make_row(10, task_id='t_10m'),  # 10m ago → in
+            {'task_id': 't3', 'timestamp': (now - timedelta(minutes=14, seconds=59)).isoformat(),
+             'outcome': 'done'},                   # 14m59s ago → in (< 15m)
+            self._make_row(20, task_id='t_20m'),  # 20m ago → out
+            {'task_id': 't5', 'timestamp': (now - timedelta(minutes=15, seconds=1)).isoformat(),
+             'outcome': 'done'},                   # 15m01s ago → out
+        ]
+        result = filter_merges_within(rows, minutes=15, now=now)
+        task_ids = [r['task_id'] for r in result]
+        assert 't_5m' in task_ids   # 5m ago — must survive
+        assert 't_10m' in task_ids  # 10m ago — must survive (both rows, not just one)
+        assert 't3' in task_ids     # 14m59s — must survive
+        assert 't_20m' not in task_ids  # 20m ago — must be filtered
+        assert 't5' not in task_ids     # 15m01s — must be filtered
+
+    def test_filters_out_old_rows(self):
+        """Rows older than the window are excluded."""
+        from dashboard.data.merge_queue import filter_merges_within
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        rows = [self._make_row(20), self._make_row(30)]
+        result = filter_merges_within(rows, minutes=15, now=now)
+        assert result == []
+
+    def test_empty_list_passthrough(self):
+        """Empty input returns empty output."""
+        from dashboard.data.merge_queue import filter_merges_within
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        assert filter_merges_within([], minutes=15, now=now) == []
+
+    def test_malformed_timestamp_filtered_out(self):
+        """A row with unparseable timestamp is dropped defensively."""
+        from dashboard.data.merge_queue import filter_merges_within
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        rows = [
+            {'task_id': 'bad', 'timestamp': 'not-a-date', 'outcome': 'done'},
+            self._make_row(5),  # valid, should survive
+        ]
+        result = filter_merges_within(rows, minutes=15, now=now)
+        task_ids = [r['task_id'] for r in result]
+        assert 'bad' not in task_ids
+        assert 't1' in task_ids
+
+    def test_preserves_input_order(self):
+        """Output order matches input order (no re-sorting)."""
+        from dashboard.data.merge_queue import filter_merges_within
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        rows = [
+            {'task_id': 'first', 'timestamp': (now - timedelta(minutes=1)).isoformat(), 'outcome': 'done'},
+            {'task_id': 'second', 'timestamp': (now - timedelta(minutes=2)).isoformat(), 'outcome': 'done'},
+            {'task_id': 'third', 'timestamp': (now - timedelta(minutes=3)).isoformat(), 'outcome': 'done'},
+        ]
+        result = filter_merges_within(rows, minutes=15, now=now)
+        assert [r['task_id'] for r in result] == ['first', 'second', 'third']
+
+    def test_now_defaults_to_current_time(self):
+        """When now=None, filter uses the current wall clock (smoke test)."""
+        from dashboard.data.merge_queue import filter_merges_within
+
+        # A row timestamped 2 minutes ago should survive a 15-minute window
+        ts = (datetime.now(UTC) - timedelta(minutes=2)).isoformat()
+        rows = [{'task_id': 'recent', 'timestamp': ts, 'outcome': 'done'}]
+        result = filter_merges_within(rows, minutes=15)
+        assert len(result) == 1
+        assert result[0]['task_id'] == 'recent'
+
+
+# ---------------------------------------------------------------------------
+# TestEnrichMergesWithTitles (step-5)
+# ---------------------------------------------------------------------------
+
+
+class TestEnrichMergesWithTitles:
+    """Tests for merge_queue.enrich_merges_with_titles."""
+
+    def test_maps_titles_by_task_id(self):
+        """task_id keys resolve to matching title values."""
+        from dashboard.data.merge_queue import enrich_merges_with_titles
+
+        merges = [
+            {'task_id': '7', 'outcome': 'done'},
+            {'task_id': '42', 'outcome': 'conflict'},
+        ]
+        title_map = {'7': 'Fix X', '42': 'Add Y'}
+        result = enrich_merges_with_titles(merges, title_map)
+        assert result[0]['title'] == 'Fix X'
+        assert result[1]['title'] == 'Add Y'
+
+    def test_none_task_id_gets_empty_title(self):
+        """task_id=None maps to empty string (no KeyError)."""
+        from dashboard.data.merge_queue import enrich_merges_with_titles
+
+        merges = [{'task_id': None, 'outcome': 'done'}]
+        result = enrich_merges_with_titles(merges, {'7': 'Fix X'})
+        assert result[0]['title'] == ''
+
+    def test_unknown_task_id_gets_empty_title(self):
+        """task_id not in title_map maps to empty string."""
+        from dashboard.data.merge_queue import enrich_merges_with_titles
+
+        merges = [{'task_id': '99', 'outcome': 'done'}]
+        result = enrich_merges_with_titles(merges, {'7': 'Fix X'})
+        assert result[0]['title'] == ''
+
+    def test_extra_title_map_keys_ignored(self):
+        """Keys in title_map absent from merges are ignored."""
+        from dashboard.data.merge_queue import enrich_merges_with_titles
+
+        merges = [{'task_id': '7', 'outcome': 'done'}]
+        title_map = {'7': 'Fix X', '99': 'Extra'}
+        result = enrich_merges_with_titles(merges, title_map)
+        assert len(result) == 1
+        assert result[0]['title'] == 'Fix X'
+
+    def test_does_not_mutate_input_rows(self):
+        """Input dicts are not modified (shallow-copy semantics)."""
+        from dashboard.data.merge_queue import enrich_merges_with_titles
+
+        original = {'task_id': '7', 'outcome': 'done'}
+        merges = [original]
+        enrich_merges_with_titles(merges, {'7': 'Fix X'})
+        assert 'title' not in original  # original row not mutated
+
+    def test_int_task_id_resolved_via_str_conversion(self):
+        """Integer task_id converts to str and resolves correctly."""
+        from dashboard.data.merge_queue import enrich_merges_with_titles
+
+        merges = [{'task_id': 7, 'outcome': 'done'}]  # int, not str
+        result = enrich_merges_with_titles(merges, {'7': 'Fix X'})
+        assert result[0]['title'] == 'Fix X'
+
+    def test_returns_new_list(self):
+        """Return value is a new list, not the input list."""
+        from dashboard.data.merge_queue import enrich_merges_with_titles
+
+        merges = [{'task_id': '7', 'outcome': 'done'}]
+        result = enrich_merges_with_titles(merges, {'7': 'Fix X'})
+        assert result is not merges
+
+
+# ---------------------------------------------------------------------------
+# TestLoadTaskTitles (step-7)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadTaskTitles:
+    """Tests for merge_queue.load_task_titles."""
+
+    def _write_tasks_json(self, path, tasks, format='master'):
+        """Write a tasks.json file in the given format."""
+        import json
+        data = {'master': {'tasks': tasks}} if format == 'master' else {'tasks': tasks}
+        path.write_text(json.dumps(data))
+
+    def test_master_format_returns_str_keyed_dict(self, tmp_path):
+        """Reads {'master': {'tasks': [...]}} format and returns {str(id): title}."""
+        from dashboard.data.merge_queue import load_task_titles
+
+        tasks_path = tmp_path / 'tasks.json'
+        self._write_tasks_json(tasks_path, [
+            {'id': 1, 'title': 'A'},
+            {'id': 2, 'title': 'B'},
+        ])
+        result = load_task_titles(tasks_path)
+        assert result == {'1': 'A', '2': 'B'}
+
+    def test_flat_format_also_works(self, tmp_path):
+        """Reads {'tasks': [...]} format correctly."""
+        from dashboard.data.merge_queue import load_task_titles
+
+        tasks_path = tmp_path / 'tasks.json'
+        self._write_tasks_json(tasks_path, [
+            {'id': 1, 'title': 'A'},
+            {'id': 2, 'title': 'B'},
+        ], format='flat')
+        result = load_task_titles(tasks_path)
+        assert result == {'1': 'A', '2': 'B'}
+
+    def test_missing_file_returns_empty_dict(self, tmp_path):
+        """Returns {} when the file does not exist."""
+        from dashboard.data.merge_queue import load_task_titles
+
+        result = load_task_titles(tmp_path / 'nonexistent.json')
+        assert result == {}
+
+    def test_malformed_json_returns_empty_dict(self, tmp_path):
+        """Returns {} for invalid JSON."""
+        from dashboard.data.merge_queue import load_task_titles
+
+        tasks_path = tmp_path / 'tasks.json'
+        tasks_path.write_text('{ invalid json ]')
+        result = load_task_titles(tasks_path)
+        assert result == {}
+
+    def test_none_title_is_omitted(self, tmp_path):
+        """Tasks with title=None are omitted from the result."""
+        from dashboard.data.merge_queue import load_task_titles
+
+        tasks_path = tmp_path / 'tasks.json'
+        self._write_tasks_json(tasks_path, [
+            {'id': 1, 'title': None},
+            {'id': 2, 'title': 'B'},
+        ])
+        result = load_task_titles(tasks_path)
+        assert '1' not in result
+        assert result.get('2') == 'B'
+
+
+# ---------------------------------------------------------------------------
+# TestBuildPerProjectMergeQueue (step-9)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPerProjectMergeQueue:
+    """Tests for merge_queue.build_per_project_merge_queue."""
+
+    async def test_returns_dict_keyed_by_pid(self, tmp_path):
+        """Result dict has one entry per (pid, db) pair."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db1_path = _make_db(tmp_path, 'a.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
+             'task_id': 'task-A', 'run_id': 'rA', 'data': {'outcome': 'done'}, 'duration_ms': 1000},
+        ])
+        db2_path = _make_db(tmp_path, 'b.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=7),
+             'task_id': 'task-B', 'run_id': 'rB', 'data': {'outcome': 'conflict'}, 'duration_ms': 2000},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1_path)) as conn1,
+            aiosqlite.connect(str(db2_path)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            project_dbs = [('/tmp/A', conn1), ('/tmp/B', conn2)]
+            result = await build_per_project_merge_queue(
+                project_dbs, hours=24, now=now, recent_window_minutes=15,
+            )
+
+        # (a) dict with both pid keys
+        assert isinstance(result, dict)
+        assert set(result.keys()) == {'/tmp/A', '/tmp/B'}
+
+        # (b) each value has the expected keys
+        for pid_data in result.values():
+            assert set(pid_data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
+
+    async def test_per_project_isolation(self, tmp_path):
+        """Each project's stats reflect only its own DB rows."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db1_path = _make_db(tmp_path, 'a.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
+             'task_id': 'task-A1', 'run_id': 'rA1', 'data': {'outcome': 'done'}, 'duration_ms': 500},
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
+             'task_id': 'task-A2', 'run_id': 'rA2', 'data': {'outcome': 'done'}, 'duration_ms': 600},
+        ])
+        db2_path = _make_db(tmp_path, 'b.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=3),
+             'task_id': 'task-B1', 'run_id': 'rB1', 'data': {'outcome': 'conflict'}, 'duration_ms': 1000},
+        ])
+
+        async with (
+            aiosqlite.connect(str(db1_path)) as conn1,
+            aiosqlite.connect(str(db2_path)) as conn2,
+        ):
+            conn1.row_factory = aiosqlite.Row
+            conn2.row_factory = aiosqlite.Row
+            project_dbs = [('/tmp/A', conn1), ('/tmp/B', conn2)]
+            result = await build_per_project_merge_queue(
+                project_dbs, hours=24, now=now, recent_window_minutes=15,
+            )
+
+        # (c) '/tmp/A' stats reflect only db1's rows (2 attempts)
+        a_recent = result['/tmp/A']['recent']
+        b_recent = result['/tmp/B']['recent']
+        a_task_ids = {r['task_id'] for r in a_recent}
+        b_task_ids = {r['task_id'] for r in b_recent}
+        assert 'task-A1' in a_task_ids
+        assert 'task-A2' in a_task_ids
+        assert 'task-B1' not in a_task_ids
+        assert 'task-B1' in b_task_ids
+
+    async def test_recent_trimmed_to_window(self, tmp_path):
+        """The recent list is already filtered to recent_window_minutes."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'a.db', [
+            # within window (5 min ago)
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
+             'task_id': 'in-window', 'run_id': 'r1', 'data': {'outcome': 'done'}, 'duration_ms': 1000},
+            # outside window (30 min ago)
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=30),
+             'task_id': 'out-window', 'run_id': 'r2', 'data': {'outcome': 'done'}, 'duration_ms': 1000},
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            project_dbs = [('/tmp/A', conn)]
+            result = await build_per_project_merge_queue(
+                project_dbs, hours=24, now=now, recent_window_minutes=15,
+            )
+
+        # (d) only in-window row survives
+        recent = result['/tmp/A']['recent']
+        task_ids = {r['task_id'] for r in recent}
+        assert 'in-window' in task_ids
+        assert 'out-window' not in task_ids
+
+    async def test_none_db_entry_skipped(self, tmp_path):
+        """A (pid, None) pair results in empty/default stats for that project."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        project_dbs = [('/tmp/nofile', None)]
+        result = await build_per_project_merge_queue(
+            project_dbs, hours=24, now=now, recent_window_minutes=15,
+        )
+
+        assert '/tmp/nofile' in result
+        data = result['/tmp/nofile']
+        assert data['latency']['count'] == 0
+        assert data['recent'] == []
+

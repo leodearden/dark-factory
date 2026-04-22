@@ -41,11 +41,9 @@ from dashboard.data.costs import (
 )
 from dashboard.data.db import DbPool
 from dashboard.data.merge_queue import (
-    aggregate_latency_stats,
-    aggregate_outcome_distribution,
-    aggregate_queue_depth_timeseries,
-    aggregate_recent_merges,
-    aggregate_speculative_stats,
+    build_per_project_merge_queue,
+    enrich_merges_with_titles,
+    load_task_titles,
 )
 from dashboard.data.orchestrator import discover_orchestrators
 from dashboard.data.performance import (
@@ -62,6 +60,7 @@ from dashboard.data.reconciliation import (
     get_latest_verdict,
     get_recent_runs,
     get_watermarks,
+    partition_burst_state,
 )
 from dashboard.data.utils import parse_utc
 from dashboard.data.write_journal import (
@@ -482,7 +481,10 @@ async def partials_recon(request: Request):
     buffer_stats = _safe_gather_result(
         bs_r, {'buffered_count': 0, 'oldest_event_age_seconds': None}, 'buffer_stats',
     )
-    burst_state = _safe_gather_result(burst_r, [], 'burst_state')
+    burst_state_raw = _safe_gather_result(burst_r, [], 'burst_state')
+    # Drop stale idle agents: keep only agents with state != 'idle'
+    # OR last_write_at within the last hour (partition_burst_state threshold).
+    active_burst, _ = partition_burst_state(burst_state_raw)
     watermarks_list = _safe_gather_result(wm_r, [], 'watermarks')
     verdict = _safe_gather_result(verdict_r, None, 'latest_verdict')
     runs = _safe_gather_result(runs_r, [], 'recent_runs')
@@ -508,7 +510,7 @@ async def partials_recon(request: Request):
         request, 'partials/recon.html',
         context={
             'buffer_stats': buffer_stats,
-            'burst_state': burst_state,
+            'burst_state': active_burst,
             'projects': projects,
             'verdict': verdict,
             'runs': runs,
@@ -595,6 +597,27 @@ async def _project_scoped_dbs(
             seen.add(root)
             paths.append(root / rel_path)
     return [await pool.get(p) for p in paths]
+
+
+async def _project_scoped_dbs_labeled(
+    config: DashboardConfig,
+    pool: DbPool,
+    rel_path: Path,
+) -> list[tuple[str, aiosqlite.Connection | None]]:
+    """Return labeled (str(root), connection|None) pairs across all known project roots.
+
+    Mirrors :func:`_project_scoped_dbs` but tags each DB connection with its
+    canonical project-root string so callers can key per-project data sections.
+    Deduplication and ordering follow the same rules: the main ``project_root``
+    is always index 0; duplicate roots in ``known_project_roots`` are skipped.
+    """
+    seen: set[Path] = {config.project_root}
+    roots: list[Path] = [config.project_root]
+    for root in config.known_project_roots:
+        if root not in seen:
+            seen.add(root)
+            roots.append(root)
+    return [(str(root), await pool.get(root / rel_path)) for root in roots]
 
 
 async def _cost_dbs(
@@ -776,47 +799,48 @@ async def costs_partials_runs(request: Request):
 
 @app.get('/partials/merge-queue')
 async def partials_merge_queue(request: Request):
-    """Merge queue operational status card."""
+    """Merge queue operational status card — one section per project."""
     config = request.app.state.config
     pool: DbPool = request.app.state.db
-    dbs = await _cost_dbs(config, pool)
     days = _parse_window(request)
     hours = days * 24
     window_raw = request.query_params.get('window', '30d')
 
     effective_now = datetime.now(UTC)
-    depth, outcomes, latency, recent, spec = await asyncio.gather(
-        aggregate_queue_depth_timeseries(dbs, hours=hours, now=effective_now),
-        aggregate_outcome_distribution(dbs, hours=hours, now=effective_now),
-        aggregate_latency_stats(dbs, hours=hours, now=effective_now),
-        aggregate_recent_merges(dbs, limit=20, hours=hours),
-        aggregate_speculative_stats(dbs, hours=hours, now=effective_now),
-        return_exceptions=True,
+    project_dbs = await _project_scoped_dbs_labeled(
+        config, pool, Path('data/orchestrator/runs.db')
     )
 
-    depth = cast(ChartData, _safe_gather_result(depth, {'labels': [], 'values': []}, 'merge_queue.depth'))
-    depth = trim_leading_zero_buckets(depth)
-    outcomes = _safe_gather_result(outcomes, {'labels': [], 'values': []}, 'merge_queue.outcomes')
-    latency = _safe_gather_result(
-        latency, {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0},
-        'merge_queue.latency',
+    projects_raw = await build_per_project_merge_queue(
+        project_dbs, hours=hours, now=effective_now, recent_window_minutes=15,
     )
-    recent = _safe_gather_result(recent, [], 'merge_queue.recent')
-    spec = _safe_gather_result(
-        spec, {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0},
-        'merge_queue.speculative',
-    )
+
+    # Apply trim + title enrichment per project.
+    # Empty-state: template shows "No merge activity" when
+    # not any(p['latency']['count'] or p['recent'] for p in projects.values()).
+    # Gather all per-project title lookups concurrently (each is a
+    # filesystem read + JSON parse — independent across projects).
+    pids = list(projects_raw.keys())
+    title_maps = await asyncio.gather(*(
+        asyncio.to_thread(
+            load_task_titles,
+            Path(pid) / '.taskmaster' / 'tasks' / 'tasks.json',
+        )
+        for pid in pids
+    ))
+    projects: dict[str, dict] = {}
+    for pid, data, titles in zip(pids, projects_raw.values(), title_maps, strict=True):
+        projects[pid] = {
+            **data,
+            'depth_timeseries': trim_leading_zero_buckets(
+                cast(ChartData, data['depth_timeseries'])
+            ),
+            'recent': enrich_merges_with_titles(data['recent'], titles),
+        }
 
     return templates.TemplateResponse(
         request, 'partials/merge_queue.html',
-        context={
-            'depth_timeseries': depth,
-            'outcomes': outcomes,
-            'latency': latency,
-            'recent': recent,
-            'speculative': spec,
-            'window': window_raw,
-        },
+        context={'projects': projects, 'window': window_raw},
     )
 
 
