@@ -763,3 +763,62 @@ async def test_resolve_ticket_unknown_ticket_returns_failed(
     assert result == {'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None}, (
         f'Expected unknown_ticket response: {result}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-55: close() drains worker and closes ticket store
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_close_drains_worker_and_closes_store(
+    taskmaster, event_buffer, tmp_path,
+):
+    """interceptor.close() cancels the curator worker and closes the ticket store.
+
+    After close():
+    - The worker task is done (cancelled or finished).
+    - ticket_store._db is None (closed).
+    - A subsequent submit_task raises RuntimeError (interceptor is closed).
+    """
+    from fused_memory.middleware.ticket_store import TicketStore
+
+    store = TicketStore(tmp_path / 'close_test_tickets.db')
+    await store.initialize()
+
+    ti = TaskInterceptor(taskmaster, None, event_buffer, ticket_store=store)
+
+    # Submit a ticket so the worker is lazily started.
+    # Use a paused asyncio.Event to block the worker indefinitely without
+    # the 'coroutine as iterator' bug that AsyncMock(side_effect=coroutine) has.
+    paused_event = asyncio.Event()  # never set during this test
+
+    async def blocking_curate(*args, **kwargs):
+        await paused_event.wait()  # blocks until cancelled
+        return CuratorDecision(action='create')
+
+    mock_curator = MagicMock()
+    mock_curator.curate = blocking_curate
+    mock_curator.note_created = MagicMock()
+    mock_curator.record_task = AsyncMock()
+    mock_curator.reembed_task = AsyncMock()
+
+    with patch.object(ti, '_get_curator', AsyncMock(return_value=mock_curator)):
+        await ti.submit_task('/project', title='Test')
+        # Worker is now running (blocked on curator).
+        assert ti._worker_task is not None
+        assert not ti._worker_task.done()
+
+        # Close should cancel the worker and close the store.
+        await ti.close()
+
+    # Worker task should be done after close.
+    assert ti._worker_task is None or ti._worker_task.done(), (
+        'Worker task should be done after close()'
+    )
+    # Ticket store should be closed.
+    assert store._db is None, 'TicketStore._db should be None after close()'
+
+    # Subsequent submit_task should raise or return an error (closed guard).
+    result = await ti.submit_task('/project', title='AfterClose')
+    assert 'error' in result, f'submit_task after close should return an error: {result}'
