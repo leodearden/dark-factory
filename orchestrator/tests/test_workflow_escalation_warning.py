@@ -107,22 +107,13 @@ class TestInvokeWiresWarning:
     """Integration: ``_invoke`` calls ``_maybe_warn_missing_escalation``."""
 
     @pytest.mark.asyncio
-    async def test_invoke_calls_maybe_warn_missing_escalation_for_architect(self, caplog):
-        """_invoke triggers the escalation warning for architect when queue is None."""
+    async def test_invoke_calls_maybe_warn_missing_escalation_for_architect(self):
+        """_invoke calls _maybe_warn_missing_escalation with the architect role name."""
         stub_result = AgentResult(success=True, output='', cost_usd=0.0)
         wf = _make_workflow(escalation_queue=None)
 
-        with patch('orchestrator.workflow.invoke_with_cap_retry', new=AsyncMock(return_value=stub_result)), caplog.at_level(logging.WARNING):
+        with patch('orchestrator.workflow.invoke_with_cap_retry', new=AsyncMock(return_value=stub_result)), \
+             patch.object(wf, '_maybe_warn_missing_escalation') as mock_warn:
             await wf._invoke(ARCHITECT, prompt='x', cwd=Path('/tmp'))
 
-        assert wf._escalation_missing_warned is True, (
-            '_invoke did not set _escalation_missing_warned — helper was never called'
-        )
-        matching = [
-            rec for rec in caplog.records
-            if rec.levelno >= logging.WARNING
-            and 'escalation_queue is unavailable' in rec.message
-        ]
-        assert len(matching) == 1, (
-            f'expected exactly 1 escalation WARNING from _invoke, got {len(matching)}'
-        )
+        mock_warn.assert_called_once_with(ARCHITECT.name)

@@ -44,7 +44,7 @@ from orchestrator.verify import run_scoped_verification
 # the plan-tools stdio MCP server.
 _ORCH_PROJECT_DIR = Path(__file__).resolve().parents[2]
 
-# Roles that have _ESCALATION_TOOLS in their allowed_tools (see roles.py:155, 221, 278, 494).
+# Roles that have _ESCALATION_TOOLS in their allowed_tools.
 # Judge is excluded: it appears in the mcp_config block only for jcodemunch, not for escalation.
 # Steward is excluded: it runs in its own TaskSteward dispatcher, not through TaskWorkflow._invoke.
 _ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset({'architect', 'implementer', 'debugger', 'merger'})
