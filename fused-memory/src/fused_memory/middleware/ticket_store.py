@@ -11,7 +11,7 @@ import contextlib
 import logging
 import secrets
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -101,6 +101,38 @@ class TicketStore:
             with contextlib.suppress(Exception):
                 await db.rollback()
             raise
+
+    async def submit(
+        self,
+        project_id: str,
+        candidate_json: str,
+        ttl_seconds: int = 600,
+    ) -> str:
+        """Insert a new pending ticket and return its ticket_id."""
+        ticket_id = _new_ticket_id()
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(seconds=ttl_seconds)
+        async with self._txn() as db:
+            await db.execute(
+                """
+                INSERT INTO tickets
+                    (ticket_id, project_id, candidate_json, status, created_at, expires_at)
+                VALUES (?, ?, ?, 'pending', ?, ?)
+                """,
+                (ticket_id, project_id, candidate_json, now.isoformat(), expires_at.isoformat()),
+            )
+        return ticket_id
+
+    async def get(self, ticket_id: str) -> dict | None:
+        """Return the ticket row as a plain dict, or None if not found."""
+        db = self._require_db()
+        cursor = await db.execute(
+            'SELECT * FROM tickets WHERE ticket_id = ?', (ticket_id,)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return dict(row)
 
     async def close(self) -> None:
         """Close the underlying aiosqlite connection."""
