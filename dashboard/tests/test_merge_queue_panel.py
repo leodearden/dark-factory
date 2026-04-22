@@ -6,7 +6,7 @@ import json
 import re
 import sqlite3
 from contextlib import ExitStack
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -823,3 +823,88 @@ class TestRecentMergesTitles:
             resp = client.get('/partials/merge-queue')
 
         assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# TestRecentMergesWindow — 15-minute sliding window (step-15/16)
+# ---------------------------------------------------------------------------
+
+_WINDOW_EVENTS_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    task_id TEXT,
+    event_type TEXT NOT NULL,
+    phase TEXT,
+    role TEXT,
+    data TEXT DEFAULT '{}',
+    cost_usd REAL,
+    duration_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp);
+"""
+
+
+class TestRecentMergesWindow:
+    """The 15-minute sliding window is applied to recent merges in the route."""
+
+    def test_only_last_15_minutes_shown(self, client, tmp_path):
+        """Only merge_attempt rows within the last 15 minutes appear in the partial.
+
+        Uses a real runs.db (no mock for build_per_project_merge_queue) with 4 events:
+        - task-inside-1 (5m ago): should appear
+        - task-inside-2 (14m ago): should appear (just within 15m window)
+        - task-outside-3 (16m ago): should NOT appear (just outside 15m window)
+        - task-outside-4 (30m ago): should NOT appear
+        """
+        from dashboard.config import DashboardConfig
+
+        FIXED_NOW = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        _FixedDT = make_fixed_datetime_cls(FIXED_NOW)
+
+        # Create the DB under tmp_path to match _project_scoped_dbs_labeled's lookup.
+        runs_db = tmp_path / 'data' / 'orchestrator' / 'runs.db'
+        runs_db.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(runs_db))
+        conn.executescript(_WINDOW_EVENTS_SCHEMA)
+        events = [
+            # Inside 15m window — should appear in recent-merges table
+            (FIXED_NOW - timedelta(minutes=5), 'run-1', 'task-inside-1'),
+            (FIXED_NOW - timedelta(minutes=14), 'run-2', 'task-inside-2'),
+            # Outside 15m window — should be filtered out
+            (FIXED_NOW - timedelta(minutes=16), 'run-3', 'task-outside-3'),
+            (FIXED_NOW - timedelta(minutes=30), 'run-4', 'task-outside-4'),
+        ]
+        for ts, run_id, task_id in events:
+            conn.execute(
+                'INSERT INTO events (timestamp, run_id, task_id, event_type, data) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (ts.isoformat(), run_id, task_id, 'merge_attempt',
+                 json.dumps({'outcome': 'done'})),
+            )
+        conn.commit()
+        conn.close()
+
+        test_config = DashboardConfig(project_root=tmp_path)
+        with patch('dashboard.app.datetime', _FixedDT), \
+             patch.object(client.app.state, 'config', test_config):
+            resp = client.get('/partials/merge-queue')
+
+        assert resp.status_code == 200
+        html = resp.text
+
+        # task-inside-1 and task-inside-2 are within 15 minutes — must appear
+        assert 'task-inside-1' in html, (
+            'task-inside-1 (5m ago) should appear in recent merges'
+        )
+        assert 'task-inside-2' in html, (
+            'task-inside-2 (14m ago) should appear in recent merges'
+        )
+        # task-outside-3 and task-outside-4 are outside 15 minutes — must NOT appear
+        assert 'task-outside-3' not in html, (
+            'task-outside-3 (16m ago) should be filtered out by the 15-minute window'
+        )
+        assert 'task-outside-4' not in html, (
+            'task-outside-4 (30m ago) should be filtered out by the 15-minute window'
+        )
