@@ -176,3 +176,92 @@ async def test_worker_processes_drop_decision(
     assert result_data.get('deduplicated') is True
     assert result_data.get('action') == 'drop'
     assert 'justification' in result_data
+
+
+# ---------------------------------------------------------------------------
+# step-25: worker processes a 'combine' decision
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_processes_combine_decision(
+    interceptor_with_store, ticket_store, taskmaster,
+):
+    """When curator returns action='combine' with target_id and rewritten_task:
+    - _execute_combine is called (implying write_lock was held)
+    - A reembed background task is created via curator.reembed_task
+    - Ticket is status='combined' with task_id='5'
+    - tm.add_task is NOT called
+    """
+    rewritten = RewrittenTask(
+        title='Combined Task',
+        description='Merged description',
+        details='Merged details',
+        files_to_modify=[],
+        priority='medium',
+    )
+    mock_curator = MagicMock()
+    mock_curator.curate = AsyncMock(
+        return_value=CuratorDecision(
+            action='combine',
+            target_id='5',
+            rewritten_task=rewritten,
+            justification='similar scope',
+        )
+    )
+    mock_curator.note_created = MagicMock()
+    mock_curator.record_task = AsyncMock()
+    mock_curator.reembed_task = AsyncMock(return_value=None)
+
+    # Sentinel: track whether _execute_combine ran (it runs under write_lock)
+    execute_combine_calls = []
+
+    async def fake_execute_combine(project_root, decision):
+        execute_combine_calls.append({'project_root': project_root, 'decision': decision})
+        return {'updated': True, 'target_id': decision.target_id}
+
+    with (
+        patch.object(
+            type(interceptor_with_store), '_get_curator',
+            new=AsyncMock(return_value=mock_curator),
+        ),
+        patch.object(
+            interceptor_with_store, '_execute_combine',
+            side_effect=fake_execute_combine,
+        ),
+    ):
+        result = await interceptor_with_store.submit_task(
+            project_root='/project',
+            title='Combine Candidate',
+            description='Should be combined',
+        )
+        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+        ticket_id = result['ticket']
+
+        # Let the worker drain
+        await asyncio.sleep(0.2)
+
+    # _execute_combine was called (confirms write_lock path was taken)
+    assert len(execute_combine_calls) == 1, (
+        f'Expected _execute_combine to be called once, got {execute_combine_calls}'
+    )
+
+    # tm.add_task must NOT have been called
+    taskmaster.add_task.assert_not_called()
+
+    # Ticket must be terminal with status='combined'
+    row = await ticket_store.get(ticket_id)
+    assert row is not None
+    assert row['status'] == 'combined', f'Expected combined, got {row["status"]}'
+    assert row['task_id'] == '5', f'Expected task_id=5, got {row["task_id"]}'
+    assert row['resolved_at'] is not None
+
+    # result_json matches legacy combine shape
+    result_data = json.loads(row['result_json'])
+    assert result_data.get('id') == '5'
+    assert result_data.get('deduplicated') is True
+    assert result_data.get('action') == 'combine'
+    assert result_data.get('title') == 'Combined Task'
+
+    # reembed background task was spawned (curator.reembed_task was called)
+    mock_curator.reembed_task.assert_called_once()
