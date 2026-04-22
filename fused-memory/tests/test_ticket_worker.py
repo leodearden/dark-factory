@@ -539,3 +539,71 @@ async def test_worker_created_path_emits_journal_event_and_schedules_commit(
     assert 'add_task' in str(call_args), (
         f'task_committer.commit should be called with add_task: {call_args}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-35: note_created + record_task run under write_lock
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_note_created_and_record_task_run_under_write_lock(
+    interceptor_with_store, ticket_store, taskmaster,
+):
+    """Verifies that curator.note_created and curator.record_task are both
+    called with the correct task_id, in order, and while the write_lock is
+    held (sentinel injection).
+    """
+    from fused_memory.models.scope import resolve_project_id
+
+    project_id = resolve_project_id('/project')
+    call_order = []
+    lock_held_at_note = []
+    lock_held_at_record = []
+
+    def spy_note_created(pid, candidate, task_id):
+        call_order.append(('note_created', task_id))
+        lock = interceptor_with_store._write_locks.get(project_id)
+        lock_held_at_note.append(lock.locked() if lock else False)
+
+    async def spy_record_task(task_id, candidate, pid):
+        call_order.append(('record_task', task_id))
+        lock = interceptor_with_store._write_locks.get(project_id)
+        lock_held_at_record.append(lock.locked() if lock else False)
+
+    mock_curator = MagicMock()
+    mock_curator.curate = AsyncMock(
+        return_value=CuratorDecision(action='create')
+    )
+    mock_curator.note_created = spy_note_created
+    mock_curator.record_task = spy_record_task
+
+    with patch.object(
+        type(interceptor_with_store), '_get_curator',
+        new=AsyncMock(return_value=mock_curator),
+    ):
+        result = await interceptor_with_store.submit_task(
+            project_root='/project',
+            title='Lock Test',
+            description='Checking write_lock',
+        )
+        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+
+        await asyncio.sleep(0.2)
+
+    # Both were called in order: note_created before record_task
+    assert len(call_order) == 2, f'Expected 2 calls, got {call_order}'
+    assert call_order[0][0] == 'note_created', f'First call should be note_created: {call_order}'
+    assert call_order[1][0] == 'record_task', f'Second call should be record_task: {call_order}'
+
+    # Both called with task_id='42'
+    assert call_order[0][1] == '42', f'note_created task_id mismatch: {call_order[0]}'
+    assert call_order[1][1] == '42', f'record_task task_id mismatch: {call_order[1]}'
+
+    # write_lock was held during both calls
+    assert lock_held_at_note == [True], (
+        f'write_lock should be held during note_created: {lock_held_at_note}'
+    )
+    assert lock_held_at_record == [True], (
+        f'write_lock should be held during record_task: {lock_held_at_record}'
+    )
