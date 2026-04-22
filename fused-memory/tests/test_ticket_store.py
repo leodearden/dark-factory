@@ -1,9 +1,11 @@
 """Tests for the TicketStore SQLite persistence layer (two-phase add_task)."""
 
+import asyncio
+
 import pytest
 import pytest_asyncio
 
-from fused_memory.middleware.ticket_store import TicketStore
+from fused_memory.middleware.ticket_store import TicketStore, _new_ticket_id
 
 
 @pytest_asyncio.fixture
@@ -45,3 +47,22 @@ async def test_initialize_creates_schema_and_is_idempotent(tmp_path):
         f"Extra columns: {col_names - expected_columns}"
     )
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_new_ticket_id_has_tkt_prefix_and_sorts_by_time():
+    """_new_ticket_id() returns tkt_-prefixed ids that are lexicographically time-ordered."""
+    id1 = _new_ticket_id()
+    await asyncio.sleep(0.001)  # ensure nanosecond timestamp advances
+    id2 = _new_ticket_id()
+
+    # Both must start with tkt_
+    assert id1.startswith('tkt_'), f"id1 missing tkt_ prefix: {id1!r}"
+    assert id2.startswith('tkt_'), f"id2 missing tkt_ prefix: {id2!r}"
+
+    # Exactly the documented length: 4 (prefix) + 26 (crockford base32 of 16 bytes)
+    assert len(id1) == 30, f"Expected length 30, got {len(id1)}"
+    assert len(id2) == 30, f"Expected length 30, got {len(id2)}"
+
+    # Later id sorts after the earlier one (monotonic time-ordered)
+    assert id1 < id2, f"Expected id1 < id2 but got {id1!r} >= {id2!r}"
