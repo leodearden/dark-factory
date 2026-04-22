@@ -199,10 +199,10 @@ async def test_add_task_facade_delegates_to_submit_and_resolve(
 
 
 @pytest.mark.asyncio
-async def test_add_task_metadata_string_passed_through(interceptor, taskmaster):
+async def test_add_task_metadata_string_passed_through(interceptor_facade, taskmaster):
     """Pre-serialised metadata JSON is forwarded unchanged."""
     metadata_json = '{"escalation_id":"esc-1","suggestion_hash":"x"}'
-    await interceptor.add_task(
+    await interceptor_facade.add_task(
         '/project', prompt='Test', metadata=metadata_json,
     )
     kwargs = taskmaster.add_task.call_args.kwargs
@@ -210,9 +210,9 @@ async def test_add_task_metadata_string_passed_through(interceptor, taskmaster):
 
 
 @pytest.mark.asyncio
-async def test_add_task_without_metadata_skips_update(interceptor, taskmaster):
+async def test_add_task_without_metadata_skips_update(interceptor_facade, taskmaster):
     """add_task without metadata does not call update_task."""
-    await interceptor.add_task('/project', prompt='Test')
+    await interceptor_facade.add_task('/project', prompt='Test')
     taskmaster.update_task.assert_not_called()
     # Backend still receives metadata=None kwarg but the value is falsy.
     kwargs = taskmaster.add_task.call_args.kwargs
@@ -220,7 +220,7 @@ async def test_add_task_without_metadata_skips_update(interceptor, taskmaster):
 
 
 @pytest.mark.asyncio
-async def test_add_task_falls_back_to_two_step_on_typeerror(event_buffer):
+async def test_add_task_falls_back_to_two_step_on_typeerror(event_buffer, tmp_path):
     """Legacy fallback: a backend that rejects ``metadata=`` still works.
 
     ``TaskmasterBackend.add_task`` on older installs may not accept the
@@ -228,6 +228,8 @@ async def test_add_task_falls_back_to_two_step_on_typeerror(event_buffer):
     R5). Keep the fallback during rollout so mixed versions don't break.
     """
     import json
+
+    from fused_memory.middleware.ticket_store import TicketStore
 
     tm = AsyncMock()
     tm.get_tasks = AsyncMock(return_value={'tasks': []})
@@ -247,19 +249,30 @@ async def test_add_task_falls_back_to_two_step_on_typeerror(event_buffer):
 
     tm.add_task = add_task
 
-    interceptor = TaskInterceptor(tm, None, event_buffer)
-    metadata = {'escalation_id': 'esc-x', 'suggestion_hash': 'h'}
-    await interceptor.add_task('/project', prompt='Test', metadata=metadata)
+    store = TicketStore(tmp_path / 'fallback_tickets.db')
+    await store.initialize()
+    try:
+        interceptor = TaskInterceptor(tm, None, event_buffer, ticket_store=store)
+        metadata = {'escalation_id': 'esc-x', 'suggestion_hash': 'h'}
+        await interceptor.add_task('/project', prompt='Test', metadata=metadata)
 
-    # Two add_task attempts: atomic first (with metadata), retry without.
-    assert len(call_log) == 2
-    assert 'metadata' in call_log[0]
-    assert 'metadata' not in call_log[1]
-    # Legacy update_task follow-up ran because atomic write failed.
-    tm.update_task.assert_called_once()
-    kwargs = tm.update_task.call_args.kwargs
-    assert kwargs['task_id'] == '7'
-    assert kwargs['metadata'] == json.dumps(metadata)
+        # Two add_task attempts: atomic first (with metadata), retry without.
+        assert len(call_log) == 2
+        assert 'metadata' in call_log[0]
+        assert 'metadata' not in call_log[1]
+        # Legacy update_task follow-up ran because atomic write failed.
+        tm.update_task.assert_called_once()
+        kwargs = tm.update_task.call_args.kwargs
+        assert kwargs['task_id'] == '7'
+        assert kwargs['metadata'] == json.dumps(metadata)
+    finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -274,6 +287,7 @@ async def test_add_task_with_queue_persists_to_real_sqlite(taskmaster, tmp_path)
     No mocks on the journal path — this catches wiring mistakes that
     unit tests with AsyncMock(EventBuffer) would miss.
     """
+    from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.event_queue import EventQueue
 
     buf = EventBuffer(db_path=tmp_path / 'wpb_smoke.db', buffer_size_threshold=100)
@@ -288,7 +302,9 @@ async def test_add_task_with_queue_persists_to_real_sqlite(taskmaster, tmp_path)
     )
     await queue.start()
 
-    interceptor = TaskInterceptor(taskmaster, None, buf, event_queue=queue)
+    store = TicketStore(tmp_path / 'wpb_tickets.db')
+    await store.initialize()
+    interceptor = TaskInterceptor(taskmaster, None, buf, event_queue=queue, ticket_store=store)
     try:
         await interceptor.add_task('/project', prompt='Test 1')
         await interceptor.set_task_status('1', 'in-progress', '/project')
@@ -304,6 +320,13 @@ async def test_add_task_with_queue_persists_to_real_sqlite(taskmaster, tmp_path)
         assert qs['dead_letters'] == 0
         assert qs['overflow_drops'] == 0
     finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await queue.close()
         await buf.close()
 
@@ -321,6 +344,7 @@ async def test_add_task_hot_path_immunity_with_queue(taskmaster, tmp_path):
 
     import aiosqlite
 
+    from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.event_queue import EventQueue
 
     # Buffer whose push always raises — simulates the 2026-04-17 lock state.
@@ -337,7 +361,9 @@ async def test_add_task_hot_path_immunity_with_queue(taskmaster, tmp_path):
     )
     await queue.start()
 
-    interceptor = TaskInterceptor(taskmaster, None, buf, event_queue=queue)
+    store = TicketStore(tmp_path / 'hotpath_tickets.db')
+    await store.initialize()
+    interceptor = TaskInterceptor(taskmaster, None, buf, event_queue=queue, ticket_store=store)
     try:
         t0 = time.perf_counter()
         result = await interceptor.add_task('/project', prompt='Test')
@@ -351,6 +377,13 @@ async def test_add_task_hot_path_immunity_with_queue(taskmaster, tmp_path):
         stats = queue.stats()
         assert stats['queue_depth'] + stats['dead_letters'] + stats['events_committed'] >= 1
     finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await queue.close()
 
 
@@ -366,11 +399,23 @@ def curator_enabled_config():
     return cfg
 
 
-@pytest.fixture
-def curator_interceptor(taskmaster, reconciler, event_buffer, curator_enabled_config):
-    return TaskInterceptor(
+@pytest_asyncio.fixture
+async def curator_interceptor(taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path):
+    from fused_memory.middleware.ticket_store import TicketStore
+    store = TicketStore(tmp_path / 'curator_tickets.db')
+    await store.initialize()
+    ti = TaskInterceptor(
         taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        ticket_store=store,
     )
+    yield ti
+    await store.close()
+    if ti._worker_task and not ti._worker_task.done():
+        ti._worker_task.cancel()
+        try:
+            await ti._worker_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 def _mock_curator(decision: CuratorDecision) -> MagicMock:
@@ -752,7 +797,7 @@ async def test_curator_combine_bulk_dedupe_respects_guard(
 
 @pytest.mark.asyncio
 async def test_concurrent_add_task_produces_single_task(
-    taskmaster, reconciler, event_buffer, curator_enabled_config,
+    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
 ):
     """Two concurrent add_task calls for identical candidates produce
     exactly one new task. The second is caught by the pre-LLM
@@ -787,8 +832,12 @@ async def test_concurrent_add_task_produces_single_task(
     real_curator._build_corpus = empty_corpus  # type: ignore[method-assign]
     real_curator._call_llm = fake_call_llm  # type: ignore[method-assign]
 
+    from fused_memory.middleware.ticket_store import TicketStore
+    store = TicketStore(tmp_path / 'concurrent_tickets.db')
+    await store.initialize()
     interceptor = TaskInterceptor(
         taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        ticket_store=store,
     )
     interceptor._curator = real_curator
 
@@ -807,10 +856,19 @@ async def test_concurrent_add_task_produces_single_task(
         description='...',
     )
 
-    results = await asyncio.gather(
-        interceptor.add_task('/project', **candidate_kwargs),
-        interceptor.add_task('/project', **candidate_kwargs),
-    )
+    try:
+        results = await asyncio.gather(
+            interceptor.add_task('/project', **candidate_kwargs),
+            interceptor.add_task('/project', **candidate_kwargs),
+        )
+    finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     # Exactly one created; the second is a pre-LLM drop pointing at the first.
     ids = {r['id'] for r in results}
@@ -886,7 +944,7 @@ async def test_pre_llm_exact_match_via_note_created(curator_enabled_config, task
 
 @pytest.mark.asyncio
 async def test_idempotency_hit_skips_curator_and_returns_existing(
-    taskmaster, reconciler, event_buffer, curator_enabled_config,
+    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
 ):
     """R4: steward-requeue duplicate suggestion → existing task id.
 
@@ -914,8 +972,12 @@ async def test_idempotency_hit_skips_curator_and_returns_existing(
     decision = CuratorDecision(action='create', justification='novel')
     curator_mock = _mock_curator(decision)
 
+    from fused_memory.middleware.ticket_store import TicketStore
+    store = TicketStore(tmp_path / 'idemp_hit_tickets.db')
+    await store.initialize()
     interceptor = TaskInterceptor(
         taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        ticket_store=store,
     )
     interceptor._curator = curator_mock
 
@@ -924,12 +986,21 @@ async def test_idempotency_hit_skips_curator_and_returns_existing(
         'suggestion_hash': 'abcd1234abcd1234',
         'modules': ['crates/reify-compiler'],
     }
-    result = await interceptor.add_task(
-        '/project',
-        title='Add Type::Error defensive arm(s)',
-        description='same suggestion from requeued triage',
-        metadata=metadata,
-    )
+    try:
+        result = await interceptor.add_task(
+            '/project',
+            title='Add Type::Error defensive arm(s)',
+            description='same suggestion from requeued triage',
+            metadata=metadata,
+        )
+    finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     assert result['id'] == '555'
     assert result['deduplicated'] is True
@@ -942,10 +1013,12 @@ async def test_idempotency_hit_skips_curator_and_returns_existing(
 
 @pytest.mark.asyncio
 async def test_idempotency_accepts_metadata_as_json_string(
-    taskmaster, reconciler, event_buffer, curator_enabled_config,
+    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
 ):
     """Metadata that arrives as a pre-serialised JSON string also dedupes."""
     import json
+
+    from fused_memory.middleware.ticket_store import TicketStore
 
     taskmaster.get_tasks = AsyncMock(return_value={
         'tasks': [
@@ -961,22 +1034,36 @@ async def test_idempotency_accepts_metadata_as_json_string(
         ],
     })
 
+    store = TicketStore(tmp_path / 'idemp_str_tickets.db')
+    await store.initialize()
     interceptor = TaskInterceptor(
         taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        ticket_store=store,
     )
     interceptor._curator = _mock_curator(CuratorDecision(action='create'))
 
-    meta_str = json.dumps({'escalation_id': 'esc-x', 'suggestion_hash': 'hash1'})
-    result = await interceptor.add_task('/project', title='T', metadata=meta_str)
+    try:
+        meta_str = json.dumps({'escalation_id': 'esc-x', 'suggestion_hash': 'hash1'})
+        result = await interceptor.add_task('/project', title='T', metadata=meta_str)
+    finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
     assert result['id'] == '555'
     assert result['action'] == 'idempotency_hit'
 
 
 @pytest.mark.asyncio
 async def test_idempotency_miss_falls_through_to_curator(
-    taskmaster, reconciler, event_buffer, curator_enabled_config,
+    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
 ):
     """No matching (escalation_id, suggestion_hash) → curator runs normally."""
+    from fused_memory.middleware.ticket_store import TicketStore
+
     taskmaster.get_tasks = AsyncMock(return_value={
         'tasks': [
             {
@@ -992,24 +1079,38 @@ async def test_idempotency_miss_falls_through_to_curator(
     })
 
     curator_mock = _mock_curator(CuratorDecision(action='create', justification='novel'))
+    store = TicketStore(tmp_path / 'idemp_miss_tickets.db')
+    await store.initialize()
     interceptor = TaskInterceptor(
         taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        ticket_store=store,
     )
     interceptor._curator = curator_mock
 
-    await interceptor.add_task(
-        '/project', title='New',
-        metadata={'escalation_id': 'esc-new', 'suggestion_hash': 'fresh'},
-    )
+    try:
+        await interceptor.add_task(
+            '/project', title='New',
+            metadata={'escalation_id': 'esc-new', 'suggestion_hash': 'fresh'},
+        )
+    finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
     curator_mock.curate.assert_called_once()
     taskmaster.add_task.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_idempotency_skips_cancelled_match(
-    taskmaster, reconciler, event_buffer, curator_enabled_config,
+    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
 ):
     """A cancelled task with matching metadata must not win the dedupe."""
+    from fused_memory.middleware.ticket_store import TicketStore
+
     taskmaster.get_tasks = AsyncMock(return_value={
         'tasks': [
             {
@@ -1025,33 +1126,59 @@ async def test_idempotency_skips_cancelled_match(
     })
 
     curator_mock = _mock_curator(CuratorDecision(action='create', justification='novel'))
+    store = TicketStore(tmp_path / 'idemp_cancel_tickets.db')
+    await store.initialize()
     interceptor = TaskInterceptor(
         taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        ticket_store=store,
     )
     interceptor._curator = curator_mock
 
-    await interceptor.add_task(
-        '/project', title='Retry',
-        metadata={'escalation_id': 'esc-y', 'suggestion_hash': 'hash-y'},
-    )
+    try:
+        await interceptor.add_task(
+            '/project', title='Retry',
+            metadata={'escalation_id': 'esc-y', 'suggestion_hash': 'hash-y'},
+        )
+    finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
     curator_mock.curate.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_idempotency_requires_both_keys(
-    taskmaster, reconciler, event_buffer, curator_enabled_config,
+    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
 ):
     """Metadata without escalation_id+suggestion_hash skips the R4 check."""
+    from fused_memory.middleware.ticket_store import TicketStore
+
     curator_mock = _mock_curator(CuratorDecision(action='create', justification='novel'))
+    store = TicketStore(tmp_path / 'idemp_both_tickets.db')
+    await store.initialize()
     interceptor = TaskInterceptor(
         taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        ticket_store=store,
     )
     interceptor._curator = curator_mock
 
-    # Only escalation_id, no suggestion_hash → not eligible.
-    await interceptor.add_task(
-        '/project', title='T', metadata={'escalation_id': 'esc-x'},
-    )
+    try:
+        # Only escalation_id, no suggestion_hash → not eligible.
+        await interceptor.add_task(
+            '/project', title='T', metadata={'escalation_id': 'esc-x'},
+        )
+    finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
     curator_mock.curate.assert_called_once()
     # get_tasks for the idempotency check should not have been invoked
     # because we bail before the walk when a key is missing.
@@ -1062,13 +1189,26 @@ async def test_idempotency_requires_both_keys(
 
 
 @pytest.mark.asyncio
-async def test_curator_disabled_still_proxies(taskmaster, reconciler, event_buffer):
+async def test_curator_disabled_still_proxies(taskmaster, reconciler, event_buffer, tmp_path):
     """With curator.enabled=False, add_task proxies straight to Taskmaster."""
+    from fused_memory.middleware.ticket_store import TicketStore
+
     cfg = FusedMemoryConfig()
     cfg.curator = CuratorConfig(enabled=False)
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg)
+    store = TicketStore(tmp_path / 'disabled_curator_tickets.db')
+    await store.initialize()
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg, ticket_store=store)
 
-    result = await interceptor.add_task('/project', title='T')
+    try:
+        result = await interceptor.add_task('/project', title='T')
+    finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.add_task.assert_called_once()
@@ -1191,33 +1331,46 @@ async def test_reconciler_receives_both_ids(interceptor, reconciler):
 
 
 @pytest.mark.asyncio
-async def test_event_roundtrip_preserves_both_ids(taskmaster, event_buffer):
+async def test_event_roundtrip_preserves_both_ids(taskmaster, event_buffer, tmp_path):
     """End-to-end: interceptor -> buffer -> drain preserves both project_id and _project_root."""
-    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+    from fused_memory.middleware.ticket_store import TicketStore
+
+    store = TicketStore(tmp_path / 'roundtrip_tickets.db')
+    await store.initialize()
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer, ticket_store=store)
     project_path = '/home/leo/src/dark-factory'
 
-    # Multiple operations
-    await interceptor.set_task_status('1', 'in-progress', project_path)
-    await interceptor.add_task(project_path, prompt='New task')
-    await interceptor.update_task('1', project_path, prompt='Updated')
+    try:
+        # Multiple operations
+        await interceptor.set_task_status('1', 'in-progress', project_path)
+        await interceptor.add_task(project_path, prompt='New task')
+        await interceptor.update_task('1', project_path, prompt='Updated')
 
-    # Buffer queryable by resolved id
-    stats = await event_buffer.get_buffer_stats('dark_factory')
-    assert stats['size'] == 3
+        # Buffer queryable by resolved id
+        stats = await event_buffer.get_buffer_stats('dark_factory')
+        assert stats['size'] == 3
 
-    # Drain by resolved id
-    events = await event_buffer.drain('dark_factory')
-    assert len(events) == 3
+        # Drain by resolved id
+        events = await event_buffer.drain('dark_factory')
+        assert len(events) == 3
 
-    for ev in events:
-        # Event project_id is the logical identifier
-        assert ev.project_id == 'dark_factory'
-        # Payload carries the original path
-        assert ev.payload['_project_root'] == project_path
+        for ev in events:
+            # Event project_id is the logical identifier
+            assert ev.project_id == 'dark_factory'
+            # Payload carries the original path
+            assert ev.payload['_project_root'] == project_path
 
-    # Buffer is now empty
-    stats = await event_buffer.get_buffer_stats('dark_factory')
-    assert stats['size'] == 0
+        # Buffer is now empty
+        stats = await event_buffer.get_buffer_stats('dark_factory')
+        assert stats['size'] == 0
+    finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 # ── Tests for None / disconnected taskmaster ───────────────────────
@@ -1772,9 +1925,20 @@ def committer():
     return c
 
 
-@pytest.fixture
-def interceptor_with_committer(taskmaster, reconciler, event_buffer, committer):
-    return TaskInterceptor(taskmaster, reconciler, event_buffer, committer)
+@pytest_asyncio.fixture
+async def interceptor_with_committer(taskmaster, reconciler, event_buffer, committer, tmp_path):
+    from fused_memory.middleware.ticket_store import TicketStore
+    store = TicketStore(tmp_path / 'committer_tickets.db')
+    await store.initialize()
+    ti = TaskInterceptor(taskmaster, reconciler, event_buffer, committer, ticket_store=store)
+    yield ti
+    await store.close()
+    if ti._worker_task and not ti._worker_task.done():
+        ti._worker_task.cancel()
+        try:
+            await ti._worker_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 @pytest.mark.asyncio
@@ -1822,10 +1986,23 @@ async def test_noop_status_change_no_commit(taskmaster, reconciler, event_buffer
 
 
 @pytest.mark.asyncio
-async def test_no_committer_still_works(taskmaster, event_buffer):
+async def test_no_committer_still_works(taskmaster, event_buffer, tmp_path):
     """task_committer=None should not break any write methods."""
-    interceptor = TaskInterceptor(taskmaster, None, event_buffer, None)
-    result = await interceptor.add_task('/project', prompt='T')
+    from fused_memory.middleware.ticket_store import TicketStore
+
+    store = TicketStore(tmp_path / 'no_committer_tickets.db')
+    await store.initialize()
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer, None, ticket_store=store)
+    try:
+        result = await interceptor.add_task('/project', prompt='T')
+    finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
     assert result == {'id': '2', 'title': 'New Task'}
 
 
@@ -1897,8 +2074,10 @@ async def test_drain_empty(taskmaster, event_buffer):
 
 
 @pytest.mark.asyncio
-async def test_drain_awaits_pending_commits(taskmaster, event_buffer):
+async def test_drain_awaits_pending_commits(taskmaster, event_buffer, tmp_path):
     """drain() awaits all pending fire-and-forget commits."""
+    from fused_memory.middleware.ticket_store import TicketStore
+
     commit_done = asyncio.Event()
 
     async def slow_commit(project_root: str, operation: str) -> None:
@@ -1906,22 +2085,33 @@ async def test_drain_awaits_pending_commits(taskmaster, event_buffer):
 
     committer = AsyncMock()
     committer.commit = AsyncMock(side_effect=slow_commit)
-    interceptor = TaskInterceptor(taskmaster, None, event_buffer, committer)
+    store = TicketStore(tmp_path / 'drain_tickets.db')
+    await store.initialize()
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer, committer, ticket_store=store)
 
-    # Fire-and-forget commits
-    await interceptor.add_task('/project', prompt='A')
-    await interceptor.add_task('/project', prompt='B')
-    await asyncio.sleep(0)  # let tasks start
+    try:
+        # Fire-and-forget commits
+        await interceptor.add_task('/project', prompt='A')
+        await interceptor.add_task('/project', prompt='B')
+        await asyncio.sleep(0)  # let tasks start
 
-    # Background tasks should be pending
-    assert len(interceptor._background_tasks) >= 1
+        # Background tasks should be pending
+        assert len(interceptor._background_tasks) >= 1
 
-    # Unblock the commits
-    commit_done.set()
+        # Unblock the commits
+        commit_done.set()
 
-    # drain should await them all
-    await interceptor.drain()
-    assert len(interceptor._background_tasks) == 0
+        # drain should await them all
+        await interceptor.drain()
+        assert len(interceptor._background_tasks) == 0
+    finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1985,11 +2175,13 @@ def overlap_tm():
 
 @pytest.mark.asyncio
 async def test_concurrent_add_task_burst_all_distinct(
-    overlap_tm, reconciler, event_buffer,
+    overlap_tm, reconciler, event_buffer, tmp_path,
 ):
     """WP-E: 20 concurrent add_task calls to the same project serialise
     through the per-project lock — every task gets a distinct id and the
     taskmaster backend never sees overlapping invocations."""
+    from fused_memory.middleware.ticket_store import TicketStore
+
     tracker = _OverlapTracker()
     counter = {'n': 0}
     id_lock = asyncio.Lock()
@@ -2019,13 +2211,24 @@ async def test_concurrent_add_task_burst_all_distinct(
 
     overlap_tm.add_task = instrumented
 
-    interceptor = TaskInterceptor(overlap_tm, reconciler, event_buffer)
+    store = TicketStore(tmp_path / 'burst_tickets.db')
+    await store.initialize()
+    interceptor = TaskInterceptor(overlap_tm, reconciler, event_buffer, ticket_store=store)
 
-    N = 20
-    results = await asyncio.gather(*[
-        interceptor.add_task('/project', title=f'Task {i}')
-        for i in range(N)
-    ])
+    try:
+        N = 20
+        results = await asyncio.gather(*[
+            interceptor.add_task('/project', title=f'Task {i}')
+            for i in range(N)
+        ])
+    finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     assert len(results) == N
     ids = {r['id'] for r in results}
@@ -2110,11 +2313,12 @@ async def test_mixed_op_concurrency_serialises_on_one_project(
 
 @pytest.mark.asyncio
 async def test_two_projects_do_not_serialise(
-    overlap_tm, reconciler, event_buffer,
+    overlap_tm, reconciler, event_buffer, tmp_path,
 ):
     """WP-E: the lock is per-project, so ops on distinct projects can
     overlap. Fire concurrent add_task bursts on /projA and /projB and
     observe total peak >= 2."""
+    from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.models.scope import resolve_project_id
 
     tracker = _OverlapTracker()
@@ -2136,13 +2340,24 @@ async def test_two_projects_do_not_serialise(
             tracker._global_in_flight -= 1
 
     overlap_tm.add_task = AsyncMock(side_effect=side_effect)
-    interceptor = TaskInterceptor(overlap_tm, reconciler, event_buffer)
+    store = TicketStore(tmp_path / 'two_proj_tickets.db')
+    await store.initialize()
+    interceptor = TaskInterceptor(overlap_tm, reconciler, event_buffer, ticket_store=store)
 
     coros = []
     for i in range(5):
         coros.append(interceptor.add_task('/projA', title=f'a{i}'))
         coros.append(interceptor.add_task('/projB', title=f'b{i}'))
-    await asyncio.gather(*coros)
+    try:
+        await asyncio.gather(*coros)
+    finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     # Per-project peak is 1 (lock held), cross-project overlap is allowed.
     peak_a = tracker.peak.get(resolve_project_id('/projA'), 0)
@@ -2305,7 +2520,7 @@ async def test_single_call_latency_not_regressed(
 
 @pytest.mark.asyncio
 async def test_set_task_status_does_not_block_during_add_task_curator(
-    taskmaster, reconciler, event_buffer, curator_enabled_config,
+    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
 ):
     """Split-lock regression (2026-04-20): a long-running curator.curate()
     inside add_task MUST NOT block a concurrent set_task_status on the
@@ -2321,8 +2536,13 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
     ``_write_lock`` for the tm.add_task write; set_task_status takes just
     ``_write_lock`` and so completes promptly.
     """
+    from fused_memory.middleware.ticket_store import TicketStore
+
+    store = TicketStore(tmp_path / 'split_lock_tickets.db')
+    await store.initialize()
     interceptor = TaskInterceptor(
         taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        ticket_store=store,
     )
 
     CURATOR_LATENCY_S = 2.0
@@ -2353,10 +2573,19 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
         )
         return result, asyncio.get_event_loop().time() - t0
 
-    add_result, (status_result, status_elapsed) = await asyncio.gather(
-        interceptor.add_task('/project', title='concurrent add'),
-        timed_set_status(),
-    )
+    try:
+        add_result, (status_result, status_elapsed) = await asyncio.gather(
+            interceptor.add_task('/project', title='concurrent add'),
+            timed_set_status(),
+        )
+    finally:
+        await store.close()
+        if interceptor._worker_task and not interceptor._worker_task.done():
+            interceptor._worker_task.cancel()
+            try:
+                await interceptor._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
     total_elapsed = asyncio.get_event_loop().time() - start
 
     # add_task ran the full curator → ~CURATOR_LATENCY_S

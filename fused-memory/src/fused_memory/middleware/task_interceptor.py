@@ -1357,191 +1357,44 @@ class TaskInterceptor:
             event.set()
 
     async def add_task(self, project_root: str, **kwargs: Any) -> dict:
-        if err := await self._backlog_gate(project_root):
-            return err
-        # Extract metadata before forwarding — taskmaster's add_task doesn't accept it
-        metadata = kwargs.pop('metadata', None)
-        if metadata is not None:
-            kwargs_for_candidate = dict(kwargs)
-            kwargs_for_candidate['metadata'] = metadata
-        else:
-            kwargs_for_candidate = kwargs
-        candidate = self._build_candidate(kwargs_for_candidate)
-        project_id = resolve_project_id(project_root)
+        """Deprecated facade: submit a ticket then block until the worker decides.
 
-        # Hold curator_lock across the whole add flow (curator.curate +
-        # tm.add_task + note_created + record_task). write_lock is acquired
-        # internally for the brief tm.add_task call. See _write_lock /
-        # _curator_lock docstrings.
-        async with self._curator_lock(project_id):
-            return await self._add_task_locked(
-                project_root=project_root,
-                project_id=project_id,
-                candidate=candidate,
-                metadata=metadata,
-                kwargs=kwargs,
-            )
+        Callers should migrate to ``submit_task`` + ``resolve_ticket`` for
+        explicit control over the blocking behaviour. This facade waits up to
+        115 s (under the MCP 120 s hard limit) and raises ``RuntimeError`` on
+        timeout — there is no silent fallback.
 
-    async def _add_task_locked(
-        self,
-        *,
-        project_root: str,
-        project_id: str,
-        candidate,
-        metadata,
-        kwargs: dict,
-    ) -> dict:
-        # ── R4: escalation-level idempotency ─────────────────────────
-        # When the caller stamps (escalation_id, suggestion_hash) into
-        # metadata, walk existing tasks and skip the curator entirely if
-        # a match is found. This covers the steward-timeout requeue case
-        # (esc-1912-179 → esc-1912-190 on Type::Error) without an LLM
-        # call or embedding lookup.
-        idempotency_hit = await self._check_escalation_idempotency(
-            project_root=project_root, metadata=metadata,
+        The ``_curator_lock`` that previously serialised this path is gone;
+        serialisation is now provided by the single-worker ticket queue in
+        ``_curator_worker``.
+
+        .. deprecated::
+            Migrate callers to ``submit_task`` / ``resolve_ticket``.
+        """
+        # Delegate entirely to the two-phase path.
+        submit_result = await self.submit_task(project_root, **kwargs)
+        if 'error' in submit_result:
+            return submit_result
+
+        ticket = submit_result['ticket']
+        resolve_result = await self.resolve_ticket(
+            ticket, project_root, timeout_seconds=115,
         )
-        if idempotency_hit is not None:
-            return idempotency_hit
 
-        # ── Curator gate: drop / combine / create ────────────────────
-        curator = await self._get_curator()
-        if curator is not None and candidate is not None:
-            decision = await curator.curate(candidate, project_id, project_root)
-
-            if decision.action == 'drop' and decision.target_id:
-                logger.warning(
-                    'task_curator: drop — returning existing task %s instead of '
-                    'creating duplicate: %s',
-                    decision.target_id, candidate.title[:80],
-                )
-                return {
-                    'id': decision.target_id,
-                    'title': candidate.title,
-                    'deduplicated': True,
-                    'action': 'drop',
-                    'justification': decision.justification,
-                }
-
-            if decision.action == 'combine' and decision.target_id:
-                # _execute_combine writes (tm.update_task) — wrap in write_lock.
-                # curator_lock is already held by the caller.
-                async with self._write_lock(project_id):
-                    combine_result = await self._execute_combine(project_root, decision)
-                if combine_result is not None:
-                    logger.warning(
-                        'task_curator: combine — folded candidate into task %s: %s',
-                        decision.target_id, decision.justification[:120],
-                    )
-                    # Re-embed target so the corpus reflects the rewrite.
-                    if decision.rewritten_task is not None:
-                        rt = decision.rewritten_task
-                        rt_candidate = CandidateTask(
-                            title=rt.title,
-                            description=rt.description,
-                            details=rt.details,
-                            files_to_modify=rt.files_to_modify,
-                            priority=rt.priority,
-                        )
-                        bg = asyncio.create_task(
-                            curator.reembed_task(
-                                decision.target_id, rt_candidate, project_id,
-                            ),
-                            name=f'curator-reembed-{decision.target_id}',
-                        )
-                        self._background_tasks.add(bg)
-                        bg.add_done_callback(
-                            lambda t: self._background_tasks.discard(t),
-                        )
-                    return {
-                        'id': decision.target_id,
-                        'title': (
-                            decision.rewritten_task.title
-                            if decision.rewritten_task else candidate.title
-                        ),
-                        'deduplicated': True,
-                        'action': 'combine',
-                        'justification': decision.justification,
-                    }
-                # combine failed → fall through to create
-
-            # action == 'create' or degenerate — proceed to Taskmaster
-
-        # ── Create task ──────────────────────────────────────────────
-        tm = await self._ensure_taskmaster()
-
-        # Normalise metadata to a JSON string for taskmaster. Serialising here
-        # keeps the MCP boundary (which demands a string) simple and preserves
-        # the plain-dict shape for the fallback update_task path.
-        metadata_json: str | None = None
-        if metadata:
-            metadata_json = (
-                metadata if isinstance(metadata, str) else json.dumps(metadata)
-            )
-
-        # Atomic path: pass metadata in the initial add_task so the task is
-        # never visible without its metadata (prevents the race that dropped
-        # files_to_modify under concurrent load — see task #1922).
-        # Writes are wrapped in write_lock so concurrent set_task_status /
-        # update_task calls see a consistent tasks.json view; curator_lock
-        # is already held by the outer caller.
-        async with self._write_lock(project_id):
-            try:
-                result = await tm.add_task(
-                    project_root=project_root,
-                    metadata=metadata_json,
-                    **kwargs,
-                )
-                atomic_metadata_written = metadata_json is not None
-            except TypeError:
-                # Backwards-compat: pre-R5 taskmaster backends reject the new
-                # ``metadata`` kwarg. Fall through to the legacy two-step path.
-                result = await tm.add_task(project_root=project_root, **kwargs)
-                atomic_metadata_written = False
-
-            # Legacy fallback: follow-up update_task when the atomic write
-            # was unavailable. Racy by construction; kept only for rollout
-            # safety while both sides upgrade.
-            task_id = None
-            if isinstance(result, dict):
-                task_id = str(result.get('id', ''))
-            if metadata_json and task_id and not atomic_metadata_written:
+        # Reconstruct the legacy result dict from result_json so in-flight
+        # callers receive the same shape they observed before this rewrite.
+        if self._ticket_store is not None:
+            row = await self._ticket_store.get(ticket)
+            if row is not None and row.get('result_json'):
                 try:
-                    await tm.update_task(
-                        task_id=task_id,
-                        metadata=metadata_json,
-                        project_root=project_root,
-                    )
-                except Exception as e:
+                    return json.loads(row['result_json'])
+                except Exception:
                     logger.warning(
-                        f'add_task: metadata update for task {task_id} failed: {e}',
+                        'add_task facade: failed to decode result_json for %s', ticket,
                     )
 
-        # Record survivor in the curator. Two layers:
-        # 1. ``note_created`` — synchronous, in-memory exact-match cache.
-        #    MUST run inside ``_curator_lock`` so the *next* waiter on the
-        #    curator lock sees the new entry on its pre-LLM check (R3).
-        #    Not inside ``_write_lock`` — that's for tasks.json only.
-        # 2. ``record_task`` — awaited (not fire-and-forget) so the Qdrant
-        #    corpus has the point before the curator lock releases, letting
-        #    a near-miss follower's embedding lookup see it too.
-        if curator is not None and candidate is not None and task_id:
-            curator.note_created(project_id, candidate, task_id)
-            try:
-                await curator.record_task(task_id, candidate, project_id)
-            except Exception:
-                logger.warning(
-                    'add_task: curator.record_task awaited path failed for %s',
-                    task_id, exc_info=True,
-                )
-
-        event = self._make_event(
-            EventType.task_created,
-            project_root,
-            {'operation': 'add_task', 'task_id': task_id},
-        )
-        await self._journal(event)
-        self._schedule_commit(project_root, 'add_task')
-        return result
+        # Fallback: return what resolve_ticket gave us (status/task_id/reason).
+        return resolve_result
 
     async def update_task(
         self, task_id: str, project_root: str, **kwargs: Any,
