@@ -300,6 +300,61 @@ async def test_harness_init_stores_project_root_from_taskmaster_config(
     assert harness_b._project_root == ''
 
 
+@pytest.mark.asyncio
+async def test_run_full_cycle_uses_configured_project_root_when_events_lack_override(
+    journal, event_buffer, mock_memory_service
+):
+    """run_full_cycle should fall back to self._project_root, not project_id, when events lack _project_root."""
+    from fused_memory.config.schema import (
+        FusedMemoryConfig,
+        ReconciliationConfig,
+        TaskmasterConfig,
+    )
+    from fused_memory.reconciliation.harness import ReconciliationHarness
+
+    recon_cfg = ReconciliationConfig(
+        enabled=True,
+        explore_codebase_root='/tmp/test',
+        agent_llm_provider='anthropic',
+        agent_llm_model='claude-sonnet-4-20250514',
+    )
+    config = FusedMemoryConfig(
+        taskmaster=TaskmasterConfig(project_root='/abs/from/config'),
+        reconciliation=recon_cfg,
+    )
+
+    # Push events with NO _project_root key in payload
+    await event_buffer.push(_make_event('dark_factory'))
+    await event_buffer.push(_make_event('dark_factory'))
+
+    harness = ReconciliationHarness(
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        journal=journal,
+        event_buffer=event_buffer,
+        config=config,
+    )
+    harness._make_stages = lambda: harness.stages
+
+    # Capture stage.project_root at the moment each stage.run fires
+    captured_roots: list[str] = []
+
+    async def capture_root(stage):
+        captured_roots.append(stage.project_root)
+
+    for stage in harness.stages:
+        _mock_stage_run(stage, before_return=capture_root)
+
+    await harness.run_full_cycle('dark_factory', 'buffer_size:2')
+
+    assert len(captured_roots) == 3
+    for root in captured_roots:
+        assert root == '/abs/from/config', (
+            f"Expected project_root='/abs/from/config' but got '{root}'"
+            " — fallback should use self._project_root, not project_id"
+        )
+
+
 # ── Tests for Task 74: Stage 3 findings feedback loop ────────────────
 
 
