@@ -44,6 +44,11 @@ from orchestrator.verify import run_scoped_verification
 # the plan-tools stdio MCP server.
 _ORCH_PROJECT_DIR = Path(__file__).resolve().parents[2]
 
+# Roles that have _ESCALATION_TOOLS in their allowed_tools.
+# Judge is excluded: it appears in the mcp_config block only for jcodemunch, not for escalation.
+# Steward is excluded: it runs in its own TaskSteward dispatcher, not through TaskWorkflow._invoke.
+_ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset({'architect', 'implementer', 'debugger', 'merger'})
+
 
 class _StewardReescalated(Exception):
     """Raised when the steward re-escalates to level-1 (human intervention)."""
@@ -218,6 +223,7 @@ class TaskWorkflow:
         # Escalation support
         self.escalation_queue = escalation_queue
         self._escalation_event = escalation_event
+        self._escalation_missing_warned: bool = False
 
         # Usage cap gate
         self.usage_gate = usage_gate
@@ -623,6 +629,21 @@ class TaskWorkflow:
                 self.task_id, missing,
             )
         return list(seen.values())
+
+    def _maybe_warn_missing_escalation(self, role_name: str) -> None:
+        """Emit a single WARNING when an escalation-capable role is invoked without a queue."""
+        if self._escalation_missing_warned:
+            return
+        if self.escalation_queue is not None:
+            return
+        if role_name not in _ESCALATION_CAPABLE_ROLES:
+            return
+        logger.warning(
+            'Task %s: escalation_queue is unavailable — agent role %r would normally'
+            ' have escalation tools wired',
+            self.task_id, role_name,
+        )
+        self._escalation_missing_warned = True
 
     async def _sync_worktree_venvs(self) -> None:
         """Run ``uv sync`` for task subprojects in the worktree.
@@ -2051,6 +2072,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         sandbox_modules = None
         if self.config.sandbox.enabled and role.name in ('implementer', 'debugger'):
             sandbox_modules = self.modules
+
+        # Warn once per workflow instance when an escalation-capable role is
+        # dispatched without an escalation queue wired up.
+        self._maybe_warn_missing_escalation(role.name)
 
         # Build MCP config — fused-memory always, escalation when available.
         # Judge gets MCP so its jcodemunch tools (in allowed_tools) actually
