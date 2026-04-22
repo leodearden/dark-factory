@@ -274,6 +274,29 @@ class TestIndexWiring:
         resp = client.get('/')
         assert 'data-poll-base' in resp.text
 
+    def test_merge_queue_section_uses_innerhtml_swap(self, client):
+        """The merge-queue polling section must use hx-swap="innerHTML" (not morph:innerHTML).
+
+        Chart-bearing sections must use plain innerHTML so the inline chart-init
+        <script> re-executes after each htmx swap (morph mode preserves the DOM
+        and does not re-run inline scripts, leaving stale/destroyed <canvas>
+        elements blank on the second poll).  Convention established in commit
+        2c2ced98d5 for the orchestrators/performance/memory-graphs sections.
+        """
+        resp = client.get('/')
+        assert resp.status_code == 200
+        html = resp.text
+
+        # The merge-queue section must use hx-swap="innerHTML" (not morph:innerHTML)
+        assert re.search(
+            r'data-section="merge-queue"[^<]*hx-swap="innerHTML"', html
+        ), 'merge-queue section must have hx-swap="innerHTML"'
+
+        # Must NOT use the default morph:innerHTML
+        assert not re.search(
+            r'data-section="merge-queue"[^<]*hx-swap="morph:innerHTML"', html
+        ), 'merge-queue section must NOT use hx-swap="morph:innerHTML"'
+
 
 # ---------------------------------------------------------------------------
 # TestMergeQueueListenerLifecycle
