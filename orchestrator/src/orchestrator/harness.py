@@ -944,8 +944,14 @@ Output JSON matching the schema. Every task must appear in the output.
                 continue
 
             # Stale lock — clear it and revert.
-            with contextlib.suppress(OSError):
-                lock_path.unlink()
+            if tid not in self._recovered_plans:
+                # Full cleanup: remove worktree dir + branch so re-acquisition
+                # creates a fresh worktree without colliding.
+                await self.git_ops.cleanup_worktree(worktree_path, tid)
+            else:
+                # Plan will be resumed — preserve worktree, only clear stale lock.
+                with contextlib.suppress(OSError):
+                    lock_path.unlink()
             await self.scheduler.set_task_status(tid, 'pending')
             logger.info(
                 'Reconcile: reverted task %s to pending (reason=stale-lock)', tid
