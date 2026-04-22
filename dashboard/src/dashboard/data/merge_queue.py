@@ -487,8 +487,8 @@ def filter_merges_within(
             ts = parse_utc(row.get('timestamp')).astimezone(UTC)
             if ts >= cutoff:
                 result.append(row)
-        except (ValueError, TypeError):
-            pass  # malformed timestamp → drop row
+        except (ValueError, TypeError, AttributeError):
+            pass  # malformed timestamp or parse_utc returned None → drop row
     return result
 
 
@@ -514,8 +514,7 @@ def enrich_merges_with_titles(
     result: list[dict] = []
     for row in merges:
         raw_id = row.get('task_id')
-        key = str(raw_id) if raw_id is not None else None
-        title = task_title_map.get(key, '') if key is not None else ''
+        title = task_title_map.get(str(raw_id), '') if raw_id is not None else ''
         result.append({**row, 'title': title})
     return result
 
@@ -606,6 +605,12 @@ async def build_per_project_merge_queue(
 
 # ---------------------------------------------------------------------------
 # 7. Multi-DB aggregation
+#
+# NOTE: These aggregate_* functions are no longer called by the partials_merge_queue
+# route (which now uses build_per_project_merge_queue for per-project isolation).
+# They are retained for future cross-project roll-up callers (e.g. a planned summary
+# panel or export endpoint).  If no such caller materialises, delete them and their
+# dedicated tests as dead code.
 # ---------------------------------------------------------------------------
 
 async def aggregate_queue_depth_timeseries(

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from dashboard.config import DashboardConfig as _DashboardConfig
 from dashboard.data.merge_queue import _bucket_minutes_for_window
 from tests._dt_helpers import make_fixed_datetime_cls
 
@@ -101,8 +102,9 @@ def _extract_inline_script(html: str) -> str:
     )
 
 
-# Default project PID used by _patch_merge_queue_data (matches the app's default project root)
-_DEFAULT_PID = '/home/leo/src/dark-factory'
+# Default project PID derived from the app's resolved config.project_root so that the
+# patch key always matches runtime state regardless of machine/worktree layout.
+_DEFAULT_PID = str(_DashboardConfig().project_root)
 
 
 def _patch_merge_queue_data(

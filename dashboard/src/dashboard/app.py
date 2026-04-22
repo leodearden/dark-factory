@@ -818,12 +818,18 @@ async def partials_merge_queue(request: Request):
     # Apply trim + title enrichment per project.
     # Empty-state: template shows "No merge activity" when
     # not any(p['latency']['count'] or p['recent'] for p in projects.values()).
-    projects: dict[str, dict] = {}
-    for pid, data in projects_raw.items():
-        titles = await asyncio.to_thread(
+    # Gather all per-project title lookups concurrently (each is a
+    # filesystem read + JSON parse — independent across projects).
+    pids = list(projects_raw.keys())
+    title_maps = await asyncio.gather(*(
+        asyncio.to_thread(
             load_task_titles,
             Path(pid) / '.taskmaster' / 'tasks' / 'tasks.json',
         )
+        for pid in pids
+    ))
+    projects: dict[str, dict] = {}
+    for pid, data, titles in zip(pids, projects_raw.values(), title_maps, strict=True):
         projects[pid] = {
             **data,
             'depth_timeseries': trim_leading_zero_buckets(

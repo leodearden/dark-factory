@@ -2195,20 +2195,21 @@ class TestFilterMergesWithin:
 
         now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
         rows = [
-            self._make_row(5),                    # 5m ago  → in
-            self._make_row(10),                   # 10m ago → in
+            self._make_row(5, task_id='t_5m'),    # 5m ago  → in
+            self._make_row(10, task_id='t_10m'),  # 10m ago → in
             {'task_id': 't3', 'timestamp': (now - timedelta(minutes=14, seconds=59)).isoformat(),
              'outcome': 'done'},                   # 14m59s ago → in (< 15m)
-            self._make_row(20),                   # 20m ago → out
+            self._make_row(20, task_id='t_20m'),  # 20m ago → out
             {'task_id': 't5', 'timestamp': (now - timedelta(minutes=15, seconds=1)).isoformat(),
              'outcome': 'done'},                   # 15m01s ago → out
         ]
         result = filter_merges_within(rows, minutes=15, now=now)
         task_ids = [r['task_id'] for r in result]
-        assert 't1' in task_ids   # 5m
-        assert 't1' in task_ids   # 10m (same task_id, first occurrence)
-        assert 't3' in task_ids   # 14m59s
-        assert 't5' not in task_ids  # 15m01s
+        assert 't_5m' in task_ids   # 5m ago — must survive
+        assert 't_10m' in task_ids  # 10m ago — must survive (both rows, not just one)
+        assert 't3' in task_ids     # 14m59s — must survive
+        assert 't_20m' not in task_ids  # 20m ago — must be filtered
+        assert 't5' not in task_ids     # 15m01s — must be filtered
 
     def test_filters_out_old_rows(self):
         """Rows older than the window are excluded."""
