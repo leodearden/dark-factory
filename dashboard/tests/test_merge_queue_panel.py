@@ -936,6 +936,62 @@ class TestRecentMergesWindow:
 
 
 # ---------------------------------------------------------------------------
+# TestMergeQueueCanvasIdCollision — server-generated canvas_id (step-3/4)
+# ---------------------------------------------------------------------------
+
+_PID_COLLISION_A = '/tmp/dark-factory'
+_PID_COLLISION_B = '/tmp/dark_factory'
+
+_MOCK_COLLIDING_PROJECT_DATA = {
+    _PID_COLLISION_A: {
+        'depth_timeseries': MOCK_DEPTH,
+        'outcomes': MOCK_OUTCOMES,
+        'latency': MOCK_LATENCY,
+        'recent': MOCK_RECENT,
+        'speculative': MOCK_SPEC,
+    },
+    _PID_COLLISION_B: {
+        'depth_timeseries': MOCK_DEPTH,
+        'outcomes': MOCK_OUTCOMES,
+        'latency': MOCK_LATENCY,
+        'recent': MOCK_RECENT,
+        'speculative': MOCK_SPEC,
+    },
+}
+
+
+class TestMergeQueueCanvasIdCollision:
+    """Two pids that css_id-collide must render distinct canvas id attributes."""
+
+    def test_colliding_pids_render_distinct_canvases(self, client):
+        """html contains four distinct canvas ids: unsuffixed + _1 variants for each chart type."""
+        with _patch_per_project_merge_data(projects=_MOCK_COLLIDING_PROJECT_DATA):
+            resp = client.get('/partials/merge-queue')
+        assert resp.status_code == 200
+        html = resp.text
+
+        # First project: unsuffixed
+        assert 'id="mergeQueueDepthChart-tmp_dark_factory"' in html, (
+            'Expected unsuffixed mergeQueueDepthChart canvas id for first project'
+        )
+        assert 'id="mergeOutcomeChart-tmp_dark_factory"' in html, (
+            'Expected unsuffixed mergeOutcomeChart canvas id for first project'
+        )
+        # Second project: suffixed with _1
+        assert 'id="mergeQueueDepthChart-tmp_dark_factory_1"' in html, (
+            'Expected _1-suffixed mergeQueueDepthChart canvas id for second project'
+        )
+        assert 'id="mergeOutcomeChart-tmp_dark_factory_1"' in html, (
+            'Expected _1-suffixed mergeOutcomeChart canvas id for second project'
+        )
+        # canvas_id key must appear in the serialized allProjects JSON in the inline script
+        script_body = _extract_inline_script(html)
+        assert '"canvas_id"' in script_body, (
+            'canvas_id must be present in the serialized allProjects payload in the inline script'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestUniqueCssIds — unit tests for unique_css_ids helper (step-1/2)
 # ---------------------------------------------------------------------------
 
