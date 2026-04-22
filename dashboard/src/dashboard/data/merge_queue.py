@@ -549,7 +549,8 @@ async def build_per_project_merge_queue(
     For each ``(pid, db)`` pair, gathers the 5 per-DB stats concurrently and
     applies :func:`filter_merges_within` to the recent-merges list.  Pairs with
     ``db=None`` produce empty/default stats (the per-DB functions handle None
-    gracefully by returning declared defaults).
+    gracefully by returning declared defaults).  All per-project gathers also
+    run concurrently across projects via a single top-level :func:`asyncio.gather`.
 
     Args:
         project_dbs: List of ``(project_root_str, connection_or_None)`` tuples
@@ -572,8 +573,7 @@ async def build_per_project_merge_queue(
             return default
         return result
 
-    out: dict[str, dict] = {}
-    for pid, db in project_dbs:
+    async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
         depth_r, outcomes_r, latency_r, recent_r, spec_r = await asyncio.gather(
             queue_depth_timeseries(db, hours=hours, now=now),
             outcome_distribution(db, hours=hours, now=now),
@@ -593,14 +593,16 @@ async def build_per_project_merge_queue(
             minutes=recent_window_minutes,
             now=now,
         )
-        out[pid] = {
+        return pid, {
             'depth_timeseries': depth,
             'outcomes': outcomes,
             'latency': latency,
             'recent': recent_trimmed,
             'speculative': spec,
         }
-    return out
+
+    results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])
+    return {pid: data for pid, data in results}
 
 
 # ---------------------------------------------------------------------------
