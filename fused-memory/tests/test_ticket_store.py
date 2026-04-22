@@ -28,6 +28,7 @@ async def test_initialize_creates_schema_and_is_idempotent(tmp_path):
 
     # Verify the table exists with the expected columns
     db = store._db
+    assert db is not None
     cursor = await db.execute("PRAGMA table_info(tickets)")
     rows = await cursor.fetchall()
     col_names = {row[1] for row in rows}
@@ -200,7 +201,6 @@ async def test_sweep_expired_marks_only_expired_pending_failed(store):
     """sweep_expired() marks pending expired tickets failed; leaves non-expired alone."""
     now = datetime.now(UTC)
     past = now - timedelta(seconds=1)
-    future = now + timedelta(seconds=600)
 
     # Insert an already-expired ticket (expires_at in the past)
     expired_id = await store.submit(project_id='p', candidate_json='{}', ttl_seconds=600)

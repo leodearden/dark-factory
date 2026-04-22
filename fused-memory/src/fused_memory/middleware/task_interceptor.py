@@ -1120,7 +1120,7 @@ class TaskInterceptor:
                 await asyncio.wait_for(event.wait(), timeout=timeout_seconds)
             else:
                 await event.wait()
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Clean up our event registration so a later caller can re-register.
             self._ticket_events.pop(ticket, None)
             return {'status': 'failed', 'reason': 'timeout', 'task_id': None}
@@ -1292,7 +1292,7 @@ class TaskInterceptor:
                 async with self._write_lock(project_id):
                     combine_result = await self._execute_combine(project_root, decision)
                 if combine_result is not None:
-                    if decision.rewritten_task is not None:
+                    if decision.rewritten_task is not None and curator is not None:
                         rt = decision.rewritten_task
                         rt_candidate = CandidateTask(
                             title=rt.title,

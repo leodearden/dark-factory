@@ -1,6 +1,7 @@
 """Tests for the TaskInterceptor curator worker (ticket queue drain loop)."""
 
 import asyncio
+import contextlib
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,7 +12,6 @@ from fused_memory.middleware.task_curator import CuratorDecision, RewrittenTask
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
-
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -52,10 +52,8 @@ async def interceptor_with_store(taskmaster, event_buffer, ticket_store):
     # Cancel worker if running
     if ti._worker_task and not ti._worker_task.done():
         ti._worker_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await ti._worker_task
-        except (asyncio.CancelledError, Exception):
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +508,6 @@ async def test_worker_created_path_emits_journal_event_and_schedules_commit(
             description='Checking event emission',
         )
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
-        ticket_id = result['ticket']
 
         # Let the worker drain and commit task fire
         await asyncio.sleep(0.2)
