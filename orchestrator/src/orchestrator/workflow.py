@@ -632,6 +632,8 @@ class TaskWorkflow:
 
     def _maybe_warn_missing_escalation(self, role_name: str) -> None:
         """Emit a single WARNING when an escalation-capable role is invoked without a queue."""
+        if self._escalation_missing_warned:
+            return
         if self.escalation_queue is not None:
             return
         if role_name not in _ESCALATION_CAPABLE_ROLES:
@@ -641,6 +643,7 @@ class TaskWorkflow:
             ' have escalation tools wired',
             self.task_id, role_name,
         )
+        self._escalation_missing_warned = True
 
     async def _sync_worktree_venvs(self) -> None:
         """Run ``uv sync`` for task subprojects in the worktree.
