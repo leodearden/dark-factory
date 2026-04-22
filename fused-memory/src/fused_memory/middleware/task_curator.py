@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
-from shared.cli_invoke import AgentResult, invoke_with_cap_retry
+from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
 from shared.locking import files_to_modules
 
 if TYPE_CHECKING:
@@ -552,6 +552,26 @@ class TaskCurator:
         try:
             decision = await self._call_llm(
                 candidate, pool, pool_sizes, start, project_id, project_root,
+            )
+        except AllAccountsCappedException as exc:
+            logger.warning(
+                'task_curator: all accounts capped (%d retries in %.1fs) — deferring to create',
+                exc.retries, exc.elapsed_secs,
+            )
+            if self._escalator is not None:
+                await self._escalator.report_failure(
+                    project_root=project_root,
+                    project_id=project_id,
+                    justification=f'all-accounts-capped: {exc}',
+                    candidate_title=candidate.title,
+                    timed_out=False,
+                    duration_ms=int(exc.elapsed_secs * 1000),
+                )
+            decision = CuratorDecision(
+                action='create',
+                justification='all-accounts-capped',
+                pool_sizes=pool_sizes,
+                latency_ms=int((time.monotonic() - start) * 1000),
             )
         except CuratorFailureError as exc:
             if self._escalator is not None:

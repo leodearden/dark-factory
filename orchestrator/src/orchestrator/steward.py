@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from shared.cli_invoke import invoke_with_cap_retry
+from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.proc_group import terminate_process_group
 
 from orchestrator.agents.invoke import invoke_agent
@@ -508,25 +508,33 @@ class TaskSteward:
         suggestions = json.loads(_strip_hash_prefix(escalation.detail))
         prompt = build_triage_prompt(suggestions, self.task)
 
-        result = await invoke_with_cap_retry(
-            self.usage_gate,
-            f'Steward for task {self.task_id} [pre-triage]',
-            invoke_fn=invoke_agent,
-            prompt=prompt,
-            system_prompt=TRIAGE_SYSTEM_PROMPT,
-            cwd=self.config.project_root,
-            model=self.config.models.triage,
-            max_turns=self.config.max_turns.triage,
-            max_budget_usd=self.config.budgets.triage,
-            allowed_tools=[
-                'Read', 'Glob', 'Grep',
-                'mcp__fused-memory__get_tasks',
-                'mcp__fused-memory__search',
-            ],
-            output_schema=TRIAGE_OUTPUT_SCHEMA,
-            effort=self.config.effort.triage,
-            backend=self.config.backends.triage,
-        )
+        try:
+            result = await invoke_with_cap_retry(
+                self.usage_gate,
+                f'Steward for task {self.task_id} [pre-triage]',
+                invoke_fn=invoke_agent,
+                prompt=prompt,
+                system_prompt=TRIAGE_SYSTEM_PROMPT,
+                cwd=self.config.project_root,
+                model=self.config.models.triage,
+                max_turns=self.config.max_turns.triage,
+                max_budget_usd=self.config.budgets.triage,
+                allowed_tools=[
+                    'Read', 'Glob', 'Grep',
+                    'mcp__fused-memory__get_tasks',
+                    'mcp__fused-memory__search',
+                ],
+                output_schema=TRIAGE_OUTPUT_SCHEMA,
+                effort=self.config.effort.triage,
+                backend=self.config.backends.triage,
+            )
+        except AllAccountsCappedException as e:
+            logger.warning(
+                'Steward for task %s: pre-triage skipped — all accounts capped '
+                '(%d retries in %.1fs), falling back to inline triage',
+                self.task_id, e.retries, e.elapsed_secs,
+            )
+            return escalation
 
         # Track cost against steward metrics (invoke_with_cap_retry handles usage_gate cleanup)
         self.metrics.invocations += 1

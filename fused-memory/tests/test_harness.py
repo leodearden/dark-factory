@@ -2437,3 +2437,84 @@ async def test_run_loop_fast_restart_releases_recent_claims(
         'release_stale_claims must increment attempt_count on re-queue '
         '(contract: event_buffer.py:702-707)'
     )
+
+
+# ── Tests for AllAccountsCappedException deferral in run_full_cycle ────
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_defers_on_all_accounts_capped(
+    journal, event_buffer, mock_memory_service, caplog
+):
+    """AllAccountsCappedException in run_full_cycle defers gracefully.
+
+    Contract:
+    (a) run_full_cycle returns without raising,
+    (b) the run is marked 'failed' in the journal,
+    (c) drained events are restored to the buffer,
+    (d) no 'recon_failure' escalation is emitted,
+    (e) a warning log contains 'all accounts capped'.
+
+    Fails before impl because the generic `except Exception` handler currently
+    re-raises and calls _escalate('recon_failure', ...).
+    """
+    import logging
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AllAccountsCappedException
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # Seed the event buffer with enough events to trigger
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+
+    # Make stage 0 raise AllAccountsCappedException
+    harness.stages[0].run = AsyncMock(
+        side_effect=AllAccountsCappedException(
+            retries=3, elapsed_secs=200.0, label='Reconciliation stage (sonnet)'
+        )
+    )
+
+    # Spy on _escalate to capture all categories emitted
+    escalate_calls: list[str] = []
+    original_escalate = harness._escalate
+
+    def capturing_escalate(category: str, *args, **kwargs) -> None:
+        escalate_calls.append(category)
+        original_escalate(category, *args, **kwargs)
+
+    harness._escalate = capturing_escalate  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.WARNING):
+        run = await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+    # (a) Call completes WITHOUT raising
+    assert run is not None
+
+    # (b) Run marked as 'failed'
+    assert run.status in (RunStatus.failed, 'failed'), (
+        f"Expected run.status='failed', got '{run.status}'"
+    )
+
+    # Also verify via the journal
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    assert len(recent_runs) >= 1
+    assert recent_runs[0].status == 'failed'
+
+    # (c) Events were restored via buffer.restore_drained
+    stats = await event_buffer.get_buffer_stats('test-project')
+    assert stats['size'] == 2, (
+        f"Expected buffer size=2 after cap deferral (events restored), got {stats['size']}"
+    )
+
+    # (d) NO 'recon_failure' escalation
+    assert 'recon_failure' not in escalate_calls, (
+        f"Expected no 'recon_failure' escalation for cap deferral, got: {escalate_calls}"
+    )
+
+    # (e) Warning log includes 'all accounts capped'
+    log_messages = [r.message.lower() for r in caplog.records]
+    assert any('all accounts capped' in msg for msg in log_messages), (
+        f'Expected log containing "all accounts capped", got: {log_messages}'
+    )

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
 
 import pytest
+from shared.cli_invoke import AllAccountsCappedException
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -443,3 +445,45 @@ class TestPreTriageSuggestions:
         assert 'Fix case 0' in result.detail
         # Original suggestions are embedded as reference
         assert 'Original Suggestions' in result.detail
+
+
+# ---------------------------------------------------------------------------
+# Pre-triage cap handling
+# ---------------------------------------------------------------------------
+
+
+class TestPreTriageCapHandling:
+    @pytest.mark.asyncio
+    async def test_pre_triage_returns_original_escalation_on_cap(
+        self, caplog
+    ):
+        """_pre_triage_suggestions must return the original escalation unchanged on cap.
+
+        Before step-8 impl: AllAccountsCappedException propagates out of
+        _pre_triage_suggestions, crashing the steward.
+        After step-8 impl: exception is caught, original escalation returned.
+        """
+        steward = _make_steward()
+        suggestions = _make_suggestions(15)
+        escalation = _make_escalation(detail=json.dumps(suggestions))
+
+        cap_exc = AllAccountsCappedException(
+            retries=2, elapsed_secs=30.0, label='Steward for task 42 [pre-triage]'
+        )
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry',
+            AsyncMock(side_effect=cap_exc),
+        ), caplog.at_level(logging.WARNING, logger='orchestrator.steward'):
+            result = await steward._pre_triage_suggestions(escalation)
+
+        # Must return the original escalation (identity check)
+        assert result is escalation, (
+            'Expected original escalation object to be returned unchanged'
+        )
+
+        # Must emit a warning containing 'all accounts capped'
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'all accounts capped' in t.lower() for t in warning_texts
+        ), f'Expected warning with "all accounts capped", got: {warning_texts}'

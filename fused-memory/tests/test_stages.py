@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from shared.cli_invoke import AgentResult
+from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
@@ -23,6 +23,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     StageResult,
     _extract_report,
     _normalize_report,
+    run_stage_via_cli,
 )
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
@@ -2546,3 +2547,45 @@ class TestInvariantAfterTask643:
         )
         # Invariant holds implicitly: the assertion above already proves done_tasks
         # is non-empty (MAX_DONE_TASKS_RETAINED == 30).
+
+
+# ---------------------------------------------------------------------------
+# Cap-exception propagation from run_stage_via_cli
+# ---------------------------------------------------------------------------
+
+
+class TestRunStageCapHandling:
+    """Verify run_stage_via_cli re-raises AllAccountsCappedException."""
+
+    @pytest.mark.asyncio
+    async def test_run_stage_via_cli_reraises_all_accounts_capped(self, tmp_path):
+        """AllAccountsCappedException must propagate out of run_stage_via_cli.
+
+        Before step-12 impl: the current broad `except Exception` swallows the
+        exception into a StageResult(error=str(e)) — no re-raise.
+        After step-12 impl: the exception propagates, allowing the harness to
+        handle deferral gracefully.
+        """
+        config = ReconciliationConfig(
+            enabled=True,
+            explore_codebase_root=str(tmp_path),
+            agent_llm_model='sonnet',
+            agent_max_steps=5,
+            stage_timeout_seconds=600,
+        )
+
+        cap_exc = AllAccountsCappedException(
+            retries=5, elapsed_secs=180.0, label='Reconciliation stage (sonnet)'
+        )
+
+        with patch(
+            'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry',
+            new=AsyncMock(side_effect=cap_exc),
+        ), pytest.raises(AllAccountsCappedException):
+            await run_stage_via_cli(
+                system_prompt='x',
+                payload='y',
+                disallowed_tools=[],
+                config=config,
+                mcp_config={'mcpServers': {}},
+            )

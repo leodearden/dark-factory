@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from shared.cli_invoke import invoke_with_cap_retry
+from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import DEEP_REVIEWER
@@ -137,22 +137,42 @@ class ReviewCheckpoint:
 
         logger.info('Review [%s]: Phase 2+3 — invoking deep reviewer agent', review_id)
         started_at = datetime.now(UTC).isoformat()
-        result = await invoke_with_cap_retry(
-            usage_gate=self.usage_gate,
-            label=f'Review checkpoint [{review_id}]',
-            invoke_fn=invoke_agent,
-            prompt=prompt,
-            system_prompt=DEEP_REVIEWER.system_prompt,
-            cwd=self.config.project_root,
-            model=getattr(self.config.models, 'deep_reviewer', 'opus'),
-            max_turns=getattr(self.config.max_turns, 'deep_reviewer', 100),
-            max_budget_usd=getattr(self.config.budgets, 'deep_reviewer', 15.0),
-            allowed_tools=DEEP_REVIEWER.allowed_tools or None,
-            disallowed_tools=DEEP_REVIEWER.disallowed_tools or None,
-            mcp_config=mcp_config,
-            effort=getattr(self.config.effort, 'deep_reviewer', 'max'),
-            backend=getattr(self.config.backends, 'deep_reviewer', 'claude'),
-        )
+        try:
+            result = await invoke_with_cap_retry(
+                usage_gate=self.usage_gate,
+                label=f'Review checkpoint [{review_id}]',
+                invoke_fn=invoke_agent,
+                prompt=prompt,
+                system_prompt=DEEP_REVIEWER.system_prompt,
+                cwd=self.config.project_root,
+                model=getattr(self.config.models, 'deep_reviewer', 'opus'),
+                max_turns=getattr(self.config.max_turns, 'deep_reviewer', 100),
+                max_budget_usd=getattr(self.config.budgets, 'deep_reviewer', 15.0),
+                allowed_tools=DEEP_REVIEWER.allowed_tools or None,
+                disallowed_tools=DEEP_REVIEWER.disallowed_tools or None,
+                mcp_config=mcp_config,
+                effort=getattr(self.config.effort, 'deep_reviewer', 'max'),
+                backend=getattr(self.config.backends, 'deep_reviewer', 'claude'),
+            )
+        except AllAccountsCappedException as e:
+            logger.warning(
+                'Review %s: skipped — all accounts capped (%d retries in %.1fs)',
+                review_id, e.retries, e.elapsed_secs,
+            )
+            # Reset accumulators so next trigger doesn't immediately re-fire
+            self._last_review_at_merge = self._merge_count
+            self._merged_modules.clear()
+            return ReviewReport(
+                review_id=review_id,
+                mode=mode,
+                changed_modules=modules,
+                phase1=phase1,
+                findings_count=0,
+                tasks_created=[],
+                escalated_findings=0,
+                cost_usd=0.0,
+                duration_ms=int((time.monotonic() - start) * 1000),
+            )
         completed_at = datetime.now(UTC).isoformat()
 
         elapsed_ms = int((time.monotonic() - start) * 1000)
