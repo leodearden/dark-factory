@@ -163,3 +163,33 @@ async def test_mark_resolved_sets_terminal_status_and_resolved_at(store):
     assert result_again is False
     row_after = await store.get(tid)
     assert row_after['status'] == 'created'  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_flush_pending_on_startup_marks_all_pending_failed(store):
+    """flush_pending_on_startup() marks all pending tickets failed/server_restart."""
+    candidate = json.dumps({'title': 'T'})
+
+    # Submit three pending tickets
+    t1 = await store.submit(project_id='p', candidate_json=candidate)
+    t2 = await store.submit(project_id='p', candidate_json=candidate)
+    t3 = await store.submit(project_id='p', candidate_json=candidate)
+
+    # Resolve one of them before the flush
+    await store.mark_resolved(t1, status='created', task_id='99')
+
+    count = await store.flush_pending_on_startup()
+    assert count == 2  # two pending tickets flushed
+
+    row2 = await store.get(t2)
+    assert row2['status'] == 'failed'
+    assert row2['reason'] == 'server_restart'
+    assert row2['resolved_at'] is not None
+
+    row3 = await store.get(t3)
+    assert row3['status'] == 'failed'
+    assert row3['reason'] == 'server_restart'
+
+    # The already-resolved ticket must be untouched
+    row1 = await store.get(t1)
+    assert row1['status'] == 'created'
