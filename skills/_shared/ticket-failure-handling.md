@@ -31,8 +31,11 @@ The task server restarted between the `submit_task` and `resolve_ticket` calls.
 The original ticket is **dead** — it exists only in memory and was lost.
 
 **Policy:** retry the full `submit_task + resolve_ticket` pair exactly **once**
-with the **same metadata**.  Do not retry more than once; if the second attempt
-also returns `failed`, treat it as terminal and apply caller-specific handling.
+with the **same metadata**.  The "once" budget applies to the `submit_task`
+re-issue specifically: if the re-submitted ticket subsequently returns `timeout`,
+follow the `timeout` policy below (retry `resolve_ticket` first) before
+escalating further.  Only declare the submission terminal once the appropriate
+per-reason retry path has been exhausted.
 
 **Dedup caveat:** if the caller does not supply `(escalation_id,
 suggestion_hash)` in the `submit_task` metadata, the R4 idempotency gate
@@ -85,8 +88,9 @@ the **R4 gate**.
 **Conditions for R4 to fire:**
 - Both `escalation_id` and `suggestion_hash` must be **non-empty strings** in
   the `submit_task` metadata.
-- The pair must match a previously recorded entry in the interceptor's
-  idempotency log (see `task_interceptor.py:1221-1231`).
+- The pair must match a previously recorded entry in the interceptor's match
+  loop (see `task_interceptor.py:1184-1208`, inside
+  `_check_escalation_idempotency`).
 
 Callers that naturally carry an escalation id (e.g. escalation-watcher when
 processing suggestions) get R4 for free.  Callers that do not (PRD
@@ -95,13 +99,42 @@ R4 protection on retry.
 
 ---
 
-## Synthesising `(escalation_id, suggestion_hash)` for callers without a native escalation
+## Synthesising idempotency metadata for callers that need it
 
-When a caller doesn't have a natural `escalation_id`, it can opt into the R4
-gate by deriving a **stable, content-addressed pair** from its submission
-payload.  The recipe below is taken from
-`skills/escalation-watcher/SKILL.md` (the `cleanup_needed` section), which
-already demonstrates this pattern:
+Callers that don't natively supply both `escalation_id` and `suggestion_hash`
+can opt into the R4 gate by deriving a **stable, content-addressed** value from
+their submission payload.  The right approach depends on what the caller already
+has at hand.
+
+### Case A — caller has a native `escalation_id`, needs to synthesize `suggestion_hash` only
+
+Use this when the caller already holds a real `escalation_id` from context (for
+example, escalation-watcher processing a `cleanup_needed` info item already has
+the escalation id; only the suggestion hash must be derived).
+
+```python
+import hashlib
+
+# suggestion_hash — sha256 of a stable payload, truncated to 16 hex chars.
+# The payload must be the same on every retry for the same logical work item
+# (e.g. the full suggestion text, or a canonical key).
+suggestion_hash = hashlib.sha256("<stable-payload>".encode()).hexdigest()[:16]
+
+submit_task(
+    title=...,
+    description=...,
+    metadata={
+        ...,
+        "escalation_id": escalation_id,   # real id already in scope
+        "suggestion_hash": suggestion_hash,
+    },
+)
+```
+
+### Case B — caller has neither `escalation_id` nor `suggestion_hash`
+
+Use this when the caller has no existing escalation context (PRD-decomposition,
+unblock-triage).  Both values must be synthesized from stable identifiers.
 
 ```python
 import hashlib
@@ -115,7 +148,6 @@ escalation_id = f"<source>-<stable-identity>"   # e.g. "prd-decomp-task-42"
 # The payload should be the same on every retry for the same logical work item.
 suggestion_hash = hashlib.sha256("<stable-payload>".encode()).hexdigest()[:16]
 
-# Then pass both in submit_task metadata:
 submit_task(
     title=...,
     description=...,
@@ -127,12 +159,12 @@ submit_task(
 )
 ```
 
-**Which callers benefit:**
+**Callers in Case B:**
 - **PRD-decomposition** (`skills/orchestrate/SKILL.md`) — use the task title +
   PRD slug as the stable payload; prefix with `"prd-decomp-"`.
 - **Unblock triage** (`skills/unblock/SKILL.md`) — use the non-blocker
   description + parent task id as the stable payload; prefix with
   `"unblock-triage-"`.
 
-Adding this pair changes retry behaviour from "the curator may or may not
-de-duplicate" to "the R4 gate guarantees exactly-once task creation".
+Adding idempotency metadata changes retry behaviour from "the curator may or may
+not de-duplicate" to "the R4 gate guarantees exactly-once task creation".
