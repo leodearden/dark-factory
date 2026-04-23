@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -2526,4 +2527,107 @@ class TestBuildPerProjectMergeQueue:
         data = result['/tmp/nofile']
         assert data['latency']['count'] == 0
         assert data['recent'] == []
+
+    async def test_mixed_real_and_none_dbs(self, tmp_path):
+        """Mixed (pid, real_conn) and (pid, None) entries all appear in the result.
+
+        Guards the parallel gather path: a None-db project must not raise and
+        must not suppress or crash the real-db project alongside it.
+        """
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'real.db', [])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            project_dbs = [
+                ('/tmp/real', conn),
+                ('/tmp/none', None),
+            ]
+            result = await build_per_project_merge_queue(
+                project_dbs, hours=24, now=now, recent_window_minutes=15,
+            )
+
+        # Both pids present — None entry must not be dropped
+        assert set(result.keys()) == {'/tmp/real', '/tmp/none'}
+
+        # None-db entry produces defaults without crashing
+        none_data = result['/tmp/none']
+        assert none_data['latency']['count'] == 0
+        assert none_data['recent'] == []
+
+        # Real-db entry has the expected top-level keys
+        real_data = result['/tmp/real']
+        assert set(real_data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
+
+    async def test_per_project_queries_run_concurrently(self, tmp_path):
+        """All N per-project gathers must run concurrently (peak-in-flight == N).
+
+        Patches ``outcome_distribution`` with a fake that:
+        - Increments an in-flight counter on entry and tracks the peak.
+        - Sets ``all_entered`` when in_flight reaches N.
+        - Blocks on a ``release`` event before returning.
+
+        On the sequential for-loop implementation only one project enters at a
+        time so ``all_entered`` is never set → TimeoutError → test fails.
+        On the parallel ``asyncio.gather`` implementation all N enter before
+        any returns → ``all_entered`` fires → test passes.
+        """
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        N = 3
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db_paths = [_make_db(tmp_path, f'c{i}.db', []) for i in range(N)]
+
+        all_entered = asyncio.Event()
+        release = asyncio.Event()
+        counter = [0]        # mutable via list to allow mutation in closure
+        max_in_flight = [0]
+
+        async def fake_outcome_distribution(db, *, hours=24, now=None):
+            counter[0] += 1
+            if counter[0] > max_in_flight[0]:
+                max_in_flight[0] = counter[0]
+            if counter[0] == N:
+                all_entered.set()
+            await release.wait()
+            counter[0] -= 1
+            return {'labels': [], 'values': []}
+
+        async with (
+            aiosqlite.connect(str(db_paths[0])) as c0,
+            aiosqlite.connect(str(db_paths[1])) as c1,
+            aiosqlite.connect(str(db_paths[2])) as c2,
+        ):
+            c0.row_factory = aiosqlite.Row
+            c1.row_factory = aiosqlite.Row
+            c2.row_factory = aiosqlite.Row
+            project_dbs = [(f'/tmp/P{i}', c) for i, c in enumerate([c0, c1, c2])]
+
+            with patch(
+                'dashboard.data.merge_queue.outcome_distribution',
+                new=fake_outcome_distribution,
+            ):
+                task = asyncio.create_task(
+                    build_per_project_merge_queue(
+                        project_dbs, hours=24, now=now, recent_window_minutes=15,
+                    )
+                )
+                try:
+                    # Fails (TimeoutError) on sequential implementation;
+                    # succeeds immediately on parallel implementation.
+                    await asyncio.wait_for(all_entered.wait(), timeout=2.0)
+                except TimeoutError:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    raise
+                release.set()
+                result = await task
+
+        assert max_in_flight[0] == N, (
+            f'Expected {N} per-project gathers in-flight concurrently, '
+            f'but peak was {max_in_flight[0]}'
+        )
+        assert set(result.keys()) == {f'/tmp/P{i}' for i in range(N)}
 

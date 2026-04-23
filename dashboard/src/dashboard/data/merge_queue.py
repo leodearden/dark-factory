@@ -549,7 +549,8 @@ async def build_per_project_merge_queue(
     For each ``(pid, db)`` pair, gathers the 5 per-DB stats concurrently and
     applies :func:`filter_merges_within` to the recent-merges list.  Pairs with
     ``db=None`` produce empty/default stats (the per-DB functions handle None
-    gracefully by returning declared defaults).
+    gracefully by returning declared defaults).  All per-project gathers also
+    run concurrently across projects via a single top-level :func:`asyncio.gather`.
 
     Args:
         project_dbs: List of ``(project_root_str, connection_or_None)`` tuples
@@ -572,35 +573,50 @@ async def build_per_project_merge_queue(
             return default
         return result
 
-    out: dict[str, dict] = {}
-    for pid, db in project_dbs:
-        depth_r, outcomes_r, latency_r, recent_r, spec_r = await asyncio.gather(
-            queue_depth_timeseries(db, hours=hours, now=now),
-            outcome_distribution(db, hours=hours, now=now),
-            latency_stats(db, hours=hours, now=now),
-            recent_merges(db, limit=50, hours=hours, now=now),
-            speculative_stats(db, hours=hours, now=now),
-            return_exceptions=True,
-        )
-        depth = _safe(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
-        outcomes = _safe(outcomes_r, _DEFAULT_OUTCOMES, f'{pid}/outcomes')
-        latency = _safe(latency_r, _DEFAULT_LATENCY, f'{pid}/latency')
-        recent_raw = _safe(recent_r, [], f'{pid}/recent')
-        spec = _safe(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
+    async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
+        try:
+            depth_r, outcomes_r, latency_r, recent_r, spec_r = await asyncio.gather(
+                queue_depth_timeseries(db, hours=hours, now=now),
+                outcome_distribution(db, hours=hours, now=now),
+                latency_stats(db, hours=hours, now=now),
+                recent_merges(db, limit=50, hours=hours, now=now),
+                speculative_stats(db, hours=hours, now=now),
+                return_exceptions=True,
+            )
+            depth = _safe(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
+            outcomes = _safe(outcomes_r, _DEFAULT_OUTCOMES, f'{pid}/outcomes')
+            latency = _safe(latency_r, _DEFAULT_LATENCY, f'{pid}/latency')
+            recent_raw = _safe(recent_r, [], f'{pid}/recent')
+            spec = _safe(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
 
-        recent_trimmed = filter_merges_within(
-            recent_raw,  # type: ignore[arg-type]
-            minutes=recent_window_minutes,
-            now=now,
-        )
-        out[pid] = {
-            'depth_timeseries': depth,
-            'outcomes': outcomes,
-            'latency': latency,
-            'recent': recent_trimmed,
-            'speculative': spec,
-        }
-    return out
+            recent_trimmed = filter_merges_within(
+                recent_raw,  # type: ignore[arg-type]
+                minutes=recent_window_minutes,
+                now=now,
+            )
+            return pid, {
+                'depth_timeseries': depth,
+                'outcomes': outcomes,
+                'latency': latency,
+                'recent': recent_trimmed,
+                'speculative': spec,
+            }
+        except Exception as exc:
+            logger.warning(
+                'build_per_project_merge_queue %s: unexpected error (returning defaults): %s',
+                pid,
+                exc,
+            )
+            return pid, {
+                'depth_timeseries': _DEFAULT_DEPTH,
+                'outcomes': _DEFAULT_OUTCOMES,
+                'latency': _DEFAULT_LATENCY,
+                'recent': [],
+                'speculative': _DEFAULT_SPEC,
+            }
+
+    results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])
+    return dict(results)
 
 
 # ---------------------------------------------------------------------------
