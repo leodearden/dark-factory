@@ -107,8 +107,15 @@ if resolve["status"] == "created":
 elif resolve["status"] == "combined":
     task_id = resolve["task_id"]           # merged into existing task — normal, not an error
 elif resolve["status"] == "failed":
-    # reason: timeout | server_restart | server_closed | unknown_ticket | ...
-    # Report reason in the review report and skip this finding
+    # reason determines how to proceed:
+    # Retryable (transient): server_restart | timeout
+    #   → retry the submit_task + resolve_ticket pair ONCE with the same metadata.
+    #     (The review_id + finding identity acts as the idempotency key — R4 only
+    #     short-circuits when (escalation_id, suggestion_hash) metadata is present,
+    #     so a retry here may create a duplicate that the curator will de-duplicate
+    #     to "combined".)
+    # Unrecoverable (terminal): unknown_ticket | server_closed | expired
+    #   → record the reason in the review report and skip this finding.
     log_failure(resolve["reason"])
 ```
 
