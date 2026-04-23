@@ -610,7 +610,14 @@ class _StubMcpSession:
             else:
                 payload = {'id': task_id}
             return self._envelope(json.dumps(payload))
-        raise NotImplementedError(f'_StubMcpSession: tool {name!r} not implemented')
+        if name == 'get_tasks':
+            return self._envelope(json.dumps({'tasks': []}))
+        if name == 'update_task':
+            task_id = arguments['id']
+            return self._envelope(json.dumps({'id': task_id}))
+        raise NotImplementedError(
+            f'_StubMcpSession: unknown tool {name!r} — add a branch if this tool is needed'
+        )
 
 
 class _EvalMcpStub:
