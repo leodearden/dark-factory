@@ -2684,3 +2684,60 @@ async def test_backlog_iterator_uses_harness_project_root_when_events_lack_overr
         f"Expected project_root='/abs/from/config' but got '{captured['project_root']}'"
         " — BacklogIterator fallback should use harness.project_root, not project_id"
     )
+
+
+@pytest.mark.asyncio
+async def test_backlog_iterator_uses_project_root_peek_limit_constant(
+    journal, event_buffer, mock_memory_service
+):
+    """BacklogIterator.run's first peek_buffered call should use the
+    _PROJECT_ROOT_PEEK_LIMIT constant, not a raw literal.
+
+    Fails with ImportError until the constant is added to harness.py (step-2).
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from fused_memory.models.reconciliation import AssembledPayload
+    from fused_memory.reconciliation.harness import (  # step-2 adds this constant
+        _PROJECT_ROOT_PEEK_LIMIT,
+        BacklogIterator,
+    )
+
+    # Push one event (no _project_root key — we only care about the peek limit)
+    await event_buffer.push(_make_event('dark_factory'))
+
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service)
+
+    # Spy on peek_buffered, recording limit for each call
+    original_peek = event_buffer.peek_buffered
+    peek_calls: list[dict] = []
+
+    async def spy_peek(project_id: str, limit: int, before=None):
+        peek_calls.append({'limit': limit, 'before': before})
+        return await original_peek(project_id, limit=limit, before=before)
+
+    event_buffer.peek_buffered = spy_peek  # type: ignore[method-assign]
+
+    # Stub ContextAssembler to return events=[] and exit the loop immediately
+    def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
+        inst = MagicMock()
+        inst.assemble = AsyncMock(return_value=AssembledPayload(events=[]))
+        return inst
+
+    with patch(
+        'fused_memory.reconciliation.context_assembler.ContextAssembler',
+        side_effect=fake_assembler_factory,
+    ):
+        iterator = BacklogIterator(harness.config, harness.journal, harness.buffer, harness)
+        await iterator.run('dark_factory')
+
+    assert peek_calls, 'peek_buffered was never called — iterator may not have run'
+    first_limit = peek_calls[0]['limit']
+    assert first_limit == _PROJECT_ROOT_PEEK_LIMIT, (
+        f'First peek_buffered call used limit={first_limit}, '
+        f'expected _PROJECT_ROOT_PEEK_LIMIT={_PROJECT_ROOT_PEEK_LIMIT}. '
+        'Replace the raw literal with the constant in BacklogIterator.run.'
+    )
+    assert _PROJECT_ROOT_PEEK_LIMIT == 10, (
+        f'_PROJECT_ROOT_PEEK_LIMIT should be 10, got {_PROJECT_ROOT_PEEK_LIMIT}'
+    )
