@@ -1596,16 +1596,27 @@ def _build_workflow_with_escalation(
     assignment: TaskAssignment,
     agent_stub: AgentStub,
     tmp_path: Path,
+    *,
+    spawn_merge_worker: bool = True,
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
-    """Wire up a TaskWorkflow with an EscalationQueue attached."""
+    """Wire up a TaskWorkflow with an EscalationQueue attached.
+
+    When ``spawn_merge_worker=False``, skips the MergeWorker/asyncio.create_task
+    setup — use for tests that exercise _mark_blocked directly and never enqueue
+    merge work; omitting create_task avoids the 'Task was destroyed but it is
+    pending!' warning in pytest teardown.
+    """
     from orchestrator.merge_queue import MergeWorker
 
     scheduler = FakeScheduler()
     queue_dir = tmp_path / 'escalation_queue'
     queue = EscalationQueue(queue_dir)
     merge_queue: asyncio.Queue = asyncio.Queue()
-    worker = MergeWorker(git_ops, merge_queue)
-    asyncio.create_task(worker.run(), name='test-merge-worker')
+    if spawn_merge_worker:
+        worker = MergeWorker(git_ops, merge_queue)
+        asyncio.create_task(worker.run(), name='test-merge-worker')
+    else:
+        worker = None
     workflow = TaskWorkflow(
         assignment=assignment,
         config=config,
@@ -1627,27 +1638,13 @@ def _build_workflow_no_merge_worker(
     agent_stub: AgentStub,  # noqa: ARG001
     tmp_path: Path,
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
-    """Like _build_workflow_with_escalation but without spawning a MergeWorker task.
+    """Thin delegate over `_build_workflow_with_escalation(spawn_merge_worker=False)`.
 
-    Use this in tests that exercise _mark_blocked directly and never enqueue merge
-    work — omitting asyncio.create_task(worker.run()) avoids the 'Task was destroyed
-    but it is pending!' warning that leaks into the pytest event-loop teardown.
+    Retained for call-site stability (~11 existing tests).
     """
-    scheduler = FakeScheduler()
-    queue_dir = tmp_path / 'escalation_queue'
-    queue = EscalationQueue(queue_dir)
-    merge_queue: asyncio.Queue = asyncio.Queue()
-    workflow = TaskWorkflow(
-        assignment=assignment,
-        config=config,
-        git_ops=git_ops,
-        scheduler=scheduler,  # type: ignore[arg-type]
-        briefing=FakeBriefing(),  # type: ignore[arg-type]
-        mcp=FakeMcp(),  # type: ignore[arg-type]
-        escalation_queue=queue,
-        merge_queue=merge_queue,
+    return _build_workflow_with_escalation(
+        config, git_ops, assignment, agent_stub, tmp_path, spawn_merge_worker=False
     )
-    return workflow, scheduler, queue
 
 
 def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
