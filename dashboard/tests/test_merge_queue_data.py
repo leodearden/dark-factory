@@ -1488,9 +1488,10 @@ class TestLoadTaskTitles:
         assert result_b == {'2': 'Beta'}, f"project B returned unexpected titles: {result_b}"
         assert result_a != result_b
 
-    def test_symlink_shares_cache_entry_with_real_path(self, tmp_path, monkeypatch):
+    def test_symlink_shares_cache_entry_with_real_path(self, tmp_path, counted_load_task_tree):
         """A symlink and the real path resolve to the same LRU entry via os.path.realpath."""
-        import dashboard.data.merge_queue as _mq
+        import os
+
         from dashboard.data.merge_queue import (
             _load_task_titles_cached,
             load_task_titles,
@@ -1509,23 +1510,17 @@ class TestLoadTaskTitles:
         except (OSError, NotImplementedError):
             pytest.skip("symlinks unsupported on this filesystem")
 
-        call_count = 0
-        original_load_task_tree = _mq.load_task_tree
-
-        def counting_load_task_tree(path):
-            nonlocal call_count
-            call_count += 1
-            return original_load_task_tree(path)
-
-        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
+        assert os.path.realpath(link_path) == os.path.realpath(real_path), (
+            f"symlink {link_path!r} and real {real_path!r} must share realpath before the cache test is meaningful"
+        )
 
         result_real = load_task_titles(real_path)
         result_link = load_task_titles(link_path)
 
         assert result_real == {'1': 'A'}, f"real path returned unexpected titles: {result_real}"
         assert result_link == {'1': 'A'}, f"symlink returned unexpected titles: {result_link}"
-        assert call_count == 1, (
-            f"load_task_tree called {call_count} time(s); expected 1 "
+        assert counted_load_task_tree.count == 1, (
+            f"load_task_tree called {counted_load_task_tree.count} time(s); expected 1 "
             "(os.path.realpath should collapse both spellings to one cache key)"
         )
 
