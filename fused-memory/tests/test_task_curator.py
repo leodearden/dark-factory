@@ -1385,3 +1385,87 @@ class TestCurateBatchHappyPath:
         assert [d.action for d in result] == ['create', 'drop', 'create']
         assert result[1].target_id == '50'
         assert mock.await_count == 1
+
+
+# ----------------------------------------------------------------------
+# curate_batch: whole-batch fallback on LLM failure
+# ----------------------------------------------------------------------
+
+
+class TestCurateBatchWholeBatchFailure:
+    @pytest.mark.asyncio
+    async def test_curator_failure_error_falls_back_to_per_candidate_curate(self):
+        """CuratorFailureError from _call_llm_batch triggers N serial curate() calls."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        c1 = CandidateTask(title='Task One')
+        c2 = CandidateTask(title='Task Two')
+
+        fallback_decisions = [
+            CuratorDecision(action='create', justification='fb1'),
+            CuratorDecision(action='drop', target_id='9', justification='fb2'),
+        ]
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch.object(
+                 curator, '_call_llm_batch',
+                 new=AsyncMock(side_effect=CuratorFailureError(
+                     'whole-batch-failed', timed_out=False, duration_ms=5000,
+                 )),
+             ), \
+             patch.object(
+                 curator, 'curate',
+                 new=AsyncMock(side_effect=fallback_decisions),
+             ) as mock_curate:
+            result = await curator.curate_batch([c1, c2], 'p', '/x')
+
+        assert result == fallback_decisions
+        assert mock_curate.await_count == 2
+        # Called in order: c1 first, c2 second.
+        assert mock_curate.call_args_list[0].args[0] is c1
+        assert mock_curate.call_args_list[1].args[0] is c2
+
+
+# ----------------------------------------------------------------------
+# curate_batch: fallback on AllAccountsCappedException
+# ----------------------------------------------------------------------
+
+
+class TestCurateBatchAllAccountsCapped:
+    @pytest.mark.asyncio
+    async def test_cap_exception_falls_back_to_per_candidate_curate(self):
+        """AllAccountsCappedException from _call_llm_batch triggers N serial curate() calls."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        c1 = CandidateTask(title='Cap One')
+        c2 = CandidateTask(title='Cap Two')
+
+        fallback_decisions = [
+            CuratorDecision(action='create', justification='cap-fb1'),
+            CuratorDecision(action='create', justification='cap-fb2'),
+        ]
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch.object(
+                 curator, '_call_llm_batch',
+                 new=AsyncMock(side_effect=AllAccountsCappedException(
+                     retries=3, elapsed_secs=90.0,
+                     label='task-curator-batch[p]',
+                 )),
+             ), \
+             patch.object(
+                 curator, 'curate',
+                 new=AsyncMock(side_effect=fallback_decisions),
+             ) as mock_curate:
+            result = await curator.curate_batch([c1, c2], 'p', '/x')
+
+        assert result == fallback_decisions
+        assert mock_curate.await_count == 2
+        assert mock_curate.call_args_list[0].args[0] is c1
+        assert mock_curate.call_args_list[1].args[0] is c2
