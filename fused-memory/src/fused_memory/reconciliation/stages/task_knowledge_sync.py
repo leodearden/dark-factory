@@ -123,6 +123,18 @@ class TaskKnowledgeSync(BaseStage):
             stage1_report.items_flagged if stage1_report else []
         )
 
+        reported_count = len(stage1_report.items_flagged) if stage1_report else 0
+        if stage1_report is not None and stage1_render_count < reported_count:
+            logger.warning(
+                'reconciliation.stage2_flagged_items_shortfall',
+                extra={
+                    'reported_count': reported_count,
+                    'received_count': stage1_render_count,
+                    'dropped': reported_count - stage1_render_count,
+                    'run_stage': 'stage2',
+                },
+            )
+
         return f"""## Stage 2: Task-Knowledge Sync
 ## Project: {self.project_id}
 
