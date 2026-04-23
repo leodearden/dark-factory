@@ -30,6 +30,7 @@ from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    _FLAGGED_ITEMS_CHAR_BUDGET,
     IntegrityCheck,
     TaskKnowledgeSync,
     _format_flagged,
@@ -2656,9 +2657,15 @@ class TestFormatFlaggedCharBudget:
         # Each item produces ~320+ chars when JSON-serialised + '- ' prefix
         items = [{'description': 'x' * 300, 'index': i} for i in range(200)]
         text, _count = _format_flagged(items)
-        # Budget is 40000; result should not wildly exceed it (footer is short)
-        assert len(text) <= 42000, (
-            f'Expected text ≤ 42000 chars but got {len(text)}'
+        # Tight upper bound: running_chars ≤ budget + \n separator + footer line.
+        # running_chars can be at most budget_chars when truncation fires.
+        max_dropped = len(items)  # worst-case: only first item fully rendered
+        max_footer = len(f'... and {max_dropped} more (truncated: char budget)')
+        tight_bound = _FLAGGED_ITEMS_CHAR_BUDGET + 1 + max_footer
+        assert len(text) <= tight_bound, (
+            f'Expected text ≤ {tight_bound} chars '
+            f'(budget={_FLAGGED_ITEMS_CHAR_BUDGET} + 1 newline + footer={max_footer}) '
+            f'but got {len(text)}'
         )
 
     def test_over_budget_has_footer(self):
@@ -2704,6 +2711,68 @@ class TestFormatFlaggedCharBudget:
         assert rendered > 0, f'rendered must be > 0, got {rendered}'
         assert dropped > 0, f'dropped must be > 0, got {dropped}'
         assert budget_chars == 40000, f'budget_chars must be 40000, got {budget_chars}'
+
+
+# ---------------------------------------------------------------------------
+# _format_flagged: first-item-exceeds-budget edge case (amendment: suggestion 3)
+# ---------------------------------------------------------------------------
+
+
+class TestFormatFlaggedFirstItemEdgeCase:
+    """_format_flagged always renders at least a truncated fragment of the first item."""
+
+    def test_single_oversized_item_renders_truncated_fragment(self, caplog):
+        """A single item whose JSON exceeds the budget produces a truncated line, not a footer-only body."""
+        # One item whose JSON far exceeds the 40000-char budget
+        items = [{'description': 'y' * 50_000, 'severity': 'critical'}]
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            text, rendered_count = _format_flagged(items)
+
+        # The LLM must see SOMETHING about the item — not just a footer
+        assert '… [item truncated]' in text, (
+            f'Expected truncation marker in text; got first 200 chars: {text[:200]!r}'
+        )
+        # No "... and N more" footer when there are no additional items to report
+        assert '... and ' not in text, (
+            f'Unexpected "... and N more" footer for single-item list; text: {text[:200]!r}'
+        )
+        # Text must not exceed the budget by more than the marker length
+        assert len(text) <= _FLAGGED_ITEMS_CHAR_BUDGET + len('… [item truncated]') + 10, (
+            f'Text too long: {len(text)} chars; expected ≤ {_FLAGGED_ITEMS_CHAR_BUDGET}'
+        )
+        # A truncation warning must still be emitted
+        warning_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING for oversized single item; got {len(warning_records)}'
+        )
+
+    def test_first_of_many_oversized_renders_fragment_plus_footer(self, caplog):
+        """When first item of many exceeds budget, fragment + N-more footer is shown."""
+        # First item is huge; second item is small
+        items = [
+            {'description': 'z' * 50_000, 'severity': 'critical'},
+            {'description': 'small', 'severity': 'minor'},
+        ]
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            text, rendered_count = _format_flagged(items)
+
+        assert '… [item truncated]' in text, (
+            'Expected truncation marker for oversized first item'
+        )
+        # The second item was not rendered; the footer should note it
+        assert '... and 1 more (truncated: char budget)' in text, (
+            f'Expected "... and 1 more" footer; got last 200 chars: {text[-200:]!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2782,7 +2851,13 @@ def _make_stage1_report_with_n_large_items(n: int) -> StageReport:
 
 
 class TestStage2HandoffShortfallWarning:
-    """TaskKnowledgeSync.assemble_payload warns when rendered_count < reported_count."""
+    """TaskKnowledgeSync.assemble_payload warns via _format_flagged when items are truncated.
+
+    After collapsing the two-warning design (suggestions 1+2), the single
+    ``reconciliation.flagged_items_truncated`` warning emitted by ``_format_flagged``
+    carries ``run_stage='stage2'`` so ops can correlate the drop to Stage 2 without
+    a separate stage-specific shortfall warning.
+    """
 
     @pytest.fixture
     def mock_deps(self):
@@ -2802,7 +2877,7 @@ class TestStage2HandoffShortfallWarning:
     async def test_shortfall_warning_emitted_when_budget_truncates(
         self, mock_deps, watermark, caplog
     ):
-        """When stage1 items exceed the char budget, a shortfall warning is emitted."""
+        """When stage1 items exceed the char budget, a truncation warning with run_stage='stage2' fires."""
         # 200 items × ~330 chars each = ~66000 chars — well over the 40000-char budget
         n_items = 200
         stage1_report = _make_stage1_report_with_n_large_items(n_items)
@@ -2818,33 +2893,36 @@ class TestStage2HandoffShortfallWarning:
         ):
             await stage.assemble_payload([], watermark, [stage1_report])
 
-        shortfall_records = [
+        # The single collapsed warning comes from _format_flagged with run_stage='stage2'
+        truncation_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
             and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
-            and 'reconciliation.stage2_flagged_items_shortfall' in rec.message
+            and 'reconciliation.flagged_items_truncated' in rec.getMessage()
+            and getattr(rec, 'run_stage', None) == 'stage2'
         ]
-        assert len(shortfall_records) == 1, (
-            f'Expected exactly 1 stage2_flagged_items_shortfall WARNING; '
-            f'got {len(shortfall_records)}: '
-            f'{[(r.message, r.__dict__) for r in shortfall_records]}'
+        assert len(truncation_records) == 1, (
+            f'Expected exactly 1 flagged_items_truncated WARNING with run_stage=stage2; '
+            f'got {len(truncation_records)}: '
+            f'{[(r.getMessage(), r.__dict__) for r in truncation_records]}'
         )
-        rec = shortfall_records[0]
-        for key in ('reported_count', 'received_count', 'dropped', 'run_stage'):
+        rec = truncation_records[0]
+        # All structured-extra keys must be present
+        for key in ('total', 'rendered', 'dropped', 'budget_chars', 'run_stage'):
             assert hasattr(rec, key), (
-                f'Expected extra key {key!r} on shortfall WARNING; '
+                f'Expected extra key {key!r} on truncation WARNING; '
                 f'record __dict__: {rec.__dict__}'
             )
-        assert rec.reported_count == n_items
-        assert rec.received_count < n_items
-        assert rec.dropped == n_items - rec.received_count
+        assert rec.total == n_items
+        assert rec.rendered < n_items
+        assert rec.dropped == n_items - rec.rendered
         assert rec.run_stage == 'stage2'
 
     @pytest.mark.asyncio
     async def test_no_shortfall_warning_when_all_items_rendered(
         self, mock_deps, watermark, caplog
     ):
-        """When all stage1 items fit in the budget, no shortfall warning is emitted."""
+        """When all stage1 items fit in the budget, no truncation warning is emitted."""
         # 5 small items — far under the 40000-char budget
         now = datetime.now(tz=UTC)
         stage1_report = StageReport(
@@ -2867,13 +2945,14 @@ class TestStage2HandoffShortfallWarning:
         ):
             await stage.assemble_payload([], watermark, [stage1_report])
 
-        shortfall_records = [
+        truncation_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
             and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
-            and 'stage2_flagged_items_shortfall' in rec.message
+            and 'flagged_items_truncated' in rec.getMessage()
+            and getattr(rec, 'run_stage', None) == 'stage2'
         ]
-        assert len(shortfall_records) == 0, (
-            f'Expected no shortfall WARNING for 5 small items; '
-            f'got: {[(r.message, r.__dict__) for r in shortfall_records]}'
+        assert len(truncation_records) == 0, (
+            f'Expected no flagged_items_truncated WARNING (run_stage=stage2) for 5 small items; '
+            f'got: {[(r.getMessage(), r.__dict__) for r in truncation_records]}'
         )
