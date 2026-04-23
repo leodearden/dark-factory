@@ -24,12 +24,14 @@ from shared.cost_store import CostStore
 from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
 from orchestrator.agents.invoke import AgentResult, invoke_agent
 from orchestrator.agents.roles import (
+    _ESCALATION_TOOLS,
     ALL_REVIEWERS,
     ARCHITECT,
     DEBUGGER,
     IMPLEMENTER,
     JUDGE,
     MERGER,
+    ROLES,
     AgentRole,
 )
 from orchestrator.artifacts import TaskArtifacts
@@ -45,10 +47,14 @@ from orchestrator.verify import VerifyResult, run_scoped_verification
 # the plan-tools stdio MCP server.
 _ORCH_PROJECT_DIR = Path(__file__).resolve().parents[2]
 
-# Roles that have _ESCALATION_TOOLS in their allowed_tools.
-# Judge is excluded: it appears in the mcp_config block only for jcodemunch, not for escalation.
+# Roles whose allowed_tools include at least one 'mcp__escalation__escalate*' tool.
 # Steward is excluded: it runs in its own TaskSteward dispatcher, not through TaskWorkflow._invoke.
-_ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset({'architect', 'implementer', 'debugger', 'merger'})
+# All other roles are included or excluded based on their actual allowed_tools entries in ROLES.
+_ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset(
+    name for name, role in ROLES.items()
+    if any(t in _ESCALATION_TOOLS for t in (role.allowed_tools or []))
+    and name != 'steward'
+)
 
 
 class _StewardReescalated(Exception):

@@ -14,8 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.agents.invoke import AgentResult
-from orchestrator.agents.roles import ARCHITECT
-from orchestrator.workflow import TaskWorkflow
+from orchestrator.agents.roles import ARCHITECT, ROLES
+from orchestrator.workflow import _ESCALATION_CAPABLE_ROLES, TaskWorkflow
 
 
 def _make_workflow(*, escalation_queue=None) -> TaskWorkflow:
@@ -73,7 +73,7 @@ class TestMaybeWarnMissingEscalation:
             if rec.levelno >= logging.WARNING
         ), 'unexpected WARNING about missing escalation_queue when queue is present'
 
-    @pytest.mark.parametrize('role_name', ['judge', 'reviewer_comprehensive'])
+    @pytest.mark.parametrize('role_name', ['judge', 'reviewer_comprehensive', 'steward'])
     def test_no_warning_for_non_escalation_capable_role(self, caplog, role_name):
         """No WARNING is emitted for roles that do not use escalation tools."""
         wf = _make_workflow(escalation_queue=None)
@@ -101,6 +101,37 @@ class TestMaybeWarnMissingEscalation:
             f'expected exactly 1 WARNING but got {len(matching)}: {[r.message for r in matching]}'
         )
         assert wf._escalation_missing_warned is True
+
+
+class TestEscalationCapableRolesDerivation:
+    """``_ESCALATION_CAPABLE_ROLES`` is derived correctly from ``ROLES``."""
+
+    def test_escalation_capable_roles_derived_from_roles(self):
+        """_ESCALATION_CAPABLE_ROLES must equal the concrete expected set.
+
+        Hard-coded so any formula change, ROLES edit, or tool-list modification
+        requires a deliberate update here — a re-derived expected would be a
+        tautology that can never fail.
+
+        'steward' is excluded by the dispatcher carve-out even though it carries
+        _ESCALATION_TOOLS; every member must also be a valid ROLES entry.
+        """
+        expected = frozenset({'architect', 'implementer', 'debugger', 'merger', 'deep_reviewer'})
+        missing = expected - _ESCALATION_CAPABLE_ROLES
+        extra = _ESCALATION_CAPABLE_ROLES - expected
+        assert expected == _ESCALATION_CAPABLE_ROLES, (
+            f'_ESCALATION_CAPABLE_ROLES {_ESCALATION_CAPABLE_ROLES!r} '
+            f'!= expected {expected!r}; '
+            f'missing: {missing!r}, extra: {extra!r}'
+        )
+        assert 'steward' not in _ESCALATION_CAPABLE_ROLES, (
+            "'steward' must not be in _ESCALATION_CAPABLE_ROLES (TaskSteward dispatcher carve-out)"
+        )
+        unknown = _ESCALATION_CAPABLE_ROLES - set(ROLES)
+        assert not unknown, (
+            f'All members of _ESCALATION_CAPABLE_ROLES must be valid ROLES entries; '
+            f'unknown: {unknown!r}'
+        )
 
 
 class TestInvokeWiresWarning:
