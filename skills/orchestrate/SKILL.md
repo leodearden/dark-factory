@@ -169,7 +169,16 @@ if resolve["status"] == "created":
 elif resolve["status"] == "combined":
     task_id = resolve["task_id"]           # merged into existing task — normal, not an error
 elif resolve["status"] == "failed":
-    # reason: timeout | server_restart | server_closed | unknown_ticket | ...
+    # reason determines how to proceed:
+    # Retryable (transient): server_restart | timeout
+    #   → retry the submit_task + resolve_ticket pair ONCE with the same metadata.
+    #     (PRD-decomposition tasks do not set escalation_id/suggestion_hash, so the
+    #     R4 idempotency gate does not fire — the curator may de-duplicate via
+    #     "combined" if the duplicate submission matches an existing task, otherwise
+    #     a second task will be created and the user can merge them via the task tree.)
+    # Unrecoverable (terminal): unknown_ticket | server_closed | expired
+    #   → surface the reason to the user and skip this task
+    #     (user can resubmit manually after investigating).
     handle_failure(resolve["reason"])
 ```
 
