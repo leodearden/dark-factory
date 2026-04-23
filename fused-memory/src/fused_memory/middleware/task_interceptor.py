@@ -436,6 +436,18 @@ class TaskInterceptor:
             # The 2026-04 bulk resets DID carry reopen_reason — the guard fires on
             # the *pattern*, not the per-id legitimacy check.
             #
+            # Trade-off: placing the guard BEFORE the terminal-exit gate means that
+            # done→pending attempts *without* a reopen_reason also consume window
+            # slots, even though the terminal-exit gate below would reject them
+            # anyway.  In a pathological burst of unauthorised (no-reopen_reason)
+            # done→pending attempts, the guard will trip and emit an escalation even
+            # though no actual reversals were allowed.  This is intentional: the
+            # *attempt pattern* is the signal.  False-positive trips from such bursts
+            # are acceptable because (a) the escalation text names the affected task
+            # IDs so a steward can distinguish legitimate from illegitimate reversals,
+            # and (b) the guard's primary goal is limiting blast radius, not
+            # distinguishing authorised from unauthorised reversals.
+            #
             # IMPORTANT: This block MUST remain outside (before) the
             # ``if old_status in TERMINAL_STATUSES:`` check below.  Moving it
             # inside that branch would leave in-progress→pending reversals (which

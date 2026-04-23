@@ -590,8 +590,12 @@ def test_verdict_to_error_dict_rejection():
     assert d['success'] is False
     assert d['error_type'] == 'BulkResetGuardTripped'
     assert 'BulkResetGuardTripped' in d['error']
-    assert str(d['threshold']) in d['error'] or d['threshold'] == 10
-    assert str(d['window_seconds']) in d['error'] or d['window_seconds'] == 60.0
+    assert str(d['threshold']) in d['error'], (
+        f"error string {d['error']!r} should contain threshold {d['threshold']}"
+    )
+    assert str(d['window_seconds']) in d['error'], (
+        f"error string {d['error']!r} should contain window_seconds {d['window_seconds']}"
+    )
     assert d['affected_task_ids'] == ['5', '6', '7']
     assert d['triggering_timestamps'] == [
         '2026-04-23T00:00:00+00:00',
