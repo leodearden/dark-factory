@@ -1198,3 +1198,22 @@ class TestBuildBatchUserPrompt:
         assert 'task-99' in result
         # Final instruction line references 'decisions'
         assert 'decisions' in result.lower()
+
+
+# ----------------------------------------------------------------------
+# _BATCH_SYSTEM_PROMPT
+# ----------------------------------------------------------------------
+
+
+class TestBatchSystemPrompt:
+    def test_batch_system_prompt_mentions_within_batch_duplicate_rule(self):
+        """The batch system prompt must carry the within-batch duplicate instruction."""
+        from fused_memory.middleware.task_curator import _BATCH_SYSTEM_PROMPT
+
+        # Must reference batch_target_index (the encoding used for within-batch drops)
+        assert 'batch_target_index' in _BATCH_SYSTEM_PROMPT
+        # Must mention within-batch scope
+        assert 'within the batch' in _BATCH_SYSTEM_PROMPT.lower()
+        # Must explicitly rule out combine between two new batch items
+        assert 'combine' in _BATCH_SYSTEM_PROMPT.lower()
+        assert 'not supported' in _BATCH_SYSTEM_PROMPT.lower() or 'not support' in _BATCH_SYSTEM_PROMPT.lower()
