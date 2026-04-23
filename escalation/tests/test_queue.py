@@ -198,6 +198,26 @@ class TestDismissAllPendingResilience:
         assert count == 0
 
 
+class TestGetArchiveFallback:
+    """EscalationQueue.get() falls back to the archive when the root path is missing."""
+
+    def test_get_returns_archived_escalation_after_resolve(self, tmp_path: Path):
+        """After resolve(), queue.get(id) returns the escalation from the archive."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'Archive fallback works')
+
+        # File has been moved to archive — root path no longer exists
+        assert not (queue.queue_dir / 'esc-1-1.json').exists()
+
+        # get() must still return the escalation
+        result = queue.get('esc-1-1')
+        assert result is not None
+        assert result.status == 'resolved'
+        assert result.resolution == 'Archive fallback works'
+
+
 class TestResolveArchives:
     """EscalationQueue.resolve() moves the file into archive/YYYY-MM-DD/ after resolution."""
 
