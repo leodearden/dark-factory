@@ -527,24 +527,29 @@ def _submit_resolve_instructions(
         Plain unindented multi-line string with the shared skeleton.
     """
     a, b = step_prefix
-    extra = f'\n{extra_submit_guidance.rstrip()}\n' if extra_submit_guidance.strip() else ''
-    return textwrap.dedent(f"""\
-        {a}. Call `submit_task`(title=..., description=..., priority=...,
-           metadata={metadata_template},
-           project_root={project_root_expr}) — returns `{{"ticket": "tkt_..."}}` on success, or
-           `{{"error": ..., "error_type": ...}}` (no `ticket` key) if the call was
-           rejected at submit time (e.g. backlog full, closed interceptor). On the
-           error shape, treat the candidate as skipped and record the error in your
-           {outcome_target}.{extra}
-        {b}. Call `resolve_ticket`(ticket=..., project_root={project_root_expr}, timeout_seconds=60) —
-           (60 s is intentionally conservative; server default is 115 s — raise if
-           curator is consistently slow) returns {{status, task_id?, reason?}}. Branch on `status`:
-           - `created` — the curator accepted the candidate; record `task_id`.
-           - `combined` — the curator deduped into an existing task; `task_id` points
-             at that task. Record it the same way as `created` (the candidate was
-             absorbed, not lost).
-           - `failed` — report the `reason` in your {outcome_target}.\
-    """)
+    # extra_submit_guidance is inserted between the submit error-shape sentence and the
+    # resolve_ticket step.  Always emit at least one \n to separate the two steps.
+    extra = ('\n' + extra_submit_guidance.rstrip() + '\n') if extra_submit_guidance.strip() else '\n'
+    # Build the string with explicit \n so that multiline metadata_template values
+    # (which introduce lines at column-0 when substituted) do not confuse textwrap.dedent.
+    return (
+        f'{a}. Call `submit_task`(title=..., description=..., priority=...,\n'
+        f'   metadata={metadata_template},\n'
+        f'   project_root={project_root_expr}) — returns `{{"ticket": "tkt_..."}}` on success, or\n'
+        '   `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was\n'
+        '   rejected at submit time (e.g. backlog full, closed interceptor). On the\n'
+        '   error shape, treat the candidate as skipped and record the error in your\n'
+        f'   {outcome_target}.'
+        + extra
+        + f'{b}. Call `resolve_ticket`(ticket=..., project_root={project_root_expr}, timeout_seconds=60) —\n'
+        '   (60 s is intentionally conservative; server default is 115 s — raise if\n'
+        '   curator is consistently slow) returns {status, task_id?, reason?}. Branch on `status`:\n'
+        '   - `created` — the curator accepted the candidate; record `task_id`.\n'
+        '   - `combined` — the curator deduped into an existing task; `task_id` points\n'
+        '     at that task. Record it the same way as `created` (the candidate was\n'
+        '     absorbed, not lost).\n'
+        f'   - `failed` — report the `reason` in your {outcome_target}.'
+    )
 
 
 _STEWARD_MEMORY_TOOLS = [
