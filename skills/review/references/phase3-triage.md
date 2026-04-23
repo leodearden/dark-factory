@@ -77,12 +77,39 @@ Suggest unblocking these.
 
 For each finding classified as "auto-fix" or "clear-cut issue":
 
+> **Note:** `add_task` is a deprecated facade being removed; always use `submit_task` + `resolve_ticket`.
+
 ```
-add_task(
-  title="{concise description of the fix}",
-  description="{what's wrong, where, evidence, and what the fix should look like}",
-  project_root="/home/leo/src/dark-factory"
+# Phase 1: submit — returns immediately with a ticket id
+submit_result = submit_task(
+    project_root="/home/leo/src/dark-factory",
+    title="{concise description of the fix}",
+    description="{what's wrong, where, evidence, and what the fix should look like}",
+    priority="high",                      # or "medium" for auto-fix — see priority mapping below
+    metadata={
+        "source": "review-cycle",
+        "review_id": "{timestamp}",
+        "spawn_context": "review",
+        "modules": ["{affected/module/path}"],
+        "memory_hints": {
+            "search_queries": ["{relevant search query}"],
+            "entity_names": ["{relevant entity}"]
+        },
+    },
 )
+ticket = submit_result["ticket"]
+
+# Phase 2: block until the curator decides (default 115 s)
+resolve = resolve_ticket(ticket=ticket, project_root="/home/leo/src/dark-factory")
+
+if resolve["status"] == "created":
+    task_id = resolve["task_id"]           # new task — use for add_dependency calls
+elif resolve["status"] == "combined":
+    task_id = resolve["task_id"]           # merged into existing task — normal, not an error
+elif resolve["status"] == "failed":
+    # reason: timeout | server_restart | server_closed | unknown_ticket | ...
+    # Report reason in the review report and skip this finding
+    log_failure(resolve["reason"])
 ```
 
 ### Task quality checklist
