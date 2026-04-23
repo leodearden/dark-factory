@@ -1,6 +1,7 @@
 """Intercepts task state transitions for targeted reconciliation."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -1214,10 +1215,8 @@ class TaskInterceptor:
             # the get() + remove() is a harmless no-op in that case.
             evs = self._ticket_events.get(ticket)
             if evs is not None:
-                try:
-                    evs.remove(event)
-                except ValueError:
-                    pass  # already removed by _signal_ticket_event
+                with contextlib.suppress(ValueError):
+                    evs.remove(event)  # already removed by _signal_ticket_event
                 if not evs:
                     self._ticket_events.pop(ticket, None)
 
@@ -1518,6 +1517,9 @@ class TaskInterceptor:
                 # Each is wrapped independently: a failure appends to
                 # post_create_warnings and is logged, but does NOT flip status.
                 if curator is not None and candidate is not None and task_id_str:
+                    # task_id_str truthy ↔ we took the else-branch above, so
+                    # result_dict was assigned; assert to satisfy the type checker.
+                    assert result_dict is not None
                     try:
                         curator.note_created(project_id, candidate, task_id_str)
                     except Exception as exc:
