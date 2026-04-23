@@ -61,6 +61,8 @@ class EventType(StrEnum):
     lock_acquired = 'lock_acquired'
     lock_released = 'lock_released'
     merge_attempt = 'merge_attempt'
+    merge_queued = 'merge_queued'
+    merge_dequeued = 'merge_dequeued'
     speculative_merge = 'speculative_merge'
     speculative_discard = 'speculative_discard'
 

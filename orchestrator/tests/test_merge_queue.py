@@ -3341,3 +3341,417 @@ class TestHaltOwnerMechanics:
         worker.set_halt_owner('esc-2-1')
         assert worker.is_halt_owner('esc-2-1') is True
         assert worker.is_halt_owner('esc-1-1') is False
+
+
+# ---------------------------------------------------------------------------
+# TestEnqueueMergeRequest — step-3
+# ---------------------------------------------------------------------------
+
+
+class TestEnqueueMergeRequest:
+    """Tests for the module-level enqueue_merge_request helper."""
+
+    @pytest.mark.asyncio
+    async def test_enqueue_helper_emits_merge_queued_and_puts_on_queue(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ):
+        """enqueue_merge_request emits merge_queued and places req on queue."""
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs.db'
+        event_store = EventStore(db_path, 'run-1')
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('42', 'task/42', wt, config)
+
+        await enqueue_merge_request(queue, req, event_store)
+
+        # Queue has exactly one item which is our req
+        assert queue.qsize() == 1
+        dequeued = queue.get_nowait()
+        assert dequeued is req
+
+        # Exactly one merge_queued row in events
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, phase, "
+            "json_extract(data, '$.branch') AS branch "
+            "FROM events WHERE event_type = 'merge_queued'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'merge_queued'
+        assert rows[0][1] == '42'
+        assert rows[0][2] == 'merge'
+        assert rows[0][3] == 'task/42'
+
+    @pytest.mark.asyncio
+    async def test_enqueue_helper_with_none_event_store_still_enqueues(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ):
+        """Passing event_store=None must still enqueue and not raise."""
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('99', 'task/99', wt, config)
+
+        await enqueue_merge_request(queue, req, None)
+
+        assert queue.qsize() == 1
+        dequeued = queue.get_nowait()
+        assert dequeued is req
+
+
+# ---------------------------------------------------------------------------
+# TestMergeWorkerDequeueEvent — step-5
+# ---------------------------------------------------------------------------
+
+
+class TestMergeWorkerDequeueEvent:
+    """MergeWorker emits merge_dequeued after dequeuing a request."""
+
+    @pytest.mark.asyncio
+    async def test_merge_worker_emits_merge_dequeued_after_dequeue(
+        self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps,
+    ):
+        """MergeWorker emits merge_dequeued after pulling request from queue.
+
+        Timestamp of merge_dequeued must be >= merge_queued timestamp.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('42', 'task/42', wt, config)
+
+        # Patch _do_merge so it immediately returns 'done' without git ops
+        async def _fast_done(req):
+            return MergeOutcome('done')
+
+        worker_task = asyncio.create_task(worker.run())
+        with patch.object(worker, '_do_merge', side_effect=_fast_done):
+            await enqueue_merge_request(queue, req, event_store)
+            outcome = await asyncio.wait_for(req.result, timeout=10)
+
+        assert outcome.status == 'done'
+
+        conn = sqlite3.connect(str(db_path))
+        dequeued_rows = conn.execute(
+            "SELECT event_type, task_id, timestamp FROM events "
+            "WHERE event_type = 'merge_dequeued'"
+        ).fetchall()
+        queued_rows = conn.execute(
+            "SELECT timestamp FROM events WHERE event_type = 'merge_queued'"
+        ).fetchall()
+        conn.close()
+
+        assert len(dequeued_rows) == 1, f'Expected 1 merge_dequeued row, got: {dequeued_rows}'
+        assert dequeued_rows[0][1] == '42'
+        # merge_dequeued timestamp must be >= merge_queued timestamp
+        assert len(queued_rows) == 1
+        assert dequeued_rows[0][2] >= queued_rows[0][0]
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestSpeculativeMergeWorkerDequeueEvent — step-7
+# ---------------------------------------------------------------------------
+
+
+class TestSpeculativeMergeWorkerDequeueEvent:
+    """SpeculativeMergeWorker emits merge_dequeued after dequeuing a request."""
+
+    @pytest.mark.asyncio
+    async def test_speculative_worker_emits_merge_dequeued_after_dequeue(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """SpeculativeMergeWorker emits merge_dequeued after dequeuing.
+
+        Uses an immediate conflict path (merge_to_main returns conflicts=True)
+        so the test is fast and doesn't need real git merge work.
+        """
+        from orchestrator.git_ops import MergeResult
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        # Use a real worktree so rev-parse HEAD works
+        wt = await _make_branch_with_file(
+            git_ops, 'spec-deq', 'spec_deq.py', 'x = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker._shutdown_timeout = 2.0
+
+        # Force an immediate conflict so the merger resolves quickly
+        conflict_result = MergeResult(
+            success=False, conflicts=True, details='conflict',
+            merge_worktree=None, merge_commit=None, pre_merge_sha=None,
+        )
+
+        worker_task = asyncio.create_task(worker.run())
+        with patch.object(git_ops, 'merge_to_main', return_value=conflict_result):
+            req = _make_request('spec-deq', 'spec-deq', wt, config)
+            await enqueue_merge_request(queue, req, event_store)
+            outcome = await asyncio.wait_for(req.result, timeout=10)
+
+        assert outcome.status == 'conflict'
+
+        conn = sqlite3.connect(str(db_path))
+        dequeued_rows = conn.execute(
+            "SELECT event_type, task_id, timestamp FROM events "
+            "WHERE event_type = 'merge_dequeued'"
+        ).fetchall()
+        queued_rows = conn.execute(
+            "SELECT timestamp FROM events WHERE event_type = 'merge_queued'"
+        ).fetchall()
+        conn.close()
+
+        assert len(dequeued_rows) == 1, f'Expected 1 merge_dequeued row, got: {dequeued_rows}'
+        assert dequeued_rows[0][1] == 'spec-deq'
+        # merge_dequeued timestamp must be >= merge_queued timestamp
+        assert len(queued_rows) == 1
+        assert dequeued_rows[0][2] >= queued_rows[0][0]
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestMergeWorkerCasRetryEmitsMergeQueued — step-9
+# ---------------------------------------------------------------------------
+
+
+class TestMergeWorkerCasRetryEmitsMergeQueued:
+    """MergeWorker emits merge_queued when re-enqueuing on CAS retry."""
+
+    @pytest.mark.asyncio
+    async def test_cas_retry_reenqueue_emits_merge_queued(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """CAS retry path emits a second merge_queued, then merge_dequeued, then done.
+
+        Event sequence expected:
+          merge_queued        (initial enqueue via helper)
+          merge_dequeued      (worker picks up request the first time)
+          merge_attempt(cas_retry)
+          merge_queued        (re-enqueue on CAS failure)
+          merge_dequeued      (worker picks up from _urgent)
+          merge_attempt(done)
+        """
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        wt = await _make_branch_with_file(
+            git_ops, 'cas-evt', 'cas_evt.py', 'x = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        original_advance = git_ops.advance_main
+        call_count = 0
+
+        async def _fail_once(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return 'cas_failed'
+            return await original_advance(*args, **kwargs)
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_fail_once),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('cas-evt', 'cas-evt', wt, config)
+            from orchestrator.merge_queue import enqueue_merge_request
+            await enqueue_merge_request(queue, req, event_store)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done'
+        assert call_count == 2
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, json_extract(data, '$.outcome') AS outcome "
+            "FROM events ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        event_types = [(r[0], r[1]) for r in rows]
+
+        # Count merge_queued rows for this task — expect exactly 2
+        queued_count = sum(1 for et, _ in event_types if et == 'merge_queued')
+        assert queued_count == 2, f'Expected 2 merge_queued rows, got: {event_types}'
+
+        # Count merge_dequeued rows — expect exactly 2
+        dequeued_count = sum(1 for et, _ in event_types if et == 'merge_dequeued')
+        assert dequeued_count == 2, f'Expected 2 merge_dequeued rows, got: {event_types}'
+
+        # Exactly one cas_retry and one done attempt
+        attempt_outcomes = [out for et, out in event_types if et == 'merge_attempt']
+        assert 'cas_retry' in attempt_outcomes, f'Expected cas_retry in attempts: {attempt_outcomes}'
+        assert 'done' in attempt_outcomes, f'Expected done in attempts: {attempt_outcomes}'
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestWorkflowSubmitUsesEnqueueHelper — step-11 test
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowSubmitUsesEnqueueHelper:
+    """_submit_to_merge_queue delegates to enqueue_merge_request instead of put() directly."""
+
+    @pytest.mark.asyncio
+    async def test_submit_to_merge_queue_calls_enqueue_helper(self, tmp_path: Path):
+        """_submit_to_merge_queue calls enqueue_merge_request with (queue, req, event_store).
+
+        Before step-12 impl, the function calls self.merge_queue.put() directly and
+        never calls enqueue_merge_request — so mock_helper.assert_called_once() fails.
+        After step-12, the function calls enqueue_merge_request — assertion passes.
+        """
+        from orchestrator.merge_queue import MergeOutcome, MergeRequest
+        from orchestrator.workflow import TaskWorkflow
+
+        # Minimal assignment mock (mirrors test_workflow_escalation_warning pattern)
+        assignment = MagicMock()
+        assignment.task_id = '42'
+        assignment.task = {'id': '42', 'title': 'T', 'description': 'desc'}
+        assignment.modules = []
+
+        wf_config = MagicMock()
+        wf_config.fused_memory.project_id = 'test'
+        wf_config.fused_memory.url = 'http://localhost'
+        wf_config.max_review_cycles = 2
+        wf_config.max_amendment_rounds = 1
+        wf_config.lock_depth = 2
+        wf_config.steward_completion_timeout = 300.0
+
+        workflow = TaskWorkflow(
+            assignment=assignment,
+            config=wf_config,
+            git_ops=MagicMock(),
+            scheduler=MagicMock(),
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+        )
+
+        # Wire required attributes
+        merge_queue_mock: AsyncMock = AsyncMock()
+        event_store_mock = MagicMock()
+        workflow.merge_queue = merge_queue_mock
+        workflow.event_store = event_store_mock
+        workflow.worktree = tmp_path / 'wt'
+        workflow.worktree.mkdir()
+
+        # Before step-12: merge_queue.put() is called directly → resolve future
+        # so _submit_to_merge_queue doesn't hang.
+        async def _put_resolves_future(req):
+            if isinstance(req, MergeRequest) and not req.result.done():
+                req.result.set_result(MergeOutcome('done'))
+
+        merge_queue_mock.put.side_effect = _put_resolves_future
+
+        # After step-12: enqueue_merge_request is called → resolve future via mock.
+        async def _mock_enqueue(queue, req, es):
+            if not req.result.done():
+                req.result.set_result(MergeOutcome('done'))
+
+        mock_helper = AsyncMock(side_effect=_mock_enqueue)
+
+        # Patch the source module so both local and module-level imports get the mock.
+        with patch('orchestrator.merge_queue.enqueue_merge_request', mock_helper):
+            await workflow._submit_to_merge_queue('task/42')
+
+        # KEY: enqueue_merge_request must have been called exactly once
+        mock_helper.assert_called_once()
+        call_queue, call_req, call_es = mock_helper.call_args.args
+        assert call_queue is merge_queue_mock
+        assert isinstance(call_req, MergeRequest)
+        assert call_req.task_id == '42'
+        assert call_req.branch == 'task/42'
+        assert call_es is event_store_mock
+
+
+# ---------------------------------------------------------------------------
+# TestEscalationServerUsesEnqueueHelper — step-13 test
+# ---------------------------------------------------------------------------
+
+
+class TestEscalationServerUsesEnqueueHelper:
+    """escalation server merge_request tool delegates to enqueue_merge_request."""
+
+    @pytest.mark.asyncio
+    async def test_escalation_server_merge_request_uses_enqueue_helper(
+        self, tmp_path: Path,
+    ):
+        """merge_request tool calls enqueue_merge_request(queue, req, event_store).
+
+        Must fail until escalation/server.py accepts the event_store kwarg (step-14)
+        and replaces merge_queue.put() with the helper.
+        """
+        from escalation.server import create_server
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import MergeOutcome, MergeRequest
+
+        merge_queue: asyncio.Queue = asyncio.Queue()
+        event_store = EventStore(db_path=tmp_path / 'test.db', run_id='test')
+
+        # Stub orch_config with _module_configs attribute
+        stub_config = MagicMock()
+        stub_config._module_configs = {}
+
+        # Mock resolves the future so the tool doesn't hang
+        async def _mock_enqueue(queue, req, es):
+            if not req.result.done():
+                req.result.set_result(MergeOutcome('done'))
+
+        mock_helper = AsyncMock(side_effect=_mock_enqueue)
+
+        # Patch the source module so local imports inside the tool get the mock
+        with patch('orchestrator.merge_queue.enqueue_merge_request', mock_helper):
+            # Before step-14: create_server raises TypeError (unexpected kwarg)
+            mcp = create_server(
+                MagicMock(),
+                merge_queue=merge_queue,
+                orch_config=stub_config,
+                event_store=event_store,
+            )
+            from fastmcp.tools.function_tool import FunctionTool
+            tool = await mcp.get_tool('merge_request')
+            assert isinstance(tool, FunctionTool)
+            await tool.fn(task_id='9', branch='task/9', worktree='/tmp/x')
+
+        # Helper must have been called exactly once with the right args
+        mock_helper.assert_called_once()
+        call_queue, call_req, call_es = mock_helper.call_args.args
+        assert call_queue is merge_queue
+        assert isinstance(call_req, MergeRequest)
+        assert call_req.task_id == '9'
+        assert call_req.branch == 'task/9'
+        assert call_es is event_store

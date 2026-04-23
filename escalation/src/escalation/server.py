@@ -33,6 +33,7 @@ def create_server(
     queue: EscalationQueue,
     merge_queue: asyncio.Queue | None = None,
     orch_config: Any = None,
+    event_store: Any = None,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered."""
     mcp = FastMCP('escalation')
@@ -169,11 +170,11 @@ def create_server(
         if orch_config is None:
             return {'error': 'Merge queue available but no orchestrator config — cannot verify'}
 
-        from orchestrator.merge_queue import MergeOutcome, MergeRequest
+        from orchestrator.merge_queue import MergeOutcome, MergeRequest, enqueue_merge_request
 
         module_configs = list(orch_config._module_configs.values())
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
-        await merge_queue.put(MergeRequest(
+        merge_req = MergeRequest(
             task_id=task_id,
             branch=branch,
             worktree=Path(worktree),
@@ -182,7 +183,8 @@ def create_server(
             module_configs=module_configs,
             config=orch_config,
             result=future,
-        ))
+        )
+        await enqueue_merge_request(merge_queue, merge_req, event_store)
 
         outcome = await future
         return {

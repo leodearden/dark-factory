@@ -117,6 +117,50 @@ def _emit_merge_attempt(
         )
 
 
+def _emit_merge_queued(
+    event_store: EventStore | None,
+    req: MergeRequest,
+    reason: str | None = None,
+) -> None:
+    """Emit a merge_queued event.  No-op when *event_store* is None.
+
+    Centralises the emit payload so both :func:`enqueue_merge_request` and
+    the ``MergeWorker`` CAS-retry path use an identical record shape.  If
+    *reason* is provided (e.g. ``'cas_retry'``) it is stored in ``data``.
+    """
+    if event_store is None:
+        return
+    data: dict = {'branch': req.branch}
+    if reason is not None:
+        data['reason'] = reason
+    event_store.emit(
+        EventType.merge_queued,
+        task_id=req.task_id,
+        phase='merge',
+        data=data,
+    )
+
+
+async def enqueue_merge_request(
+    queue: asyncio.Queue,
+    req: MergeRequest,
+    event_store: EventStore | None,
+) -> None:
+    """Enqueue a MergeRequest and emit a merge_queued event.
+
+    Puts the request on *queue* first so that a cancellation between put and
+    emit (or any emit error) does not leave a dangling ``merge_queued`` row
+    with no corresponding worker pickup.  Losing the event is less confusing
+    than a stale "queued" row that persists until the TTL expires.
+
+    If ``event_store`` is None the request is still enqueued; emission is
+    silently skipped (mirrors the None-safe pattern used by
+    ``_emit_merge_attempt``).
+    """
+    await queue.put(req)
+    _emit_merge_queued(event_store, req)
+
+
 @dataclass
 class MergeRequest:
     """A request to merge a task branch into main."""
@@ -268,6 +312,14 @@ class MergeWorker:
             req = await self._dequeue()
             if req is None:
                 break  # shutdown sentinel
+
+            if self._event_store is not None:
+                self._event_store.emit(
+                    EventType.merge_dequeued,
+                    task_id=req.task_id,
+                    phase='merge',
+                    data={'branch': req.branch},
+                )
 
             outcome = await self._process(req)
             # outcome is None when the request was re-enqueued (CAS failure)
@@ -564,6 +616,7 @@ class MergeWorker:
             f'{self.MAX_CAS_RETRIES}), re-enqueueing at front'
         )
         _emit_merge_attempt(self._event_store, req.task_id, 'cas_retry', attempt=retries, duration_ms=_elapsed_ms(t0))
+        _emit_merge_queued(self._event_store, req, reason='cas_retry')
         self._urgent.append(req)
         return None  # don't resolve Future — will be reprocessed
 
@@ -626,6 +679,8 @@ class SpeculativeMergeWorker:
         # queue. Used by stop() to resolve Futures for requests that were
         # mid-processing when shutdown was initiated.
         self._inflight_req: MergeRequest | None = None
+        # Can be overridden in tests for fast shutdown (see stop()).
+        self._shutdown_timeout: float = 5.0
 
     def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome:
         """Build the terminal MergeOutcome for the loop-breaker.
@@ -745,7 +800,7 @@ class SpeculativeMergeWorker:
             if t is not None and not t.done()
         ]
         if tasks_to_wait:
-            timeout = getattr(self, '_shutdown_timeout', 5.0)
+            timeout = self._shutdown_timeout
             await asyncio.wait(tasks_to_wait, timeout=timeout)
 
         # Re-drain the verifier queue: the merger may have pushed SpeculativeItems
@@ -822,6 +877,13 @@ class SpeculativeMergeWorker:
                     await self._wip_halt.wait()
 
                 self._inflight_req = req  # track for stop() race resolution
+                if self._event_store is not None:
+                    self._event_store.emit(
+                        EventType.merge_dequeued,
+                        task_id=req.task_id,
+                        phase='merge',
+                        data={'branch': req.branch},
+                    )
                 t0 = time.monotonic()
                 merge_result_local: MergeResult | None = None
                 try:

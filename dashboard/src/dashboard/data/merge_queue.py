@@ -48,6 +48,12 @@ def _ts_sort_key(entry: dict) -> datetime:
 
 _CANONICAL_OUTCOMES = ['done', 'conflict', 'blocked', 'already_merged']
 
+_TERMINAL_MERGE_OUTCOMES: frozenset[str] = frozenset({
+    'done', 'already_merged', 'conflict', 'blocked',
+    'dropped_plan_targets', 'cas_exhausted', 'abandoned_verify_timeouts',
+})
+_ACTIVE_EVENT_TYPES: tuple[str, ...] = ('merge_queued', 'merge_dequeued', 'merge_attempt')
+
 # Soft operational-warning threshold: warn when recent_merges returns more rows
 # than this while running unbounded (limit=None).  Signals a possible producer
 # burst worth investigating before memory pressure is reached.
@@ -490,7 +496,95 @@ async def speculative_stats(
 
 
 # ---------------------------------------------------------------------------
-# 6. Per-project helpers
+# 6. Active queued merges
+# ---------------------------------------------------------------------------
+
+
+async def active_queued_merges(
+    db: aiosqlite.Connection | None,
+    *,
+    ttl_minutes: int = 30,
+    now: datetime | None = None,
+) -> list[dict]:
+    """Return tasks whose latest merge-lifecycle event is not a terminal outcome.
+
+    Queries events with event_type IN ('merge_queued', 'merge_dequeued',
+    'merge_attempt'), picks the latest row per task_id within the TTL window,
+    and excludes tasks whose latest event is a terminal merge_attempt outcome
+    (done, already_merged, conflict, blocked, dropped_plan_targets,
+    cas_exhausted, abandoned_verify_timeouts).
+
+    Args:
+        db:  Async SQLite connection, or None (returns []).
+        ttl_minutes:  Drop tasks whose latest relevant event is older than
+            this many minutes.  Acts as a safety net for crashed orchestrators
+            that left dangling merge_queued rows.
+        now:  Reference timestamp for the TTL cutoff.  Defaults to
+            ``datetime.now(UTC)`` when None.
+
+    Returns:
+        List of dicts with keys: task_id, run_id, state, timestamp, branch,
+        outcome.  ``state`` is 'queued' when latest event is merge_queued;
+        'in_flight' for merge_dequeued or merge_attempt(cas_retry).
+    """
+    if db is None:
+        return []
+
+    effective_now = now if now is not None else datetime.now(UTC)
+    cutoff = (effective_now - timedelta(minutes=ttl_minutes)).isoformat()
+    et_placeholders = ','.join('?' * len(_ACTIVE_EVENT_TYPES))
+
+    async def _query(conn: aiosqlite.Connection) -> list[dict]:
+        # Use ROW_NUMBER() window function for a single-pass plan that:
+        # (a) avoids the O(N²) correlated-subquery scan, and
+        # (b) deterministically picks one row per task_id when two events
+        #     share an identical timestamp (ties broken by insertion order
+        #     via id DESC, which is unique by AUTOINCREMENT).
+        sql = f"""
+            WITH ranked AS (
+                SELECT task_id, run_id, event_type,
+                       json_extract(data, '$.outcome') AS outcome,
+                       json_extract(data, '$.branch') AS branch,
+                       timestamp,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY task_id
+                           ORDER BY timestamp DESC, id DESC
+                       ) AS rn
+                FROM events
+                WHERE event_type IN ({et_placeholders})
+                  AND timestamp >= ?
+            )
+            SELECT task_id, run_id, event_type, outcome, branch, timestamp
+            FROM ranked
+            WHERE rn = 1
+        """
+        params = (*_ACTIVE_EVENT_TYPES, cutoff)
+        rows = await conn.execute_fetchall(sql, params)
+
+        result = []
+        for row in rows:
+            et = row['event_type']
+            outcome = row['outcome']
+            # Exclude terminal merge_attempt rows
+            if et == 'merge_attempt' and outcome in _TERMINAL_MERGE_OUTCOMES:
+                continue
+            # Derive state
+            state = 'queued' if et == 'merge_queued' else 'in_flight'
+            result.append({
+                'task_id': row['task_id'],
+                'run_id': row['run_id'],
+                'state': state,
+                'timestamp': row['timestamp'],
+                'branch': row['branch'],
+                'outcome': outcome,
+            })
+        return result
+
+    return await with_db(db, _query, [])
+
+
+# ---------------------------------------------------------------------------
+# 7. Per-project helpers
 # ---------------------------------------------------------------------------
 
 
@@ -637,7 +731,7 @@ async def build_per_project_merge_queue(
             the Python post-filter tightens to the exact minute boundary.
 
     Returns:
-        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, speculative}}``.
+        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, speculative, active}}``.
     """
     _DEFAULT_DEPTH: ChartData = {'labels': [], 'values': []}
     _DEFAULT_OUTCOMES: ChartData = {'labels': [], 'values': []}
@@ -648,12 +742,13 @@ async def build_per_project_merge_queue(
 
     async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
         try:
-            depth_r, outcomes_r, latency_r, recent_r, spec_r = await asyncio.gather(
+            depth_r, outcomes_r, latency_r, recent_r, spec_r, active_r = await asyncio.gather(
                 queue_depth_timeseries(db, hours=hours, now=now),
                 outcome_distribution(db, hours=hours, now=now),
                 latency_stats(db, hours=hours, now=now),
                 recent_merges(db, limit=None, hours=recent_hours, now=now),
                 speculative_stats(db, hours=hours, now=now),
+                active_queued_merges(db, ttl_minutes=30, now=now),
                 return_exceptions=True,
             )
             depth = safe_gather_result(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
@@ -661,6 +756,7 @@ async def build_per_project_merge_queue(
             latency = safe_gather_result(latency_r, _DEFAULT_LATENCY, f'{pid}/latency')
             recent_raw = safe_gather_result(recent_r, [], f'{pid}/recent')
             spec = safe_gather_result(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
+            active_list = safe_gather_result(active_r, [], f'{pid}/active')
             if len(recent_raw) > _RECENT_MERGES_BURST_WARN:  # type: ignore[arg-type]
                 logger.warning(
                     'build_per_project_merge_queue %s: recent_merges returned %d rows'
@@ -682,6 +778,7 @@ async def build_per_project_merge_queue(
                 'latency': latency,
                 'recent': recent_trimmed,
                 'speculative': spec,
+                'active': active_list,
             }
         except Exception as exc:
             logger.warning(
@@ -695,6 +792,7 @@ async def build_per_project_merge_queue(
                 'latency': _DEFAULT_LATENCY,
                 'recent': [],
                 'speculative': _DEFAULT_SPEC,
+                'active': [],
             }
 
     results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])
