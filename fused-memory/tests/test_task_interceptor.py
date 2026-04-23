@@ -3161,3 +3161,117 @@ async def test_csv_set_task_status_mixed_statuses_partial_success(
     # Task 2: in-progress -> pending, standard allowed transition.
     assert per_id['2'].get('success') is True or 'error' not in per_id['2']
     assert result['success'] is False  # overall false because 1 failed
+
+
+# ---------------------------------------------------------------------------
+# step-21 / step-23: BulkResetGuard integration tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def bulk_reset_guard():
+    """BulkResetGuard with test-friendly thresholds (threshold=3)."""
+    from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard
+    return BulkResetGuard(
+        threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+    )
+
+
+@pytest.fixture
+def interceptor_with_guard(taskmaster, reconciler, event_buffer, bulk_reset_guard):
+    """TaskInterceptor with BulkResetGuard wired in."""
+    return TaskInterceptor(taskmaster, reconciler, event_buffer, bulk_reset_guard=bulk_reset_guard)
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_csv_done_to_pending_tripping_guard_rejects_and_escalates(
+    interceptor_with_guard, taskmaster, tmp_path,
+):
+    """CSV done→pending: first 3 apply, tasks 4 and 5 are rejected by the guard."""
+    async def get_task_done(task_id, project_root, tag=None):
+        return {'id': task_id, 'status': 'done', 'title': f'Task {task_id}'}
+
+    taskmaster.get_task.side_effect = get_task_done
+
+    result = await interceptor_with_guard.set_task_status(
+        task_id='1,2,3,4,5',
+        status='pending',
+        project_root=str(tmp_path),
+        reopen_reason='test bulk autopilot reset',
+    )
+
+    # (a) top-level: overall failure, five per-id results
+    assert result['success'] is False
+    assert len(result['results']) == 5
+
+    per_id = {r['task_id']: r['result'] for r in result['results']}
+
+    # (b) First three applied successfully
+    for tid in ('1', '2', '3'):
+        r = per_id[tid]
+        assert r.get('success') is True, f'task {tid}: expected success, got {r}'
+
+    # (c) Tasks 4 and 5 rejected by guard
+    for tid in ('4', '5'):
+        r = per_id[tid]
+        assert r.get('error_type') == 'BulkResetGuardTripped', (
+            f'task {tid}: expected BulkResetGuardTripped, got {r}'
+        )
+        assert r.get('success') is False
+        assert 'affected_task_ids' in r
+        assert 'triggering_timestamps' in r
+
+    # (d) Escalation JSON exists under <project_root>/data/escalations/
+    esc_dir = tmp_path / 'data' / 'escalations'
+    esc_files = list(esc_dir.glob('esc-bulk-reset-*.json'))
+    assert len(esc_files) >= 1, f'Expected at least 1 escalation file, found {esc_files}'
+
+    # (e) tm.set_task_status NOT called for tasks 4 and 5 (guard short-circuited)
+    called_ids = {call.args[0] for call in taskmaster.set_task_status.call_args_list}
+    assert '4' not in called_ids, f'set_task_status should not have been called for task 4'
+    assert '5' not in called_ids, f'set_task_status should not have been called for task 5'
+    # Tasks 1, 2, 3 were called
+    for tid in ('1', '2', '3'):
+        assert tid in called_ids, f'set_task_status should have been called for task {tid}'
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_csv_in_progress_to_pending_trips_guard(
+    interceptor_with_guard, taskmaster, tmp_path,
+):
+    """CSV in-progress→pending: first 3 apply, task 4 is rejected by the guard.
+
+    in-progress→pending does not hit the terminal-exit gate, so no reopen_reason
+    needed. This exercises the non-terminal reversal path.
+    """
+    async def get_task_in_progress(task_id, project_root, tag=None):
+        return {'id': task_id, 'status': 'in-progress', 'title': f'Task {task_id}'}
+
+    taskmaster.get_task.side_effect = get_task_in_progress
+
+    result = await interceptor_with_guard.set_task_status(
+        task_id='1,2,3,4',
+        status='pending',
+        project_root=str(tmp_path),
+    )
+
+    assert result['success'] is False
+    assert len(result['results']) == 4
+
+    per_id = {r['task_id']: r['result'] for r in result['results']}
+
+    # First three ok
+    for tid in ('1', '2', '3'):
+        r = per_id[tid]
+        assert r.get('success') is True, f'task {tid}: expected success, got {r}'
+
+    # Task 4 rejected by guard
+    r4 = per_id['4']
+    assert r4.get('error_type') == 'BulkResetGuardTripped', (
+        f'task 4: expected BulkResetGuardTripped, got {r4}'
+    )
+
+    # tm.set_task_status NOT called for task 4
+    called_ids = {call.args[0] for call in taskmaster.set_task_status.call_args_list}
+    assert '4' not in called_ids, 'set_task_status should not have been called for task 4'
