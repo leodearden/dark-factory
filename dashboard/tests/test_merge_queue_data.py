@@ -2460,6 +2460,59 @@ class TestLoadTaskTitles:
         result2 = load_task_titles(tasks_path)
         assert result2 == {'1': 'Z'}
 
+    def test_missing_file_does_not_invoke_load_task_tree(self, tmp_path, monkeypatch):
+        """A missing file short-circuits before touching load_task_tree or the cache."""
+        import dashboard.data.merge_queue as _mq
+        from dashboard.data.merge_queue import (
+            _load_task_titles_cached,
+            load_task_titles,
+        )
+
+        _load_task_titles_cached.cache_clear()
+
+        call_count = 0
+        original_load_task_tree = _mq.load_task_tree
+
+        def counting_load_task_tree(path):
+            nonlocal call_count
+            call_count += 1
+            return original_load_task_tree(path)
+
+        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
+
+        result = load_task_titles(tmp_path / 'nope.json')
+
+        assert result == {}
+        assert call_count == 0, f"load_task_tree was called {call_count} time(s); expected 0"
+
+    def test_distinct_paths_cached_separately(self, tmp_path):
+        """Different task files produce independent cache entries."""
+        import os
+
+        from dashboard.data.merge_queue import _load_task_titles_cached, load_task_titles
+
+        _load_task_titles_cached.cache_clear()
+
+        path_a = tmp_path / 'proj_a' / 'tasks.json'
+        path_b = tmp_path / 'proj_b' / 'tasks.json'
+        path_a.parent.mkdir()
+        path_b.parent.mkdir()
+        self._write_tasks_json(path_a, [{'id': 1, 'title': 'Alpha'}])
+        self._write_tasks_json(path_b, [{'id': 2, 'title': 'Beta'}])
+
+        # Force distinct mtimes so there's no accidental key collision
+        stat_a = os.stat(path_a)
+        os.utime(path_a, ns=(stat_a.st_atime_ns, stat_a.st_mtime_ns))
+        stat_b = os.stat(path_b)
+        os.utime(path_b, ns=(stat_b.st_atime_ns, stat_b.st_mtime_ns + 1_000_000_000))
+
+        result_a = load_task_titles(path_a)
+        result_b = load_task_titles(path_b)
+
+        assert result_a == {'1': 'Alpha'}, f"project A returned unexpected titles: {result_a}"
+        assert result_b == {'2': 'Beta'}, f"project B returned unexpected titles: {result_b}"
+        assert result_a != result_b
+
 
 # ---------------------------------------------------------------------------
 # TestBuildPerProjectMergeQueue (step-9)
