@@ -2145,3 +2145,33 @@ class TestSchedulerMcpSessionDI:
 
         assert ok is True
         no_http.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_accepts_done_provenance(self):
+        """set_task_status with done_provenance passes through the stub without error."""
+        stub = _StubMcpSession()
+        cfg = OrchestratorConfig()
+        sched = Scheduler(cfg, mcp_session=stub)
+
+        with patch(
+            'orchestrator.scheduler.mcp_call',
+            new=AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected')),
+        ):
+            await sched.set_task_status('42', 'done', done_provenance={'commit': 'abc123'})
+
+        assert stub._statuses['42'] == 'done'
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_accepts_reopen_reason(self):
+        """set_task_status with reopen_reason passes through the stub without error."""
+        stub = _StubMcpSession()
+        cfg = OrchestratorConfig()
+        sched = Scheduler(cfg, mcp_session=stub)
+
+        with patch(
+            'orchestrator.scheduler.mcp_call',
+            new=AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected')),
+        ):
+            await sched.set_task_status('42', 'pending', reopen_reason='un-defer script')
+
+        assert stub._statuses['42'] == 'pending'

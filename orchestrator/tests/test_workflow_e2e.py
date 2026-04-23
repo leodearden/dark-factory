@@ -2286,63 +2286,6 @@ class TestFakeSchedulerGetStatus:
 
 
 # ---------------------------------------------------------------------------
-# Tests: unified Scheduler status tracking (via _StubMcpSession)
-# ---------------------------------------------------------------------------
-
-
-class TestEvalUnifiedSchedulerStatus:
-    """Production Scheduler+_StubMcpSession exposes status for workflow consumption.
-
-    Migrated from TestEvalSchedulerStatus after _EvalScheduler was replaced by
-    _build_eval_scheduler which wires the production Scheduler with an in-memory
-    _StubMcpSession (task 946).
-    """
-
-    @pytest.mark.asyncio
-    async def test_eval_scheduler_get_status_returns_none_initially(self):
-        from orchestrator.config import OrchestratorConfig
-        from orchestrator.evals.runner import _StubMcpSession
-        from orchestrator.scheduler import Scheduler
-
-        sched = Scheduler(OrchestratorConfig(), mcp_session=_StubMcpSession())
-        assert await sched.get_status('99') is None
-
-    @pytest.mark.asyncio
-    async def test_eval_scheduler_get_status_tracks_set_task_status(self):
-        from orchestrator.config import OrchestratorConfig
-        from orchestrator.evals.runner import _StubMcpSession
-        from orchestrator.scheduler import Scheduler
-
-        sched = Scheduler(OrchestratorConfig(), mcp_session=_StubMcpSession())
-        await sched.set_task_status('99', 'done')
-        assert await sched.get_status('99') == 'done'
-
-    @pytest.mark.asyncio
-    async def test_eval_scheduler_set_task_status_accepts_done_provenance(self):
-        """Unified path accepts done_provenance kwarg without error."""
-        from orchestrator.config import OrchestratorConfig
-        from orchestrator.evals.runner import _StubMcpSession
-        from orchestrator.scheduler import Scheduler
-
-        sched = Scheduler(OrchestratorConfig(), mcp_session=_StubMcpSession())
-        await sched.set_task_status('99', 'done', done_provenance={'commit': 'abc'})
-        assert await sched.get_status('99') == 'done'
-
-    @pytest.mark.asyncio
-    async def test_eval_scheduler_set_task_status_accepts_reopen_reason(self):
-        """Unified path accepts reopen_reason kwarg without error."""
-        from orchestrator.config import OrchestratorConfig
-        from orchestrator.evals.runner import _StubMcpSession
-        from orchestrator.scheduler import Scheduler
-
-        sched = Scheduler(OrchestratorConfig(), mcp_session=_StubMcpSession())
-        await sched.set_task_status(
-            '99', 'pending', reopen_reason='un-defer script',
-        )
-        assert await sched.get_status('99') == 'pending'
-
-
-# ---------------------------------------------------------------------------
 # Tests: Prerequisites format validation
 # ---------------------------------------------------------------------------
 

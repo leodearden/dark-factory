@@ -563,6 +563,20 @@ class _StubMcpSession:
         arguments: dict,
         timeout: float = 30,
     ) -> dict:
+        """Dispatch an in-memory MCP tool call and return a JSON-RPC envelope.
+
+        Supported tools: ``set_task_status``, ``get_task``, ``get_tasks``,
+        ``update_task``.  Unknown tool names raise ``NotImplementedError``.
+
+        .. note::
+            Terminal-state enforcement is intentionally **not** simulated.
+            The production fused-memory ``TaskInterceptor`` rejects transitions
+            from terminal states (e.g. ``done`` → ``pending``) unless a
+            ``reopen_reason`` is supplied.  This stub silently accepts any
+            transition so eval flows are not blocked by status-guard logic.
+            If a test needs to verify terminal-state semantics it should target
+            the real fused-memory server rather than this stub.
+        """
         if name == 'set_task_status':
             task_id = arguments['id']
             status = arguments['status']

@@ -10,6 +10,7 @@ import statistics
 import time
 from collections import deque
 from dataclasses import dataclass
+from typing import Protocol
 
 from shared.locking import files_to_modules, normalize_lock
 
@@ -36,10 +37,29 @@ logger = logging.getLogger(__name__)
 __all__ = [
     'normalize_lock',
     'files_to_modules',
+    'McpSessionLike',
     'TaskAssignment',
     'ModuleLockTable',
     'Scheduler',
 ]
+
+
+class McpSessionLike(Protocol):
+    """Structural interface for MCP session objects.
+
+    Both ``McpSession`` (production) and ``_StubMcpSession`` (eval mode)
+    conform to this interface.  Typing the optional *mcp_session* kwarg on
+    ``Scheduler.__init__`` against this Protocol lets pyright verify that any
+    injected stub actually provides the expected API — a mis-shaped stub will
+    be caught at type-check time rather than at runtime.
+    """
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict,
+        timeout: float = ...,
+    ) -> dict: ...
 
 
 @dataclass
@@ -252,7 +272,7 @@ class Scheduler:
         config: OrchestratorConfig,
         event_store: EventStore | None = None,
         *,
-        mcp_session: object | None = None,
+        mcp_session: McpSessionLike | None = None,
     ):
         self.config = config
         self.lock_table = ModuleLockTable(config)
@@ -296,7 +316,7 @@ class Scheduler:
         production semantics, retries, and error handling are preserved.
         """
         if self._mcp_session is not None:
-            return await self._mcp_session.call_tool(name, arguments, timeout=timeout)  # type: ignore[union-attr]
+            return await self._mcp_session.call_tool(name, arguments, timeout=timeout)
         return await mcp_call(
             f'{self._memory_url}/mcp',
             'tools/call',

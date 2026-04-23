@@ -229,24 +229,15 @@ class TestBuildEvalScheduler:
         scheduler, session = _build_eval_scheduler(config, 'task-99', ['some_module'])
         assert scheduler._mcp_session is session
 
-    def test_lock_preinstalled_for_task(self):
-        """The module lock is pre-installed for task_id in lock_table._held."""
-        from shared.locking import normalize_lock
-
-        from orchestrator.config import OrchestratorConfig
-
-        config = OrchestratorConfig()
-        scheduler, _ = _build_eval_scheduler(config, 'task-99', ['some_module'])
-        assert 'task-99' in scheduler.lock_table._held
-        expected_module = normalize_lock('some_module', config.lock_depth)
-        assert expected_module in scheduler.lock_table._held['task-99']
-
     @pytest.mark.asyncio
     async def test_handle_blast_radius_expansion_returns_true(self):
         """handle_blast_radius_expansion returns True without raising.
 
         This is the end-to-end sanity check: DI + lock-preinstall means the
-        production code path for plan refinement works in eval mode.
+        production code path for plan refinement works in eval mode.  The test
+        also implicitly verifies that the module lock was pre-installed: without
+        the pre-install ``try_acquire_additional`` would raise ``KeyError`` when
+        looking up ``task_id`` in ``_held``.
         """
         from orchestrator.config import OrchestratorConfig
 
@@ -260,3 +251,33 @@ class TestBuildEvalScheduler:
             ['some_module', 'other_module'],
         )
         assert result is True
+
+    @pytest.mark.asyncio
+    async def test_handle_blast_radius_expansion_contended_returns_false(self):
+        """handle_blast_radius_expansion returns False when lock is contended.
+
+        The interesting path: a different task already holds ``other_module``
+        at max capacity (default limit = 1), so ``try_acquire_additional``
+        rejects the expansion and the method resets the task to pending.
+        This is the whole rationale for pre-installing the module lock — to
+        ensure the ``_held`` entry exists so the conflict-check works rather
+        than raising ``KeyError``.
+        """
+        from orchestrator.config import OrchestratorConfig
+
+        config = OrchestratorConfig()
+        scheduler, stub = _build_eval_scheduler(
+            config, 'task-99', ['some_module']
+        )
+        # A competing task grabs other_module at the limit (max_per_module=1).
+        acquired = scheduler.lock_table.try_acquire('task-other', ['other_module'])
+        assert acquired, 'pre-condition: task-other must successfully hold other_module'
+
+        result = await scheduler.handle_blast_radius_expansion(
+            'task-99',
+            ['some_module'],
+            ['some_module', 'other_module'],  # other_module is now contended
+        )
+        # Expansion fails → method returns False and resets task to pending.
+        assert result is False
+        assert stub._statuses.get('task-99') == 'pending'
