@@ -1354,3 +1354,70 @@ class TestDispatchTicketDecision:
         assert isinstance(result_dict, dict)
         assert result_dict.get('id') == '88'
         assert mock_executor.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# _process_add_tickets_batch — step-33
+# ---------------------------------------------------------------------------
+
+
+class TestProcessAddTicketsBatch:
+    """Tests for the batch ticket processor _process_add_tickets_batch."""
+
+    def _make_candidate_json(self, title: str) -> str:
+        return json.dumps({
+            'project_root': '/project',
+            'kwargs': {'title': title, 'description': 'test'},
+            'metadata': None,
+        })
+
+    @pytest.mark.asyncio
+    async def test_batch_dispatches_each_ticket_and_marks_terminal(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """Batch of 3 tickets: issues one curate_batch call, dispatches each, marks all terminal."""
+        # Submit 3 tickets directly to the store
+        t1 = await ticket_store.submit('project', self._make_candidate_json('Task Alpha'))
+        t2 = await ticket_store.submit('project', self._make_candidate_json('Task Beta'))
+        t3 = await ticket_store.submit('project', self._make_candidate_json('Task Gamma'))
+
+        # Mock curator: one curate_batch call for all 3
+        mock_curator = MagicMock()
+        mock_curator.curate_batch = AsyncMock(return_value=[
+            CuratorDecision(action='create', justification='new'),
+            CuratorDecision(action='drop', target_id='5', justification='dup'),
+            CuratorDecision(action='create', justification='newer'),
+        ])
+        mock_curator.note_created = MagicMock()
+        mock_curator.record_task = AsyncMock()
+
+        # Two creates → add_task called twice; return distinct IDs
+        taskmaster.add_task = AsyncMock(side_effect=[
+            {'id': '42', 'title': 'Task Alpha'},
+            {'id': '43', 'title': 'Task Gamma'},
+        ])
+
+        with patch.object(
+            type(interceptor_with_store), '_get_curator',
+            new=AsyncMock(return_value=mock_curator),
+        ), patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            await interceptor_with_store._process_add_tickets_batch([t1, t2, t3])
+
+        # Each ticket must be terminal
+        r1 = await ticket_store.get(t1)
+        r2 = await ticket_store.get(t2)
+        r3 = await ticket_store.get(t3)
+
+        assert r1 is not None and r1['status'] == 'created'
+        assert r1['task_id'] == '42'
+        assert r2 is not None and r2['status'] == 'combined'
+        assert r2['task_id'] == '5'
+        assert r3 is not None and r3['status'] == 'created'
+        assert r3['task_id'] == '43'
+
+        # One batched LLM call, not three single ones
+        assert mock_curator.curate_batch.await_count == 1
+        assert taskmaster.add_task.call_count == 2
