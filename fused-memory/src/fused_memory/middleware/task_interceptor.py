@@ -430,6 +430,22 @@ class TaskInterceptor:
             if status == old_status:
                 return {'success': True, 'no_op': True, 'task_id': task_id}
 
+            # 2a-pre. Bulk-reset circuit-breaker (task 918): observe the attempt
+            # before the terminal-exit gate so the guard catches reversal patterns
+            # regardless of whether individual attempts carry a reopen_reason.
+            # The 2026-04 bulk resets DID carry reopen_reason — the guard fires on
+            # the *pattern*, not the per-id legitimacy check.
+            if self._bulk_reset_guard is not None:
+                _brg_verdict = await self._bulk_reset_guard.observe_attempt(
+                    project_id=project_id,
+                    task_id=task_id,
+                    old_status=old_status,
+                    new_status=status,
+                    project_root=project_root,
+                )
+                if _brg_verdict.is_rejection:
+                    return _brg_verdict.to_error_dict()
+
             # 2a. Terminal-exit gate: reject done→non-done and cancelled→non-done
             # unless a non-empty reopen_reason is provided. Moves the terminal
             # FSM server-side so two independent writers (scheduler + steward)
