@@ -409,7 +409,15 @@ violations are always bugs. Pay special attention to `stability_concerns`.
 2. **Read code** — trace critical paths, audit stubs, check cross-module consistency.
 
 3. **Triage each finding** and act:
-   - Clear-cut issues → `add_task(title=..., description=..., priority=..., metadata={{"source": "review-cycle", "review_id": "{review_id}", "modules": ["path/to/module", ...]}}, project_root="{project_root}")`
+   - Clear-cut issues — use the two-step API:
+     1. Call `submit_task`(title=..., description=..., priority=...,
+        metadata={{"source": "review-cycle", "review_id": "{review_id}", "modules": ["path/to/module", ...]}},
+        project_root="{project_root}") — returns `{{"ticket": "tkt_..."}}`.
+     2. Call `resolve_ticket`(ticket=..., project_root="{project_root}", timeout_seconds=60) —
+        returns {{status, task_id?, reason?}}. Branch on `status`:
+        - `created` or `combined` — record `task_id` in the finding's `task_id` field.
+        - `dropped` — candidate rejected (duplicate / backlog_full); skip.
+        - `failed` — include `reason` in the finding description.
    - Ambiguous/architectural → `escalate_info(category=..., summary=...)`
    - Known/accepted → dismiss (don't report)
 
