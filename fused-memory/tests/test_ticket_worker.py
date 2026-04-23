@@ -1529,3 +1529,89 @@ class TestProcessAddTicketsBatch:
 
         assert r3 is not None and r3['status'] == 'created'
         assert r3['task_id'] == '33'
+
+
+# ---------------------------------------------------------------------------
+# TestCuratorWorkerBatchDrain — step-39 / step-41 / step-43 / step-45
+# ---------------------------------------------------------------------------
+
+
+class TestCuratorWorkerBatchDrain:
+    """Tests for the batch-drain loop in _curator_worker."""
+
+    def _make_candidate_json(self, title: str) -> str:
+        return json.dumps({
+            'project_root': '/project',
+            'kwargs': {'title': title, 'description': 'test'},
+            'metadata': None,
+        })
+
+    @pytest.mark.asyncio
+    async def test_worker_drains_up_to_batch_max_then_calls_curate_batch_once(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """Worker drains all queued tickets in one batch, calling _process_add_tickets_batch once."""
+        project_id = 'project'
+
+        mock_curator = MagicMock()
+        mock_curator.curate = AsyncMock(
+            return_value=CuratorDecision(action='create', justification='single')
+        )
+        mock_curator.curate_batch = AsyncMock(return_value=[
+            CuratorDecision(action='create', justification='a'),
+            CuratorDecision(action='create', justification='b'),
+            CuratorDecision(action='create', justification='c'),
+            CuratorDecision(action='create', justification='d'),
+        ])
+        mock_curator.note_created = MagicMock()
+        mock_curator.record_task = AsyncMock()
+
+        taskmaster.add_task = AsyncMock(side_effect=[
+            {'id': str(i), 'title': f'Task {i}'} for i in range(4)
+        ])
+
+        # Submit 4 tickets to the store directly (no worker queue involvement yet).
+        t1 = await ticket_store.submit(project_id, self._make_candidate_json('Task 1'))
+        t2 = await ticket_store.submit(project_id, self._make_candidate_json('Task 2'))
+        t3 = await ticket_store.submit(project_id, self._make_candidate_json('Task 3'))
+        t4 = await ticket_store.submit(project_id, self._make_candidate_json('Task 4'))
+
+        # Pre-fill the queue synchronously so all tickets are queued before worker starts.
+        queue = interceptor_with_store._ticket_queues.setdefault(
+            project_id, asyncio.Queue()
+        )
+        for tid in [t1, t2, t3, t4]:
+            queue.put_nowait(tid)
+
+        # Track calls to _process_add_tickets_batch.
+        original_impl = interceptor_with_store._process_add_tickets_batch
+        call_args_log: list[list[str]] = []
+
+        async def tracking_batch(ticket_ids: list[str]) -> None:
+            call_args_log.append(list(ticket_ids))
+            return await original_impl(ticket_ids)
+
+        with patch.object(
+            type(interceptor_with_store), '_get_curator',
+            new=AsyncMock(return_value=mock_curator),
+        ), patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ), patch.object(
+            interceptor_with_store, '_process_add_tickets_batch',
+            side_effect=tracking_batch,
+        ):
+            # Start the worker manually.
+            interceptor_with_store._start_worker_if_needed(project_id)
+
+            # Let the worker drain.
+            await asyncio.sleep(0.5)
+
+        # Worker should have called _process_add_tickets_batch exactly once with 4 tickets.
+        assert len(call_args_log) == 1, (
+            f'Expected 1 batch call, got {len(call_args_log)}: {call_args_log}'
+        )
+        assert len(call_args_log[0]) == 4, (
+            f'Expected batch of 4, got {len(call_args_log[0])}'
+        )
+        assert set(call_args_log[0]) == {t1, t2, t3, t4}
