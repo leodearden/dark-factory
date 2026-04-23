@@ -3069,6 +3069,67 @@ class TestRecoverIfAlreadyMerged:
             f"{[r.message for r in caplog.records]}"
         )
 
+    async def test_returns_none_and_logs_distinctly_on_artifacts_exception(
+        self, config, git_ops, task_assignment, tmp_path, caplog
+    ):
+        """Artifacts-layer exception must log DISTINCTLY from git-layer exceptions.
+
+        Set up a worktree where wt_head is an ancestor of main (is_ancestor=True
+        so the git layer passes), then force workflow.artifacts.read_iteration_log
+        to raise RuntimeError.  The artifacts-layer try/except must catch it,
+        log a WARNING containing 'artifacts read failed during merge-check'
+        (distinct from the git-layer 'merge-check failed' message), and return None.
+
+        Pins the distinct log message that operators use to diagnose the correct
+        root cause (filesystem/JSON issue vs. git/infra issue).
+
+        Fails on unmodified code with RuntimeError propagating uncaught.
+        """
+        import logging
+
+        # 1. Create a fresh worktree — wt_head == initial main commit, trivially ancestor
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. Force read_iteration_log to raise — simulates corrupted iterations.jsonl
+        def _raise_artifacts():
+            raise RuntimeError('simulated artifacts failure')
+
+        workflow.artifacts.read_iteration_log = _raise_artifacts  # type: ignore[method-assign]
+
+        # 4. Call _recover_if_already_merged, capturing WARNING logs
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+            outcome = await workflow._recover_if_already_merged()
+
+        # 5. Assertions: must return None with DISTINCT 'artifacts read failed' log
+        assert outcome is None, (
+            f'Expected None on artifacts exception but got {outcome!r} — '
+            'artifacts-layer exception must be caught and return None'
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE after artifacts exception: {workflow.state!r}'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear after artifacts exception: {statuses}"
+        )
+        assert any(
+            'artifacts read failed during merge-check' in r.message
+            for r in caplog.records
+        ), (
+            f"Expected 'artifacts read failed during merge-check' "
+            f"(distinct from 'merge-check failed') "
+            f"but caplog only has: {[r.message for r in caplog.records]}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # File-structure invariants
