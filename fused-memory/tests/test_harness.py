@@ -2684,3 +2684,183 @@ async def test_backlog_iterator_uses_harness_project_root_when_events_lack_overr
         f"Expected project_root='/abs/from/config' but got '{captured['project_root']}'"
         " — BacklogIterator fallback should use harness.project_root, not project_id"
     )
+
+
+@pytest.mark.asyncio
+async def test_backlog_iterator_peek_window_finds_later_project_root_override(
+    journal, event_buffer, mock_memory_service
+):
+    """Regression guard: BacklogIterator's peek window must be wide enough that
+    a `_project_root` override on a LATER buffered event is still found, even
+    when several earlier buffered events lack the key.
+
+    This pins the actual behavioral invariant (window >= N for realistic N)
+    without referencing the module-private `_PROJECT_ROOT_PEEK_LIMIT` constant
+    or its exact value — so the window size can be tuned freely as long as it
+    stays large enough to accommodate a realistic mix of buffered events.
+
+    Replaces the prior meta-test flagged by reviewer as locking implementation
+    detail (asserting `first_limit == _PROJECT_ROOT_PEEK_LIMIT` and
+    `_PROJECT_ROOT_PEEK_LIMIT == 10`).
+    """
+    from datetime import timedelta
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from fused_memory.models.reconciliation import (
+        AssembledPayload,
+        EventSource,
+        EventType,
+        ReconciliationEvent,
+    )
+    from fused_memory.reconciliation.harness import BacklogIterator
+
+    # peek_buffered orders by `timestamp ASC LIMIT ?` (FIFO). Push 9 events that
+    # LACK _project_root with monotonically-increasing timestamps, then 1 event
+    # carrying _project_root='/from/event' with the latest timestamp. With FIFO
+    # peek, the override event is returned LAST — so the resolver only finds it
+    # if the window is wide enough to accommodate all 10 buffered events.
+    # Using 9+1=10 puts the override right at the current limit, so any
+    # reduction of the peek window (even to 9) will cause this test to fail.
+    # Anchor base_ts 60 seconds in the past so that peek_buffered's
+    # `WHERE timestamp < cutoff` clause (cutoff ≈ datetime.now(UTC) at run() time)
+    # includes all 10 events.  Explicit offsets avoid sub-microsecond tie flakiness.
+    base_ts = datetime.now(UTC) - timedelta(seconds=60)
+    for i in range(9):
+        await event_buffer.push(ReconciliationEvent(
+            id=str(uuid.uuid4()),
+            type=EventType.episode_added,
+            source=EventSource.agent,
+            project_id='dark_factory',
+            timestamp=base_ts + timedelta(seconds=i),
+            payload={},  # NO _project_root key
+        ))
+    await event_buffer.push(ReconciliationEvent(
+        id=str(uuid.uuid4()),
+        type=EventType.task_status_changed,
+        source=EventSource.agent,
+        project_id='dark_factory',
+        timestamp=base_ts + timedelta(seconds=20),  # latest — FIFO peek returns last
+        payload={'_project_root': '/from/event', 'task_id': '1'},
+    ))
+
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service)
+
+    captured: dict = {}
+
+    def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
+        captured['project_root'] = project_root
+        inst = MagicMock()
+        inst.assemble = AsyncMock(return_value=AssembledPayload(events=[]))
+        return inst
+
+    with patch(
+        'fused_memory.reconciliation.context_assembler.ContextAssembler',
+        side_effect=fake_assembler_factory,
+    ):
+        iterator = BacklogIterator(harness.config, harness.journal, harness.buffer, harness)
+        await iterator.run('dark_factory')
+
+    assert 'project_root' in captured, (
+        'ContextAssembler was never constructed — iterator may not have run'
+    )
+    assert captured['project_root'] == '/from/event', (
+        f"Expected project_root='/from/event' but got '{captured['project_root']}'. "
+        'The peek window must be wide enough to find a later-buffered _project_root '
+        'override past 9 earlier events that lack the key. If this test now fails, '
+        'the peek window has been tuned too narrow — consider whether 10 buffered '
+        'events is an unreasonable lookback and adjust accordingly.'
+    )
+
+
+@pytest.mark.asyncio
+async def test_backlog_iterator_event_project_root_wins_over_configured(
+    journal, event_buffer, mock_memory_service
+):
+    """BacklogIterator.run should use the project_root from peeked events over
+    the harness-configured fallback (regression guard for task-927 invariant).
+
+    Parallel to test_backlog_iterator_uses_harness_project_root_when_events_lack_override
+    but exercises the event-override path: events carry _project_root='/from/event'
+    while the harness is configured with '/from/config'.  The event value must win.
+
+    Peek-window semantics differ from run_full_cycle's full-drain coverage at
+    test_harness.py:341, making this a distinct regression guard.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from fused_memory.models.reconciliation import AssembledPayload
+    from fused_memory.reconciliation.harness import BacklogIterator
+
+    # Push two events WITH _project_root key — both within the peek window
+    await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
+    await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
+
+    # Build harness with a different configured root
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service, '/from/config')
+
+    captured: dict = {}
+
+    def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
+        captured['project_root'] = project_root
+        inst = MagicMock()
+        inst.assemble = AsyncMock(return_value=AssembledPayload(events=[]))
+        return inst
+
+    with patch(
+        'fused_memory.reconciliation.context_assembler.ContextAssembler',
+        side_effect=fake_assembler_factory,
+    ):
+        iterator = BacklogIterator(harness.config, harness.journal, harness.buffer, harness)
+        await iterator.run('dark_factory')
+
+    assert 'project_root' in captured, (
+        'ContextAssembler was never constructed — iterator may not have run'
+    )
+    assert captured['project_root'] == '/from/event', (
+        f"Expected project_root='/from/event' but got '{captured['project_root']}'"
+        " — event-provided root must win over the configured fallback in BacklogIterator"
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_fallback_resolves_and_short_circuits_filtered_task_tree(
+    journal, event_buffer, mock_memory_service
+):
+    """_resolve_project_root with no-override events returns '' and
+    _fetch_filtered_task_tree('') short-circuits without a taskmaster call.
+
+    This chained assertion guards the full resolver → fetcher pipeline introduced
+    by task-927.  task-927 replaced project_id (e.g. 'dark_factory') with '' as
+    the fallback in _resolve_project_root.  That change is only 'strictly better'
+    because downstream _fetch_filtered_task_tree short-circuits on empty strings.
+    Splitting the assertion would leave a gap: a future refactor could reintroduce
+    project_id as fallback and _fetch_filtered_task_tree would silently start
+    hitting taskmaster again.
+
+    test_harness.py:1827 (test_returns_empty_when_empty_project_root) covers the
+    fetch-level short-circuit in isolation; this test pins the resolver ↔ fetcher
+    contract so the full pipeline is protected.
+    """
+    from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+    # project_root=None → config.taskmaster=None → harness._project_root == ''
+    # harness.taskmaster = AsyncMock() (injected mock) so we can assert it was NOT called
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service, project_root=None)
+
+    # Events with NO _project_root key — triggers the fallback path
+    events = [_make_event('dark_factory'), _make_event('dark_factory')]
+
+    # (a) resolver returns '' — pins post-927 invariant (NOT 'dark_factory')
+    resolved = harness._resolve_project_root(events)
+    assert resolved == '', (
+        f"_resolve_project_root returned '{resolved}' but expected '' — "
+        "regression to old project_id fallback detected (task-927 invariant violated)"
+    )
+
+    # (b) fetcher returns empty tree when project_root is ''
+    result = await harness._fetch_filtered_task_tree('')
+    assert isinstance(result, FilteredTaskTree)
+    assert result.active_tasks == []
+
+    # (c) taskmaster.get_tasks was never called (short-circuit on empty project_root)
+    harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
