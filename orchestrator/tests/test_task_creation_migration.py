@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from orchestrator.agents.roles import DEEP_REVIEWER, STEWARD
 
-
 # ---------------------------------------------------------------------------
 # Step 1 / Step 2: Tool allowlists
 # ---------------------------------------------------------------------------
