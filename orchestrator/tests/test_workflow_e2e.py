@@ -3671,8 +3671,8 @@ class TestMarkBlockedPhantomDone:
 
 
 if TYPE_CHECKING:
-    from orchestrator.evals.runner import _EvalScheduler as _EvalSchedulerStatic
+    from orchestrator.scheduler import Scheduler
     from orchestrator.workflow import _SchedulerLike
 
     _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()
-    _eval_scheduler_conforms: _SchedulerLike = _EvalSchedulerStatic(OrchestratorConfig())
+    _scheduler_conforms: _SchedulerLike = Scheduler(OrchestratorConfig())

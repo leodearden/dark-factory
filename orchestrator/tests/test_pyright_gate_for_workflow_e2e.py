@@ -188,7 +188,7 @@ def test_workflow_e2e_conformance_block_is_present() -> None:
 
     This pins the block's existence so it cannot be deleted without also updating
     this regression test. Without the block, Protocol drift between FakeScheduler/
-    _EvalScheduler and _SchedulerLike would be undetectable by pyright regardless
+    Scheduler and _SchedulerLike would be undetectable by pyright regardless
     of how the gate is configured. See task 699.
     """
     e2e_path = _PACKAGE_ROOT / "tests" / "test_workflow_e2e.py"
@@ -197,14 +197,14 @@ def test_workflow_e2e_conformance_block_is_present() -> None:
     required_fragments = [
         "if TYPE_CHECKING:",
         "_fake_scheduler_conforms: _SchedulerLike",
-        "_eval_scheduler_conforms: _SchedulerLike",
+        "_scheduler_conforms: _SchedulerLike",
     ]
     for fragment in required_fragments:
         assert fragment in content, (
             f"Expected fragment {fragment!r} not found in {e2e_path}. "
             "The TYPE_CHECKING Protocol conformance block must be present for "
             "pyright to enforce _SchedulerLike conformance on FakeScheduler and "
-            "_EvalScheduler. See task 699."
+            "Scheduler. See task 699."
         )
 
 
