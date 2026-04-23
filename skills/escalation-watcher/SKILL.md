@@ -254,7 +254,6 @@ After the sub-agent returns:
    ticket = submit_result["ticket"]
 
    # Phase 2: block until the curator decides (default 115 s)
-   # The (escalation_id, suggestion_hash) pair is the R4 idempotency gate — safe to retry on server_restart
    resolve = mcp__fused-memory__resolve_ticket(ticket=ticket, project_root="<project_root>")
 
    if resolve["status"] == "created":
@@ -262,7 +261,18 @@ After the sub-agent returns:
    elif resolve["status"] == "combined":
        task_id = resolve["task_id"]           # merged into existing task — normal, not an error
    elif resolve["status"] == "failed":
-       # reason: timeout | server_restart | server_closed | unknown_ticket | ...
+       # reason determines how to proceed:
+       # server_restart → retry the submit_task + resolve_ticket pair ONCE with the same
+       #   metadata (original ticket is dead; a fresh submit is the only path forward).
+       #   The (escalation_id, suggestion_hash) pair is the R4 idempotency gate
+       #   (task_interceptor.py:_check_escalation_idempotency) — the retry returns the
+       #   existing task if the first call already created one.
+       # timeout → first retry resolve_ticket(ticket=same_ticket, ...) with the same
+       #   ticket — the worker may still be processing. Only re-submit_task if that retry
+       #   returns unknown_ticket or expired. The R4 gate still fires on re-submit when
+       #   the same (escalation_id, suggestion_hash) metadata is sent.
+       # unknown_ticket | server_closed | expired → terminal: record the reason in the
+       #   escalation resolution note and skip this suggestion group.
        handle_failure(resolve["reason"])
    ```
 

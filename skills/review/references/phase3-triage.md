@@ -107,8 +107,17 @@ if resolve["status"] == "created":
 elif resolve["status"] == "combined":
     task_id = resolve["task_id"]           # merged into existing task — normal, not an error
 elif resolve["status"] == "failed":
-    # reason: timeout | server_restart | server_closed | unknown_ticket | ...
-    # Report reason in the review report and skip this finding
+    # reason determines how to proceed:
+    # server_restart → retry the submit_task + resolve_ticket pair ONCE with the same
+    #   metadata (original ticket is dead; a fresh submit is the only path forward).
+    #   R4 only short-circuits when (escalation_id, suggestion_hash) metadata is present,
+    #   so a retry here may create a duplicate that the curator will de-duplicate to "combined".
+    # timeout → first retry resolve_ticket(ticket=same_ticket, ...) with the same ticket —
+    #   the worker may still be processing. Only re-submit_task if that retry returns
+    #   unknown_ticket or expired (the original ticket has since been swept).
+    #   Same dedup caveat as server_restart if re-submit becomes necessary.
+    # unknown_ticket | server_closed | expired → terminal: record the reason in the
+    #   review report and skip this finding.
     log_failure(resolve["reason"])
 ```
 
