@@ -1123,3 +1123,45 @@ class TestParseBatchDecisions:
         assert result[0].action == 'drop'
         assert result[1].action == 'create'
         assert result[2].action == 'create'
+
+    def test_per_item_parse_failure_degrades_only_that_item(self):
+        """A single bad decision dict (invalid action) degrades only that item."""
+        from fused_memory.middleware.task_curator import _parse_batch_decisions
+        result = _parse_batch_decisions(
+            self._make_result([
+                {'candidate_index': 0, 'action': 'create', 'justification': 'ok'},
+                {'candidate_index': 1, 'action': 'garbage'},
+                {'candidate_index': 2, 'action': 'create', 'justification': 'ok2'},
+            ]),
+            pools=[[], [], []],
+            pool_sizes_list=[{}, {}, {}],
+            latency_ms=50,
+        )
+        assert len(result) == 3
+        assert result[0].action == 'create'
+        assert result[0].justification == 'ok'
+        assert result[1].action == 'create'
+        assert 'invalid-action' in result[1].justification
+        assert result[2].action == 'create'
+        assert result[2].justification == 'ok2'
+
+    def test_missing_item_index_degrades_only_that_item(self):
+        """When a decision for index i is absent from the batch, only that item degrades."""
+        from fused_memory.middleware.task_curator import _parse_batch_decisions
+        # Decisions for indices 0 and 2 only — index 1 is missing.
+        result = _parse_batch_decisions(
+            self._make_result([
+                {'candidate_index': 0, 'action': 'create', 'justification': 'first'},
+                {'candidate_index': 2, 'action': 'create', 'justification': 'third'},
+            ]),
+            pools=[[], [], []],
+            pool_sizes_list=[{}, {}, {}],
+            latency_ms=50,
+        )
+        assert len(result) == 3
+        assert result[0].action == 'create'
+        assert result[0].justification == 'first'
+        assert result[1].action == 'create'
+        assert 'batch-item-missing' in result[1].justification
+        assert result[2].action == 'create'
+        assert result[2].justification == 'third'
