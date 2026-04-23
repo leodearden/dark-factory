@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -98,3 +100,36 @@ class TestPruneArchive:
         count = archive.prune_archive(tmp_path, retention_days=30, now=self._now())
 
         assert count == 2  # 2026-03-01 and 2026-03-15 removed
+
+
+class TestArchiveCli:
+    """python -m escalation.archive CLI entry point."""
+
+    _PYTHON = str(Path(sys.executable).parent.parent / '.venv' / 'bin' / 'python')
+
+    def _run_cli(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [self._PYTHON, '-m', 'escalation.archive', *args],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_cli_invokes_prune(self, tmp_path: Path):
+        """CLI prunes old archive subdir, exits 0, and reports count in stdout."""
+        # Create an old subdir that should be pruned
+        old_dir = tmp_path / 'archive' / '2026-03-01'
+        old_dir.mkdir(parents=True)
+        (old_dir / 'esc-1-1.json').write_text('{}')
+
+        result = self._run_cli('--queue-dir', str(tmp_path), '--retention-days', '30')
+
+        assert result.returncode == 0
+        assert not old_dir.exists()
+        assert 'Pruned 1 archive dir(s)' in result.stdout
+
+    def test_cli_missing_queue_dir_exits_nonzero(self, tmp_path: Path):
+        """CLI exits non-zero when --queue-dir does not exist."""
+        missing = tmp_path / 'no-such-dir'
+        result = self._run_cli('--queue-dir', str(missing))
+
+        assert result.returncode != 0
