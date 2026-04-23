@@ -967,3 +967,125 @@ class TestCuratorBatchOutputSchema:
         assert 'action' in items_schema['required']
         assert 'candidate_index' in items_schema['required']
         assert 'justification' in items_schema['required']
+
+
+# ----------------------------------------------------------------------
+# _parse_decision_dict + CuratorDecision.batch_target_index
+# ----------------------------------------------------------------------
+
+
+class TestParseDecisionDict:
+    """Mirrors TestParseDecision but calls _parse_decision_dict directly."""
+
+    def _call(self, raw: dict, pool=None, *, pool_sizes=None, latency_ms=50, cost_usd=0.01):
+        from fused_memory.middleware.task_curator import _parse_decision_dict
+        return _parse_decision_dict(
+            raw,
+            pool=pool or [],
+            pool_sizes=pool_sizes or {},
+            latency_ms=latency_ms,
+            cost_usd=cost_usd,
+        )
+
+    def test_create_no_target(self):
+        pool = _pool_with_ids(('10', 'pending'))
+        result = self._call({'action': 'create', 'justification': 'novel work'}, pool)
+        assert result.action == 'create'
+        assert result.target_id is None
+        assert 'novel work' in result.justification
+
+    def test_drop_valid_target(self):
+        pool = _pool_with_ids(('10', 'pending'), ('11', 'done'))
+        result = self._call(
+            {'action': 'drop', 'target_id': '11', 'justification': 'already done'},
+            pool,
+        )
+        assert result.action == 'drop'
+        assert result.target_id == '11'
+
+    def test_drop_invalid_target_degrades(self):
+        pool = _pool_with_ids(('10', 'pending'))
+        result = self._call({'action': 'drop', 'target_id': '999', 'justification': '...'}, pool)
+        assert result.action == 'create'
+        assert 'invalid-target' in result.justification
+
+    def test_combine_into_pending(self):
+        pool = _pool_with_ids(('10', 'pending'))
+        result = self._call(
+            {
+                'action': 'combine',
+                'target_id': '10',
+                'justification': 'same scope',
+                'rewritten_task': {
+                    'title': 'Fixed parser',
+                    'description': 'unified',
+                    'details': 'all the details',
+                    'files_to_modify': ['src/parser.py'],
+                    'priority': 'high',
+                },
+            },
+            pool,
+        )
+        assert result.action == 'combine'
+        assert result.rewritten_task is not None
+        assert result.rewritten_task.title == 'Fixed parser'
+
+    def test_combine_into_non_pending_degrades(self):
+        pool = _pool_with_ids(('10', 'in-progress'))
+        result = self._call(
+            {
+                'action': 'combine',
+                'target_id': '10',
+                'justification': '...',
+                'rewritten_task': {
+                    'title': 'x', 'description': '', 'details': 'd',
+                    'files_to_modify': [], 'priority': 'medium',
+                },
+            },
+            pool,
+        )
+        assert result.action == 'create'
+        assert 'invalid-combine-target' in result.justification
+
+    def test_combine_missing_rewrite_degrades(self):
+        pool = _pool_with_ids(('10', 'pending'))
+        result = self._call({'action': 'combine', 'target_id': '10', 'justification': '...'}, pool)
+        assert result.action == 'create'
+        assert 'combine-missing-rewrite' in result.justification
+
+    def test_combine_empty_title_degrades(self):
+        pool = _pool_with_ids(('10', 'pending'))
+        result = self._call(
+            {
+                'action': 'combine', 'target_id': '10', 'justification': '...',
+                'rewritten_task': {
+                    'title': '', 'description': '', 'details': 'd',
+                    'files_to_modify': [], 'priority': 'medium',
+                },
+            },
+            pool,
+        )
+        assert result.action == 'create'
+        assert 'empty-title' in result.justification
+
+    def test_invalid_action_degrades(self):
+        pool = _pool_with_ids(('10', 'pending'))
+        result = self._call({'action': 'split', 'justification': '...'}, pool)
+        assert result.action == 'create'
+        assert 'invalid-action' in result.justification
+
+    def test_parse_decision_dict_accepts_batch_target_index(self):
+        """A drop with batch_target_index (no existing target_id) should preserve it."""
+        # When a candidate drops to another batch item, target_id is None (no
+        # existing task) and batch_target_index carries the sibling's index.
+        result = self._call(
+            {
+                'action': 'drop',
+                'target_id': None,
+                'batch_target_index': 2,
+                'justification': 'dup of batch item 2',
+            },
+            pool=[],  # no existing pool — target is within-batch
+        )
+        assert result.action == 'drop'
+        assert result.batch_target_index == 2
