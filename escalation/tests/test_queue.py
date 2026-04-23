@@ -7,6 +7,8 @@ import logging
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -376,6 +378,63 @@ class TestMakeIdAcrossArchive:
         all_ids = {e.id for e in all_escs}
         assert all_ids == {'esc-42-1', 'esc-42-2', 'esc-42-3'}, (
             f'Expected three distinct IDs but got: {all_ids}'
+        )
+
+    @pytest.mark.parametrize(
+        'archived_seq, pending_seq, expected_next',
+        [
+            (5, 2, 6),  # archive seq > pending seq (interleaved scenario)
+            (3, 7, 8),  # pending seq > archive seq (symmetric scenario)
+        ],
+    )
+    def test_make_id_takes_max_across_archive_and_pending(
+        self,
+        tmp_path: Path,
+        archived_seq: int,
+        pending_seq: int,
+        expected_next: int,
+    ):
+        """make_id() takes max across BOTH archive and queue root in either ordering.
+
+        The parametrization captures two orderings:
+        - Row (5, 2, 6): archive seq (5) > pending seq (2) → next = 6
+        - Row (3, 7, 8): pending seq (7) > archive seq (3) → next = 8
+
+        In both cases make_id() must return max(archive_max, pending_max) + 1,
+        proving the two-loop scan in queue.py:265-274 works regardless of which
+        source holds the higher sequence number.
+
+        Regression guard for the two-source max logic in make_id().
+        """
+        queue_dir = tmp_path / 'queue'
+        archived_id = f'esc-42-{archived_seq}'
+        pending_id = f'esc-42-{pending_seq}'
+
+        # First process: submit archived_id and resolve it (moves to archive).
+        queue = EscalationQueue(queue_dir)
+        queue.submit(_make_escalation(archived_id, task_id='42'))
+        queue.resolve(archived_id, f'fixed {archived_seq}')
+
+        # Submit pending_id and leave it in queue root.
+        queue.submit(_make_escalation(pending_id, task_id='42'))
+
+        # Sanity: archived_id is in archive, pending_id is in queue root.
+        assert not (queue_dir / f'{archived_id}.json').exists(), (
+            f'{archived_id} should be archived'
+        )
+        assert (queue_dir / f'{pending_id}.json').exists(), (
+            f'{pending_id} should be pending in queue root'
+        )
+
+        # Simulate process restart: fresh EscalationQueue, _seq resets to 0.
+        queue2 = EscalationQueue(queue_dir)
+
+        # make_id() MUST return expected_next: max(archive, pending) + 1.
+        new_id = queue2.make_id('42')
+        assert new_id == f'esc-42-{expected_next}', (
+            f'Expected esc-42-{expected_next} '
+            f'(max across archive={archived_seq} and queue_root={pending_seq}) '
+            f'but got {new_id!r}'
         )
 
     def test_make_id_interleaved_archive_and_pending(self, tmp_path: Path):
