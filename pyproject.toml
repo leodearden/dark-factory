@@ -15,6 +15,7 @@ members = [
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
+asyncio_mode = "auto"
 # fused-memory, orchestrator, and shared each have tests/__init__.py, making
 # their conftest.py resolve to the same "tests.conftest" module name as
 # dashboard/tests/conftest.py. Pytest's plugin registry rejects the second
