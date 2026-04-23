@@ -854,6 +854,7 @@ async def partials_merge_queue(request: Request):
                 cast(ChartData, data['depth_timeseries'])
             ),
             'recent': enrich_merges_with_titles(data['recent'], titles),
+            'active': enrich_merges_with_titles(data.get('active', []), titles),
         }
 
     canvas_ids = unique_css_ids(pids)
