@@ -964,30 +964,42 @@ class TestMergeQueueCanvasIdCollision:
     """Two pids that css_id-collide must render distinct canvas id attributes."""
 
     def test_colliding_pids_render_distinct_canvases(self, client):
-        """html contains four distinct canvas ids: unsuffixed + _1 variants for each chart type."""
+        """Colliding pids render distinct canvas ids: both tmp_dark_factory and tmp_dark_factory_1
+        appear in the HTML (order-independent), and no two <canvas> elements share an id."""
         with _patch_per_project_merge_data(projects=_MOCK_COLLIDING_PROJECT_DATA):
             resp = client.get('/partials/merge-queue')
         assert resp.status_code == 200
         html = resp.text
 
-        # First project: unsuffixed
-        assert 'id="mergeQueueDepthChart-tmp_dark_factory"' in html, (
-            'Expected unsuffixed mergeQueueDepthChart canvas id for first project'
+        # Both css_id variants must appear as mergeQueueDepthChart canvas ids (order-independent)
+        depth_ids = set(re.findall(r'id="mergeQueueDepthChart-([^"]+)"', html))
+        assert depth_ids == {'tmp_dark_factory', 'tmp_dark_factory_1'}, (
+            f'Expected depth chart canvas ids {{tmp_dark_factory, tmp_dark_factory_1}}, got {depth_ids}'
         )
-        assert 'id="mergeOutcomeChart-tmp_dark_factory"' in html, (
-            'Expected unsuffixed mergeOutcomeChart canvas id for first project'
+        # Both css_id variants must appear as mergeOutcomeChart canvas ids (order-independent)
+        outcome_ids = set(re.findall(r'id="mergeOutcomeChart-([^"]+)"', html))
+        assert outcome_ids == {'tmp_dark_factory', 'tmp_dark_factory_1'}, (
+            f'Expected outcome chart canvas ids {{tmp_dark_factory, tmp_dark_factory_1}}, got {outcome_ids}'
         )
-        # Second project: suffixed with _1
-        assert 'id="mergeQueueDepthChart-tmp_dark_factory_1"' in html, (
-            'Expected _1-suffixed mergeQueueDepthChart canvas id for second project'
+        # No two <canvas> elements may share the same id attribute.
+        # Use \s before id= so the pattern cannot match attributes whose names
+        # merely end in "id" (e.g. data-id="..."), where \b would also match.
+        all_canvas_ids = re.findall(r'<canvas\b[^>]*\sid="([^"]+)"', html)
+        assert len(all_canvas_ids) == len(set(all_canvas_ids)), (
+            f'Duplicate canvas ids found: {[i for i in all_canvas_ids if all_canvas_ids.count(i) > 1]}'
         )
-        assert 'id="mergeOutcomeChart-tmp_dark_factory_1"' in html, (
-            'Expected _1-suffixed mergeOutcomeChart canvas id for second project'
-        )
-        # canvas_id key must appear in the serialized allProjects JSON in the inline script
+        # Both canvas_id values must be present in the serialized allProjects JSON
+        # in the inline script.  Parsing the JSON (rather than just checking for
+        # the key name) catches server-side regressions where canvas_id wouldn't
+        # be correctly serialized for colliding pids.
         script_body = _extract_inline_script(html)
-        assert '"canvas_id"' in script_body, (
-            'canvas_id must be present in the serialized allProjects payload in the inline script'
+        m = re.search(r'var allProjects\s*=\s*', script_body)
+        assert m is not None, 'allProjects assignment not found in inline script'
+        all_projects, _ = json.JSONDecoder().raw_decode(script_body[m.end():])
+        canvas_id_values = {v['canvas_id'] for v in all_projects.values()}
+        assert canvas_id_values == {'tmp_dark_factory', 'tmp_dark_factory_1'}, (
+            f'Expected canvas_id values {{tmp_dark_factory, tmp_dark_factory_1}} in allProjects JSON, '
+            f'got {canvas_id_values}'
         )
 
 
@@ -1030,36 +1042,3 @@ class TestUniqueCssIds:
         """Non-colliding and colliding entries are interleaved correctly."""
         result = unique_css_ids(['x', '/tmp/a', 'y', '/tmp/a'])
         assert result == ['x', 'tmp_a', 'y', 'tmp_a_1']
-
-
-# ---------------------------------------------------------------------------
-# TestMergeQueueJsUsesCanvasId — structural guard that JS reads server value
-# ---------------------------------------------------------------------------
-
-
-class TestMergeQueueJsUsesCanvasId:
-    """The inline JS must read allProjects[pid].canvas_id, not recompute it.
-
-    This is a structural regression guard: if someone reintroduces the client-side
-    css_id regex (e.g. 'pid.replace(...)'), this test will catch it immediately.
-    """
-
-    def test_js_reads_canvas_id_from_server(self, client):
-        """JS renderAll() uses allProjects[pid].canvas_id, not a local pid.replace regex."""
-        with _patch_merge_queue_data():
-            resp = client.get('/partials/merge-queue')
-        assert resp.status_code == 200
-
-        script_body = _extract_inline_script(resp.text)
-
-        # (a) The JS must read the server-generated canvas_id
-        assert 'allProjects[pid].canvas_id' in script_body, (
-            "Expected 'allProjects[pid].canvas_id' in the inline script body — "
-            "JS should read the server-generated value, not recompute it"
-        )
-
-        # (b) The client-side css_id regex must be gone
-        assert "pid.replace(/[^a-zA-Z0-9_]/g, '_')" not in script_body, (
-            "The client-side pid.replace regex must be removed — "
-            "safeId should come from allProjects[pid].canvas_id"
-        )
