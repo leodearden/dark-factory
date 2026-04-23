@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -924,12 +925,13 @@ class TestRecentMerges:
         assert all(tid.startswith('recent-') for tid in task_ids)
 
     @pytest.mark.asyncio
-    async def test_limit_none_returns_all_rows(self, merge_events_db):
-        """recent_merges with limit=None returns every matching row (no SQL LIMIT).
+    async def test_limit_none_returns_all_rows(self, merge_events_db, caplog):
+        """recent_merges with limit=None returns every matching row up to _RECENT_MERGES_HARD_CAP.
 
         Inserts 60 merge_attempt events all within the last 5 minutes, then
-        asserts that limit=None returns all 60, verifying that limit=None is
-        supported and returns every matching row without a row-count cap.
+        asserts that limit=None returns all 60 (60 < 100_000 default hard cap,
+        so no truncation occurs) and that no WARNING is emitted (the 'below
+        cap → silent' branch).
         """
         now = datetime.now(UTC)
         with contextlib.closing(sqlite3.connect(str(merge_events_db))) as conn_sync:
@@ -945,13 +947,75 @@ class TestRecentMerges:
                 )
             conn_sync.commit()
 
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await recent_merges(db, limit=None, hours=1)
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.merge_queue'):
+            async with aiosqlite.connect(str(merge_events_db)) as db:
+                db.row_factory = aiosqlite.Row
+                result = await recent_merges(db, limit=None, hours=1)
 
         assert len(result) == 60, (
             f'Expected 60 rows with limit=None, got {len(result)}. '
-            'The SQL LIMIT clause must be omitted when limit is None.'
+            'limit=None returns every matching row up to _RECENT_MERGES_HARD_CAP '
+            '(no truncation for normal-sized result sets).'
+        )
+        warn_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warn_records, (
+            f'Expected no WARNING for 60 rows (well below hard cap), '
+            f'but got: {[r.message for r in warn_records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_recent_merges_limit_none_hard_cap_truncates_and_warns(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """recent_merges(limit=None) truncates to _RECENT_MERGES_HARD_CAP rows and logs WARN.
+
+        Patches _RECENT_MERGES_HARD_CAP to 5, inserts 10 events (all within the
+        1-hour window), and asserts:
+          1. Only 5 rows are returned (truncation to the patched cap).
+          2. At least one WARNING log record contains 'hard cap' (or 'hard_cap')
+             so operators can identify the cap was hit.
+        """
+        monkeypatch.setattr(_mqmod, '_RECENT_MERGES_HARD_CAP', 5)
+
+        now = datetime.now(UTC)
+        db_path = tmp_path / 'hard_cap_test.db'
+
+        with contextlib.closing(sqlite3.connect(str(db_path))) as conn_sync:
+            conn_sync.executescript(MERGE_EVENTS_SCHEMA)
+            for i in range(10):
+                _insert_event(
+                    conn_sync,
+                    event_type='merge_attempt',
+                    timestamp=now - timedelta(seconds=i * 5),
+                    task_id=f'cap-task-{i:03d}',
+                    run_id=f'cap-run-{i:03d}',
+                    data={'outcome': 'done'},
+                    duration_ms=100 + i,
+                )
+            conn_sync.commit()
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            with caplog.at_level(logging.WARNING, logger='dashboard.data.merge_queue'):
+                result = await recent_merges(db, limit=None, hours=1)
+
+        assert len(result) == 5, (
+            f'Expected 5 rows (hard cap=5), got {len(result)}. '
+            'recent_merges(limit=None) must truncate to _RECENT_MERGES_HARD_CAP rows.'
+        )
+        warn_msgs = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ]
+        assert any('hard cap' in m or 'hard_cap' in m for m in warn_msgs), (
+            f'Expected a WARNING containing "hard cap" or "hard_cap", got: {warn_msgs}'
+        )
+        # The row count must appear in the warning so it is actionable.
+        assert any(
+            ('hard cap' in m or 'hard_cap' in m) and ('5' in m or '6' in m)
+            for m in warn_msgs
+        ), (
+            f'Expected the row count (5 or 6) in the hard-cap WARNING, got: {warn_msgs}'
         )
 
 
@@ -1969,5 +2033,61 @@ class TestBuildPerProjectMergeQueue:
         expected_task_ids = {f'burst-task-{i:03d}' for i in range(60)}
         assert returned_task_ids == expected_task_ids, (
             f'Missing task_ids: {expected_task_ids - returned_task_ids}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_build_per_project_burst_warn_uses_module_constant(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """_one_project WARN references _RECENT_MERGES_BURST_WARN, not the bare 1_000 literal.
+
+        Patches _RECENT_MERGES_BURST_WARN to 5, inserts 10 events all within the
+        15-minute recent_window_minutes window (above the patched soft threshold,
+        well below the 100_000 hard cap), and asserts:
+          1. At least one WARNING log record contains 'runaway burst'.
+          2. The same record mentions the row count (10).
+        Fails before step-4 (bare 1_000 literal ignores the patched constant),
+        passes after step-4 (_RECENT_MERGES_BURST_WARN drives the comparison).
+        """
+        monkeypatch.setattr(_mqmod, '_RECENT_MERGES_BURST_WARN', 5)
+
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        # 10 events spread across ~9 minutes (56 s apart), all within the 15-min window.
+        events = [
+            {
+                'event_type': 'merge_attempt',
+                'timestamp': now - timedelta(seconds=i * 56),
+                'task_id': f'bw-task-{i:03d}',
+                'run_id': f'bw-run-{i:03d}',
+                'data': {'outcome': 'done'},
+                'duration_ms': 100 + i,
+            }
+            for i in range(10)
+        ]
+        db_path = _make_db(tmp_path, 'burst_warn.db', events)
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with caplog.at_level(logging.WARNING, logger='dashboard.data.merge_queue'):
+                await build_per_project_merge_queue(
+                    [('/tmp/P', conn)],
+                    hours=24,
+                    now=now,
+                    recent_window_minutes=15,
+                )
+
+        warn_msgs = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ]
+        assert any('runaway burst' in m for m in warn_msgs), (
+            f'Expected a WARNING containing "runaway burst", got: {warn_msgs!r}. '
+            'Ensure _RECENT_MERGES_BURST_WARN (patched to 5) controls the threshold '
+            'in _one_project, not the bare 1_000 literal.'
+        )
+        assert any('runaway burst' in m and '10' in m for m in warn_msgs), (
+            f'Expected the row count (10) in the runaway-burst WARNING, got: {warn_msgs!r}'
         )
 
