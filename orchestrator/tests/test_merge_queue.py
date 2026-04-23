@@ -3536,3 +3536,86 @@ class TestSpeculativeMergeWorkerDequeueEvent:
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestMergeWorkerCasRetryEmitsMergeQueued — step-9
+# ---------------------------------------------------------------------------
+
+
+class TestMergeWorkerCasRetryEmitsMergeQueued:
+    """MergeWorker emits merge_queued when re-enqueuing on CAS retry."""
+
+    @pytest.mark.asyncio
+    async def test_cas_retry_reenqueue_emits_merge_queued(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """CAS retry path emits a second merge_queued, then merge_dequeued, then done.
+
+        Event sequence expected:
+          merge_queued        (initial enqueue via helper)
+          merge_dequeued      (worker picks up request the first time)
+          merge_attempt(cas_retry)
+          merge_queued        (re-enqueue on CAS failure)
+          merge_dequeued      (worker picks up from _urgent)
+          merge_attempt(done)
+        """
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        wt = await _make_branch_with_file(
+            git_ops, 'cas-evt', 'cas_evt.py', 'x = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        original_advance = git_ops.advance_main
+        call_count = 0
+
+        async def _fail_once(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return 'cas_failed'
+            return await original_advance(*args, **kwargs)
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_fail_once),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('cas-evt', 'cas-evt', wt, config)
+            from orchestrator.merge_queue import enqueue_merge_request
+            await enqueue_merge_request(queue, req, event_store)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'done'
+        assert call_count == 2
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, json_extract(data, '$.outcome') AS outcome "
+            "FROM events ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        event_types = [(r[0], r[1]) for r in rows]
+
+        # Count merge_queued rows for this task — expect exactly 2
+        queued_count = sum(1 for et, _ in event_types if et == 'merge_queued')
+        assert queued_count == 2, f'Expected 2 merge_queued rows, got: {event_types}'
+
+        # Count merge_dequeued rows — expect exactly 2
+        dequeued_count = sum(1 for et, _ in event_types if et == 'merge_dequeued')
+        assert dequeued_count == 2, f'Expected 2 merge_dequeued rows, got: {event_types}'
+
+        # Exactly one cas_retry and one done attempt
+        attempt_outcomes = [out for et, out in event_types if et == 'merge_attempt']
+        assert 'cas_retry' in attempt_outcomes, f'Expected cas_retry in attempts: {attempt_outcomes}'
+        assert 'done' in attempt_outcomes, f'Expected done in attempts: {attempt_outcomes}'
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
