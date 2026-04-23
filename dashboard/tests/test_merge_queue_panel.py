@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from dashboard.app import unique_css_ids
 from dashboard.config import DashboardConfig as _DashboardConfig
 from dashboard.data.merge_queue import _bucket_minutes_for_window
 from tests._dt_helpers import make_fixed_datetime_cls
@@ -931,4 +932,134 @@ class TestRecentMergesWindow:
         )
         assert 'task-outside-4' not in html, (
             'task-outside-4 (30m ago) should be filtered out by the 15-minute window'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestMergeQueueCanvasIdCollision — server-generated canvas_id (step-3/4)
+# ---------------------------------------------------------------------------
+
+_PID_COLLISION_A = '/tmp/dark-factory'
+_PID_COLLISION_B = '/tmp/dark_factory'
+
+_MOCK_COLLIDING_PROJECT_DATA = {
+    _PID_COLLISION_A: {
+        'depth_timeseries': MOCK_DEPTH,
+        'outcomes': MOCK_OUTCOMES,
+        'latency': MOCK_LATENCY,
+        'recent': MOCK_RECENT,
+        'speculative': MOCK_SPEC,
+    },
+    _PID_COLLISION_B: {
+        'depth_timeseries': MOCK_DEPTH,
+        'outcomes': MOCK_OUTCOMES,
+        'latency': MOCK_LATENCY,
+        'recent': MOCK_RECENT,
+        'speculative': MOCK_SPEC,
+    },
+}
+
+
+class TestMergeQueueCanvasIdCollision:
+    """Two pids that css_id-collide must render distinct canvas id attributes."""
+
+    def test_colliding_pids_render_distinct_canvases(self, client):
+        """html contains four distinct canvas ids: unsuffixed + _1 variants for each chart type."""
+        with _patch_per_project_merge_data(projects=_MOCK_COLLIDING_PROJECT_DATA):
+            resp = client.get('/partials/merge-queue')
+        assert resp.status_code == 200
+        html = resp.text
+
+        # First project: unsuffixed
+        assert 'id="mergeQueueDepthChart-tmp_dark_factory"' in html, (
+            'Expected unsuffixed mergeQueueDepthChart canvas id for first project'
+        )
+        assert 'id="mergeOutcomeChart-tmp_dark_factory"' in html, (
+            'Expected unsuffixed mergeOutcomeChart canvas id for first project'
+        )
+        # Second project: suffixed with _1
+        assert 'id="mergeQueueDepthChart-tmp_dark_factory_1"' in html, (
+            'Expected _1-suffixed mergeQueueDepthChart canvas id for second project'
+        )
+        assert 'id="mergeOutcomeChart-tmp_dark_factory_1"' in html, (
+            'Expected _1-suffixed mergeOutcomeChart canvas id for second project'
+        )
+        # canvas_id key must appear in the serialized allProjects JSON in the inline script
+        script_body = _extract_inline_script(html)
+        assert '"canvas_id"' in script_body, (
+            'canvas_id must be present in the serialized allProjects payload in the inline script'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestUniqueCssIds — unit tests for unique_css_ids helper (step-1/2)
+# ---------------------------------------------------------------------------
+
+
+class TestUniqueCssIds:
+    """Unit tests for the unique_css_ids(values) helper in dashboard.app.
+
+    Each test drives a documented case from the plan.  All must fail with
+    ImportError or AttributeError until step-2 implements the helper.
+    """
+
+    def test_non_colliding_passthrough(self):
+        """Non-colliding inputs are returned unchanged."""
+        assert unique_css_ids(['a', 'b']) == ['a', 'b']
+
+    def test_two_way_collision(self):
+        """/tmp/dark-factory and /tmp/dark_factory both normalize to tmp_dark_factory."""
+        result = unique_css_ids(['/tmp/dark-factory', '/tmp/dark_factory'])
+        assert result == ['tmp_dark_factory', 'tmp_dark_factory_1']
+
+    def test_three_way_collision(self):
+        """Three inputs with the same css_id get _0 (no suffix), _1, _2."""
+        result = unique_css_ids(['a-b', 'a.b', 'a b'])
+        assert result == ['a_b', 'a_b_1', 'a_b_2']
+
+    def test_counter_collision_edge_case(self):
+        """Third 'foo' must skip already-taken foo_1 and land on foo_2."""
+        result = unique_css_ids(['foo', 'foo_1', 'foo'])
+        assert result == ['foo', 'foo_1', 'foo_2']
+
+    def test_empty_input(self):
+        """Empty sequence returns empty list."""
+        assert unique_css_ids([]) == []
+
+    def test_order_preserved_mixed(self):
+        """Non-colliding and colliding entries are interleaved correctly."""
+        result = unique_css_ids(['x', '/tmp/a', 'y', '/tmp/a'])
+        assert result == ['x', 'tmp_a', 'y', 'tmp_a_1']
+
+
+# ---------------------------------------------------------------------------
+# TestMergeQueueJsUsesCanvasId — structural guard that JS reads server value
+# ---------------------------------------------------------------------------
+
+
+class TestMergeQueueJsUsesCanvasId:
+    """The inline JS must read allProjects[pid].canvas_id, not recompute it.
+
+    This is a structural regression guard: if someone reintroduces the client-side
+    css_id regex (e.g. 'pid.replace(...)'), this test will catch it immediately.
+    """
+
+    def test_js_reads_canvas_id_from_server(self, client):
+        """JS renderAll() uses allProjects[pid].canvas_id, not a local pid.replace regex."""
+        with _patch_merge_queue_data():
+            resp = client.get('/partials/merge-queue')
+        assert resp.status_code == 200
+
+        script_body = _extract_inline_script(resp.text)
+
+        # (a) The JS must read the server-generated canvas_id
+        assert 'allProjects[pid].canvas_id' in script_body, (
+            "Expected 'allProjects[pid].canvas_id' in the inline script body — "
+            "JS should read the server-generated value, not recompute it"
+        )
+
+        # (b) The client-side css_id regex must be gone
+        assert "pid.replace(/[^a-zA-Z0-9_]/g, '_')" not in script_body, (
+            "The client-side pid.replace regex must be removed — "
+            "safeId should come from allProjects[pid].canvas_id"
         )
