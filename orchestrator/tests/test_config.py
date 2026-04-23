@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from orchestrator.config import (
     ConfigRequiredError,
+    EscalationConfig,
     ModuleConfig,
     OrchestratorConfig,
     TimeoutsConfig,
@@ -107,6 +108,19 @@ class TestDefaults:
         """Raw Pydantic field default is None; the shipped 5400 value comes from defaults.yaml."""
         field_info = OrchestratorConfig.model_fields['verify_cold_command_timeout_secs']
         assert field_info.default is None
+
+    def test_escalation_archive_retention_days_default(self, monkeypatch, tmp_path):
+        """archive_retention_days is 30 in EscalationConfig pydantic default and defaults.yaml."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        defaults = _load_package_defaults()
+        # Pydantic standalone default
+        assert EscalationConfig().archive_retention_days == 30
+        # Loaded from defaults.yaml via OrchestratorConfig
+        assert config.escalation.archive_retention_days == 30
+        # defaults.yaml itself carries the value
+        assert defaults['escalation']['archive_retention_days'] == 30
 
 
 class TestYamlLoading:
