@@ -640,7 +640,7 @@ async def build_per_project_merge_queue(
                     ' (limit=None, hours=%d) — possible runaway burst; consider'
                     ' rate-limiting the producer or adding capacity monitoring',
                     pid,
-                    len(recent_raw),
+                    len(recent_raw),  # type: ignore[arg-type]
                     recent_hours,
                 )
 
