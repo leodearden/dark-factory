@@ -11,6 +11,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+from escalation import archive
 from escalation.models import Escalation
 
 logger = logging.getLogger(__name__)
@@ -147,6 +148,18 @@ class EscalationQueue:
             with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
             raise
+
+        # Best-effort: move resolved file into dated archive subdir.
+        # Failure logs a warning but does not abort the resolution.
+        try:
+            archive_dir = archive.archive_dir_for_date(self.queue_dir, esc.resolved_at)
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(str(path), str(archive_dir / f'{escalation_id}.json'))
+        except OSError as exc:
+            logger.warning(
+                f'Failed to archive escalation {escalation_id}: {exc}; '
+                'file remains in queue_dir'
+            )
 
         logger.info(f'Escalation {escalation_id} {esc.status}: {resolution[:100]}')
 
