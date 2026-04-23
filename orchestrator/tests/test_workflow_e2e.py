@@ -2413,11 +2413,17 @@ class TestPrerequisitesValidation:
 
 @pytest.mark.asyncio
 class TestMarkBlockedFalseDoneGuard:
-    """Empty-branch is_ancestor path must not false-done — must requeue instead.
+    """_mark_blocked's requeue-on-steward-resolution contract.
 
-    Regression for task 839: an empty task branch (worktree HEAD == base commit)
-    trivially satisfies is_ancestor(HEAD, main), causing _mark_blocked to mark
-    the task 'done' with no code landed on main.
+    After steward resolution of all L0 escalations, _mark_blocked must requeue
+    the task (return REQUEUED) and must NOT false-done it — even when the worktree
+    HEAD is trivially an ancestor of main (empty branch point) or when a stale
+    iteration-log entry is present.
+
+    The "branch already on main → DONE" recovery was extracted into
+    _recover_if_already_merged() (called pre-PLAN from workflow.run).
+    _mark_blocked is now single-purpose: check L1 → ESCALATED; check
+    'deferred' → BLOCKED; otherwise → requeue → REQUEUED.
     """
 
     async def test_empty_branch_with_resolved_l0_requeues_not_done(
@@ -2426,10 +2432,9 @@ class TestMarkBlockedFalseDoneGuard:
         """Empty task branch with steward-resolved L0 must requeue, not false-done.
 
         The base commit is always an ancestor of main, so is_ancestor returns True
-        even when no implementation was committed.  Without the
-        _has_prior_implementation() guard this path marks the task 'done'.
-        With the guard it detects the stale branch point and falls through to the
-        normal requeue path.  This test FAILS on unmodified code (step-1 TDD).
+        even when no implementation was committed.  _mark_blocked is now
+        single-purpose (no inline merge-check) and always requeues on the
+        no-remaining-L0 path — this test pins that contract.
         """
         # 1. Create a fresh worktree with no implementation commits (base commit only)
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
@@ -2470,258 +2475,18 @@ class TestMarkBlockedFalseDoneGuard:
             f'workflow.state must not be DONE after empty-branch guard: {workflow.state!r}'
         )
 
-    async def test_genuine_prior_merge_still_fast_paths_to_done(
-        self, config, git_ops, task_assignment, tmp_path
-    ):
-        """Positive control: branch with impl entry + merged to main must still fast-path to DONE.
-
-        Verifies the guard is not over-conservative: when a real implementer
-        iteration entry exists and the branch HEAD is a genuine ancestor of main
-        (because it was merged), _mark_blocked must still return DONE.
-        """
-        import json as _json
-
-        # 1. Create worktree and write an implementer iteration entry
-        wt_info = await git_ops.create_worktree(task_assignment.task_id)
-        wt = wt_info.path
-        task_dir = wt / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'iterations.jsonl').write_text(
-            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
-        )
-
-        # 2. Make a real implementation commit on the branch and merge it to main
-        (wt / 'farewell.py').write_text('def farewell(name):\n    return f"Bye, {name}"\n')
-        await git_ops.commit(wt, 'Implement farewell')
-        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
-        assert result.success
-        await git_ops.advance_main(result.merge_commit)
-        if result.merge_worktree:
-            await git_ops.cleanup_merge_worktree(result.merge_worktree)
-
-        # 3. Build workflow with escalation queue, wire up worktree and artifacts
-        #    (has implementer iteration entry → _has_prior_implementation() returns True)
-        #    Use the no-merge-worker variant to avoid leaking the MergeWorker task.
-        stub = AgentStub()
-        workflow, scheduler, queue = _build_workflow_no_merge_worker(
-            config, git_ops, task_assignment, stub, tmp_path,
-        )
-        workflow.worktree = wt
-        workflow.artifacts = TaskArtifacts(wt)
-
-        # 4. FakeSteward resolves all pending L0 escalations immediately in start()
-        workflow._steward_factory = _make_resolving_steward(
-            queue, task_assignment.task_id,
-        )
-
-        # 5. Call _mark_blocked directly
-        outcome = await workflow._mark_blocked('synthetic failure')
-
-        # 6. Assertions: genuine prior merge must still fast-path to DONE
-        assert outcome == WorkflowOutcome.DONE, (
-            f'Expected DONE for genuine prior merge but got {outcome!r} — '
-            'the _has_prior_implementation guard is too conservative'
-        )
-        statuses = scheduler.statuses.get(task_assignment.task_id, [])
-        assert statuses[-1] == 'done', (
-            f"Last scheduler status must be 'done' for genuine prior merge, got: {statuses}"
-        )
-        assert workflow.state == WorkflowState.DONE
-
-    async def test_workflow_already_on_main_done_uses_note_provenance(
-        self, config, git_ops, task_assignment, tmp_path
-    ):
-        """already-on-main path passes done_provenance={'note': '...'} to set_task_status.
-
-        When _mark_blocked detects the branch is already on main after steward resolution,
-        scheduler.provenance must record the note explanation, not a commit SHA.
-        Fails until step-17 adds done_provenance={'note': ...} at workflow.py:2446-2448.
-        """
-        import json as _json
-
-        # 1. Create worktree with an implementer iteration entry (makes _has_prior_implementation True)
-        wt_info = await git_ops.create_worktree(task_assignment.task_id)
-        wt = wt_info.path
-        task_dir = wt / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'iterations.jsonl').write_text(
-            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
-        )
-
-        # 2. Make a real implementation commit on the branch and merge it to main
-        (wt / 'farewell.py').write_text('def farewell(name):\n    return f"Bye, {name}"\n')
-        await git_ops.commit(wt, 'Implement farewell')
-        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
-        assert result.success
-        await git_ops.advance_main(result.merge_commit)
-        if result.merge_worktree:
-            await git_ops.cleanup_merge_worktree(result.merge_worktree)
-
-        # 3. Build workflow with escalation queue, wire up worktree and artifacts
-        stub = AgentStub()
-        workflow, scheduler, queue = _build_workflow_no_merge_worker(
-            config, git_ops, task_assignment, stub, tmp_path,
-        )
-        workflow.worktree = wt
-        workflow.artifacts = TaskArtifacts(wt)
-
-        # 4. FakeSteward resolves all pending L0 escalations immediately in start()
-        workflow._steward_factory = _make_resolving_steward(
-            queue, task_assignment.task_id,
-        )
-
-        # 5. Call _mark_blocked directly (drives the already-on-main completion path)
-        outcome = await workflow._mark_blocked('synthetic failure')
-
-        # 6. Assertions: must DONE with the note provenance
-        assert outcome == WorkflowOutcome.DONE
-        assert scheduler.provenance.get(task_assignment.task_id) == {
-            'note': 'branch already on main after escalation resolution'
-        }, (
-            f"Expected done_provenance note but got: "
-            f"{scheduler.provenance.get(task_assignment.task_id)!r}"
-        )
-
-    async def test_git_exception_in_ancestor_check_requeues(
-        self, config, git_ops, task_assignment, monkeypatch, tmp_path
-    ):
-        """git exception during is_ancestor must fall through to requeue, not crash.
-
-        The try/except at the is_ancestor call site swallows all exceptions and
-        falls through to the normal requeue path.  This test ensures a future
-        refactor can't accidentally turn a RuntimeError into an unguarded raise
-        or a false-done transition.
-        """
-        # 1. Create a fresh worktree (base commit only — no implementation commits)
-        wt_info = await git_ops.create_worktree(task_assignment.task_id)
-        wt = wt_info.path
-
-        # 2. Build workflow, wire up worktree and artifacts
-        #    Use the no-merge-worker variant to avoid leaking the MergeWorker task.
-        stub = AgentStub()
-        workflow, scheduler, queue = _build_workflow_no_merge_worker(
-            config, git_ops, task_assignment, stub, tmp_path,
-        )
-        workflow.worktree = wt
-        workflow.artifacts = TaskArtifacts(wt)
-
-        # 3. FakeSteward resolves the L0 so we reach the is_ancestor check
-        workflow._steward_factory = _make_resolving_steward(
-            queue, task_assignment.task_id,
-        )
-
-        # 4. Force is_ancestor to raise RuntimeError — simulates a git subprocess
-        #    failure (e.g. corrupted index, network mount offline, etc.)
-        async def _boom(*args, **kwargs):  # noqa: ARG001
-            raise RuntimeError('simulated git failure')
-
-        monkeypatch.setattr(git_ops, 'is_ancestor', _boom)
-
-        # 5. Call _mark_blocked — must survive the exception and requeue
-        outcome = await workflow._mark_blocked('synthetic failure')
-
-        # 6. Assertions: exception path must fall through to requeue
-        assert outcome == WorkflowOutcome.REQUEUED, (
-            f'Expected REQUEUED after git exception but got {outcome!r} — '
-            'the except-block in _mark_blocked is broken'
-        )
-        statuses = scheduler.statuses.get(task_assignment.task_id, [])
-        assert 'done' not in statuses, (
-            f"'done' must not appear after a git exception: {statuses}"
-        )
-        assert statuses[-1] == 'pending', (
-            f"Last status must be 'pending' after exception-path requeue: {statuses}"
-        )
-
     async def test_empty_branch_with_stale_iteration_log_still_requeues(
         self, config, git_ops, task_assignment, tmp_path
     ):
-        """SHA-primary guard must requeue even when a stale implementer entry is present.
+        """_mark_blocked requeues even when a stale implementer iteration entry is present.
 
-        On the baseline (entry-scan only) _has_prior_implementation(), the stale entry
-        causes it to return True.  Because the fresh worktree HEAD is trivially an
-        ancestor of main (wt_head == base_commit == main HEAD), the guard incorrectly
-        fast-paths to DONE.
-
-        After the SHA-primary refactor, the guard compares wt_head == base_commit and
-        returns (False, entries), falling through to the normal requeue path.
-
-        This test FAILS on unmodified code (step-1 TDD for SHA-primary signal).
+        The "branch already on main → DONE" recovery was moved out of _mark_blocked
+        into _recover_if_already_merged() (called pre-PLAN).  _mark_blocked is now
+        single-purpose and never returns DONE; the stale iteration-log entry no
+        longer influences its outcome at all.  This test asserts the requeue
+        contract holds on a worktree that carries such an entry.
         """
-        import json as _json
-
-        # 1. Create a fresh worktree (no implementation commits — wt_head == base_commit)
-        wt_info = await git_ops.create_worktree(task_assignment.task_id)
-        wt = wt_info.path
-
-        # 2. Get the current HEAD SHA — this is also the base_commit
-        _, wt_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
-        wt_head = wt_head_raw.strip()
-
-        # 3. Stamp metadata.json with base_commit == wt_head
-        #    (mirrors what workflow._init_plan_artifacts does at task start)
-        task_dir = wt / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'metadata.json').write_text(
-            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': wt_head})
-        )
-
-        # 4. Write a stale implementer iteration entry.
-        #    On baseline code this alone makes _has_prior_implementation() return True.
-        (task_dir / 'iterations.jsonl').write_text(
-            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
-        )
-
-        # 5. Build workflow, wire up worktree and artifacts
-        stub = AgentStub()
-        workflow, scheduler, queue = _build_workflow_no_merge_worker(
-            config, git_ops, task_assignment, stub, tmp_path,
-        )
-        workflow.worktree = wt
-        workflow.artifacts = TaskArtifacts(wt)
-
-        # 6. FakeSteward resolves all pending L0 escalations immediately in start()
-        workflow._steward_factory = _make_resolving_steward(
-            queue, task_assignment.task_id,
-        )
-
-        # 7. Call _mark_blocked directly
-        outcome = await workflow._mark_blocked('synthetic failure')
-
-        # 8. Assert REQUEUED — stale entry must not trigger false-done when wt_head == base_commit
-        assert outcome == WorkflowOutcome.REQUEUED, (
-            f'Expected REQUEUED but got {outcome!r} — '
-            'stale iteration entry triggered false-done despite wt_head == base_commit'
-        )
-        statuses = scheduler.statuses.get(task_assignment.task_id, [])
-        assert 'done' not in statuses, (
-            f"'done' must not appear in scheduler statuses: {statuses}"
-        )
-        assert statuses[-1] == 'pending', (
-            f"Last scheduler status must be 'pending' after requeue, got: {statuses}"
-        )
-        assert workflow.state != WorkflowState.DONE, (
-            f'workflow.state must not be DONE: {workflow.state!r}'
-        )
-
-    async def test_artifacts_exception_logs_distinctly_and_requeues(
-        self, config, git_ops, task_assignment, tmp_path, caplog
-    ):
-        """Artifacts-layer exception in _has_prior_implementation must log distinctly.
-
-        When read_iteration_log raises (e.g. malformed JSON, filesystem error),
-        the exception must be caught by a separate artifacts-layer try/except that
-        logs a message containing 'artifacts' — distinct from the git-layer
-        'merge-check failed' message — so operators can diagnose the correct root
-        cause.  Both paths fall through to the normal requeue flow.
-
-        On unmodified code the single bare except catches the exception and logs
-        'merge-check failed', so the 'artifacts' assertion fails.
-        This test FAILS on unmodified code (step-3 TDD for distinct exception handling).
-        """
-        import logging
-
-        # 1. Create a fresh worktree (wt_head == base_commit — trivially is_ancestor True)
+        # 1. Create a fresh worktree
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
 
@@ -2738,114 +2503,497 @@ class TestMarkBlockedFalseDoneGuard:
             queue, task_assignment.task_id,
         )
 
-        # 4. Force read_iteration_log to raise — simulates corrupted iterations.jsonl
-        def _raise_artifacts():
-            raise RuntimeError('simulated artifacts failure')
+        # 4. Call _mark_blocked directly
+        outcome = await workflow._mark_blocked('synthetic failure')
 
-        workflow.artifacts.read_iteration_log = _raise_artifacts  # type: ignore[method-assign]
-
-        # 5. Call _mark_blocked, capturing WARNING-level logs
-        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
-            outcome = await workflow._mark_blocked('synthetic failure')
-
-        # 6. Assertions: must REQUEUE with a distinct 'artifacts' log message
+        # 5. Assert REQUEUED — _mark_blocked must never return DONE
         assert outcome == WorkflowOutcome.REQUEUED, (
-            f'Expected REQUEUED but got {outcome!r} — '
-            'artifacts exception must fall through to requeue'
+            f'Expected REQUEUED but got {outcome!r}'
         )
         statuses = scheduler.statuses.get(task_assignment.task_id, [])
         assert 'done' not in statuses, (
-            f"'done' must not appear after an artifacts exception: {statuses}"
+            f"'done' must not appear in scheduler statuses: {statuses}"
         )
         assert statuses[-1] == 'pending', (
-            f"Last status must be 'pending' after exception-path requeue: {statuses}"
+            f"Last scheduler status must be 'pending' after requeue, got: {statuses}"
         )
-        assert any(
-            'artifacts read failed during merge-check' in r.message
-            for r in caplog.records
-        ), (
-            f"Expected a log record containing 'artifacts read failed during merge-check' "
-            f"(distinct from 'merge-check failed') "
-            f"but caplog only has: {[r.message for r in caplog.records]}"
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE: {workflow.state!r}'
         )
 
-    async def test_sha_primary_signal_fires_done_after_real_commit(
-        self, config, git_ops, task_assignment, tmp_path, caplog
+
+# ---------------------------------------------------------------------------
+# Tests: _recover_if_already_merged unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRecoverIfAlreadyMerged:
+    """Unit tests for TaskWorkflow._recover_if_already_merged().
+
+    Each test exercises the method directly without a full workflow.run() cycle
+    or steward/escalation machinery.  The method is pure: it does git + artifact
+    reads and returns either WorkflowOutcome.DONE or None.
+    """
+
+    async def test_returns_done_when_branch_merged_with_prior_work(
+        self, config, git_ops, task_assignment, tmp_path
     ):
-        """SHA-primary signal must fire DONE when wt_head != base_commit after a real commit.
+        """Happy path: merged branch with implementer entry returns DONE.
 
-        Stamps metadata.json with base_commit = X (the initial branch HEAD),
-        then makes a real implementation commit so HEAD advances to Y.
-        The SHA-primary guard sees wt_head (Y) != base_commit (X) → has_work=True.
-        The branch is merged to main so is_ancestor is True.
-        Expected: outcome == DONE and the 'completing instead of re-queueing' log fires.
+        Set up a worktree, stamp iterations.jsonl with an implementer entry,
+        commit a real file, merge to main, then call _recover_if_already_merged()
+        directly.  Asserts WorkflowOutcome.DONE is returned and scheduler
+        records 'done'.
 
-        This locks in the positive branch of the SHA-primary signal introduced in
-        step-2 — the complement to test_empty_branch_with_stale_iteration_log_still_requeues.
+        Fails on unmodified code with AttributeError (method does not exist yet).
         """
         import json as _json
-        import logging
 
-        # 1. Create worktree — initial HEAD is base_commit
+        # 1. Create worktree and write an implementer iteration entry
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-
-        _, base_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
-        base_sha = base_sha_raw.strip()
-
-        # 2. Stamp metadata.json with base_commit = initial HEAD
         task_dir = wt / '.task'
         task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'metadata.json').write_text(
-            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': base_sha})
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
         )
-        # No iterations.jsonl entry — SHA-primary path must not need it.
 
-        # 3. Make a real implementation commit (HEAD advances past base_commit)
-        (wt / 'farewell_sha.py').write_text(
-            'def farewell(name):\n    return f"Goodbye, {name}"\n'
-        )
-        await git_ops.commit(wt, 'Implement farewell (SHA-primary test)')
-
-        # 4. Merge the branch to main so is_ancestor(wt_head, main_sha) is True
+        # 2. Make a real implementation commit and merge it to main
+        (wt / 'impl_merged.py').write_text('def impl():\n    return 42\n')
+        await git_ops.commit(wt, 'Implement feature (test_returns_done_when_branch_merged)')
         result = await git_ops.merge_to_main(wt, task_assignment.task_id)
         assert result.success
         await git_ops.advance_main(result.merge_commit)
         if result.merge_worktree:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
 
-        # 5. Build workflow, wire up worktree and artifacts
+        # 3. Build workflow, wire up worktree and artifacts (no steward needed)
         stub = AgentStub()
-        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
             config, git_ops, task_assignment, stub, tmp_path,
         )
         workflow.worktree = wt
         workflow.artifacts = TaskArtifacts(wt)
 
-        # 6. FakeSteward resolves all pending L0 escalations immediately in start()
-        workflow._steward_factory = _make_resolving_steward(
-            queue, task_assignment.task_id,
-        )
+        # 4. Call _recover_if_already_merged directly
+        outcome = await workflow._recover_if_already_merged()
 
-        # 7. Call _mark_blocked, capturing INFO-level logs (completing log is INFO)
-        with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
-            outcome = await workflow._mark_blocked('synthetic failure')
-
-        # 8. Assert DONE with the 'completing instead of re-queueing' log
+        # 5. Assertions: must return DONE with scheduler 'done'
         assert outcome == WorkflowOutcome.DONE, (
-            f'Expected DONE (wt_head != base_commit, merged) but got {outcome!r}'
+            f'Expected DONE for merged branch with prior work but got {outcome!r}'
         )
         statuses = scheduler.statuses.get(task_assignment.task_id, [])
         assert statuses[-1] == 'done', (
-            f"Last scheduler status must be 'done' after SHA-primary fast-path, got: {statuses}"
+            f"Last scheduler status must be 'done', got: {statuses}"
         )
         assert workflow.state == WorkflowState.DONE
+
+    async def test_returns_none_for_stale_branch_point(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Stale branch point (wt_head == base_commit, no iteration entries) must return None.
+
+        A fresh worktree with no implementation commits has wt_head equal to
+        base_commit and no iterations.jsonl.  The branch trivially satisfies
+        is_ancestor(wt_head, main) since it was never advanced.
+
+        _recover_if_already_merged() calls _has_prior_implementation() WITHOUT
+        wt_head (by design — the branch may have been rebased; see the method
+        comment), so the SHA-primary signal is NOT exercised here.  Instead
+        the iteration-log fallback runs: with no implementer/debugger entries
+        in iterations.jsonl, has_work=False and the recovery returns None.
+
+        NOTE: the SHA-primary path is deliberately unreachable from
+        _recover_if_already_merged because passing wt_head would cause
+        false-negatives on rebased branches.  The iteration-log fallback is
+        the sole signal here.
+        """
+        import json as _json
+
+        # 1. Create a fresh worktree (no iteration entries, no implementation commits)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Read current HEAD (= base_commit) and stamp metadata.json
+        _, base_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        base_sha = base_sha_raw.strip()
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'metadata.json').write_text(
+            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': base_sha})
+        )
+        # No iterations.jsonl written — iteration-log fallback finds 0 entries → has_work=False
+
+        # 3. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 4. Call _recover_if_already_merged directly
+        outcome = await workflow._recover_if_already_merged()
+
+        # 5. Assertions: stale branch must return None with no DONE side-effects
+        assert outcome is None, (
+            f'Expected None for stale branch point but got {outcome!r} — '
+            'iteration-log fallback empty-entries guard is missing or broken'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses for stale branch: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE for stale branch: {workflow.state!r}'
+        )
+
+    async def test_returns_none_when_branch_not_on_main(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Branch with real commit but NOT merged to main returns None.
+
+        Create a worktree with a real implementation commit (wt_head != base_commit,
+        has_work=True) but do NOT merge to main.  is_ancestor(wt_head, main_sha)
+        returns False, so _recover_if_already_merged() must return None without
+        side-effects.
+
+        Pins the is_ancestor=False branch returns None cleanly.
+        """
+        # 1. Create worktree and make a real implementation commit (no merge)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        (wt / 'unmerged_impl.py').write_text('def impl():\n    return 99\n')
+        await git_ops.commit(wt, 'Implement feature (unmerged)')
+
+        # 2. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. Call _recover_if_already_merged directly
+        outcome = await workflow._recover_if_already_merged()
+
+        # 4. Assertions: unmerged branch must return None with no side-effects
+        assert outcome is None, (
+            f'Expected None for unmerged branch but got {outcome!r} — '
+            'is_ancestor=False guard is missing or broken'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE for unmerged branch: {workflow.state!r}'
+        )
+
+    async def test_returns_none_and_logs_on_git_exception(
+        self, config, git_ops, task_assignment, tmp_path, caplog
+    ):
+        """Git-layer exception must return None and log 'merge-check failed'.
+
+        Monkeypatch git_ops.is_ancestor to raise RuntimeError.  The git-layer
+        try/except must catch it, log a WARNING containing 'merge-check failed',
+        and return None (not re-raise).  Mirrors the existing
+        test_git_exception_in_ancestor_check_requeues but targets the new helper
+        directly.
+
+        Fails on unmodified code with RuntimeError propagating uncaught.
+        """
+        import logging
+
+        # 1. Create a worktree (needed for the worktree guard to pass)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. Monkeypatch is_ancestor to raise
+        async def _raise_git(*args, **kwargs):
+            raise RuntimeError('simulated git failure')
+
+        workflow.git_ops.is_ancestor = _raise_git  # type: ignore[method-assign]
+
+        # 4. Call _recover_if_already_merged, capturing WARNING logs
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+            outcome = await workflow._recover_if_already_merged()
+
+        # 5. Assertions: must return None with 'merge-check failed' log
+        assert outcome is None, (
+            f'Expected None on git exception but got {outcome!r} — '
+            'git-layer exception must be caught and return None'
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE after git exception: {workflow.state!r}'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear after git exception: {statuses}"
+        )
         assert any(
-            'completing instead of re-queueing' in r.message
+            'merge-check failed' in r.message
             for r in caplog.records
         ), (
-            f"Expected 'completing instead of re-queueing' log but only got: "
+            f"Expected 'merge-check failed' in log records but only got: "
             f"{[r.message for r in caplog.records]}"
+        )
+
+    async def test_returns_none_and_logs_distinctly_on_artifacts_exception(
+        self, config, git_ops, task_assignment, tmp_path, caplog
+    ):
+        """Artifacts-layer exception must log DISTINCTLY from git-layer exceptions.
+
+        Set up a worktree where wt_head is an ancestor of main (is_ancestor=True
+        so the git layer passes), then force workflow.artifacts.read_iteration_log
+        to raise RuntimeError.  The artifacts-layer try/except must catch it,
+        log a WARNING containing 'artifacts read failed during merge-check'
+        (distinct from the git-layer 'merge-check failed' message), and return None.
+
+        Pins the distinct log message that operators use to diagnose the correct
+        root cause (filesystem/JSON issue vs. git/infra issue).
+
+        Fails on unmodified code with RuntimeError propagating uncaught.
+        """
+        import logging
+
+        # 1. Create a fresh worktree — wt_head == initial main commit, trivially ancestor
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. Force read_iteration_log to raise — simulates corrupted iterations.jsonl
+        def _raise_artifacts():
+            raise RuntimeError('simulated artifacts failure')
+
+        workflow.artifacts.read_iteration_log = _raise_artifacts  # type: ignore[method-assign]
+
+        # 4. Call _recover_if_already_merged, capturing WARNING logs
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+            outcome = await workflow._recover_if_already_merged()
+
+        # 5. Assertions: must return None with DISTINCT 'artifacts read failed' log
+        assert outcome is None, (
+            f'Expected None on artifacts exception but got {outcome!r} — '
+            'artifacts-layer exception must be caught and return None'
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE after artifacts exception: {workflow.state!r}'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear after artifacts exception: {statuses}"
+        )
+        assert any(
+            'artifacts read failed during merge-check' in r.message
+            for r in caplog.records
+        ), (
+            f"Expected 'artifacts read failed during merge-check' "
+            f"(distinct from 'merge-check failed') "
+            f"but caplog only has: {[r.message for r in caplog.records]}"
+        )
+
+    async def test_sets_done_state_and_note_provenance_on_fire(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """On fire, must set workflow.state=DONE and note provenance.
+
+        Pins the exact state/scheduler side-effects:
+        - return value is WorkflowOutcome.DONE
+        - workflow.state == WorkflowState.DONE
+        - scheduler.statuses[task_id][-1] == 'done'
+        - scheduler.provenance[task_id] == {'note': 'branch already on main after escalation resolution'}
+
+        Previously asserted against _mark_blocked; now retargeted to the
+        new helper directly.
+        """
+        import json as _json
+
+        # 1. Create worktree, stamp implementer entry, commit + merge to main
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+        (wt / 'provenance_check.py').write_text('def impl():\n    return 1\n')
+        await git_ops.commit(wt, 'Implement feature (provenance test)')
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # 2. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. Call _recover_if_already_merged
+        outcome = await workflow._recover_if_already_merged()
+
+        # 4. Assertions: exact state + provenance
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE but got {outcome!r}'
+        )
+        assert workflow.state == WorkflowState.DONE, (
+            f'workflow.state must be DONE, got: {workflow.state!r}'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert statuses[-1] == 'done', (
+            f"Last scheduler status must be 'done', got: {statuses}"
+        )
+        assert scheduler.provenance.get(task_assignment.task_id) == {
+            'note': 'branch already on main after escalation resolution'
+        }, (
+            f"Expected note provenance but got: "
+            f"{scheduler.provenance.get(task_assignment.task_id)!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: pre-PLAN recovery in workflow.run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunPrePlanRecovery:
+    """workflow.run returns DONE before PLAN when the branch is already on main.
+
+    The pre-PLAN call to _recover_if_already_merged() must fire before the
+    architect (PLAN phase) is invoked — neither architect nor implementer
+    should be called when the recovery detects a prior merge.
+    """
+
+    async def test_run_returns_done_early_via_pre_plan_recovery(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """workflow.run exits DONE before architect is called on a merged branch.
+
+        Set up: pre-create a worktree, stamp iterations.jsonl with an
+        implementer entry, commit a real file, merge to main.
+
+        The AgentStub's _architect is overridden to raise AssertionError so
+        the test fails loudly if workflow.run enters the PLAN phase.
+
+        After step-14 adds the pre-PLAN recovery call in workflow.run, the
+        recovery fires before PLAN and the architect is never invoked.
+        """
+        import json as _json
+
+        # 1. Create worktree, stamp implementer entry, commit + merge to main
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+        (wt / 'pre_plan_recovery.py').write_text('def work():\n    return 42\n')
+        await git_ops.commit(wt, 'Implement feature (pre-plan recovery test)')
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # 2. Build workflow with a stub that raises if architect/implementer called
+        class _NoCallStub(AgentStub):
+            async def _architect(self, cwd):
+                raise AssertionError(
+                    'architect must NOT be called when branch is already on main '
+                    '— pre-PLAN recovery should have short-circuited'
+                )
+
+            async def _implementer(self, cwd):
+                raise AssertionError(
+                    'implementer must NOT be called when branch is already on main '
+                    '— pre-PLAN recovery should have short-circuited'
+                )
+
+        stub = _NoCallStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        # 3. Run workflow — should detect prior merge before PLAN
+        outcome = await workflow.run()
+
+        # 4. Assert DONE with no agent calls
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE but got {outcome!r}'
+        )
+        assert 'architect' not in stub.calls, (
+            f'architect was unexpectedly called: {stub.calls}'
+        )
+        assert 'implementer' not in stub.calls, (
+            f'implementer was unexpectedly called: {stub.calls}'
+        )
+
+    async def test_run_proceeds_to_plan_when_recovery_returns_none(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """workflow.run enters PLAN when branch has no prior work (recovery returns None).
+
+        Creates a stale-branch-point scenario: a fresh worktree where
+        wt_head == base_commit and there are no iteration entries — the
+        branch is an ancestor of main but has no implementation work.
+
+        _recover_if_already_merged() must return None (no prior work), so
+        the workflow proceeds to PLAN normally and the architect IS called.
+
+        Pins that the pre-PLAN recovery is non-destructive: it only
+        short-circuits DONE when prior work exists, never on a stale branch.
+        """
+        # Fresh worktree — workflow.run() creates it; no pre-create needed.
+        # wt_head == base_commit (no commits), no iterations.jsonl → recovery None.
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        # Outcome should be DONE via the normal PLAN → EXECUTE → MERGE path
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE via normal flow but got {outcome!r}'
+        )
+        # PLAN phase was entered — architect was called
+        assert 'architect' in stub.calls, (
+            f'Expected architect to be called (PLAN entered) but stub.calls={stub.calls!r}'
         )
 
 
@@ -2919,72 +3067,6 @@ class TestFileStructureInvariants:
 # behaviour — the static conformance block only catches signature drift,
 # not behavioural regressions.
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Tests: _plan → DONE propagates without entering EXECUTE
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-class TestPlanDoneEarlyReturn:
-    """workflow.run returns DONE when _plan returns DONE, without entering EXECUTE.
-
-    Prevents the cascade where _mark_blocked's "branch already on main → DONE"
-    recovery fell through into _execute_iterations → validate_plan_owner → the
-    spurious plan-overwrite escalation.
-    """
-
-    async def test_plan_done_returns_without_execute(
-        self, config, git_ops, task_assignment
-    ):
-        stub = AgentStub()
-        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
-
-        # Stub _plan to return DONE (simulates _mark_blocked's ghost-loop recovery)
-        workflow._plan = AsyncMock(return_value=WorkflowOutcome.DONE)
-        # If EXECUTE were entered, this would raise
-        workflow._execute_iterations = AsyncMock(
-            side_effect=AssertionError('EXECUTE must not be entered when _plan returns DONE'),
-        )
-
-        outcome = await workflow.run()
-
-        assert outcome == WorkflowOutcome.DONE
-        workflow._execute_iterations.assert_not_called()
-
-    async def test_successful_plan_returns_PLANNED_and_continues_to_execute(
-        self, config, git_ops, task_assignment
-    ):
-        """Regression for b242030313: _plan success returns PLANNED, not DONE.
-
-        If _plan returns DONE on successful planning, the DONE early-return
-        at the _plan outcome handler short-circuits execute/verify/review/
-        merge entirely — every post-plan workflow exits with zero execute
-        iterations and no code merged.  This is the b242 regression that
-        corrupted 40+ tasks across three projects.
-
-        This test asserts the fallthrough: when _plan returns PLANNED the
-        outcome-handler block does NOT early-return, and
-        _execute_verify_review_loop is invoked.
-        """
-        stub = AgentStub()
-        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
-
-        # Simulate successful planning
-        workflow._plan = AsyncMock(return_value=WorkflowOutcome.PLANNED)
-        # Capture that execute was reached; short-circuit to BLOCKED to keep
-        # the test self-contained (we only care that fallthrough happened).
-        workflow._execute_verify_review_loop = AsyncMock(
-            return_value=WorkflowOutcome.BLOCKED,
-        )
-
-        outcome = await workflow.run()
-
-        # The test asserts the *path*: _execute_verify_review_loop was called.
-        # The ultimate outcome (BLOCKED here) is incidental to the path check.
-        workflow._execute_verify_review_loop.assert_called_once()
-        assert outcome == WorkflowOutcome.BLOCKED
-
 
 def _make_status_setting_steward(
     queue: EscalationQueue, scheduler, task_id: str, final_status: str,

@@ -352,6 +352,23 @@ class TaskWorkflow:
                 # Don't commit the removal separately — it'll be part of
                 # the first real commit the agent makes.
 
+            # ── Pre-PLAN ghost-loop recovery ──────────────────────────
+            # If the worktree's branch is already merged to main AND there
+            # is evidence of prior implementation work, mark the task DONE
+            # immediately — a prior run merged it but died before writing
+            # the DONE status.  Short-circuiting here prevents the architect
+            # from being invoked and keeps the run idempotent.
+            #
+            # NOTE: a related guard runs just below (before EXECUTE) and has
+            # deliberately different semantics: the post-PLAN guard falls through
+            # to the SUCCESS path (writes completion memory, uses merge-sha
+            # provenance), and it also checks has_uncommitted_work (useful
+            # post-execution, premature here).  If you change the
+            # is_ancestor/has_work logic, check both guards.
+            recovery = await self._recover_if_already_merged()
+            if recovery == WorkflowOutcome.DONE:
+                return recovery
+
             # PLAN (skip if initial_plan was provided — eval mode)
             if self.initial_plan:
                 plan_tid = self.initial_plan.get('task_id')
@@ -383,12 +400,6 @@ class TaskWorkflow:
                             data={'waste_type': 'replan_after_failure'},
                         )
                     return plan_outcome  # _plan() already called _mark_blocked
-                if plan_outcome == WorkflowOutcome.DONE:
-                    # _mark_blocked's "branch already on main → DONE" recovery
-                    # propagates up here.  The scheduler status is already DONE
-                    # and plan.json was never stamped — entering EXECUTE would
-                    # spuriously fire the plan-overwrite escalation.
-                    return plan_outcome
                 # WorkflowOutcome.PLANNED falls through to execute/verify/review.
 
             # ── Ghost-loop early exit (before EXECUTE) ─────────────
@@ -404,6 +415,12 @@ class TaskWorkflow:
             # main, fast-forwarding a post-merge branch to match main
             # exactly.  The has_work check below distinguishes stale
             # branch points (no implementation) from true ghost loops.
+            #
+            # See also: the pre-PLAN _recover_if_already_merged() call
+            # above.  That guard returns DONE directly (skips completion
+            # memory); this guard falls through to the SUCCESS path which
+            # writes completion memory.  The two guards cover complementary
+            # failure modes — do not collapse them.
             wt_head = await self._get_head_commit()
             current_main = await self.git_ops.get_main_sha()
             already_on_main = (
@@ -2351,11 +2368,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         in warning breadcrumbs without a second ``read_iteration_log()`` call),
         and ``base_commit`` (may be ``None`` if metadata.json is absent).
 
-        Correctness assumption: worktrees are always created fresh per task run.
-        If .task/iterations.jsonl were ever carried across a worktree recreation
-        (e.g. worktree reuse on the same branch), this guard could incorrectly
-        return True for an empty branch and reintroduce the false-done path.
-        Any future change to create_worktree that enables reuse must revisit here.
+        Correctness invariants: the iteration-log fallback relies on
+        .task/iterations.jsonl entries faithfully reflecting prior work on the
+        *same branch*.  Two scenarios matter:
+
+        *Intended* — ghost-loop re-run on the same branch: create_worktree
+        may rebase a reused worktree onto main, so wt_head == base_commit even
+        though the branch was genuinely implemented.  The fallback correctly
+        returns True here because the earlier implementer run wrote its entries
+        before the rebase.  This is the scenario exploited by
+        ``_recover_if_already_merged()`` and the pre-MERGE guard; it is safe.
+
+        *Dangerous* — orphaned log: if iterations.jsonl were somehow copied
+        from a different task's branch, the fallback would return True for an
+        empty branch → false-done.  This is why callers that hold a reliable
+        post-execution wt_head (i.e. callers that have not rebased yet) must
+        pass it explicitly to use the SHA-primary path.
+        ``_recover_if_already_merged()`` intentionally omits wt_head (the
+        branch may have been rebased) — see the comment there for rationale.
         """
         if self.artifacts is None:
             return _PriorImplStatus(has_work=False, entries=[], base_commit=None)
@@ -2373,6 +2403,98 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             entries=entries,
             base_commit=base_commit,
         )
+
+    async def _recover_if_already_merged(self) -> WorkflowOutcome | None:
+        """Check if the task's branch is already on main and transition to DONE.
+
+        Called pre-PLAN to short-circuit ghost-loop re-runs: if a prior workflow
+        run merged the branch but failed before writing DONE status, this guard
+        detects the merged branch and immediately marks the task done.
+
+        Returns WorkflowOutcome.DONE if the branch is already merged to main AND
+        there is prior implementation work.  Returns None in all other cases
+        (branch not merged, no prior work, missing worktree/git_ops, exceptions).
+        """
+        if self.worktree is None or self.git_ops is None:
+            logger.debug(
+                'Task %s: skipping merge-recovery (no worktree or git_ops)',
+                self.task_id,
+            )
+            return None
+
+        # ── Git layer ─────────────────────────────────────
+        # Subprocess calls that can fail for git/infra reasons
+        # (e.g. corrupted index, network mount offline).
+        # Returns (wt_head, main_sha) when the branch is on main, else None.
+        _git_check: tuple[str, str] | None = None
+        try:
+            _, _wt_head_raw, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'],
+                cwd=self.worktree,
+            )
+            _main_sha = await self.git_ops.get_main_sha()
+            if await self.git_ops.is_ancestor(_wt_head_raw.strip(), _main_sha):
+                _git_check = (_wt_head_raw.strip(), _main_sha)
+        except Exception:
+            logger.warning(
+                'Task %s: merge-check failed, proceeding with requeue',
+                self.task_id, exc_info=True,
+            )
+            return None
+
+        if _git_check is None:
+            return None
+
+        wt_head, main_sha = _git_check
+
+        # ── Artifacts layer ────────────────────────────────
+        # Reads that can fail for filesystem/JSON reasons (e.g. corrupted
+        # iterations.jsonl, missing metadata).  Wrapped in a SEPARATE
+        # try/except from the git layer so operators can distinguish the
+        # root cause from the log message.
+        #
+        # Note: we call _has_prior_implementation() WITHOUT wt_head so that
+        # the iteration-log fallback is used.  SHA-primary is unreliable here
+        # because create_worktree may have rebased the branch onto main before
+        # this call — after rebase, wt_head == base_commit even on a genuinely
+        # implemented branch, causing a false-negative.  The iteration-log scan
+        # correctly identifies prior implementer/debugger entries regardless of
+        # rebasing.  See _has_prior_implementation() docstring.
+        try:
+            status = self._has_prior_implementation()
+            if not status.has_work:
+                logger.warning(
+                    'Task %s: branch HEAD %s is ancestor '
+                    'of main %s but no implementation '
+                    'entries (base=%s, entries=%d) — '
+                    'proceeding with requeue',
+                    self.task_id,
+                    wt_head[:8],
+                    main_sha[:8],
+                    status.base_commit[:8] if status.base_commit else 'none',
+                    len(status.entries),
+                )
+                return None
+        except Exception:
+            logger.warning(
+                'Task %s: artifacts read failed during merge-check, '
+                'proceeding with requeue',
+                self.task_id, exc_info=True,
+            )
+            return None
+
+        logger.info(
+            'Task %s: branch already on main — completing instead of re-queueing',
+            self.task_id,
+        )
+        self._enter_phase(WorkflowState.DONE)
+        await self.scheduler.set_task_status(
+            self.task_id, 'done',
+            done_provenance={
+                'note': 'branch already on main after escalation resolution',
+            },
+        )
+        return WorkflowOutcome.DONE
 
     def _escalate_plan_overwrite(self) -> None:
         """Submit a blocking escalation when plan.json ownership doesn't match.
@@ -2574,79 +2696,6 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             self.task_id,
                         )
                         return WorkflowOutcome.ESCALATED
-
-                    # Guard: if the task's branch is already merged to
-                    # main, transition to DONE instead of re-queueing —
-                    # prevents stash_failed / advance_main ghost loops.
-                    if self.worktree and self.git_ops:
-                        # ── Git layer ─────────────────────────────────────
-                        # Subprocess calls that can fail for git/infra reasons
-                        # (e.g. corrupted index, network mount offline).
-                        # Returns (wt_head_stripped, main_sha) when the branch
-                        # is on main, None on failure or when not yet merged.
-                        # Using an Optional result eliminates dead '' initializers
-                        # that would never be used on the exception path.
-                        _git_check: tuple[str, str] | None = None
-                        try:
-                            _, _wt_head_raw, _ = await _run(
-                                ['git', 'rev-parse', 'HEAD'],
-                                cwd=self.worktree,
-                            )
-                            _main_sha = await self.git_ops.get_main_sha()
-                            if await self.git_ops.is_ancestor(
-                                _wt_head_raw.strip(), _main_sha,
-                            ):
-                                _git_check = (_wt_head_raw.strip(), _main_sha)
-                        except Exception:
-                            logger.warning(
-                                'Task %s: merge-check failed, '
-                                'proceeding with requeue',
-                                self.task_id, exc_info=True,
-                            )
-
-                        # ── Artifacts layer ────────────────────────────────
-                        # Reads that can fail for filesystem/JSON reasons
-                        # (e.g. corrupted iterations.jsonl, missing metadata).
-                        if _git_check is not None:
-                            wt_head, main_sha = _git_check
-                            try:
-                                status = self._has_prior_implementation(wt_head)
-                                if not status.has_work:
-                                    logger.warning(
-                                        'Task %s: branch HEAD %s is ancestor '
-                                        'of main %s but no implementation '
-                                        'entries (base=%s, entries=%d) — '
-                                        'proceeding with requeue',
-                                        self.task_id,
-                                        wt_head[:8],
-                                        main_sha[:8],
-                                        status.base_commit[:8]
-                                        if status.base_commit else 'none',
-                                        len(status.entries),
-                                    )
-                                else:
-                                    logger.info(
-                                        'Task %s: branch already on main — '
-                                        'completing instead of re-queueing',
-                                        self.task_id,
-                                    )
-                                    self._enter_phase(WorkflowState.DONE)
-                                    await self.scheduler.set_task_status(
-                                        self.task_id, 'done',
-                                        done_provenance={
-                                            'note': (
-                                                'branch already on main '
-                                                'after escalation resolution'
-                                            ),
-                                        },
-                                    )
-                                    return WorkflowOutcome.DONE
-                            except Exception:
-                                logger.warning(
-                                    'Task %s: artifacts read failed during '
-                                    'merge-check, proceeding with requeue',
-                                    self.task_id, exc_info=True,
-                                )
 
                     # Preserve steward-set deferred. Terminal statuses (done,
                     # cancelled) were caught earlier via ``current``; blocked
