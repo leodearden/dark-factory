@@ -18,8 +18,10 @@ query each project's runs.db in parallel and merge the results.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import math
+import os
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -519,12 +521,37 @@ def enrich_merges_with_titles(
     return result
 
 
+@functools.lru_cache(maxsize=32)
+def _load_task_titles_cached(path_str: str, mtime_ns: int) -> dict[str, str]:
+    """Cache body for :func:`load_task_titles`, keyed on ``(path, mtime_ns)``.
+
+    Only called when the file's ``st_mtime_ns`` differs from the last observed
+    value; otherwise :func:`load_task_titles` returns the cached result without
+    entering this function.
+
+    The returned dict is shared across callers via the LRU cache — do NOT
+    mutate it.  :func:`load_task_titles` returns a shallow copy to callers so
+    they cannot reach this cached object.
+    """
+    return {str(t['id']): t['title'] for t in load_task_tree(Path(path_str)) if t.get('title')}
+
+
 def load_task_titles(tasks_json_path: Path) -> dict[str, str]:
     """Return a {str(task_id): title} map from a Taskmaster tasks.json file.
 
     Wraps :func:`dashboard.data.orchestrator.load_task_tree` and builds the
     mapping needed by :func:`enrich_merges_with_titles`.  Tasks without a
     title (``title=None`` or missing) are omitted.
+
+    Results are mtime-keyed: repeat calls where the file's ``st_mtime_ns`` has
+    not changed return a cached ``dict`` in O(1) without re-reading the file.
+    A missing or inaccessible file short-circuits to ``{}`` before the cache is
+    consulted, preserving the original OSError-safe contract.
+
+    The path is resolved to its real path before caching so that different
+    spellings of the same file (symlinks, relative vs. absolute) map to the
+    same cache entry.  A fresh shallow copy of the cached mapping is returned
+    to callers so that downstream mutation cannot poison the shared cache entry.
 
     Args:
         tasks_json_path: Path to the ``.taskmaster/tasks/tasks.json`` file.
@@ -533,8 +560,12 @@ def load_task_titles(tasks_json_path: Path) -> dict[str, str]:
         Dict mapping ``str(task.id)`` to ``task.title``.  Returns ``{}`` on
         missing file, invalid JSON, or missing tasks structure.
     """
-    tasks = load_task_tree(tasks_json_path)
-    return {str(t['id']): t['title'] for t in tasks if t.get('title')}
+    real_path = os.path.realpath(tasks_json_path)
+    try:
+        mtime_ns = os.stat(real_path).st_mtime_ns
+    except OSError:
+        return {}
+    return dict(_load_task_titles_cached(real_path, mtime_ns))
 
 
 async def build_per_project_merge_queue(
