@@ -908,9 +908,8 @@ class TestRecentMerges:
         """recent_merges with limit=None returns every matching row (no SQL LIMIT).
 
         Inserts 60 merge_attempt events all within the last 5 minutes, then
-        asserts that limit=None returns all 60.  With the legacy ``LIMIT ?``
-        path, passing None causes a TypeError / sqlite adapter failure — so this
-        test fails on the pre-fix implementation, confirming the red step.
+        asserts that limit=None returns all 60, verifying that limit=None is
+        supported and returns every matching row without a row-count cap.
         """
         now = datetime.now(UTC)
         conn_sync = sqlite3.connect(str(merge_events_db))
