@@ -307,13 +307,9 @@ class Scheduler:
     async def get_tasks(self) -> list[dict]:
         """Fetch all tasks from fused-memory/taskmaster."""
         try:
-            result = await mcp_call(
-                f'{self._memory_url}/mcp',
-                'tools/call',
-                {
-                    'name': 'get_tasks',
-                    'arguments': {'project_root': self._project_root},
-                },
+            result = await self._dispatch_tool(
+                'get_tasks',
+                {'project_root': self._project_root},
                 timeout=15,
             )
             content = result.get('result', {}).get('content', [])
@@ -409,16 +405,12 @@ class Scheduler:
         if isinstance(metadata, dict):
             metadata = json.dumps(metadata)
         try:
-            result = await mcp_call(
-                f'{self._memory_url}/mcp',
-                'tools/call',
+            result = await self._dispatch_tool(
+                'update_task',
                 {
-                    'name': 'update_task',
-                    'arguments': {
-                        'id': task_id,
-                        'metadata': metadata,
-                        'project_root': self._project_root,
-                    },
+                    'id': task_id,
+                    'metadata': metadata,
+                    'project_root': self._project_root,
                 },
                 timeout=15,
             )
