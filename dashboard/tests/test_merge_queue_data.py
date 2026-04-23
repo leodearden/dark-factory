@@ -1524,7 +1524,7 @@ class TestLoadTaskTitles:
             "(os.path.realpath should collapse both spellings to one cache key)"
         )
 
-    def test_corrupt_json_then_valid_refreshes_cache(self, tmp_path, monkeypatch):
+    def test_corrupt_json_then_valid_refreshes_cache(self, tmp_path, counted_load_task_tree):
         """Empty-dict from corrupt JSON is cached and then invalidated when mtime bumps.
 
         Verifies two distinct behaviors:
@@ -1535,7 +1535,6 @@ class TestLoadTaskTitles:
         """
         import os
 
-        import dashboard.data.merge_queue as _mq
         from dashboard.data.merge_queue import _load_task_titles_cached, load_task_titles
 
         _load_task_titles_cached.cache_clear()
@@ -1543,24 +1542,14 @@ class TestLoadTaskTitles:
         tasks_path = tmp_path / 'tasks.json'
         tasks_path.write_text('{ invalid json ]')
 
-        call_count = 0
-        original_load_task_tree = _mq.load_task_tree
-
-        def counting_load_task_tree(path):
-            nonlocal call_count
-            call_count += 1
-            return original_load_task_tree(path)
-
-        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
-
         result_corrupt = load_task_titles(tasks_path)
         assert result_corrupt == {}, f"corrupt JSON should return {{}}, got {result_corrupt!r}"
 
         # Second call with unchanged mtime must hit the cache — {} is not a sentinel
         result_corrupt2 = load_task_titles(tasks_path)
         assert result_corrupt2 == {}
-        assert call_count == 1, (
-            f"load_task_tree called {call_count} time(s) for two reads with unchanged mtime; "
+        assert counted_load_task_tree.count == 1, (
+            f"load_task_tree called {counted_load_task_tree.count} time(s) for two reads with unchanged mtime; "
             "expected 1 (empty dict must be a legitimate cached value, not a sentinel)"
         )
 
