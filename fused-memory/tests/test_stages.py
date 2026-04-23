@@ -2621,3 +2621,84 @@ class TestFormatFlaggedNoSilentTruncation:
         """Empty list must return the sentinel string."""
         result = _format_flagged([])
         assert result == 'No flagged items.'
+
+
+# ---------------------------------------------------------------------------
+# _format_flagged: char budget tests (step-3)
+# ---------------------------------------------------------------------------
+
+
+class TestFormatFlaggedCharBudget:
+    """_format_flagged applies a char budget and emits a warning when truncating."""
+
+    def test_under_budget_no_warning(self, caplog):
+        """10 small items stay well under the 40000-char budget — no warning."""
+        items = [{'description': f'small-{i}', 'severity': 'minor'} for i in range(10)]
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            _format_flagged(items)
+
+        assert not any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            for rec in caplog.records
+        ), (
+            'Expected no WARNING for 10 small items; '
+            f'got: {[(r.name, r.levelno, r.message) for r in caplog.records]}'
+        )
+
+    def test_over_budget_text_capped(self):
+        """200 items with ~300-byte descriptions exceed 40000 chars; text is capped."""
+        # Each item produces ~320+ chars when JSON-serialised + '- ' prefix
+        items = [{'description': 'x' * 300, 'index': i} for i in range(200)]
+        text = _format_flagged(items)
+        # Budget is 40000; result should not wildly exceed it (footer is short)
+        assert len(text) <= 42000, (
+            f'Expected text ≤ 42000 chars but got {len(text)}'
+        )
+
+    def test_over_budget_has_footer(self):
+        """Over-budget render must end with a truncation footer line."""
+        items = [{'description': 'x' * 300, 'index': i} for i in range(200)]
+        text = _format_flagged(items)
+        assert '... and ' in text, (
+            f'Expected truncation footer in text; last 200 chars: {text[-200:]!r}'
+        )
+
+    def test_over_budget_emits_warning_with_structured_extras(self, caplog):
+        """Over-budget render must emit exactly one WARNING with correct extra keys."""
+        items = [{'description': 'x' * 300, 'index': i} for i in range(200)]
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            _format_flagged(items)
+
+        warning_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING; got {len(warning_records)}: '
+            f'{[(r.message, getattr(r, "__dict__", {})) for r in warning_records]}'
+        )
+        rec = warning_records[0]
+        # All four structured-extra keys must be present
+        for key in ('total', 'rendered', 'dropped', 'budget_chars'):
+            assert hasattr(rec, key), (
+                f'Expected extra key {key!r} on WARNING record; '
+                f'record __dict__: {rec.__dict__}'
+            )
+        total = rec.total
+        rendered = rec.rendered
+        dropped = rec.dropped
+        budget_chars = rec.budget_chars
+        assert total == rendered + dropped, (
+            f'total={total} must equal rendered={rendered} + dropped={dropped}'
+        )
+        assert rendered > 0, f'rendered must be > 0, got {rendered}'
+        assert dropped > 0, f'dropped must be > 0, got {dropped}'
+        assert budget_chars == 40000, f'budget_chars must be 40000, got {budget_chars}'
