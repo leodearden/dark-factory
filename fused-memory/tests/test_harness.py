@@ -308,6 +308,49 @@ async def test_harness_init_stores_project_root_from_taskmaster_config(
 
 
 @pytest.mark.asyncio
+async def test_harness_init_resolves_relative_project_root_to_absolute(
+    journal, event_buffer, mock_memory_service
+):
+    """ReconciliationHarness.__init__ must resolve relative project_root values to absolute.
+
+    Three cases:
+    (a) Relative path '.' is resolved to str(Path('.').resolve()) — an absolute path.
+    (b) Already-absolute '/abs/already' passes through unchanged (idempotent).
+    (c) project_root=None (no taskmaster) stays '' (preserves task-927 short-circuit).
+
+    Both _project_root attribute and the public project_root property must reflect
+    the normalized value.
+    """
+    from pathlib import Path
+
+    # (a) Relative '.' must be resolved to an absolute path
+    harness_a = _make_harness_927(journal, event_buffer, mock_memory_service, '.')
+    expected_resolved = str(Path('.').resolve())
+    assert harness_a._project_root == expected_resolved, (
+        f"Expected _project_root={expected_resolved!r} (resolved absolute path), "
+        f"got {harness_a._project_root!r}"
+    )
+    assert harness_a._project_root != '.', "relative '.' must not remain as-is"
+    assert harness_a.project_root == harness_a._project_root, (
+        "project_root property must mirror _project_root"
+    )
+
+    # (b) Already-absolute path passes through unchanged
+    harness_b = _make_harness_927(journal, event_buffer, mock_memory_service, '/abs/already')
+    assert harness_b._project_root == '/abs/already', (
+        f"Absolute path should pass through unchanged; got {harness_b._project_root!r}"
+    )
+    assert harness_b.project_root == '/abs/already'
+
+    # (c) None (no taskmaster configured) → empty string — task-927 short-circuit preserved
+    harness_c = _make_harness_927(journal, event_buffer, mock_memory_service, None)
+    assert harness_c._project_root == '', (
+        f"taskmaster=None should give _project_root=''; got {harness_c._project_root!r}"
+    )
+    assert harness_c.project_root == ''
+
+
+@pytest.mark.asyncio
 async def test_run_full_cycle_uses_configured_project_root_when_events_lack_override(
     journal, event_buffer, mock_memory_service
 ):
