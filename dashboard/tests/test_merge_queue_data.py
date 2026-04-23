@@ -903,6 +903,38 @@ class TestRecentMerges:
         task_ids = [r['task_id'] for r in result]
         assert all(tid.startswith('recent-') for tid in task_ids)
 
+    @pytest.mark.asyncio
+    async def test_limit_none_returns_all_rows(self, merge_events_db):
+        """recent_merges with limit=None returns every matching row (no SQL LIMIT).
+
+        Inserts 60 merge_attempt events all within the last 5 minutes, then
+        asserts that limit=None returns all 60, verifying that limit=None is
+        supported and returns every matching row without a row-count cap.
+        """
+        now = datetime.now(UTC)
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        for i in range(60):
+            _insert_event(
+                conn_sync,
+                event_type='merge_attempt',
+                timestamp=now - timedelta(seconds=i * 5),
+                task_id=f'burst-{i:03d}',
+                run_id=f'run-burst-{i:03d}',
+                data={'outcome': 'done'},
+                duration_ms=100 + i,
+            )
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await recent_merges(db, limit=None, hours=1)
+
+        assert len(result) == 60, (
+            f'Expected 60 rows with limit=None, got {len(result)}. '
+            'The SQL LIMIT clause must be omitted when limit is None.'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestSpeculativeStats
@@ -2736,4 +2768,96 @@ class TestBuildPerProjectMergeQueue:
             f'but peak was {max_in_flight[0]}'
         )
         assert set(result.keys()) == {f'/tmp/P{i}' for i in range(N)}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('recent_window_minutes,expected_hours', [
+        (15, 1),
+        (60, 1),
+        (90, 2),
+        (120, 2),
+    ])
+    async def test_recent_merges_called_with_ceil_hours_and_no_limit(
+        self, tmp_path, recent_window_minutes, expected_hours,
+    ):
+        """build_per_project_merge_queue calls recent_merges with hours=ceil(window/60) and limit=None.
+
+        Parametrized over recent_window_minutes ∈ {15, 60, 90, 120} to lock in
+        the max(1, ceil(x/60)) semantics.  Fails on the pre-fix implementation
+        which passes limit=50 and hours=<outer dashboard window>.
+        """
+        from unittest.mock import patch
+
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'p.db', [])
+
+        captured_kwargs: dict = {}
+
+        async def fake_recent_merges(db, **kwargs):
+            captured_kwargs.update(kwargs)
+            return []
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with patch('dashboard.data.merge_queue.recent_merges', new=fake_recent_merges):
+                await build_per_project_merge_queue(
+                    [('/tmp/P', conn)],
+                    hours=24,
+                    now=now,
+                    recent_window_minutes=recent_window_minutes,
+                )
+
+        assert captured_kwargs.get('limit') is None, (
+            f'Expected limit=None, got limit={captured_kwargs.get("limit")!r}'
+        )
+        assert captured_kwargs.get('hours') == expected_hours, (
+            f'recent_window_minutes={recent_window_minutes}: '
+            f'expected hours={expected_hours}, got hours={captured_kwargs.get("hours")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_burst_exceeding_50_within_window_not_dropped(self, tmp_path):
+        """60 merge_attempt events within the 15-min window are all returned (none silently dropped).
+
+        This is the end-to-end regression gate: the old limit=50 call would silently
+        truncate a burst of >50 events even if every event was within recent_window_minutes.
+        With the fix (limit=None + SQL hours window), all 60 events survive the pipeline.
+        """
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        # 60 events spread across the last ~14 minutes (14s apart), all within 15-min window.
+        events = [
+            {
+                'event_type': 'merge_attempt',
+                'timestamp': now - timedelta(seconds=i * 14),
+                'task_id': f'burst-task-{i:03d}',
+                'run_id': f'burst-run-{i:03d}',
+                'data': {'outcome': 'done'},
+                'duration_ms': 500 + i,
+            }
+            for i in range(60)
+        ]
+        db_path = _make_db(tmp_path, 'burst.db', events)
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue(
+                [('/tmp/P', conn)],
+                hours=24,
+                now=now,
+                recent_window_minutes=15,
+            )
+
+        recent = result['/tmp/P']['recent']
+        assert len(recent) == 60, (
+            f'Expected 60 rows in recent burst, got {len(recent)}. '
+            'The SQL LIMIT cap must not silently truncate burst events within the window.'
+        )
+        returned_task_ids = {r['task_id'] for r in recent}
+        expected_task_ids = {f'burst-task-{i:03d}' for i in range(60)}
+        assert returned_task_ids == expected_task_ids, (
+            f'Missing task_ids: {expected_task_ids - returned_task_ids}'
+        )
 
