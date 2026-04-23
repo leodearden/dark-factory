@@ -118,7 +118,7 @@ class TestEscalationCapableRolesDerivation:
         valid ROLES entry.
         """
         expected = frozenset({'architect', 'implementer', 'debugger', 'merger'})
-        assert _ESCALATION_CAPABLE_ROLES == expected
+        assert expected == _ESCALATION_CAPABLE_ROLES
         assert 'steward' not in _ESCALATION_CAPABLE_ROLES, (
             "'steward' must not be in _ESCALATION_CAPABLE_ROLES (TaskSteward dispatcher carve-out)"
         )
