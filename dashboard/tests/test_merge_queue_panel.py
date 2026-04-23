@@ -646,7 +646,7 @@ class TestDepthTrimLeadingZeros:
     """Verify that /partials/merge-queue strips leading zero buckets from the depth series."""
 
     def test_leading_zeros_stripped_from_rendered_depth(self, client):
-        """When aggregate_queue_depth_timeseries returns a long zero-prefix, the
+        """When build_per_project_merge_queue returns a depth timeseries with a long zero-prefix, the
         rendered depthData must have the leading zeros removed.
 
         Setup: mock returns 4 buckets — [0, 0, 0, 5] — only the last is non-zero.
