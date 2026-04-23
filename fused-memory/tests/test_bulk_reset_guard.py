@@ -571,14 +571,31 @@ def test_verdict_to_error_dict_ok():
     assert v.to_error_dict() == {}
 
 
-@pytest.mark.parametrize("threshold,window_seconds", [(10, 60.0), (6, 60.0)])
+@pytest.mark.parametrize("threshold,window_seconds", [
+    (10, 60.0),  # original case
+    (6, 60.0),   # threshold "gotcha": str(6)="6" collides with "60" inside "60.0s"
+    (10, 6.0),   # window_seconds "gotcha": varies window_seconds so bound-form is
+                 # tested against a distinct value ("within 6.0s window")
+])
 def test_verdict_to_error_dict_rejection(threshold, window_seconds):
     """outcome='rejection' produces a structured error payload.
 
-    Parametrized with (10, 60.0) and the "gotcha" case (6, 60.0):
-    threshold=6 with window_seconds=60.0 demonstrates the antipattern —
-    str(6)="6" would spuriously match "60" inside "60.0s", so plain
-    substring checks are fragile.  The bound forms pin the label prefix.
+    Three parametrized cases exercise bound-form assertions on both axes:
+    - (10, 60.0): the original baseline values.
+    - (6,  60.0): threshold "gotcha" — str(6)="6" would spuriously match "60"
+      inside "60.0s" under a naive substring check; bound form "threshold 6"
+      is unambiguous.
+    - (10, 6.0):  window_seconds "gotcha" — varies window_seconds so the
+      "within {window_seconds}s window" bound assertion is exercised against a
+      distinct value; without this row the 60.0 path would never be exercised
+      differently across parametrize iterations.
+
+    Note: affected_task_ids is kept short (3 items) across all cases.  In
+    production a rejection verdict is only constructed when
+    len(affected_task_ids) > threshold, so the 3-vs-6 and 3-vs-10
+    combinations are semantically impossible.  BulkResetVerdict.to_error_dict()
+    does not enforce that invariant, so this test intentionally decouples
+    formatting correctness from semantic validity.
     """
     v = BulkResetVerdict(
         outcome='rejection',
