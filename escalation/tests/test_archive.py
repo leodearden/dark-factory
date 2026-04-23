@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -126,7 +128,7 @@ class TestArchiveCli:
         assert result == 0
         assert not old_dir.exists()
         assert any(
-            'Pruned 1 archive dir(s)' in r.message for r in caplog.records
+            'Pruned 1 archive dir(s) older than 30 days' in r.message for r in caplog.records
         ), f'Expected pruned-count log; got: {[r.message for r in caplog.records]}'
 
     def test_cli_missing_queue_dir_returns_2_and_logs_error(self, tmp_path: Path, caplog):
@@ -140,3 +142,16 @@ class TestArchiveCli:
         assert any(
             'queue-dir does not exist' in r.message for r in caplog.records
         ), f'Expected missing-dir error log; got: {[r.message for r in caplog.records]}'
+
+    def test_main_block_shell_exit_code_is_2_for_missing_queue_dir(self):
+        """The __main__ guard propagates main()'s return value via sys.exit().
+
+        Smoke-tests that `sys.exit(main())` in the __main__ block is wired
+        correctly — if it were written as just `main()`, the shell exit code
+        would be 0 even on error because sys.exit would never be called.
+        """
+        proc = subprocess.run(
+            [sys.executable, '-m', 'escalation.archive', '--queue-dir', '/no/such/path'],
+            capture_output=True,
+        )
+        assert proc.returncode == 2
