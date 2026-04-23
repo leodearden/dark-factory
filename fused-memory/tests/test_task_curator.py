@@ -1424,13 +1424,9 @@ class TestCurateBatchPreDedupCachePollution:
 
         # The cache for the shared payload_hash must hold the REAL 'create'
         # decision, NOT the synthetic drop.
-        cached = curator._lookup_cache(payload_hash) \
-            if hasattr(curator, '_lookup_cache') else curator._decision_cache.get(payload_hash)
         # _decision_cache stores (decision, timestamp)
-        if isinstance(cached, tuple):
-            cached_decision = cached[0]
-        else:
-            cached_decision = cached
+        cached = curator._decision_cache.get(payload_hash)
+        cached_decision = cached[0] if isinstance(cached, tuple) else cached
         assert cached_decision is not None
         assert cached_decision.action == 'create'
         assert cached_decision.batch_target_index is None
