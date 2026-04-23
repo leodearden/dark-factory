@@ -219,6 +219,14 @@ class TestReconcileStrandedInProgress:
                 16, True, False, r'no owner_pid; treating as stale',
                 id='null-owner-pid',
             ),
+            # (b3) Non-numeric owner_pid → int('abc') raises ValueError
+            #      → except (TypeError, ValueError) catches it → owner_alive=False
+            #      → stale-lock path: cleanup_worktree called, task reverted, lock gone
+            pytest.param(
+                json.dumps({'session_id': 'test-42', 'locked_at': '2026-01-01T00:00:00+00:00', 'owner_pid': 'abc'}),
+                42, True, False, None,
+                id='non-numeric-owner-pid',
+            ),
             # (e) Non-dict JSON (list) → treated as corruption → revert + unlink
             pytest.param(
                 '["not", "an", "object"]', 14, True, False, None,
@@ -474,6 +482,42 @@ class TestReconcileStrandedInProgress:
         matching = [
             r for r in caplog.records
             if re.search(r'cleanup_worktree failed.*40.*stale-lock', r.message, re.IGNORECASE)
+        ]
+        assert len(matching) >= 1, (
+            f'Expected cleanup-failure WARNING in harness logs, got: {[r.message for r in caplog.records]}'
+        )
+
+    async def test_no_lock_branch_cleanup_worktree_raises_still_reverts(
+        self, harness: Harness, caplog
+    ):
+        """Regression lockdown: task is reverted even when cleanup_worktree raises
+        in the no-lock branch.  Covers the uncovered except Exception at harness.py:908-913.
+
+        The no-lock branch has no lock to unlink; after cleanup failure it must
+        still call set_task_status so the task escapes in-progress.
+        """
+        tid = 41
+        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
+            {'id': tid, 'status': 'in-progress'},
+        ]
+        # Create worktree dir with NO plan.lock inside
+        worktree_path = harness.git_ops.worktree_base / str(tid)
+        worktree_path.mkdir(parents=True)
+
+        # Make cleanup_worktree raise so we exercise the except-branch
+        harness.git_ops.cleanup_worktree = AsyncMock(side_effect=OSError('boom'))  # type: ignore[attr-defined]
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress()
+
+        # cleanup_worktree must have been attempted
+        harness.git_ops.cleanup_worktree.assert_called_once_with(worktree_path, str(tid))  # type: ignore[attr-defined]
+        # Task must still be reverted to pending despite cleanup failure
+        harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
+        # Cleanup-failure WARNING must be present in logs
+        matching = [
+            r for r in caplog.records
+            if re.search(r'cleanup_worktree failed.*41.*no-lock', r.message, re.IGNORECASE)
         ]
         assert len(matching) >= 1, (
             f'Expected cleanup-failure WARNING in harness logs, got: {[r.message for r in caplog.records]}'
