@@ -1787,7 +1787,7 @@ class TestTaskFailureEscalation:
             config, git_ops, task_assignment, stub, tmp_path,
         )
 
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(

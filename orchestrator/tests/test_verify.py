@@ -8,6 +8,7 @@ import pytest
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
+    VerifyResult,
     _aggregate_results,
     _apply_cargo_scope,
     _extract_cause_hint,
@@ -16,7 +17,6 @@ from orchestrator.verify import (
     run_scoped_verification,
     run_verification,
     scope_module_config,
-    VerifyResult,
 )
 
 
