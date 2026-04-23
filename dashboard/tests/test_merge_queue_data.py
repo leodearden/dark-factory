@@ -2135,3 +2135,151 @@ class TestBuildPerProjectMergeQueue:
                     recent_window_minutes=15,
                 )
 
+
+# ---------------------------------------------------------------------------
+# TestActiveQueuedMerges — step-15 tests for active_queued_merges()
+# ---------------------------------------------------------------------------
+
+
+class TestActiveQueuedMerges:
+    """Tests for active_queued_merges(db, *, ttl_minutes, now) -> list[dict]."""
+
+    async def test_only_merge_queued_returns_queued_state(self, tmp_path):
+        """A task with only a merge_queued event appears with state='queued'."""
+        from dashboard.data.merge_queue import active_queued_merges
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        queued_at = now - timedelta(minutes=5)
+
+        db_path = _make_db(tmp_path, 'aq1.db', [
+            dict(event_type='merge_queued', task_id='T1', run_id='run-1',
+                 timestamp=queued_at, data={'branch': 'task/T1'}),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await active_queued_merges(conn, ttl_minutes=30, now=now)
+
+        assert len(result) == 1
+        row = result[0]
+        assert row['task_id'] == 'T1'
+        assert row['state'] == 'queued'
+        assert row['branch'] == 'task/T1'
+        assert 'run_id' in row
+        assert 'timestamp' in row
+
+    async def test_merge_queued_then_dequeued_returns_in_flight(self, tmp_path):
+        """merge_queued → merge_dequeued produces state='in_flight'."""
+        from dashboard.data.merge_queue import active_queued_merges
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        t0 = now - timedelta(minutes=5)
+        t1 = now - timedelta(minutes=4)
+
+        db_path = _make_db(tmp_path, 'aq2.db', [
+            dict(event_type='merge_queued', task_id='T2', run_id='run-1',
+                 timestamp=t0, data={'branch': 'task/T2'}),
+            dict(event_type='merge_dequeued', task_id='T2', run_id='run-1',
+                 timestamp=t1, data={'branch': 'task/T2'}),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await active_queued_merges(conn, ttl_minutes=30, now=now)
+
+        assert len(result) == 1
+        assert result[0]['task_id'] == 'T2'
+        assert result[0]['state'] == 'in_flight'
+
+    async def test_cas_retry_attempt_returns_in_flight(self, tmp_path):
+        """merge_queued → merge_dequeued → merge_attempt(cas_retry) → state='in_flight'."""
+        from dashboard.data.merge_queue import active_queued_merges
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        t0 = now - timedelta(minutes=6)
+        t1 = now - timedelta(minutes=5)
+        t2 = now - timedelta(minutes=4)
+
+        db_path = _make_db(tmp_path, 'aq3.db', [
+            dict(event_type='merge_queued', task_id='T3', run_id='run-1',
+                 timestamp=t0, data={'branch': 'task/T3'}),
+            dict(event_type='merge_dequeued', task_id='T3', run_id='run-1',
+                 timestamp=t1, data={'branch': 'task/T3'}),
+            dict(event_type='merge_attempt', task_id='T3', run_id='run-1',
+                 timestamp=t2, data={'branch': 'task/T3', 'outcome': 'cas_retry'}),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await active_queued_merges(conn, ttl_minutes=30, now=now)
+
+        assert len(result) == 1
+        assert result[0]['task_id'] == 'T3'
+        assert result[0]['state'] == 'in_flight'
+
+    async def test_terminal_outcome_excludes_task_from_active(self, tmp_path):
+        """Terminal merge_attempt outcomes remove the task from the active set."""
+        from dashboard.data.merge_queue import active_queued_merges
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        terminal_outcomes = [
+            'done', 'already_merged', 'conflict', 'blocked',
+            'dropped_plan_targets', 'cas_exhausted', 'abandoned_verify_timeouts',
+        ]
+        events = []
+        for i, outcome in enumerate(terminal_outcomes):
+            task_id = f'T{i + 10}'
+            t0 = now - timedelta(minutes=10)
+            t1 = now - timedelta(minutes=5)
+            events.append(dict(event_type='merge_queued', task_id=task_id, run_id='run-1',
+                               timestamp=t0, data={'branch': f'task/{task_id}'}))
+            events.append(dict(event_type='merge_attempt', task_id=task_id, run_id='run-1',
+                               timestamp=t1, data={'branch': f'task/{task_id}', 'outcome': outcome}))
+
+        db_path = _make_db(tmp_path, 'aq4.db', events)
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await active_queued_merges(conn, ttl_minutes=30, now=now)
+
+        assert result == [], f'Expected empty list; got {result}'
+
+    async def test_ttl_drops_stale_merge_queued_rows(self, tmp_path):
+        """A merge_queued from 60 min ago is dropped when ttl_minutes=15."""
+        from dashboard.data.merge_queue import active_queued_merges
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        stale_at = now - timedelta(minutes=60)
+
+        db_path = _make_db(tmp_path, 'aq5.db', [
+            dict(event_type='merge_queued', task_id='STALE', run_id='run-1',
+                 timestamp=stale_at, data={'branch': 'task/STALE'}),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await active_queued_merges(conn, ttl_minutes=15, now=now)
+
+        assert result == []
+
+    async def test_empty_db_returns_empty_list(self, tmp_path):
+        """An empty events table returns an empty list."""
+        from dashboard.data.merge_queue import active_queued_merges
+
+        db_path = _make_db(tmp_path, 'aq6.db', [])
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await active_queued_merges(conn, ttl_minutes=30, now=now)
+
+        assert result == []
+
+    async def test_none_db_returns_empty_list(self):
+        """Passing db=None returns an empty list without raising."""
+        from dashboard.data.merge_queue import active_queued_merges
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        result = await active_queued_merges(None, ttl_minutes=30, now=now)
+        assert result == []
+
