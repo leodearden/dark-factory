@@ -529,23 +529,38 @@ Post-merge improvement suggestions from automated code reviewers.
 
 **Pre-triaged format:** When the escalation detail starts with `## Pre-Triaged Results`,
 classification has already been done by a triage agent. Do NOT re-classify. Instead:
-1. For each entry in `proposed_task_groups`: create a task via `add_task` with the
-   group's title, description, and `metadata={"source": "steward-triage",
-   "spawn_context": "steward-triage", "spawned_from": "<task_id under review>",
-   "modules": [...]}` using the file paths listed in the group. Populate `spawned_from`
-   with the id of the task that produced the escalation (it is in the escalation detail
-   under `task_id`).
+1. For each entry in `proposed_task_groups`: create a task using the two-step API:
+   a. Call `submit_task`(title=..., description=..., priority=...,
+      metadata={"source": "steward-triage", "spawn_context": "steward-triage",
+      "spawned_from": "<task_id under review>", "modules": [...]},
+      project_root=...) — returns `{"ticket": "tkt_..."}`.
+      Populate `spawned_from` with the id of the task that produced the escalation
+      (it is in the escalation detail under `task_id`). Use the file paths listed in
+      the group for `modules`.
+   b. Call `resolve_ticket`(ticket=..., project_root=..., timeout_seconds=60) —
+      returns {status, task_id?, reason?}. Branch on `status`:
+      - `created` or `combined` — record `task_id` as the id of the resulting task.
+      - `dropped` — candidate was rejected (duplicate / backlog_full); skip it.
+      - `failed` — report the `reason` in your resolve_issue summary.
 2. For notable conventions among accepted items: write via `add_memory`
    with category `preferences_and_norms`.
-3. Call `resolve_issue` summarizing: N tasks created, M conventions written, K skipped.
+3. Call `resolve_issue` summarizing: N tasks created/combined, M conventions written,
+   K dropped, any failures.
 
 **Raw format (fallback):** When the detail is a raw JSON array, triage each suggestion as:
-- **create_task** — Substantial improvement worth a follow-up task. Create via `add_task`
-  with `metadata={"source": "steward-triage", "spawn_context": "steward-triage",
-  "spawned_from": "<task_id under review>", "modules": ["path/to/module", ...]}`.
-  Include the code modules (directory paths relative to project root) that this task will
-  need to modify — these are used for concurrency locking. `spawned_from` lets the task
-  curator spot duplicates against the original task's details.
+- **create_task** — Substantial improvement worth a follow-up task. Use the two-step API:
+  a. Call `submit_task`(title=..., description=..., priority=...,
+     metadata={"source": "steward-triage", "spawn_context": "steward-triage",
+     "spawned_from": "<task_id under review>", "modules": ["path/to/module", ...]},
+     project_root=...) — returns `{"ticket": "tkt_..."}`.
+     Include the code modules (directory paths relative to project root) that this task
+     will need to modify — these are used for concurrency locking. `spawned_from` lets
+     the task curator spot duplicates against the original task's details.
+  b. Call `resolve_ticket`(ticket=..., project_root=..., timeout_seconds=60) —
+     returns {status, task_id?, reason?}. Branch on `status`:
+     - `created` or `combined` — record `task_id` as the id of the resulting task.
+     - `dropped` — candidate was rejected (duplicate / backlog_full); skip it.
+     - `failed` — report the `reason` in your resolve_issue summary.
 - **convention** — Pattern-level insight for future agents. Write via `add_memory`
   with category `preferences_and_norms`.
 - **dismiss** — Not actionable, already covered, or noise.
