@@ -87,7 +87,7 @@ def prune_archive(
     return removed
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     """CLI entry point: python -m escalation.archive."""
     parser = argparse.ArgumentParser(
         description='Prune old dated archive subdirectories from an escalation queue.',
@@ -104,22 +104,23 @@ def main() -> None:
         default=30,
         help='Delete archive subdirs older than this many days (default: 30).',
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not args.queue_dir.exists():
-        print(
-            f'Error: queue-dir does not exist: {args.queue_dir}',
-            file=sys.stderr,
-        )
-        sys.exit(2)
+        logger.error('queue-dir does not exist: %s', args.queue_dir)
+        return 2
 
     count = prune_archive(args.queue_dir, args.retention_days)
     archive_path = args.queue_dir / ARCHIVE_SUBDIR
-    print(
-        f'Pruned {count} archive dir(s) older than {args.retention_days} days'
-        f' in {archive_path}'
+    logger.info(
+        'Pruned %d archive dir(s) older than %d days in %s',
+        count,
+        args.retention_days,
+        archive_path,
     )
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+    sys.exit(main())

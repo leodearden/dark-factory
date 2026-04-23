@@ -377,3 +377,75 @@ class TestMakeIdAcrossArchive:
         assert all_ids == {'esc-42-1', 'esc-42-2', 'esc-42-3'}, (
             f'Expected three distinct IDs but got: {all_ids}'
         )
+
+    def test_make_id_interleaved_archive_and_pending(self, tmp_path: Path):
+        """make_id() takes max across BOTH archive and queue root, not just one.
+
+        Scenario (interleaved):
+        - esc-42-5 is submitted and resolved → lives in archive/<date>/
+        - esc-42-2 is submitted and left pending → lives in queue root
+        - Simulate restart: fresh EscalationQueue (in-memory _seq resets to 0)
+        - make_id('42') must return 'esc-42-6', proving it took the max across
+          *both* archive (5) and queue root (2), not just whichever side is non-empty.
+
+        Regression guard for the two-loop scan in make_id() at queue.py:265-274.
+        """
+        queue_dir = tmp_path / 'queue'
+
+        # First process: submit esc-42-5, resolve it (moves to archive).
+        queue = EscalationQueue(queue_dir)
+        queue.submit(_make_escalation('esc-42-5', task_id='42'))
+        queue.resolve('esc-42-5', 'fixed fifth')
+
+        # Submit esc-42-2 and leave it pending in queue root.
+        queue.submit(_make_escalation('esc-42-2', task_id='42'))
+
+        # Sanity: esc-42-5 is in archive (not queue root), esc-42-2 is in queue root.
+        assert not (queue_dir / 'esc-42-5.json').exists(), 'esc-42-5 should be archived'
+        assert (queue_dir / 'esc-42-2.json').exists(), 'esc-42-2 should be pending in queue root'
+
+        # Simulate process restart: fresh EscalationQueue, _seq resets to 0.
+        queue2 = EscalationQueue(queue_dir)
+
+        # make_id() MUST return 'esc-42-6': max(archive=5, queue_root=2) + 1.
+        new_id = queue2.make_id('42')
+        assert new_id == 'esc-42-6', (
+            f'Expected esc-42-6 (max across archive=5 and queue_root=2) but got {new_id!r}'
+        )
+
+    def test_make_id_pending_higher_than_archive(self, tmp_path: Path):
+        """make_id() takes max across BOTH sources when pending seq > archive seq.
+
+        Symmetric counterpart to test_make_id_interleaved_archive_and_pending:
+        proves the two-loop scan works in BOTH orderings, not just archive > pending.
+
+        Scenario:
+        - esc-42-3 is submitted and resolved → lives in archive/<date>/ (archive max = 3)
+        - esc-42-7 is submitted and left pending → lives in queue root (pending max = 7)
+        - Simulate restart: fresh EscalationQueue (_seq resets to 0)
+        - make_id('42') must return 'esc-42-8': max(archive=3, pending=7) + 1
+
+        Regression guard for the two-loop scan in make_id() at queue.py:265-274.
+        """
+        queue_dir = tmp_path / 'queue'
+
+        # First process: submit esc-42-3, resolve it (moves to archive).
+        queue = EscalationQueue(queue_dir)
+        queue.submit(_make_escalation('esc-42-3', task_id='42'))
+        queue.resolve('esc-42-3', 'fixed third')
+
+        # Submit esc-42-7 and leave it pending in queue root.
+        queue.submit(_make_escalation('esc-42-7', task_id='42'))
+
+        # Sanity: esc-42-3 is archived, esc-42-7 is pending in queue root.
+        assert not (queue_dir / 'esc-42-3.json').exists(), 'esc-42-3 should be archived'
+        assert (queue_dir / 'esc-42-7.json').exists(), 'esc-42-7 should be pending in queue root'
+
+        # Simulate process restart: fresh EscalationQueue, _seq resets to 0.
+        queue2 = EscalationQueue(queue_dir)
+
+        # make_id() MUST return 'esc-42-8': max(archive=3, queue_root=7) + 1.
+        new_id = queue2.make_id('42')
+        assert new_id == 'esc-42-8', (
+            f'Expected esc-42-8 (max across archive=3 and queue_root=7) but got {new_id!r}'
+        )
