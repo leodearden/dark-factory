@@ -1640,7 +1640,9 @@ def _build_workflow_no_merge_worker(
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
     """Thin delegate over `_build_workflow_with_escalation(spawn_merge_worker=False)`.
 
-    Retained for call-site stability (~11 existing tests).
+    Retained for call-site stability (~11 existing tests).  Consider removing
+    in a follow-up cleanup once call sites are updated to pass
+    ``spawn_merge_worker=False`` directly to avoid indefinite surface-area growth.
     """
     return _build_workflow_with_escalation(
         config, git_ops, assignment, agent_stub, tmp_path, spawn_merge_worker=False
@@ -2655,10 +2657,11 @@ class TestRecoverIfAlreadyMerged:
 
             has_work=any(e.get('agent') in ('implementer', 'debugger') for e in entries)
 
-        This test would still pass if the filter were trivially `bool(entries)` — i.e.
+        This test would FAIL if the filter were trivially `bool(entries)` — i.e.
         any non-empty iterations.jsonl triggers fast-path — because a non-empty log of
-        only architect + judge entries would incorrectly return DONE.  The filter must
-        walk the full list and reject every non-implementer/non-debugger role.
+        only architect + judge entries would incorrectly return DONE, causing
+        `assert outcome is None` to fail.  The filter must walk the full list and
+        reject every non-implementer/non-debugger role.
 
         Setup mirrors test_returns_none_for_stale_branch_point (fresh worktree, wt_head
         == base_commit, metadata.json stamped) except iterations.jsonl is written with
@@ -2676,6 +2679,14 @@ class TestRecoverIfAlreadyMerged:
         # 2. Read current HEAD (= base_commit) and stamp metadata.json
         _, base_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
         base_sha = base_sha_raw.strip()
+        # Precondition: fresh worktree HEAD must equal main so the is_ancestor
+        # check passes unconditionally, leaving the role filter as the sole guard.
+        main_sha = await git_ops.get_main_sha()
+        assert base_sha == main_sha, (
+            f'Precondition failed: fresh worktree HEAD ({base_sha[:8]}) '
+            f'must equal current main ({main_sha[:8]}). '
+            f'An earlier test or fixture advanced main mid-run.'
+        )
         task_dir = wt / '.task'
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'metadata.json').write_text(
