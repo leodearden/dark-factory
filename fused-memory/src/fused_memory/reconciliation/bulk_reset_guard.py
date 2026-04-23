@@ -226,7 +226,12 @@ class BulkResetGuard:
             state.entries.append(_Entry(ts=now, task_id=task_id))
 
             # 5. Check threshold.
-            if len(state.entries) < self._threshold:
+            # Trip fires when the count EXCEEDS threshold (len > threshold),
+            # i.e. the (threshold+1)-th attempt in the window is the first
+            # rejection.  This means "up to threshold reversals are allowed;
+            # the next one trips the circuit-breaker."  Steps 5, 13, 15 all
+            # assume threshold=3 allows exactly three ok reversals.
+            if len(state.entries) <= self._threshold:
                 return BulkResetVerdict(outcome='ok', project_id=project_id)
 
             # 6. Threshold crossed — collect window contents for the verdict.
