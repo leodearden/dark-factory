@@ -1217,3 +1217,71 @@ class TestBatchSystemPrompt:
         # Must explicitly rule out combine between two new batch items
         assert 'combine' in _BATCH_SYSTEM_PROMPT.lower()
         assert 'not supported' in _BATCH_SYSTEM_PROMPT.lower() or 'not support' in _BATCH_SYSTEM_PROMPT.lower()
+
+
+# ----------------------------------------------------------------------
+# TaskCurator._call_llm_batch — timeout / turns scaling
+# ----------------------------------------------------------------------
+
+
+class TestCallLlmBatchScaling:
+    def _make_batch_result(self, n: int) -> AgentResult:
+        """Minimal successful AgentResult with N create decisions."""
+        decisions = [
+            {'candidate_index': i, 'action': 'create', 'justification': f'c{i}'}
+            for i in range(n)
+        ]
+        return AgentResult(
+            success=True,
+            output='',
+            structured_output={'decisions': decisions},
+            cost_usd=0.01 * n,
+        )
+
+    @pytest.mark.asyncio
+    async def test_timeout_and_turns_scale_linearly(self):
+        """N=3 → timeout=240+30*3=330, max_turns=3+1*3=6."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        mock = AsyncMock(return_value=self._make_batch_result(3))
+        candidates = [CandidateTask(title=f'T{i}') for i in range(3)]
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            with patch.object(curator, '_build_corpus', side_effect=Exception('no corpus')):
+                await curator._call_llm_batch(
+                    candidates,
+                    pools=[[], [], []],
+                    pool_sizes_list=[{}, {}, {}],
+                    start=0.0,
+                    project_id='p',
+                    project_root='/x',
+                )
+        _, kwargs = mock.call_args
+        assert kwargs['timeout_seconds'] == 330.0
+        assert kwargs['max_turns'] == 6
+
+    @pytest.mark.asyncio
+    async def test_scaling_clamps_at_caps(self):
+        """N=20 → timeout capped at 540.0, max_turns capped at 10."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        mock = AsyncMock(return_value=self._make_batch_result(20))
+        candidates = [CandidateTask(title=f'T{i}') for i in range(20)]
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            with patch.object(curator, '_build_corpus', side_effect=Exception('no corpus')):
+                await curator._call_llm_batch(
+                    candidates,
+                    pools=[[] for _ in range(20)],
+                    pool_sizes_list=[{} for _ in range(20)],
+                    start=0.0,
+                    project_id='p',
+                    project_root='/x',
+                )
+        _, kwargs = mock.call_args
+        assert kwargs['timeout_seconds'] == 540.0
+        assert kwargs['max_turns'] == 10
