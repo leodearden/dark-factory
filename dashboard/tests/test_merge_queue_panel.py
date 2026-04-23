@@ -981,15 +981,25 @@ class TestMergeQueueCanvasIdCollision:
         assert outcome_ids == {'tmp_dark_factory', 'tmp_dark_factory_1'}, (
             f'Expected outcome chart canvas ids {{tmp_dark_factory, tmp_dark_factory_1}}, got {outcome_ids}'
         )
-        # No two <canvas> elements may share the same id attribute
-        all_canvas_ids = re.findall(r'<canvas\b[^>]*\bid="([^"]+)"', html)
+        # No two <canvas> elements may share the same id attribute.
+        # Use \s before id= so the pattern cannot match attributes whose names
+        # merely end in "id" (e.g. data-id="..."), where \b would also match.
+        all_canvas_ids = re.findall(r'<canvas\b[^>]*\sid="([^"]+)"', html)
         assert len(all_canvas_ids) == len(set(all_canvas_ids)), (
             f'Duplicate canvas ids found: {[i for i in all_canvas_ids if all_canvas_ids.count(i) > 1]}'
         )
-        # canvas_id key must appear in the serialized allProjects JSON in the inline script
+        # Both canvas_id values must be present in the serialized allProjects JSON
+        # in the inline script.  Parsing the JSON (rather than just checking for
+        # the key name) catches server-side regressions where canvas_id wouldn't
+        # be correctly serialized for colliding pids.
         script_body = _extract_inline_script(html)
-        assert '"canvas_id"' in script_body, (
-            'canvas_id must be present in the serialized allProjects payload in the inline script'
+        m = re.search(r'var allProjects\s*=\s*', script_body)
+        assert m is not None, 'allProjects assignment not found in inline script'
+        all_projects, _ = json.JSONDecoder().raw_decode(script_body[m.end():])
+        canvas_id_values = {v['canvas_id'] for v in all_projects.values()}
+        assert canvas_id_values == {'tmp_dark_factory', 'tmp_dark_factory_1'}, (
+            f'Expected canvas_id values {{tmp_dark_factory, tmp_dark_factory_1}} in allProjects JSON, '
+            f'got {canvas_id_values}'
         )
 
 
