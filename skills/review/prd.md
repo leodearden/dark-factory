@@ -201,7 +201,8 @@ This is the expensive, high-value phase. An Opus agent (or coordinated team) rea
    - Flag tasks that are blocked on something that no longer exists
 
 4. **Create tasks**
-   - Use `add_task` via fused-memory MCP
+   - Use `submit_task` + `resolve_ticket` via fused-memory MCP (two-phase pattern): call `submit_task(...)` with the metadata below to receive a `ticket`, then call `resolve_ticket(ticket=ticket, project_root=...)` to block until the curator decides — `created` or `combined` → `task_id` is the new or merged task id; `failed` → log the `reason` and surface to the user
+   - The legacy `add_task` facade is deprecated and slated for removal; all new triage tasks must use `submit_task` + `resolve_ticket`
    - Each task tagged with `metadata.source: "review-cycle"` and `metadata.review_id: "<timestamp>"`
    - Include `memory_hints` pointing to the review findings and relevant briefing sections
    - Set dependencies appropriately (fix-up tasks may depend on each other)
