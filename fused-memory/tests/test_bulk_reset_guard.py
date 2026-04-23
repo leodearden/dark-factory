@@ -20,10 +20,8 @@ import json
 from pathlib import Path
 
 import pytest
-import pytest_asyncio
 
 from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard, BulkResetVerdict
-
 
 # ---------------------------------------------------------------------------
 # step-1: ReconciliationConfig defaults
@@ -261,11 +259,10 @@ async def test_window_drains_after_expiry(tmp_path):
         f'Expected rejection, got {v_trip.outcome}'
     )
     # Only the fresh timestamps should appear — expired entries must not be included.
-    trip_ts_set = set(v_trip.triggering_timestamps)
     # None of the original timestamps should be in the trip
     for orig in v_trip.triggering_timestamps:
         # All timestamps must be >= t=1065 (the first fresh attempt)
-        from datetime import datetime, timezone
+        from datetime import datetime
         ts_val = datetime.fromisoformat(orig).timestamp()
         assert ts_val >= 1065.0, (
             f'triggering_timestamps contains stale entry at {orig} (ts={ts_val})'
@@ -447,6 +444,7 @@ async def test_escalation_rate_limited(tmp_path):
     esc_dir = tmp_path / 'data' / 'escalations'
 
     # Fire four reversals — fourth trips and writes escalation X.
+    v = None
     for i in range(4):
         clock[0] += 1.0
         v = await guard.observe_attempt(
@@ -457,6 +455,7 @@ async def test_escalation_rate_limited(tmp_path):
             project_root=str(tmp_path),
         )
     # v is now the fourth verdict (escalated)
+    assert v is not None
     assert v.outcome == 'escalated'
     first_esc_path = v.escalation_path
     assert first_esc_path is not None

@@ -3229,8 +3229,8 @@ async def test_set_task_status_csv_done_to_pending_tripping_guard_rejects_and_es
 
     # (e) tm.set_task_status NOT called for tasks 4 and 5 (guard short-circuited)
     called_ids = {call.args[0] for call in taskmaster.set_task_status.call_args_list}
-    assert '4' not in called_ids, f'set_task_status should not have been called for task 4'
-    assert '5' not in called_ids, f'set_task_status should not have been called for task 5'
+    assert '4' not in called_ids, 'set_task_status should not have been called for task 4'
+    assert '5' not in called_ids, 'set_task_status should not have been called for task 5'
     # Tasks 1, 2, 3 were called
     for tid in ('1', '2', '3'):
         assert tid in called_ids, f'set_task_status should have been called for task {tid}'
