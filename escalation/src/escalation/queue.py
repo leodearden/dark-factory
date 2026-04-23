@@ -92,9 +92,22 @@ class EscalationQueue:
     def get_by_task(
         self, task_id: str, status: str | None = None, level: int | None = None,
     ) -> list[Escalation]:
-        """Scan dir for escalations matching a task ID."""
+        """Scan dir for escalations matching a task ID.
+
+        Two-tier scan:
+        - status == 'pending': scan queue root only (fast path, skips archive).
+        - status is None or another value: scan queue root PLUS archive/**/ to
+          include resolved/dismissed escalations that have been moved out.
+        """
+        # Build the candidate path list.
+        paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
+        if status != 'pending':
+            archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
+            if archive_root.exists():
+                paths.extend(archive_root.rglob('esc-*.json'))
+
         results = []
-        for path in self.queue_dir.glob('esc-*.json'):
+        for path in paths:
             try:
                 esc = Escalation.from_json(path.read_text())
                 if esc.task_id != task_id:
