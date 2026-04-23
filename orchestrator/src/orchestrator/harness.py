@@ -1277,7 +1277,7 @@ Output JSON matching the schema. Every task must appear in the output.
         if self.review_checkpoint is not None:
             self.review_checkpoint.escalation_queue = self._escalation_queue
 
-        mcp_server = create_server(self._escalation_queue, merge_queue=self._merge_queue, orch_config=self.config)  # type: ignore[possibly-undefined]
+        mcp_server = create_server(self._escalation_queue, merge_queue=self._merge_queue, orch_config=self.config, event_store=self.event_store)  # type: ignore[possibly-undefined]
         host = self.config.escalation.host
         port = self.config.escalation.port
 
