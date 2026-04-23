@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import textwrap
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -12,7 +13,7 @@ from typing import TYPE_CHECKING
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 
 from orchestrator.agents.invoke import invoke_agent
-from orchestrator.agents.roles import DEEP_REVIEWER
+from orchestrator.agents.roles import DEEP_REVIEWER, _submit_resolve_instructions
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import VerifyResult, run_full_verification
 
@@ -328,6 +329,16 @@ class ReviewCheckpoint:
         project_root = str(self.config.project_root)
         project_id = self.config.fused_memory.project_id
 
+        submit_resolve_block = textwrap.indent(
+            _submit_resolve_instructions(
+                f'{{"source": "review-cycle", "review_id": "{review_id}", "modules": ["path/to/module", ...]}}',
+                outcome_target='finding description',
+                project_root_expr=f'"{project_root}"',
+                step_prefix=('1', '2'),
+            ),
+            '     ',
+        )
+
         scope_block = ''
         if mode == 'focused' and modules:
             mod_list = '\n'.join(f'- `{m}`' for m in modules)
@@ -410,21 +421,7 @@ violations are always bugs. Pay special attention to `stability_concerns`.
 
 3. **Triage each finding** and act:
    - Clear-cut issues — use the two-step API:
-     1. Call `submit_task`(title=..., description=..., priority=...,
-        metadata={{"source": "review-cycle", "review_id": "{review_id}", "modules": ["path/to/module", ...]}},
-        project_root="{project_root}") — returns `{{"ticket": "tkt_..."}}` on
-        success, or `{{"error": ..., "error_type": ...}}` (no `ticket` key) if
-        the call was rejected at submit time (e.g. backlog full, closed
-        interceptor). On the error shape, treat the finding as skipped and
-        include the error in the finding description.
-     2. Call `resolve_ticket`(ticket=..., project_root="{project_root}", timeout_seconds=60) —
-        (60 s is intentionally conservative; server default is 115 s — raise if
-        curator is consistently slow) returns {{status, task_id?, reason?}}. Branch on `status`:
-        - `created` — the curator accepted the candidate; record `task_id`.
-        - `combined` — the curator deduped into an existing task; `task_id`
-          points at that task. Record it the same way as `created` (the
-          candidate was absorbed, not lost).
-        - `failed` — include `reason` in the finding description.
+{submit_resolve_block}
    - Ambiguous/architectural → `escalate_info(category=..., summary=...)`
    - Known/accepted → dismiss (don't report)
 
