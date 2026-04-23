@@ -372,10 +372,6 @@ class EscalationConfig(BaseModel):
     queue_dir: str = Field(default='data/escalations')
     port: int = Field(default=8100)
     host: str = Field(default='127.0.0.1')
-    archive_retention_days: int = Field(
-        default=30,
-        description='Days to retain archived escalation JSON files before pruning',
-    )
 
 
 from shared.config_models import AccountConfig, UsageCapConfig  # noqa: F401, E402

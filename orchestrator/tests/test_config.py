@@ -109,20 +109,6 @@ class TestDefaults:
         field_info = OrchestratorConfig.model_fields['verify_cold_command_timeout_secs']
         assert field_info.default is None
 
-    def test_escalation_archive_retention_days_default(self, monkeypatch, tmp_path):
-        """archive_retention_days is 30 in EscalationConfig pydantic default and defaults.yaml."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        config = OrchestratorConfig()
-        defaults = _load_package_defaults()
-        # Pydantic standalone default
-        assert EscalationConfig().archive_retention_days == 30
-        # Loaded from defaults.yaml via OrchestratorConfig
-        assert config.escalation.archive_retention_days == 30
-        # defaults.yaml itself carries the value
-        assert defaults['escalation']['archive_retention_days'] == 30
-
-
 class TestYamlLoading:
     def test_load_config_raises_when_explicit_path_nonexistent(self, tmp_path: Path):
         """Explicit --config pointing at a missing file raises ConfigRequiredError."""
