@@ -24,7 +24,6 @@ from orchestrator.config import (
 )
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp_lifecycle import mcp_call
-from orchestrator.task_status import TERMINAL_STATUSES, is_valid_transition
 
 # task_skipped events for "effectively infinite" skip thresholds (>= this
 # value) are rate-limited to a geometric schedule so the event store is not
@@ -256,7 +255,6 @@ class Scheduler:
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
         self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
-        self._status_cache: dict[str, str] = {}
         self._fallback_warned: set[str] = set()  # task IDs already warned about fallback
         self._requeue_until: dict[str, float] = {}  # task_id -> monotonic deadline
         # --- Fairness state (see orchestrator.config.FairnessConfig) ---
@@ -298,23 +296,6 @@ class Scheduler:
                         tasks = data['data'].get('tasks', [])
                     else:
                         tasks = data.get('tasks', [])
-                    # Seed status cache from task list.
-                    # Always trust the store — it is the source of truth.
-                    # External processes may reinstate cancelled/done tasks
-                    # to pending; the cache must reflect that to avoid
-                    # silent rejection loops in set_task_status().
-                    for t in tasks:
-                        tid = str(t.get('id', ''))
-                        s = t.get('status', '')
-                        if tid and s:
-                            old = self.get_cached_status(tid)
-                            if old in TERMINAL_STATUSES and old != s:
-                                logger.info(
-                                    'Task %s: store status %s overrides cached %s '
-                                    '(external reinstatement)',
-                                    tid, s, old,
-                                )
-                            self._set_cached_status(tid, s)
                     return tasks
         except Exception as e:
             # logger.exception preserves the traceback + exception class so the
@@ -332,14 +313,15 @@ class Scheduler:
         status: str,
         *,
         done_provenance: dict | None = None,
+        reopen_reason: str | None = None,
     ) -> None:
-        """Update task status via fused-memory."""
-        cached = self.get_cached_status(task_id)
-        if not is_valid_transition(cached, status):
-            logger.warning(
-                'Task %s: rejecting %s->%s (terminal state guard)', task_id, cached, status
-            )
-            return
+        """Update task status via fused-memory.
+
+        Terminal-state enforcement lives on the server (fused-memory
+        TaskInterceptor) — this method just forwards the call. Pass
+        ``reopen_reason`` to exit a terminal status (done/cancelled);
+        orchestrator automation never needs it.
+        """
         try:
             arguments: dict = {
                 'id': task_id,
@@ -348,6 +330,8 @@ class Scheduler:
             }
             if done_provenance is not None:
                 arguments['done_provenance'] = done_provenance
+            if reopen_reason is not None:
+                arguments['reopen_reason'] = reopen_reason
             await mcp_call(
                 f'{self._memory_url}/mcp',
                 'tools/call',
@@ -357,25 +341,52 @@ class Scheduler:
                 },
                 timeout=15,
             )
-            self._set_cached_status(task_id, status)
         except Exception as e:
             logger.exception(
                 'Failed to set task %s status to %s: %s: %s',
                 task_id, status, type(e).__name__, e,
             )
 
-    def get_cached_status(self, task_id: str) -> str | None:
-        """Return the last known status for a task, or None if not yet seen."""
-        return self._status_cache.get(task_id)
+    async def get_status(self, task_id: str) -> str | None:
+        """Return the current status of ``task_id``, or ``None`` on failure.
 
-    def _set_cached_status(self, task_id: str, status: str) -> None:
-        """Write the cached status for a task.
-
-        Write-side counterpart to get_cached_status().  All internal cache
-        writes funnel through this single helper, mirroring the single read
-        choke-point so both sides are consistently overridable and testable.
+        Replaces the old client-side status cache. Each call is a fresh MCP
+        round-trip; fused-memory's warm get_task is ~30 ms, so this is cheap
+        at the handful of decision points that actually need the truth
+        (post-steward terminal check).
         """
-        self._status_cache[task_id] = status
+        try:
+            result = await mcp_call(
+                f'{self._memory_url}/mcp',
+                'tools/call',
+                {
+                    'name': 'get_task',
+                    'arguments': {
+                        'id': task_id,
+                        'project_root': self._project_root,
+                    },
+                },
+                timeout=15,
+            )
+        except Exception as e:
+            logger.exception(
+                'Failed to get task %s status: %s: %s',
+                task_id, type(e).__name__, e,
+            )
+            return None
+        content = result.get('result', {}).get('content', [])
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'text':
+                try:
+                    data = json.loads(block['text'])
+                except (ValueError, TypeError):
+                    return None
+                # Taskmaster envelope: {data: {...}} — unwrap if present.
+                inner = data.get('data') if isinstance(data.get('data'), dict) else data
+                status = inner.get('status') if isinstance(inner, dict) else None
+                if isinstance(status, str):
+                    return status
+        return None
 
     async def update_task(self, task_id: str, metadata: str | dict) -> bool:
         """Update task metadata via fused-memory. Returns True on success."""

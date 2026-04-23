@@ -119,6 +119,44 @@ _CARGO_EXCLUDE_RE = re.compile(
 )
 
 
+def _extract_cause_hint(output: str) -> str:
+    """Extract a one-line failure hint from command output.
+
+    Uses a pattern ladder (first match wins):
+    1. ``error: …``         — cargo/clippy surface errors
+    2. ``… FAILED``         — Rust test runner failure lines
+    3. ``Command timed out after Ns: …`` — our own timeout wrapper
+    4. ``ERROR: …``         — flock/script wrapper errors
+    5. ``… npm (ERR!|error) …`` — npm errors
+    6. fallback: last non-blank line of output
+
+    Returns ``''`` for None, empty, or whitespace-only input.
+    Result is stripped to a single line and capped at 200 chars.
+    """
+    if not output or not output.strip():
+        return ''
+
+    _HINT_PATTERNS = [
+        re.compile(r'^error: .+$', re.MULTILINE),
+        re.compile(r'^.+\s+FAILED$', re.MULTILINE),
+        re.compile(r'^Command timed out after \d+s:.+$', re.MULTILINE),
+        re.compile(r'^ERROR: .+$', re.MULTILINE),
+        re.compile(r'^.*npm (ERR!|error).*$', re.MULTILINE),
+    ]
+
+    for pattern in _HINT_PATTERNS:
+        m = pattern.search(output)
+        if m:
+            return m.group(0).strip()[:200]
+
+    # Fallback: last non-blank line
+    last = next(
+        (line for line in reversed(output.splitlines()) if line.strip()),
+        '',
+    )
+    return last.strip()[:200]
+
+
 async def _derive_task_files_from_git(
     worktree: Path, config: OrchestratorConfig,
 ) -> list[str] | None:
@@ -363,6 +401,7 @@ class VerifyResult:
     type_output: str
     summary: str
     timed_out: bool = False
+    cause_hint: str = ''
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
@@ -384,6 +423,8 @@ class VerifyResult:
                 f'genuinely hanging command — inspect the output below before '
                 f'treating it as a real failure.'
             )
+        if self.cause_hint:
+            sections.append(f'## Failure Cause\n\n{self.cause_hint}')
         if self.test_output and 'FAILED' in self.test_output:
             sections.append(f'## Test Failures\n\n```\n{self.test_output[-3000:]}\n```')
         if self.lint_output and self.lint_output.strip():
@@ -713,6 +754,18 @@ async def run_verification(
             parts.append('type errors')
         summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
 
+    # Build cause_hint from each failing check's output; join with ' | '.
+    if passed:
+        cause_hint = ''
+    else:
+        hint_parts = []
+        for rc, out in ((test_rc, test_out), (lint_rc, lint_out), (type_rc, type_out)):
+            if rc != 0:
+                h = _extract_cause_hint(out)
+                if h:
+                    hint_parts.append(h)
+        cause_hint = ' | '.join(hint_parts)
+
     result = VerifyResult(
         passed=passed,
         test_output=test_out,
@@ -720,6 +773,7 @@ async def run_verification(
         type_output=type_out if type_rc != 0 else '',
         summary=summary,
         timed_out=timed_out,
+        cause_hint=cause_hint,
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -735,10 +789,12 @@ async def run_verification(
 
     if passed:
         logger.info('Verification passed: %s', summary)
-    elif timed_out:
-        logger.warning('Verification failed: %s', summary)
     else:
-        logger.info('Verification failed: %s', summary)
+        detail_tail = f' — {cause_hint}' if cause_hint else ''
+        if timed_out:
+            logger.warning('Verification failed: %s%s', summary, detail_tail)
+        else:
+            logger.info('Verification failed: %s%s', summary, detail_tail)
     return result
 
 
@@ -769,6 +825,9 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
             parts.append('type errors')
         summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
 
+    # Collect cause_hint from failing child results; join with ' | '.
+    cause_hint = ' | '.join(r.cause_hint for r in results if r.cause_hint)
+
     return VerifyResult(
         passed=passed,
         test_output=test_output,
@@ -776,6 +835,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         type_output=type_output,
         summary=summary,
         timed_out=timed_out,
+        cause_hint=cause_hint,
     )
 
 

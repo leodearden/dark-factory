@@ -1514,12 +1514,16 @@ async def test_ensure_taskmaster_error_propagates(event_buffer):
 
 
 @pytest.mark.asyncio
-async def test_set_task_status_allows_done_to_blocked(taskmaster, reconciler, event_buffer):
-    """Transitions from terminal states (done->blocked) are allowed."""
+async def test_set_task_status_allows_done_to_blocked_with_reopen_reason(
+    taskmaster, reconciler, event_buffer,
+):
+    """done->blocked is allowed when an explicit reopen_reason is passed."""
     taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
 
-    result = await interceptor.set_task_status('1', 'blocked', '/project')
+    result = await interceptor.set_task_status(
+        '1', 'blocked', '/project', reopen_reason='manual re-scope',
+    )
 
     taskmaster.set_task_status.assert_called_once()
     assert 'error' not in result
@@ -1901,7 +1905,10 @@ async def test_done_provenance_commit_plus_note_both_persisted(
 async def test_done_provenance_reopen_does_not_require_provenance(
     taskmaster, reconciler, event_buffer, config_with_strict_provenance
 ):
-    """Transitioning out of done (e.g. done → in-progress) bypasses the gate."""
+    """Transitioning out of done (e.g. done → in-progress) bypasses the
+    done_provenance gate but still requires reopen_reason to pass the
+    terminal-exit gate.
+    """
     taskmaster.get_task = AsyncMock(
         return_value={'id': '1', 'status': 'done', 'title': 'T'},
     )
@@ -1909,9 +1916,11 @@ async def test_done_provenance_reopen_does_not_require_provenance(
         taskmaster, reconciler, event_buffer, config=config_with_strict_provenance,
     )
 
-    result = await interceptor.set_task_status('1', 'in-progress', '/project')
+    result = await interceptor.set_task_status(
+        '1', 'in-progress', '/project', reopen_reason='resuming after investigation',
+    )
 
-    assert 'error' not in result
+    assert 'error' not in result, result
     taskmaster.set_task_status.assert_called_once()
 
 
@@ -2107,11 +2116,13 @@ async def test_no_committer_still_works(taskmaster, event_buffer, tmp_path):
 
 @pytest.mark.asyncio
 async def test_terminal_state_transition_commits(taskmaster, reconciler, event_buffer, committer):
-    """Transitions from terminal states (done->blocked) schedule a commit."""
+    """Reopened terminal transitions (done->blocked with reason) schedule a commit."""
     taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
     interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, committer)
-    result = await interceptor.set_task_status('1', 'blocked', '/project')
-    assert 'error' not in result
+    result = await interceptor.set_task_status(
+        '1', 'blocked', '/project', reopen_reason='manual re-scope',
+    )
+    assert 'error' not in result, result
     committer.commit.assert_called_once()
 
 
@@ -2828,6 +2839,7 @@ async def test_start_flushes_prior_pending_tickets(
         await ti.close()
 
 
+# ---------------------------------------------------------------------------
 # step-59: server/main.py wires TicketStore into TaskInterceptor via helper
 # ---------------------------------------------------------------------------
 
@@ -2996,3 +3008,156 @@ async def test_resolve_ticket_no_lost_wakeup_between_read_and_register(
     assert result.get('task_id') == '42', (
         f'Expected task_id=42 but got: {result!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Terminal-exit gate: server-side FSM that refuses done/cancelled -> non-same
+# without an explicit reopen_reason.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_terminal_exit_rejects_done_to_pending_without_reason(
+    interceptor, taskmaster,
+):
+    """done -> pending with no reopen_reason returns terminal_exit_rejected."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'done', 'title': 'T'},
+    )
+    result = await interceptor.set_task_status('1', 'pending', '/project')
+    assert result.get('error') == 'terminal_exit_rejected', result
+    assert result.get('from_status') == 'done'
+    assert result.get('to_status') == 'pending'
+    # The backing Taskmaster must NOT be mutated when the gate trips.
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_terminal_exit_rejects_cancelled_to_pending_without_reason(
+    interceptor, taskmaster,
+):
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'cancelled', 'title': 'T'},
+    )
+    result = await interceptor.set_task_status('1', 'pending', '/project')
+    assert result.get('error') == 'terminal_exit_rejected'
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_terminal_exit_accepts_with_reopen_reason(
+    interceptor, taskmaster,
+):
+    """done -> pending with a non-empty reopen_reason succeeds and persists reason."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'done', 'title': 'T'},
+    )
+    result = await interceptor.set_task_status(
+        '1', 'pending', '/project', reopen_reason='un-defer script',
+    )
+    assert result.get('success') or 'error' not in result, result
+    taskmaster.set_task_status.assert_called_once()
+    # update_task called with metadata containing reopen_reason.
+    assert taskmaster.update_task.called, 'reopen_reason must be persisted'
+    persisted_metadata = None
+    for call in taskmaster.update_task.call_args_list:
+        md = call.kwargs.get('metadata')
+        if md and 'reopen_reason' in md:
+            persisted_metadata = md
+            break
+    assert persisted_metadata is not None
+    parsed = json.loads(persisted_metadata)
+    assert parsed['reopen_reason'] == 'un-defer script'
+    assert parsed['reopen_from'] == 'done'
+    assert 'reopen_at' in parsed
+
+
+@pytest.mark.asyncio
+async def test_terminal_exit_rejects_empty_string_reason(interceptor, taskmaster):
+    """A whitespace-only reopen_reason is treated as missing."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'done', 'title': 'T'},
+    )
+    result = await interceptor.set_task_status(
+        '1', 'pending', '/project', reopen_reason='   ',
+    )
+    assert result.get('error') == 'terminal_exit_rejected'
+
+
+@pytest.mark.asyncio
+async def test_terminal_same_status_is_noop(interceptor, taskmaster):
+    """done -> done returns a no-op even without reopen_reason (same-status guard first)."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'done', 'title': 'T'},
+    )
+    result = await interceptor.set_task_status('1', 'done', '/project')
+    assert result == {'success': True, 'no_op': True, 'task_id': '1'}
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_terminal_exit_event_payload_includes_reopen_reason(
+    interceptor, taskmaster, event_buffer,
+):
+    """Emitted event carries reopen_reason and reopen_from for audit."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'cancelled', 'title': 'T'},
+    )
+    await interceptor.set_task_status(
+        '1', 'pending', '/project', reopen_reason='manual re-scope',
+    )
+    events = await event_buffer.peek_buffered('project', limit=10)
+    assert events, 'expected a task_status_changed event'
+    payload = events[-1].payload
+    assert payload.get('reopen_reason') == 'manual re-scope'
+    assert payload.get('reopen_from') == 'cancelled'
+
+
+# ---------------------------------------------------------------------------
+# Batch-aware set_task_status: CSV input runs gates per-id.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_csv_set_task_status_runs_per_id_gates(interceptor, taskmaster):
+    """CSV task_id input applies the terminal-exit gate to each id independently."""
+    statuses = {'1': 'done', '2': 'pending', '3': 'pending'}
+
+    async def get_task(task_id, project_root, tag=None):
+        return {'id': task_id, 'status': statuses[task_id], 'title': 'T'}
+
+    taskmaster.get_task.side_effect = get_task
+
+    result = await interceptor.set_task_status(
+        '1,2,3', 'pending', '/project',
+    )
+    assert 'results' in result
+    per_id = {r['task_id']: r['result'] for r in result['results']}
+    # Task 1 was 'done' — rejected by the gate.
+    assert per_id['1'].get('error') == 'terminal_exit_rejected'
+    # Task 2 is already 'pending' — no-op.
+    assert per_id['2'].get('no_op') is True
+    # Task 3 is also 'pending' — no-op.
+    assert per_id['3'].get('no_op') is True
+    # all_ok is False because one id hit the gate.
+    assert result['success'] is False
+
+
+@pytest.mark.asyncio
+async def test_csv_set_task_status_mixed_statuses_partial_success(
+    interceptor, taskmaster,
+):
+    """CSV input where some ids succeed and others hit the gate."""
+    statuses = {'1': 'done', '2': 'in-progress'}
+
+    async def get_task(task_id, project_root, tag=None):
+        return {'id': task_id, 'status': statuses[task_id], 'title': 'T'}
+
+    taskmaster.get_task.side_effect = get_task
+
+    result = await interceptor.set_task_status('1,2', 'pending', '/project')
+    per_id = {r['task_id']: r['result'] for r in result['results']}
+    assert per_id['1'].get('error') == 'terminal_exit_rejected'
+    # Task 2: in-progress -> pending, standard allowed transition.
+    assert per_id['2'].get('success') is True or 'error' not in per_id['2']
+    assert result['success'] is False  # overall false because 1 failed

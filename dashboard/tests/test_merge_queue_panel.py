@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from dashboard.app import unique_css_ids
 from dashboard.config import DashboardConfig as _DashboardConfig
 from dashboard.data.merge_queue import _bucket_minutes_for_window
 from tests._dt_helpers import make_fixed_datetime_cls
@@ -645,7 +646,7 @@ class TestDepthTrimLeadingZeros:
     """Verify that /partials/merge-queue strips leading zero buckets from the depth series."""
 
     def test_leading_zeros_stripped_from_rendered_depth(self, client):
-        """When aggregate_queue_depth_timeseries returns a long zero-prefix, the
+        """When build_per_project_merge_queue returns a depth timeseries with a long zero-prefix, the
         rendered depthData must have the leading zeros removed.
 
         Setup: mock returns 4 buckets — [0, 0, 0, 5] — only the last is non-zero.
@@ -932,3 +933,112 @@ class TestRecentMergesWindow:
         assert 'task-outside-4' not in html, (
             'task-outside-4 (30m ago) should be filtered out by the 15-minute window'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestMergeQueueCanvasIdCollision — server-generated canvas_id (step-3/4)
+# ---------------------------------------------------------------------------
+
+_PID_COLLISION_A = '/tmp/dark-factory'
+_PID_COLLISION_B = '/tmp/dark_factory'
+
+_MOCK_COLLIDING_PROJECT_DATA = {
+    _PID_COLLISION_A: {
+        'depth_timeseries': MOCK_DEPTH,
+        'outcomes': MOCK_OUTCOMES,
+        'latency': MOCK_LATENCY,
+        'recent': MOCK_RECENT,
+        'speculative': MOCK_SPEC,
+    },
+    _PID_COLLISION_B: {
+        'depth_timeseries': MOCK_DEPTH,
+        'outcomes': MOCK_OUTCOMES,
+        'latency': MOCK_LATENCY,
+        'recent': MOCK_RECENT,
+        'speculative': MOCK_SPEC,
+    },
+}
+
+
+class TestMergeQueueCanvasIdCollision:
+    """Two pids that css_id-collide must render distinct canvas id attributes."""
+
+    def test_colliding_pids_render_distinct_canvases(self, client):
+        """Colliding pids render distinct canvas ids: both tmp_dark_factory and tmp_dark_factory_1
+        appear in the HTML (order-independent), and no two <canvas> elements share an id."""
+        with _patch_per_project_merge_data(projects=_MOCK_COLLIDING_PROJECT_DATA):
+            resp = client.get('/partials/merge-queue')
+        assert resp.status_code == 200
+        html = resp.text
+
+        # Both css_id variants must appear as mergeQueueDepthChart canvas ids (order-independent)
+        depth_ids = set(re.findall(r'id="mergeQueueDepthChart-([^"]+)"', html))
+        assert depth_ids == {'tmp_dark_factory', 'tmp_dark_factory_1'}, (
+            f'Expected depth chart canvas ids {{tmp_dark_factory, tmp_dark_factory_1}}, got {depth_ids}'
+        )
+        # Both css_id variants must appear as mergeOutcomeChart canvas ids (order-independent)
+        outcome_ids = set(re.findall(r'id="mergeOutcomeChart-([^"]+)"', html))
+        assert outcome_ids == {'tmp_dark_factory', 'tmp_dark_factory_1'}, (
+            f'Expected outcome chart canvas ids {{tmp_dark_factory, tmp_dark_factory_1}}, got {outcome_ids}'
+        )
+        # No two <canvas> elements may share the same id attribute.
+        # Use \s before id= so the pattern cannot match attributes whose names
+        # merely end in "id" (e.g. data-id="..."), where \b would also match.
+        all_canvas_ids = re.findall(r'<canvas\b[^>]*\sid="([^"]+)"', html)
+        assert len(all_canvas_ids) == len(set(all_canvas_ids)), (
+            f'Duplicate canvas ids found: {[i for i in all_canvas_ids if all_canvas_ids.count(i) > 1]}'
+        )
+        # Both canvas_id values must be present in the serialized allProjects JSON
+        # in the inline script.  Parsing the JSON (rather than just checking for
+        # the key name) catches server-side regressions where canvas_id wouldn't
+        # be correctly serialized for colliding pids.
+        script_body = _extract_inline_script(html)
+        m = re.search(r'var allProjects\s*=\s*', script_body)
+        assert m is not None, 'allProjects assignment not found in inline script'
+        all_projects, _ = json.JSONDecoder().raw_decode(script_body[m.end():])
+        canvas_id_values = {v['canvas_id'] for v in all_projects.values()}
+        assert canvas_id_values == {'tmp_dark_factory', 'tmp_dark_factory_1'}, (
+            f'Expected canvas_id values {{tmp_dark_factory, tmp_dark_factory_1}} in allProjects JSON, '
+            f'got {canvas_id_values}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestUniqueCssIds — unit tests for unique_css_ids helper (step-1/2)
+# ---------------------------------------------------------------------------
+
+
+class TestUniqueCssIds:
+    """Unit tests for the unique_css_ids(values) helper in dashboard.app.
+
+    Each test drives a documented case from the plan.  All must fail with
+    ImportError or AttributeError until step-2 implements the helper.
+    """
+
+    def test_non_colliding_passthrough(self):
+        """Non-colliding inputs are returned unchanged."""
+        assert unique_css_ids(['a', 'b']) == ['a', 'b']
+
+    def test_two_way_collision(self):
+        """/tmp/dark-factory and /tmp/dark_factory both normalize to tmp_dark_factory."""
+        result = unique_css_ids(['/tmp/dark-factory', '/tmp/dark_factory'])
+        assert result == ['tmp_dark_factory', 'tmp_dark_factory_1']
+
+    def test_three_way_collision(self):
+        """Three inputs with the same css_id get _0 (no suffix), _1, _2."""
+        result = unique_css_ids(['a-b', 'a.b', 'a b'])
+        assert result == ['a_b', 'a_b_1', 'a_b_2']
+
+    def test_counter_collision_edge_case(self):
+        """Third 'foo' must skip already-taken foo_1 and land on foo_2."""
+        result = unique_css_ids(['foo', 'foo_1', 'foo'])
+        assert result == ['foo', 'foo_1', 'foo_2']
+
+    def test_empty_input(self):
+        """Empty sequence returns empty list."""
+        assert unique_css_ids([]) == []
+
+    def test_order_preserved_mixed(self):
+        """Non-colliding and colliding entries are interleaved correctly."""
+        result = unique_css_ids(['x', '/tmp/a', 'y', '/tmp/a'])
+        assert result == ['x', 'tmp_a', 'y', 'tmp_a_1']

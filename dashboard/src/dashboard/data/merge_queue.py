@@ -10,16 +10,15 @@ synchronously *after* an attempt finishes.  We therefore approximate
 "queue depth" as the count of ``merge_attempt`` events per 15-minute bucket
 (throughput proxy), *not* true in-flight queue depth.  The MergeWorker's
 in-flight queue state is in-memory and not persisted to the events table.
-
-When multiple project roots are configured, the ``aggregate_*`` functions
-query each project's runs.db in parallel and merge the results.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import math
+import os
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -354,7 +353,7 @@ async def latency_stats(
 async def recent_merges(
     db: aiosqlite.Connection | None,
     *,
-    limit: int = 20,
+    limit: int | None = 20,
     hours: int = 168,
     now: datetime | None = None,
 ) -> list[dict]:
@@ -362,7 +361,9 @@ async def recent_merges(
 
     Args:
         db: Async SQLite connection, or None (returns []).
-        limit: Maximum number of rows to return.
+        limit: Maximum number of rows to return.  When ``None``, no SQL
+            ``LIMIT`` clause is added and every matching row is returned.
+            The SQL WHERE window (``hours``) then becomes the sole bound.
         hours: Look-back window in hours (default 168 = 7 days).  Only
             events with ``timestamp >= now - hours`` are included.
         now: Reference timestamp for the cutoff window (default:
@@ -377,17 +378,20 @@ async def recent_merges(
 
     async def _query(conn: aiosqlite.Connection) -> list[dict]:
         since = _cutoff_iso(hours, now=now)
-        rows = await conn.execute_fetchall(
+        base_sql = (
             "SELECT task_id, run_id, "
             "       json_extract(data, '$.outcome') AS outcome, "
             "       duration_ms, timestamp "
             "FROM events "
             "WHERE event_type = 'merge_attempt' "
             "  AND timestamp >= ? "
-            "ORDER BY timestamp DESC "
-            "LIMIT ?",
-            (since, limit),
+            "ORDER BY timestamp DESC"
         )
+        if limit is None:
+            sql, params = base_sql, (since,)
+        else:
+            sql, params = base_sql + " LIMIT ?", (since, limit)
+        rows = await conn.execute_fetchall(sql, params)
         return [
             {
                 'task_id': row['task_id'],
@@ -519,12 +523,38 @@ def enrich_merges_with_titles(
     return result
 
 
+# 32 ≈ max projects we expect to enumerate concurrently; JSON re-parse on eviction is acceptable.
+@functools.lru_cache(maxsize=32)
+def _load_task_titles_cached(path_str: str, mtime_ns: int) -> dict[str, str]:
+    """Cache body for :func:`load_task_titles`, keyed on ``(path, mtime_ns)``.
+
+    Only called when the file's ``st_mtime_ns`` differs from the last observed
+    value; otherwise :func:`load_task_titles` returns the cached result without
+    entering this function.
+
+    The returned dict is shared across callers via the LRU cache — do NOT
+    mutate it.  :func:`load_task_titles` returns a shallow copy to callers so
+    they cannot reach this cached object.
+    """
+    return {str(t['id']): t['title'] for t in load_task_tree(Path(path_str)) if t.get('title')}
+
+
 def load_task_titles(tasks_json_path: Path) -> dict[str, str]:
     """Return a {str(task_id): title} map from a Taskmaster tasks.json file.
 
     Wraps :func:`dashboard.data.orchestrator.load_task_tree` and builds the
     mapping needed by :func:`enrich_merges_with_titles`.  Tasks without a
     title (``title=None`` or missing) are omitted.
+
+    Results are mtime-keyed: repeat calls where the file's ``st_mtime_ns`` has
+    not changed return a cached ``dict`` in O(1) without re-reading the file.
+    A missing or inaccessible file short-circuits to ``{}`` before the cache is
+    consulted, preserving the original OSError-safe contract.
+
+    The path is resolved to its real path before caching so that different
+    spellings of the same file (symlinks, relative vs. absolute) map to the
+    same cache entry.  A fresh shallow copy of the cached mapping is returned
+    to callers so that downstream mutation cannot poison the shared cache entry.
 
     Args:
         tasks_json_path: Path to the ``.taskmaster/tasks/tasks.json`` file.
@@ -533,8 +563,12 @@ def load_task_titles(tasks_json_path: Path) -> dict[str, str]:
         Dict mapping ``str(task.id)`` to ``task.title``.  Returns ``{}`` on
         missing file, invalid JSON, or missing tasks structure.
     """
-    tasks = load_task_tree(tasks_json_path)
-    return {str(t['id']): t['title'] for t in tasks if t.get('title')}
+    real_path = os.path.realpath(tasks_json_path)
+    try:
+        mtime_ns = os.stat(real_path).st_mtime_ns
+    except OSError:
+        return {}
+    return dict(_load_task_titles_cached(real_path, mtime_ns))
 
 
 async def build_per_project_merge_queue(
@@ -549,14 +583,23 @@ async def build_per_project_merge_queue(
     For each ``(pid, db)`` pair, gathers the 5 per-DB stats concurrently and
     applies :func:`filter_merges_within` to the recent-merges list.  Pairs with
     ``db=None`` produce empty/default stats (the per-DB functions handle None
-    gracefully by returning declared defaults).
+    gracefully by returning declared defaults).  All per-project gathers also
+    run concurrently across projects via a single top-level :func:`asyncio.gather`.
+
+    The recent-merges SQL query uses an hour-granular window derived from
+    ``recent_window_minutes`` (``max(1, ceil(recent_window_minutes / 60))``
+    hours) with ``limit=None`` so that bursts exceeding any fixed row cap are
+    not silently truncated.  :func:`filter_merges_within` then tightens the
+    result to the precise ``recent_window_minutes`` boundary.
 
     Args:
         project_dbs: List of ``(project_root_str, connection_or_None)`` tuples
             from :func:`_project_scoped_dbs_labeled`.
         hours: Look-back window in hours (forwarded to each per-DB function).
         now: Shared reference timestamp captured once per request.
-        recent_window_minutes: Sliding window for recent-merges trimming.
+        recent_window_minutes: Sliding window for recent-merges trimming.  The
+            SQL WHERE uses ``max(1, ceil(recent_window_minutes / 60))`` hours;
+            the Python post-filter tightens to the exact minute boundary.
 
     Returns:
         Dict ``{pid: {depth_timeseries, outcomes, latency, recent, speculative}}``.
@@ -572,261 +615,59 @@ async def build_per_project_merge_queue(
             return default
         return result
 
-    out: dict[str, dict] = {}
-    for pid, db in project_dbs:
-        depth_r, outcomes_r, latency_r, recent_r, spec_r = await asyncio.gather(
-            queue_depth_timeseries(db, hours=hours, now=now),
-            outcome_distribution(db, hours=hours, now=now),
-            latency_stats(db, hours=hours, now=now),
-            recent_merges(db, limit=50, hours=hours, now=now),
-            speculative_stats(db, hours=hours, now=now),
-            return_exceptions=True,
-        )
-        depth = _safe(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
-        outcomes = _safe(outcomes_r, _DEFAULT_OUTCOMES, f'{pid}/outcomes')
-        latency = _safe(latency_r, _DEFAULT_LATENCY, f'{pid}/latency')
-        recent_raw = _safe(recent_r, [], f'{pid}/recent')
-        spec = _safe(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
+    recent_hours = max(1, math.ceil(recent_window_minutes / 60))
 
-        recent_trimmed = filter_merges_within(
-            recent_raw,  # type: ignore[arg-type]
-            minutes=recent_window_minutes,
-            now=now,
-        )
-        out[pid] = {
-            'depth_timeseries': depth,
-            'outcomes': outcomes,
-            'latency': latency,
-            'recent': recent_trimmed,
-            'speculative': spec,
-        }
-    return out
+    async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
+        try:
+            depth_r, outcomes_r, latency_r, recent_r, spec_r = await asyncio.gather(
+                queue_depth_timeseries(db, hours=hours, now=now),
+                outcome_distribution(db, hours=hours, now=now),
+                latency_stats(db, hours=hours, now=now),
+                recent_merges(db, limit=None, hours=recent_hours, now=now),
+                speculative_stats(db, hours=hours, now=now),
+                return_exceptions=True,
+            )
+            depth = _safe(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
+            outcomes = _safe(outcomes_r, _DEFAULT_OUTCOMES, f'{pid}/outcomes')
+            latency = _safe(latency_r, _DEFAULT_LATENCY, f'{pid}/latency')
+            recent_raw = _safe(recent_r, [], f'{pid}/recent')
+            spec = _safe(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
+            if len(recent_raw) > 1_000:  # type: ignore[arg-type]
+                logger.warning(
+                    'build_per_project_merge_queue %s: recent_merges returned %d rows'
+                    ' (limit=None, hours=%d) — possible runaway burst; consider'
+                    ' rate-limiting the producer or adding capacity monitoring',
+                    pid,
+                    len(recent_raw),  # type: ignore[arg-type]
+                    recent_hours,
+                )
 
+            recent_trimmed = filter_merges_within(
+                recent_raw,  # type: ignore[arg-type]
+                minutes=recent_window_minutes,
+                now=now,
+            )
+            return pid, {
+                'depth_timeseries': depth,
+                'outcomes': outcomes,
+                'latency': latency,
+                'recent': recent_trimmed,
+                'speculative': spec,
+            }
+        except Exception as exc:
+            logger.warning(
+                'build_per_project_merge_queue %s: unexpected error (returning defaults): %s',
+                pid,
+                exc,
+            )
+            return pid, {
+                'depth_timeseries': _DEFAULT_DEPTH,
+                'outcomes': _DEFAULT_OUTCOMES,
+                'latency': _DEFAULT_LATENCY,
+                'recent': [],
+                'speculative': _DEFAULT_SPEC,
+            }
 
-# ---------------------------------------------------------------------------
-# 7. Multi-DB aggregation
-#
-# NOTE: These aggregate_* functions are no longer called by the partials_merge_queue
-# route (which now uses build_per_project_merge_queue for per-project isolation).
-# They are retained for future cross-project roll-up callers (e.g. a planned summary
-# panel or export endpoint).  If no such caller materialises, delete them and their
-# dedicated tests as dead code.
-# ---------------------------------------------------------------------------
+    results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])
+    return dict(results)
 
-async def aggregate_queue_depth_timeseries(
-    dbs: list[aiosqlite.Connection | None],
-    *,
-    hours: int = 24,
-    now: datetime | None = None,
-) -> ChartData:
-    """Aggregate queue depth timeseries across multiple project DBs.
-
-    Counts per bucket are summed across all DBs.  Bucket width is adaptive
-    to ``hours`` (see ``_bucket_minutes_for_window``).
-
-    Args:
-        dbs: List of aiosqlite connections (None entries are tolerated).
-        hours: Look-back window in hours (default 24).
-        now: Reference timestamp captured **once** for the entire aggregation
-            call and threaded into every per-DB ``queue_depth_timeseries``
-            query.  When None (the default), ``datetime.now(UTC)`` is resolved
-            here so that all concurrent per-DB coroutines share the same
-            alignment — eliminating the race where concurrent calls to
-            ``datetime.now(UTC)`` inside each per-DB ``_query`` could straddle
-            a bucket boundary and produce divergent label sets.  Pass an
-            explicit value in tests for full determinism.
-    """
-    effective_now = now if now is not None else datetime.now(UTC)
-    results = await asyncio.gather(
-        *[queue_depth_timeseries(db, hours=hours, now=effective_now) for db in dbs],
-        return_exceptions=True,
-    )
-
-    # Collect all valid results
-    valid: list[ChartData] = []
-    for r in results:
-        if isinstance(r, BaseException):
-            logger.warning('aggregate_queue_depth_timeseries: error from one DB: %s', r)
-            continue
-        valid.append(r)
-
-    if not valid:
-        return {'labels': [], 'values': []}
-
-    # All results share the same labels (same hours window, same alignment)
-    # Use the first non-empty label set
-    labels: list[str] = []
-    for v in valid:
-        if v['labels']:
-            labels = v['labels']
-            break
-
-    if not labels:
-        return {'labels': [], 'values': []}
-
-    # Sum counts per label
-    total_counts: dict[str, int | float] = {lbl: 0 for lbl in labels}
-    for v in valid:
-        for lbl, cnt in zip(v['labels'], v['values'], strict=False):
-            if lbl in total_counts:
-                total_counts[lbl] += cnt
-
-    return {'labels': labels, 'values': [total_counts[lbl] for lbl in labels]}
-
-
-async def aggregate_outcome_distribution(
-    dbs: list[aiosqlite.Connection | None],
-    *,
-    hours: int = 24,
-    now: datetime | None = None,
-) -> ChartData:
-    """Aggregate outcome distribution across multiple project DBs.
-
-    Counts per outcome are summed; canonical ordering is preserved.
-
-    Args:
-        dbs: List of aiosqlite connections (None entries are tolerated).
-        hours: Look-back window in hours (default 24).
-        now: Reference timestamp captured **once** for the entire aggregation
-            call and threaded into every per-DB ``outcome_distribution`` query.
-            When None (the default), ``datetime.now(UTC)`` is resolved here so
-            that all concurrent per-DB coroutines share the same cutoff window.
-            Pass an explicit value in tests for full determinism.
-    """
-    effective_now = now if now is not None else datetime.now(UTC)
-    results = await asyncio.gather(
-        *[outcome_distribution(db, hours=hours, now=effective_now) for db in dbs],
-        return_exceptions=True,
-    )
-
-    merged: dict[str, int | float] = {}
-    for r in results:
-        if isinstance(r, BaseException):
-            logger.warning('aggregate_outcome_distribution: error from one DB: %s', r)
-            continue
-        for lbl, cnt in zip(r['labels'], r['values'], strict=False):
-            merged[lbl] = merged.get(lbl, 0) + cnt
-
-    if not merged:
-        return {'labels': [], 'values': []}
-
-    # Re-apply canonical ordering
-    labels: list[str] = []
-    values: list[int | float] = []
-    for outcome in _CANONICAL_OUTCOMES:
-        if outcome in merged:
-            labels.append(outcome)
-            values.append(merged[outcome])
-    for outcome in sorted(k for k in merged if k not in _CANONICAL_OUTCOMES):
-        labels.append(outcome)
-        values.append(merged[outcome])
-
-    return {'labels': labels, 'values': values}
-
-
-async def aggregate_latency_stats(
-    dbs: list[aiosqlite.Connection | None],
-    *,
-    hours: int = 24,
-    now: datetime | None = None,
-) -> dict:
-    """Aggregate latency stats across multiple project DBs.
-
-    Recomputes percentiles from the merged raw duration list.
-
-    Args:
-        dbs: List of aiosqlite connections (None entries are tolerated).
-        hours: Look-back window in hours (default 24).
-        now: Reference timestamp captured **once** for the entire aggregation
-            call and threaded into every per-DB ``_get_durations`` query.
-            When None (the default), ``datetime.now(UTC)`` is resolved here so
-            that all concurrent per-DB coroutines share the same cutoff window.
-            Pass an explicit value in tests for full determinism.
-    """
-    effective_now = now if now is not None else datetime.now(UTC)
-    all_durations: list[float] = []
-    gather_results = await asyncio.gather(
-        *[_get_durations(db, hours=hours, now=effective_now) for db in dbs],
-        return_exceptions=True,
-    )
-    for r in gather_results:
-        if isinstance(r, BaseException):
-            logger.warning('aggregate_latency_stats: error from one DB: %s', r)
-            continue
-        all_durations.extend(r)
-
-    return _compute_latency_stats(sorted(all_durations))
-
-
-async def aggregate_recent_merges(
-    dbs: list[aiosqlite.Connection | None],
-    *,
-    limit: int = 20,
-    hours: int = 168,
-) -> list[dict]:
-    """Aggregate recent merges across multiple project DBs.
-
-    Concatenates, re-sorts by timestamp DESC, and truncates to limit.
-
-    Args:
-        dbs: List of async SQLite connections (None entries are skipped).
-        limit: Maximum number of rows to return.
-        hours: Look-back window in hours (default 168 = 7 days), passed
-            through to each per-DB :func:`recent_merges` call.
-    """
-    gather_results = await asyncio.gather(
-        *[recent_merges(db, limit=limit, hours=hours) for db in dbs],
-        return_exceptions=True,
-    )
-    merged: list[dict] = []
-    for r in gather_results:
-        if isinstance(r, BaseException):
-            logger.warning('aggregate_recent_merges: error from one DB: %s', r)
-            continue
-        merged.extend(r)
-
-    merged.sort(key=_ts_sort_key, reverse=True)
-    return merged[:limit]
-
-
-async def aggregate_speculative_stats(
-    dbs: list[aiosqlite.Connection | None],
-    *,
-    hours: int = 24,
-    now: datetime | None = None,
-) -> dict:
-    """Aggregate speculative stats across multiple project DBs.
-
-    Sums hit/discard counts and recomputes hit_rate.
-
-    Args:
-        dbs: List of aiosqlite connections (None entries are tolerated).
-        hours: Look-back window in hours (default 24).
-        now: Reference timestamp captured **once** for the entire aggregation
-            call and threaded into every per-DB ``speculative_stats`` query.
-            When None (the default), ``datetime.now(UTC)`` is resolved here so
-            that all concurrent per-DB coroutines share the same cutoff window.
-            Pass an explicit value in tests for full determinism.
-    """
-    effective_now = now if now is not None else datetime.now(UTC)
-    gather_results = await asyncio.gather(
-        *[speculative_stats(db, hours=hours, now=effective_now) for db in dbs],
-        return_exceptions=True,
-    )
-    hit_count = 0
-    discard_count = 0
-    for r in gather_results:
-        if isinstance(r, BaseException):
-            logger.warning('aggregate_speculative_stats: error from one DB: %s', r)
-            continue
-        hit_count += r['hit_count']
-        discard_count += r['discard_count']
-
-    total = hit_count + discard_count
-    hit_rate = hit_count / total if total > 0 else 0.0
-    return {
-        'hit_count': hit_count,
-        'discard_count': discard_count,
-        'total': total,
-        'hit_rate': hit_rate,
-    }

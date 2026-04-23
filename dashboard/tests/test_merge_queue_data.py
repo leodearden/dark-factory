@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import aiosqlite
 import pytest
@@ -118,11 +119,6 @@ from dashboard.data.merge_queue import (  # noqa: E402
     _cutoff_iso,
     _get_durations,
     _ts_sort_key,
-    aggregate_latency_stats,
-    aggregate_outcome_distribution,
-    aggregate_queue_depth_timeseries,
-    aggregate_recent_merges,
-    aggregate_speculative_stats,
     latency_stats,
     outcome_distribution,
     queue_depth_timeseries,
@@ -902,6 +898,38 @@ class TestRecentMerges:
         task_ids = [r['task_id'] for r in result]
         assert all(tid.startswith('recent-') for tid in task_ids)
 
+    @pytest.mark.asyncio
+    async def test_limit_none_returns_all_rows(self, merge_events_db):
+        """recent_merges with limit=None returns every matching row (no SQL LIMIT).
+
+        Inserts 60 merge_attempt events all within the last 5 minutes, then
+        asserts that limit=None returns all 60, verifying that limit=None is
+        supported and returns every matching row without a row-count cap.
+        """
+        now = datetime.now(UTC)
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        for i in range(60):
+            _insert_event(
+                conn_sync,
+                event_type='merge_attempt',
+                timestamp=now - timedelta(seconds=i * 5),
+                task_id=f'burst-{i:03d}',
+                run_id=f'run-burst-{i:03d}',
+                data={'outcome': 'done'},
+                duration_ms=100 + i,
+            )
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await recent_merges(db, limit=None, hours=1)
+
+        assert len(result) == 60, (
+            f'Expected 60 rows with limit=None, got {len(result)}. '
+            'The SQL LIMIT clause must be omitted when limit is None.'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestSpeculativeStats
@@ -983,886 +1011,6 @@ class TestSpeculativeStats:
 
 
 # ---------------------------------------------------------------------------
-# TestMultiDbAggregation
-# ---------------------------------------------------------------------------
-
-class TestMultiDbAggregation:
-    def _make_db(self, tmp_path, name, events):
-        """Create a populated DB with given events list of dicts."""
-        db_path = tmp_path / name
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(MERGE_EVENTS_SCHEMA)
-        for evt in events:
-            _insert_event(conn, **evt)
-        conn.commit()
-        conn.close()
-        return db_path
-
-    def _make_broken_mock(self):
-        """Return a mock connection that raises on any real method call.
-
-        The mock just needs to cause *some* exception that escapes with_db() —
-        the exact failure point doesn't matter.  asyncio.gather(return_exceptions=True)
-        catches BaseException at the coroutine level, so any unhandled exception
-        (TypeError from awaiting a non-async attribute, RuntimeError from
-        execute_fetchall, etc.) is silently skipped by the aggregators.
-        """
-        broken = MagicMock(spec=aiosqlite.Connection)
-        broken.execute_fetchall = AsyncMock(side_effect=RuntimeError('simulated broken DB'))
-        return broken
-
-    async def _run_with_one_broken_db(self, tmp_path, aggregate_fn, events, **kwargs):
-        """Scaffold for resilience tests: one valid DB + one broken mock connection.
-
-        Returns (result, broken) so callers can assert the broken mock was exercised.
-        """
-        db1 = self._make_db(tmp_path, 'runs1.db', events)
-        broken = self._make_broken_mock()
-        async with aiosqlite.connect(str(db1)) as conn1:
-            conn1.row_factory = aiosqlite.Row
-            result = await aggregate_fn([conn1, broken], **kwargs)
-            return result, broken
-
-    async def _run_with_none_entry(self, tmp_path, aggregate_fn, events, **kwargs):
-        """Scaffold for None-entry tests: one valid DB + None in dbs list."""
-        db1 = self._make_db(tmp_path, 'runs1.db', events)
-        async with aiosqlite.connect(str(db1)) as conn1:
-            conn1.row_factory = aiosqlite.Row
-            return await aggregate_fn([conn1, None], **kwargs)
-
-    @pytest.mark.asyncio
-    async def test_aggregate_queue_depth_timeseries(self, tmp_path):
-        """Counts per bucket sum across two DBs."""
-        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
-        cutoff = now - timedelta(hours=24)
-        bucket = _bucket_start(cutoff) + timedelta(hours=22)
-
-        db1 = self._make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt', 'timestamp': bucket + timedelta(minutes=1),
-             'data': {'outcome': 'done'}},
-            {'event_type': 'merge_attempt', 'timestamp': bucket + timedelta(minutes=2),
-             'data': {'outcome': 'done'}},
-        ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt', 'timestamp': bucket + timedelta(minutes=3),
-             'data': {'outcome': 'conflict'}},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=24, now=now)
-
-        assert len(result['labels']) == 97
-        bucket_label = bucket.isoformat()
-        assert bucket_label in result['labels']
-        idx = result['labels'].index(bucket_label)
-        assert result['values'][idx] == 3  # 2 + 1
-
-    @pytest.mark.asyncio
-    async def test_aggregator_uses_consistent_now_across_dbs(self, tmp_path):
-        """Aggregator with explicit now threads same timestamp to all per-DB calls."""
-        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
-        current_bucket_label = _bucket_start(now).isoformat()  # "2026-04-11T12:00:00+00:00"
-
-        db1 = self._make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt',
-             'timestamp': now - timedelta(seconds=30),
-             'data': {'outcome': 'done'}},
-        ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt',
-             'timestamp': now - timedelta(seconds=45),
-             'data': {'outcome': 'done'}},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=24, now=now)
-
-        assert current_bucket_label in result['labels']
-        idx = result['labels'].index(current_bucket_label)
-        assert result['values'][idx] == 2  # 1 from each DB
-
-    @pytest.mark.asyncio
-    async def test_aggregator_labels_stable_skewed_now(self, tmp_path, monkeypatch):
-        """Aggregator captures datetime.now() once and threads it to all per-DB calls.
-
-        Without the effective_now capture at the top of aggregate_queue_depth_timeseries,
-        a stepping datetime.now() that straddles the 12:00→12:15 bucket boundary would
-        cause per-DB subcalls to receive different now values, diverging their label sets.
-        The strengthened test verifies: (a) both subcalls receive the same pre-boundary
-        now, (b) datetime.now was called exactly once (aggregator-level capture, not
-        per-DB), and (c) labels use the pre-boundary 15-min bucket alignment.
-        """
-        from dashboard.data import merge_queue
-
-        # Stepping clock: first call → 12:14:59 (pre-boundary),
-        # subsequent calls → 12:15:01 (post-boundary, should never be reached).
-        before = datetime(2026, 4, 11, 12, 14, 59, tzinfo=UTC)
-        after = datetime(2026, 4, 11, 12, 15, 1, tzinfo=UTC)
-
-        class _SteppingDT(datetime):
-            _call_count = 0
-
-            @classmethod
-            def now(cls, tz=None):
-                assert tz is UTC, f'Expected UTC, got {tz}'
-                val = before if cls._call_count == 0 else after
-                cls._call_count += 1
-                return val
-
-        monkeypatch.setattr(merge_queue, 'datetime', _SteppingDT)
-
-        # Async spy: record the `now` kwarg received by each per-DB subcall.
-        received_nows: list = []
-        _real = queue_depth_timeseries
-
-        async def _spy(db, *, hours, now=None):
-            received_nows.append(now)
-            return await _real(db, hours=hours, now=now)
-
-        monkeypatch.setattr(merge_queue, 'queue_depth_timeseries', _spy)
-
-        db1 = self._make_db(tmp_path, 'runs1.db', [])
-        db2 = self._make_db(tmp_path, 'runs2.db', [])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=24)
-
-        # (a) Both per-DB subcalls received the same pre-boundary now.
-        assert len(received_nows) == 2
-        assert received_nows[0] == before
-        assert received_nows[1] == before
-
-        # (b) datetime.now was called exactly once: aggregator-level capture, not per-DB.
-        assert _SteppingDT._call_count == 1
-
-        # (c) Labels use the pre-boundary 15-min bucket: 12:14:59 → bucket 12:00:00.
-        assert result['labels'][-1] == '2026-04-11T12:00:00+00:00'
-
-    @pytest.mark.asyncio
-    async def test_aggregate_outcome_distribution(self, tmp_path):
-        """Outcome counts sum across two DBs."""
-        now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
-             'data': {'outcome': 'done'}},
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
-             'data': {'outcome': 'done'}},
-        ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=7),
-             'data': {'outcome': 'done'}},
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=8),
-             'data': {'outcome': 'conflict'}},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_outcome_distribution([conn1, conn2], hours=24)
-
-        assert 'done' in result['labels']
-        done_idx = result['labels'].index('done')
-        assert result['values'][done_idx] == 3  # 2 + 1
-
-    @pytest.mark.asyncio
-    async def test_aggregate_latency_stats(self, tmp_path):
-        """Latency stats recomputed from merged durations."""
-        now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
-             'data': {'outcome': 'done'}, 'duration_ms': 100},
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
-             'data': {'outcome': 'done'}, 'duration_ms': 200},
-        ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=7),
-             'data': {'outcome': 'done'}, 'duration_ms': 300},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_latency_stats([conn1, conn2], hours=24)
-
-        assert result['count'] == 3
-        assert result['mean_ms'] == pytest.approx(200.0, abs=1e-6)
-
-    @pytest.mark.asyncio
-    async def test_aggregate_recent_merges(self, tmp_path):
-        """Recent merges concatenated, sorted by timestamp DESC, truncated."""
-        now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt',
-             'timestamp': now - timedelta(minutes=1), 'task_id': 'task-a',
-             'data': {'outcome': 'done'}},
-        ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt',
-             'timestamp': now - timedelta(minutes=2), 'task_id': 'task-b',
-             'data': {'outcome': 'done'}},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_recent_merges([conn1, conn2], limit=20)
-
-        assert len(result) == 2
-        # Newest first
-        assert result[0]['task_id'] == 'task-a'
-        assert result[1]['task_id'] == 'task-b'
-
-    @pytest.mark.asyncio
-    async def test_aggregate_speculative_stats(self, tmp_path):
-        """Speculative counts summed, hit_rate recomputed."""
-        now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'speculative_merge',
-             'timestamp': now - timedelta(minutes=1), 'data': {'base_sha': 'abc'}},
-            {'event_type': 'speculative_merge',
-             'timestamp': now - timedelta(minutes=2), 'data': {'base_sha': 'def'}},
-        ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'speculative_discard',
-             'timestamp': now - timedelta(minutes=3),
-             'data': {'reason': 'previous_failed'}},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_speculative_stats([conn1, conn2], hours=24)
-
-        assert result['hit_count'] == 2
-        assert result['discard_count'] == 1
-        assert result['total'] == 3
-        assert result['hit_rate'] == pytest.approx(2 / 3, abs=1e-6)
-
-    @pytest.mark.asyncio
-    async def test_aggregate_7d_uses_1h_buckets(self, tmp_path):
-        """aggregate_queue_depth_timeseries at hours=168 produces 169 buckets,
-        summing counts across two DBs into the same 1h bucket."""
-        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
-        event_time = now - timedelta(hours=12)  # 12h before now
-
-        db1 = self._make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt',
-             'timestamp': event_time + timedelta(minutes=5),
-             'data': {'outcome': 'done'}},
-        ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt',
-             'timestamp': event_time + timedelta(minutes=10),
-             'data': {'outcome': 'conflict'}},
-            {'event_type': 'merge_attempt',
-             'timestamp': event_time + timedelta(minutes=15),
-             'data': {'outcome': 'conflict'}},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=168, now=now)
-
-        labels = result['labels']
-        values = result['values']
-
-        assert len(labels) == 169
-
-        # All 3 events share the same 1h bucket
-        bucket_label = _align_bucket(event_time, 60).isoformat()
-        assert bucket_label in labels
-        idx = labels.index(bucket_label)
-        assert values[idx] == 3  # 1 + 2
-
-    @pytest.mark.asyncio
-    async def test_aggregate_all_window_bounded(self, tmp_path):
-        """aggregate_queue_depth_timeseries at hours=87600 produces exactly 3651 buckets."""
-        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
-
-        db1 = self._make_db(tmp_path, 'runs1.db', [])
-        db2 = self._make_db(tmp_path, 'runs2.db', [])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=87600, now=now)
-
-        assert len(result['labels']) == 3651
-
-
-    @pytest.mark.asyncio
-    async def test_aggregate_recent_merges_hours_window(self, tmp_path):
-        """aggregate_recent_merges with hours=1 excludes events older than 1 hour."""
-        now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt',
-             'timestamp': now - timedelta(minutes=30), 'task_id': 'recent-a',
-             'data': {'outcome': 'done'}},
-            {'event_type': 'merge_attempt',
-             'timestamp': now - timedelta(hours=3), 'task_id': 'old-a',
-             'data': {'outcome': 'done'}},
-        ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt',
-             'timestamp': now - timedelta(minutes=45), 'task_id': 'recent-b',
-             'data': {'outcome': 'done'}},
-            {'event_type': 'merge_attempt',
-             'timestamp': now - timedelta(hours=4), 'task_id': 'old-b',
-             'data': {'outcome': 'done'}},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_recent_merges([conn1, conn2], limit=20, hours=1)
-
-        assert len(result) == 2
-        task_ids = {r['task_id'] for r in result}
-        assert task_ids == {'recent-a', 'recent-b'}
-
-    @pytest.mark.asyncio
-    async def test_aggregate_recent_merges_mixed_tz_sort(self, tmp_path):
-        """Merges with different UTC offsets sort correctly by chronological order.
-
-        Lexicographic sort would compare '13:00+05:00' > '12:00+00:00' (wrong).
-        Chronological sort: 12:00 UTC > 08:00 UTC (13:00+05:00), so UTC noon
-        must appear first (newest).
-        """
-        # DB1: 2026-04-11T12:00:00+00:00  = 12:00 UTC (newer)
-        # DB2: 2026-04-11T13:00:00+05:00  = 08:00 UTC (older)
-        ts_utc_noon = '2026-04-11T12:00:00+00:00'
-        ts_tz_plus5 = '2026-04-11T13:00:00+05:00'
-
-        db1 = self._make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt', 'timestamp': ts_utc_noon,
-             'task_id': 'utc-noon', 'data': {'outcome': 'done'}},
-        ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt', 'timestamp': ts_tz_plus5,
-             'task_id': 'tz-plus5', 'data': {'outcome': 'done'}},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            # Use a large hours window so both events are included
-            result = await aggregate_recent_merges([conn1, conn2], limit=20, hours=87600)
-
-        assert len(result) == 2
-        # utc-noon (12:00 UTC) is newer than tz-plus5 (08:00 UTC), so must be first
-        assert result[0]['task_id'] == 'utc-noon'
-        assert result[1]['task_id'] == 'tz-plus5'
-    # -----------------------------------------------------------------------
-    # Gap coverage (a): one DB raises RuntimeError — gather-level resilience
-    # -----------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_one_db_raises_queue_depth_timeseries(self, tmp_path):
-        """aggregate_queue_depth_timeseries silently skips a DB whose coroutine
-        raises RuntimeError (escapes with_db) via gather(return_exceptions=True).
-        """
-        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
-        cutoff = now - timedelta(hours=24)
-        bucket = _bucket_start(cutoff) + timedelta(hours=22)
-        events = [
-            {'event_type': 'merge_attempt',
-             'timestamp': bucket + timedelta(minutes=1),
-             'data': {'outcome': 'done'}},
-        ]
-        result, broken = await self._run_with_one_broken_db(
-            tmp_path, aggregate_queue_depth_timeseries, events, hours=24, now=now,
-        )
-        # Broken DB error was silently skipped — no exception raised
-        assert len(result['labels']) == 97
-        bucket_label = bucket.isoformat()
-        assert bucket_label in result['labels']
-        idx = result['labels'].index(bucket_label)
-        assert result['values'][idx] == 1  # only from valid DB; broken DB skipped
-        broken.execute_fetchall.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_one_db_raises_outcome_distribution(self, tmp_path):
-        """aggregate_outcome_distribution silently skips a broken DB."""
-        now = datetime.now(UTC)
-        events = [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
-             'data': {'outcome': 'done'}},
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
-             'data': {'outcome': 'done'}},
-        ]
-        result, broken = await self._run_with_one_broken_db(
-            tmp_path, aggregate_outcome_distribution, events, hours=24,
-        )
-        assert 'done' in result['labels']
-        done_idx = result['labels'].index('done')
-        assert result['values'][done_idx] == 2  # only from valid DB
-        broken.execute_fetchall.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_one_db_raises_latency_stats(self, tmp_path):
-        """aggregate_latency_stats silently skips a broken DB."""
-        now = datetime.now(UTC)
-        events = [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
-             'data': {'outcome': 'done'}, 'duration_ms': 100},
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
-             'data': {'outcome': 'done'}, 'duration_ms': 200},
-        ]
-        result, broken = await self._run_with_one_broken_db(
-            tmp_path, aggregate_latency_stats, events, hours=24,
-        )
-        assert result['count'] == 2
-        assert result['mean_ms'] == pytest.approx(150.0, abs=1e-6)
-        broken.execute_fetchall.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_one_db_raises_recent_merges(self, tmp_path):
-        """aggregate_recent_merges silently skips a broken DB."""
-        now = datetime.now(UTC)
-        events = [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=1),
-             'task_id': 'task-x', 'data': {'outcome': 'done'}},
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=2),
-             'task_id': 'task-y', 'data': {'outcome': 'done'}},
-        ]
-        result, broken = await self._run_with_one_broken_db(
-            tmp_path, aggregate_recent_merges, events, limit=20,
-        )
-        assert len(result) == 2
-        # Newest first
-        assert result[0]['task_id'] == 'task-x'
-        assert result[1]['task_id'] == 'task-y'
-        broken.execute_fetchall.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_one_db_raises_speculative_stats(self, tmp_path):
-        """aggregate_speculative_stats silently skips a broken DB."""
-        now = datetime.now(UTC)
-        events = [
-            {'event_type': 'speculative_merge', 'timestamp': now - timedelta(minutes=1),
-             'data': {'base_sha': 'abc'}},
-            {'event_type': 'speculative_merge', 'timestamp': now - timedelta(minutes=2),
-             'data': {'base_sha': 'def'}},
-        ]
-        result, broken = await self._run_with_one_broken_db(
-            tmp_path, aggregate_speculative_stats, events, hours=24,
-        )
-        assert result['hit_count'] == 2
-        assert result['discard_count'] == 0
-        assert result['total'] == 2
-        assert result['hit_rate'] == pytest.approx(1.0, abs=1e-6)
-        broken.execute_fetchall.assert_called()
-
-    # -----------------------------------------------------------------------
-    # Gap coverage (b): empty dbs=[] — asyncio.gather(*[]) returns []
-    # -----------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_empty_dbs_queue_depth(self):
-        """aggregate_queue_depth_timeseries with dbs=[] returns empty ChartData."""
-        result = await aggregate_queue_depth_timeseries([], hours=24)
-        assert result == {'labels': [], 'values': []}
-
-    @pytest.mark.asyncio
-    async def test_empty_dbs_outcome_distribution(self):
-        """aggregate_outcome_distribution with dbs=[] returns empty ChartData."""
-        result = await aggregate_outcome_distribution([], hours=24)
-        assert result == {'labels': [], 'values': []}
-
-    @pytest.mark.asyncio
-    async def test_empty_dbs_latency_stats(self):
-        """aggregate_latency_stats with dbs=[] returns all-zero stats dict."""
-        result = await aggregate_latency_stats([], hours=24)
-        assert result == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
-
-    @pytest.mark.asyncio
-    async def test_empty_dbs_recent_merges(self):
-        """aggregate_recent_merges with dbs=[] returns empty list."""
-        result = await aggregate_recent_merges([], limit=20)
-        assert result == []
-
-    @pytest.mark.asyncio
-    async def test_empty_dbs_speculative_stats(self):
-        """aggregate_speculative_stats with dbs=[] returns all-zero stats dict."""
-        result = await aggregate_speculative_stats([], hours=24)
-        assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
-
-    # -----------------------------------------------------------------------
-    # Gap coverage (b+): all-None dbs — gather(*[fn(None), fn(None)]) path
-    # -----------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize('patch_target,agg_fn,kwargs,expected', [
-        (
-            'queue_depth_timeseries',
-            aggregate_queue_depth_timeseries,
-            {'hours': 24},
-            {'labels': [], 'values': []},
-        ),
-        (
-            'outcome_distribution',
-            aggregate_outcome_distribution,
-            {'hours': 24},
-            {'labels': [], 'values': []},
-        ),
-        (
-            '_get_durations',
-            aggregate_latency_stats,
-            {'hours': 24},
-            {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0},
-        ),
-        (
-            'recent_merges',
-            aggregate_recent_merges,
-            {'limit': 20},
-            [],
-        ),
-        (
-            'speculative_stats',
-            aggregate_speculative_stats,
-            {'hours': 24},
-            {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0},
-        ),
-    ])
-    async def test_all_none_dbs_spy(self, patch_target, agg_fn, kwargs, expected):
-        """Parametrized: aggregate fn with dbs=[None, None] calls per-DB fn twice with None.
-
-        Confirms the gather(*[fn(None), fn(None)]) path is distinct from
-        dbs=[] (gather(*[]) → []) because per-DB functions ARE called with None.
-        """
-        wraps_fn = getattr(_mqmod, patch_target)
-        with patch(
-            f'dashboard.data.merge_queue.{patch_target}',
-            wraps=wraps_fn,
-        ) as spy:
-            result = await agg_fn([None, None], **kwargs)
-            assert result == expected
-            assert spy.call_count == 2
-            for call in spy.call_args_list:
-                assert call.args[0] is None
-
-    # -----------------------------------------------------------------------
-    # Gap coverage (c): None entries in dbs — per-DB returns empty defaults
-    # -----------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_none_entry_queue_depth(self, tmp_path):
-        """aggregate_queue_depth_timeseries with [valid_conn, None] merges cleanly."""
-        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
-        cutoff = now - timedelta(hours=24)
-        bucket = _bucket_start(cutoff) + timedelta(hours=22)
-        events = [
-            {'event_type': 'merge_attempt',
-             'timestamp': bucket + timedelta(minutes=1),
-             'data': {'outcome': 'done'}},
-        ]
-        result = await self._run_with_none_entry(
-            tmp_path, aggregate_queue_depth_timeseries, events, hours=24, now=now,
-        )
-        assert len(result['labels']) == 97
-        bucket_label = bucket.isoformat()
-        assert bucket_label in result['labels']
-        idx = result['labels'].index(bucket_label)
-        assert result['values'][idx] == 1  # valid DB only; None contributed nothing
-
-    @pytest.mark.asyncio
-    async def test_none_entry_outcome_distribution(self, tmp_path):
-        """aggregate_outcome_distribution with [valid_conn, None] merges cleanly."""
-        now = datetime.now(UTC)
-        events = [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
-             'data': {'outcome': 'done'}},
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
-             'data': {'outcome': 'done'}},
-        ]
-        result = await self._run_with_none_entry(
-            tmp_path, aggregate_outcome_distribution, events, hours=24,
-        )
-        assert 'done' in result['labels']
-        done_idx = result['labels'].index('done')
-        assert result['values'][done_idx] == 2  # from valid DB only
-
-    @pytest.mark.asyncio
-    async def test_none_entry_latency_stats(self, tmp_path):
-        """aggregate_latency_stats with [valid_conn, None] merges cleanly."""
-        now = datetime.now(UTC)
-        events = [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
-             'data': {'outcome': 'done'}, 'duration_ms': 100},
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
-             'data': {'outcome': 'done'}, 'duration_ms': 200},
-        ]
-        result = await self._run_with_none_entry(
-            tmp_path, aggregate_latency_stats, events, hours=24,
-        )
-        assert result['count'] == 2
-        assert result['mean_ms'] == pytest.approx(150.0, abs=1e-6)
-
-    @pytest.mark.asyncio
-    async def test_none_entry_recent_merges(self, tmp_path):
-        """aggregate_recent_merges with [valid_conn, None] merges cleanly."""
-        now = datetime.now(UTC)
-        events = [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=1),
-             'task_id': 'task-a', 'data': {'outcome': 'done'}},
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=2),
-             'task_id': 'task-b', 'data': {'outcome': 'done'}},
-        ]
-        result = await self._run_with_none_entry(
-            tmp_path, aggregate_recent_merges, events, limit=20,
-        )
-        assert len(result) == 2
-        assert result[0]['task_id'] == 'task-a'
-        assert result[1]['task_id'] == 'task-b'
-
-    @pytest.mark.asyncio
-    async def test_none_entry_speculative_stats(self, tmp_path):
-        """aggregate_speculative_stats with [valid_conn, None] merges cleanly."""
-        now = datetime.now(UTC)
-        events = [
-            {'event_type': 'speculative_merge', 'timestamp': now - timedelta(minutes=1),
-             'data': {'base_sha': 'abc'}},
-            {'event_type': 'speculative_discard', 'timestamp': now - timedelta(minutes=2),
-             'data': {'reason': 'previous_failed'}},
-        ]
-        result = await self._run_with_none_entry(
-            tmp_path, aggregate_speculative_stats, events, hours=24,
-        )
-        assert result['hit_count'] == 1
-        assert result['discard_count'] == 1
-        assert result['total'] == 2
-        assert result['hit_rate'] == pytest.approx(0.5, abs=1e-6)
-
-    # -----------------------------------------------------------------------
-    # Gap coverage (d): current-bucket-tail regression
-    # -----------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_current_bucket_tail_regression(self, tmp_path):
-        """Near-now events from two DBs land in the last (current) bucket.
-
-        Verifies that: (a) the current bucket is always present as the last
-        label, and (b) events inserted at now-1min and now-30s each contribute
-        to the same current bucket so the summed count is 2.
-        """
-        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
-
-        db1 = self._make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt',
-             'timestamp': now - timedelta(minutes=1),
-             'data': {'outcome': 'done'}},
-        ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt',
-             'timestamp': now - timedelta(seconds=30),
-             'data': {'outcome': 'done'}},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=24, now=now)
-
-        # The last label must be the current aligned bucket (12:00:00 for 12:07:30)
-        expected_last_label = _align_bucket(now, 15).isoformat()
-        assert result['labels'][-1] == expected_last_label
-
-        # Both events are in the current bucket — summed count must be 2
-        idx = result['labels'].index(expected_last_label)
-        assert result['values'][idx] == 2
-
-    @pytest.mark.asyncio
-    async def test_bucket_boundary_events_in_adjacent_buckets(self, tmp_path):
-        """Events straddling a 15-min boundary land in adjacent buckets, not the same one.
-
-        DB1: event at exactly 12:15:00 → bucket 12:15.
-        DB2: event at 12:14:59          → bucket 12:00.
-        Tests the 'divergent label sets' scenario from the aggregate docstring:
-        each DB independently aligns its timestamps, so the aggregate must merge
-        label sets correctly and never collapse boundary events into a single bucket.
-        """
-        base = datetime(2026, 4, 11, 12, 15, 0, tzinfo=UTC)  # exact bucket boundary
-
-        db1 = self._make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt',
-             'timestamp': base,                              # 12:15:00 → bucket 12:15
-             'data': {'outcome': 'done'}},
-        ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt',
-             'timestamp': base - timedelta(seconds=1),      # 12:14:59 → bucket 12:00
-             'data': {'outcome': 'done'}},
-        ])
-
-        now = datetime(2026, 4, 11, 12, 30, 0, tzinfo=UTC)
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_queue_depth_timeseries([conn1, conn2], hours=1, now=now)
-
-        labels = result['labels']
-        values = result['values']
-        bucket_1215 = datetime(2026, 4, 11, 12, 15, tzinfo=UTC).isoformat()
-        bucket_1200 = datetime(2026, 4, 11, 12, 0, tzinfo=UTC).isoformat()
-
-        assert bucket_1215 in labels, f"bucket 12:15 missing from {labels}"
-        assert bucket_1200 in labels, f"bucket 12:00 missing from {labels}"
-
-        idx_1215 = labels.index(bucket_1215)
-        idx_1200 = labels.index(bucket_1200)
-
-        # Each event is in its own bucket — no cross-boundary merging
-        assert values[idx_1215] == 1
-        assert values[idx_1200] == 1
-        # 12:15 bucket immediately follows 12:00 bucket (adjacent, one step apart)
-        assert idx_1215 == idx_1200 + 1
-
-    # -----------------------------------------------------------------------
-    # Gap coverage (e): duration_ms=0 and NULL excluded by aggregate path
-    # -----------------------------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_aggregate_latency_zero_duration_excluded(self, tmp_path):
-        """Zero-duration rows are excluded from aggregate latency stats.
-
-        _get_durations filters 'AND duration_ms > 0', so duration_ms=0 rows
-        must not contribute to count or percentiles in the aggregate.
-        """
-        now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
-             'data': {'outcome': 'done'}, 'duration_ms': 0},
-        ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
-             'data': {'outcome': 'done'}, 'duration_ms': 500},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_latency_stats([conn1, conn2], hours=24)
-
-        assert result['count'] == 1  # zero-duration row excluded
-        assert result['p50'] == 500
-
-    @pytest.mark.asyncio
-    async def test_aggregate_latency_null_duration_excluded(self, tmp_path):
-        """NULL-duration rows are excluded from aggregate latency stats.
-
-        _get_durations filters 'AND duration_ms IS NOT NULL', so NULL rows
-        must not contribute to count or percentiles in the aggregate.
-        """
-        now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
-            # duration_ms=None → stored as NULL in SQLite
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
-             'data': {'outcome': 'done'}},
-        ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
-             'data': {'outcome': 'done'}, 'duration_ms': 300},
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=7),
-             'data': {'outcome': 'done'}, 'duration_ms': 600},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_latency_stats([conn1, conn2], hours=24)
-
-        assert result['count'] == 2  # NULL row excluded
-        assert result['mean_ms'] == pytest.approx(450.0, abs=1e-6)
-
-    @pytest.mark.asyncio
-    async def test_aggregate_latency_mixed_zero_null_valid(self, tmp_path):
-        """Only valid (non-zero, non-NULL) durations from multiple DBs contribute.
-
-        DB1 has duration_ms=0 and a NULL-duration row; DB2 has three valid rows.
-        Confirms the aggregate path preserves _get_durations' filter and only
-        the three valid durations from DB2 contribute.
-        """
-        now = datetime.now(UTC)
-        db1 = self._make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
-             'data': {'outcome': 'done'}, 'duration_ms': 0},
-            # NULL duration:
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
-             'data': {'outcome': 'done'}},
-        ])
-        db2 = self._make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=7),
-             'data': {'outcome': 'done'}, 'duration_ms': 100},
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=8),
-             'data': {'outcome': 'done'}, 'duration_ms': 200},
-            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=9),
-             'data': {'outcome': 'done'}, 'duration_ms': 300},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_latency_stats([conn1, conn2], hours=24)
-
-        assert result['count'] == 3  # only valid durations from DB2
-        assert result['mean_ms'] == pytest.approx(200.0, abs=1e-6)
-
-# ---------------------------------------------------------------------------
 # TestCutoffIso (step-1)
 # ---------------------------------------------------------------------------
 
@@ -1914,172 +1062,6 @@ class TestNowThreadingToCutoffIso:
 
         assert captured_nows == [fixed_now], (
             f"Expected _cutoff_iso called once with now={fixed_now!r}, got {captured_nows!r}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# TestAggregateOutcomeDistributionNow (step-9)
-# ---------------------------------------------------------------------------
-
-class TestAggregateOutcomeDistributionNow:
-    @pytest.mark.asyncio
-    async def test_aggregate_outcome_distribution_consistent_now(self, tmp_path):
-        """aggregate_outcome_distribution resolves now once and threads it to all per-DB calls.
-
-        Events near fixed_now are inside the 24h window for that now, but would be
-        excluded by a real datetime.now(UTC) cutoff (they are 2+ days in the past).
-        Will fail before step-10 impl because aggregate_outcome_distribution has no `now` param.
-        """
-        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
-        # Events at 1h before fixed_now — inside [fixed_now - 24h, fixed_now] window
-        event_time = fixed_now - timedelta(hours=1)
-
-        db1 = _make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt', 'timestamp': event_time, 'data': {'outcome': 'done'}},
-        ])
-        db2 = _make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt', 'timestamp': event_time, 'data': {'outcome': 'done'}},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_outcome_distribution(
-                [conn1, conn2], hours=24, now=fixed_now,
-            )
-
-        # Both events are inside the window → both should appear in the results
-        assert 'done' in result['labels'], f"Expected 'done' in labels, got {result}"
-        done_idx = result['labels'].index('done')
-        assert result['values'][done_idx] == 2  # one event per DB
-
-
-# ---------------------------------------------------------------------------
-# TestAggregateLatencyStatsNow (step-11)
-# ---------------------------------------------------------------------------
-
-class TestAggregateLatencyStatsNow:
-    @pytest.mark.asyncio
-    async def test_aggregate_latency_stats_consistent_now(self, tmp_path):
-        """aggregate_latency_stats resolves now once and threads it to all per-DB calls.
-
-        Events near fixed_now are inside the 24h window for that now, but would be
-        excluded by a real datetime.now(UTC) cutoff (they are 2+ days in the past).
-        Will fail before step-12 impl because aggregate_latency_stats has no `now` param.
-        """
-        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
-        event_time = fixed_now - timedelta(hours=1)
-
-        db1 = _make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt', 'timestamp': event_time,
-             'data': {'outcome': 'done'}, 'duration_ms': 100},
-        ])
-        db2 = _make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt', 'timestamp': event_time,
-             'data': {'outcome': 'done'}, 'duration_ms': 200},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_latency_stats([conn1, conn2], hours=24, now=fixed_now)
-
-        # Both events are inside the window → count=2
-        assert result['count'] == 2, (
-            f"Expected count=2 (both events within fixed_now window), got {result}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# TestAggregateSpeculativeStatsNow (step-13)
-# ---------------------------------------------------------------------------
-
-class TestAggregateSpeculativeStatsNow:
-    @pytest.mark.asyncio
-    async def test_aggregate_speculative_stats_consistent_now(self, tmp_path):
-        """aggregate_speculative_stats resolves now once and threads it to all per-DB calls.
-
-        Events near fixed_now are inside the 24h window for that now, but would be
-        excluded by a real datetime.now(UTC) cutoff (they are 2+ days in the past).
-        Will fail before step-14 impl because aggregate_speculative_stats has no `now` param.
-        """
-        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
-        event_time = fixed_now - timedelta(hours=1)
-
-        db1 = _make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'speculative_merge',
-             'timestamp': event_time, 'data': {'base_sha': 'abc'}},
-        ])
-        db2 = _make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'speculative_discard',
-             'timestamp': event_time, 'data': {'reason': 'previous_failed'}},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_speculative_stats(
-                [conn1, conn2], hours=24, now=fixed_now,
-            )
-
-        # Both events are inside the window → hit_count=1, discard_count=1, total=2
-        assert result['total'] == 2, (
-            f"Expected total=2 (both events within fixed_now window), got {result}"
-        )
-        assert result['hit_count'] == 1
-        assert result['discard_count'] == 1
-
-
-# ---------------------------------------------------------------------------
-# TestAggregateQueueDepthTimeseriesNow
-# ---------------------------------------------------------------------------
-
-class TestAggregateQueueDepthTimeseriesNow:
-    @pytest.mark.asyncio
-    async def test_aggregate_queue_depth_timeseries_consistent_now(self, tmp_path):
-        """aggregate_queue_depth_timeseries resolves now once and threads it to per-DB calls.
-
-        Events near fixed_now are inside the 24h window for that now, but would be
-        excluded by a real datetime.now(UTC) cutoff (they are 2+ days in the past).
-        Ensures a regression removing `now` from aggregate_queue_depth_timeseries
-        would be caught by this test.
-        """
-        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
-        event_time = fixed_now - timedelta(hours=1)
-
-        db1 = _make_db(tmp_path, 'runs1.db', [
-            {'event_type': 'merge_attempt', 'timestamp': event_time,
-             'data': {'outcome': 'done'}},
-        ])
-        db2 = _make_db(tmp_path, 'runs2.db', [
-            {'event_type': 'merge_attempt', 'timestamp': event_time,
-             'data': {'outcome': 'done'}},
-        ])
-
-        async with (
-            aiosqlite.connect(str(db1)) as conn1,
-            aiosqlite.connect(str(db2)) as conn2,
-        ):
-            conn1.row_factory = aiosqlite.Row
-            conn2.row_factory = aiosqlite.Row
-            result = await aggregate_queue_depth_timeseries(
-                [conn1, conn2], hours=24, now=fixed_now,
-            )
-
-        # Both events are inside the fixed_now window → total count == 2
-        total_count = sum(result['values'])
-        assert total_count == 2, (
-            f"Expected 2 events (both inside fixed_now window), got total={total_count}, "
-            f"result={result}"
         )
 
 
@@ -2406,6 +1388,197 @@ class TestLoadTaskTitles:
         assert '1' not in result
         assert result.get('2') == 'B'
 
+    def test_repeat_calls_cached_via_mtime(self, tmp_path, monkeypatch):
+        """Two calls with unchanged mtime invoke load_task_tree exactly once."""
+        import dashboard.data.merge_queue as _mq
+        from dashboard.data.merge_queue import (
+            _load_task_titles_cached,
+            load_task_titles,
+        )
+
+        _load_task_titles_cached.cache_clear()
+
+        tasks_path = tmp_path / 'tasks.json'
+        self._write_tasks_json(tasks_path, [{'id': 1, 'title': 'A'}])
+
+        call_count = 0
+        original_load_task_tree = _mq.load_task_tree
+
+        def counting_load_task_tree(path):
+            nonlocal call_count
+            call_count += 1
+            return original_load_task_tree(path)
+
+        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
+
+        result1 = load_task_titles(tasks_path)
+        result2 = load_task_titles(tasks_path)
+
+        assert call_count == 1, f"load_task_tree called {call_count} times, expected 1"
+        assert result1 == {'1': 'A'}
+        assert result2 == {'1': 'A'}
+
+    def test_mtime_change_invalidates_cache(self, tmp_path):
+        """Bumping st_mtime_ns causes the next call to return fresh content."""
+        import os
+
+        from dashboard.data.merge_queue import _load_task_titles_cached, load_task_titles
+
+        _load_task_titles_cached.cache_clear()
+
+        tasks_path = tmp_path / 'tasks.json'
+        self._write_tasks_json(tasks_path, [{'id': 1, 'title': 'A'}])
+
+        result1 = load_task_titles(tasks_path)
+        assert result1 == {'1': 'A'}
+
+        # Overwrite content then bump mtime explicitly to guarantee a new key
+        stat = os.stat(tasks_path)
+        orig_mtime_ns = stat.st_mtime_ns
+        self._write_tasks_json(tasks_path, [{'id': 1, 'title': 'Z'}])
+        os.utime(tasks_path, ns=(stat.st_atime_ns, orig_mtime_ns + 1))
+
+        result2 = load_task_titles(tasks_path)
+        assert result2 == {'1': 'Z'}
+
+    def test_missing_file_does_not_invoke_load_task_tree(self, tmp_path, monkeypatch):
+        """A missing file short-circuits before touching load_task_tree or the cache."""
+        import dashboard.data.merge_queue as _mq
+        from dashboard.data.merge_queue import (
+            _load_task_titles_cached,
+            load_task_titles,
+        )
+
+        _load_task_titles_cached.cache_clear()
+
+        call_count = 0
+        original_load_task_tree = _mq.load_task_tree
+
+        def counting_load_task_tree(path):
+            nonlocal call_count
+            call_count += 1
+            return original_load_task_tree(path)
+
+        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
+
+        result = load_task_titles(tmp_path / 'nope.json')
+
+        assert result == {}
+        assert call_count == 0, f"load_task_tree was called {call_count} time(s); expected 0"
+
+    def test_distinct_paths_cached_separately(self, tmp_path):
+        """Different task files produce independent cache entries."""
+        from dashboard.data.merge_queue import _load_task_titles_cached, load_task_titles
+
+        _load_task_titles_cached.cache_clear()
+
+        path_a = tmp_path / 'proj_a' / 'tasks.json'
+        path_b = tmp_path / 'proj_b' / 'tasks.json'
+        path_a.parent.mkdir()
+        path_b.parent.mkdir()
+        self._write_tasks_json(path_a, [{'id': 1, 'title': 'Alpha'}])
+        self._write_tasks_json(path_b, [{'id': 2, 'title': 'Beta'}])
+
+        result_a = load_task_titles(path_a)
+        result_b = load_task_titles(path_b)
+
+        assert result_a == {'1': 'Alpha'}, f"project A returned unexpected titles: {result_a}"
+        assert result_b == {'2': 'Beta'}, f"project B returned unexpected titles: {result_b}"
+        assert result_a != result_b
+
+    def test_symlink_shares_cache_entry_with_real_path(self, tmp_path, monkeypatch):
+        """A symlink and the real path resolve to the same LRU entry via os.path.realpath."""
+        import dashboard.data.merge_queue as _mq
+        from dashboard.data.merge_queue import (
+            _load_task_titles_cached,
+            load_task_titles,
+        )
+
+        _load_task_titles_cached.cache_clear()
+
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        real_path = real_dir / 'tasks.json'
+        self._write_tasks_json(real_path, [{'id': 1, 'title': 'A'}])
+
+        link_path = tmp_path / 'link.json'
+        try:
+            link_path.symlink_to(real_path)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks unsupported on this filesystem")
+
+        call_count = 0
+        original_load_task_tree = _mq.load_task_tree
+
+        def counting_load_task_tree(path):
+            nonlocal call_count
+            call_count += 1
+            return original_load_task_tree(path)
+
+        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
+
+        result_real = load_task_titles(real_path)
+        result_link = load_task_titles(link_path)
+
+        assert result_real == {'1': 'A'}, f"real path returned unexpected titles: {result_real}"
+        assert result_link == {'1': 'A'}, f"symlink returned unexpected titles: {result_link}"
+        assert call_count == 1, (
+            f"load_task_tree called {call_count} time(s); expected 1 "
+            "(os.path.realpath should collapse both spellings to one cache key)"
+        )
+
+    def test_corrupt_json_then_valid_refreshes_cache(self, tmp_path, monkeypatch):
+        """Empty-dict from corrupt JSON is cached and then invalidated when mtime bumps.
+
+        Verifies two distinct behaviors:
+        1. {} is a legitimate cached value (not a cache-skipping sentinel): a second call
+           with unchanged mtime must not re-invoke load_task_tree.
+        2. Bumping st_mtime_ns by 1s causes the next call to pick up the valid content,
+           distinct from test_mtime_change_invalidates_cache where both sides are valid.
+        """
+        import os
+
+        import dashboard.data.merge_queue as _mq
+        from dashboard.data.merge_queue import _load_task_titles_cached, load_task_titles
+
+        _load_task_titles_cached.cache_clear()
+
+        tasks_path = tmp_path / 'tasks.json'
+        tasks_path.write_text('{ invalid json ]')
+
+        call_count = 0
+        original_load_task_tree = _mq.load_task_tree
+
+        def counting_load_task_tree(path):
+            nonlocal call_count
+            call_count += 1
+            return original_load_task_tree(path)
+
+        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
+
+        result_corrupt = load_task_titles(tasks_path)
+        assert result_corrupt == {}, f"corrupt JSON should return {{}}, got {result_corrupt!r}"
+
+        # Second call with unchanged mtime must hit the cache — {} is not a sentinel
+        result_corrupt2 = load_task_titles(tasks_path)
+        assert result_corrupt2 == {}
+        assert call_count == 1, (
+            f"load_task_tree called {call_count} time(s) for two reads with unchanged mtime; "
+            "expected 1 (empty dict must be a legitimate cached value, not a sentinel)"
+        )
+
+        # Overwrite with valid content and bump mtime by 1s to guarantee a distinct cache key.
+        # Capture stat before the overwrite so the bump is relative to the corrupt-JSON mtime;
+        # 1_000_000_000 ns = 1 s ensures the delta is honored even on second-resolution filesystems.
+        stat = os.stat(tasks_path)
+        self._write_tasks_json(tasks_path, [{'id': 1, 'title': 'A'}])
+        os.utime(tasks_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+        result_valid = load_task_titles(tasks_path)
+        assert result_valid == {'1': 'A'}, (
+            f"after mtime bump to valid content, expected {{'1': 'A'}}, got {result_valid!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestBuildPerProjectMergeQueue (step-9)
@@ -2526,4 +1699,199 @@ class TestBuildPerProjectMergeQueue:
         data = result['/tmp/nofile']
         assert data['latency']['count'] == 0
         assert data['recent'] == []
+
+    async def test_mixed_real_and_none_dbs(self, tmp_path):
+        """Mixed (pid, real_conn) and (pid, None) entries all appear in the result.
+
+        Guards the parallel gather path: a None-db project must not raise and
+        must not suppress or crash the real-db project alongside it.
+        """
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'real.db', [])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            project_dbs = [
+                ('/tmp/real', conn),
+                ('/tmp/none', None),
+            ]
+            result = await build_per_project_merge_queue(
+                project_dbs, hours=24, now=now, recent_window_minutes=15,
+            )
+
+        # Both pids present — None entry must not be dropped
+        assert set(result.keys()) == {'/tmp/real', '/tmp/none'}
+
+        # None-db entry produces defaults without crashing
+        none_data = result['/tmp/none']
+        assert none_data['latency']['count'] == 0
+        assert none_data['recent'] == []
+
+        # Real-db entry has the expected top-level keys
+        real_data = result['/tmp/real']
+        assert set(real_data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
+
+    async def test_per_project_queries_run_concurrently(self, tmp_path):
+        """All N per-project gathers must run concurrently (peak-in-flight == N).
+
+        Patches ``outcome_distribution`` with a fake that:
+        - Increments an in-flight counter on entry and tracks the peak.
+        - Sets ``all_entered`` when in_flight reaches N.
+        - Blocks on a ``release`` event before returning.
+
+        On the sequential for-loop implementation only one project enters at a
+        time so ``all_entered`` is never set → TimeoutError → test fails.
+        On the parallel ``asyncio.gather`` implementation all N enter before
+        any returns → ``all_entered`` fires → test passes.
+        """
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        N = 3
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db_paths = [_make_db(tmp_path, f'c{i}.db', []) for i in range(N)]
+
+        all_entered = asyncio.Event()
+        release = asyncio.Event()
+        counter = [0]        # mutable via list to allow mutation in closure
+        max_in_flight = [0]
+
+        async def fake_outcome_distribution(db, *, hours=24, now=None):
+            counter[0] += 1
+            if counter[0] > max_in_flight[0]:
+                max_in_flight[0] = counter[0]
+            if counter[0] == N:
+                all_entered.set()
+            await release.wait()
+            counter[0] -= 1
+            return {'labels': [], 'values': []}
+
+        async with (
+            aiosqlite.connect(str(db_paths[0])) as c0,
+            aiosqlite.connect(str(db_paths[1])) as c1,
+            aiosqlite.connect(str(db_paths[2])) as c2,
+        ):
+            c0.row_factory = aiosqlite.Row
+            c1.row_factory = aiosqlite.Row
+            c2.row_factory = aiosqlite.Row
+            project_dbs = [(f'/tmp/P{i}', c) for i, c in enumerate([c0, c1, c2])]
+
+            with patch(
+                'dashboard.data.merge_queue.outcome_distribution',
+                new=fake_outcome_distribution,
+            ):
+                task = asyncio.create_task(
+                    build_per_project_merge_queue(
+                        project_dbs, hours=24, now=now, recent_window_minutes=15,
+                    )
+                )
+                try:
+                    # Fails (TimeoutError) on sequential implementation;
+                    # succeeds immediately on parallel implementation.
+                    await asyncio.wait_for(all_entered.wait(), timeout=2.0)
+                except TimeoutError:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    raise
+                release.set()
+                result = await task
+
+        assert max_in_flight[0] == N, (
+            f'Expected {N} per-project gathers in-flight concurrently, '
+            f'but peak was {max_in_flight[0]}'
+        )
+        assert set(result.keys()) == {f'/tmp/P{i}' for i in range(N)}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('recent_window_minutes,expected_hours', [
+        (15, 1),
+        (60, 1),
+        (90, 2),
+        (120, 2),
+    ])
+    async def test_recent_merges_called_with_ceil_hours_and_no_limit(
+        self, tmp_path, recent_window_minutes, expected_hours,
+    ):
+        """build_per_project_merge_queue calls recent_merges with hours=ceil(window/60) and limit=None.
+
+        Parametrized over recent_window_minutes ∈ {15, 60, 90, 120} to lock in
+        the max(1, ceil(x/60)) semantics.  Fails on the pre-fix implementation
+        which passes limit=50 and hours=<outer dashboard window>.
+        """
+        from unittest.mock import patch
+
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'p.db', [])
+
+        captured_kwargs: dict = {}
+
+        async def fake_recent_merges(db, **kwargs):
+            captured_kwargs.update(kwargs)
+            return []
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with patch('dashboard.data.merge_queue.recent_merges', new=fake_recent_merges):
+                await build_per_project_merge_queue(
+                    [('/tmp/P', conn)],
+                    hours=24,
+                    now=now,
+                    recent_window_minutes=recent_window_minutes,
+                )
+
+        assert captured_kwargs.get('limit') is None, (
+            f'Expected limit=None, got limit={captured_kwargs.get("limit")!r}'
+        )
+        assert captured_kwargs.get('hours') == expected_hours, (
+            f'recent_window_minutes={recent_window_minutes}: '
+            f'expected hours={expected_hours}, got hours={captured_kwargs.get("hours")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_burst_exceeding_50_within_window_not_dropped(self, tmp_path):
+        """60 merge_attempt events within the 15-min window are all returned (none silently dropped).
+
+        This is the end-to-end regression gate: the old limit=50 call would silently
+        truncate a burst of >50 events even if every event was within recent_window_minutes.
+        With the fix (limit=None + SQL hours window), all 60 events survive the pipeline.
+        """
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        # 60 events spread across the last ~14 minutes (14s apart), all within 15-min window.
+        events = [
+            {
+                'event_type': 'merge_attempt',
+                'timestamp': now - timedelta(seconds=i * 14),
+                'task_id': f'burst-task-{i:03d}',
+                'run_id': f'burst-run-{i:03d}',
+                'data': {'outcome': 'done'},
+                'duration_ms': 500 + i,
+            }
+            for i in range(60)
+        ]
+        db_path = _make_db(tmp_path, 'burst.db', events)
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue(
+                [('/tmp/P', conn)],
+                hours=24,
+                now=now,
+                recent_window_minutes=15,
+            )
+
+        recent = result['/tmp/P']['recent']
+        assert len(recent) == 60, (
+            f'Expected 60 rows in recent burst, got {len(recent)}. '
+            'The SQL LIMIT cap must not silently truncate burst events within the window.'
+        )
+        returned_task_ids = {r['task_id'] for r in recent}
+        expected_task_ids = {f'burst-task-{i:03d}' for i in range(60)}
+        assert returned_task_ids == expected_task_ids, (
+            f'Missing task_ids: {expected_task_ids - returned_task_ids}'
+        )
 

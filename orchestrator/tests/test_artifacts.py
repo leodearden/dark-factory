@@ -368,6 +368,25 @@ class TestPlanLock:
         assert 'locked_at' in lock_data
         assert lock_data['owner_pid'] == os.getpid()
 
+    def test_lock_plan_raises_when_owner_pid_invalid(
+        self, artifacts: TaskArtifacts, monkeypatch
+    ):
+        """lock_plan must raise ValueError and leave no plan.lock if os.getpid() returns non-int."""
+        monkeypatch.setattr('orchestrator.artifacts.os.getpid', lambda: None)
+        lock_path = artifacts.root / 'plan.lock'
+
+        with pytest.raises(ValueError, match=r'owner_pid.*non-null int'):
+            artifacts.lock_plan('session-abc')
+
+        # No partial plan.lock should be left behind
+        assert not lock_path.exists(), 'plan.lock must be cleaned up after failed lock_plan'
+
+        # A subsequent call (with a real pid) must succeed — no persistent poison-pill
+        monkeypatch.undo()
+        result = artifacts.lock_plan('session-abc')
+        assert result is True
+        assert lock_path.exists()
+
 
 class TestReviews:
     def test_write_and_read_reviews(self, artifacts: TaskArtifacts):

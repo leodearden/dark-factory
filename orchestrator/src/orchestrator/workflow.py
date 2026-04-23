@@ -37,12 +37,9 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment, files_to_modules, normalize_lock
-from orchestrator.task_status import (
-    TERMINAL_STATUSES,
-    WORKFLOW_PRESERVE_STATUSES,
-)
+from orchestrator.task_status import TERMINAL_STATUSES
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
-from orchestrator.verify import run_scoped_verification
+from orchestrator.verify import VerifyResult, run_scoped_verification
 
 # Orchestrator package directory — used to resolve ``uv run --project`` for
 # the plan-tools stdio MCP server.
@@ -71,12 +68,18 @@ if TYPE_CHECKING:
 
 class _SchedulerLike(Protocol):
     async def set_task_status(
-        self, task_id: str, status: str, /, *, done_provenance: dict | None = ...
+        self,
+        task_id: str,
+        status: str,
+        /,
+        *,
+        done_provenance: dict | None = ...,
+        reopen_reason: str | None = ...,
     ) -> None: ...
     async def handle_blast_radius_expansion(
         self, task_id: str, current: list[str], needed: list[str], /
     ) -> bool: ...
-    def get_cached_status(self, task_id: str, /) -> str | None: ...
+    async def get_status(self, task_id: str, /) -> str | None: ...
 
 
 class _McpLike(Protocol):
@@ -258,6 +261,7 @@ class TaskWorkflow:
         self._old_plan_base: str | None = None  # base commit from prior session (for revalidation diff)
         self._merge_sha: str | None = None  # merge commit SHA set by _submit_to_merge_queue on success
         self._last_invoked_role: str | None = None  # role of the last successful invocation
+        self._last_verify_result: VerifyResult | None = None  # most recent failing VerifyResult from _verify_debugfix_loop
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -1061,7 +1065,8 @@ class TaskWorkflow:
             if verify_outcome == WorkflowOutcome.ESCALATED:
                 return WorkflowOutcome.ESCALATED
             if verify_outcome == WorkflowOutcome.BLOCKED:
-                return await self._mark_blocked('Verification attempts exhausted')
+                detail = self._last_verify_result.failure_report() if self._last_verify_result else ''
+                return await self._mark_blocked('Verification attempts exhausted', detail=detail)
 
             # REVIEW
             self._enter_phase(WorkflowState.REVIEW)
@@ -1437,6 +1442,8 @@ class TaskWorkflow:
 
         while True:
             result = await run_scoped_verification(self.worktree, self.config, self._module_configs, task_files=self._task_files)
+            if not result.passed:
+                self._last_verify_result = result
             if result.passed:
                 return WorkflowOutcome.DONE
 
@@ -2530,28 +2537,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                               'severity': 'blocking', 'summary': reason[:200]},
                     )
 
-            # Snapshot status before steward runs so we can distinguish the
-            # 'blocked' _mark_blocked just wrote from a 'blocked' the steward
-            # deliberately re-asserts.  The preserve check below is positioned
-            # after the branch-merged fast-path so it can't clobber a genuine
-            # DONE transition, and after the L1 guard so ESCALATED still wins.
-            cached_before_steward = self.scheduler.get_cached_status(self.task_id)
-
             # Give the steward a chance to resolve the escalation
             await self._ensure_steward_started()
             if self._steward:
                 await self._await_steward_completion()
 
-                # Guard: steward may have marked the task done (terminal).
-                # The scheduler rejects done→pending, but we must also
-                # return the correct outcome.
-                cached = self.scheduler.get_cached_status(self.task_id)
-                if cached in TERMINAL_STATUSES:
+                # Single fresh read of the store — replaces the old cached
+                # scheduler snapshots. Server-side terminal guard rejects
+                # done→pending, but we still need the correct workflow
+                # outcome.
+                current = await self.scheduler.get_status(self.task_id)
+                if current in TERMINAL_STATUSES:
                     logger.info(
                         'Task %s: status is %s after steward — not re-queueing',
-                        self.task_id, cached,
+                        self.task_id, current,
                     )
-                    if cached == 'done':
+                    if current == 'done':
                         self._enter_phase(WorkflowState.DONE)
                         return WorkflowOutcome.DONE
                     return WorkflowOutcome.BLOCKED
@@ -2647,25 +2648,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                                     self.task_id, exc_info=True,
                                 )
 
-                    # Preserve steward-set deferred/blocked.  If the cached
-                    # status differs from the snapshot taken before the
-                    # steward ran, AND the new value is in the preserve set,
-                    # the steward deliberately chose that status — do not
-                    # auto-requeue on top of it.  Note: 'blocked' == 'blocked'
-                    # (our own write, steward left alone) still falls through
-                    # here so the historic requeue behaviour is preserved for
-                    # the "steward resolved L0 without touching status" path.
-                    cached_after_steward = self.scheduler.get_cached_status(
-                        self.task_id,
-                    )
-                    if (
-                        cached_after_steward in WORKFLOW_PRESERVE_STATUSES
-                        and cached_after_steward != cached_before_steward
-                    ):
+                    # Preserve steward-set deferred. Terminal statuses (done,
+                    # cancelled) were caught earlier via ``current``; blocked
+                    # intentionally falls through to requeue because the
+                    # orchestrator's own _mark_blocked wrote it and the steward
+                    # leaving it alone is indistinguishable from re-asserting
+                    # it. 'deferred' is the one case the steward chooses
+                    # explicitly that we must not overwrite.
+                    if current == 'deferred':
                         logger.info(
-                            'Task %s: steward set status to %s — preserving, '
-                            'skipping auto-requeue',
-                            self.task_id, cached_after_steward,
+                            'Task %s: steward set status to deferred — '
+                            'preserving, skipping auto-requeue',
+                            self.task_id,
                         )
                         return WorkflowOutcome.BLOCKED
 

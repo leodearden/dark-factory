@@ -119,6 +119,11 @@ class TaskKnowledgeSync(BaseStage):
                 f'{format_task_list(sample)}\n'
             )
 
+        flagged_text, stage1_render_count = _format_flagged(
+            stage1_report.items_flagged if stage1_report else [],
+            run_stage='stage2',
+        )
+
         return f"""## Stage 2: Task-Knowledge Sync
 ## Project: {self.project_id}
 
@@ -126,7 +131,7 @@ class TaskKnowledgeSync(BaseStage):
 {_format_report(stage1_report)}
 
 ### Stage 1 Flagged Items (Task-Relevant)
-{_format_flagged(stage1_report.items_flagged if stage1_report else [])}
+{flagged_text}
 
 {format_filtered_task_tree(filtered)}
 
@@ -238,6 +243,8 @@ class IntegrityCheck(BaseStage):
         if stage2_report:
             flagged.extend(stage2_report.items_flagged)
 
+        flagged_text, _ = _format_flagged(flagged, run_stage='stage3')
+
         return f"""## Stage 3: Cross-System Integrity Check
 ## Project: {self.project_id}
 
@@ -248,7 +255,7 @@ class IntegrityCheck(BaseStage):
 {_format_report(stage2_report)}
 
 ### Items Flagged for Cross-System Verification ({len(flagged)})
-{_format_flagged(flagged)}
+{flagged_text}
 
 ## Your Task
 Verify consistency across all three systems:
@@ -276,15 +283,68 @@ def _format_report(report: StageReport | None) -> str:
     )
 
 
-def _format_flagged(items: list[dict]) -> str:
+_FLAGGED_ITEMS_CHAR_BUDGET = 40_000
+
+
+def _format_flagged(
+    items: list[dict],
+    *,
+    budget_chars: int = _FLAGGED_ITEMS_CHAR_BUDGET,
+    run_stage: str | None = None,
+) -> tuple[str, int]:
+    """Render flagged items as a bullet list, capped by *budget_chars*.
+
+    Returns ``(text, rendered_count)`` where *rendered_count* is the number of
+    items whose JSON appears in full in *text*.  Emits a single structured
+    ``logger.warning`` when the budget truncates items.
+
+    When *run_stage* is provided it is embedded in the warning's ``extra`` dict
+    so ops can correlate the drop to its call site without a separate
+    stage-specific shortfall warning.
+
+    Edge case: if the very first item's JSON alone exceeds *budget_chars*, a
+    truncated fragment is always rendered (with a ``… [item truncated]`` marker)
+    so the LLM receives at least some signal rather than an opaque footer-only
+    body.
+    """
     if not items:
-        return 'No flagged items.'
-    lines = []
-    for item in items[:50]:
-        lines.append(f'- {json.dumps(item, default=str)}')
-    if len(items) > 50:
-        lines.append(f'... and {len(items) - 50} more')
-    return '\n'.join(lines)
+        return ('No flagged items.', 0)
+    lines: list[str] = []
+    running_chars = 0
+    rendered_count = 0
+    for item in items:
+        line = f'- {json.dumps(item, default=str)}'
+        # +1 for the '\n' separator between lines
+        separator = 1 if lines else 0
+        if running_chars + separator + len(line) > budget_chars:
+            # Budget exceeded — stop and emit a truncation footer + warning.
+            if rendered_count == 0:
+                # First item alone exceeds the budget.  Always show at least a
+                # truncated fragment so the LLM has some signal rather than an
+                # opaque footer-only body.
+                marker = '… [item truncated]'
+                available = budget_chars - len('- ') - len(marker)
+                if available > 0:
+                    json_str = json.dumps(item, default=str)
+                    lines.append(f'- {json_str[:available]}{marker}')
+                    rendered_count = 1
+            dropped = len(items) - rendered_count
+            if dropped > 0:
+                lines.append(f'... and {dropped} more (truncated: char budget)')
+            extra: dict = {
+                'total': len(items),
+                'rendered': rendered_count,
+                'dropped': dropped,
+                'budget_chars': budget_chars,
+            }
+            if run_stage is not None:
+                extra['run_stage'] = run_stage
+            logger.warning('reconciliation.flagged_items_truncated', extra=extra)
+            return ('\n'.join(lines), rendered_count)
+        lines.append(line)
+        running_chars += separator + len(line)
+        rendered_count += 1
+    return ('\n'.join(lines), rendered_count)
 
 
 async def _render_done_provenance_section(
