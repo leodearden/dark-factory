@@ -128,8 +128,8 @@ class TestArchiveCli:
         assert result == 0
         assert not old_dir.exists()
         assert any(
-            'Pruned 1 archive dir(s) older than 30 days' in r.message for r in caplog.records
-        ), f'Expected pruned-count log; got: {[r.message for r in caplog.records]}'
+            'Pruned 1 archive dir(s) older than 30 days' in r.getMessage() for r in caplog.records
+        ), f'Expected pruned-count log; got: {[r.getMessage() for r in caplog.records]}'
 
     def test_cli_missing_queue_dir_returns_2_and_logs_error(self, tmp_path: Path, caplog):
         """archive.main() returns 2 and logs an error when --queue-dir does not exist."""
@@ -140,8 +140,8 @@ class TestArchiveCli:
 
         assert result == 2
         assert any(
-            'queue-dir does not exist' in r.message for r in caplog.records
-        ), f'Expected missing-dir error log; got: {[r.message for r in caplog.records]}'
+            'queue-dir does not exist' in r.getMessage() for r in caplog.records
+        ), f'Expected missing-dir error log; got: {[r.getMessage() for r in caplog.records]}'
 
     def test_main_block_shell_exit_code_is_2_for_missing_queue_dir(self):
         """The __main__ guard propagates main()'s return value via sys.exit().
