@@ -819,3 +819,179 @@ async def test_close_drains_worker_and_closes_store(
     # Subsequent submit_task should raise or return an error (closed guard).
     result = await ti.submit_task('/project', title='AfterClose')
     assert 'error' in result, f'submit_task after close should return an error: {result}'
+
+
+# ---------------------------------------------------------------------------
+# step-65: post-create failure still resolves as created (partial-success)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_post_create_failure_still_resolves_as_created(
+    interceptor_with_store, ticket_store, taskmaster, event_buffer,
+):
+    """Regression: if note_created raises AFTER tm.add_task succeeds, the ticket
+    must still resolve as status='created' (NOT 'failed').
+
+    Under the OLD code, the outer ``except Exception`` catches the note_created
+    RuntimeError, clobbers ``status`` back to ``'failed'``, and sets
+    ``result_dict = None`` — stranding the created task and causing duplicate-on-retry.
+
+    Under the FIXED code, ``status`` is latched to ``'created'`` and ``task_id``
+    set immediately after ``tm.add_task`` returns; subsequent failures only
+    append to ``result_dict['post_create_warnings']``.
+    """
+    from fused_memory.models.reconciliation import EventType
+
+    # Wire a mock task_committer so _schedule_commit fires
+    mock_committer = MagicMock()
+    mock_committer.commit = AsyncMock(return_value=None)
+    interceptor_with_store.task_committer = mock_committer
+
+    # Capture journal calls
+    journal_calls = []
+    original_journal = interceptor_with_store._journal
+
+    async def capturing_journal(event):
+        journal_calls.append(event)
+        return await original_journal(event)
+
+    interceptor_with_store._journal = capturing_journal
+
+    mock_curator = MagicMock()
+    mock_curator.curate = AsyncMock(return_value=CuratorDecision(action='create'))
+    mock_curator.note_created = MagicMock(side_effect=RuntimeError('embed broke'))
+    mock_curator.record_task = AsyncMock()
+
+    with patch.object(
+        type(interceptor_with_store), '_get_curator',
+        new=AsyncMock(return_value=mock_curator),
+    ):
+        result = await interceptor_with_store.submit_task(
+            project_root='/project',
+            title='PostCreateFailure Test',
+            description='note_created will fail',
+        )
+        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+        ticket_id = result['ticket']
+
+        await asyncio.sleep(0.2)
+
+    # (1) tm.add_task was called exactly once
+    taskmaster.add_task.assert_called_once()
+
+    # (2) Ticket row ends with status='created' (NOT 'failed')
+    row = await ticket_store.get(ticket_id)
+    assert row is not None
+    assert row['status'] == 'created', (
+        f'Expected status=created after note_created failure, got {row["status"]!r}'
+    )
+
+    # (3) task_id matches tm.add_task return ('42')
+    assert row['task_id'] == '42', f'Expected task_id=42, got {row["task_id"]!r}'
+
+    # (4) result_json has post_create_warnings mentioning 'embed broke' and 'note_created'
+    assert row['result_json'] is not None, 'result_json should be set on partial success'
+    result_data = json.loads(row['result_json'])
+    warnings_list = result_data.get('post_create_warnings', [])
+    assert warnings_list, f'post_create_warnings should be non-empty: {result_data}'
+    warning_text = str(warnings_list)
+    assert 'embed broke' in warning_text, (
+        f'warning should mention embed broke: {warning_text}'
+    )
+    assert 'note_created' in warning_text, (
+        f'warning should mention note_created stage: {warning_text}'
+    )
+
+    # (5) Exactly one task_created event was emitted
+    task_created_events = [
+        e for e in journal_calls
+        if hasattr(e, 'type') and e.type == EventType.task_created
+    ]
+    assert len(task_created_events) == 1, (
+        f'Expected 1 task_created event despite post-create failure: {task_created_events}'
+    )
+
+    # (6) task_committer.commit was scheduled with operation='add_task'
+    mock_committer.commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_worker_record_task_failure_still_resolves_as_created(
+    interceptor_with_store, ticket_store, taskmaster, event_buffer,
+):
+    """Regression: if record_task raises AFTER tm.add_task succeeds, the ticket
+    must still resolve as status='created'.
+
+    Sibling test to test_worker_post_create_failure_still_resolves_as_created —
+    confirms the same partial-success guarantee applies to the second post-create
+    site (``curator.record_task``).
+    """
+    from fused_memory.models.reconciliation import EventType
+
+    mock_committer = MagicMock()
+    mock_committer.commit = AsyncMock(return_value=None)
+    interceptor_with_store.task_committer = mock_committer
+
+    journal_calls = []
+    original_journal = interceptor_with_store._journal
+
+    async def capturing_journal(event):
+        journal_calls.append(event)
+        return await original_journal(event)
+
+    interceptor_with_store._journal = capturing_journal
+
+    mock_curator = MagicMock()
+    mock_curator.curate = AsyncMock(return_value=CuratorDecision(action='create'))
+    mock_curator.note_created = MagicMock()
+    mock_curator.record_task = AsyncMock(side_effect=RuntimeError('record broke'))
+
+    with patch.object(
+        type(interceptor_with_store), '_get_curator',
+        new=AsyncMock(return_value=mock_curator),
+    ):
+        result = await interceptor_with_store.submit_task(
+            project_root='/project',
+            title='RecordTaskFailure Test',
+            description='record_task will fail',
+        )
+        assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
+        ticket_id = result['ticket']
+
+        await asyncio.sleep(0.2)
+
+    # (1) tm.add_task was called exactly once
+    taskmaster.add_task.assert_called_once()
+
+    # (2) Ticket row ends with status='created' (NOT 'failed')
+    row = await ticket_store.get(ticket_id)
+    assert row is not None
+    assert row['status'] == 'created', (
+        f'Expected status=created after record_task failure, got {row["status"]!r}'
+    )
+
+    # (3) task_id matches tm.add_task return ('42')
+    assert row['task_id'] == '42', f'Expected task_id=42, got {row["task_id"]!r}'
+
+    # (4) result_json has post_create_warnings mentioning 'record broke'
+    assert row['result_json'] is not None, 'result_json should be set on partial success'
+    result_data = json.loads(row['result_json'])
+    warnings_list = result_data.get('post_create_warnings', [])
+    assert warnings_list, f'post_create_warnings should be non-empty: {result_data}'
+    warning_text = str(warnings_list)
+    assert 'record broke' in warning_text, (
+        f'warning should mention record broke: {warning_text}'
+    )
+
+    # (5) Exactly one task_created event was emitted
+    task_created_events = [
+        e for e in journal_calls
+        if hasattr(e, 'type') and e.type == EventType.task_created
+    ]
+    assert len(task_created_events) == 1, (
+        f'Expected 1 task_created event despite record_task failure: {task_created_events}'
+    )
+
+    # (6) task_committer.commit was scheduled
+    mock_committer.commit.assert_called_once()
