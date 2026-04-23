@@ -345,3 +345,79 @@ async def test_per_project_isolation(tmp_path):
         f'proj-b 4th: expected rejection, got {vb4.outcome}'
     )
     assert vb4.project_id == 'proj-b'
+
+
+# ---------------------------------------------------------------------------
+# step-13: L1 escalation file written on trip
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_emits_l1_escalation_on_trip(tmp_path):
+    """When the guard trips, an L1 escalation JSON is written and the verdict
+    carries outcome=='escalated' with escalation_path pointing to the file."""
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    task_ids = ['t1', 't2', 't3', 't4']
+
+    # First three: ok
+    for tid in task_ids[:3]:
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='proj-esc',
+            task_id=tid,
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'{tid}: expected ok'
+
+    # Fourth: should escalate
+    clock[0] += 1.0
+    v4 = await guard.observe_attempt(
+        project_id='proj-esc',
+        task_id='t4',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert v4.outcome == 'escalated', f'Expected escalated, got {v4.outcome}'
+    assert v4.escalation_path is not None
+
+    # File must exist
+    esc_file = Path(v4.escalation_path)
+    assert esc_file.exists(), f'Escalation file not found at {v4.escalation_path}'
+    assert str(esc_file).startswith(str(tmp_path / 'data' / 'escalations'))
+
+    # Parse and validate contents
+    data = json.loads(esc_file.read_text(encoding='utf-8'))
+    assert data['id'].startswith('esc-bulk-reset-')
+    assert data['task_id'] is None
+    assert data['agent_role'] == 'fused-memory'
+    assert data['severity'] == 'blocking'
+    assert data['category'] == 'infra_issue'
+    assert data['level'] == 1
+    assert data['status'] == 'pending'
+    assert data['workflow_state'] == 'infra'
+
+    # Guard-specific fields
+    assert set(data['affected_task_ids']) == set(task_ids)
+    assert len(data['affected_task_ids']) == 4
+    assert len(data['triggering_timestamps']) == 4
+    # Each triggering timestamp must be a parseable ISO string
+    from datetime import datetime
+    for ts_str in data['triggering_timestamps']:
+        datetime.fromisoformat(ts_str)  # raises if not parseable
+    assert data['threshold'] == 3
+    assert data['window_seconds'] == 60.0
+    assert data['project_id'] == 'proj-esc'
