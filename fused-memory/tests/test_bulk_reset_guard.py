@@ -597,15 +597,9 @@ def test_verdict_to_error_dict_rejection(threshold, window_seconds):
     assert d['success'] is False
     assert d['error_type'] == 'BulkResetGuardTripped'
     assert 'BulkResetGuardTripped' in d['error']
-    assert str(d['threshold']) in d['error'], (
-        f"error string {d['error']!r} should contain threshold {d['threshold']}"
-    )
-    assert str(d['window_seconds']) in d['error'], (
-        f"error string {d['error']!r} should contain window_seconds {d['window_seconds']}"
-    )
     # Bound-form assertions: pin the label prefix to avoid numeric substring coincidences.
-    # e.g. threshold=6 with window_seconds=60.0 — "6" would match "60" in "60.0s";
-    # "threshold 6" only appears in the right place.
+    # e.g. threshold=6 with window_seconds=60.0 — str(6)="6" would match "60" inside
+    # "60.0s", but "threshold 6" only appears in the right label position.
     assert f"threshold {d['threshold']}" in d['error'], (
         f"error string {d['error']!r} should contain bound form 'threshold {d['threshold']}'"
     )
