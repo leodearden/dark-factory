@@ -26,10 +26,11 @@ import json
 import logging
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
