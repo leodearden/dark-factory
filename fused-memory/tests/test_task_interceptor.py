@@ -62,10 +62,11 @@ async def interceptor_facade(taskmaster, reconciler, event_buffer, tmp_path):
     ti = TaskInterceptor(taskmaster, reconciler, event_buffer, ticket_store=store)
     yield ti
     await store.close()
-    if ti._worker_task and not ti._worker_task.done():
-        ti._worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await ti._worker_task
+    for t in list(ti._worker_tasks.values()):
+        if not t.done():
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t
 
 
 @pytest.mark.asyncio
@@ -359,10 +360,12 @@ async def test_add_task_falls_back_to_two_step_on_typeerror(event_buffer, tmp_pa
         assert kwargs['metadata'] == json.dumps(metadata)
     finally:
         await store.close()
-        if interceptor is not None and interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        if interceptor is not None:
+            for t in list(interceptor._worker_tasks.values()):
+                if not t.done():
+                    t.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await t
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -411,10 +414,11 @@ async def test_add_task_with_queue_persists_to_real_sqlite(taskmaster, tmp_path)
         assert qs['overflow_drops'] == 0
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for t in list(interceptor._worker_tasks.values()):
+            if not t.done():
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
         await queue.close()
         await buf.close()
 
@@ -475,10 +479,11 @@ async def test_add_task_hot_path_immunity_with_queue(taskmaster, tmp_path):
         assert in_system >= 1, f'event vanished from queue tracking: {stats}'
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for t in list(interceptor._worker_tasks.values()):
+            if not t.done():
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
         await queue.close()
 
 
@@ -505,10 +510,11 @@ async def curator_interceptor(taskmaster, reconciler, event_buffer, curator_enab
     )
     yield ti
     await store.close()
-    if ti._worker_task and not ti._worker_task.done():
-        ti._worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await ti._worker_task
+    for _wt in list(ti._worker_tasks.values()):
+        if not _wt.done():
+            _wt.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await _wt
 
 
 def _mock_curator(decision: CuratorDecision) -> MagicMock:
@@ -956,10 +962,11 @@ async def test_concurrent_add_task_produces_single_task(
         )
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
 
     # Exactly one created; the second is a pre-LLM drop pointing at the first.
     ids = {r['id'] for r in results}
@@ -1086,10 +1093,11 @@ async def test_idempotency_hit_skips_curator_and_returns_existing(
         )
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
 
     assert result['id'] == '555'
     assert result['deduplicated'] is True
@@ -1136,10 +1144,11 @@ async def test_idempotency_accepts_metadata_as_json_string(
         result = await interceptor.add_task('/project', title='T', metadata=meta_str)
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
     assert result['id'] == '555'
     assert result['action'] == 'idempotency_hit'
 
@@ -1181,10 +1190,11 @@ async def test_idempotency_miss_falls_through_to_curator(
         )
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
     curator_mock.curate.assert_called_once()
     taskmaster.add_task.assert_called_once()
 
@@ -1226,10 +1236,11 @@ async def test_idempotency_skips_cancelled_match(
         )
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
     curator_mock.curate.assert_called_once()
 
 
@@ -1256,10 +1267,11 @@ async def test_idempotency_requires_both_keys(
         )
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
     curator_mock.curate.assert_called_once()
     # get_tasks for the idempotency check should not have been invoked
     # because we bail before the walk when a key is missing.
@@ -1284,10 +1296,11 @@ async def test_curator_disabled_still_proxies(taskmaster, reconciler, event_buff
         result = await interceptor.add_task('/project', title='T')
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
 
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.add_task.assert_called_once()
@@ -1444,10 +1457,11 @@ async def test_event_roundtrip_preserves_both_ids(taskmaster, event_buffer, tmp_
         assert stats['size'] == 0
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
 
 
 # ── Tests for None / disconnected taskmaster ───────────────────────
@@ -2010,10 +2024,11 @@ async def interceptor_with_committer(taskmaster, reconciler, event_buffer, commi
     ti = TaskInterceptor(taskmaster, reconciler, event_buffer, committer, ticket_store=store)
     yield ti
     await store.close()
-    if ti._worker_task and not ti._worker_task.done():
-        ti._worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await ti._worker_task
+    for _wt in list(ti._worker_tasks.values()):
+        if not _wt.done():
+            _wt.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await _wt
 
 
 @pytest.mark.asyncio
@@ -2072,10 +2087,11 @@ async def test_no_committer_still_works(taskmaster, event_buffer, tmp_path):
         result = await interceptor.add_task('/project', prompt='T')
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
     assert result == {'id': '2', 'title': 'New Task'}
 
 
@@ -2179,10 +2195,11 @@ async def test_drain_awaits_pending_commits(taskmaster, event_buffer, tmp_path):
         assert len(interceptor._background_tasks) == 0
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -2294,10 +2311,11 @@ async def test_concurrent_add_task_burst_all_distinct(
         ])
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
 
     assert len(results) == N
     ids = {r['id'] for r in results}
@@ -2430,10 +2448,11 @@ async def test_two_projects_do_not_serialise(
         await asyncio.gather(*coros)
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
 
     # Per-project peak is 1 (write_lock serialises same-project ops).
     peak_a = tracker.peak.get(resolve_project_id('/projA'), 0)
@@ -2658,10 +2677,11 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
         )
     finally:
         await store.close()
-        if interceptor._worker_task and not interceptor._worker_task.done():
-            interceptor._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await interceptor._worker_task
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
     total_elapsed = asyncio.get_event_loop().time() - start
 
     # add_task ran the full curator → ~CURATOR_LATENCY_S

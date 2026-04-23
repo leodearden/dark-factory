@@ -119,9 +119,12 @@ class TaskInterceptor:
         # the curator lock sees the new entry on its pre-LLM check (R3).
         #
         # NOTE: add_task is NO LONGER in the _curator_locks scope.
-        # Serialisation for add_task is now provided by the single-worker
-        # ticket queue (_curator_worker), which processes tickets one at a
-        # time. This removes the long-held lock from the MCP hot path.
+        # Serialisation for add_task is now provided by per-project ticket
+        # queues and workers (_curator_worker) — one asyncio.Queue and one
+        # asyncio.Task per project_id.  Serialisation boundary matches the
+        # _curator_locks semantics: a slow curator round-trip on project A
+        # does not delay submissions on project B.  Within a project, tickets
+        # are processed one at a time so R3/R4 invariants are unchanged.
         # add_subtask and remove_task retain _curator_lock (routing them
         # through the worker queue is out-of-scope for this task).
         #
@@ -139,15 +142,15 @@ class TaskInterceptor:
         self._closed: bool = False
         # Two-phase ticket store: persists submitted tickets across restarts.
         self._ticket_store = ticket_store
-        # In-memory queue of ticket_ids pending worker processing. Lazily
-        # populated from submit_task; worker drains it one at a time so
-        # curator.curate() is called serially (no concurrent LLM calls per
-        # instance). Queue is created eagerly so submit_task can put() without
-        # waiting for the worker to start.
-        self._ticket_queue: asyncio.Queue[str] = asyncio.Queue()
-        # asyncio.Task handle for the curator worker. Lazily started on first
-        # submit_task call (when ticket_store is wired in). None until then.
-        self._worker_task: asyncio.Task | None = None
+        # Per-project in-memory queues of ticket_ids pending worker processing.
+        # Each project_id gets its own Queue so a slow curator on project A
+        # does not delay submissions on project B.  Queues are created lazily
+        # on first submit_task call (via setdefault) — no empty-queue overhead
+        # for projects that never use submit_task.
+        self._ticket_queues: dict[str, asyncio.Queue[str]] = {}
+        # Per-project asyncio.Task handles for the curator workers.  Keyed by
+        # project_id, lazily started on first submit_task for that project.
+        self._worker_tasks: dict[str, asyncio.Task] = {}
         # Per-ticket asyncio.Events: resolve_ticket registers one so the
         # worker can wake a waiting caller the moment a ticket is terminal.
         self._ticket_events: dict[str, asyncio.Event] = {}
@@ -276,10 +279,16 @@ class TaskInterceptor:
         # the worker — prevents a TOCTOU race between close() and submit_task().
         self._closed = True
 
-        # Cancel the curator worker so it stops blocking on curator.curate().
-        if self._worker_task is not None and not self._worker_task.done():
-            self._worker_task.cancel()
-            await asyncio.gather(self._worker_task, return_exceptions=True)
+        # Cancel all per-project curator workers so they stop blocking on
+        # curator.curate().  Gather all tasks regardless of done-state so we
+        # can detect any task that raised unexpectedly.
+        running_workers = [
+            t for t in self._worker_tasks.values() if not t.done()
+        ]
+        for t in running_workers:
+            t.cancel()
+        if running_workers:
+            await asyncio.gather(*running_workers, return_exceptions=True)
 
         # Wake all resolve_ticket callers that are waiting on an event so they
         # don't block forever after the worker has been cancelled.  The callers
@@ -1105,8 +1114,9 @@ class TaskInterceptor:
             candidate_json=blob,
             ttl_seconds=600,
         )
-        await self._ticket_queue.put(ticket_id)
-        self._start_worker_if_needed()
+        queue = self._ticket_queues.setdefault(project_id, asyncio.Queue())
+        await queue.put(ticket_id)
+        self._start_worker_if_needed(project_id)
         return {'ticket': ticket_id}
 
     async def resolve_ticket(
@@ -1191,33 +1201,42 @@ class TaskInterceptor:
             # _signal_ticket_event may have already popped it — no-op if so.
             self._ticket_events.pop(ticket, None)
 
-    def _start_worker_if_needed(self) -> None:
-        """Lazily start the curator worker asyncio.Task if not already running.
+    def _start_worker_if_needed(self, project_id: str) -> None:
+        """Lazily start the per-project curator worker asyncio.Task if not running.
 
-        The worker is intentionally NOT added to ``_background_tasks``: it is a
-        long-running infinite-loop task, not a fire-and-forget one.  Adding it
-        to ``_background_tasks`` would cause ``drain()`` to block forever.  The
-        worker's lifecycle is managed explicitly by ``close()``.
+        One worker per project_id so a slow LLM on project A does not delay
+        add_task traffic on project B.  Within a project, tickets are still
+        serialised (one curator.curate() at a time).
+
+        Workers are intentionally NOT added to ``_background_tasks``: they are
+        long-running infinite-loop tasks.  Adding them would cause ``drain()``
+        to block forever.  Lifecycle is managed explicitly by ``close()``.
         """
         if self._ticket_store is None:
             return
-        if self._worker_task is None or self._worker_task.done():
-            self._worker_task = asyncio.create_task(
-                self._curator_worker(),
-                name='task-interceptor-curator-worker',
+        existing = self._worker_tasks.get(project_id)
+        if existing is None or existing.done():
+            self._worker_tasks[project_id] = asyncio.create_task(
+                self._curator_worker(project_id),
+                name=f'task-interceptor-curator-worker-{project_id}',
             )
 
-    async def _curator_worker(self) -> None:
-        """Drain pending tickets from the queue one at a time.
+    async def _curator_worker(self, project_id: str) -> None:
+        """Drain pending tickets for *project_id* from its per-project queue.
 
         Processes tickets serially so ``curator.curate()`` is never called
-        concurrently — the key property that obsoletes ``_curator_lock`` on the
-        add_task path.  Lifecycle: cancellable; ``close()`` cancels the task
-        and awaits it so in-flight work is not silently dropped.
+        concurrently for the same project — the key property that obsoletes
+        ``_curator_lock`` on the add_task path.  Independent workers per
+        project restore the per-project fairness of the old curator_lock
+        approach: project B is never blocked by a slow LLM call for project A.
+
+        Lifecycle: cancellable; ``close()`` cancels all worker tasks and awaits
+        them so in-flight work is not silently dropped.
         """
+        queue = self._ticket_queues.setdefault(project_id, asyncio.Queue())
         try:
             while True:
-                ticket_id = await self._ticket_queue.get()
+                ticket_id = await queue.get()
                 try:
                     await self._process_add_ticket(ticket_id)
                 except Exception:
@@ -1230,7 +1249,7 @@ class TaskInterceptor:
                     # before it can call _signal_ticket_event itself.
                     self._signal_ticket_event(ticket_id)
                 finally:
-                    self._ticket_queue.task_done()
+                    queue.task_done()
         except asyncio.CancelledError:
             pass
 

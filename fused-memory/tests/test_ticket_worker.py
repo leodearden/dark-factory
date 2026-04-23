@@ -49,11 +49,14 @@ async def ticket_store(tmp_path):
 async def interceptor_with_store(taskmaster, event_buffer, ticket_store):
     ti = TaskInterceptor(taskmaster, None, event_buffer, ticket_store=ticket_store)
     yield ti
-    # Cancel worker if running
-    if ti._worker_task and not ti._worker_task.done():
-        ti._worker_task.cancel()
+    # Cancel all per-project workers if running
+    workers = list(ti._worker_tasks.values()) if hasattr(ti, '_worker_tasks') else []
+    for t in workers:
+        if not t.done():
+            t.cancel()
+    for t in workers:
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await ti._worker_task
+            await t
 
 
 # ---------------------------------------------------------------------------
@@ -803,15 +806,17 @@ async def test_close_drains_worker_and_closes_store(
     with patch.object(ti, '_get_curator', AsyncMock(return_value=mock_curator)):
         await ti.submit_task('/project', title='Test')
         # Worker is now running (blocked on curator).
-        assert ti._worker_task is not None
-        assert not ti._worker_task.done()
+        assert len(ti._worker_tasks) > 0, 'At least one worker should be started'
+        assert any(not t.done() for t in ti._worker_tasks.values()), (
+            'At least one worker should still be running'
+        )
 
         # Close should cancel the worker and close the store.
         await ti.close()
 
-    # Worker task should be done after close.
-    assert ti._worker_task is None or ti._worker_task.done(), (
-        'Worker task should be done after close()'
+    # All worker tasks should be done after close.
+    assert all(t.done() for t in ti._worker_tasks.values()), (
+        'All worker tasks should be done after close()'
     )
     # Ticket store should be closed.
     assert store._db is None, 'TicketStore._db should be None after close()'
@@ -1087,25 +1092,22 @@ async def test_per_project_ticket_queues_do_not_serialise(
                 f'{list(ti._worker_tasks.keys())}'
             )
             worker_names = {t.get_name() for t in ti._worker_tasks.values()}
-            assert any('project-a' in n for n in worker_names), (
-                f'Expected a worker named for project-a: {worker_names}'
+            # resolve_project_id converts hyphens to underscores: /project-a → project_a
+            assert any('project_a' in n for n in worker_names), (
+                f'Expected a worker named for project_a: {worker_names}'
             )
-            assert any('project-b' in n for n in worker_names), (
-                f'Expected a worker named for project-b: {worker_names}'
+            assert any('project_b' in n for n in worker_names), (
+                f'Expected a worker named for project_b: {worker_names}'
             )
 
     finally:
         # Clean up all per-project workers
         unblock_a.set()  # ensure worker-a is not stuck
-        if hasattr(ti, '_worker_tasks'):
-            tasks = list(ti._worker_tasks.values())
-        elif ti._worker_task is not None:
-            tasks = [ti._worker_task]
-        else:
-            tasks = []
+        tasks = list(ti._worker_tasks.values())
         for t in tasks:
             if not t.done():
                 t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         if ti._ticket_store is not None:
             await ti._ticket_store.close()
