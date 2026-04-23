@@ -3278,6 +3278,45 @@ class TestRunPrePlanRecovery:
             f'implementer was unexpectedly called: {stub.calls}'
         )
 
+    async def test_run_proceeds_to_plan_when_recovery_returns_none(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """workflow.run enters PLAN when branch has no prior work (recovery returns None).
+
+        Creates a stale-branch-point scenario: a fresh worktree where
+        wt_head == base_commit and there are no iteration entries — the
+        branch is an ancestor of main but has no implementation work.
+
+        _recover_if_already_merged() must return None (no prior work), so
+        the workflow proceeds to PLAN normally and the architect IS called.
+
+        Pins that the pre-PLAN recovery is non-destructive: it only
+        short-circuits DONE when prior work exists, never on a stale branch.
+        """
+        # Fresh worktree — workflow.run() creates it; no pre-create needed.
+        # wt_head == base_commit (no commits), no iterations.jsonl → recovery None.
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        outcome = await workflow.run()
+
+        # Outcome should be DONE via the normal PLAN → EXECUTE → MERGE path
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE via normal flow but got {outcome!r}'
+        )
+        # PLAN phase was entered — architect was called
+        assert 'architect' in stub.calls, (
+            f'Expected architect to be called (PLAN entered) but stub.calls={stub.calls!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # File-structure invariants
