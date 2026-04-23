@@ -3468,3 +3468,71 @@ class TestMergeWorkerDequeueEvent:
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestSpeculativeMergeWorkerDequeueEvent — step-7
+# ---------------------------------------------------------------------------
+
+
+class TestSpeculativeMergeWorkerDequeueEvent:
+    """SpeculativeMergeWorker emits merge_dequeued after dequeuing a request."""
+
+    @pytest.mark.asyncio
+    async def test_speculative_worker_emits_merge_dequeued_after_dequeue(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """SpeculativeMergeWorker emits merge_dequeued after dequeuing.
+
+        Uses an immediate conflict path (merge_to_main returns conflicts=True)
+        so the test is fast and doesn't need real git merge work.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import enqueue_merge_request
+        from orchestrator.git_ops import MergeResult
+
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        # Use a real worktree so rev-parse HEAD works
+        wt = await _make_branch_with_file(
+            git_ops, 'spec-deq', 'spec_deq.py', 'x = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
+        worker._shutdown_timeout = 2.0
+
+        # Force an immediate conflict so the merger resolves quickly
+        conflict_result = MergeResult(
+            success=False, conflicts=True, details='conflict',
+            merge_worktree=None, merge_commit=None, pre_merge_sha=None,
+        )
+
+        worker_task = asyncio.create_task(worker.run())
+        with patch.object(git_ops, 'merge_to_main', return_value=conflict_result):
+            req = _make_request('spec-deq', 'spec-deq', wt, config)
+            await enqueue_merge_request(queue, req, event_store)
+            outcome = await asyncio.wait_for(req.result, timeout=10)
+
+        assert outcome.status == 'conflict'
+
+        conn = sqlite3.connect(str(db_path))
+        dequeued_rows = conn.execute(
+            "SELECT event_type, task_id, timestamp FROM events "
+            "WHERE event_type = 'merge_dequeued'"
+        ).fetchall()
+        queued_rows = conn.execute(
+            "SELECT timestamp FROM events WHERE event_type = 'merge_queued'"
+        ).fetchall()
+        conn.close()
+
+        assert len(dequeued_rows) == 1, f'Expected 1 merge_dequeued row, got: {dequeued_rows}'
+        assert dequeued_rows[0][1] == 'spec-deq'
+        # merge_dequeued timestamp must be >= merge_queued timestamp
+        assert len(queued_rows) == 1
+        assert dequeued_rows[0][2] >= queued_rows[0][0]
+
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
