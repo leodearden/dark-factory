@@ -70,10 +70,19 @@ class EscalationQueue:
         return escalation.id
 
     def get(self, escalation_id: str) -> Escalation | None:
-        """Read a single escalation by ID."""
+        """Read a single escalation by ID.
+
+        Falls back to the archive directory when the file is not in the
+        queue root (i.e. the escalation has been resolved and archived).
+        """
         path = self.queue_dir / f'{escalation_id}.json'
         if not path.exists():
-            return None
+            # Fall back to archive: search all dated subdirs.
+            archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
+            candidates = list(archive_root.rglob(f'{escalation_id}.json'))
+            if not candidates:
+                return None
+            path = candidates[0]
         try:
             return Escalation.from_json(path.read_text())
         except (json.JSONDecodeError, KeyError, TypeError) as e:
