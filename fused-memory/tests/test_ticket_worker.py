@@ -1771,3 +1771,98 @@ class TestCuratorWorkerBatchDrain:
         assert lock_acquired_while_batch_running, (
             '_curator_lock was NOT locked during curate_batch — lock not held across batch'
         )
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_three_tickets_one_llm_call_all_resolve_correctly(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """End-to-end: 3 tickets pre-queued, one curate_batch call, all resolve.
+
+        Decisions: [create, drop-to-existing, create].
+        Expected: curate_batch called once, curate called zero times,
+        taskmaster.add_task called twice (for the two 'create' items),
+        all 3 tickets resolve to their expected status + task_id.
+
+        Tickets are submitted to the store and queue pre-filled before the
+        worker starts, ensuring all 3 land in the same batch (same pattern
+        as test_worker_drains_up_to_batch_max_then_calls_curate_batch_once).
+        """
+        project_id = 'project'
+        existing_task_id = 'existing-99'
+
+        # Three decisions: create, drop (to existing task), create
+        mock_curator = MagicMock()
+        mock_curator.curate = AsyncMock()  # should NOT be called
+        mock_curator.curate_batch = AsyncMock(return_value=[
+            CuratorDecision(action='create', justification='new task A'),
+            CuratorDecision(action='drop', target_id=existing_task_id,
+                            justification='duplicate of existing'),
+            CuratorDecision(action='create', justification='new task C'),
+        ])
+        mock_curator.note_created = MagicMock()
+        mock_curator.record_task = AsyncMock()
+
+        # add_task is called once per 'create' decision
+        task_a = {'id': 'task-a', 'title': 'Task A'}
+        task_c = {'id': 'task-c', 'title': 'Task C'}
+        taskmaster.add_task = AsyncMock(side_effect=[task_a, task_c])
+
+        # Submit all 3 tickets to the store and pre-fill the queue
+        # before starting the worker so they all land in one batch.
+        t1 = await ticket_store.submit(project_id, self._make_candidate_json('Task A'))
+        t2 = await ticket_store.submit(project_id, self._make_candidate_json('Task B'))
+        t3 = await ticket_store.submit(project_id, self._make_candidate_json('Task C'))
+
+        queue = interceptor_with_store._ticket_queues.setdefault(
+            project_id, asyncio.Queue()
+        )
+        for tid in [t1, t2, t3]:
+            queue.put_nowait(tid)
+
+        with patch.object(
+            type(interceptor_with_store), '_get_curator',
+            new=AsyncMock(return_value=mock_curator),
+        ), patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            # Start the worker and let it drain.
+            interceptor_with_store._start_worker_if_needed(project_id)
+
+            # Await resolution of all 3 tickets via resolve_ticket.
+            r1 = await interceptor_with_store.resolve_ticket(
+                t1, '/project', timeout_seconds=5.0,
+            )
+            r2 = await interceptor_with_store.resolve_ticket(
+                t2, '/project', timeout_seconds=5.0,
+            )
+            r3 = await interceptor_with_store.resolve_ticket(
+                t3, '/project', timeout_seconds=5.0,
+            )
+
+        # Ticket 1: created
+        assert r1['status'] == 'created', f'ticket1 expected created, got {r1}'
+        assert r1.get('task_id') == 'task-a', f'ticket1 expected task-a, got {r1}'
+
+        # Ticket 2: combined (drop to existing)
+        assert r2['status'] == 'combined', f'ticket2 expected combined, got {r2}'
+        assert r2.get('task_id') == existing_task_id, (
+            f'ticket2 expected {existing_task_id}, got {r2}'
+        )
+
+        # Ticket 3: created
+        assert r3['status'] == 'created', f'ticket3 expected created, got {r3}'
+        assert r3.get('task_id') == 'task-c', f'ticket3 expected task-c, got {r3}'
+
+        # One batched call, no single-item calls
+        assert mock_curator.curate_batch.await_count == 1, (
+            f'Expected 1 curate_batch call, got {mock_curator.curate_batch.await_count}'
+        )
+        assert mock_curator.curate.await_count == 0, (
+            f'Expected 0 curate calls (no fallback), got {mock_curator.curate.await_count}'
+        )
+
+        # Only the 2 creates trigger add_task
+        assert taskmaster.add_task.call_count == 2, (
+            f'Expected 2 add_task calls, got {taskmaster.add_task.call_count}'
+        )
