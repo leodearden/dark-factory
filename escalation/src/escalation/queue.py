@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -40,6 +40,18 @@ class EscalationQueue:
     def _next_seq(self) -> int:
         self._seq += 1
         return self._seq
+
+    def _iter_archive_paths(self, pattern: str) -> Iterator[Path]:
+        """Yield escalation JSON files from the archive subtree matching *pattern*.
+
+        Returns an empty iterator when the archive root does not exist, avoiding
+        a spurious ``rglob`` call on a missing directory.  Centralising the
+        existence-check + rglob here means get(), get_by_task(), and make_id()
+        all benefit from any future caching or indexing added in one place.
+        """
+        archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
+        if archive_root.exists():
+            yield from archive_root.rglob(pattern)
 
     def submit(self, escalation: Escalation) -> str:
         """Atomic write: {id}.tmp -> rename to {id}.json."""
@@ -74,12 +86,16 @@ class EscalationQueue:
 
         Falls back to the archive directory when the file is not in the
         queue root (i.e. the escalation has been resolved and archived).
+
+        Note: the archive fallback performs an O(|archive|) rglob on every miss.
+        For a 30-day retention window this is bounded, but callers on hot paths
+        should avoid repeated get() calls for ids known to be archived.
+        TODO: memoise the archive listing per dated subdir to reduce repeated scans.
         """
         path = self.queue_dir / f'{escalation_id}.json'
         if not path.exists():
             # Fall back to archive: search all dated subdirs.
-            archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
-            candidates = list(archive_root.rglob(f'{escalation_id}.json'))
+            candidates = list(self._iter_archive_paths(f'{escalation_id}.json'))
             if not candidates:
                 return None
             path = candidates[0]
@@ -102,9 +118,7 @@ class EscalationQueue:
         # Build the candidate path list.
         paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
         if status != 'pending':
-            archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
-            if archive_root.exists():
-                paths.extend(archive_root.rglob('esc-*.json'))
+            paths.extend(self._iter_archive_paths('esc-*.json'))
 
         results = []
         for path in paths:
@@ -233,6 +247,11 @@ class EscalationQueue:
         subdirectory to avoid reusing sequence numbers from escalations
         that have been archived after resolution (the in-memory counter
         resets on process restart, so we must re-derive max_seq from disk).
+
+        Note: the archive scan is O(|archive files for task_id|) on every call.
+        make_id() is a slow path (invoked only at submission), so this is
+        acceptable within a 30-day retention window.
+        TODO: cache max_seq per task_id to eliminate repeated archive scans.
         """
         prefix = f'esc-{task_id}-'
         max_seq = 0
@@ -242,11 +261,9 @@ class EscalationQueue:
                 max_seq = max(max_seq, int(suffix))
         # Also scan the archive so post-restart calls don't return IDs
         # already used by archived escalations for the same task.
-        archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
-        if archive_root.exists():
-            for path in archive_root.rglob(f'{prefix}*.json'):
-                suffix = path.stem[len(prefix):]
-                with contextlib.suppress(ValueError):
-                    max_seq = max(max_seq, int(suffix))
+        for path in self._iter_archive_paths(f'{prefix}*.json'):
+            suffix = path.stem[len(prefix):]
+            with contextlib.suppress(ValueError):
+                max_seq = max(max_seq, int(suffix))
         seq = max(max_seq + 1, self._next_seq())
         return f'{prefix}{seq}'

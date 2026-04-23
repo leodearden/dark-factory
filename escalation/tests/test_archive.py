@@ -30,6 +30,16 @@ class TestArchiveDirForDate:
         expected = tmp_path / 'archive' / '2026-04-23'
         assert result == expected
 
+    def test_non_utc_tz_bucketed_by_utc_date(self, tmp_path: Path):
+        """Non-UTC tz-aware timestamps are normalised to UTC before extracting the date.
+
+        2026-04-24T01:00:00+05:00  ==  2026-04-23T20:00:00 UTC
+        Without normalisation the local date (2026-04-24) would be used — wrong bucket.
+        """
+        result = archive.archive_dir_for_date(tmp_path, '2026-04-24T01:00:00+05:00')
+        expected = tmp_path / 'archive' / '2026-04-23'
+        assert result == expected
+
 
 def _make_dummy_esc_file(directory: Path, name: str = 'esc-1-1.json') -> Path:
     """Create a placeholder esc-*.json in *directory* and return its path."""

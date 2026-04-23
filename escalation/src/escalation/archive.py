@@ -31,9 +31,14 @@ def archive_dir_for_date(queue_dir: Path, resolved_at_iso: str) -> Path:
         resolved_at_iso: ISO 8601 timestamp string (timezone-aware or naive).
 
     Returns:
-        ``queue_dir / 'archive' / 'YYYY-MM-DD'`` derived from the UTC date.
+        ``queue_dir / 'archive' / 'YYYY-MM-DD'`` derived from the **UTC** date.
+        Timezone-aware timestamps are converted to UTC before extracting the date
+        so that a +05:00 timestamp near midnight is bucketed by UTC day, not local day.
+        Naive timestamps are treated as-is (assumed UTC at call site).
     """
     dt = datetime.fromisoformat(resolved_at_iso)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(UTC)
     date_str = dt.strftime(DATE_FORMAT)
     return Path(queue_dir) / ARCHIVE_SUBDIR / date_str
 
