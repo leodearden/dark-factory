@@ -2414,19 +2414,30 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         wt_head, main_sha = _git_check
 
         # ── Artifacts layer ────────────────────────────────
-        # Reads that can fail for filesystem/JSON reasons.
-        status = self._has_prior_implementation(wt_head)
-        if not status.has_work:
+        # Reads that can fail for filesystem/JSON reasons (e.g. corrupted
+        # iterations.jsonl, missing metadata).  Wrapped in a SEPARATE
+        # try/except from the git layer so operators can distinguish the
+        # root cause from the log message.
+        try:
+            status = self._has_prior_implementation(wt_head)
+            if not status.has_work:
+                logger.warning(
+                    'Task %s: branch HEAD %s is ancestor '
+                    'of main %s but no implementation '
+                    'entries (base=%s, entries=%d) — '
+                    'proceeding with requeue',
+                    self.task_id,
+                    wt_head[:8],
+                    main_sha[:8],
+                    status.base_commit[:8] if status.base_commit else 'none',
+                    len(status.entries),
+                )
+                return None
+        except Exception:
             logger.warning(
-                'Task %s: branch HEAD %s is ancestor '
-                'of main %s but no implementation '
-                'entries (base=%s, entries=%d) — '
+                'Task %s: artifacts read failed during merge-check, '
                 'proceeding with requeue',
-                self.task_id,
-                wt_head[:8],
-                main_sha[:8],
-                status.base_commit[:8] if status.base_commit else 'none',
-                len(status.entries),
+                self.task_id, exc_info=True,
             )
             return None
 
