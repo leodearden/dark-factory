@@ -1326,3 +1326,62 @@ class TestCallLlmBatchFailure:
         assert 'batch_size=2' in msg
         assert 'error_max_turns' in msg
         assert 'configured_timeout_secs' in msg
+
+
+# ----------------------------------------------------------------------
+# curate_batch N>1 happy path
+# ----------------------------------------------------------------------
+
+
+class TestCurateBatchHappyPath:
+    @pytest.mark.asyncio
+    async def test_curate_batch_n3_returns_ordered_decisions(self):
+        """N=3 batch issues exactly one LLM call and returns per-candidate decisions."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidates = [
+            CandidateTask(title='Alpha'),
+            CandidateTask(title='Beta'),
+            CandidateTask(title='Gamma'),
+        ]
+        # Pool for candidate 1 has task '50' so the drop target is valid.
+        pools = [
+            [],
+            _pool_with_ids(('50', 'done')),
+            [],
+        ]
+        sizes = [
+            {'anchor': 0},
+            {'anchor': 1},
+            {'anchor': 0},
+        ]
+
+        call_idx = 0
+
+        async def fake_corpus(candidate, project_id, project_root):
+            nonlocal call_idx
+            result = (pools[call_idx], sizes[call_idx])
+            call_idx += 1
+            return result
+
+        batch_result = AgentResult(
+            success=True,
+            output='',
+            structured_output={'decisions': [
+                {'candidate_index': 0, 'action': 'create', 'justification': 'new'},
+                {'candidate_index': 1, 'action': 'drop', 'target_id': '50',
+                 'justification': 'dup'},
+                {'candidate_index': 2, 'action': 'create', 'justification': 'newer'},
+            ]},
+            cost_usd=0.05,
+        )
+        mock = AsyncMock(return_value=batch_result)
+        with patch.object(curator, '_build_corpus', side_effect=fake_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock):
+            result = await curator.curate_batch(candidates, 'p', '/x')
+
+        assert len(result) == 3
+        assert [d.action for d in result] == ['create', 'drop', 'create']
+        assert result[1].target_id == '50'
+        assert mock.await_count == 1
