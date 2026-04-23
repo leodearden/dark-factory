@@ -1018,6 +1018,61 @@ class TestRecentMerges:
             f'Expected the row count (5 or 6) in the hard-cap WARNING, got: {warn_msgs}'
         )
 
+    @pytest.mark.asyncio
+    async def test_explicit_limit_above_hard_cap_clamps_and_warns(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """recent_merges(limit=N) clamps to _RECENT_MERGES_HARD_CAP when N > cap.
+
+        Patches _RECENT_MERGES_HARD_CAP to 5, inserts 10 events within the
+        1-hour window, calls recent_merges(db, limit=8, hours=1) and asserts:
+          1. Only 5 rows are returned (clamped to the patched hard cap).
+          2. At least one WARNING log record contains 'hard cap' (or 'hard_cap')
+             plus the row-count digit so operators can identify the cap was hit.
+        """
+        monkeypatch.setattr(_mqmod, '_RECENT_MERGES_HARD_CAP', 5)
+
+        now = datetime.now(UTC)
+        db_path = tmp_path / 'explicit_limit_cap_test.db'
+
+        with contextlib.closing(sqlite3.connect(str(db_path))) as conn_sync:
+            conn_sync.executescript(MERGE_EVENTS_SCHEMA)
+            for i in range(10):
+                _insert_event(
+                    conn_sync,
+                    event_type='merge_attempt',
+                    timestamp=now - timedelta(seconds=i * 5),
+                    task_id=f'explicit-task-{i:03d}',
+                    run_id=f'explicit-run-{i:03d}',
+                    data={'outcome': 'done'},
+                    duration_ms=100 + i,
+                )
+            conn_sync.commit()
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            with caplog.at_level(logging.WARNING, logger='dashboard.data.merge_queue'):
+                result = await recent_merges(db, limit=8, hours=1)
+
+        assert len(result) == 5, (
+            f'Expected 5 rows (hard cap=5, limit=8 clamped to cap), got {len(result)}. '
+            'explicit `limit > _RECENT_MERGES_HARD_CAP` must be clamped to the hard cap.'
+        )
+        warn_msgs = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ]
+        assert any('hard cap' in m or 'hard_cap' in m for m in warn_msgs), (
+            f'Expected a WARNING containing "hard cap" or "hard_cap", got: {warn_msgs}'
+        )
+        # The row count must appear in the warning so it is actionable.
+        assert any(
+            ('hard cap' in m or 'hard_cap' in m) and ('5' in m or '6' in m)
+            for m in warn_msgs
+        ), (
+            f'Expected the row count (5 or 6) in the hard-cap WARNING, got: {warn_msgs}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestSpeculativeStats
