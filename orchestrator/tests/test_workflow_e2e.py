@@ -1596,16 +1596,27 @@ def _build_workflow_with_escalation(
     assignment: TaskAssignment,
     agent_stub: AgentStub,
     tmp_path: Path,
+    *,
+    spawn_merge_worker: bool = True,
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
-    """Wire up a TaskWorkflow with an EscalationQueue attached."""
+    """Wire up a TaskWorkflow with an EscalationQueue attached.
+
+    When ``spawn_merge_worker=False``, skips the MergeWorker/asyncio.create_task
+    setup — use for tests that exercise _mark_blocked directly and never enqueue
+    merge work; omitting create_task avoids the 'Task was destroyed but it is
+    pending!' warning in pytest teardown.
+    """
     from orchestrator.merge_queue import MergeWorker
 
     scheduler = FakeScheduler()
     queue_dir = tmp_path / 'escalation_queue'
     queue = EscalationQueue(queue_dir)
     merge_queue: asyncio.Queue = asyncio.Queue()
-    worker = MergeWorker(git_ops, merge_queue)
-    asyncio.create_task(worker.run(), name='test-merge-worker')
+    if spawn_merge_worker:
+        worker = MergeWorker(git_ops, merge_queue)
+        asyncio.create_task(worker.run(), name='test-merge-worker')
+    else:
+        worker = None
     workflow = TaskWorkflow(
         assignment=assignment,
         config=config,
@@ -1627,27 +1638,15 @@ def _build_workflow_no_merge_worker(
     agent_stub: AgentStub,  # noqa: ARG001
     tmp_path: Path,
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
-    """Like _build_workflow_with_escalation but without spawning a MergeWorker task.
+    """Thin delegate over `_build_workflow_with_escalation(spawn_merge_worker=False)`.
 
-    Use this in tests that exercise _mark_blocked directly and never enqueue merge
-    work — omitting asyncio.create_task(worker.run()) avoids the 'Task was destroyed
-    but it is pending!' warning that leaks into the pytest event-loop teardown.
+    Retained for call-site stability (~11 existing tests).  Consider removing
+    in a follow-up cleanup once call sites are updated to pass
+    ``spawn_merge_worker=False`` directly to avoid indefinite surface-area growth.
     """
-    scheduler = FakeScheduler()
-    queue_dir = tmp_path / 'escalation_queue'
-    queue = EscalationQueue(queue_dir)
-    merge_queue: asyncio.Queue = asyncio.Queue()
-    workflow = TaskWorkflow(
-        assignment=assignment,
-        config=config,
-        git_ops=git_ops,
-        scheduler=scheduler,  # type: ignore[arg-type]
-        briefing=FakeBriefing(),  # type: ignore[arg-type]
-        mcp=FakeMcp(),  # type: ignore[arg-type]
-        escalation_queue=queue,
-        merge_queue=merge_queue,
+    return _build_workflow_with_escalation(
+        config, git_ops, assignment, agent_stub, tmp_path, spawn_merge_worker=False
     )
-    return workflow, scheduler, queue
 
 
 def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
@@ -2647,6 +2646,86 @@ class TestRecoverIfAlreadyMerged:
         )
         assert workflow.state != WorkflowState.DONE, (
             f'workflow.state must not be DONE for stale branch: {workflow.state!r}'
+        )
+
+    async def test_returns_none_for_non_implementer_entries_only(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Non-implementer/non-debugger entries (architect + judge) must return None.
+
+        Regression-defender for the role filter in _has_prior_implementation():
+
+            has_work=any(e.get('agent') in ('implementer', 'debugger') for e in entries)
+
+        This test would FAIL if the filter were trivially `bool(entries)` — i.e.
+        any non-empty iterations.jsonl triggers fast-path — because a non-empty log of
+        only architect + judge entries would incorrectly return DONE, causing
+        `assert outcome is None` to fail.  The filter must walk the full list and
+        reject every non-implementer/non-debugger role.
+
+        Setup mirrors test_returns_none_for_stale_branch_point (fresh worktree, wt_head
+        == base_commit, metadata.json stamped) except iterations.jsonl is written with
+        TWO non-implementer lines: one 'architect' and one 'judge'.  The is_ancestor
+        check trivially passes (base_commit is an ancestor of main), so the only guard
+        preventing a spurious DONE is the role filter.  Asserting None locks in the
+        documented semantics: 'no implementer/debugger entries → has_work=False'.
+        """
+        import json as _json
+
+        # 1. Create a fresh worktree (wt_head == base_commit, trivially ancestor of main)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Read current HEAD (= base_commit) and stamp metadata.json
+        _, base_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        base_sha = base_sha_raw.strip()
+        # Precondition: fresh worktree HEAD must equal main so the is_ancestor
+        # check passes unconditionally, leaving the role filter as the sole guard.
+        main_sha = await git_ops.get_main_sha()
+        assert base_sha == main_sha, (
+            f'Precondition failed: fresh worktree HEAD ({base_sha[:8]}) '
+            f'must equal current main ({main_sha[:8]}). '
+            f'An earlier test or fixture advanced main mid-run.'
+        )
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'metadata.json').write_text(
+            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': base_sha})
+        )
+
+        # 3. Stamp iterations.jsonl with TWO non-implementer/non-debugger entries.
+        #    Using two distinct roles (architect + judge) ensures the filter walks the
+        #    full list rather than only checking the first entry.
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'architect', 'iteration': 1, 'steps_attempted': []}) + '\n'
+            + _json.dumps({'agent': 'judge', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+
+        # 4. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 5. Call _recover_if_already_merged directly
+        outcome = await workflow._recover_if_already_merged()
+
+        # 6. Assertions: role filter must reject architect+judge entries → return None
+        assert outcome is None, (
+            f'Expected None for non-implementer/non-debugger entries only but got '
+            f'{outcome!r} — role filter in _has_prior_implementation() is missing '
+            f'or too broad (accepts non-implementer agents)'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses when only architect/judge "
+            f"entries are present: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE when only non-implementer entries exist: '
+            f'{workflow.state!r}'
         )
 
     async def test_returns_none_when_branch_not_on_main(
