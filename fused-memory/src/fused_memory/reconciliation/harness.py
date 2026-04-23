@@ -83,6 +83,8 @@ class ReconciliationHarness:
         self.journal = journal
         self.buffer = event_buffer
         _raw_root = config.taskmaster.project_root if config.taskmaster else ''
+        if _raw_root:
+            _raw_root = os.path.expanduser(_raw_root)
         self._project_root = str(Path(_raw_root).resolve()) if _raw_root else ''
         self.config = config.reconciliation
         self._backlog_policy = backlog_policy
@@ -308,7 +310,7 @@ class ReconciliationHarness:
         try:
             tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
             raw_count = len(tasks_data.get('tasks', [])) if isinstance(tasks_data, dict) else 0
-            logger.info(
+            logger.debug(
                 '_fetch_filtered_task_tree fetched %d raw tasks for %r',
                 raw_count,
                 project_root,

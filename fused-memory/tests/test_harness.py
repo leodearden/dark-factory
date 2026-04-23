@@ -349,6 +349,16 @@ async def test_harness_init_resolves_relative_project_root_to_absolute(
     )
     assert harness_c.project_root == ''
 
+    # (d) Empty-string project_root → empty string — distinct from None, exercises the
+    # truthiness guard `if _raw_root` branch (not the `config.taskmaster is None` branch).
+    # If the guard were removed, empty string would silently resolve to CWD, breaking the
+    # task-927 short-circuit in _fetch_filtered_task_tree.
+    harness_d = _make_harness_927(journal, event_buffer, mock_memory_service, '')
+    assert harness_d._project_root == '', (
+        f"empty-string project_root must stay ''; got {harness_d._project_root!r}"
+    )
+    assert harness_d.project_root == ''
+
 
 @pytest.mark.asyncio
 async def test_run_full_cycle_uses_configured_project_root_when_events_lack_override(
@@ -412,7 +422,6 @@ async def test_run_full_cycle_event_project_root_wins_over_configured(
             f"Expected project_root='/from/event' (from event payload) but got '{root}'"
             " — event-provided root must win over the configured fallback"
         )
-
 
 
 # ── Tests for Task 74: Stage 3 findings feedback loop ────────────────
@@ -1920,14 +1929,14 @@ class TestHarnessFetchFilteredTaskTree:
         # (b) taskmaster.get_tasks must NOT be called (pre-check short-circuit)
         harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
 
-        # (c) distinct WARNING marker present in logs
+        # (c) distinct WARNING marker present in logs, including repr of the rejected path
         warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert any(
-            'non-absolute project_root' in msg and "'.'".replace("'", '') in msg.replace("'", '')
+            'non-absolute project_root' in msg and repr('.') in msg
             for msg in warning_msgs
         ), (
-            f"Expected WARNING containing 'non-absolute project_root' and the rejected path '.'; "
-            f"got: {warning_msgs}"
+            f"Expected WARNING containing 'non-absolute project_root' and repr(\".\") == \"'.'\";"
+            f" got: {warning_msgs}"
         )
 
     @pytest.mark.asyncio
@@ -1938,13 +1947,14 @@ class TestHarnessFetchFilteredTaskTree:
         mock_memory_service,
         caplog,
     ):
-        """_fetch_filtered_task_tree emits an INFO log with the raw task count after a successful fetch.
+        """_fetch_filtered_task_tree emits a DEBUG log with the raw task count after a successful fetch.
 
         The log message must contain 'raw tasks', the integer count of tasks
         returned by taskmaster, and the project_root so operators can distinguish
         'get_tasks returned 0 raw tasks' (upstream Taskmaster issue) from
         'get_tasks returned N tasks but filter partitioned all into other'
-        (task_filter regression).
+        (task_filter regression).  DEBUG level keeps the happy-path heartbeat out
+        of the default INFO log stream at scale.
         """
         import logging
 
@@ -1962,16 +1972,16 @@ class TestHarnessFetchFilteredTaskTree:
             ]
         }
 
-        with caplog.at_level(logging.INFO):
+        with caplog.at_level(logging.DEBUG):
             result = await harness._fetch_filtered_task_tree('/abs/path')
 
-        # (a) INFO log must contain 'raw tasks', the count 4, and the project_root
-        info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        # (a) DEBUG log must contain 'raw tasks', the count 4, and the project_root
+        debug_msgs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
         assert any(
             'raw tasks' in msg and '4' in msg and '/abs/path' in msg
-            for msg in info_msgs
+            for msg in debug_msgs
         ), (
-            f"Expected INFO log containing 'raw tasks', '4', '/abs/path'; got: {info_msgs}"
+            f"Expected DEBUG log containing 'raw tasks', '4', '/abs/path'; got: {debug_msgs}"
         )
 
         # (b) sanity: returned tree reflects the actual data
