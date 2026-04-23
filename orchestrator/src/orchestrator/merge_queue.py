@@ -855,6 +855,13 @@ class SpeculativeMergeWorker:
                     await self._wip_halt.wait()
 
                 self._inflight_req = req  # track for stop() race resolution
+                if self._event_store is not None:
+                    self._event_store.emit(
+                        EventType.merge_dequeued,
+                        task_id=req.task_id,
+                        phase='merge',
+                        data={'branch': req.branch},
+                    )
                 t0 = time.monotonic()
                 merge_result_local: MergeResult | None = None
                 try:
