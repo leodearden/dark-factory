@@ -379,7 +379,7 @@ An agent flagged a risk during development. Risk assessment requires human judgm
 
 Technical debt or cleanup discovered during development.
 
-- **Info**: queue as a follow-up task using `mcp__fused-memory__submit_task` → `mcp__fused-memory__resolve_ticket` (two-phase pattern; see `review_suggestions` §2 above for the full snippet). Resolve the escalation via `mcp__escalation__resolve_issue` once the ticket resolves.
+- **Info**: queue as a follow-up task using `mcp__fused-memory__submit_task` → `mcp__fused-memory__resolve_ticket` (two-phase pattern; see `review_suggestions` §2 above for the full snippet — when reusing that snippet here, substitute `"source": "escalation-info"` and `"spawn_context": "steward-triage"` in place of the review-suggestions values; `escalation_id` stays the same). Resolve the escalation via `mcp__escalation__resolve_issue` once the ticket resolves.
 - **Blocking** (rare): spawn an interactive `/unblock` session (see `task_failure` for invocation pattern).
 
 ### `infra_issue` (blocking)
