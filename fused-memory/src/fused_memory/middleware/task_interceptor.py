@@ -11,6 +11,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+try:
+    from shared.cli_invoke import AllAccountsCappedException  # type: ignore[import]
+except ImportError:
+    AllAccountsCappedException = Exception  # type: ignore[assignment,misc]
+
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.middleware.task_curator import (
     CandidateTask,
@@ -20,10 +25,6 @@ from fused_memory.middleware.task_curator import (
     _to_pool_entry,
     flatten_task_tree,
 )
-try:
-    from shared.cli_invoke import AllAccountsCappedException  # type: ignore[import]
-except ImportError:
-    AllAccountsCappedException = Exception  # type: ignore[assignment,misc]
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,

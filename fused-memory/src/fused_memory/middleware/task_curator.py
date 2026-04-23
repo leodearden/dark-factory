@@ -807,7 +807,7 @@ class TaskCurator:
         ]
 
         # Cache each decision so subsequent identical candidates hit the idempotency path.
-        for candidate, decision in zip(candidates, decisions):
+        for candidate, decision in zip(candidates, decisions, strict=True):
             self._store_cache(candidate.payload_hash(), decision)
 
         return decisions
@@ -1372,7 +1372,7 @@ class TaskCurator:
         details_cap = self._config.curator.entry_details_chars
 
         lines: list[str] = []
-        for i, (candidate, pool) in enumerate(zip(candidates, pools)):
+        for i, (candidate, pool) in enumerate(zip(candidates, pools, strict=True)):
             lines.append(f'# Candidate batch_index={i}')
             lines.append(f'  title: {candidate.title}')
             lines.append(f'  priority: {candidate.priority}')
