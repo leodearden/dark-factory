@@ -201,7 +201,7 @@ This is the expensive, high-value phase. An Opus agent (or coordinated team) rea
    - Flag tasks that are blocked on something that no longer exists
 
 4. **Create tasks**
-   - Use `submit_task` + `resolve_ticket` via fused-memory MCP (two-phase pattern). See `references/phase3-triage.md` for the full snippet including failure-reason handling (`server_restart`, `timeout`, `unknown_ticket`, `server_closed`, `expired`).
+   - Use `submit_task` + `resolve_ticket` via fused-memory MCP (two-phase pattern). See `references/phase3-triage.md` for the full snippet including required metadata (`source`, `review_id`, `spawn_context`, `modules`, `memory_hints`) and failure-reason handling (`server_restart`, `timeout`, `unknown_ticket`, `server_closed`, `expired`).
    - The legacy `add_task` facade is deprecated and slated for removal; all new triage tasks must use `submit_task` + `resolve_ticket`
    - Each task tagged with `metadata.source: "review-cycle"` and `metadata.review_id: "<timestamp>"`
    - Include `memory_hints` pointing to the review findings and relevant briefing sections
