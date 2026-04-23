@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from orchestrator.evals.runner import _StubMcpSession
+from orchestrator.evals.runner import _StubMcpSession, _build_eval_scheduler
 
 
 class TestStubMcpSessionSetTaskStatus:
@@ -194,3 +194,68 @@ class TestStubMcpSessionUnknownTool:
         stub = _StubMcpSession()
         with pytest.raises(NotImplementedError, match='some_unknown_tool'):
             await stub.call_tool('some_unknown_tool', {})
+
+
+# ---------------------------------------------------------------------------
+# Tests for _build_eval_scheduler helper
+# ---------------------------------------------------------------------------
+
+
+class TestBuildEvalScheduler:
+    """Tests for _build_eval_scheduler(orch_config, task_id, modules) helper."""
+
+    def test_returns_scheduler_instance(self):
+        """Returns a production Scheduler (not _EvalScheduler)."""
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.scheduler import Scheduler
+
+        config = OrchestratorConfig()
+        scheduler, _ = _build_eval_scheduler(config, 'task-99', ['some_module'])
+        assert isinstance(scheduler, Scheduler)
+
+    def test_returns_stub_mcp_session(self):
+        """Returns a _StubMcpSession as the second element."""
+        from orchestrator.config import OrchestratorConfig
+
+        config = OrchestratorConfig()
+        _, session = _build_eval_scheduler(config, 'task-99', ['some_module'])
+        assert isinstance(session, _StubMcpSession)
+
+    def test_di_wired_mcp_session(self):
+        """scheduler._mcp_session is the returned session (DI wired)."""
+        from orchestrator.config import OrchestratorConfig
+
+        config = OrchestratorConfig()
+        scheduler, session = _build_eval_scheduler(config, 'task-99', ['some_module'])
+        assert scheduler._mcp_session is session
+
+    def test_lock_preinstalled_for_task(self):
+        """The module lock is pre-installed for task_id in lock_table._held."""
+        from orchestrator.config import OrchestratorConfig
+        from shared.locking import normalize_lock
+
+        config = OrchestratorConfig()
+        scheduler, _ = _build_eval_scheduler(config, 'task-99', ['some_module'])
+        assert 'task-99' in scheduler.lock_table._held
+        expected_module = normalize_lock('some_module', config.lock_depth)
+        assert expected_module in scheduler.lock_table._held['task-99']
+
+    @pytest.mark.asyncio
+    async def test_handle_blast_radius_expansion_returns_true(self):
+        """handle_blast_radius_expansion returns True without raising.
+
+        This is the end-to-end sanity check: DI + lock-preinstall means the
+        production code path for plan refinement works in eval mode.
+        """
+        from orchestrator.config import OrchestratorConfig
+
+        config = OrchestratorConfig()
+        scheduler, _ = _build_eval_scheduler(
+            config, 'task-99', ['some_module']
+        )
+        result = await scheduler.handle_blast_radius_expansion(
+            'task-99',
+            ['some_module'],
+            ['some_module', 'other_module'],
+        )
+        assert result is True
