@@ -2786,8 +2786,8 @@ class TestBuildPerProjectMergeQueue:
         the max(1, ceil(x/60)) semantics.  Fails on the pre-fix implementation
         which passes limit=50 and hours=<outer dashboard window>.
         """
-        import math
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
+
         from dashboard.data.merge_queue import build_per_project_merge_queue
 
         now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
