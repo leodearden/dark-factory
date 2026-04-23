@@ -1375,6 +1375,68 @@ class TestCurateBatchHappyPath:
 
 
 # ----------------------------------------------------------------------
+# curate_batch: pre-batch-dedup must not pollute the payload-hash cache
+# ----------------------------------------------------------------------
+
+
+class TestCurateBatchPreDedupCachePollution:
+    """Regression: synthetic pre-batch-dedup decisions share a payload_hash with
+    the first sibling's real LLM decision.  Caching them would overwrite the
+    real decision with a degenerate ``action='drop', target_id=None`` entry,
+    and a later single-item ``curate()`` hit on that hash would then return
+    the synthetic drop — which ``_process_add_ticket`` cannot safely dispatch
+    and would interpret as "create a duplicate task".
+    """
+
+    @pytest.mark.asyncio
+    async def test_duplicate_candidate_does_not_overwrite_real_decision_in_cache(self):
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        # Two candidates with IDENTICAL payload_hash
+        c1 = CandidateTask(title='Same', description='same-body')
+        c2 = CandidateTask(title='Same', description='same-body')
+        assert c1.payload_hash() == c2.payload_hash()
+
+        payload_hash = c1.payload_hash()
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        # The LLM only sees the unique candidate (the first one); emit a 'create'.
+        batch_result = AgentResult(
+            success=True,
+            output='',
+            structured_output={'decisions': [
+                {'candidate_index': 0, 'action': 'create', 'justification': 'real'},
+            ]},
+            cost_usd=0.01,
+        )
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=batch_result)):
+            result = await curator.curate_batch([c1, c2], 'p', '/x')
+
+        # Decision order preserved: c1 is the 'create', c2 is the synthetic drop.
+        assert result[0].action == 'create'
+        assert result[1].action == 'drop'
+        assert result[1].batch_target_index == 0
+
+        # The cache for the shared payload_hash must hold the REAL 'create'
+        # decision, NOT the synthetic drop.
+        cached = curator._lookup_cache(payload_hash) \
+            if hasattr(curator, '_lookup_cache') else curator._decision_cache.get(payload_hash)
+        # _decision_cache stores (decision, timestamp)
+        if isinstance(cached, tuple):
+            cached_decision = cached[0]
+        else:
+            cached_decision = cached
+        assert cached_decision is not None
+        assert cached_decision.action == 'create'
+        assert cached_decision.batch_target_index is None
+
+
+# ----------------------------------------------------------------------
 # curate_batch: whole-batch fallback on LLM failure
 # ----------------------------------------------------------------------
 

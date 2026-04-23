@@ -807,7 +807,16 @@ class TaskCurator:
         ]
 
         # Cache each decision so subsequent identical candidates hit the idempotency path.
+        # IMPORTANT: skip synthetic pre-batch-dedup decisions (batch_target_index
+        # set) — they share a payload_hash with the first sibling's real LLM
+        # decision, and caching them would overwrite the real decision with a
+        # degenerate action='drop', target_id=None entry.  A later single-item
+        # curate() hit on that hash would then return the synthetic drop, which
+        # _process_add_ticket's dispatch cannot safely interpret (no target_id
+        # and no batch context), leading to a duplicate-task bug.
         for candidate, decision in zip(candidates, decisions, strict=True):
+            if decision.batch_target_index is not None:
+                continue
             self._store_cache(candidate.payload_hash(), decision)
 
         return decisions
