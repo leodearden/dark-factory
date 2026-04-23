@@ -48,6 +48,12 @@ def _ts_sort_key(entry: dict) -> datetime:
 
 _CANONICAL_OUTCOMES = ['done', 'conflict', 'blocked', 'already_merged']
 
+_TERMINAL_MERGE_OUTCOMES: frozenset[str] = frozenset({
+    'done', 'already_merged', 'conflict', 'blocked',
+    'dropped_plan_targets', 'cas_exhausted', 'abandoned_verify_timeouts',
+})
+_ACTIVE_EVENT_TYPES: tuple[str, ...] = ('merge_queued', 'merge_dequeued', 'merge_attempt')
+
 # Soft operational-warning threshold: warn when recent_merges returns more rows
 # than this while running unbounded (limit=None).  Signals a possible producer
 # burst worth investigating before memory pressure is reached.
@@ -490,7 +496,88 @@ async def speculative_stats(
 
 
 # ---------------------------------------------------------------------------
-# 6. Per-project helpers
+# 6. Active queued merges
+# ---------------------------------------------------------------------------
+
+
+async def active_queued_merges(
+    db: aiosqlite.Connection | None,
+    *,
+    ttl_minutes: int = 30,
+    now: datetime | None = None,
+) -> list[dict]:
+    """Return tasks whose latest merge-lifecycle event is not a terminal outcome.
+
+    Queries events with event_type IN ('merge_queued', 'merge_dequeued',
+    'merge_attempt'), picks the latest row per task_id within the TTL window,
+    and excludes tasks whose latest event is a terminal merge_attempt outcome
+    (done, already_merged, conflict, blocked, dropped_plan_targets,
+    cas_exhausted, abandoned_verify_timeouts).
+
+    Args:
+        db:  Async SQLite connection, or None (returns []).
+        ttl_minutes:  Drop tasks whose latest relevant event is older than
+            this many minutes.  Acts as a safety net for crashed orchestrators
+            that left dangling merge_queued rows.
+        now:  Reference timestamp for the TTL cutoff.  Defaults to
+            ``datetime.now(UTC)`` when None.
+
+    Returns:
+        List of dicts with keys: task_id, run_id, state, timestamp, branch,
+        outcome.  ``state`` is 'queued' when latest event is merge_queued;
+        'in_flight' for merge_dequeued or merge_attempt(cas_retry).
+    """
+    if db is None:
+        return []
+
+    effective_now = now if now is not None else datetime.now(UTC)
+    cutoff = (effective_now - timedelta(minutes=ttl_minutes)).isoformat()
+    et_placeholders = ','.join('?' * len(_ACTIVE_EVENT_TYPES))
+
+    async def _query(conn: aiosqlite.Connection) -> list[dict]:
+        sql = f"""
+            SELECT task_id, run_id, event_type,
+                   json_extract(data, '$.outcome') AS outcome,
+                   json_extract(data, '$.branch') AS branch,
+                   timestamp
+            FROM events e
+            WHERE event_type IN ({et_placeholders})
+              AND timestamp >= ?
+              AND timestamp = (
+                  SELECT MAX(timestamp)
+                  FROM events e2
+                  WHERE e2.task_id = e.task_id
+                    AND e2.event_type IN ({et_placeholders})
+                    AND e2.timestamp >= ?
+              )
+        """
+        params = (*_ACTIVE_EVENT_TYPES, cutoff, *_ACTIVE_EVENT_TYPES, cutoff)
+        rows = await conn.execute_fetchall(sql, params)
+
+        result = []
+        for row in rows:
+            et = row['event_type']
+            outcome = row['outcome']
+            # Exclude terminal merge_attempt rows
+            if et == 'merge_attempt' and outcome in _TERMINAL_MERGE_OUTCOMES:
+                continue
+            # Derive state
+            state = 'queued' if et == 'merge_queued' else 'in_flight'
+            result.append({
+                'task_id': row['task_id'],
+                'run_id': row['run_id'],
+                'state': state,
+                'timestamp': row['timestamp'],
+                'branch': row['branch'],
+                'outcome': outcome,
+            })
+        return result
+
+    return await with_db(db, _query, [])
+
+
+# ---------------------------------------------------------------------------
+# 7. Per-project helpers
 # ---------------------------------------------------------------------------
 
 
