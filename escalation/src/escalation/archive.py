@@ -82,7 +82,7 @@ def prune_archive(
         if parsed < cutoff:
             shutil.rmtree(child)
             removed += 1
-            logger.info(f'Pruned archive subdir: {child}')
+            logger.info('Pruned archive subdir: %s', child)
 
     return removed
 
