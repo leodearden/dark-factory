@@ -15,3 +15,10 @@ members = [
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
+# fused-memory, orchestrator, and shared each have tests/__init__.py, making
+# their conftest.py resolve to the same "tests.conftest" module name as
+# dashboard/tests/conftest.py. Pytest's plugin registry rejects the second
+# registration with ValueError. These subprojects are tested per-subproject
+# (each has its own pyproject.toml + pytest config); exclude them from the
+# root-level collection to avoid the namespace collision.
+norecursedirs = ["fused-memory", "orchestrator", "shared"]
