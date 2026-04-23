@@ -499,18 +499,22 @@ git add -- . ':!.task'
 )
 
 
-def _submit_resolve_instructions(
+def submit_resolve_instructions(
     metadata_template: str,
     *,
     outcome_target: str,
     project_root_expr: str = '...',
     step_prefix: tuple[str, str] = ('a', 'b'),
     extra_submit_guidance: str = '',
+    caller_indent: str = '',
 ) -> str:
     """Return the shared submit_task → resolve_ticket two-step instruction block.
 
-    Returns an unindented string. Callers apply textwrap.indent(...) as needed
-    for their local markdown context.
+    Returns the block indented by ``caller_indent`` (default ``''`` for no
+    extra indentation).  Pass the same prefix you would have given to
+    ``textwrap.indent`` — the helper applies it internally so callers don't
+    need a separate wrap step and the sub-continuation alignment is always
+    correct regardless of indent width.
 
     Args:
         metadata_template: The metadata dict literal to show in the submit_task call.
@@ -522,26 +526,23 @@ def _submit_resolve_instructions(
             e.g. ('a', 'b') or ('1', '2').
         extra_submit_guidance: Optional per-site extra guidance paragraph inserted
             after the error-shape description.
+        caller_indent: Prefix string applied to every line of the returned block via
+            ``textwrap.indent``.  Defaults to ``''`` (unindented).
 
     Returns:
-        Plain unindented multi-line string with the shared skeleton.
+        Multi-line string with the shared skeleton, indented by caller_indent.
     """
     a, b = step_prefix
-    # Pre-indent continuation lines so they align at the sub-continuation column
-    # (3 spaces inside the helper) after the caller applies textwrap.indent(...).
-    # A multi-line metadata_template like '{"a": 1,\n"b": 2}' would otherwise have
-    # its second line at column 0, landing at the step-letter column after caller indent
-    # instead of at the 'metadata=' column.
+    # Normalize multi-line metadata_template: add 3-space continuation indent so
+    # lines after the first align at the 'metadata=' column in the raw block.
     metadata_normalized = metadata_template.replace('\n', '\n   ')
-    # extra_submit_guidance is inserted between the submit error-shape sentence and the
-    # resolve_ticket step.  Indent its lines 3 spaces so they sit at the sub-continuation
-    # column after the caller's textwrap.indent wrap.
+    # extra_submit_guidance sits after the error-shape sentence; indent its lines
+    # 3 spaces so they read as a sub-continuation under step a./1. in the raw block.
     extra = (
         '\n' + textwrap.indent(extra_submit_guidance.rstrip(), '   ') + '\n'
     ) if extra_submit_guidance.strip() else '\n'
-    # Build the string with explicit \n so that multiline metadata_template values
-    # (which introduce lines at column-0 when substituted) do not confuse textwrap.dedent.
-    return (
+    # Build the raw (unindented) block, then apply caller_indent in one shot.
+    raw = (
         f'{a}. Call `submit_task`(title=..., description=..., priority=...,\n'
         f'   metadata={metadata_normalized},\n'
         f'   project_root={project_root_expr}) — returns `{{"ticket": "tkt_..."}}` on success, or\n'
@@ -559,6 +560,7 @@ def _submit_resolve_instructions(
         '     absorbed, not lost).\n'
         f'   - `failed` — report the `reason` in your {outcome_target}.'
     )
+    return textwrap.indent(raw, caller_indent)
 
 
 _STEWARD_MEMORY_TOOLS = [
@@ -593,7 +595,7 @@ Post-merge improvement suggestions from automated code reviewers.
 **Pre-triaged format:** When the escalation detail starts with `## Pre-Triaged Results`,
 classification has already been done by a triage agent. Do NOT re-classify. Instead:
 1. For each entry in `proposed_task_groups`: create a task using the two-step API:
-""" + textwrap.indent(_submit_resolve_instructions(
+""" + submit_resolve_instructions(
     '{"source": "steward-triage", "spawn_context": "steward-triage",\n'
     '"spawned_from": "<task_id under review>", "modules": [...]}',
     outcome_target='resolve_issue summary',
@@ -603,7 +605,8 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
         '(it is in the escalation detail under `task_id`). Use the file paths listed in\n'
         'the group for `modules`.'
     ),
-), '   ') + """
+    caller_indent='   ',
+) + """
 2. For notable conventions among accepted items: write via `add_memory`
    with category `preferences_and_norms`.
 3. Call `resolve_issue` summarizing: N tasks created/combined, M conventions written,
@@ -611,7 +614,7 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
 
 **Raw format (fallback):** When the detail is a raw JSON array, triage each suggestion as:
 - **create_task** — Substantial improvement worth a follow-up task. Use the two-step API:
-""" + textwrap.indent(_submit_resolve_instructions(
+""" + submit_resolve_instructions(
     '{"source": "steward-triage", "spawn_context": "steward-triage",\n'
     '"spawned_from": "<task_id under review>", "modules": ["path/to/module", ...]}',
     outcome_target='resolve_issue summary',
@@ -621,7 +624,8 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
         "will need to modify — these are used for concurrency locking. `spawned_from` lets\n"
         "the task curator spot duplicates against the original task's details."
     ),
-), '  ') + """
+    caller_indent='  ',
+) + """
 - **convention** — Pattern-level insight for future agents. Write via `add_memory`
   with category `preferences_and_norms`.
 - **dismiss** — Not actionable, already covered, or noise.
@@ -774,7 +778,7 @@ For each finding, classify and act:
 
 Use the two-step API to create tasks:
 
-""" + _submit_resolve_instructions(
+""" + submit_resolve_instructions(
     '...',
     outcome_target='review output',
     step_prefix=('1', '2'),

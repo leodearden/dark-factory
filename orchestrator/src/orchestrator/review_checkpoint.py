@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import textwrap
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -13,7 +12,7 @@ from typing import TYPE_CHECKING
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 
 from orchestrator.agents.invoke import invoke_agent
-from orchestrator.agents.roles import DEEP_REVIEWER, _submit_resolve_instructions
+from orchestrator.agents.roles import DEEP_REVIEWER, submit_resolve_instructions
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import VerifyResult, run_full_verification
 
@@ -329,14 +328,12 @@ class ReviewCheckpoint:
         project_root = str(self.config.project_root)
         project_id = self.config.fused_memory.project_id
 
-        submit_resolve_block = textwrap.indent(
-            _submit_resolve_instructions(
-                f'{{"source": "review-cycle", "review_id": "{review_id}", "modules": ["path/to/module", ...]}}',
-                outcome_target='finding description',
-                project_root_expr=f'"{project_root}"',
-                step_prefix=('1', '2'),
-            ),
-            '     ',
+        submit_resolve_block = submit_resolve_instructions(
+            f'{{"source": "review-cycle", "review_id": "{review_id}", "modules": ["path/to/module", ...]}}',
+            outcome_target='finding description',
+            project_root_expr=f'"{project_root}"',
+            step_prefix=('1', '2'),
+            caller_indent='     ',
         )
 
         scope_block = ''
