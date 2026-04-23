@@ -1088,3 +1088,38 @@ class TestParseDecisionDict:
         )
         assert result.action == 'drop'
         assert result.batch_target_index == 2
+
+
+# ----------------------------------------------------------------------
+# _parse_batch_decisions
+# ----------------------------------------------------------------------
+
+
+class TestParseBatchDecisions:
+    def _make_result(self, decisions: list[dict]) -> AgentResult:
+        return AgentResult(
+            success=True,
+            output='',
+            structured_output={'decisions': decisions},
+            cost_usd=0.03,
+        )
+
+    def test_returns_ordered_decisions_by_candidate_index(self):
+        from fused_memory.middleware.task_curator import _parse_batch_decisions
+        pool0 = _pool_with_ids(('10', 'pending'))
+        pool1: list[_PoolEntry] = []
+        pool2: list[_PoolEntry] = []
+        result = _parse_batch_decisions(
+            self._make_result([
+                {'candidate_index': 2, 'action': 'create', 'justification': 'c'},
+                {'candidate_index': 0, 'action': 'drop', 'target_id': '10', 'justification': 'd'},
+                {'candidate_index': 1, 'action': 'create', 'justification': 'e'},
+            ]),
+            pools=[pool0, pool1, pool2],
+            pool_sizes_list=[{'module': 1}, {}, {}],
+            latency_ms=100,
+        )
+        assert len(result) == 3
+        assert result[0].action == 'drop'
+        assert result[1].action == 'create'
+        assert result[2].action == 'create'
