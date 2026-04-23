@@ -705,22 +705,31 @@ For each finding, classify and act:
 
 | Classification | Criteria | Action |
 |---|---|---|
-| **create_task** | Unambiguous bug, missing wiring, unfilled stub, clear fix path | Call `add_task` via MCP |
+| **create_task** | Unambiguous bug, missing wiring, unfilled stub, clear fix path | Call `submit_task` then `resolve_ticket`(timeout_seconds=60) |
 | **escalate** | Ambiguous, multiple valid approaches, architectural implications, design questions | Call `escalate_info` with category and summary |
 | **dismiss** | Known gap in briefing, noise, style preference, intentionally incomplete | Skip |
 
 ### Creating tasks
 
-Use the `add_task` MCP tool. Always include:
-- `title`: concise description of the fix
-- `description`: what's wrong, where, and the suggested approach
-- `priority`: "high" for broken wiring/stubs, "medium" for consistency issues
-- `metadata`: `{"source": "review-cycle", "spawn_context": "review",
-  "review_id": "<from your prompt>", "modules": ["path/to/module", ...]}`
-  Include the code modules (directory paths relative to project root) that this task will need to modify.
-  These are used for concurrency locking — be specific and include both source and test directories.
-  `spawn_context` tells the task curator how to treat duplicates against the existing backlog.
-- `project_root`: use the value from your Agent Identity section
+Use the two-step API to create tasks:
+
+1. Call `submit_task`(title=..., description=..., priority=..., metadata=...,
+   project_root=...) — returns `{"ticket": "tkt_..."}`. Always include:
+   - `title`: concise description of the fix
+   - `description`: what's wrong, where, and the suggested approach
+   - `priority`: "high" for broken wiring/stubs, "medium" for consistency issues
+   - `metadata`: `{"source": "review-cycle", "spawn_context": "review",
+     "review_id": "<from your prompt>", "modules": ["path/to/module", ...]}`
+     Include the code modules (directory paths relative to project root) that this task will need to modify.
+     These are used for concurrency locking — be specific and include both source and test directories.
+     `spawn_context` tells the task curator how to treat duplicates against the existing backlog.
+   - `project_root`: use the value from your Agent Identity section
+
+2. Call `resolve_ticket`(ticket=..., project_root=..., timeout_seconds=60) —
+   returns {status, task_id?, reason?}. Branch on `status`:
+   - `created` or `combined` — record `task_id` as the id of the resulting task.
+   - `dropped` — candidate was rejected (duplicate / backlog_full); skip it.
+   - `failed` — report the `reason` in your review output.
 
 ### Escalating ambiguous findings
 
