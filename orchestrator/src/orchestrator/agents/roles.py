@@ -1,5 +1,6 @@
 """Agent role definitions — system prompts and tool configurations per stage."""
 
+import textwrap
 from dataclasses import dataclass, field
 
 
@@ -496,6 +497,54 @@ git add -- . ':!.task'
     default_budget=5.0,
     default_max_turns=50,
 )
+
+
+def _submit_resolve_instructions(
+    metadata_template: str,
+    *,
+    outcome_target: str,
+    project_root_expr: str = '...',
+    step_prefix: tuple[str, str] = ('a', 'b'),
+    extra_submit_guidance: str = '',
+) -> str:
+    """Return the shared submit_task → resolve_ticket two-step instruction block.
+
+    Returns an unindented string. Callers apply textwrap.indent(...) as needed
+    for their local markdown context.
+
+    Args:
+        metadata_template: The metadata dict literal to show in the submit_task call.
+        outcome_target: Role-specific outcome target string (e.g. 'resolve_issue summary',
+            'review output', 'finding description').
+        project_root_expr: Expression for project_root arg (default '...' placeholder;
+            use e.g. '"/actual/path"' for interpolated contexts).
+        step_prefix: Tuple of (first_label, second_label) for the step bullets,
+            e.g. ('a', 'b') or ('1', '2').
+        extra_submit_guidance: Optional per-site extra guidance paragraph inserted
+            after the error-shape description.
+
+    Returns:
+        Plain unindented multi-line string with the shared skeleton.
+    """
+    a, b = step_prefix
+    extra = f'\n{extra_submit_guidance.rstrip()}\n' if extra_submit_guidance.strip() else ''
+    return textwrap.dedent(f"""\
+        {a}. Call `submit_task`(title=..., description=..., priority=...,
+           metadata={metadata_template},
+           project_root={project_root_expr}) — returns `{{"ticket": "tkt_..."}}` on success, or
+           `{{"error": ..., "error_type": ...}}` (no `ticket` key) if the call was
+           rejected at submit time (e.g. backlog full, closed interceptor). On the
+           error shape, treat the candidate as skipped and record the error in your
+           {outcome_target}.{extra}
+        {b}. Call `resolve_ticket`(ticket=..., project_root={project_root_expr}, timeout_seconds=60) —
+           (60 s is intentionally conservative; server default is 115 s — raise if
+           curator is consistently slow) returns {{status, task_id?, reason?}}. Branch on `status`:
+           - `created` — the curator accepted the candidate; record `task_id`.
+           - `combined` — the curator deduped into an existing task; `task_id` points
+             at that task. Record it the same way as `created` (the candidate was
+             absorbed, not lost).
+           - `failed` — report the `reason` in your {outcome_target}.\
+    """)
 
 
 _STEWARD_MEMORY_TOOLS = [
