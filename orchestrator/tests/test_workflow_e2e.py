@@ -2970,6 +2970,48 @@ class TestRecoverIfAlreadyMerged:
             f'workflow.state must not be DONE for stale branch: {workflow.state!r}'
         )
 
+    async def test_returns_none_when_branch_not_on_main(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Branch with real commit but NOT merged to main returns None.
+
+        Create a worktree with a real implementation commit (wt_head != base_commit,
+        has_work=True) but do NOT merge to main.  is_ancestor(wt_head, main_sha)
+        returns False, so _recover_if_already_merged() must return None without
+        side-effects.
+
+        Pins the is_ancestor=False branch returns None cleanly.
+        """
+        # 1. Create worktree and make a real implementation commit (no merge)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        (wt / 'unmerged_impl.py').write_text('def impl():\n    return 99\n')
+        await git_ops.commit(wt, 'Implement feature (unmerged)')
+
+        # 2. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. Call _recover_if_already_merged directly
+        outcome = await workflow._recover_if_already_merged()
+
+        # 4. Assertions: unmerged branch must return None with no side-effects
+        assert outcome is None, (
+            f'Expected None for unmerged branch but got {outcome!r} — '
+            'is_ancestor=False guard is missing or broken'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE for unmerged branch: {workflow.state!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # File-structure invariants
