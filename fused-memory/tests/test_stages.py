@@ -3,7 +3,7 @@
 import json
 import logging
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2769,7 +2769,7 @@ def _make_stage1_report_with_n_large_items(n: int) -> StageReport:
     Each item's 'description' is ~300 bytes so that 200 items exceed the
     40000-char budget when rendered by _format_flagged.
     """
-    now = datetime.now(tz=timezone.utc)
+    now = datetime.now(tz=UTC)
     return StageReport(
         stage=StageId.memory_consolidator,
         started_at=now,
@@ -2846,7 +2846,7 @@ class TestStage2HandoffShortfallWarning:
     ):
         """When all stage1 items fit in the budget, no shortfall warning is emitted."""
         # 5 small items — far under the 40000-char budget
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         stage1_report = StageReport(
             stage=StageId.memory_consolidator,
             started_at=now,
