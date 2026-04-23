@@ -356,7 +356,7 @@ async def latency_stats(
 async def recent_merges(
     db: aiosqlite.Connection | None,
     *,
-    limit: int = 20,
+    limit: int | None = 20,
     hours: int = 168,
     now: datetime | None = None,
 ) -> list[dict]:
@@ -364,7 +364,9 @@ async def recent_merges(
 
     Args:
         db: Async SQLite connection, or None (returns []).
-        limit: Maximum number of rows to return.
+        limit: Maximum number of rows to return.  When ``None``, no SQL
+            ``LIMIT`` clause is added and every matching row is returned.
+            The SQL WHERE window (``hours``) then becomes the sole bound.
         hours: Look-back window in hours (default 168 = 7 days).  Only
             events with ``timestamp >= now - hours`` are included.
         now: Reference timestamp for the cutoff window (default:
@@ -379,17 +381,20 @@ async def recent_merges(
 
     async def _query(conn: aiosqlite.Connection) -> list[dict]:
         since = _cutoff_iso(hours, now=now)
-        rows = await conn.execute_fetchall(
+        base_sql = (
             "SELECT task_id, run_id, "
             "       json_extract(data, '$.outcome') AS outcome, "
             "       duration_ms, timestamp "
             "FROM events "
             "WHERE event_type = 'merge_attempt' "
             "  AND timestamp >= ? "
-            "ORDER BY timestamp DESC "
-            "LIMIT ?",
-            (since, limit),
+            "ORDER BY timestamp DESC"
         )
+        if limit is None:
+            sql, params = base_sql, (since,)
+        else:
+            sql, params = base_sql + " LIMIT ?", (since, limit)
+        rows = await conn.execute_fetchall(sql, params)
         return [
             {
                 'task_id': row['task_id'],
