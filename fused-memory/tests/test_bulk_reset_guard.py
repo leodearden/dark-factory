@@ -518,3 +518,45 @@ async def test_escalation_rate_limited(tmp_path):
     assert len(esc_files) == 2, (
         f'Expected 2 escalation files, found {len(esc_files)}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-17: disabled guard always returns ok
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_guard_disabled_returns_ok(tmp_path):
+    """With enabled=False the guard is a no-op: all attempts return ok,
+    no escalation dir is created, and no internal state is accumulated."""
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        enabled=False,
+        threshold=1,  # Would trip on the first attempt if enabled
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    for i in range(5):
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='proj-disabled',
+            task_id=f'task-{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'attempt {i}: expected ok, got {v.outcome}'
+        assert v.is_rejection is False
+
+    # No escalation dir should have been created
+    esc_dir = tmp_path / 'data' / 'escalations'
+    assert not esc_dir.exists(), 'escalations dir should not exist when guard is disabled'
+
+    # Internal state deque should be empty (no entries accumulated)
+    assert not guard._state, 'guard state should be empty when disabled'
