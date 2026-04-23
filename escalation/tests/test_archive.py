@@ -105,11 +105,9 @@ class TestPruneArchive:
 class TestArchiveCli:
     """python -m escalation.archive CLI entry point."""
 
-    _PYTHON = str(Path(sys.executable).parent.parent / '.venv' / 'bin' / 'python')
-
     def _run_cli(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [self._PYTHON, '-m', 'escalation.archive', *args],
+            [sys.executable, '-m', 'escalation.archive', *args],
             capture_output=True,
             text=True,
         )
