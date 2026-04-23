@@ -232,8 +232,44 @@ Return a JSON object:
 
 After the sub-agent returns:
 1. Review the groupings (sanity check — don't re-triage, just confirm the groupings make sense)
-2. Create follow-up tasks via `mcp__fused-memory__add_task` for each task group
-3. Resolve the escalation:
+2. Create follow-up tasks using the two-phase pattern for each task group:
+
+   > **Note:** `mcp__fused-memory__add_task` is a deprecated facade being removed — always use `mcp__fused-memory__submit_task` + `mcp__fused-memory__resolve_ticket`.
+
+   ```
+   # Phase 1: submit — returns immediately with a ticket id
+   submit_result = mcp__fused-memory__submit_task(
+       project_root="<project_root>",
+       title="<task group title>",
+       description="<task group description with file paths and specifics>",
+       priority="medium",
+       metadata={
+           "source": "review-suggestions",
+           "escalation_id": escalation_id,
+           "suggestion_hash": hash,          # (escalation_id, suggestion_hash) is the idempotency key
+           "spawn_context": "steward-triage",
+           "modules": ["<path/to/module>"],
+       },
+   )
+   ticket = submit_result["ticket"]
+
+   # Phase 2: block until the curator decides (default 115 s)
+   # The (escalation_id, suggestion_hash) pair is the R4 idempotency gate — safe to retry on server_restart
+   resolve = mcp__fused-memory__resolve_ticket(ticket=ticket, project_root="<project_root>")
+
+   if resolve["status"] == "created":
+       task_id = resolve["task_id"]           # new task
+   elif resolve["status"] == "combined":
+       task_id = resolve["task_id"]           # merged into existing task — normal, not an error
+   elif resolve["status"] == "failed":
+       # reason: timeout | server_restart | server_closed | unknown_ticket | ...
+       handle_failure(resolve["reason"])
+   ```
+
+3. Resolve the escalation using the **escalation** MCP — `mcp__escalation__resolve_issue` closes the
+   escalation record on the escalation server. This is distinct from `mcp__fused-memory__resolve_ticket`
+   above, which waits for the task curator on the fused-memory server. Despite the name overlap, the two
+   calls operate on different systems:
    ```
    mcp__escalation__resolve_issue(
      escalation_id="...",
@@ -343,7 +379,7 @@ An agent flagged a risk during development. Risk assessment requires human judgm
 
 Technical debt or cleanup discovered during development.
 
-- **Info**: queue as a follow-up task via `mcp__fused-memory__add_task`. Resolve the escalation.
+- **Info**: queue as a follow-up task using `mcp__fused-memory__submit_task` → `mcp__fused-memory__resolve_ticket` (two-phase pattern; see `review_suggestions` §2 above for the full snippet — when reusing that snippet here, substitute `"source": "escalation-info"` and `"spawn_context": "steward-triage"` in place of the review-suggestions values; `escalation_id` stays the same). Resolve the escalation via `mcp__escalation__resolve_issue` once the ticket resolves.
 - **Blocking** (rare): spawn an interactive `/unblock` session (see `task_failure` for invocation pattern).
 
 ### `infra_issue` (blocking)

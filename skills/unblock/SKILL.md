@@ -149,12 +149,34 @@ Everything else: group into logically coherent tasks and queue them.
 - Not too small (don't create a task for a single rename)
 - Include specific file locations and what the reviewers flagged
 
+> **Note:** The `add_task` facade is deprecated and will be removed — use `submit_task` + `resolve_ticket`.
+
 ```
-add_task(
-  title="<descriptive title>",
-  description="<specific issues, file locations, reviewer references>",
-  project_root="<PROJECT_ROOT>"
+# Phase 1: submit — returns immediately with a ticket id
+submit_result = submit_task(
+    title="<descriptive title>",
+    description="<specific issues, file locations, reviewer references>",
+    project_root="<PROJECT_ROOT>",
+    priority="<medium|high>",
+    metadata={
+        "source": "unblock-triage",
+        "spawn_context": "unblock",
+        "modules": ["<path/to/affected/module>"],
+    },
 )
+ticket = submit_result["ticket"]
+
+# Phase 2: block until the curator decides (default 115 s)
+resolve = resolve_ticket(ticket=ticket, project_root="<PROJECT_ROOT>")
+
+if resolve["status"] == "created":
+    task_id = resolve["task_id"]           # new task queued successfully
+elif resolve["status"] == "combined":
+    task_id = resolve["task_id"]           # folded into existing task — still counts as queued
+elif resolve["status"] == "failed":
+    # reason: timeout | server_restart | server_closed | unknown_ticket | ...
+    # Retry once; if it fails again, escalate to the user with resolve["reason"]
+    handle_failure(resolve["reason"])
 ```
 
 ### 4.2: Reflect on analysis
