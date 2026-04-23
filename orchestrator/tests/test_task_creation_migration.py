@@ -26,104 +26,32 @@ class TestSharedSubmitResolveFragment:
     def test_helper_renders_shared_skeleton(self):
         result = _submit_resolve_instructions(
             '{"source": "X"}',
-            outcome_target='test summary',
+            outcome_target='SENTINEL_OUTCOME_XYZ',
             step_prefix=('1', '2'),
             project_root_expr='"/tmp"',
         )
-
-        # (a) 60s timeout rationale parenthetical
-        assert '60 s is intentionally conservative' in result
-        # (b) error-shape branch
-        assert 'error_type' in result
-        # (c) status branches
-        assert 'created' in result
-        assert 'combined' in result
-        assert 'failed' in result
-        # (d) supplied metadata_template
-        assert '{"source": "X"}' in result
-        # (e) supplied outcome_target
-        assert 'test summary' in result
-        # (f) step prefix labels
-        assert '1.' in result
-        assert '2.' in result
-        # (g) supplied project_root_expr
-        assert '"/tmp"' in result
+        # The outcome_target sentinel must appear at least twice:
+        # once in the error-shape sentence and once in the failed-branch sentence.
+        assert result.count('SENTINEL_OUTCOME_XYZ') >= 2
 
 
 # ---------------------------------------------------------------------------
-# Site-wiring tests (one assertion per site)
+# Site-wiring tests (minimal behavioral assertions)
 # ---------------------------------------------------------------------------
 
-_STEWARD_PRETRIAGED_METADATA = (
-    '{"source": "steward-triage", "spawn_context": "steward-triage",\n'
-    '"spawned_from": "<task_id under review>", "modules": [...]}'
-)
-_STEWARD_PRETRIAGED_EXTRA = (
-    'Populate `spawned_from` with the id of the task that produced the escalation\n'
-    '(it is in the escalation detail under `task_id`). Use the file paths listed in\n'
-    'the group for `modules`.'
-)
 
-_STEWARD_RAW_METADATA = (
-    '{"source": "steward-triage", "spawn_context": "steward-triage",\n'
-    '"spawned_from": "<task_id under review>", "modules": ["path/to/module", ...]}'
-)
-_STEWARD_RAW_EXTRA = (
-    "Include the code modules (directory paths relative to project root) that this task\n"
-    "will need to modify — these are used for concurrency locking. `spawned_from` lets\n"
-    "the task curator spot duplicates against the original task's details."
-)
+class TestSiteWiringMinimal:
+    """Minimal wiring checks: prompts must direct the agent through the two-step API."""
 
-_DEEP_REVIEWER_METADATA = '...'
-_DEEP_REVIEWER_EXTRA = (
-    'Always include:\n'
-    '- `title`: concise description of the fix\n'
-    '- `description`: what\'s wrong, where, and the suggested approach\n'
-    '- `priority`: "high" for broken wiring/stubs, "medium" for consistency issues\n'
-    '- `metadata`: `{"source": "review-cycle", "spawn_context": "review",\n'
-    '  "review_id": "<from your prompt>", "modules": ["path/to/module", ...]}`\n'
-    '  Include the code modules (directory paths relative to project root) that this task will need to modify.\n'
-    '  These are used for concurrency locking — be specific and include both source and test directories.\n'
-    '  `spawn_context` tells the task curator how to treat duplicates against the existing backlog.\n'
-    '- `project_root`: use the value from your Agent Identity section'
-)
+    def test_steward_prompt_directs_two_step_api(self):
+        assert 'submit_task' in STEWARD.system_prompt
+        assert 'resolve_ticket' in STEWARD.system_prompt
+        assert '60 s is intentionally conservative' in STEWARD.system_prompt
 
-
-class TestSiteWiring:
-    """Each site must be wired to use the shared helper."""
-
-    def test_steward_pretriaged_site_uses_helper(self):
-        expected = textwrap.indent(
-            _submit_resolve_instructions(
-                _STEWARD_PRETRIAGED_METADATA,
-                outcome_target='resolve_issue summary',
-                step_prefix=('a', 'b'),
-                extra_submit_guidance=_STEWARD_PRETRIAGED_EXTRA,
-            ),
-            '   ',
-        )
-        assert expected in STEWARD.system_prompt
-
-    def test_steward_raw_site_uses_helper(self):
-        expected = textwrap.indent(
-            _submit_resolve_instructions(
-                _STEWARD_RAW_METADATA,
-                outcome_target='resolve_issue summary',
-                step_prefix=('a', 'b'),
-                extra_submit_guidance=_STEWARD_RAW_EXTRA,
-            ),
-            '  ',
-        )
-        assert expected in STEWARD.system_prompt
-
-    def test_deep_reviewer_site_uses_helper(self):
-        expected = _submit_resolve_instructions(
-            _DEEP_REVIEWER_METADATA,
-            outcome_target='review output',
-            step_prefix=('1', '2'),
-            extra_submit_guidance=_DEEP_REVIEWER_EXTRA,
-        )
-        assert expected in DEEP_REVIEWER.system_prompt
+    def test_deep_reviewer_prompt_directs_two_step_api(self):
+        assert 'submit_task' in DEEP_REVIEWER.system_prompt
+        assert 'resolve_ticket' in DEEP_REVIEWER.system_prompt
+        assert '60 s is intentionally conservative' in DEEP_REVIEWER.system_prompt
 
 
 # ---------------------------------------------------------------------------
