@@ -119,15 +119,18 @@ class TaskInterceptor:
         # ``note_created`` + awaited ``record_task`` so the NEXT waiter on
         # the curator lock sees the new entry on its pre-LLM check (R3).
         #
-        # NOTE: add_task is NO LONGER in the _curator_locks scope.
-        # Serialisation for add_task is now provided by per-project ticket
+        # NOTE: add_task's *queueing* is now provided by per-project ticket
         # queues and workers (_curator_worker) — one asyncio.Queue and one
-        # asyncio.Task per project_id.  Serialisation boundary matches the
-        # _curator_locks semantics: a slow curator round-trip on project A
-        # does not delay submissions on project B.  Within a project, tickets
-        # are processed one at a time so R3/R4 invariants are unchanged.
-        # add_subtask and remove_task retain _curator_lock (routing them
-        # through the worker queue is out-of-scope for this task).
+        # asyncio.Task per project_id — so a slow curator round-trip on
+        # project A does not delay submissions on project B.  The worker
+        # STILL acquires ``_curator_lock(project_id)`` around curator.curate()
+        # through note_created + record_task to preserve R3: add_subtask /
+        # remove_task still enter _curator_lock directly, and without this
+        # acquisition their curate() calls could race against the worker's
+        # on a stale pre-note_created snapshot and both decide "create" for
+        # the same candidate.  Within a project, the lock provides
+        # single-threaded curator execution; across projects, the per-project
+        # queue+worker+lock architecture preserves fairness.
         #
         # Lock ordering is always curator_lock BEFORE write_lock to avoid
         # deadlock. Write-only ops take just write_lock, so a long curator
@@ -984,15 +987,19 @@ class TaskInterceptor:
         on this lock sees the new entry on its pre-LLM check.
 
         Taken by: ``add_subtask``, ``remove_task`` (conservative: protects
-        concurrent combine-target integrity). Lock order: curator_lock BEFORE
-        write_lock. Short writes (set_task_status etc.) never take this lock
-        and so are not blocked by an in-flight curator decision.
+        concurrent combine-target integrity) AND by ``_process_add_ticket``
+        (the add_task worker path) so curator decisions for the three families
+        are mutually exclusive within a project.  Without the worker taking
+        this lock, concurrent add_subtask + add_task on the same project
+        could both call curator.curate() against a stale snapshot and both
+        decide "create" for what is effectively the same candidate.
+        Lock order: curator_lock BEFORE write_lock. Short writes
+        (set_task_status etc.) never take this lock and so are not blocked
+        by an in-flight curator decision.
 
-        NOTE: ``add_task`` is **not** in this lock's scope.  The single-worker
-        ticket queue (``_curator_worker``) serialises add_task without holding
-        this lock, which obsoletes the long-held curator_lock on the hot MCP
-        path.  Routing ``add_subtask`` / ``remove_task`` through the worker
-        queue is a planned follow-up (out-of-scope for this task).
+        NOTE: Routing ``add_subtask`` / ``remove_task`` through the per-project
+        worker queue is a planned follow-up (out-of-scope for this task); until
+        then the worker must acquire this lock to preserve R3.
         """
         lock = self._curator_locks.get(project_id)
         if lock is None:
@@ -1364,182 +1371,194 @@ class TaskInterceptor:
         curator_degrade_reason: str | None = None
 
         try:
-            # ── R4: escalation-level idempotency ─────────────────────────
-            # Short-circuits curator when (escalation_id, suggestion_hash) in
-            # metadata matches a non-cancelled existing task — avoids duplicate
-            # tasks when reconciliation retries an escalation suggestion.
-            idempotency_hit = await self._check_escalation_idempotency(
-                project_root=project_root, metadata=metadata,
-            )
-            if idempotency_hit is not None:
-                existing_task_id = str(idempotency_hit.get('id', ''))
-                await self._ticket_store.mark_resolved(
-                    ticket_id,
-                    status='combined',
-                    task_id=existing_task_id or None,
-                    reason='idempotency_hit',
-                    result_json=json.dumps(idempotency_hit),
+            # ── R3 invariant: serialise curator+write within this project ─
+            # The worker runs per-project, but add_subtask / remove_task still
+            # take _curator_lock in their own paths.  Without this acquisition,
+            # a concurrent add_subtask could call curator.curate() against a
+            # stale snapshot (note_created not yet published) and both paths
+            # could independently decide 'create' for the same candidate.
+            # Lock ordering: curator_lock (outer) → write_lock (inner), matching
+            # remove_task and _add_subtask_locked.
+            async with self._curator_lock(project_id):
+                # ── R4: escalation-level idempotency ─────────────────────────
+                # Short-circuits curator when (escalation_id, suggestion_hash) in
+                # metadata matches a non-cancelled existing task — avoids duplicate
+                # tasks when reconciliation retries an escalation suggestion.
+                idempotency_hit = await self._check_escalation_idempotency(
+                    project_root=project_root, metadata=metadata,
                 )
-                self._signal_ticket_event(ticket_id)
-                return
-
-            # ── Curator gate ─────────────────────────────────────────────
-            curator = await self._get_curator()
-            decision: CuratorDecision | None = None
-            if curator is not None and candidate is not None:
-                try:
-                    decision = await curator.curate(candidate, project_id, project_root)
-                except CuratorFailureError as exc:
-                    logger.warning(
-                        '_process_add_ticket: curator.curate raised CuratorFailureError '
-                        'for %s; degrading to create. reason=%s',
-                        ticket_id, exc,
+                if idempotency_hit is not None:
+                    existing_task_id = str(idempotency_hit.get('id', ''))
+                    await self._ticket_store.mark_resolved(
+                        ticket_id,
+                        status='combined',
+                        task_id=existing_task_id or None,
+                        reason='idempotency_hit',
+                        result_json=json.dumps(idempotency_hit),
                     )
-                    # Degrade gracefully to create — avoids losing the task on
-                    # transient LLM failures.  Record the failure so the facade
-                    # and callers can see it in result_json.
-                    curator_degrade_reason = str(exc)
-                    decision = CuratorDecision(action='create')
+                    self._signal_ticket_event(ticket_id)
+                    return
 
-            if decision is not None and decision.action == 'drop' and decision.target_id:
-                # Drop: fold candidate into the existing target task (status='combined').
-                # Preserves legacy result shape for the add_task facade.
-                result_dict = {
-                    'id': decision.target_id,
-                    'title': candidate.title if candidate else '',
-                    'deduplicated': True,
-                    'action': 'drop',
-                    'justification': decision.justification,
-                }
-                await self._ticket_store.mark_resolved(
-                    ticket_id,
-                    status='combined',
-                    task_id=decision.target_id,
-                    reason=f'drop: {decision.justification}',
-                    result_json=json.dumps(result_dict),
-                )
-                self._signal_ticket_event(ticket_id)
-                return
-
-            if decision is not None and decision.action == 'combine' and decision.target_id:
-                # Combine: rewrite target task under write_lock, spawn reembed background task.
-                async with self._write_lock(project_id):
-                    combine_result = await self._execute_combine(project_root, decision)
-                if combine_result is not None:
-                    if decision.rewritten_task is not None and curator is not None:
-                        rt_candidate = CandidateTask.from_rewritten_task(decision.rewritten_task)
-                        bg = asyncio.create_task(
-                            curator.reembed_task(
-                                decision.target_id, rt_candidate, project_id,
-                            ),
-                            name=f'curator-reembed-{decision.target_id}',
+                # ── Curator gate ─────────────────────────────────────────────
+                curator = await self._get_curator()
+                decision: CuratorDecision | None = None
+                if curator is not None and candidate is not None:
+                    try:
+                        decision = await curator.curate(candidate, project_id, project_root)
+                    except CuratorFailureError as exc:
+                        logger.warning(
+                            '_process_add_ticket: curator.curate raised CuratorFailureError '
+                            'for %s; degrading to create. reason=%s',
+                            ticket_id, exc,
                         )
-                        self._background_tasks.add(bg)
-                        bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+                        # Degrade gracefully to create — avoids losing the task on
+                        # transient LLM failures.  Record the failure so the facade
+                        # and callers can see it in result_json.
+                        curator_degrade_reason = str(exc)
+                        decision = CuratorDecision(action='create')
+
+                if decision is not None and decision.action == 'drop' and decision.target_id:
+                    # Drop: fold candidate into the existing target task (status='combined').
+                    # Preserves legacy result shape for the add_task facade.
                     result_dict = {
                         'id': decision.target_id,
-                        'title': (
-                            decision.rewritten_task.title
-                            if decision.rewritten_task else (candidate.title if candidate else '')
-                        ),
+                        'title': candidate.title if candidate else '',
                         'deduplicated': True,
-                        'action': 'combine',
+                        'action': 'drop',
                         'justification': decision.justification,
                     }
                     await self._ticket_store.mark_resolved(
                         ticket_id,
                         status='combined',
                         task_id=decision.target_id,
-                        reason=f'combine: {decision.justification}',
+                        reason=f'drop: {decision.justification}',
                         result_json=json.dumps(result_dict),
                     )
                     self._signal_ticket_event(ticket_id)
                     return
-                # combine failed → fall through to create
 
-            # ── Create task ───────────────────────────────────────────────
-            tm = await self._ensure_taskmaster()
-            metadata_json: str | None = None
-            if metadata:
-                metadata_json = (
-                    metadata if isinstance(metadata, str) else json.dumps(metadata)
-                )
+                if decision is not None and decision.action == 'combine' and decision.target_id:
+                    # Combine: rewrite target task under write_lock, spawn reembed background task.
+                    async with self._write_lock(project_id):
+                        combine_result = await self._execute_combine(project_root, decision)
+                    if combine_result is not None:
+                        if decision.rewritten_task is not None and curator is not None:
+                            rt_candidate = CandidateTask.from_rewritten_task(decision.rewritten_task)
+                            bg = asyncio.create_task(
+                                curator.reembed_task(
+                                    decision.target_id, rt_candidate, project_id,
+                                ),
+                                name=f'curator-reembed-{decision.target_id}',
+                            )
+                            self._background_tasks.add(bg)
+                            bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+                        result_dict = {
+                            'id': decision.target_id,
+                            'title': (
+                                decision.rewritten_task.title
+                                if decision.rewritten_task else (candidate.title if candidate else '')
+                            ),
+                            'deduplicated': True,
+                            'action': 'combine',
+                            'justification': decision.justification,
+                        }
+                        await self._ticket_store.mark_resolved(
+                            ticket_id,
+                            status='combined',
+                            task_id=decision.target_id,
+                            reason=f'combine: {decision.justification}',
+                            result_json=json.dumps(result_dict),
+                        )
+                        self._signal_ticket_event(ticket_id)
+                        return
+                    # combine failed → fall through to create
 
-            async with self._write_lock(project_id):
-                try:
-                    result = await tm.add_task(
-                        project_root=project_root,
-                        metadata=metadata_json,
-                        **kwargs,
+                # ── Create task ───────────────────────────────────────────────
+                tm = await self._ensure_taskmaster()
+                metadata_json: str | None = None
+                if metadata:
+                    metadata_json = (
+                        metadata if isinstance(metadata, str) else json.dumps(metadata)
                     )
-                    atomic_metadata_written = metadata_json is not None
-                except TypeError:
-                    result = await tm.add_task(project_root=project_root, **kwargs)
-                    atomic_metadata_written = False
 
-                task_id_str: str = ''
-                if isinstance(result, dict):
-                    task_id_str = str(result.get('id', ''))
-
-                if not task_id_str:
-                    # tm.add_task returned a non-dict result or a dict without 'id'.
-                    # Reserves 'created' for the case where a usable task_id exists;
-                    # status='created' with task_id=None is semantically inconsistent
-                    # (the journal gate at L1519 silently skips it, but resolve_ticket
-                    # callers would get {status: 'created'} with no task_id — useless).
-                    reason = 'tm_add_task_returned_no_id'
-                    # status stays 'failed' (the initial default).
-                else:
-                    # ── Latch success immediately — post-create errors must NOT
-                    # downgrade this to 'failed'.  Once tm.add_task returns, the
-                    # task exists in tasks.json; marking the ticket 'failed' would
-                    # strand the task and cause duplicate-on-retry.
-                    task_id = task_id_str
-                    status = 'created'
-                    result_dict = result if isinstance(result, dict) else {}
-                    if curator_degrade_reason is not None:
-                        result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
-
-                if metadata_json and task_id_str and not atomic_metadata_written:
+                async with self._write_lock(project_id):
                     try:
-                        await tm.update_task(
-                            task_id=task_id_str,
-                            metadata=metadata_json,
+                        result = await tm.add_task(
                             project_root=project_root,
+                            metadata=metadata_json,
+                            **kwargs,
                         )
-                    except Exception as e:
-                        logger.warning(
-                            '_process_add_ticket: metadata follow-up for %s failed: %s',
-                            task_id_str, e,
-                        )
+                        atomic_metadata_written = metadata_json is not None
+                    except TypeError:
+                        result = await tm.add_task(project_root=project_root, **kwargs)
+                        atomic_metadata_written = False
 
-                # note_created + record_task under write_lock (R3 invariant).
-                # Each is wrapped independently: a failure appends to
-                # post_create_warnings and is logged, but does NOT flip status.
-                if curator is not None and candidate is not None and task_id_str:
-                    # task_id_str truthy ↔ we took the else-branch above, so
-                    # result_dict was assigned; assert to satisfy the type checker.
-                    assert result_dict is not None
-                    try:
-                        curator.note_created(project_id, candidate, task_id_str)
-                    except Exception as exc:
-                        logger.warning(
-                            '_process_add_ticket: curator.note_created failed for %s: %s',
-                            task_id_str, exc,
-                        )
-                        result_dict.setdefault('post_create_warnings', []).append(
-                            {'stage': 'note_created', 'error': str(exc)}
-                        )
-                    try:
-                        await curator.record_task(task_id_str, candidate, project_id)
-                    except Exception as exc:
-                        logger.warning(
-                            '_process_add_ticket: curator.record_task failed for %s',
-                            task_id_str, exc_info=True,
-                        )
-                        result_dict.setdefault('post_create_warnings', []).append(
-                            {'stage': 'record_task', 'error': str(exc)}
-                        )
+                    task_id_str: str = ''
+                    if isinstance(result, dict):
+                        task_id_str = str(result.get('id', ''))
+
+                    if not task_id_str:
+                        # tm.add_task returned a non-dict result or a dict without 'id'.
+                        # Reserves 'created' for the case where a usable task_id exists;
+                        # status='created' with task_id=None is semantically inconsistent
+                        # (the journal gate at L1519 silently skips it, but resolve_ticket
+                        # callers would get {status: 'created'} with no task_id — useless).
+                        reason = 'tm_add_task_returned_no_id'
+                        # status stays 'failed' (the initial default).
+                    else:
+                        # ── Latch success immediately — post-create errors must NOT
+                        # downgrade this to 'failed'.  Once tm.add_task returns, the
+                        # task exists in tasks.json; marking the ticket 'failed' would
+                        # strand the task and cause duplicate-on-retry.
+                        task_id = task_id_str
+                        status = 'created'
+                        result_dict = result if isinstance(result, dict) else {}
+                        if curator_degrade_reason is not None:
+                            result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
+
+                    if metadata_json and task_id_str and not atomic_metadata_written:
+                        try:
+                            await tm.update_task(
+                                task_id=task_id_str,
+                                metadata=metadata_json,
+                                project_root=project_root,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                '_process_add_ticket: metadata follow-up for %s failed: %s',
+                                task_id_str, e,
+                            )
+
+                    # note_created + record_task under curator_lock + write_lock
+                    # (R3 invariant): by holding curator_lock across curate() →
+                    # note_created, concurrent add_subtask curator calls cannot
+                    # race on a stale in-memory snapshot.
+                    # Each is wrapped independently: a failure appends to
+                    # post_create_warnings and is logged, but does NOT flip status.
+                    if curator is not None and candidate is not None and task_id_str:
+                        # task_id_str truthy ↔ we took the else-branch above, so
+                        # result_dict was assigned; assert to satisfy the type checker.
+                        assert result_dict is not None
+                        try:
+                            curator.note_created(project_id, candidate, task_id_str)
+                        except Exception as exc:
+                            logger.warning(
+                                '_process_add_ticket: curator.note_created failed for %s: %s',
+                                task_id_str, exc,
+                            )
+                            result_dict.setdefault('post_create_warnings', []).append(
+                                {'stage': 'note_created', 'error': str(exc)}
+                            )
+                        try:
+                            await curator.record_task(task_id_str, candidate, project_id)
+                        except Exception as exc:
+                            logger.warning(
+                                '_process_add_ticket: curator.record_task failed for %s',
+                                task_id_str, exc_info=True,
+                            )
+                            result_dict.setdefault('post_create_warnings', []).append(
+                                {'stage': 'record_task', 'error': str(exc)}
+                            )
 
         except Exception as exc:
             logger.exception(
@@ -1599,9 +1618,10 @@ class TaskInterceptor:
         115 s (under the MCP 120 s hard limit) and raises ``RuntimeError`` on
         timeout — there is no silent fallback.
 
-        The ``_curator_lock`` that previously serialised this path is gone;
-        serialisation is now provided by the single-worker ticket queue in
-        ``_curator_worker``.
+        Serialisation is now primarily provided by the per-project worker
+        ticket queue in ``_curator_worker``; the worker additionally acquires
+        ``_curator_lock(project_id)`` so add_subtask / remove_task curator
+        calls stay mutually exclusive with the worker's curate() step (R3).
 
         .. deprecated::
             Migrate callers to ``submit_task`` / ``resolve_ticket``.
