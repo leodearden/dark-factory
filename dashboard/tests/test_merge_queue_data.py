@@ -2817,3 +2817,48 @@ class TestBuildPerProjectMergeQueue:
             f'expected hours={expected_hours}, got hours={captured_kwargs.get("hours")!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_burst_exceeding_50_within_window_not_dropped(self, tmp_path):
+        """60 merge_attempt events within the 15-min window are all returned (none silently dropped).
+
+        This is the end-to-end regression gate: the old limit=50 call would silently
+        truncate a burst of >50 events even if every event was within recent_window_minutes.
+        With the fix (limit=None + SQL hours window), all 60 events survive the pipeline.
+        """
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        # 60 events spread across the last ~14 minutes (14s apart), all within 15-min window.
+        events = [
+            {
+                'event_type': 'merge_attempt',
+                'timestamp': now - timedelta(seconds=i * 14),
+                'task_id': f'burst-task-{i:03d}',
+                'run_id': f'burst-run-{i:03d}',
+                'data': {'outcome': 'done'},
+                'duration_ms': 500 + i,
+            }
+            for i in range(60)
+        ]
+        db_path = _make_db(tmp_path, 'burst.db', events)
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue(
+                [('/tmp/P', conn)],
+                hours=24,
+                now=now,
+                recent_window_minutes=15,
+            )
+
+        recent = result['/tmp/P']['recent']
+        assert len(recent) == 60, (
+            f'Expected 60 rows in recent burst, got {len(recent)}. '
+            'The SQL LIMIT cap must not silently truncate burst events within the window.'
+        )
+        returned_task_ids = {r['task_id'] for r in recent}
+        expected_task_ids = {f'burst-task-{i:03d}' for i in range(60)}
+        assert returned_task_ids == expected_task_ids, (
+            f'Missing task_ids: {expected_task_ids - returned_task_ids}'
+        )
+
