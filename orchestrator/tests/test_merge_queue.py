@@ -3698,3 +3698,60 @@ class TestWorkflowSubmitUsesEnqueueHelper:
         assert call_req.task_id == '42'
         assert call_req.branch == 'task/42'
         assert call_es is event_store_mock
+
+
+# ---------------------------------------------------------------------------
+# TestEscalationServerUsesEnqueueHelper — step-13 test
+# ---------------------------------------------------------------------------
+
+
+class TestEscalationServerUsesEnqueueHelper:
+    """escalation server merge_request tool delegates to enqueue_merge_request."""
+
+    @pytest.mark.asyncio
+    async def test_escalation_server_merge_request_uses_enqueue_helper(
+        self, tmp_path: Path,
+    ):
+        """merge_request tool calls enqueue_merge_request(queue, req, event_store).
+
+        Must fail until escalation/server.py accepts the event_store kwarg (step-14)
+        and replaces merge_queue.put() with the helper.
+        """
+        from orchestrator.merge_queue import MergeOutcome, MergeRequest
+        from orchestrator.event_store import EventStore
+        from escalation.server import create_server
+
+        merge_queue: asyncio.Queue = asyncio.Queue()
+        event_store = EventStore(db_path=tmp_path / 'test.db', run_id='test')
+
+        # Stub orch_config with _module_configs attribute
+        stub_config = MagicMock()
+        stub_config._module_configs = {}
+
+        # Mock resolves the future so the tool doesn't hang
+        async def _mock_enqueue(queue, req, es):
+            if not req.result.done():
+                req.result.set_result(MergeOutcome('done'))
+
+        mock_helper = AsyncMock(side_effect=_mock_enqueue)
+
+        # Patch the source module so local imports inside the tool get the mock
+        with patch('orchestrator.merge_queue.enqueue_merge_request', mock_helper):
+            # Before step-14: create_server raises TypeError (unexpected kwarg)
+            mcp = create_server(
+                MagicMock(),
+                merge_queue=merge_queue,
+                orch_config=stub_config,
+                event_store=event_store,
+            )
+            tool = await mcp.get_tool('merge_request')
+            await tool.fn(task_id='9', branch='task/9', worktree='/tmp/x')
+
+        # Helper must have been called exactly once with the right args
+        mock_helper.assert_called_once()
+        call_queue, call_req, call_es = mock_helper.call_args.args
+        assert call_queue is merge_queue
+        assert isinstance(call_req, MergeRequest)
+        assert call_req.task_id == '9'
+        assert call_req.branch == 'task/9'
+        assert call_es is event_store
