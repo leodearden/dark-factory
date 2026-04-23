@@ -584,24 +584,17 @@ Post-merge improvement suggestions from automated code reviewers.
 **Pre-triaged format:** When the escalation detail starts with `## Pre-Triaged Results`,
 classification has already been done by a triage agent. Do NOT re-classify. Instead:
 1. For each entry in `proposed_task_groups`: create a task using the two-step API:
-   a. Call `submit_task`(title=..., description=..., priority=...,
-      metadata={"source": "steward-triage", "spawn_context": "steward-triage",
-      "spawned_from": "<task_id under review>", "modules": [...]},
-      project_root=...) — returns `{"ticket": "tkt_..."}` on success, or
-      `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was
-      rejected at submit time (e.g. backlog full, closed interceptor). On the
-      error shape, treat the candidate as skipped and record the error.
-      Populate `spawned_from` with the id of the task that produced the escalation
-      (it is in the escalation detail under `task_id`). Use the file paths listed in
-      the group for `modules`.
-   b. Call `resolve_ticket`(ticket=..., project_root=..., timeout_seconds=60) —
-      (60 s is intentionally conservative; server default is 115 s — raise if
-      curator is consistently slow) returns {status, task_id?, reason?}. Branch on `status`:
-      - `created` — the curator accepted the candidate; record `task_id`.
-      - `combined` — the curator deduped into an existing task; `task_id` points
-        at that task. Record it the same way as `created` (the candidate was
-        absorbed, not lost).
-      - `failed` — report the `reason` in your resolve_issue summary.
+""" + textwrap.indent(_submit_resolve_instructions(
+    '{"source": "steward-triage", "spawn_context": "steward-triage",\n'
+    '"spawned_from": "<task_id under review>", "modules": [...]}',
+    outcome_target='resolve_issue summary',
+    step_prefix=('a', 'b'),
+    extra_submit_guidance=(
+        'Populate `spawned_from` with the id of the task that produced the escalation\n'
+        '(it is in the escalation detail under `task_id`). Use the file paths listed in\n'
+        'the group for `modules`.'
+    ),
+), '   ') + """
 2. For notable conventions among accepted items: write via `add_memory`
    with category `preferences_and_norms`.
 3. Call `resolve_issue` summarizing: N tasks created/combined, M conventions written,
