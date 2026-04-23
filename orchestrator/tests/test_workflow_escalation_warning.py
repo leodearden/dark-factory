@@ -73,7 +73,7 @@ class TestMaybeWarnMissingEscalation:
             if rec.levelno >= logging.WARNING
         ), 'unexpected WARNING about missing escalation_queue when queue is present'
 
-    @pytest.mark.parametrize('role_name', ['judge', 'reviewer_comprehensive', 'steward'])
+    @pytest.mark.parametrize('role_name', ['judge', 'reviewer_comprehensive', 'steward', 'deep_reviewer'])
     def test_no_warning_for_non_escalation_capable_role(self, caplog, role_name):
         """No WARNING is emitted for roles that do not use escalation tools."""
         wf = _make_workflow(escalation_queue=None)
