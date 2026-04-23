@@ -3130,6 +3130,67 @@ class TestRecoverIfAlreadyMerged:
             f"but caplog only has: {[r.message for r in caplog.records]}"
         )
 
+    async def test_sets_done_state_and_note_provenance_on_fire(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """On fire, must set workflow.state=DONE and note provenance.
+
+        Pins the exact state/scheduler side-effects:
+        - return value is WorkflowOutcome.DONE
+        - workflow.state == WorkflowState.DONE
+        - scheduler.statuses[task_id][-1] == 'done'
+        - scheduler.provenance[task_id] == {'note': 'branch already on main after escalation resolution'}
+
+        Previously asserted against _mark_blocked; now retargeted to the
+        new helper directly.
+        """
+        import json as _json
+
+        # 1. Create worktree, stamp implementer entry, commit + merge to main
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+        (wt / 'provenance_check.py').write_text('def impl():\n    return 1\n')
+        await git_ops.commit(wt, 'Implement feature (provenance test)')
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # 2. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. Call _recover_if_already_merged
+        outcome = await workflow._recover_if_already_merged()
+
+        # 4. Assertions: exact state + provenance
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE but got {outcome!r}'
+        )
+        assert workflow.state == WorkflowState.DONE, (
+            f'workflow.state must be DONE, got: {workflow.state!r}'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert statuses[-1] == 'done', (
+            f"Last scheduler status must be 'done', got: {statuses}"
+        )
+        assert scheduler.provenance.get(task_assignment.task_id) == {
+            'note': 'branch already on main after escalation resolution'
+        }, (
+            f"Expected note provenance but got: "
+            f"{scheduler.provenance.get(task_assignment.task_id)!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # File-structure invariants
