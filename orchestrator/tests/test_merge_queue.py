@@ -3406,3 +3406,65 @@ class TestEnqueueMergeRequest:
         assert queue.qsize() == 1
         dequeued = queue.get_nowait()
         assert dequeued is req
+
+
+# ---------------------------------------------------------------------------
+# TestMergeWorkerDequeueEvent — step-5
+# ---------------------------------------------------------------------------
+
+
+class TestMergeWorkerDequeueEvent:
+    """MergeWorker emits merge_dequeued after dequeuing a request."""
+
+    @pytest.mark.asyncio
+    async def test_merge_worker_emits_merge_dequeued_after_dequeue(
+        self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps,
+    ):
+        """MergeWorker emits merge_dequeued after pulling request from queue.
+
+        Timestamp of merge_dequeued must be >= merge_queued timestamp.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=event_store)
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('42', 'task/42', wt, config)
+
+        # Patch _do_merge so it immediately returns 'done' without git ops
+        async def _fast_done(req):
+            return MergeOutcome('done')
+
+        worker_task = asyncio.create_task(worker.run())
+        with patch.object(worker, '_do_merge', side_effect=_fast_done):
+            await enqueue_merge_request(queue, req, event_store)
+            outcome = await asyncio.wait_for(req.result, timeout=10)
+
+        assert outcome.status == 'done'
+
+        conn = sqlite3.connect(str(db_path))
+        dequeued_rows = conn.execute(
+            "SELECT event_type, task_id, timestamp FROM events "
+            "WHERE event_type = 'merge_dequeued'"
+        ).fetchall()
+        queued_rows = conn.execute(
+            "SELECT timestamp FROM events WHERE event_type = 'merge_queued'"
+        ).fetchall()
+        conn.close()
+
+        assert len(dequeued_rows) == 1, f'Expected 1 merge_dequeued row, got: {dequeued_rows}'
+        assert dequeued_rows[0][1] == '42'
+        # merge_dequeued timestamp must be >= merge_queued timestamp
+        assert len(queued_rows) == 1
+        assert dequeued_rows[0][2] >= queued_rows[0][0]
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
