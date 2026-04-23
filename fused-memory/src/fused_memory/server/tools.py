@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from fused_memory.middleware.task_interceptor import _is_ticket_id
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout
 from fused_memory.services.memory_service import MemoryService
@@ -1064,6 +1065,27 @@ def create_mcp_server(
         except ValueError as e:
             return {'error': str(e), 'error_type': 'ValidationError'}
 
+    def _reject_if_ticket_id(name: str, value: object) -> dict | None:
+        """Return a ValidationError dict if ``value`` is a ticket-shaped id.
+
+        Ticket ids (``tkt_`` prefix) are returned by ``submit_task`` and must
+        be resolved via ``resolve_ticket`` before being passed to id-accepting
+        task tools. Returning a clear error here prevents confusing downstream
+        failures inside the taskmaster backend.
+
+        Delegates to :func:`~fused_memory.middleware.task_interceptor._is_ticket_id`
+        so there is a single source of truth for the ticket-id prefix.
+        """
+        if _is_ticket_id(value):
+            return {
+                'error': (
+                    f'Ticket-shaped id {value!r} not allowed here; '
+                    'call resolve_ticket first to obtain a numeric task_id.'
+                ),
+                'error_type': 'ValidationError',
+            }
+        return None
+
     @mcp.tool()
     async def get_tasks(
         project_root: str,
@@ -1148,6 +1170,8 @@ def create_mcp_server(
                 Persisted on the task as metadata.reopen_reason for audit.
                 Ignored for non-terminal transitions.
         """
+        if err := _reject_if_ticket_id('id', id):
+            return err
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
@@ -1224,6 +1248,109 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    async def submit_task(
+        project_root: str,
+        prompt: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        details: str | None = None,
+        dependencies: str | None = None,
+        priority: str | None = None,
+        metadata: str | dict[str, Any] | None = None,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        """Phase-1 of two-phase task creation: persist a ticket and return its id immediately.
+
+        Returns ``{"ticket": "tkt_<id>"}`` so the caller can either poll or
+        block via ``resolve_ticket``.  Does NOT call the Taskmaster backend
+        directly — that happens asynchronously in the curator worker.
+
+        Callers should follow up with ``resolve_ticket`` to obtain the final
+        task_id once the curator has decided (create / drop / combine).
+
+        Args:
+            project_root: Absolute path to project root
+            prompt: Task description for AI generation (forwarded to Taskmaster)
+            title: Task title
+            description: Task description
+            details: Task details / implementation notes
+            dependencies: Comma-separated dependency task IDs
+            priority: critical, high, medium, low, or polish (default medium)
+            metadata: Task metadata (object or JSON string)
+            tag: Tag context (optional)
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        try:
+            return await task_interceptor.submit_task(
+                project_root=project_root,
+                prompt=prompt,
+                title=title,
+                description=description,
+                details=details,
+                dependencies=dependencies,
+                priority=priority,
+                metadata=metadata,
+                tag=tag,
+            )
+        except Exception as e:
+            logger.error(f'submit_task error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def resolve_ticket(
+        ticket: str,
+        project_root: str,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Phase-2 of two-phase task creation: block until the curator worker decides.
+
+        Returns ``{status, task_id?, reason?}`` once the ticket is terminal.
+        If the ticket is already terminal, returns immediately.
+
+        Status values:
+        - ``created``  — a new task was created; ``task_id`` is the numeric id.
+        - ``combined`` — candidate was folded into an existing task; ``task_id``
+          is the target task's id.
+        - ``failed``   — an error occurred; ``reason`` describes it. Common
+          reasons: ``timeout``, ``server_restart``, ``expired``.
+
+        Callers that receive ``status=failed, reason=timeout`` should either
+        retry or report an error — the legacy ``add_task`` facade raises
+        ``RuntimeError`` in this case.
+
+        Args:
+            ticket: Ticket id returned by ``submit_task`` (must start with ``tkt_``)
+            project_root: Absolute path to project root (same as supplied to submit_task)
+            timeout_seconds: Maximum seconds to wait.  Defaults to 115 s (just
+                under the MCP 120 s hard limit) so external callers that omit this
+                parameter cannot hang indefinitely on an orphaned ticket.
+        """
+        if not _is_ticket_id(ticket):
+            return {
+                'error': f'ticket must start with tkt_ (got {ticket!r})',
+                'error_type': 'ValidationError',
+            }
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        # Apply a safe default timeout at the MCP layer so external callers
+        # cannot block indefinitely — mirrors the add_task facade's 115 s budget.
+        effective_timeout = 115.0 if timeout_seconds is None else timeout_seconds
+        try:
+            return await task_interceptor.resolve_ticket(
+                ticket=ticket,
+                project_root=project_root,
+                timeout_seconds=effective_timeout,
+            )
+        except Exception as e:
+            logger.error(f'resolve_ticket error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
     async def update_task(
         id: str,
         project_root: str,
@@ -1242,6 +1369,8 @@ def create_mcp_server(
             append: Append instead of full update
             tag: Tag context (optional)
         """
+        if err := _reject_if_ticket_id('id', id):
+            return err
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
@@ -1280,6 +1409,8 @@ def create_mcp_server(
             details: Subtask details
             tag: Tag context (optional)
         """
+        if err := _reject_if_ticket_id('id', id):
+            return err
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
@@ -1310,6 +1441,8 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
+        if err := _reject_if_ticket_id('id', id):
+            return err
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
@@ -1337,6 +1470,10 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
+        if err := _reject_if_ticket_id('id', id):
+            return err
+        if err := _reject_if_ticket_id('depends_on', depends_on):
+            return err
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
@@ -1367,6 +1504,10 @@ def create_mcp_server(
             project_root: Absolute path to project root
             tag: Tag context (optional)
         """
+        if err := _reject_if_ticket_id('id', id):
+            return err
+        if err := _reject_if_ticket_id('depends_on', depends_on):
+            return err
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized

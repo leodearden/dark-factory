@@ -143,6 +143,23 @@ class CandidateTask:
         h.update((self.spawned_from or '').encode())
         return h.hexdigest()[:16]
 
+    @classmethod
+    def from_rewritten_task(cls, rt: RewrittenTask) -> CandidateTask:
+        """Construct a CandidateTask from a RewrittenTask produced by the combine action.
+
+        Centralises the field mapping so callers don't hand-enumerate fields
+        and silently drop any that ``RewrittenTask`` gains in the future.
+        ``spawned_from`` and ``spawn_context`` are left at their defaults
+        because a rewritten task has no direct spawning relationship.
+        """
+        return cls(
+            title=rt.title,
+            description=rt.description,
+            details=rt.details,
+            files_to_modify=rt.files_to_modify,
+            priority=rt.priority,
+        )
+
 
 @dataclass
 class RewrittenTask:

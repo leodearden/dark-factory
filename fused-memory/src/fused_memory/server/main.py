@@ -20,6 +20,7 @@ from fused_memory.services.memory_service import MemoryService  # noqa: E402
 
 if TYPE_CHECKING:
     from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
     from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -255,13 +256,16 @@ async def run_server():
         from fused_memory.middleware.task_file_committer import TaskFileCommitter
 
         task_committer = TaskFileCommitter()
+        ticket_store = await _build_ticket_store(Path(config.reconciliation.data_dir))
         task_interceptor = TaskInterceptor(
             taskmaster, targeted, event_buffer, task_committer,
             config=config, escalator=curator_escalator,
             event_queue=event_queue,
             backlog_policy=backlog_policy,
             usage_gate=curator_usage_gate,
+            ticket_store=ticket_store,
         )
+        await task_interceptor.start()
 
         # Full reconciliation harness (background loop)
         reconciliation_harness = ReconciliationHarness(
@@ -282,11 +286,15 @@ async def run_server():
         event_buffer = EventBuffer(db_path=None)
         await event_buffer.initialize()
         task_committer = TaskFileCommitter()
+        _disabled_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
+        ticket_store = await _build_ticket_store(_disabled_data_dir)
         task_interceptor = TaskInterceptor(
             taskmaster, None, event_buffer, task_committer,
             config=config, escalator=curator_escalator,
             usage_gate=curator_usage_gate,
+            ticket_store=ticket_store,
         )
+        await task_interceptor.start()
 
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(
@@ -361,6 +369,23 @@ async def run_server():
             event_queue=event_queue,
             sqlite_watchdog=sqlite_watchdog,
         )
+
+
+async def _build_ticket_store(data_dir: Path) -> 'TicketStore':
+    """Construct and initialise a :class:`TicketStore` for the given data directory.
+
+    The store is backed by ``data_dir/tickets.db`` (sibling to
+    ``reconciliation.db``).  :meth:`~TicketStore.initialize` is called before
+    returning so the SQLite schema and WAL pragmas are applied.
+
+    Used by both the *reconciliation-enabled* and *disabled* startup branches in
+    :func:`run_server` so the same setup is applied consistently.
+    """
+    from fused_memory.middleware.ticket_store import TicketStore
+
+    store = TicketStore(data_dir / 'tickets.db')
+    await store.initialize()
+    return store
 
 
 def _register_drain_signal_handler(reconciliation_harness: 'ReconciliationHarness') -> None:
