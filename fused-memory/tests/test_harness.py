@@ -1886,6 +1886,56 @@ class TestHarnessFetchFilteredTaskTree:
             f"got: {warning_msgs}"
         )
 
+    @pytest.mark.asyncio
+    async def test_fetch_filtered_task_tree_logs_raw_task_count(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """_fetch_filtered_task_tree emits an INFO log with the raw task count after a successful fetch.
+
+        The log message must contain 'raw tasks', the integer count of tasks
+        returned by taskmaster, and the project_root so operators can distinguish
+        'get_tasks returned 0 raw tasks' (upstream Taskmaster issue) from
+        'get_tasks returned N tasks but filter partitioned all into other'
+        (task_filter regression).
+        """
+        import logging
+
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # Four tasks with mixed statuses
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+            'tasks': [
+                {'id': 1, 'title': 'T1', 'status': 'in-progress', 'dependencies': []},
+                {'id': 2, 'title': 'T2', 'status': 'done', 'dependencies': []},
+                {'id': 3, 'title': 'T3', 'status': 'cancelled', 'dependencies': []},
+                {'id': 4, 'title': 'T4', 'status': 'pending', 'dependencies': []},
+            ]
+        }
+
+        with caplog.at_level(logging.INFO):
+            result = await harness._fetch_filtered_task_tree('/abs/path')
+
+        # (a) INFO log must contain 'raw tasks', the count 4, and the project_root
+        info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            'raw tasks' in msg and '4' in msg and '/abs/path' in msg
+            for msg in info_msgs
+        ), (
+            f"Expected INFO log containing 'raw tasks', '4', '/abs/path'; got: {info_msgs}"
+        )
+
+        # (b) sanity: returned tree reflects the actual data
+        assert isinstance(result, FilteredTaskTree)
+        assert len(result.active_tasks) == 2   # in-progress + pending
+        assert result.done_count == 1
+        assert result.cancelled_count == 1
+
 
 # ── Tests for task 455: harness wires filtered_task_tree into stages ──────────
 
