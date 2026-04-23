@@ -2528,6 +2528,39 @@ class TestBuildPerProjectMergeQueue:
         assert data['latency']['count'] == 0
         assert data['recent'] == []
 
+    async def test_mixed_real_and_none_dbs(self, tmp_path):
+        """Mixed (pid, real_conn) and (pid, None) entries all appear in the result.
+
+        Guards the parallel gather path: a None-db project must not raise and
+        must not suppress or crash the real-db project alongside it.
+        """
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'real.db', [])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            project_dbs = [
+                ('/tmp/real', conn),
+                ('/tmp/none', None),
+            ]
+            result = await build_per_project_merge_queue(
+                project_dbs, hours=24, now=now, recent_window_minutes=15,
+            )
+
+        # Both pids present — None entry must not be dropped
+        assert set(result.keys()) == {'/tmp/real', '/tmp/none'}
+
+        # None-db entry produces defaults without crashing
+        none_data = result['/tmp/none']
+        assert none_data['latency']['count'] == 0
+        assert none_data['recent'] == []
+
+        # Real-db entry has the expected top-level keys
+        real_data = result['/tmp/real']
+        assert set(real_data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
+
     async def test_per_project_queries_run_concurrently(self, tmp_path):
         """All N per-project gathers must run concurrently (peak-in-flight == N).
 
