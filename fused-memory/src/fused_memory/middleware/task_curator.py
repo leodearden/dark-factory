@@ -14,6 +14,14 @@ docs/reify-task-fragmentation-report-2026-04-11.txt for the motivating analysis.
 
 The curator is best-effort: any failure (embedder, Qdrant, LLM, taskmaster) degrades
 to ``action="create"`` so task creation is never blocked.
+
+Batch API (task 924)
+--------------------
+:meth:`TaskCurator.curate_batch` is the preferred entry point for the ticket worker:
+one ``invoke_with_cap_retry`` round-trip for up to ``CuratorConfig.batch_max`` candidates.
+Identical candidates in the same batch are short-circuited via pre-batch payload-hash
+dedup; each unique candidate gets its own four-stream pool.  See plan.json for task 924
+for the full design rationale (batch prompt, schema, topo-sort dispatch, fallback).
 """
 
 from __future__ import annotations
@@ -720,9 +728,38 @@ class TaskCurator:
 
         # N>1: build per-candidate corpus, call the batched LLM, cache results.
         start = time.monotonic()
+
+        # ── Pre-batch deduplication by payload_hash ────────────────────────────
+        # If two candidates in the batch are identical (same payload_hash),
+        # only the FIRST goes through the LLM or fallback curate() path.
+        # The duplicate gets a synthetic batch_target_index drop decision so
+        # the worker's topo-sort can substitute the first candidate's resulting
+        # task_id.  This preserves the single-ticket invariant where the second
+        # identical add_task call sees the first's outcome via note_created/cache.
+        hash_to_first_idx: dict[str, int] = {}
+        # Maps full-list index → synthetic drop decision (for duplicates)
+        pre_dedup_decisions: dict[int, CuratorDecision] = {}
+        # Indices of candidates that will go to the LLM (unique ones only)
+        unique_indices: list[int] = []
+        for i, candidate in enumerate(candidates):
+            h = candidate.payload_hash()
+            if h in hash_to_first_idx:
+                pre_dedup_decisions[i] = CuratorDecision(
+                    action='drop',
+                    batch_target_index=hash_to_first_idx[h],
+                    justification='pre-batch-dedup: identical payload_hash',
+                )
+            else:
+                hash_to_first_idx[h] = i
+                unique_indices.append(i)
+
+        unique_candidates = [candidates[i] for i in unique_indices]
+        # ── End pre-batch dedup ────────────────────────────────────────────────
+
         pools: list[list[_PoolEntry]] = []
         pool_sizes_list: list[dict[str, int]] = []
-        for candidate in candidates:
+        for i in unique_indices:
+            candidate = candidates[i]
             try:
                 pool, pool_sizes = await self._build_corpus(
                     candidate, project_id, project_root,
@@ -741,19 +778,33 @@ class TaskCurator:
             pool_sizes_list.append(pool_sizes)
 
         try:
-            decisions = await self._call_llm_batch(
-                candidates, pools, pool_sizes_list, start, project_id, project_root,
+            unique_decisions = await self._call_llm_batch(
+                unique_candidates, pools, pool_sizes_list, start, project_id, project_root,
             )
-        except (CuratorFailureError, AllAccountsCappedException) as exc:
+        except Exception as exc:
+            # Catches CuratorFailureError, AllAccountsCappedException, and
+            # unexpected exceptions from the LLM layer (e.g. subprocess errors
+            # in test environments without a real claude CLI).  CancelledError
+            # is a BaseException subclass (Python 3.8+) and is NOT caught here.
             logger.warning(
                 'curate_batch: whole-batch LLM failed (%s), falling back to '
                 '%d size-1 curate calls',
                 exc,
-                len(candidates),
+                len(unique_candidates),
             )
-            return [
-                await self.curate(c, project_id, project_root) for c in candidates
+            unique_decisions = [
+                await self.curate(c, project_id, project_root) for c in unique_candidates
             ]
+
+        # Merge: unique candidates use LLM/fallback decisions; duplicates use pre_dedup.
+        unique_decision_map: dict[int, CuratorDecision] = {
+            original_i: unique_decisions[k]
+            for k, original_i in enumerate(unique_indices)
+        }
+        decisions = [
+            pre_dedup_decisions[i] if i in pre_dedup_decisions else unique_decision_map[i]
+            for i in range(len(candidates))
+        ]
 
         # Cache each decision so subsequent identical candidates hit the idempotency path.
         for candidate, decision in zip(candidates, decisions):

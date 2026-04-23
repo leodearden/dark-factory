@@ -531,6 +531,13 @@ def _mock_curator(decision: CuratorDecision) -> MagicMock:
     """Mock TaskCurator returning a fixed decision."""
     curator = MagicMock()
     curator.curate = AsyncMock(return_value=decision)
+    # curate_batch delegates to curate() per candidate so that assertions on
+    # curator.curate (e.g. assert_called_once) continue to pass for tests that
+    # use the batch worker path.  The inner curate call uses the same AsyncMock,
+    # so call counts accumulate correctly.
+    async def _curate_batch(candidates, *a, **kw):
+        return [await curator.curate(c, *a, **kw) for c in candidates]
+    curator.curate_batch = AsyncMock(side_effect=_curate_batch)
     curator.record_task = AsyncMock()
     curator.reembed_task = AsyncMock()
     # note_created is a plain sync method on the real TaskCurator.
@@ -2679,6 +2686,11 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
 
     curator = MagicMock()
     curator.curate = AsyncMock(side_effect=slow_curate)
+    # curate_batch delegates to curate() so slow_curate is still invoked
+    # and the latency-based assertion holds.
+    async def _slow_curate_batch(candidates, pid, project_root):
+        return [await curator.curate(c, pid, project_root) for c in candidates]
+    curator.curate_batch = AsyncMock(side_effect=_slow_curate_batch)
     curator.record_task = AsyncMock()
     curator.reembed_task = AsyncMock()
     curator.note_created = MagicMock()
