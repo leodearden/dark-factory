@@ -2100,3 +2100,20 @@ class TestSchedulerMcpSessionDI:
             await sched.set_task_status('42', 'in-progress')
 
         assert stub._statuses['42'] == 'in-progress'
+
+    @pytest.mark.asyncio
+    async def test_get_status_round_trips_through_stub(self):
+        """get_status reads from the stub after a prior set_task_status."""
+        stub = _StubMcpSession()
+        cfg = OrchestratorConfig()
+        sched = Scheduler(cfg, mcp_session=stub)
+        no_http = AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected'))
+
+        with patch('orchestrator.scheduler.mcp_call', new=no_http):
+            await sched.set_task_status('77', 'done')
+            result = await sched.get_status('77')
+            unknown = await sched.get_status('unknown-id')
+
+        assert result == 'done'
+        assert unknown is None
+        no_http.assert_not_called()
