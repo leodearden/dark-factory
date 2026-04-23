@@ -22,6 +22,8 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard, BulkResetVerdict
+
 
 # ---------------------------------------------------------------------------
 # step-1: ReconciliationConfig defaults
@@ -37,3 +39,36 @@ def test_reconciliation_config_bulk_reset_guard_defaults():
     assert cfg.bulk_reset_guard_threshold == 10
     assert cfg.bulk_reset_guard_window_seconds == 60.0
     assert cfg.bulk_reset_guard_escalation_rate_limit_seconds == 900.0
+
+
+# ---------------------------------------------------------------------------
+# step-3: observe_attempt returns ok for all calls under threshold
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_observe_attempt_returns_ok_under_threshold(tmp_path):
+    """Nine done→pending attempts (below threshold of 10) all return ok."""
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        threshold=10,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    for i in range(9):
+        clock[0] += 1.0
+        verdict = await guard.observe_attempt(
+            project_id='proj-a',
+            task_id=str(i),
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert verdict.outcome == 'ok', f'attempt {i}: expected ok, got {verdict.outcome}'
+        assert verdict.is_rejection is False
