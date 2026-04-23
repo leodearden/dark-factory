@@ -379,7 +379,13 @@ An agent flagged a risk during development. Risk assessment requires human judgm
 
 Technical debt or cleanup discovered during development.
 
-- **Info**: queue as a follow-up task using `mcp__fused-memory__submit_task` → `mcp__fused-memory__resolve_ticket` (two-phase pattern; see `review_suggestions` §2 above for the full snippet — when reusing that snippet here, substitute `"source": "escalation-info"` and `"spawn_context": "steward-triage"` in place of the review-suggestions values; `escalation_id` stays the same). Resolve the escalation via `mcp__escalation__resolve_issue` once the ticket resolves.
+- **Info**: queue as a follow-up task using `mcp__fused-memory__submit_task` → `mcp__fused-memory__resolve_ticket` (two-phase pattern; see `review_suggestions` §2 above for the full snippet). When adapting the snippet:
+  1. Substitute `"source": "escalation-info"` (only this field changes).
+  2. Keep `"spawn_context": "steward-triage"` — unchanged from §2; both sites feed the same steward pipeline.
+  3. Set `"suggestion_hash"` to `hashlib.sha256(escalation.detail.encode()).hexdigest()[:16]` — a retry token (not a per-item discriminator) for single-finding info escalations; aligns with the 16-char sha256 shape in `orchestrator/agents/triage.py :: suggestion_hash()`.
+  4. Both `escalation_id` and `suggestion_hash` must be non-empty strings for the R4 gate (`task_interceptor.py :: _check_escalation_idempotency`) to activate.
+
+  Resolve via `mcp__escalation__resolve_issue` once the ticket resolves.
 - **Blocking** (rare): spawn an interactive `/unblock` session (see `task_failure` for invocation pattern).
 
 ### `infra_issue` (blocking)
