@@ -1421,3 +1421,51 @@ class TestProcessAddTicketsBatch:
         # One batched LLM call, not three single ones
         assert mock_curator.curate_batch.await_count == 1
         assert taskmaster.add_task.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_within_batch_drop_uses_sibling_task_id(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """Within-batch drop (batch_target_index=0, target_id=None) uses sibling's task_id."""
+        t1 = await ticket_store.submit('project', self._make_candidate_json('Task One'))
+        t2 = await ticket_store.submit('project', self._make_candidate_json('Task One dup'))
+
+        mock_curator = MagicMock()
+        mock_curator.curate_batch = AsyncMock(return_value=[
+            CuratorDecision(action='create', justification='new'),
+            CuratorDecision(
+                action='drop',
+                target_id=None,       # no existing task yet
+                batch_target_index=0, # duplicate of item 0 in this batch
+                justification='dup of batch 0',
+            ),
+        ])
+        mock_curator.note_created = MagicMock()
+        mock_curator.record_task = AsyncMock()
+
+        taskmaster.add_task = AsyncMock(return_value={'id': '88', 'title': 'Task One'})
+
+        with patch.object(
+            type(interceptor_with_store), '_get_curator',
+            new=AsyncMock(return_value=mock_curator),
+        ), patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            await interceptor_with_store._process_add_tickets_batch([t1, t2])
+
+        r1 = await ticket_store.get(t1)
+        r2 = await ticket_store.get(t2)
+
+        # t1 should be created with the new task_id
+        assert r1 is not None and r1['status'] == 'created'
+        assert r1['task_id'] == '88'
+
+        # t2 should be combined, using t1's task_id via batch_target_index substitution
+        assert r2 is not None and r2['status'] == 'combined'
+        assert r2['task_id'] == '88'
+        # reason should indicate within-batch drop
+        assert r2.get('reason') is not None and 'batch_target_index' in r2['reason']
+
+        # Only one tm.add_task call (t2 is a within-batch drop)
+        assert taskmaster.add_task.call_count == 1
