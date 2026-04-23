@@ -2432,10 +2432,9 @@ class TestMarkBlockedFalseDoneGuard:
         """Empty task branch with steward-resolved L0 must requeue, not false-done.
 
         The base commit is always an ancestor of main, so is_ancestor returns True
-        even when no implementation was committed.  Without the
-        _has_prior_implementation() guard this path marks the task 'done'.
-        With the guard it detects the stale branch point and falls through to the
-        normal requeue path.  This test FAILS on unmodified code (step-1 TDD).
+        even when no implementation was committed.  _mark_blocked is now
+        single-purpose (no inline merge-check) and always requeues on the
+        no-remaining-L0 path — this test pins that contract.
         """
         # 1. Create a fresh worktree with no implementation commits (base commit only)
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
@@ -2479,43 +2478,19 @@ class TestMarkBlockedFalseDoneGuard:
     async def test_empty_branch_with_stale_iteration_log_still_requeues(
         self, config, git_ops, task_assignment, tmp_path
     ):
-        """SHA-primary guard must requeue even when a stale implementer entry is present.
+        """_mark_blocked requeues even when a stale implementer iteration entry is present.
 
-        On the baseline (entry-scan only) _has_prior_implementation(), the stale entry
-        causes it to return True.  Because the fresh worktree HEAD is trivially an
-        ancestor of main (wt_head == base_commit == main HEAD), the guard incorrectly
-        fast-paths to DONE.
-
-        After the SHA-primary refactor, the guard compares wt_head == base_commit and
-        returns (False, entries), falling through to the normal requeue path.
-
-        This test FAILS on unmodified code (step-1 TDD for SHA-primary signal).
+        The "branch already on main → DONE" recovery was moved out of _mark_blocked
+        into _recover_if_already_merged() (called pre-PLAN).  _mark_blocked is now
+        single-purpose and never returns DONE; the stale iteration-log entry no
+        longer influences its outcome at all.  This test asserts the requeue
+        contract holds on a worktree that carries such an entry.
         """
-        import json as _json
-
-        # 1. Create a fresh worktree (no implementation commits — wt_head == base_commit)
+        # 1. Create a fresh worktree
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
 
-        # 2. Get the current HEAD SHA — this is also the base_commit
-        _, wt_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
-        wt_head = wt_head_raw.strip()
-
-        # 3. Stamp metadata.json with base_commit == wt_head
-        #    (mirrors what workflow._init_plan_artifacts does at task start)
-        task_dir = wt / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'metadata.json').write_text(
-            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': wt_head})
-        )
-
-        # 4. Write a stale implementer iteration entry.
-        #    On baseline code this alone makes _has_prior_implementation() return True.
-        (task_dir / 'iterations.jsonl').write_text(
-            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
-        )
-
-        # 5. Build workflow, wire up worktree and artifacts
+        # 2. Build workflow, wire up worktree and artifacts
         stub = AgentStub()
         workflow, scheduler, queue = _build_workflow_no_merge_worker(
             config, git_ops, task_assignment, stub, tmp_path,
@@ -2523,18 +2498,17 @@ class TestMarkBlockedFalseDoneGuard:
         workflow.worktree = wt
         workflow.artifacts = TaskArtifacts(wt)
 
-        # 6. FakeSteward resolves all pending L0 escalations immediately in start()
+        # 3. FakeSteward resolves all pending L0 escalations immediately in start()
         workflow._steward_factory = _make_resolving_steward(
             queue, task_assignment.task_id,
         )
 
-        # 7. Call _mark_blocked directly
+        # 4. Call _mark_blocked directly
         outcome = await workflow._mark_blocked('synthetic failure')
 
-        # 8. Assert REQUEUED — stale entry must not trigger false-done when wt_head == base_commit
+        # 5. Assert REQUEUED — _mark_blocked must never return DONE
         assert outcome == WorkflowOutcome.REQUEUED, (
-            f'Expected REQUEUED but got {outcome!r} — '
-            'stale iteration entry triggered false-done despite wt_head == base_commit'
+            f'Expected REQUEUED but got {outcome!r}'
         )
         statuses = scheduler.statuses.get(task_assignment.task_id, [])
         assert 'done' not in statuses, (
@@ -2618,16 +2592,22 @@ class TestRecoverIfAlreadyMerged:
     async def test_returns_none_for_stale_branch_point(
         self, config, git_ops, task_assignment, tmp_path
     ):
-        """Stale branch point (wt_head == base_commit) must return None, not DONE.
+        """Stale branch point (wt_head == base_commit, no iteration entries) must return None.
 
         A fresh worktree with no implementation commits has wt_head equal to
-        base_commit.  The branch trivially satisfies is_ancestor(wt_head, main)
-        since it was never advanced.  The SHA-primary signal in
-        _has_prior_implementation sees wt_head == base_commit → has_work=False
-        and the recovery must return None (not DONE), so the task proceeds to PLAN.
+        base_commit and no iterations.jsonl.  The branch trivially satisfies
+        is_ancestor(wt_head, main) since it was never advanced.
 
-        Exercises the _has_prior_implementation SHA-primary guard path that
-        prevents a false-done on an empty branch.
+        _recover_if_already_merged() calls _has_prior_implementation() WITHOUT
+        wt_head (by design — the branch may have been rebased; see the method
+        comment), so the SHA-primary signal is NOT exercised here.  Instead
+        the iteration-log fallback runs: with no implementer/debugger entries
+        in iterations.jsonl, has_work=False and the recovery returns None.
+
+        NOTE: the SHA-primary path is deliberately unreachable from
+        _recover_if_already_merged because passing wt_head would cause
+        false-negatives on rebased branches.  The iteration-log fallback is
+        the sole signal here.
         """
         import json as _json
 
@@ -2643,7 +2623,7 @@ class TestRecoverIfAlreadyMerged:
         (task_dir / 'metadata.json').write_text(
             _json.dumps({'task_id': task_assignment.task_id, 'base_commit': base_sha})
         )
-        # No iterations.jsonl written — SHA-primary path must not need it
+        # No iterations.jsonl written — iteration-log fallback finds 0 entries → has_work=False
 
         # 3. Build workflow, wire up worktree and artifacts
         stub = AgentStub()
@@ -2659,7 +2639,7 @@ class TestRecoverIfAlreadyMerged:
         # 5. Assertions: stale branch must return None with no DONE side-effects
         assert outcome is None, (
             f'Expected None for stale branch point but got {outcome!r} — '
-            '_has_prior_implementation SHA-primary guard is missing or broken'
+            'iteration-log fallback empty-entries guard is missing or broken'
         )
         statuses = scheduler.statuses.get(task_assignment.task_id, [])
         assert 'done' not in statuses, (

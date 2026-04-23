@@ -358,6 +358,13 @@ class TaskWorkflow:
             # immediately — a prior run merged it but died before writing
             # the DONE status.  Short-circuiting here prevents the architect
             # from being invoked and keeps the run idempotent.
+            #
+            # NOTE: a related guard runs just below (before EXECUTE) and has
+            # deliberately different semantics: the post-PLAN guard falls through
+            # to the SUCCESS path (writes completion memory, uses merge-sha
+            # provenance), and it also checks has_uncommitted_work (useful
+            # post-execution, premature here).  If you change the
+            # is_ancestor/has_work logic, check both guards.
             recovery = await self._recover_if_already_merged()
             if recovery == WorkflowOutcome.DONE:
                 return recovery
@@ -408,6 +415,12 @@ class TaskWorkflow:
             # main, fast-forwarding a post-merge branch to match main
             # exactly.  The has_work check below distinguishes stale
             # branch points (no implementation) from true ghost loops.
+            #
+            # See also: the pre-PLAN _recover_if_already_merged() call
+            # above.  That guard returns DONE directly (skips completion
+            # memory); this guard falls through to the SUCCESS path which
+            # writes completion memory.  The two guards cover complementary
+            # failure modes — do not collapse them.
             wt_head = await self._get_head_commit()
             current_main = await self.git_ops.get_main_sha()
             already_on_main = (
@@ -2355,11 +2368,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         in warning breadcrumbs without a second ``read_iteration_log()`` call),
         and ``base_commit`` (may be ``None`` if metadata.json is absent).
 
-        Correctness assumption: worktrees are always created fresh per task run.
-        If .task/iterations.jsonl were ever carried across a worktree recreation
-        (e.g. worktree reuse on the same branch), this guard could incorrectly
-        return True for an empty branch and reintroduce the false-done path.
-        Any future change to create_worktree that enables reuse must revisit here.
+        Correctness invariants: the iteration-log fallback relies on
+        .task/iterations.jsonl entries faithfully reflecting prior work on the
+        *same branch*.  Two scenarios matter:
+
+        *Intended* — ghost-loop re-run on the same branch: create_worktree
+        may rebase a reused worktree onto main, so wt_head == base_commit even
+        though the branch was genuinely implemented.  The fallback correctly
+        returns True here because the earlier implementer run wrote its entries
+        before the rebase.  This is the scenario exploited by
+        ``_recover_if_already_merged()`` and the pre-MERGE guard; it is safe.
+
+        *Dangerous* — orphaned log: if iterations.jsonl were somehow copied
+        from a different task's branch, the fallback would return True for an
+        empty branch → false-done.  This is why callers that hold a reliable
+        post-execution wt_head (i.e. callers that have not rebased yet) must
+        pass it explicitly to use the SHA-primary path.
+        ``_recover_if_already_merged()`` intentionally omits wt_head (the
+        branch may have been rebased) — see the comment there for rationale.
         """
         if self.artifacts is None:
             return _PriorImplStatus(has_work=False, entries=[], base_commit=None)
@@ -2390,6 +2416,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         (branch not merged, no prior work, missing worktree/git_ops, exceptions).
         """
         if self.worktree is None or self.git_ops is None:
+            logger.debug(
+                'Task %s: skipping merge-recovery (no worktree or git_ops)',
+                self.task_id,
+            )
             return None
 
         # ── Git layer ─────────────────────────────────────
