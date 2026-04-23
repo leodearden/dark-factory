@@ -2537,6 +2537,72 @@ class TestLoadTaskTitles:
         assert result_b == {'2': 'Beta'}, f"project B returned unexpected titles: {result_b}"
         assert result_a != result_b
 
+    def test_symlink_and_relative_path_share_cache_entry(self, tmp_path, monkeypatch):
+        """A symlink and the real path resolve to the same LRU entry via os.path.realpath."""
+        import dashboard.data.merge_queue as _mq
+        from dashboard.data.merge_queue import (
+            _load_task_titles_cached,
+            load_task_titles,
+        )
+
+        _load_task_titles_cached.cache_clear()
+
+        real_dir = tmp_path / 'real'
+        real_dir.mkdir()
+        real_path = real_dir / 'tasks.json'
+        self._write_tasks_json(real_path, [{'id': 1, 'title': 'A'}])
+
+        link_path = tmp_path / 'link.json'
+        try:
+            link_path.symlink_to(real_path)
+        except (OSError, NotImplementedError):
+            import pytest
+            pytest.skip("symlinks unsupported on this filesystem")
+
+        call_count = 0
+        original_load_task_tree = _mq.load_task_tree
+
+        def counting_load_task_tree(path):
+            nonlocal call_count
+            call_count += 1
+            return original_load_task_tree(path)
+
+        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
+
+        result_real = load_task_titles(real_path)
+        result_link = load_task_titles(link_path)
+
+        assert result_real == {'1': 'A'}, f"real path returned unexpected titles: {result_real}"
+        assert result_link == {'1': 'A'}, f"symlink returned unexpected titles: {result_link}"
+        assert call_count == 1, (
+            f"load_task_tree called {call_count} time(s); expected 1 "
+            "(os.path.realpath should collapse both spellings to one cache key)"
+        )
+
+    def test_corrupt_json_then_valid_refreshes_cache(self, tmp_path):
+        """Empty-dict cached under corrupt mtime is invalidated when mtime bumps to valid content."""
+        import os
+
+        from dashboard.data.merge_queue import _load_task_titles_cached, load_task_titles
+
+        _load_task_titles_cached.cache_clear()
+
+        tasks_path = tmp_path / 'tasks.json'
+        tasks_path.write_text('{ invalid json ]')
+
+        result_corrupt = load_task_titles(tasks_path)
+        assert result_corrupt == {}, f"corrupt JSON should return {{}}, got {result_corrupt!r}"
+
+        # Overwrite with valid content and bump mtime to guarantee a new cache key
+        stat = os.stat(tasks_path)
+        self._write_tasks_json(tasks_path, [{'id': 1, 'title': 'A'}])
+        os.utime(tasks_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+
+        result_valid = load_task_titles(tasks_path)
+        assert result_valid == {'1': 'A'}, (
+            f"after mtime bump to valid content, expected {{'1': 'A'}}, got {result_valid!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestBuildPerProjectMergeQueue (step-9)
