@@ -523,7 +523,12 @@ def enrich_merges_with_titles(
     return result
 
 
-# 32 ≈ max projects we expect to enumerate concurrently; JSON re-parse on eviction is acceptable.
+# 32 comfortably covers the expected number of concurrently enumerated projects.
+# If the working set exceeds 32, the LRU evicts the oldest entry and the next access
+# triggers one extra load_task_tree call (a single JSON re-parse) — there is NO
+# correctness impact. Bumping maxsize or switching to maxsize=None is therefore
+# rarely worthwhile and risks unbounded memory growth if callers ever supply many
+# distinct tasks.json paths (e.g., a buggy loop).
 @functools.lru_cache(maxsize=32)
 def _load_task_titles_cached(path_str: str, mtime_ns: int) -> dict[str, str]:
     """Cache body for :func:`load_task_titles`, keyed on ``(path, mtime_ns)``.

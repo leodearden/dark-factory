@@ -109,6 +109,30 @@ async def empty_merge_events_conn(empty_merge_events_db):
         yield conn
 
 
+@pytest.fixture()
+def counted_load_task_tree(monkeypatch):
+    """Patches dashboard.data.merge_queue.load_task_tree with a counting wrapper.
+
+    Yields an object with a ``count`` attribute that increments on every call
+    to the patched function. The original is restored automatically via
+    ``monkeypatch`` teardown.
+    """
+    import dashboard.data.merge_queue as _mq
+
+    class _Counter:
+        count = 0
+
+    counter = _Counter()
+    original = _mq.load_task_tree
+
+    def _counting(path):
+        counter.count += 1
+        return original(path)
+
+    monkeypatch.setattr(_mq, 'load_task_tree', _counting)
+    return counter
+
+
 # ---------------------------------------------------------------------------
 # Imports under test (deferred so the test file fails gracefully before impl)
 # ---------------------------------------------------------------------------
@@ -1388,9 +1412,8 @@ class TestLoadTaskTitles:
         assert '1' not in result
         assert result.get('2') == 'B'
 
-    def test_repeat_calls_cached_via_mtime(self, tmp_path, monkeypatch):
+    def test_repeat_calls_cached_via_mtime(self, tmp_path, counted_load_task_tree):
         """Two calls with unchanged mtime invoke load_task_tree exactly once."""
-        import dashboard.data.merge_queue as _mq
         from dashboard.data.merge_queue import (
             _load_task_titles_cached,
             load_task_titles,
@@ -1401,20 +1424,10 @@ class TestLoadTaskTitles:
         tasks_path = tmp_path / 'tasks.json'
         self._write_tasks_json(tasks_path, [{'id': 1, 'title': 'A'}])
 
-        call_count = 0
-        original_load_task_tree = _mq.load_task_tree
-
-        def counting_load_task_tree(path):
-            nonlocal call_count
-            call_count += 1
-            return original_load_task_tree(path)
-
-        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
-
         result1 = load_task_titles(tasks_path)
         result2 = load_task_titles(tasks_path)
 
-        assert call_count == 1, f"load_task_tree called {call_count} times, expected 1"
+        assert counted_load_task_tree.count == 1, f"load_task_tree called {counted_load_task_tree.count} times, expected 1"
         assert result1 == {'1': 'A'}
         assert result2 == {'1': 'A'}
 
@@ -1441,9 +1454,8 @@ class TestLoadTaskTitles:
         result2 = load_task_titles(tasks_path)
         assert result2 == {'1': 'Z'}
 
-    def test_missing_file_does_not_invoke_load_task_tree(self, tmp_path, monkeypatch):
+    def test_missing_file_does_not_invoke_load_task_tree(self, tmp_path, counted_load_task_tree):
         """A missing file short-circuits before touching load_task_tree or the cache."""
-        import dashboard.data.merge_queue as _mq
         from dashboard.data.merge_queue import (
             _load_task_titles_cached,
             load_task_titles,
@@ -1451,20 +1463,10 @@ class TestLoadTaskTitles:
 
         _load_task_titles_cached.cache_clear()
 
-        call_count = 0
-        original_load_task_tree = _mq.load_task_tree
-
-        def counting_load_task_tree(path):
-            nonlocal call_count
-            call_count += 1
-            return original_load_task_tree(path)
-
-        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
-
         result = load_task_titles(tmp_path / 'nope.json')
 
         assert result == {}
-        assert call_count == 0, f"load_task_tree was called {call_count} time(s); expected 0"
+        assert counted_load_task_tree.count == 0, f"load_task_tree was called {counted_load_task_tree.count} time(s); expected 0"
 
     def test_distinct_paths_cached_separately(self, tmp_path):
         """Different task files produce independent cache entries."""
@@ -1486,9 +1488,10 @@ class TestLoadTaskTitles:
         assert result_b == {'2': 'Beta'}, f"project B returned unexpected titles: {result_b}"
         assert result_a != result_b
 
-    def test_symlink_shares_cache_entry_with_real_path(self, tmp_path, monkeypatch):
+    def test_symlink_shares_cache_entry_with_real_path(self, tmp_path, counted_load_task_tree):
         """A symlink and the real path resolve to the same LRU entry via os.path.realpath."""
-        import dashboard.data.merge_queue as _mq
+        import os
+
         from dashboard.data.merge_queue import (
             _load_task_titles_cached,
             load_task_titles,
@@ -1507,27 +1510,21 @@ class TestLoadTaskTitles:
         except (OSError, NotImplementedError):
             pytest.skip("symlinks unsupported on this filesystem")
 
-        call_count = 0
-        original_load_task_tree = _mq.load_task_tree
-
-        def counting_load_task_tree(path):
-            nonlocal call_count
-            call_count += 1
-            return original_load_task_tree(path)
-
-        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
+        assert os.path.realpath(link_path) == os.path.realpath(real_path), (
+            f"symlink {link_path!r} and real {real_path!r} must share realpath before the cache test is meaningful"
+        )
 
         result_real = load_task_titles(real_path)
         result_link = load_task_titles(link_path)
 
         assert result_real == {'1': 'A'}, f"real path returned unexpected titles: {result_real}"
         assert result_link == {'1': 'A'}, f"symlink returned unexpected titles: {result_link}"
-        assert call_count == 1, (
-            f"load_task_tree called {call_count} time(s); expected 1 "
+        assert counted_load_task_tree.count == 1, (
+            f"load_task_tree called {counted_load_task_tree.count} time(s); expected 1 "
             "(os.path.realpath should collapse both spellings to one cache key)"
         )
 
-    def test_corrupt_json_then_valid_refreshes_cache(self, tmp_path, monkeypatch):
+    def test_corrupt_json_then_valid_refreshes_cache(self, tmp_path, counted_load_task_tree):
         """Empty-dict from corrupt JSON is cached and then invalidated when mtime bumps.
 
         Verifies two distinct behaviors:
@@ -1538,7 +1535,6 @@ class TestLoadTaskTitles:
         """
         import os
 
-        import dashboard.data.merge_queue as _mq
         from dashboard.data.merge_queue import _load_task_titles_cached, load_task_titles
 
         _load_task_titles_cached.cache_clear()
@@ -1546,24 +1542,14 @@ class TestLoadTaskTitles:
         tasks_path = tmp_path / 'tasks.json'
         tasks_path.write_text('{ invalid json ]')
 
-        call_count = 0
-        original_load_task_tree = _mq.load_task_tree
-
-        def counting_load_task_tree(path):
-            nonlocal call_count
-            call_count += 1
-            return original_load_task_tree(path)
-
-        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
-
         result_corrupt = load_task_titles(tasks_path)
         assert result_corrupt == {}, f"corrupt JSON should return {{}}, got {result_corrupt!r}"
 
         # Second call with unchanged mtime must hit the cache — {} is not a sentinel
         result_corrupt2 = load_task_titles(tasks_path)
         assert result_corrupt2 == {}
-        assert call_count == 1, (
-            f"load_task_tree called {call_count} time(s) for two reads with unchanged mtime; "
+        assert counted_load_task_tree.count == 1, (
+            f"load_task_tree called {counted_load_task_tree.count} time(s) for two reads with unchanged mtime; "
             "expected 1 (empty dict must be a legitimate cached value, not a sentinel)"
         )
 
