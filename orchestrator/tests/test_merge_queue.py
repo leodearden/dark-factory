@@ -3341,3 +3341,68 @@ class TestHaltOwnerMechanics:
         worker.set_halt_owner('esc-2-1')
         assert worker.is_halt_owner('esc-2-1') is True
         assert worker.is_halt_owner('esc-1-1') is False
+
+
+# ---------------------------------------------------------------------------
+# TestEnqueueMergeRequest — step-3
+# ---------------------------------------------------------------------------
+
+
+class TestEnqueueMergeRequest:
+    """Tests for the module-level enqueue_merge_request helper."""
+
+    @pytest.mark.asyncio
+    async def test_enqueue_helper_emits_merge_queued_and_puts_on_queue(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ):
+        """enqueue_merge_request emits merge_queued and places req on queue."""
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs.db'
+        event_store = EventStore(db_path, 'run-1')
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('42', 'task/42', wt, config)
+
+        await enqueue_merge_request(queue, req, event_store)
+
+        # Queue has exactly one item which is our req
+        assert queue.qsize() == 1
+        dequeued = queue.get_nowait()
+        assert dequeued is req
+
+        # Exactly one merge_queued row in events
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, phase, "
+            "json_extract(data, '$.branch') AS branch "
+            "FROM events WHERE event_type = 'merge_queued'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'merge_queued'
+        assert rows[0][1] == '42'
+        assert rows[0][2] == 'merge'
+        assert rows[0][3] == 'task/42'
+
+    @pytest.mark.asyncio
+    async def test_enqueue_helper_with_none_event_store_still_enqueues(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ):
+        """Passing event_store=None must still enqueue and not raise."""
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('99', 'task/99', wt, config)
+
+        await enqueue_merge_request(queue, req, None)
+
+        assert queue.qsize() == 1
+        dequeued = queue.get_nowait()
+        assert dequeued is req
