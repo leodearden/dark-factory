@@ -2091,3 +2091,44 @@ class TestBuildPerProjectMergeQueue:
             f'Expected the row count (10) in the runaway-burst WARNING, got: {warn_msgs!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_cancelled_error_from_sub_query_propagates(self, tmp_path):
+        """CancelledError raised inside a sub-query must propagate out of build_per_project_merge_queue.
+
+        The inner _safe closure (pre-step-5) treats all BaseException subclasses —
+        including CancelledError — as recoverable and returns the default, silently
+        swallowing asyncio cancellation.  After step-5 swaps in safe_gather_result,
+        CancelledError re-raises through _one_project's ``except Exception`` guard
+        (which only catches Exception, not BaseException) and propagates out of
+        the outer asyncio.gather call.
+
+        This test pins the corrected behaviour: any CancelledError from a sub-query
+        must NOT be swallowed.
+        """
+        import asyncio
+        from unittest.mock import patch
+
+        import pytest
+
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        async def _raise_cancelled(*_args, **_kwargs):
+            raise asyncio.CancelledError('shutdown')
+
+        db_path = _make_db(tmp_path, 'x.db', [])
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with patch(
+                'dashboard.data.merge_queue.queue_depth_timeseries',
+                side_effect=_raise_cancelled,
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await build_per_project_merge_queue(
+                        [('/tmp/P', conn)],
+                        hours=24,
+                        now=now,
+                        recent_window_minutes=15,
+                    )
+
