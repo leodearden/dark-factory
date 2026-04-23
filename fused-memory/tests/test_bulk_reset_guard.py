@@ -560,3 +560,67 @@ async def test_guard_disabled_returns_ok(tmp_path):
 
     # Internal state deque should be empty (no entries accumulated)
     assert not guard._state, 'guard state should be empty when disabled'
+
+
+# ---------------------------------------------------------------------------
+# step-19: BulkResetVerdict.to_error_dict() shape
+# ---------------------------------------------------------------------------
+
+def test_verdict_to_error_dict_ok():
+    """outcome='ok' produces an empty dict."""
+    v = BulkResetVerdict(outcome='ok', project_id='p')
+    assert v.to_error_dict() == {}
+
+
+def test_verdict_to_error_dict_rejection():
+    """outcome='rejection' produces a structured error payload."""
+    v = BulkResetVerdict(
+        outcome='rejection',
+        affected_task_ids=('5', '6', '7'),
+        triggering_timestamps=(
+            '2026-04-23T00:00:00+00:00',
+            '2026-04-23T00:00:01+00:00',
+            '2026-04-23T00:00:02+00:00',
+        ),
+        threshold=10,
+        window_seconds=60.0,
+        project_id='proj',
+        error_type='BulkResetGuardTripped',
+    )
+    d = v.to_error_dict()
+    assert d['success'] is False
+    assert d['error_type'] == 'BulkResetGuardTripped'
+    assert 'BulkResetGuardTripped' in d['error']
+    assert str(d['threshold']) in d['error'] or d['threshold'] == 10
+    assert str(d['window_seconds']) in d['error'] or d['window_seconds'] == 60.0
+    assert d['affected_task_ids'] == ['5', '6', '7']
+    assert d['triggering_timestamps'] == [
+        '2026-04-23T00:00:00+00:00',
+        '2026-04-23T00:00:01+00:00',
+        '2026-04-23T00:00:02+00:00',
+    ]
+    assert d['threshold'] == 10
+    assert d['window_seconds'] == 60.0
+    assert d['project_id'] == 'proj'
+    assert 'hint' in d
+    # No escalation_path for plain rejection
+    assert 'escalation_path' not in d
+
+
+def test_verdict_to_error_dict_escalated():
+    """outcome='escalated' produces the same rejection payload PLUS escalation_path."""
+    v = BulkResetVerdict(
+        outcome='escalated',
+        affected_task_ids=('t1', 't2'),
+        triggering_timestamps=('2026-04-23T00:00:00+00:00', '2026-04-23T00:00:01+00:00'),
+        threshold=3,
+        window_seconds=60.0,
+        project_id='proj',
+        error_type='BulkResetGuardTripped',
+        escalation_path='/tmp/esc-bulk-reset-xyz.json',
+    )
+    d = v.to_error_dict()
+    assert d['success'] is False
+    assert d['error_type'] == 'BulkResetGuardTripped'
+    assert d['escalation_path'] == '/tmp/esc-bulk-reset-xyz.json'
+    assert d['project_id'] == 'proj'
