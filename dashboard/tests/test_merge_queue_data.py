@@ -2027,3 +2027,59 @@ class TestBuildPerProjectMergeQueue:
             f'Missing task_ids: {expected_task_ids - returned_task_ids}'
         )
 
+    @pytest.mark.asyncio
+    async def test_build_per_project_burst_warn_uses_module_constant(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """_one_project WARN references _RECENT_MERGES_BURST_WARN, not the bare 1_000 literal.
+
+        Patches _RECENT_MERGES_BURST_WARN to 5, inserts 10 events all within the
+        15-minute recent_window_minutes window (above the patched soft threshold,
+        well below the 100_000 hard cap), and asserts:
+          1. At least one WARNING log record contains 'runaway burst'.
+          2. The same record mentions the row count (10).
+        Fails before step-4 (bare 1_000 literal ignores the patched constant),
+        passes after step-4 (_RECENT_MERGES_BURST_WARN drives the comparison).
+        """
+        monkeypatch.setattr(_mqmod, '_RECENT_MERGES_BURST_WARN', 5)
+
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        # 10 events spread across ~9 minutes (56 s apart), all within the 15-min window.
+        events = [
+            {
+                'event_type': 'merge_attempt',
+                'timestamp': now - timedelta(seconds=i * 56),
+                'task_id': f'bw-task-{i:03d}',
+                'run_id': f'bw-run-{i:03d}',
+                'data': {'outcome': 'done'},
+                'duration_ms': 100 + i,
+            }
+            for i in range(10)
+        ]
+        db_path = _make_db(tmp_path, 'burst_warn.db', events)
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with caplog.at_level(logging.WARNING, logger='dashboard.data.merge_queue'):
+                await build_per_project_merge_queue(
+                    [('/tmp/P', conn)],
+                    hours=24,
+                    now=now,
+                    recent_window_minutes=15,
+                )
+
+        warn_msgs = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ]
+        assert any('runaway burst' in m for m in warn_msgs), (
+            f'Expected a WARNING containing "runaway burst", got: {warn_msgs!r}. '
+            'Ensure _RECENT_MERGES_BURST_WARN (patched to 5) controls the threshold '
+            'in _one_project, not the bare 1_000 literal.'
+        )
+        assert any('runaway burst' in m and '10' in m for m in warn_msgs), (
+            f'Expected the row count (10) in the runaway-burst WARNING, got: {warn_msgs!r}'
+        )
+
