@@ -597,6 +597,13 @@ class MergeWorker:
             f'{self.MAX_CAS_RETRIES}), re-enqueueing at front'
         )
         _emit_merge_attempt(self._event_store, req.task_id, 'cas_retry', attempt=retries, duration_ms=_elapsed_ms(t0))
+        if self._event_store is not None:
+            self._event_store.emit(
+                EventType.merge_queued,
+                task_id=req.task_id,
+                phase='merge',
+                data={'branch': req.branch, 'reason': 'cas_retry'},
+            )
         self._urgent.append(req)
         return None  # don't resolve Future — will be reprocessed
 
