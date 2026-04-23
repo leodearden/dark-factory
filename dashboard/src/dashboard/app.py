@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, cast
 
 import aiosqlite
 import httpx
@@ -63,7 +63,7 @@ from dashboard.data.reconciliation import (
     get_watermarks,
     partition_burst_state,
 )
-from dashboard.data.utils import parse_utc
+from dashboard.data.utils import parse_utc, safe_gather_result
 from dashboard.data.write_journal import (
     get_agent_breakdown,
     get_memory_timeseries,
@@ -97,26 +97,6 @@ def _parse_window(request: Any) -> int:
     window = request.query_params.get('window', '30d')
     return _WINDOW_DAYS.get(window, 30)
 
-
-_T = TypeVar('_T')
-
-
-def _safe_gather_result(result: object, default: _T, label: str) -> _T:
-    """Return *default* if *result* is an exception, otherwise return *result*.
-
-    Used with ``asyncio.gather(return_exceptions=True)`` to inspect each result
-    independently, preserving sibling results when one coroutine fails.
-
-    Non-Exception BaseExceptions (CancelledError, KeyboardInterrupt, SystemExit)
-    are re-raised so that asyncio cancellation and process signals propagate
-    correctly during shutdown and disconnect.
-    """
-    if isinstance(result, BaseException) and not isinstance(result, Exception):
-        raise result
-    if isinstance(result, Exception):
-        logger.warning('Error fetching %s data: %s', label, result)
-        return default
-    return cast(_T, result)
 
 templates = Jinja2Templates(directory=str(_pkg_dir / 'templates'))
 
@@ -487,9 +467,9 @@ async def memory_graphs_partial(request: Request):
         get_agent_breakdown(db),
         return_exceptions=True,
     )
-    timeseries = _safe_gather_result(ts_r, {'labels': [], 'reads': [], 'writes': []}, 'timeseries')
-    operations: ChartData = cast(ChartData, _safe_gather_result(ops_r, {'labels': [], 'values': []}, 'operations'))
-    agents: ChartData = cast(ChartData, _safe_gather_result(agents_r, {'labels': [], 'values': []}, 'agents'))
+    timeseries = safe_gather_result(ts_r, {'labels': [], 'reads': [], 'writes': []}, 'timeseries')
+    operations: ChartData = cast(ChartData, safe_gather_result(ops_r, {'labels': [], 'values': []}, 'operations'))
+    agents: ChartData = cast(ChartData, safe_gather_result(agents_r, {'labels': [], 'values': []}, 'agents'))
     return templates.TemplateResponse(
         request, 'partials/memory_graphs.html',
         context={
@@ -516,17 +496,17 @@ async def partials_recon(request: Request):
         get_last_attempted_run(db),
         return_exceptions=True,
     )
-    buffer_stats = _safe_gather_result(
+    buffer_stats = safe_gather_result(
         bs_r, {'buffered_count': 0, 'oldest_event_age_seconds': None}, 'buffer_stats',
     )
-    burst_state_raw = _safe_gather_result(burst_r, [], 'burst_state')
+    burst_state_raw = safe_gather_result(burst_r, [], 'burst_state')
     # Drop stale idle agents: keep only agents with state != 'idle'
     # OR last_write_at within the last hour (partition_burst_state threshold).
     active_burst, _ = partition_burst_state(burst_state_raw)
-    watermarks_list = _safe_gather_result(wm_r, [], 'watermarks')
-    verdict = _safe_gather_result(verdict_r, None, 'latest_verdict')
-    runs = _safe_gather_result(runs_r, [], 'recent_runs')
-    last_attempted_map = _safe_gather_result(la_r, {}, 'last_attempted_run')
+    watermarks_list = safe_gather_result(wm_r, [], 'watermarks')
+    verdict = safe_gather_result(verdict_r, None, 'latest_verdict')
+    runs = safe_gather_result(runs_r, [], 'recent_runs')
+    last_attempted_map = safe_gather_result(la_r, {}, 'last_attempted_run')
 
     # Build per-project view: merge watermarks + last attempted run
     projects: dict[str, dict] = {}
@@ -594,10 +574,10 @@ async def partials_performance(request: Request):
         aggregate_time_centiles(dbs),
         return_exceptions=True,
     )
-    paths = _safe_gather_result(paths_r, {}, 'completion_paths')
-    escalations = _safe_gather_result(esc_r, {}, 'escalation_rates')
-    histograms = _safe_gather_result(hist_r, {}, 'loop_histograms')
-    ttc = _safe_gather_result(ttc_r, {}, 'time_centiles')
+    paths = safe_gather_result(paths_r, {}, 'completion_paths')
+    escalations = safe_gather_result(esc_r, {}, 'escalation_rates')
+    histograms = safe_gather_result(hist_r, {}, 'loop_histograms')
+    ttc = safe_gather_result(ttc_r, {}, 'time_centiles')
     return templates.TemplateResponse(
         request, 'partials/performance.html',
         context={
