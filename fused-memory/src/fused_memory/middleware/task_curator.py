@@ -1170,6 +1170,54 @@ class TaskCurator:
         )
         return '\n'.join(lines)
 
+    def _build_batch_user_prompt(
+        self,
+        candidates: list[CandidateTask],
+        pools: list[list[_PoolEntry]],
+    ) -> str:
+        """Build a batched user prompt containing one labelled section per candidate.
+
+        Each section mirrors the single-item :meth:`_build_user_prompt` layout but
+        is prefixed ``# Candidate batch_index={i}`` so the model can address
+        decisions by index.  Pools are kept per-candidate (not unioned).
+        """
+        desc_cap = self._config.curator.entry_description_chars
+        details_cap = self._config.curator.entry_details_chars
+
+        lines: list[str] = []
+        for i, (candidate, pool) in enumerate(zip(candidates, pools)):
+            lines.append(f'# Candidate batch_index={i}')
+            lines.append(f'  title: {candidate.title}')
+            lines.append(f'  priority: {candidate.priority}')
+            lines.append(f'  spawn_context: {candidate.spawn_context}')
+            if candidate.spawned_from:
+                lines.append(f'  spawned_from: {candidate.spawned_from}')
+            if candidate.description:
+                lines.append(f'  description: {candidate.description[:desc_cap]}')
+            if candidate.details:
+                lines.append(f'  details: {candidate.details[:details_cap]}')
+            if candidate.files_to_modify:
+                lines.append(
+                    '  files_to_modify: '
+                    + ', '.join(candidate.files_to_modify),
+                )
+            lines.append('')
+
+            lines.append(f'# Pool for batch_index={i} ({len(pool)} tasks)')
+            if not pool:
+                lines.append('  (empty — no candidates; answer "create")')
+            else:
+                for entry in pool:
+                    lines.append(entry.render(desc_cap, details_cap))
+                    lines.append('')
+            lines.append('')
+
+        lines.append(
+            'Return one decision per candidate as {"decisions": [...]} '
+            'with a candidate_index field on each item, per the schema.',
+        )
+        return '\n'.join(lines)
+
 
 # ----------------------------------------------------------------------
 # Pure helpers (module-level — easier to unit-test)
