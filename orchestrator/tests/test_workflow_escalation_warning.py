@@ -14,8 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.agents.invoke import AgentResult
-from orchestrator.agents.roles import ARCHITECT
-from orchestrator.workflow import TaskWorkflow
+from orchestrator.agents.roles import ARCHITECT, ROLES
+from orchestrator.workflow import TaskWorkflow, _ESCALATION_CAPABLE_ROLES
 
 
 def _make_workflow(*, escalation_queue=None) -> TaskWorkflow:
@@ -101,6 +101,30 @@ class TestMaybeWarnMissingEscalation:
             f'expected exactly 1 WARNING but got {len(matching)}: {[r.message for r in matching]}'
         )
         assert wf._escalation_missing_warned is True
+
+
+class TestEscalationCapableRolesDerivation:
+    """``_ESCALATION_CAPABLE_ROLES`` is derived correctly from ``ROLES``."""
+
+    def test_escalation_capable_roles_derived_from_roles(self):
+        """_ESCALATION_CAPABLE_ROLES must equal the formula-derived set from ROLES.
+
+        Any role whose allowed_tools contains at least one tool starting with
+        'mcp__escalation__escalate' is escalation-capable, except 'steward'
+        which is excluded because it runs in its own TaskSteward dispatcher.
+        """
+        expected = frozenset(
+            name for name, role in ROLES.items()
+            if any(t.startswith('mcp__escalation__escalate') for t in (role.allowed_tools or []))
+            and name != 'steward'
+        )
+        missing = expected - _ESCALATION_CAPABLE_ROLES
+        extra = _ESCALATION_CAPABLE_ROLES - expected
+        assert _ESCALATION_CAPABLE_ROLES == expected, (
+            f'_ESCALATION_CAPABLE_ROLES {_ESCALATION_CAPABLE_ROLES!r} '
+            f'!= formula-derived {expected!r}; '
+            f'missing: {missing!r}, extra: {extra!r}'
+        )
 
 
 class TestInvokeWiresWarning:
