@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from orchestrator.evals.runner import _StubMcpSession, _build_eval_scheduler
+from orchestrator.evals.runner import _build_eval_scheduler, _StubMcpSession
 
 
 class TestStubMcpSessionSetTaskStatus:
@@ -231,8 +231,9 @@ class TestBuildEvalScheduler:
 
     def test_lock_preinstalled_for_task(self):
         """The module lock is pre-installed for task_id in lock_table._held."""
-        from orchestrator.config import OrchestratorConfig
         from shared.locking import normalize_lock
+
+        from orchestrator.config import OrchestratorConfig
 
         config = OrchestratorConfig()
         scheduler, _ = _build_eval_scheduler(config, 'task-99', ['some_module'])

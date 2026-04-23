@@ -509,7 +509,7 @@ def _build_eval_scheduler(
     orch_config: OrchestratorConfig,
     task_id: str,
     modules: list[str],
-) -> tuple[Scheduler, '_StubMcpSession']:
+) -> tuple[Scheduler, _StubMcpSession]:
     """Build a production Scheduler wired with an in-memory MCP session stub.
 
     Pre-installs the module lock for ``task_id`` so that a later
@@ -571,10 +571,7 @@ class _StubMcpSession:
         if name == 'get_task':
             task_id = arguments['id']
             status = self._statuses.get(task_id)
-            if status is not None:
-                payload = {'id': task_id, 'status': status}
-            else:
-                payload = {'id': task_id}
+            payload = {'id': task_id, 'status': status} if status is not None else {'id': task_id}
             return self._envelope(json.dumps(payload))
         if name == 'get_tasks':
             return self._envelope(json.dumps({'tasks': []}))
