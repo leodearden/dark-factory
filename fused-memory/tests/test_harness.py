@@ -2791,3 +2791,47 @@ async def test_backlog_iterator_event_project_root_wins_over_configured(
         f"Expected project_root='/from/event' but got '{captured['project_root']}'"
         " — event-provided root must win over the configured fallback in BacklogIterator"
     )
+
+
+@pytest.mark.asyncio
+async def test_empty_fallback_resolves_and_short_circuits_filtered_task_tree(
+    journal, event_buffer, mock_memory_service
+):
+    """_resolve_project_root with no-override events returns '' and
+    _fetch_filtered_task_tree('') short-circuits without a taskmaster call.
+
+    This chained assertion guards the full resolver → fetcher pipeline introduced
+    by task-927.  task-927 replaced project_id (e.g. 'dark_factory') with '' as
+    the fallback in _resolve_project_root.  That change is only 'strictly better'
+    because downstream _fetch_filtered_task_tree short-circuits on empty strings.
+    Splitting the assertion would leave a gap: a future refactor could reintroduce
+    project_id as fallback and _fetch_filtered_task_tree would silently start
+    hitting taskmaster again.
+
+    test_harness.py:1827 (test_returns_empty_when_empty_project_root) covers the
+    fetch-level short-circuit in isolation; this test pins the resolver ↔ fetcher
+    contract so the full pipeline is protected.
+    """
+    from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+    # project_root=None → config.taskmaster=None → harness._project_root == ''
+    # harness.taskmaster = AsyncMock() (injected mock) so we can assert it was NOT called
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service, project_root=None)
+
+    # Events with NO _project_root key — triggers the fallback path
+    events = [_make_event('dark_factory'), _make_event('dark_factory')]
+
+    # (a) resolver returns '' — pins post-927 invariant (NOT 'dark_factory')
+    resolved = harness._resolve_project_root(events)
+    assert resolved == '', (
+        f"_resolve_project_root returned '{resolved}' but expected '' — "
+        "regression to old project_id fallback detected (task-927 invariant violated)"
+    )
+
+    # (b) fetcher returns empty tree when project_root is ''
+    result = await harness._fetch_filtered_task_tree('')
+    assert isinstance(result, FilteredTaskTree)
+    assert result.active_tasks == []
+
+    # (c) taskmaster.get_tasks was never called (short-circuit on empty project_root)
+    harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
