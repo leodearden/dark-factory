@@ -412,11 +412,18 @@ violations are always bugs. Pay special attention to `stability_concerns`.
    - Clear-cut issues — use the two-step API:
      1. Call `submit_task`(title=..., description=..., priority=...,
         metadata={{"source": "review-cycle", "review_id": "{review_id}", "modules": ["path/to/module", ...]}},
-        project_root="{project_root}") — returns `{{"ticket": "tkt_..."}}`.
+        project_root="{project_root}") — returns `{{"ticket": "tkt_..."}}` on
+        success, or `{{"error": ..., "error_type": ...}}` (no `ticket` key) if
+        the call was rejected at submit time (e.g. backlog full, closed
+        interceptor). On the error shape, treat the finding as skipped and
+        include the error in the finding description.
      2. Call `resolve_ticket`(ticket=..., project_root="{project_root}", timeout_seconds=60) —
-        returns {{status, task_id?, reason?}}. Branch on `status`:
-        - `created` or `combined` — record `task_id` in the finding's `task_id` field.
-        - `dropped` — candidate rejected (duplicate / backlog_full); skip.
+        (60 s is intentionally conservative; server default is 115 s — raise if
+        curator is consistently slow) returns {{status, task_id?, reason?}}. Branch on `status`:
+        - `created` — the curator accepted the candidate; record `task_id`.
+        - `combined` — the curator deduped into an existing task; `task_id`
+          points at that task. Record it the same way as `created` (the
+          candidate was absorbed, not lost).
         - `failed` — include `reason` in the finding description.
    - Ambiguous/architectural → `escalate_info(category=..., summary=...)`
    - Known/accepted → dismiss (don't report)

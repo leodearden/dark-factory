@@ -533,33 +533,45 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
    a. Call `submit_task`(title=..., description=..., priority=...,
       metadata={"source": "steward-triage", "spawn_context": "steward-triage",
       "spawned_from": "<task_id under review>", "modules": [...]},
-      project_root=...) — returns `{"ticket": "tkt_..."}`.
+      project_root=...) — returns `{"ticket": "tkt_..."}` on success, or
+      `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was
+      rejected at submit time (e.g. backlog full, closed interceptor). On the
+      error shape, treat the candidate as skipped and record the error.
       Populate `spawned_from` with the id of the task that produced the escalation
       (it is in the escalation detail under `task_id`). Use the file paths listed in
       the group for `modules`.
    b. Call `resolve_ticket`(ticket=..., project_root=..., timeout_seconds=60) —
-      returns {status, task_id?, reason?}. Branch on `status`:
-      - `created` or `combined` — record `task_id` as the id of the resulting task.
-      - `dropped` — candidate was rejected (duplicate / backlog_full); skip it.
+      (60 s is intentionally conservative; server default is 115 s — raise if
+      curator is consistently slow) returns {status, task_id?, reason?}. Branch on `status`:
+      - `created` — the curator accepted the candidate; record `task_id`.
+      - `combined` — the curator deduped into an existing task; `task_id` points
+        at that task. Record it the same way as `created` (the candidate was
+        absorbed, not lost).
       - `failed` — report the `reason` in your resolve_issue summary.
 2. For notable conventions among accepted items: write via `add_memory`
    with category `preferences_and_norms`.
 3. Call `resolve_issue` summarizing: N tasks created/combined, M conventions written,
-   K dropped, any failures.
+   K skipped (submit errors), any `failed` resolve_ticket reasons.
 
 **Raw format (fallback):** When the detail is a raw JSON array, triage each suggestion as:
 - **create_task** — Substantial improvement worth a follow-up task. Use the two-step API:
   a. Call `submit_task`(title=..., description=..., priority=...,
      metadata={"source": "steward-triage", "spawn_context": "steward-triage",
      "spawned_from": "<task_id under review>", "modules": ["path/to/module", ...]},
-     project_root=...) — returns `{"ticket": "tkt_..."}`.
+     project_root=...) — returns `{"ticket": "tkt_..."}` on success, or
+     `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was
+     rejected at submit time (e.g. backlog full, closed interceptor). On the
+     error shape, treat the candidate as skipped and record the error.
      Include the code modules (directory paths relative to project root) that this task
      will need to modify — these are used for concurrency locking. `spawned_from` lets
      the task curator spot duplicates against the original task's details.
   b. Call `resolve_ticket`(ticket=..., project_root=..., timeout_seconds=60) —
-     returns {status, task_id?, reason?}. Branch on `status`:
-     - `created` or `combined` — record `task_id` as the id of the resulting task.
-     - `dropped` — candidate was rejected (duplicate / backlog_full); skip it.
+     (60 s is intentionally conservative; server default is 115 s — raise if
+     curator is consistently slow) returns {status, task_id?, reason?}. Branch on `status`:
+     - `created` — the curator accepted the candidate; record `task_id`.
+     - `combined` — the curator deduped into an existing task; `task_id` points
+       at that task. Record it the same way as `created` (the candidate was
+       absorbed, not lost).
      - `failed` — report the `reason` in your resolve_issue summary.
 - **convention** — Pattern-level insight for future agents. Write via `add_memory`
   with category `preferences_and_norms`.
@@ -705,7 +717,7 @@ For each finding, classify and act:
 
 | Classification | Criteria | Action |
 |---|---|---|
-| **create_task** | Unambiguous bug, missing wiring, unfilled stub, clear fix path | Call `submit_task` then `resolve_ticket`(timeout_seconds=60) |
+| **create_task** | Unambiguous bug, missing wiring, unfilled stub, clear fix path | Call `submit_task` then `resolve_ticket`(timeout_seconds=60) — see Creating tasks below |
 | **escalate** | Ambiguous, multiple valid approaches, architectural implications, design questions | Call `escalate_info` with category and summary |
 | **dismiss** | Known gap in briefing, noise, style preference, intentionally incomplete | Skip |
 
@@ -714,7 +726,11 @@ For each finding, classify and act:
 Use the two-step API to create tasks:
 
 1. Call `submit_task`(title=..., description=..., priority=..., metadata=...,
-   project_root=...) — returns `{"ticket": "tkt_..."}`. Always include:
+   project_root=...) — returns `{"ticket": "tkt_..."}` on success, or
+   `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was rejected
+   at submit time (e.g. backlog full, closed interceptor). On the error shape,
+   treat the candidate as skipped and include the error in your review output.
+   Always include:
    - `title`: concise description of the fix
    - `description`: what's wrong, where, and the suggested approach
    - `priority`: "high" for broken wiring/stubs, "medium" for consistency issues
@@ -726,9 +742,12 @@ Use the two-step API to create tasks:
    - `project_root`: use the value from your Agent Identity section
 
 2. Call `resolve_ticket`(ticket=..., project_root=..., timeout_seconds=60) —
-   returns {status, task_id?, reason?}. Branch on `status`:
-   - `created` or `combined` — record `task_id` as the id of the resulting task.
-   - `dropped` — candidate was rejected (duplicate / backlog_full); skip it.
+   (60 s is intentionally conservative; server default is 115 s — raise if
+   curator is consistently slow) returns {status, task_id?, reason?}. Branch on `status`:
+   - `created` — the curator accepted the candidate; record `task_id`.
+   - `combined` — the curator deduped into an existing task; `task_id` points at
+     that task. Record it the same way as `created` (the candidate was absorbed,
+     not lost).
    - `failed` — report the `reason` in your review output.
 
 ### Escalating ambiguous findings
