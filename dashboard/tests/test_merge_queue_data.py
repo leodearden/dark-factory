@@ -2770,3 +2770,50 @@ class TestBuildPerProjectMergeQueue:
         )
         assert set(result.keys()) == {f'/tmp/P{i}' for i in range(N)}
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('recent_window_minutes,expected_hours', [
+        (15, 1),
+        (60, 1),
+        (90, 2),
+        (120, 2),
+    ])
+    async def test_recent_merges_called_with_ceil_hours_and_no_limit(
+        self, tmp_path, recent_window_minutes, expected_hours,
+    ):
+        """build_per_project_merge_queue calls recent_merges with hours=ceil(window/60) and limit=None.
+
+        Parametrized over recent_window_minutes ∈ {15, 60, 90, 120} to lock in
+        the max(1, ceil(x/60)) semantics.  Fails on the pre-fix implementation
+        which passes limit=50 and hours=<outer dashboard window>.
+        """
+        import math
+        from unittest.mock import AsyncMock, patch
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'p.db', [])
+
+        captured_kwargs: dict = {}
+
+        async def fake_recent_merges(db, **kwargs):
+            captured_kwargs.update(kwargs)
+            return []
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with patch('dashboard.data.merge_queue.recent_merges', new=fake_recent_merges):
+                await build_per_project_merge_queue(
+                    [('/tmp/P', conn)],
+                    hours=24,
+                    now=now,
+                    recent_window_minutes=recent_window_minutes,
+                )
+
+        assert captured_kwargs.get('limit') is None, (
+            f'Expected limit=None, got limit={captured_kwargs.get("limit")!r}'
+        )
+        assert captured_kwargs.get('hours') == expected_hours, (
+            f'recent_window_minutes={recent_window_minutes}: '
+            f'expected hours={expected_hours}, got hours={captured_kwargs.get("hours")!r}'
+        )
+
