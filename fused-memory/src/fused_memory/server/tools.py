@@ -1117,6 +1117,7 @@ def create_mcp_server(
         project_root: str,
         tag: str | None = None,
         done_provenance: dict | None = None,
+        reopen_reason: str | None = None,
     ) -> dict[str, Any]:
         """Update task status. Triggers targeted reconciliation for
         done/blocked/cancelled/deferred transitions.
@@ -1141,6 +1142,11 @@ def create_mcp_server(
                 required when reconciliation.require_done_provenance is True
                 (default False during rollout — missing provenance logs a
                 warning but does not block the transition).
+            reopen_reason: Required to exit a terminal status (done, cancelled).
+                Short free-text explanation — e.g. 'un-defer script',
+                'manual re-scope', 'reconciliation: re-implementation required'.
+                Persisted on the task as metadata.reopen_reason for audit.
+                Ignored for non-terminal transitions.
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -1158,6 +1164,7 @@ def create_mcp_server(
             return await task_interceptor.set_task_status(
                 task_id=id, status=status, project_root=project_root, tag=tag,
                 done_provenance=done_provenance,
+                reopen_reason=reopen_reason,
             )
         except Exception as e:
             logger.error(f'set_task_status error: {e}')

@@ -23,7 +23,6 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
-from tests.conftest import _spy_set_cached_status
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -355,6 +354,7 @@ class FakeScheduler:
     def __init__(self):
         self.statuses: dict[str, list[str]] = {}
         self.provenance: dict[str, dict] = {}
+        self.reopen_reasons: dict[str, str] = {}
 
     async def set_task_status(
         self,
@@ -362,17 +362,20 @@ class FakeScheduler:
         status: str,
         *,
         done_provenance: dict | None = None,
+        reopen_reason: str | None = None,
     ) -> None:
         self.statuses.setdefault(task_id, []).append(status)
         if done_provenance is not None:
             self.provenance[task_id] = done_provenance
+        if reopen_reason is not None:
+            self.reopen_reasons[task_id] = reopen_reason
 
     async def handle_blast_radius_expansion(
         self, task_id: str, current: list[str], needed: list[str]
     ) -> bool:
         return True
 
-    def get_cached_status(self, task_id: str) -> str | None:
+    async def get_status(self, task_id: str) -> str | None:
         history = self.statuses.get(task_id)
         return history[-1] if history else None
 
@@ -2245,104 +2248,90 @@ class TestWipRecoveryNoAdvance:
 
 
 # ---------------------------------------------------------------------------
-# Tests: FakeScheduler.get_cached_status
+# Tests: FakeScheduler forwarding semantics
 # ---------------------------------------------------------------------------
 
 
-class TestFakeSchedulerCachedStatus:
-    """FakeScheduler.get_cached_status returns the last status set for a task."""
-
-    def test_get_cached_status_returns_none_before_any_set(self):
-        """Before any set_task_status call, get_cached_status returns None."""
-        fake = FakeScheduler()
-        assert fake.get_cached_status('x') is None
+class TestFakeSchedulerGetStatus:
+    """FakeScheduler.get_status returns the last status set for a task."""
 
     @pytest.mark.asyncio
-    async def test_get_cached_status_returns_last_set_status(self):
-        """get_cached_status returns the most recent status after multiple sets."""
+    async def test_get_status_returns_none_before_any_set(self):
+        """Before any set_task_status call, get_status returns None."""
+        fake = FakeScheduler()
+        assert await fake.get_status('x') is None
+
+    @pytest.mark.asyncio
+    async def test_get_status_returns_last_set_status(self):
+        """get_status returns the most recent status after multiple sets."""
         fake = FakeScheduler()
         await fake.set_task_status('x', 'in-progress')
         await fake.set_task_status('x', 'done')
-        assert fake.get_cached_status('x') == 'done'
+        assert await fake.get_status('x') == 'done'
 
     @pytest.mark.asyncio
     async def test_fake_scheduler_accepts_and_records_done_provenance(self):
-        """FakeScheduler.set_task_status records done_provenance on the instance.
-
-        Asserts that after calling set_task_status('x', 'done', done_provenance={...}),
-        fake.provenance['x'] == {'commit': 'deadbeef'}.
-        Fails until FakeScheduler signature and provenance dict are updated (step-13).
-        """
+        """FakeScheduler.set_task_status records done_provenance on the instance."""
         fake = FakeScheduler()
         await fake.set_task_status('x', 'done', done_provenance={'commit': 'deadbeef'})
         assert fake.provenance['x'] == {'commit': 'deadbeef'}  # type: ignore[attr-defined]
 
+    @pytest.mark.asyncio
+    async def test_fake_scheduler_accepts_and_records_reopen_reason(self):
+        """FakeScheduler.set_task_status records reopen_reason on the instance."""
+        fake = FakeScheduler()
+        await fake.set_task_status(
+            'x', 'pending', reopen_reason='un-defer script',
+        )
+        assert fake.reopen_reasons['x'] == 'un-defer script'  # type: ignore[attr-defined]
+
 
 # ---------------------------------------------------------------------------
-# Tests: _EvalScheduler.get_cached_status
+# Tests: _EvalScheduler status tracking
 # ---------------------------------------------------------------------------
 
 
-class TestEvalSchedulerCachedStatus:
-    """_EvalScheduler.get_cached_status tracks status set via set_task_status."""
+class TestEvalSchedulerStatus:
+    """_EvalScheduler exposes status via get_status for workflow consumption."""
 
-    def test_eval_scheduler_get_cached_status_returns_none_initially(self):
-        """Before any set_task_status call, get_cached_status returns None."""
+    @pytest.mark.asyncio
+    async def test_eval_scheduler_get_status_returns_none_initially(self):
         from orchestrator.config import OrchestratorConfig
         from orchestrator.evals.runner import _EvalScheduler
 
         sched = _EvalScheduler(OrchestratorConfig())
-        assert sched.get_cached_status('99') is None
+        assert await sched.get_status('99') is None
 
     @pytest.mark.asyncio
-    async def test_eval_scheduler_get_cached_status_tracks_set_task_status(self):
-        """get_cached_status returns the status written by set_task_status."""
+    async def test_eval_scheduler_get_status_tracks_set_task_status(self):
         from orchestrator.config import OrchestratorConfig
         from orchestrator.evals.runner import _EvalScheduler
 
         sched = _EvalScheduler(OrchestratorConfig())
         await sched.set_task_status('99', 'done')
-        assert sched.get_cached_status('99') == 'done'
-
-    @pytest.mark.asyncio
-    async def test_eval_scheduler_uses_status_cache_attribute(self):
-        """_EvalScheduler uses _status_cache (not _cache) to match Scheduler naming."""
-        from orchestrator.config import OrchestratorConfig
-        from orchestrator.evals.runner import _EvalScheduler
-
-        sched = _EvalScheduler(OrchestratorConfig())
-        await sched.set_task_status('99', 'done')
-        assert sched._status_cache == {'99': 'done'}
-        assert not hasattr(sched, '_cache')
-
-    @pytest.mark.asyncio
-    async def test_eval_scheduler_set_task_status_writes_via_set_cached_status(self):
-        """_EvalScheduler.set_task_status() must write via _set_cached_status()."""
-        from orchestrator.config import OrchestratorConfig
-        from orchestrator.evals.runner import _EvalScheduler
-
-        sched = _EvalScheduler(OrchestratorConfig())
-
-        recorded = _spy_set_cached_status(sched)
-
-        await sched.set_task_status('99', 'done')
-        assert ('99', 'done') in recorded
+        assert await sched.get_status('99') == 'done'
 
     @pytest.mark.asyncio
     async def test_eval_scheduler_set_task_status_accepts_done_provenance(self):
-        """_EvalScheduler.set_task_status accepts done_provenance kwarg without error.
-
-        Eval mode doesn't persist provenance; the kwarg is accepted and ignored.
-        Also asserts the cached status is updated normally.
-        Fails until _EvalScheduler.set_task_status signature adds done_provenance.
-        """
+        """Eval mode accepts done_provenance kwarg without error."""
         from orchestrator.config import OrchestratorConfig
         from orchestrator.evals.runner import _EvalScheduler
 
         sched = _EvalScheduler(OrchestratorConfig())
-        # Should not raise TypeError
         await sched.set_task_status('99', 'done', done_provenance={'commit': 'abc'})
-        assert sched.get_cached_status('99') == 'done'
+        assert await sched.get_status('99') == 'done'
+
+    @pytest.mark.asyncio
+    async def test_eval_scheduler_set_task_status_accepts_reopen_reason(self):
+        """Eval mode accepts reopen_reason kwarg without error."""
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.runner import _EvalScheduler
+
+        sched = _EvalScheduler(OrchestratorConfig())
+        await sched.set_task_status(
+            '99', 'pending', reopen_reason='un-defer script',
+        )
+        assert await sched.get_status('99') == 'pending'
 
 
 # ---------------------------------------------------------------------------
@@ -2921,14 +2910,14 @@ class TestFileStructureInvariants:
 #   so accidental removal of either fails at normal pytest time.
 #
 # Experimental verification: enforcement was confirmed in commit 357fa4d6a5 and
-# re-verified during task 699 by temporarily mutating FakeScheduler.get_cached_status
-# to return `int | None`; pyright flagged line 2098 with reportAssignmentType as
-# expected, then the file was reverted.
+# re-verified during task 699 by temporarily mutating FakeScheduler.get_status
+# to return `int | None`; pyright flagged the protocol conformance check with
+# reportAssignmentType as expected, then the file was reverted.
 #
-# Runtime belt-and-braces: TestFakeSchedulerCachedStatus and
-# TestEvalSchedulerCachedStatus (above) provide runtime coverage of
-# get_cached_status behaviour — the static conformance block only catches
-# signature drift, not behavioural regressions.
+# Runtime belt-and-braces: TestFakeSchedulerGetStatus and
+# TestEvalSchedulerStatus (above) provide runtime coverage of get_status
+# behaviour — the static conformance block only catches signature drift,
+# not behavioural regressions.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -3436,6 +3425,79 @@ class TestSessionBudgetExhaustionEscalation:
         assert 'total_turns=' in detail, f'Expected "total_turns=" label in detail, got: {detail!r}'
         assert 'last_role' in detail, f'Expected "last_role" label in detail, got: {detail!r}'
         assert 'architect' in detail, f'Expected "architect" (last role) in detail, got: {detail!r}'
+
+
+def _make_done_setting_steward(
+    queue: EscalationQueue, scheduler, task_id: str,
+) -> type:
+    """FakeSteward that resolves L0s and sets the task status to done.
+
+    Models the phantom-done race: while workflow is blocked in
+    ``_await_steward_completion``, the steward marks the task done via MCP
+    (out-of-band from the workflow). The workflow must observe the fresh
+    status via ``get_status`` and return DONE, not requeue to pending.
+    """
+    class _FakeSteward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            pass
+
+        async def start(self) -> None:
+            pending = queue.get_by_task(task_id, status='pending', level=0)
+            for esc in pending:
+                queue.resolve(esc.id, 'Implementation already shipped',
+                              resolved_by='fake-steward')
+            await scheduler.set_task_status(
+                task_id, 'done',
+                done_provenance={'note': 'phantom-done regression test'},
+            )
+
+        async def stop(self) -> None:
+            pass
+
+    return _FakeSteward
+
+
+@pytest.mark.asyncio
+class TestMarkBlockedPhantomDone:
+    """Regression: steward marking task done out-of-band must return DONE.
+
+    Before the server-authoritative FSM, the scheduler's local status cache
+    could hold 'blocked' while the store already showed 'done' (steward wrote
+    it via MCP). The workflow's cache-read fell through to
+    ``set_task_status('pending')``, ping-ponging the task. With
+    ``get_status()`` reading live from the store, the post-steward branch
+    correctly short-circuits to DONE.
+    """
+
+    async def test_steward_marks_done_returns_done_not_requeued(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt_info.path
+        workflow.artifacts = TaskArtifacts(wt_info.path)
+        workflow._steward_factory = _make_done_setting_steward(
+            queue, scheduler, task_assignment.task_id,
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE when steward marked done, got {outcome!r}. '
+            'Workflow must read fresh status via get_status and short-circuit.'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert statuses[-1] == 'done', (
+            f"Last status must be 'done' (steward's decision), got: {statuses}"
+        )
+        # Must not have written 'pending' after 'done' — the ghost-loop bug.
+        done_index = statuses.index('done')
+        assert 'pending' not in statuses[done_index:], (
+            f'Workflow must not requeue after steward marked done: {statuses}'
+        )
 
 
 if TYPE_CHECKING:

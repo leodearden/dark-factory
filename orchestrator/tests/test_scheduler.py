@@ -2,7 +2,7 @@
 
 
 import time
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -14,7 +14,6 @@ from orchestrator.config import (
 )
 from orchestrator.event_store import EventType
 from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules
-from tests.conftest import _spy_set_cached_status
 
 
 @pytest.fixture
@@ -326,201 +325,6 @@ class TestModuleLockWithModuleConfig:
         assert lt.try_acquire('t1', ['dashboard'])
         assert lt.try_acquire('t2', ['dashboard'])
         assert not lt.try_acquire('t3', ['dashboard'])
-
-
-class TestStatusTransitionGuard:
-    """Scheduler.set_task_status must reject transitions from terminal states."""
-
-    @pytest.fixture
-    def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
-
-    @pytest.mark.asyncio
-    async def test_rejects_done_to_blocked(self, scheduler: Scheduler, monkeypatch):
-        """Once a task is DONE, subsequent set_task_status('blocked') is silently dropped."""
-        mock = AsyncMock(return_value={})
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
-
-        await scheduler.set_task_status('1', 'in-progress')
-        await scheduler.set_task_status('1', 'done')
-        await scheduler.set_task_status('1', 'blocked')
-
-        # Only in-progress and done should have triggered MCP calls
-        assert mock.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_rejects_done_to_in_progress(self, scheduler: Scheduler, monkeypatch):
-        """done->in-progress is rejected (duplicate workflow start)."""
-        mock = AsyncMock(return_value={})
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
-
-        await scheduler.set_task_status('1', 'done')
-        call_count_after_done = mock.call_count
-        await scheduler.set_task_status('1', 'in-progress')
-
-        assert mock.call_count == call_count_after_done  # no new MCP call
-
-    @pytest.mark.asyncio
-    async def test_allows_done_to_done_idempotent(self, scheduler: Scheduler, monkeypatch):
-        """Idempotent done->done transitions must be allowed."""
-        mock = AsyncMock(return_value={})
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
-
-        await scheduler.set_task_status('1', 'done')
-        await scheduler.set_task_status('1', 'done')
-
-        assert mock.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_allows_normal_flow(self, scheduler: Scheduler, monkeypatch):
-        """in-progress->done is a valid transition and must go through."""
-        mock = AsyncMock(return_value={})
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
-
-        await scheduler.set_task_status('2', 'in-progress')
-        await scheduler.set_task_status('2', 'done')
-
-        assert mock.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_fail_open_unknown_task(self, scheduler: Scheduler, monkeypatch):
-        """First-ever set_task_status for an unknown task always calls mcp_call."""
-        mock = AsyncMock(return_value={})
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
-
-        await scheduler.set_task_status('unknown-99', 'blocked')
-
-        assert mock.call_count == 1
-
-    @pytest.mark.asyncio
-    async def test_cache_survives_release(self, scheduler: Scheduler, monkeypatch):
-        """Status cache persists beyond lock release so stale workflows are still blocked."""
-        mock = AsyncMock(return_value={})
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
-
-        await scheduler.set_task_status('1', 'done')
-        scheduler.release('1')  # clears _dispatched and module lock, NOT status cache
-        call_count_before = mock.call_count
-
-        await scheduler.set_task_status('1', 'blocked')
-
-        # Cache still shows 'done', so blocked is rejected
-        assert mock.call_count == call_count_before
-
-
-class TestGetTasksSeedsCache:
-    """get_tasks() should populate the status cache so pre-existing terminal tasks are guarded.
-
-    Uses get_cached_status() to verify cache contents.
-    """
-
-    @pytest.fixture
-    def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
-
-    @pytest.mark.asyncio
-    async def test_get_tasks_seeds_status_cache(self, scheduler: Scheduler, monkeypatch):
-        """After get_tasks(), set_task_status for a 'done' task is rejected without MCP call."""
-        tasks_response = {
-            'result': {
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': '{"tasks": [{"id": "42", "status": "done", "title": "T"}]}',
-                    }
-                ]
-            }
-        }
-        mcp_mock = AsyncMock(return_value=tasks_response)
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
-
-        await scheduler.get_tasks()  # seeds cache from tasks response
-
-        call_count_after_seed = mcp_mock.call_count
-
-        # Now try to set blocked on the done task
-        await scheduler.set_task_status('42', 'blocked')
-
-        # Cache was seeded: the blocked call must be rejected (no new MCP call)
-        assert mcp_mock.call_count == call_count_after_seed
-
-
-    @pytest.mark.asyncio
-    async def test_get_tasks_resyncs_from_store_on_reinstatement(
-        self, scheduler: Scheduler, monkeypatch
-    ):
-        """get_tasks() must update cache when store shows a reinstated (non-terminal) status.
-
-        External processes may reinstate cancelled/done tasks to pending.  The
-        store is the source of truth — the cache must reflect the reinstatement
-        so that set_task_status() does not silently reject valid transitions.
-        """
-        # Step 1: Populate cache with terminal status via set_task_status
-        set_mock = AsyncMock(return_value={})
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', set_mock)
-        await scheduler.set_task_status('42', 'cancelled')
-        assert scheduler.get_cached_status('42') == 'cancelled'
-
-        # Step 2: Simulate store reinstatement — task 42 is now 'pending'
-        reinstated_response = {
-            'result': {
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': '{"tasks": [{"id": "42", "status": "pending", "title": "T"}]}',
-                    }
-                ]
-            }
-        }
-        get_mock = AsyncMock(return_value=reinstated_response)
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', get_mock)
-
-        # Step 3: get_tasks() must resync cache to match store
-        await scheduler.get_tasks()
-        assert scheduler.get_cached_status('42') == 'pending', (
-            'get_tasks() must trust store reinstatement of cancelled -> pending'
-        )
-
-        # Step 4: set_task_status('in-progress') must now succeed
-        call_count_before = get_mock.call_count
-        await scheduler.set_task_status('42', 'in-progress')
-        assert get_mock.call_count == call_count_before + 1, (
-            'set_task_status(in-progress) must succeed after store reinstatement'
-        )
-
-    @pytest.mark.asyncio
-    async def test_get_tasks_updates_non_terminal_cache(
-        self, scheduler: Scheduler, monkeypatch
-    ):
-        """get_tasks() should update cache entries that are not yet terminal."""
-        # Pre-populate cache with a non-terminal status
-        set_mock = AsyncMock(return_value={})
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', set_mock)
-        await scheduler.set_task_status('42', 'in-progress')
-        assert scheduler.get_cached_status('42') == 'in-progress'
-
-        # Simulate taskmaster reporting a different non-terminal status ('blocked')
-        update_response = {
-            'result': {
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': '{"tasks": [{"id": "42", "status": "blocked", "title": "T"}]}',
-                    }
-                ]
-            }
-        }
-        get_mock = AsyncMock(return_value=update_response)
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', get_mock)
-
-        await scheduler.get_tasks()
-
-        # Non-terminal cache entry SHOULD be updated
-        assert scheduler.get_cached_status('42') == 'blocked', (
-            'get_tasks() should update non-terminal cache entries'
-        )
 
 
 class TestGetTasksExceptionLogging:
@@ -1139,128 +943,6 @@ class TestUpdateTaskMetadataSerialization:
         assert parsed == {'prd': '/abs/path/to/feature.prd'}
 
 
-class TestCancelledTaskResync:
-    """Regression: externally reinstated cancelled tasks must not spin-loop.
-
-    Reproduces the bug where 15 cancelled tasks were reinstated to pending in
-    the store, but the scheduler's status cache still held 'cancelled'.  The
-    terminal guard rejected every cancelled->in-progress transition, and the
-    task was immediately reacquired — an infinite spin that starved pending
-    tasks (156k+ rejections for a single task).
-
-    Uses get_cached_status() to verify cache contents.
-    """
-
-    @pytest.fixture
-    def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
-
-    @pytest.mark.asyncio
-    async def test_reinstated_cancelled_task_dispatches_successfully(
-        self, scheduler: Scheduler, monkeypatch
-    ):
-        """Full cycle: cancel -> external reinstatement -> acquire -> in-progress succeeds."""
-        mock = AsyncMock(return_value={})
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
-
-        # 1. Orchestrator cancels the task — cache records 'cancelled'
-        await scheduler.set_task_status('64', 'cancelled')
-        assert scheduler.get_cached_status('64') == 'cancelled'
-
-        # 2. External process reinstates to pending (store returns pending)
-        reinstated_task = {
-            'id': '64',
-            'title': 'Reinstated task',
-            'status': 'pending',
-            'dependencies': [],
-            'metadata': {'modules': ['backend']},
-        }
-        reinstated_response = {
-            'result': {
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': '{"tasks": [' + __import__('json').dumps(reinstated_task) + ']}',
-                    }
-                ]
-            }
-        }
-        monkeypatch.setattr(
-            'orchestrator.scheduler.mcp_call',
-            AsyncMock(return_value=reinstated_response),
-        )
-
-        # 3. acquire_next picks up the task and resyncs cache
-        assignment = await scheduler.acquire_next()
-        assert assignment is not None, (
-            'Reinstated task must be acquirable — was silently rejected before fix'
-        )
-        assert assignment.task_id == '64'
-
-        # 4. Cache must now show 'pending' (resynced from store)
-        #    so that set_task_status('in-progress') is NOT rejected
-        assert scheduler.get_cached_status('64') == 'pending'
-
-        # 5. Transition to in-progress must succeed (not be silently dropped)
-        ip_mock = AsyncMock(return_value={})
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', ip_mock)
-        await scheduler.set_task_status('64', 'in-progress')
-
-        assert ip_mock.call_count == 1, (
-            'set_task_status(in-progress) must issue MCP call after reinstatement — '
-            'was silently rejected by stale terminal guard before fix'
-        )
-        assert scheduler.get_cached_status('64') == 'in-progress'
-
-    @pytest.mark.asyncio
-    async def test_spin_loop_does_not_occur(
-        self, scheduler: Scheduler, monkeypatch
-    ):
-        """Simulates N acquire cycles — each must make progress, not spin on rejection."""
-        mock = AsyncMock(return_value={})
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
-
-        # Cancel the task
-        await scheduler.set_task_status('57', 'cancelled')
-
-        # Store reinstates to pending
-        task = {
-            'id': '57',
-            'title': 'Spin-loop candidate',
-            'status': 'pending',
-            'dependencies': [],
-            'metadata': {'modules': ['frontend']},
-        }
-        store_response = {
-            'result': {
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': '{"tasks": [' + __import__('json').dumps(task) + ']}',
-                    }
-                ]
-            }
-        }
-        store_mock = AsyncMock(return_value=store_response)
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', store_mock)
-
-        # First acquire — should get the task
-        a1 = await scheduler.acquire_next()
-        assert a1 is not None and a1.task_id == '57'
-
-        # set_task_status should succeed (not be silently rejected)
-        ip_mock = AsyncMock(return_value={})
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', ip_mock)
-        await scheduler.set_task_status('57', 'in-progress')
-        assert ip_mock.call_count == 1, 'in-progress transition must not be rejected'
-
-        # Second acquire — task is already dispatched, should return None
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', store_mock)
-        a2 = await scheduler.acquire_next()
-        assert a2 is None, 'Task already dispatched — second acquire must return None'
-
-
 class TestRequeueCooldown:
     """Tests for the requeue cooldown that prevents ghost loops."""
 
@@ -1649,30 +1331,8 @@ class TestFairness:
         assert not scheduler.lock_table.has_parks('A')
 
 
-class TestGetCachedStatus:
-    """get_cached_status() exposes the internal status cache via a public method."""
-
-    @pytest.fixture
-    def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
-
-    def test_get_cached_status_returns_none_for_unknown_task(self, scheduler: Scheduler):
-        """get_cached_status returns None when the task has never been seen."""
-        assert scheduler.get_cached_status('unknown') is None
-
-    @pytest.mark.asyncio
-    async def test_get_cached_status_returns_status_after_set_task_status(
-        self, scheduler: Scheduler, monkeypatch
-    ):
-        """get_cached_status returns the last status written via set_task_status."""
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value={}))
-        await scheduler.set_task_status('42', 'in-progress')
-        assert scheduler.get_cached_status('42') == 'in-progress'
-
-
-class TestSchedulerInternalRouting:
-    """Scheduler internal call sites route reads through get_cached_status."""
+class TestGetStatus:
+    """``Scheduler.get_status`` returns the fresh store value via MCP."""
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
@@ -1680,170 +1340,144 @@ class TestSchedulerInternalRouting:
         return Scheduler(config)
 
     @pytest.mark.asyncio
-    async def test_set_task_status_reads_via_get_cached_status(
+    async def test_get_status_returns_store_value(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """set_task_status() must read the cached value via get_cached_status().
-
-        Stronger invariant: the return value must actually drive the transition
-        gate.  Patching get_cached_status to return 'done' causes done->blocked
-        to be rejected (is_valid_transition('done', 'blocked') is False), so
-        mcp_call is never invoked.  A spy-only assertion would pass even if the
-        production code read _status_cache directly alongside a vestigial
-        get_cached_status() call; this form does not.
-        """
-        mcp_mock = AsyncMock(return_value={})
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
-
-        with patch.object(scheduler, 'get_cached_status', return_value='done'):
-            await scheduler.set_task_status('42', 'blocked')
-            mcp_mock.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_get_tasks_reads_via_get_cached_status(
-        self, scheduler: Scheduler, monkeypatch
-    ):
-        """get_tasks() must read the cached value via get_cached_status() for reinstatement detection."""
+        """get_status parses the MCP get_task response and returns the status field."""
         import json
-        scheduler._status_cache['42'] = 'cancelled'
-
-        tasks_response = {
+        response = {
             'result': {
                 'content': [
                     {
                         'type': 'text',
-                        'text': json.dumps({'tasks': [{'id': '42', 'status': 'pending', 'title': 'T'}]}),
+                        'text': json.dumps({'id': '42', 'status': 'done', 'title': 'T'}),
                     }
                 ]
             }
         }
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value=tasks_response))
-
-        with patch.object(scheduler, 'get_cached_status', wraps=scheduler.get_cached_status) as spy:
-            await scheduler.get_tasks()
-            spy.assert_any_call('42')
-
-    @pytest.mark.asyncio
-    async def test_set_task_status_writes_via_set_cached_status(
-        self, scheduler: Scheduler, monkeypatch
-    ):
-        """set_task_status() must write the new status via _set_cached_status().
-
-        Instance-level rebinding works because Python's attribute lookup finds
-        the instance attribute before the class method, so the production call
-        self._set_cached_status(...) resolves to the recorder.
-        """
-        mcp_mock = AsyncMock(return_value={})
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
-
-        # Pre-seed the cache so is_valid_transition('pending', 'in-progress')
-        # is True regardless of future gate tightening for None->* transitions.
-        scheduler._status_cache['42'] = 'pending'
-
-        recorded = _spy_set_cached_status(scheduler)
-
-        await scheduler.set_task_status('42', 'in-progress')
-        assert ('42', 'in-progress') in recorded
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+        assert await scheduler.get_status('42') == 'done'
 
     @pytest.mark.asyncio
-    async def test_get_tasks_writes_via_set_cached_status(
+    async def test_get_status_unwraps_data_envelope(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """get_tasks() must write the cached status via _set_cached_status().
-
-        Verifies get_tasks() writes via the _set_cached_status chokepoint.
-        """
+        """Taskmaster's ``{'data': {...}}`` envelope is unwrapped."""
         import json
-
-        tasks_response = {
+        response = {
             'result': {
                 'content': [
                     {
                         'type': 'text',
-                        'text': json.dumps({'tasks': [{'id': '42', 'status': 'pending', 'title': 'T'}]}),
+                        'text': json.dumps(
+                            {'data': {'id': '42', 'status': 'in-progress'}},
+                        ),
                     }
                 ]
             }
         }
-        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(return_value=tasks_response))
-
-        recorded = _spy_set_cached_status(scheduler)
-
-        await scheduler.get_tasks()
-        assert ('42', 'pending') in recorded
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+        assert await scheduler.get_status('42') == 'in-progress'
 
     @pytest.mark.asyncio
-    async def test_set_task_status_forwards_done_provenance(
+    async def test_get_status_returns_none_on_mcp_exception(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """set_task_status with done_provenance kwarg forwards it in MCP arguments.
+        """MCP failures bubble up as ``None`` — callers treat that as stall-retry."""
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(side_effect=OSError(2, 'No such file')),
+        )
+        assert await scheduler.get_status('42') is None
 
-        Asserts the 'done_provenance' key reaches the MCP call's arguments dict.
-        Fails initially because the current signature has no done_provenance kwarg.
-        """
+
+class TestSetTaskStatusForwarding:
+    """``Scheduler.set_task_status`` is a thin forwarder; server owns the FSM."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_forwards_done_provenance(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """done_provenance kwarg reaches the MCP arguments dict."""
         mcp_mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
-        scheduler._status_cache['1'] = 'pending'
 
         await scheduler.set_task_status('1', 'done', done_provenance={'commit': 'abc123'})
 
         mcp_mock.assert_called_once()
-        call_args = mcp_mock.call_args
-        arguments = call_args[0][2]['arguments']  # positional arg 3 = body dict
+        arguments = mcp_mock.call_args[0][2]['arguments']
         assert arguments.get('done_provenance') == {'commit': 'abc123'}
 
     @pytest.mark.asyncio
-    async def test_set_task_status_omits_done_provenance_when_absent(
+    async def test_omits_done_provenance_when_absent(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """set_task_status without done_provenance must NOT include the key in MCP arguments.
-
-        Guards against accidentally forwarding a None value to the MCP tool,
-        which would trigger the Phase-1 validator error path.
-        """
+        """No done_provenance key when the caller didn't pass one."""
         mcp_mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
-        scheduler._status_cache['1'] = 'pending'
 
         await scheduler.set_task_status('1', 'in-progress')
 
         mcp_mock.assert_called_once()
-        call_args = mcp_mock.call_args
-        arguments = call_args[0][2]['arguments']  # positional arg 3 = body dict
+        arguments = mcp_mock.call_args[0][2]['arguments']
         assert 'done_provenance' not in arguments
 
+    @pytest.mark.asyncio
+    async def test_forwards_reopen_reason(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """reopen_reason kwarg reaches the MCP arguments dict — for un-defer scripts."""
+        mcp_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
 
-class TestSpySetCachedStatus:
-    """Unit tests for the _spy_set_cached_status helper in conftest.py."""
+        await scheduler.set_task_status(
+            '1', 'pending', reopen_reason='un-defer script',
+        )
 
-    def test_spy_returns_empty_list_initially(self):
-        """Installing the spy on a fresh object returns an empty list."""
+        mcp_mock.assert_called_once()
+        arguments = mcp_mock.call_args[0][2]['arguments']
+        assert arguments.get('reopen_reason') == 'un-defer script'
 
-        class Dummy:
-            def _set_cached_status(self, task_id: str, status: str) -> None:
-                pass
+    @pytest.mark.asyncio
+    async def test_omits_reopen_reason_when_absent(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        mcp_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
 
-        d = Dummy()
-        recorded = _spy_set_cached_status(d)
-        assert recorded == []
+        await scheduler.set_task_status('1', 'in-progress')
 
-    def test_spy_captures_and_forwards_call(self):
-        """The spy captures the call AND forwards it to the original method."""
+        mcp_mock.assert_called_once()
+        arguments = mcp_mock.call_args[0][2]['arguments']
+        assert 'reopen_reason' not in arguments
 
-        class Dummy:
-            def __init__(self) -> None:
-                self.calls: list[tuple[str, str]] = []
-
-            def _set_cached_status(self, task_id: str, status: str) -> None:
-                self.calls.append((task_id, status))
-
-        d = Dummy()
-        recorded = _spy_set_cached_status(d)
-        d._set_cached_status('t1', 's1')
-        # spy captures the call
-        assert ('t1', 's1') in recorded
-        # original is also called (forwarding, not just capturing)
-        assert ('t1', 's1') in d.calls
+    @pytest.mark.asyncio
+    async def test_mcp_exception_is_swallowed_and_logged(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """MCP failures are logged but don't raise — scheduler ticks survive."""
+        import logging as _logging
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(side_effect=OSError(2, 'No such file')),
+        )
+        with caplog.at_level(_logging.ERROR, logger='orchestrator.scheduler'):
+            await scheduler.set_task_status('1', 'in-progress')
+        assert any(
+            'Failed to set task 1 status' in rec.message
+            for rec in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------
