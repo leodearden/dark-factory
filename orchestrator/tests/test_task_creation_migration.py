@@ -102,6 +102,52 @@ _PHASE1_RESULT = VerifyResult(
 )
 
 
+# ---------------------------------------------------------------------------
+# Rendering-alignment tests (step 12)
+# ---------------------------------------------------------------------------
+
+
+class TestHelperIndentationAlignment:
+    """Verify that multiline metadata and extra_submit_guidance align properly after caller indent."""
+
+    def test_multiline_metadata_continuation_aligns_after_caller_indent(self):
+        result = _submit_resolve_instructions(
+            '{"a": 1,\n"b": 2}',
+            outcome_target='t',
+            step_prefix=('a', 'b'),
+            extra_submit_guidance='Line1\nLine2',
+        )
+        wrapped = textwrap.indent(result, '   ')
+        # After 3-space caller indent, "b": 2} continuation must sit at column 6
+        # (same column as 'metadata=' which is at '   ' + '   metadata=').
+        assert '\n      "b": 2}' in wrapped, (
+            f'Expected 6-space continuation not found.\nWrapped:\n{wrapped!r}'
+        )
+        # extra_submit_guidance lines must also sit at column 6, subordinated
+        # under step 'a.', not at the step-letter column (3 spaces).
+        assert '\n      Line1\n      Line2' in wrapped, (
+            f'Expected 6-space extra guidance not found.\nWrapped:\n{wrapped!r}'
+        )
+
+    def test_steward_prompt_aligns_metadata_and_extra_guidance(self):
+        # Pre-triaged site: caller indent = '   ' (3 spaces), so sub-continuation
+        # sits at 6 spaces (3 caller + 3 internal).
+        assert '      "spawned_from": "<task_id under review>"' in STEWARD.system_prompt, (
+            'Expected 6-space spawned_from in pre-triaged STEWARD prompt'
+        )
+        assert '      Populate `spawned_from`' in STEWARD.system_prompt, (
+            'Expected 6-space Populate extra guidance in pre-triaged STEWARD prompt'
+        )
+        # Raw-format site: caller indent = '  ' (2 spaces), so sub-continuation
+        # sits at 5 spaces (2 caller + 3 internal).
+        assert '     "spawned_from": "<task_id under review>"' in STEWARD.system_prompt, (
+            'Expected 5-space spawned_from in raw-format STEWARD prompt'
+        )
+        assert '     Include the code modules' in STEWARD.system_prompt, (
+            'Expected 5-space Include extra guidance in raw-format STEWARD prompt'
+        )
+
+
 class TestReviewCheckpointSite:
     """ReviewCheckpoint._build_prompt must emit the shared helper-rendered block for site 4."""
 
