@@ -393,12 +393,6 @@ class TaskWorkflow:
                             data={'waste_type': 'replan_after_failure'},
                         )
                     return plan_outcome  # _plan() already called _mark_blocked
-                if plan_outcome == WorkflowOutcome.DONE:
-                    # _mark_blocked's "branch already on main → DONE" recovery
-                    # propagates up here.  The scheduler status is already DONE
-                    # and plan.json was never stamped — entering EXECUTE would
-                    # spuriously fire the plan-overwrite escalation.
-                    return plan_outcome
                 # WorkflowOutcome.PLANNED falls through to execute/verify/review.
 
             # ── Ghost-loop early exit (before EXECUTE) ─────────────
