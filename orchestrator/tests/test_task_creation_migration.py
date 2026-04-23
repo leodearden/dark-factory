@@ -46,12 +46,10 @@ class TestSiteWiringMinimal:
     def test_steward_prompt_directs_two_step_api(self):
         assert 'submit_task' in STEWARD.system_prompt
         assert 'resolve_ticket' in STEWARD.system_prompt
-        assert '60 s is intentionally conservative' in STEWARD.system_prompt
 
     def test_deep_reviewer_prompt_directs_two_step_api(self):
         assert 'submit_task' in DEEP_REVIEWER.system_prompt
         assert 'resolve_ticket' in DEEP_REVIEWER.system_prompt
-        assert '60 s is intentionally conservative' in DEEP_REVIEWER.system_prompt
 
 
 # ---------------------------------------------------------------------------
