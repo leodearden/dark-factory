@@ -2539,7 +2539,6 @@ class TestLoadTaskTitles:
 
     def test_symlink_shares_cache_entry_with_real_path(self, tmp_path, monkeypatch):
         """A symlink and the real path resolve to the same LRU entry via os.path.realpath."""
-        import pytest
         import dashboard.data.merge_queue as _mq
         from dashboard.data.merge_queue import (
             _load_task_titles_cached,
