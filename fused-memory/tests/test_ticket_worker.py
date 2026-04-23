@@ -1690,3 +1690,84 @@ class TestCuratorWorkerBatchDrain:
         row = await ticket_store.get(t1)
         assert row is not None
         assert row['status'] == 'created', f'Expected created, got {row["status"]}'
+
+    @pytest.mark.asyncio
+    async def test_curator_lock_held_across_entire_batch(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """The curator_lock is held across the ENTIRE batch — curate_batch + dispatch.
+
+        While curate_batch is in-flight, a concurrent attempt to acquire
+        _curator_lock should block until the batch (curate_batch + per-ticket
+        dispatch) fully completes.
+        """
+        project_id = 'project'
+
+        # Event to block curate_batch in the middle of the batch.
+        release_event = asyncio.Event()
+        curate_batch_started = asyncio.Event()
+
+        async def blocking_curate_batch(candidates, pid, project_root):
+            curate_batch_started.set()
+            # Block until test releases us.
+            await release_event.wait()
+            return [CuratorDecision(action='create', justification='ok')
+                    for _ in candidates]
+
+        mock_curator = MagicMock()
+        mock_curator.curate_batch = AsyncMock(side_effect=blocking_curate_batch)
+        mock_curator.note_created = MagicMock()
+        mock_curator.record_task = AsyncMock()
+
+        taskmaster.add_task = AsyncMock(return_value={'id': '99', 'title': 'Locked Task'})
+
+        # Submit one ticket.
+        t1 = await ticket_store.submit(project_id, self._make_candidate_json('Locked Task'))
+
+        queue = interceptor_with_store._ticket_queues.setdefault(
+            project_id, asyncio.Queue()
+        )
+        queue.put_nowait(t1)
+
+        # Track whether the competing coroutine acquired the lock.
+        lock_acquired_while_batch_running = False
+        competing_acquired = asyncio.Event()
+
+        async def competing_acquire():
+            nonlocal lock_acquired_while_batch_running
+            # Wait until curate_batch has started so we know the batch lock is held.
+            await curate_batch_started.wait()
+            # Now try to acquire the lock (non-blocking check).
+            lock = interceptor_with_store._curator_lock(project_id)
+            lock_acquired_while_batch_running = lock.locked()
+            # Now try a blocking acquire — it should succeed after batch finishes.
+            await lock.acquire()
+            lock.release()
+            competing_acquired.set()
+
+        with patch.object(
+            type(interceptor_with_store), '_get_curator',
+            new=AsyncMock(return_value=mock_curator),
+        ), patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            interceptor_with_store._start_worker_if_needed(project_id)
+
+            # Start the competing coroutine.
+            competing_task = asyncio.create_task(competing_acquire())
+
+            # Wait for curate_batch to be entered.
+            await asyncio.wait_for(curate_batch_started.wait(), timeout=2.0)
+
+            # Release the batch so it can complete.
+            release_event.set()
+
+            # Wait for competing coroutine to finish.
+            await asyncio.wait_for(competing_acquired.wait(), timeout=2.0)
+            await competing_task
+
+        # The lock MUST have been held (locked) when curate_batch was in-flight.
+        assert lock_acquired_while_batch_running, (
+            '_curator_lock was NOT locked during curate_batch — lock not held across batch'
+        )
