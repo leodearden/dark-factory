@@ -1469,3 +1469,54 @@ class TestCurateBatchAllAccountsCapped:
         assert mock_curate.await_count == 2
         assert mock_curate.call_args_list[0].args[0] is c1
         assert mock_curate.call_args_list[1].args[0] is c2
+
+
+# ----------------------------------------------------------------------
+# batch_target_index validation and cycle detection
+# ----------------------------------------------------------------------
+
+
+class TestBatchTargetIndex:
+    def _make_agent_result(self, decisions: list[dict]) -> AgentResult:
+        return AgentResult(
+            success=True,
+            output='',
+            structured_output={'decisions': decisions},
+            cost_usd=0.02,
+        )
+
+    def test_within_batch_drop_preserves_batch_target_index(self):
+        """A valid within-batch drop keeps action='drop', target_id=None, and
+        batch_target_index correctly populated."""
+        from fused_memory.middleware.task_curator import _parse_batch_decisions
+        ar = self._make_agent_result([
+            {'candidate_index': 0, 'action': 'create', 'justification': 'new'},
+            {'candidate_index': 1, 'action': 'drop', 'batch_target_index': 0,
+             'justification': 'dup of 0'},
+        ])
+        pools = [[], []]
+        sizes = [{'anchor': 0}, {'anchor': 0}]
+        result = _parse_batch_decisions(ar, pools=pools, pool_sizes_list=sizes,
+                                        latency_ms=10)
+        assert result[1].action == 'drop'
+        assert result[1].target_id is None
+        assert result[1].batch_target_index == 0
+
+    def test_batch_target_cycle_degrades_both_to_create(self):
+        """A→B and B→A cycle: both items must be degraded to 'create' with
+        'batch-cycle' in their justification."""
+        from fused_memory.middleware.task_curator import _parse_batch_decisions
+        ar = self._make_agent_result([
+            {'candidate_index': 0, 'action': 'drop', 'batch_target_index': 1,
+             'justification': 'dup of 1'},
+            {'candidate_index': 1, 'action': 'drop', 'batch_target_index': 0,
+             'justification': 'dup of 0'},
+        ])
+        pools = [[], []]
+        sizes = [{'anchor': 0}, {'anchor': 0}]
+        result = _parse_batch_decisions(ar, pools=pools, pool_sizes_list=sizes,
+                                        latency_ms=10)
+        assert result[0].action == 'create'
+        assert result[1].action == 'create'
+        assert 'batch-cycle' in result[0].justification
+        assert 'batch-cycle' in result[1].justification
