@@ -120,3 +120,77 @@ class TestStubMcpSessionGetTask:
         content = result['result']['content']
         assert isinstance(content, list) and len(content) >= 1
         assert content[0]['type'] == 'text'
+
+
+class TestStubMcpSessionGetTasks:
+    """Tests for _StubMcpSession.call_tool('get_tasks', ...)."""
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_returns_empty_list(self):
+        """get_tasks returns an envelope whose decoded text has tasks: []."""
+        stub = _StubMcpSession()
+        result = await stub.call_tool('get_tasks', {})
+        block = result['result']['content'][0]
+        decoded = json.loads(block['text'])
+        assert decoded['tasks'] == []
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_envelope_shape(self):
+        """get_tasks returns a correctly-shaped JSON-RPC envelope."""
+        stub = _StubMcpSession()
+        result = await stub.call_tool('get_tasks', {})
+        assert result['jsonrpc'] == '2.0'
+        assert isinstance(result['id'], int)
+        content = result['result']['content']
+        assert isinstance(content, list) and len(content) >= 1
+        assert content[0]['type'] == 'text'
+
+
+class TestStubMcpSessionUpdateTask:
+    """Tests for _StubMcpSession.call_tool('update_task', ...)."""
+
+    @pytest.mark.asyncio
+    async def test_update_task_returns_non_error_envelope(self):
+        """update_task returns a non-error envelope so Scheduler.update_task returns True.
+
+        Scheduler.update_task checks result.get('result', result).get('isError').
+        No isError key means success → True.
+        """
+        stub = _StubMcpSession()
+        result = await stub.call_tool('update_task', {'id': 'task-20', 'metadata': '{}'})
+        # The envelope must not have isError set
+        content_wrapper = result.get('result', result)
+        assert not content_wrapper.get('isError')
+        # Decoded text echoes back the id
+        block = result['result']['content'][0]
+        decoded = json.loads(block['text'])
+        assert decoded['id'] == 'task-20'
+
+    @pytest.mark.asyncio
+    async def test_update_task_envelope_shape(self):
+        """update_task returns a correctly-shaped JSON-RPC envelope."""
+        stub = _StubMcpSession()
+        result = await stub.call_tool('update_task', {'id': 'task-21', 'metadata': '{}'})
+        assert result['jsonrpc'] == '2.0'
+        assert isinstance(result['id'], int)
+        content = result['result']['content']
+        assert isinstance(content, list) and len(content) >= 1
+        assert content[0]['type'] == 'text'
+
+
+class TestStubMcpSessionUnknownTool:
+    """Tests for _StubMcpSession.call_tool with an unknown tool name."""
+
+    @pytest.mark.asyncio
+    async def test_unknown_tool_raises_not_implemented_error(self):
+        """Calling an unknown tool name raises NotImplementedError."""
+        stub = _StubMcpSession()
+        with pytest.raises(NotImplementedError):
+            await stub.call_tool('some_unknown_tool', {})
+
+    @pytest.mark.asyncio
+    async def test_unknown_tool_message_names_the_tool(self):
+        """The NotImplementedError message names the unknown tool."""
+        stub = _StubMcpSession()
+        with pytest.raises(NotImplementedError, match='some_unknown_tool'):
+            await stub.call_tool('some_unknown_tool', {})
