@@ -1,5 +1,6 @@
 """Agent role definitions — system prompts and tool configurations per stage."""
 
+import textwrap
 from dataclasses import dataclass, field
 
 
@@ -498,6 +499,70 @@ git add -- . ':!.task'
 )
 
 
+def submit_resolve_instructions(
+    metadata_template: str,
+    *,
+    outcome_target: str,
+    project_root_expr: str = '...',
+    step_prefix: tuple[str, str] = ('a', 'b'),
+    extra_submit_guidance: str = '',
+    caller_indent: str = '',
+) -> str:
+    """Return the shared submit_task → resolve_ticket two-step instruction block.
+
+    Returns the block indented by ``caller_indent`` (default ``''`` for no
+    extra indentation).  Pass the same prefix you would have given to
+    ``textwrap.indent`` — the helper applies it internally so callers don't
+    need a separate wrap step and the sub-continuation alignment is always
+    correct regardless of indent width.
+
+    Args:
+        metadata_template: The metadata dict literal to show in the submit_task call.
+        outcome_target: Role-specific outcome target string (e.g. 'resolve_issue summary',
+            'review output', 'finding description').
+        project_root_expr: Expression for project_root arg (default '...' placeholder;
+            use e.g. '"/actual/path"' for interpolated contexts).
+        step_prefix: Tuple of (first_label, second_label) for the step bullets,
+            e.g. ('a', 'b') or ('1', '2').
+        extra_submit_guidance: Optional per-site extra guidance paragraph inserted
+            after the error-shape description.
+        caller_indent: Prefix string applied to every line of the returned block via
+            ``textwrap.indent``.  Defaults to ``''`` (unindented).
+
+    Returns:
+        Multi-line string with the shared skeleton, indented by caller_indent.
+    """
+    a, b = step_prefix
+    # Normalize multi-line metadata_template: add 3-space continuation indent so
+    # lines after the first align at the 'metadata=' column in the raw block.
+    metadata_normalized = metadata_template.replace('\n', '\n   ')
+    # extra_submit_guidance sits after the error-shape sentence; indent its lines
+    # 3 spaces so they read as a sub-continuation under step a./1. in the raw block.
+    extra = (
+        '\n' + textwrap.indent(extra_submit_guidance.rstrip(), '   ') + '\n'
+    ) if extra_submit_guidance.strip() else '\n'
+    # Build the raw (unindented) block, then apply caller_indent in one shot.
+    raw = (
+        f'{a}. Call `submit_task`(title=..., description=..., priority=...,\n'
+        f'   metadata={metadata_normalized},\n'
+        f'   project_root={project_root_expr}) — returns `{{"ticket": "tkt_..."}}` on success, or\n'
+        '   `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was\n'
+        '   rejected at submit time (e.g. backlog full, closed interceptor). On the\n'
+        '   error shape, treat the candidate as skipped and record the error in your\n'
+        f'   {outcome_target}.'
+        + extra
+        + f'{b}. Call `resolve_ticket`(ticket=..., project_root={project_root_expr}, timeout_seconds=60) —\n'
+        '   (60 s is intentionally conservative; server default is 115 s — raise if\n'
+        '   curator is consistently slow) returns {status, task_id?, reason?}. Branch on `status`:\n'
+        '   - `created` — the curator accepted the candidate; record `task_id`.\n'
+        '   - `combined` — the curator deduped into an existing task; `task_id` points\n'
+        '     at that task. Record it the same way as `created` (the candidate was\n'
+        '     absorbed, not lost).\n'
+        f'   - `failed` — report the `reason` in your {outcome_target}.'
+    )
+    return textwrap.indent(raw, caller_indent)
+
+
 _STEWARD_MEMORY_TOOLS = [
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_entity',
@@ -530,24 +595,18 @@ Post-merge improvement suggestions from automated code reviewers.
 **Pre-triaged format:** When the escalation detail starts with `## Pre-Triaged Results`,
 classification has already been done by a triage agent. Do NOT re-classify. Instead:
 1. For each entry in `proposed_task_groups`: create a task using the two-step API:
-   a. Call `submit_task`(title=..., description=..., priority=...,
-      metadata={"source": "steward-triage", "spawn_context": "steward-triage",
-      "spawned_from": "<task_id under review>", "modules": [...]},
-      project_root=...) — returns `{"ticket": "tkt_..."}` on success, or
-      `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was
-      rejected at submit time (e.g. backlog full, closed interceptor). On the
-      error shape, treat the candidate as skipped and record the error.
-      Populate `spawned_from` with the id of the task that produced the escalation
-      (it is in the escalation detail under `task_id`). Use the file paths listed in
-      the group for `modules`.
-   b. Call `resolve_ticket`(ticket=..., project_root=..., timeout_seconds=60) —
-      (60 s is intentionally conservative; server default is 115 s — raise if
-      curator is consistently slow) returns {status, task_id?, reason?}. Branch on `status`:
-      - `created` — the curator accepted the candidate; record `task_id`.
-      - `combined` — the curator deduped into an existing task; `task_id` points
-        at that task. Record it the same way as `created` (the candidate was
-        absorbed, not lost).
-      - `failed` — report the `reason` in your resolve_issue summary.
+""" + submit_resolve_instructions(
+    '{"source": "steward-triage", "spawn_context": "steward-triage",\n'
+    '"spawned_from": "<task_id under review>", "modules": [...]}',
+    outcome_target='resolve_issue summary',
+    step_prefix=('a', 'b'),
+    extra_submit_guidance=(
+        'Populate `spawned_from` with the id of the task that produced the escalation\n'
+        '(it is in the escalation detail under `task_id`). Use the file paths listed in\n'
+        'the group for `modules`.'
+    ),
+    caller_indent='   ',
+) + """
 2. For notable conventions among accepted items: write via `add_memory`
    with category `preferences_and_norms`.
 3. Call `resolve_issue` summarizing: N tasks created/combined, M conventions written,
@@ -555,24 +614,18 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
 
 **Raw format (fallback):** When the detail is a raw JSON array, triage each suggestion as:
 - **create_task** — Substantial improvement worth a follow-up task. Use the two-step API:
-  a. Call `submit_task`(title=..., description=..., priority=...,
-     metadata={"source": "steward-triage", "spawn_context": "steward-triage",
-     "spawned_from": "<task_id under review>", "modules": ["path/to/module", ...]},
-     project_root=...) — returns `{"ticket": "tkt_..."}` on success, or
-     `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was
-     rejected at submit time (e.g. backlog full, closed interceptor). On the
-     error shape, treat the candidate as skipped and record the error.
-     Include the code modules (directory paths relative to project root) that this task
-     will need to modify — these are used for concurrency locking. `spawned_from` lets
-     the task curator spot duplicates against the original task's details.
-  b. Call `resolve_ticket`(ticket=..., project_root=..., timeout_seconds=60) —
-     (60 s is intentionally conservative; server default is 115 s — raise if
-     curator is consistently slow) returns {status, task_id?, reason?}. Branch on `status`:
-     - `created` — the curator accepted the candidate; record `task_id`.
-     - `combined` — the curator deduped into an existing task; `task_id` points
-       at that task. Record it the same way as `created` (the candidate was
-       absorbed, not lost).
-     - `failed` — report the `reason` in your resolve_issue summary.
+""" + submit_resolve_instructions(
+    '{"source": "steward-triage", "spawn_context": "steward-triage",\n'
+    '"spawned_from": "<task_id under review>", "modules": ["path/to/module", ...]}',
+    outcome_target='resolve_issue summary',
+    step_prefix=('a', 'b'),
+    extra_submit_guidance=(
+        "Include the code modules (directory paths relative to project root) that this task\n"
+        "will need to modify — these are used for concurrency locking. `spawned_from` lets\n"
+        "the task curator spot duplicates against the original task's details."
+    ),
+    caller_indent='  ',
+) + """
 - **convention** — Pattern-level insight for future agents. Write via `add_memory`
   with category `preferences_and_norms`.
 - **dismiss** — Not actionable, already covered, or noise.
@@ -725,30 +778,23 @@ For each finding, classify and act:
 
 Use the two-step API to create tasks:
 
-1. Call `submit_task`(title=..., description=..., priority=..., metadata=...,
-   project_root=...) — returns `{"ticket": "tkt_..."}` on success, or
-   `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was rejected
-   at submit time (e.g. backlog full, closed interceptor). On the error shape,
-   treat the candidate as skipped and include the error in your review output.
-   Always include:
-   - `title`: concise description of the fix
-   - `description`: what's wrong, where, and the suggested approach
-   - `priority`: "high" for broken wiring/stubs, "medium" for consistency issues
-   - `metadata`: `{"source": "review-cycle", "spawn_context": "review",
-     "review_id": "<from your prompt>", "modules": ["path/to/module", ...]}`
-     Include the code modules (directory paths relative to project root) that this task will need to modify.
-     These are used for concurrency locking — be specific and include both source and test directories.
-     `spawn_context` tells the task curator how to treat duplicates against the existing backlog.
-   - `project_root`: use the value from your Agent Identity section
-
-2. Call `resolve_ticket`(ticket=..., project_root=..., timeout_seconds=60) —
-   (60 s is intentionally conservative; server default is 115 s — raise if
-   curator is consistently slow) returns {status, task_id?, reason?}. Branch on `status`:
-   - `created` — the curator accepted the candidate; record `task_id`.
-   - `combined` — the curator deduped into an existing task; `task_id` points at
-     that task. Record it the same way as `created` (the candidate was absorbed,
-     not lost).
-   - `failed` — report the `reason` in your review output.
+""" + submit_resolve_instructions(
+    '...',
+    outcome_target='review output',
+    step_prefix=('1', '2'),
+    extra_submit_guidance=(
+        'Always include:\n'
+        '- `title`: concise description of the fix\n'
+        '- `description`: what\'s wrong, where, and the suggested approach\n'
+        '- `priority`: "high" for broken wiring/stubs, "medium" for consistency issues\n'
+        '- `metadata`: `{"source": "review-cycle", "spawn_context": "review",\n'
+        '  "review_id": "<from your prompt>", "modules": ["path/to/module", ...]}`\n'
+        '  Include the code modules (directory paths relative to project root) that this task will need to modify.\n'
+        '  These are used for concurrency locking — be specific and include both source and test directories.\n'
+        '  `spawn_context` tells the task curator how to treat duplicates against the existing backlog.\n'
+        '- `project_root`: use the value from your Agent Identity section'
+    ),
+) + """
 
 ### Escalating ambiguous findings
 
