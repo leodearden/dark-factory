@@ -375,7 +375,10 @@ async def recent_merges(
             bounded by ``_RECENT_MERGES_HARD_CAP`` (enforced via a SQL probe)
             rather than returned without bound.  A WARNING is logged if the
             hard cap is reached.  The SQL WHERE window (``hours``) is the
-            primary bound; the hard cap is a memory-safety backstop.
+            primary bound; the hard cap is a memory-safety backstop.  When an
+            explicit ``limit`` exceeds ``_RECENT_MERGES_HARD_CAP`` it is
+            clamped to the cap and a WARNING is logged on actual truncation
+            (symmetric with the ``limit=None`` branch).
         hours: Look-back window in hours (default 168 = 7 days).  Only
             events with ``timestamp >= now - hours`` are included.
         now: Reference timestamp for the cutoff window (default:
@@ -399,7 +402,10 @@ async def recent_merges(
             "  AND timestamp >= ? "
             "ORDER BY timestamp DESC"
         )
-        if limit is None:
+        # cap_in_effect: hard-cap backstop applies when limit is None OR when
+        # an explicit limit exceeds the hard cap (so the cap is truly hard).
+        cap_in_effect = limit is None or limit > _RECENT_MERGES_HARD_CAP
+        if cap_in_effect:
             # Probe with hard_cap + 1 rows so we can distinguish "exactly
             # hard_cap rows existed" from "window exceeded hard_cap".
             probe = _RECENT_MERGES_HARD_CAP + 1
@@ -407,7 +413,7 @@ async def recent_merges(
         else:
             sql, params = base_sql + " LIMIT ?", (since, limit)
         rows = list(await conn.execute_fetchall(sql, params))
-        if limit is None and len(rows) > _RECENT_MERGES_HARD_CAP:
+        if cap_in_effect and len(rows) > _RECENT_MERGES_HARD_CAP:
             logger.warning(
                 'recent_merges: hard cap %d reached; window contained more rows '
                 'than the cap and was truncated to %d — consider adding a tighter '

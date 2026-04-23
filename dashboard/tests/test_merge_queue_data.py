@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -964,21 +965,27 @@ class TestRecentMerges:
         )
 
     @pytest.mark.asyncio
-    async def test_recent_merges_limit_none_hard_cap_truncates_and_warns(
-        self, tmp_path, monkeypatch, caplog
+    @pytest.mark.parametrize('limit_arg', [None, 8])
+    async def test_hard_cap_truncates_and_warns(
+        self, tmp_path, monkeypatch, caplog, limit_arg
     ):
-        """recent_merges(limit=None) truncates to _RECENT_MERGES_HARD_CAP rows and logs WARN.
+        """recent_merges truncates to _RECENT_MERGES_HARD_CAP and logs WARN when cap is in effect.
+
+        Covers both cap-in-effect triggers symmetrically:
+          - limit_arg=None  → the original limit=None path
+          - limit_arg=8     → explicit limit > patched hard cap (8 > 5)
 
         Patches _RECENT_MERGES_HARD_CAP to 5, inserts 10 events (all within the
         1-hour window), and asserts:
-          1. Only 5 rows are returned (truncation to the patched cap).
-          2. At least one WARNING log record contains 'hard cap' (or 'hard_cap')
-             so operators can identify the cap was hit.
+          1. Only 5 rows are returned (truncation/clamping to the patched cap).
+          2. At least one WARNING record contains 'hard cap' (or 'hard_cap').
+          3. The cap value (5) appears as a standalone token in that WARNING,
+             so the message is actionable and the assertion is digit-boundary safe.
         """
         monkeypatch.setattr(_mqmod, '_RECENT_MERGES_HARD_CAP', 5)
 
         now = datetime.now(UTC)
-        db_path = tmp_path / 'hard_cap_test.db'
+        db_path = tmp_path / f'hard_cap_limit_{limit_arg!s}.db'
 
         with contextlib.closing(sqlite3.connect(str(db_path))) as conn_sync:
             conn_sync.executescript(MERGE_EVENTS_SCHEMA)
@@ -987,8 +994,8 @@ class TestRecentMerges:
                     conn_sync,
                     event_type='merge_attempt',
                     timestamp=now - timedelta(seconds=i * 5),
-                    task_id=f'cap-task-{i:03d}',
-                    run_id=f'cap-run-{i:03d}',
+                    task_id=f'task-{i:03d}',
+                    run_id=f'run-{i:03d}',
                     data={'outcome': 'done'},
                     duration_ms=100 + i,
                 )
@@ -997,11 +1004,12 @@ class TestRecentMerges:
         async with aiosqlite.connect(str(db_path)) as db:
             db.row_factory = aiosqlite.Row
             with caplog.at_level(logging.WARNING, logger='dashboard.data.merge_queue'):
-                result = await recent_merges(db, limit=None, hours=1)
+                result = await recent_merges(db, limit=limit_arg, hours=1)
 
         assert len(result) == 5, (
-            f'Expected 5 rows (hard cap=5), got {len(result)}. '
-            'recent_merges(limit=None) must truncate to _RECENT_MERGES_HARD_CAP rows.'
+            f'Expected 5 rows (hard cap=5, limit={limit_arg!r}), got {len(result)}. '
+            'recent_merges must truncate/clamp to _RECENT_MERGES_HARD_CAP rows '
+            'whenever the cap is in effect (limit=None or limit > cap).'
         )
         warn_msgs = [
             r.getMessage() for r in caplog.records
@@ -1010,12 +1018,15 @@ class TestRecentMerges:
         assert any('hard cap' in m or 'hard_cap' in m for m in warn_msgs), (
             f'Expected a WARNING containing "hard cap" or "hard_cap", got: {warn_msgs}'
         )
-        # The row count must appear in the warning so it is actionable.
+        # The cap value (5) must appear as a whole token so the message is
+        # actionable. Use \b word-boundaries to avoid false matches on e.g. '15'
+        # or '500' that might appear in future message enrichment.
         assert any(
-            ('hard cap' in m or 'hard_cap' in m) and ('5' in m or '6' in m)
+            ('hard cap' in m or 'hard_cap' in m) and re.search(r'\b5\b', m)
             for m in warn_msgs
         ), (
-            f'Expected the row count (5 or 6) in the hard-cap WARNING, got: {warn_msgs}'
+            f'Expected the cap value (5) as a standalone token in the hard-cap '
+            f'WARNING, got: {warn_msgs}'
         )
 
 
