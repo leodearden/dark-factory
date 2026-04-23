@@ -2440,6 +2440,7 @@ class TestLoadTaskTitles:
     def test_mtime_change_invalidates_cache(self, tmp_path):
         """Bumping st_mtime_ns causes the next call to return fresh content."""
         import os
+
         from dashboard.data.merge_queue import _load_task_titles_cached, load_task_titles
 
         _load_task_titles_cached.cache_clear()
