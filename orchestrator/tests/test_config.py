@@ -108,7 +108,6 @@ class TestDefaults:
         field_info = OrchestratorConfig.model_fields['verify_cold_command_timeout_secs']
         assert field_info.default is None
 
-
 class TestYamlLoading:
     def test_load_config_raises_when_explicit_path_nonexistent(self, tmp_path: Path):
         """Explicit --config pointing at a missing file raises ConfigRequiredError."""

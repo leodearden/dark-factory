@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -195,3 +197,183 @@ class TestDismissAllPendingResilience:
             count = queue.dismiss_all_pending('Stale from prior run')
 
         assert count == 0
+
+
+class TestGetArchiveFallback:
+    """EscalationQueue.get() falls back to the archive when the root path is missing."""
+
+    def test_get_returns_archived_escalation_after_resolve(self, tmp_path: Path):
+        """After resolve(), queue.get(id) returns the escalation from the archive."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'Archive fallback works')
+
+        # File has been moved to archive — root path no longer exists
+        assert not (queue.queue_dir / 'esc-1-1.json').exists()
+
+        # get() must still return the escalation
+        result = queue.get('esc-1-1')
+        assert result is not None
+        assert result.status == 'resolved'
+        assert result.resolution == 'Archive fallback works'
+
+
+class TestGetByTaskAcrossArchive:
+    """get_by_task() two-tier scan: hot path skips archive; broad path includes it."""
+
+    def _setup_mixed_queue(self, tmp_path: Path):
+        """Return (queue, esc_a_resolved, esc_b_pending) for task '42'."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        # Escalation A: submitted and resolved (will be archived)
+        queue.submit(_make_escalation('esc-42-1', task_id='42'))
+        queue.resolve('esc-42-1', 'Fixed it')
+        # Escalation B: submitted, stays pending
+        queue.submit(_make_escalation('esc-42-2', task_id='42'))
+        return queue
+
+    def test_get_by_task_no_filter_includes_archived(self, tmp_path: Path):
+        """get_by_task(task_id) with no status filter returns pending AND archived."""
+        queue = self._setup_mixed_queue(tmp_path)
+
+        results = queue.get_by_task('42')
+
+        ids = {e.id for e in results}
+        assert 'esc-42-1' in ids  # archived / resolved
+        assert 'esc-42-2' in ids  # still pending
+
+    def test_get_by_task_status_pending_excludes_archive(self, tmp_path: Path):
+        """get_by_task(task_id, status='pending') only returns files in queue root."""
+        queue = self._setup_mixed_queue(tmp_path)
+
+        results = queue.get_by_task('42', status='pending')
+
+        ids = {e.id for e in results}
+        assert 'esc-42-2' in ids   # pending — in root
+        assert 'esc-42-1' not in ids  # resolved / archived
+
+    def test_get_pending_excludes_archive(self, tmp_path: Path):
+        """get_pending() does not scan the archive directory."""
+        queue = self._setup_mixed_queue(tmp_path)
+
+        results = queue.get_pending()
+
+        ids = {e.id for e in results}
+        assert 'esc-42-2' in ids   # pending — in root
+        assert 'esc-42-1' not in ids  # resolved / archived
+
+
+class TestResolveArchives:
+    """EscalationQueue.resolve() moves the file into archive/YYYY-MM-DD/ after resolution.
+
+    The implementation uses a two-step approach:
+      1. Atomically write the resolved JSON to queue_dir/{id}.json (tmp+rename).
+      2. Best-effort os.replace() into archive/YYYY-MM-DD/{id}.json.
+    If step 2 fails, the resolved file stays in queue_dir — still readable by
+    get() — so the resolution is never lost.  This is intentionally more robust
+    than writing directly to the archive dir: a failed archive write would leave
+    the file in queue_dir as *pending* rather than as *resolved*.
+    """
+
+    def test_resolve_moves_file_to_dated_archive_subdir(self, tmp_path: Path):
+        """After resolve(), the esc-*.json is in archive/<date>/ not the queue root."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'All good')
+
+        # (a) File no longer in queue root
+        assert not (queue.queue_dir / 'esc-1-1.json').exists()
+
+        # (b) File is in the archive under the correct date
+        # Derive expected directory from the resolved_at that was written to disk
+        archived_files = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archived_files) == 1
+        archived_path = archived_files[0]
+
+        # (c) The archived JSON parses back correctly
+        data = json.loads(archived_path.read_text())
+        assert data['status'] == 'resolved'
+        assert data['resolution'] == 'All good'
+
+        # (d) The parent directory name matches the date in resolved_at
+        resolved_at = data['resolved_at']
+        expected_date = resolved_at[:10]  # YYYY-MM-DD prefix
+        assert archived_path.parent.name == expected_date
+
+    def test_resolve_archive_failure_leaves_file_in_queue_root(
+        self, tmp_path: Path, caplog,
+    ):
+        """When the archive move (os.replace) fails, resolve() still succeeds.
+
+        Contract (the except OSError arm at queue.py:~180):
+        - resolve() returns the resolved Escalation.
+        - The file stays in queue_dir (readable by get()).
+        - A WARNING is emitted naming the escalation.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        with patch('os.replace', side_effect=OSError('cross-device link')), caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            result = queue.resolve('esc-1-1', 'Force archive failure')
+
+        # resolve() must return the updated escalation despite the OSError
+        assert result is not None
+        assert result.status == 'resolved'
+        assert result.resolution == 'Force archive failure'
+
+        # File must remain readable from queue root (archive move failed → stayed)
+        from_queue = queue.get('esc-1-1')
+        assert from_queue is not None
+        assert from_queue.status == 'resolved'
+
+        # A warning naming the escalation ID must have been logged
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('esc-1-1' in msg for msg in warning_messages), (
+            f'Expected a warning mentioning esc-1-1; got: {warning_messages}'
+        )
+
+
+class TestMakeIdAcrossArchive:
+    """make_id() must consider archived sequence numbers to avoid post-restart collisions."""
+
+    def test_make_id_does_not_collide_with_archived_after_restart(self, tmp_path: Path):
+        """After all escalations are archived and process restarts, make_id() skips used IDs.
+
+        Scenario:
+        - Submit esc-42-1 and esc-42-2 for task '42', resolve both (moves to archive).
+        - Simulate restart: create a new EscalationQueue (in-memory _seq resets to 0).
+        - make_id('42') must return 'esc-42-3', NOT 'esc-42-1' which is already in archive.
+        - Submitting that new escalation and calling get_by_task('42') returns three distinct IDs.
+        """
+        queue_dir = tmp_path / 'queue'
+
+        # First process: submit two escalations and resolve (archive) both.
+        queue = EscalationQueue(queue_dir)
+        queue.submit(_make_escalation('esc-42-1', task_id='42'))
+        queue.submit(_make_escalation('esc-42-2', task_id='42'))
+        queue.resolve('esc-42-1', 'fixed first')
+        queue.resolve('esc-42-2', 'fixed second')
+
+        # Queue root should now be empty for task 42.
+        assert not (queue_dir / 'esc-42-1.json').exists()
+        assert not (queue_dir / 'esc-42-2.json').exists()
+
+        # Simulate process restart: fresh EscalationQueue, _seq resets to 0.
+        queue2 = EscalationQueue(queue_dir)
+
+        # make_id() MUST return 'esc-42-3', not 'esc-42-1'.
+        new_id = queue2.make_id('42')
+        assert new_id == 'esc-42-3', (
+            f'Expected esc-42-3 (avoids archive collision) but got {new_id!r}'
+        )
+
+        # Submit the new escalation and verify all three are visible via get_by_task.
+        new_esc = _make_escalation(new_id, task_id='42')
+        queue2.submit(new_esc)
+
+        all_escs = queue2.get_by_task('42')
+        all_ids = {e.id for e in all_escs}
+        assert all_ids == {'esc-42-1', 'esc-42-2', 'esc-42-3'}, (
+            f'Expected three distinct IDs but got: {all_ids}'
+        )
