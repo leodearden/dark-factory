@@ -50,6 +50,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Peek window size for BacklogIterator's project_root resolution.
+# Large enough that an older event lacking `_project_root` doesn't force a
+# fallback when a later buffered event carries the key (see BacklogIterator.run).
+_PROJECT_ROOT_PEEK_LIMIT = 10
+
 
 @dataclass
 class TierConfig:
@@ -1106,7 +1111,7 @@ class BacklogIterator:
         # lacking _project_root doesn't force a fallback when a later event in
         # the buffer carries the key.  Uses the shared helper for identical
         # fallback semantics as run_full_cycle (task 927).
-        peeked_for_root = await self.buffer.peek_buffered(project_id, limit=10, before=cutoff)
+        peeked_for_root = await self.buffer.peek_buffered(project_id, limit=_PROJECT_ROOT_PEEK_LIMIT, before=cutoff)
         project_root = self.harness._resolve_project_root(peeked_for_root)
 
         assembler = ContextAssembler(
