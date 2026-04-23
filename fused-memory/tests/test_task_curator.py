@@ -1285,3 +1285,44 @@ class TestCallLlmBatchScaling:
         _, kwargs = mock.call_args
         assert kwargs['timeout_seconds'] == 540.0
         assert kwargs['max_turns'] == 10
+
+
+# ----------------------------------------------------------------------
+# TaskCurator._call_llm_batch — failure error propagation
+# ----------------------------------------------------------------------
+
+
+class TestCallLlmBatchFailure:
+    @pytest.mark.asyncio
+    async def test_raises_curator_failure_error_when_agent_result_not_success(self):
+        """Non-success AgentResult raises CuratorFailureError with batch diagnostics."""
+        from fused_memory.middleware.task_curator import CuratorFailureError
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        failed_result = AgentResult(
+            success=False,
+            output='max_turns',
+            subtype='error_max_turns',
+            turns=8,
+            timed_out=False,
+            duration_ms=120000,
+        )
+        mock = AsyncMock(return_value=failed_result)
+        candidates = [CandidateTask(title='A'), CandidateTask(title='B')]
+        with pytest.raises(CuratorFailureError) as exc_info:
+            with patch(
+                'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                new=mock,
+            ):
+                await curator._call_llm_batch(
+                    candidates,
+                    pools=[[], []],
+                    pool_sizes_list=[{}, {}],
+                    start=0.0,
+                    project_id='p',
+                    project_root='/x',
+                )
+        msg = str(exc_info.value)
+        assert 'batch_size=2' in msg
+        assert 'error_max_turns' in msg
+        assert 'configured_timeout_secs' in msg
