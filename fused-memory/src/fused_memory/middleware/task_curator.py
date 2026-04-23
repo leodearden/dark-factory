@@ -84,7 +84,7 @@ if DEFAULT_PRIORITY not in _PRIORITY_RANK:
     raise ValueError(f'{DEFAULT_PRIORITY!r} not in _PRIORITY_RANK')
 
 # JSON schema for the curator's structured output — used by invoke_with_cap_retry
-# to constrain the LLM's response.
+# to constrain the LLM's response.  See also CURATOR_BATCH_OUTPUT_SCHEMA below.
 CURATOR_OUTPUT_SCHEMA: dict[str, Any] = {
     'type': 'object',
     'required': ['action', 'justification'],
@@ -107,6 +107,42 @@ CURATOR_OUTPUT_SCHEMA: dict[str, Any] = {
                     'items': {'type': 'string'},
                 },
                 'priority': {'type': 'string'},
+            },
+        },
+    },
+}
+
+# JSON schema for the batched curator output — wraps N per-item decisions.
+# Each item mirrors the single-item shape plus candidate_index (for safe
+# reordering) and batch_target_index (for within-batch duplicates).
+_REWRITTEN_TASK_SCHEMA: dict[str, Any] = {
+    'type': ['object', 'null'],
+    'properties': {
+        'title': {'type': 'string'},
+        'description': {'type': 'string'},
+        'details': {'type': 'string'},
+        'files_to_modify': {'type': 'array', 'items': {'type': 'string'}},
+        'priority': {'type': 'string'},
+    },
+}
+CURATOR_BATCH_OUTPUT_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'required': ['decisions'],
+    'properties': {
+        'decisions': {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'required': ['candidate_index', 'action', 'justification'],
+                'properties': {
+                    'candidate_index': {'type': 'integer'},
+                    'action': {'type': 'string', 'enum': ['drop', 'combine', 'create']},
+                    'target_id': {'type': ['string', 'null']},
+                    'batch_target_index': {'type': ['integer', 'null']},
+                    'target_fingerprint': {'type': ['string', 'null']},
+                    'justification': {'type': 'string'},
+                    'rewritten_task': _REWRITTEN_TASK_SCHEMA,
+                },
             },
         },
     },
