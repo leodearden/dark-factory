@@ -107,23 +107,30 @@ class TestEscalationCapableRolesDerivation:
     """``_ESCALATION_CAPABLE_ROLES`` is derived correctly from ``ROLES``."""
 
     def test_escalation_capable_roles_derived_from_roles(self):
-        """_ESCALATION_CAPABLE_ROLES must equal the formula-derived set from ROLES.
+        """_ESCALATION_CAPABLE_ROLES must equal the concrete expected set.
 
-        Any role whose allowed_tools contains at least one tool starting with
-        'mcp__escalation__escalate' is escalation-capable, except 'steward'
-        which is excluded because it runs in its own TaskSteward dispatcher.
+        Hard-coded so any formula change, ROLES edit, or tool-list modification
+        requires a deliberate update here — a re-derived expected would be a
+        tautology that can never fail.
+
+        'steward' is excluded by the dispatcher carve-out even though it carries
+        _ESCALATION_TOOLS; every member must also be a valid ROLES entry.
         """
-        expected = frozenset(
-            name for name, role in ROLES.items()
-            if any(t.startswith('mcp__escalation__escalate') for t in (role.allowed_tools or []))
-            and name != 'steward'
-        )
+        expected = frozenset({'architect', 'implementer', 'debugger', 'merger', 'deep_reviewer'})
         missing = expected - _ESCALATION_CAPABLE_ROLES
         extra = _ESCALATION_CAPABLE_ROLES - expected
         assert expected == _ESCALATION_CAPABLE_ROLES, (
             f'_ESCALATION_CAPABLE_ROLES {_ESCALATION_CAPABLE_ROLES!r} '
-            f'!= formula-derived {expected!r}; '
+            f'!= expected {expected!r}; '
             f'missing: {missing!r}, extra: {extra!r}'
+        )
+        assert 'steward' not in _ESCALATION_CAPABLE_ROLES, (
+            "'steward' must not be in _ESCALATION_CAPABLE_ROLES (TaskSteward dispatcher carve-out)"
+        )
+        unknown = _ESCALATION_CAPABLE_ROLES - set(ROLES)
+        assert not unknown, (
+            f'All members of _ESCALATION_CAPABLE_ROLES must be valid ROLES entries; '
+            f'unknown: {unknown!r}'
         )
 
 

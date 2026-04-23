@@ -24,6 +24,7 @@ from shared.cost_store import CostStore
 from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
 from orchestrator.agents.invoke import AgentResult, invoke_agent
 from orchestrator.agents.roles import (
+    _ESCALATION_TOOLS,
     ALL_REVIEWERS,
     ARCHITECT,
     DEBUGGER,
@@ -51,7 +52,7 @@ _ORCH_PROJECT_DIR = Path(__file__).resolve().parents[2]
 # All other roles are included or excluded based on their actual allowed_tools entries in ROLES.
 _ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset(
     name for name, role in ROLES.items()
-    if any(t.startswith('mcp__escalation__escalate') for t in (role.allowed_tools or []))
+    if any(t in _ESCALATION_TOOLS for t in (role.allowed_tools or []))
     and name != 'steward'
 )
 
