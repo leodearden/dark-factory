@@ -247,10 +247,17 @@ class ModuleLockTable:
 class Scheduler:
     """Selects next eligible task and manages module locks."""
 
-    def __init__(self, config: OrchestratorConfig, event_store: EventStore | None = None):
+    def __init__(
+        self,
+        config: OrchestratorConfig,
+        event_store: EventStore | None = None,
+        *,
+        mcp_session: object | None = None,
+    ):
         self.config = config
         self.lock_table = ModuleLockTable(config)
         self.event_store = event_store
+        self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
@@ -273,6 +280,29 @@ class Scheduler:
         # fresh (no accumulated age).
         self._pending_anchor: dict[str, int] = {}
         self._was_non_pending: set[str] = set()
+
+    async def _dispatch_tool(
+        self,
+        name: str,
+        arguments: dict,
+        *,
+        timeout: float = 15,
+    ) -> dict:
+        """Route an MCP tool call through the injected session or HTTP fallback.
+
+        When ``self._mcp_session`` is set (e.g. a ``_StubMcpSession`` in eval
+        mode), the call is dispatched directly via its ``call_tool`` method.
+        Otherwise the existing ``mcp_call`` HTTP path is used unchanged so
+        production semantics, retries, and error handling are preserved.
+        """
+        if self._mcp_session is not None:
+            return await self._mcp_session.call_tool(name, arguments, timeout=timeout)  # type: ignore[union-attr]
+        return await mcp_call(
+            f'{self._memory_url}/mcp',
+            'tools/call',
+            {'name': name, 'arguments': arguments},
+            timeout=timeout,
+        )
 
     async def get_tasks(self) -> list[dict]:
         """Fetch all tasks from fused-memory/taskmaster."""
@@ -332,15 +362,7 @@ class Scheduler:
                 arguments['done_provenance'] = done_provenance
             if reopen_reason is not None:
                 arguments['reopen_reason'] = reopen_reason
-            await mcp_call(
-                f'{self._memory_url}/mcp',
-                'tools/call',
-                {
-                    'name': 'set_task_status',
-                    'arguments': arguments,
-                },
-                timeout=15,
-            )
+            await self._dispatch_tool('set_task_status', arguments, timeout=15)
         except Exception as e:
             logger.exception(
                 'Failed to set task %s status to %s: %s: %s',
