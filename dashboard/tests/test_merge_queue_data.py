@@ -1454,9 +1454,8 @@ class TestLoadTaskTitles:
         result2 = load_task_titles(tasks_path)
         assert result2 == {'1': 'Z'}
 
-    def test_missing_file_does_not_invoke_load_task_tree(self, tmp_path, monkeypatch):
+    def test_missing_file_does_not_invoke_load_task_tree(self, tmp_path, counted_load_task_tree):
         """A missing file short-circuits before touching load_task_tree or the cache."""
-        import dashboard.data.merge_queue as _mq
         from dashboard.data.merge_queue import (
             _load_task_titles_cached,
             load_task_titles,
@@ -1464,20 +1463,10 @@ class TestLoadTaskTitles:
 
         _load_task_titles_cached.cache_clear()
 
-        call_count = 0
-        original_load_task_tree = _mq.load_task_tree
-
-        def counting_load_task_tree(path):
-            nonlocal call_count
-            call_count += 1
-            return original_load_task_tree(path)
-
-        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
-
         result = load_task_titles(tmp_path / 'nope.json')
 
         assert result == {}
-        assert call_count == 0, f"load_task_tree was called {call_count} time(s); expected 0"
+        assert counted_load_task_tree.count == 0, f"load_task_tree was called {counted_load_task_tree.count} time(s); expected 0"
 
     def test_distinct_paths_cached_separately(self, tmp_path):
         """Different task files produce independent cache entries."""
