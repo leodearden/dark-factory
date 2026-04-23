@@ -218,6 +218,50 @@ class TestGetArchiveFallback:
         assert result.resolution == 'Archive fallback works'
 
 
+class TestGetByTaskAcrossArchive:
+    """get_by_task() two-tier scan: hot path skips archive; broad path includes it."""
+
+    def _setup_mixed_queue(self, tmp_path: Path):
+        """Return (queue, esc_a_resolved, esc_b_pending) for task '42'."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        # Escalation A: submitted and resolved (will be archived)
+        queue.submit(_make_escalation('esc-42-1', task_id='42'))
+        queue.resolve('esc-42-1', 'Fixed it')
+        # Escalation B: submitted, stays pending
+        queue.submit(_make_escalation('esc-42-2', task_id='42'))
+        return queue
+
+    def test_get_by_task_no_filter_includes_archived(self, tmp_path: Path):
+        """get_by_task(task_id) with no status filter returns pending AND archived."""
+        queue = self._setup_mixed_queue(tmp_path)
+
+        results = queue.get_by_task('42')
+
+        ids = {e.id for e in results}
+        assert 'esc-42-1' in ids  # archived / resolved
+        assert 'esc-42-2' in ids  # still pending
+
+    def test_get_by_task_status_pending_excludes_archive(self, tmp_path: Path):
+        """get_by_task(task_id, status='pending') only returns files in queue root."""
+        queue = self._setup_mixed_queue(tmp_path)
+
+        results = queue.get_by_task('42', status='pending')
+
+        ids = {e.id for e in results}
+        assert 'esc-42-2' in ids   # pending — in root
+        assert 'esc-42-1' not in ids  # resolved / archived
+
+    def test_get_pending_excludes_archive(self, tmp_path: Path):
+        """get_pending() does not scan the archive directory."""
+        queue = self._setup_mixed_queue(tmp_path)
+
+        results = queue.get_pending()
+
+        ids = {e.id for e in results}
+        assert 'esc-42-2' in ids   # pending — in root
+        assert 'esc-42-1' not in ids  # resolved / archived
+
+
 class TestResolveArchives:
     """EscalationQueue.resolve() moves the file into archive/YYYY-MM-DD/ after resolution."""
 
