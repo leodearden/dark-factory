@@ -37,6 +37,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Terminal statuses the server refuses to exit without a reopen_reason.
+# Duplicated from orchestrator.task_status.TERMINAL_STATUSES — the server
+# and orchestrator are independent modules, and the set is effectively
+# ossified; duplication is cheaper than cross-package coupling.
+TERMINAL_STATUSES: frozenset[str] = frozenset({'done', 'cancelled'})
+
 
 class TaskInterceptor:
     """Wraps Taskmaster operations, intercepts state transitions for targeted reconciliation."""
@@ -230,16 +236,68 @@ class TaskInterceptor:
         project_root: str,
         tag: str | None = None,
         done_provenance: dict | None = None,
+        reopen_reason: str | None = None,
     ) -> dict:
-        """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered."""
+        """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered.
+
+        ``task_id`` may be a single id (``"12"``) or a comma-separated list
+        (``"12,13,14"``). CSV input runs each id through the same gates
+        independently and returns ``{'success': bool, 'results': [...]}``;
+        single-id input returns the raw per-id result dict for backwards
+        compatibility.
+        """
         if err := await self._backlog_gate(project_root):
             return err
+        await self._ensure_taskmaster()
+
+        if ',' in task_id:
+            ids = [t.strip() for t in task_id.split(',') if t.strip()]
+            results: list[dict] = []
+            for tid in ids:
+                per_result = await self._apply_status_transition(
+                    task_id=tid,
+                    status=status,
+                    project_root=project_root,
+                    tag=tag,
+                    done_provenance=done_provenance,
+                    reopen_reason=reopen_reason,
+                )
+                results.append({'task_id': tid, 'result': per_result})
+            all_ok = all(
+                isinstance(r.get('result'), dict) and r['result'].get('error') is None
+                for r in results
+            )
+            return {'success': all_ok, 'results': results}
+
+        return await self._apply_status_transition(
+            task_id=task_id,
+            status=status,
+            project_root=project_root,
+            tag=tag,
+            done_provenance=done_provenance,
+            reopen_reason=reopen_reason,
+        )
+
+    async def _apply_status_transition(
+        self,
+        *,
+        task_id: str,
+        status: str,
+        project_root: str,
+        tag: str | None,
+        done_provenance: dict | None,
+        reopen_reason: str | None,
+    ) -> dict:
+        """Single-id status transition with all gates + event emission.
+
+        Extracted so the public ``set_task_status`` can loop over CSV ids
+        and apply the gates per-id. Holds the write lock across
+        read→check→write, emits the event outside the lock.
+        """
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
-        # WP-E: hold the per-project lock across the read + no-op check +
-        # write so two concurrent status transitions can't observe the
-        # same before-state and both mutate tasks.json.
         resolved_provenance: dict | None = None
+        resolved_reopen_reason: str | None = None
         async with self._write_lock(project_id):
             # 1. Get before-state
             before = await tm.get_task(task_id, project_root, tag)
@@ -248,6 +306,31 @@ class TaskInterceptor:
             old_status = _extract_status(before)
             if status == old_status:
                 return {'success': True, 'no_op': True, 'task_id': task_id}
+
+            # 2a. Terminal-exit gate: reject done→non-done and cancelled→non-done
+            # unless a non-empty reopen_reason is provided. Moves the terminal
+            # FSM server-side so two independent writers (scheduler + steward)
+            # can no longer race past a stale client cache.
+            if old_status in TERMINAL_STATUSES:
+                reason = (reopen_reason or '').strip()
+                if not reason:
+                    return _terminal_exit_error(task_id, old_status, status)
+                resolved_reopen_reason = reason
+                try:
+                    await tm.update_task(
+                        task_id=task_id,
+                        metadata=json.dumps({
+                            'reopen_reason': reason,
+                            'reopen_from': old_status,
+                            'reopen_at': datetime.now(UTC).isoformat(),
+                        }),
+                        project_root=project_root,
+                        tag=tag,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        'Failed to persist reopen_reason for task %s: %s', task_id, e,
+                    )
 
             # 2b. Phantom-done gate: if transitioning to done and the task
             # advertises concrete files in metadata.files, refuse when any of
@@ -293,6 +376,9 @@ class TaskInterceptor:
         }
         if resolved_provenance is not None:
             payload['done_provenance'] = resolved_provenance
+        if resolved_reopen_reason is not None:
+            payload['reopen_reason'] = resolved_reopen_reason
+            payload['reopen_from'] = old_status
         event = self._make_event(
             EventType.task_status_changed,
             project_root,
@@ -1441,6 +1527,29 @@ def _missing_files(project_root: str, declared: list[str]) -> list[str]:
     """Return the subset of ``declared`` that does not exist under ``project_root``."""
     root = Path(project_root)
     return [f for f in declared if not (root / f).exists()]
+
+
+def _terminal_exit_error(task_id: str, from_status: str, to_status: str) -> dict:
+    """Structured error returned when the terminal-exit gate trips.
+
+    Mirrors :func:`_done_gate_error` in shape so MCP callers (scheduler,
+    steward, human un-defer scripts) can handle the rejection uniformly.
+    """
+    return {
+        'success': False,
+        'error': 'terminal_exit_rejected',
+        'task_id': task_id,
+        'from_status': from_status,
+        'to_status': to_status,
+        'hint': (
+            f'Cannot transition task from {from_status!r} to {to_status!r} '
+            'without reopen_reason. Terminal statuses (done, cancelled) are '
+            'server-side frozen; pass reopen_reason="<short explanation>" to '
+            "override — e.g. 'un-defer script', 'manual re-scope', "
+            "'reconciliation: re-implementation required'. The reason is "
+            'persisted as task metadata for audit.'
+        ),
+    }
 
 
 def _done_gate_error(task_id: str, declared: list[str], missing: list[str]) -> dict:

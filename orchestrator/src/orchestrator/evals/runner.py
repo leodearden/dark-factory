@@ -509,6 +509,12 @@ class _EvalScheduler:
 
     def __init__(self, config: OrchestratorConfig):
         self.config = config
+        # NOTE: duplicates the production Scheduler status cache that was
+        # removed when terminal-state enforcement moved server-side (see the
+        # feat(task-interceptor) commit that added _terminal_exit_error).
+        # Kept so the eval harness still runs without rewiring. See deferred
+        # task "Unify scheduler/evals-runner status tracking" for the
+        # long-term cleanup.
         self._status_cache: dict[str, str] = {}
 
     async def get_tasks(self):
@@ -520,10 +526,19 @@ class _EvalScheduler:
         status: str,
         *,
         done_provenance: dict | None = None,
+        reopen_reason: str | None = None,
     ) -> None:
-        log_extra = f' (provenance={done_provenance!r})' if done_provenance is not None else ''
+        extras = []
+        if done_provenance is not None:
+            extras.append(f'provenance={done_provenance!r}')
+        if reopen_reason is not None:
+            extras.append(f'reopen_reason={reopen_reason!r}')
+        log_extra = f' ({", ".join(extras)})' if extras else ''
         logger.info(f'[eval] Task {task_id} → {status}{log_extra}')
         self._set_cached_status(task_id, status)
+
+    async def get_status(self, task_id: str) -> str | None:
+        return self._status_cache.get(task_id)
 
     def get_cached_status(self, task_id: str) -> str | None:
         return self._status_cache.get(task_id)

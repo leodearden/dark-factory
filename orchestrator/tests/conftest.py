@@ -3,7 +3,6 @@ import asyncio
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Protocol
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,50 +25,6 @@ from shared.usage_gate import AccountState, UsageGate  # noqa: E402
 # system-wide FIFO (pytest-jobserver.service).  No-op when PYTEST_JOBSERVER_FIFO
 # is unset or the FIFO is absent.
 pytest_plugins = ('shared.pytest_jobserver',)
-
-
-class _SupportsSetCachedStatus(Protocol):
-    """Structural type for objects that expose the _set_cached_status chokepoint."""
-
-    def _set_cached_status(self, task_id: str, status: str) -> None: ...
-
-
-def _spy_set_cached_status(obj: _SupportsSetCachedStatus) -> list[tuple[str, str]]:
-    """Install a recording spy on obj._set_cached_status and return the capture list.
-
-    The helper installs an instance-level rebind on ``obj`` that intercepts every
-    call to ``_set_cached_status``, appends ``(task_id, status)`` to a shared list,
-    and then forwards the call to the original method.  Python's attribute lookup
-    finds the instance attribute before the class method, so production code that
-    calls ``self._set_cached_status(...)`` transparently routes through the recorder.
-
-    This is used to verify the ``_set_cached_status`` write-side chokepoint
-    invariant: production code must route all status-cache writes through
-    ``_set_cached_status()`` rather than writing to ``_status_cache`` directly.
-
-    Parameters
-    ----------
-    obj:
-        Any object satisfying ``_SupportsSetCachedStatus`` — i.e. it has a
-        ``_set_cached_status(self, task_id: str, status: str) -> None`` method.
-        Both ``orchestrator.scheduler.Scheduler`` and
-        ``orchestrator.evals.runner._EvalScheduler`` qualify.
-
-    Returns
-    -------
-    list[tuple[str, str]]
-        The shared capture list.  Initially empty; each ``_set_cached_status``
-        call appends ``(task_id, status)`` to it.
-    """
-    recorded: list[tuple[str, str]] = []
-    original = obj._set_cached_status
-
-    def recorder(task_id: str, status: str) -> None:
-        recorded.append((task_id, status))
-        original(task_id, status)
-
-    obj._set_cached_status = recorder  # type: ignore[method-assign]
-    return recorded
 
 
 def build_usage_gate(
