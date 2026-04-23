@@ -37,6 +37,13 @@ follow the `timeout` policy below (retry `resolve_ticket` first) before
 escalating further.  Only declare the submission terminal once the appropriate
 per-reason retry path has been exhausted.
 
+**Total-submission cap:** at most **two** `submit_task` calls per logical work
+item, regardless of which failure reason triggers the retry.  The full allowed
+budget across both reasons is: 1 initial submit + optional 1 `resolve_ticket`
+retry (under `timeout`) + optional 1 re-submit (under `server_restart`, or
+under `timeout` when its retry returns `unknown_ticket` / `expired`).  After
+the second submit, any further failure is terminal — do not submit a third time.
+
 **Dedup caveat:** if the caller does not supply `(escalation_id,
 suggestion_hash)` in the `submit_task` metadata, the R4 idempotency gate
 (see §R4 below) does not fire on retry.  The curator may still merge the
@@ -79,8 +86,8 @@ Each caller file documents what "caller-specific handling" means in its context
 
 ## R4 idempotency gate
 
-`task_interceptor._check_escalation_idempotency` (implementation:
-`fused-memory/src/fused_memory/middleware/task_interceptor.py:1154`) short-circuits
+`task_interceptor._check_escalation_idempotency` (in
+`fused-memory/src/fused_memory/middleware/task_interceptor.py`) short-circuits
 a `submit_task` call and returns the existing task id when the same
 `(escalation_id, suggestion_hash)` pair has already been processed.  This is
 the **R4 gate**.
@@ -89,8 +96,7 @@ the **R4 gate**.
 - Both `escalation_id` and `suggestion_hash` must be **non-empty strings** in
   the `submit_task` metadata.
 - The pair must match a previously recorded entry in the interceptor's match
-  loop (see `task_interceptor.py:1184-1208`, inside
-  `_check_escalation_idempotency`).
+  loop inside `_check_escalation_idempotency`.
 
 Callers that naturally carry an escalation id (e.g. escalation-watcher when
 processing suggestions) get R4 for free.  Callers that do not (PRD
@@ -105,6 +111,11 @@ Callers that don't natively supply both `escalation_id` and `suggestion_hash`
 can opt into the R4 gate by deriving a **stable, content-addressed** value from
 their submission payload.  The right approach depends on what the caller already
 has at hand.
+
+**Type requirement:** both `escalation_id` and `suggestion_hash` must be
+non-empty `str` values — R4 silently no-ops if either is non-string (the
+interceptor's `_check_escalation_idempotency` uses an `isinstance(..., str)`
+check).  Coerce numeric ids via `str()` before placing them in metadata.
 
 ### Case A — caller has a native `escalation_id`, needs to synthesize `suggestion_hash` only
 

@@ -386,6 +386,11 @@ Technical debt or cleanup discovered during development.
   2. Keep `"spawn_context": "steward-triage"` — unchanged from §2; both sites feed the same steward pipeline.
   3. For the `suggestion_hash` / `escalation_id` synthesis recipe and R4 gate details, see
      [`skills/_shared/ticket-failure-handling.md`](../_shared/ticket-failure-handling.md).
+     At this callsite (Case A — the escalation's id is already in scope), the concrete
+     synthesis is:
+     ```python
+     suggestion_hash = hashlib.sha256(escalation.detail.encode()).hexdigest()[:16]
+     ```
 
   Resolve via `mcp__escalation__resolve_issue` once the ticket resolves.
 - **Blocking** (rare): spawn an interactive `/unblock` session (see `task_failure` for invocation pattern).
