@@ -8,8 +8,12 @@ Covers two scopes:
 from __future__ import annotations
 
 import textwrap
+from pathlib import Path
+from unittest.mock import MagicMock
 
 from orchestrator.agents.roles import DEEP_REVIEWER, STEWARD, _submit_resolve_instructions
+from orchestrator.review_checkpoint import ReviewCheckpoint
+from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
 # Helper contract tests
@@ -146,3 +150,51 @@ class TestAllowlists:
 
     def test_deep_reviewer_does_not_have_add_task(self):
         assert 'mcp__fused-memory__add_task' not in DEEP_REVIEWER.allowed_tools
+
+
+# ---------------------------------------------------------------------------
+# Site-wiring test: ReviewCheckpoint._build_prompt (site 4)
+# ---------------------------------------------------------------------------
+
+
+def _make_review_checkpoint() -> ReviewCheckpoint:
+    """Construct a minimal ReviewCheckpoint with mocked config for site-4 tests."""
+    config = MagicMock()
+    config.project_root = Path('/tmp/pr')
+    config.fused_memory.project_id = 'test-proj'
+    config.escalation.host = 'localhost'
+    config.escalation.port = 9999
+
+    mcp = MagicMock()
+    mcp.mcp_config_json.return_value = {'mcpServers': {}}
+
+    return ReviewCheckpoint(config, mcp=mcp, usage_gate=None)
+
+
+_PHASE1_RESULT = VerifyResult(
+    passed=True, summary='OK', test_output='', lint_output='', type_output=''
+)
+
+
+class TestReviewCheckpointSite:
+    """ReviewCheckpoint._build_prompt must emit the shared helper-rendered block for site 4."""
+
+    def test_review_checkpoint_site_uses_helper(self):
+        cp = _make_review_checkpoint()
+        prompt = cp._build_prompt(
+            mode='focused',
+            phase1=_PHASE1_RESULT,
+            modules=['orchestrator'],
+            briefing_content='',
+            review_id='REV-TEST',
+        )
+        expected = textwrap.indent(
+            _submit_resolve_instructions(
+                '{"source": "review-cycle", "review_id": "REV-TEST", "modules": ["path/to/module", ...]}',
+                outcome_target='finding description',
+                project_root_expr='"/tmp/pr"',
+                step_prefix=('1', '2'),
+            ),
+            '     ',
+        )
+        assert expected in prompt
