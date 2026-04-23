@@ -31,6 +31,7 @@ from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsoli
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
+    _format_flagged,
     _select_proactive_sample,
 )
 from fused_memory.reconciliation.task_filter import (
@@ -2589,3 +2590,34 @@ class TestRunStageCapHandling:
                 config=config,
                 mcp_config={'mcpServers': {}},
             )
+
+
+# ---------------------------------------------------------------------------
+# _format_flagged: no-silent-truncation tests (step-1)
+# ---------------------------------------------------------------------------
+
+
+class TestFormatFlaggedNoSilentTruncation:
+    """_format_flagged renders all items — no silent [:50] truncation."""
+
+    def test_all_100_items_present_in_text(self):
+        """100 items must all appear in the rendered text — no [:50] cap."""
+        items = [{'description': f'item-{i}', 'severity': 'minor'} for i in range(100)]
+        text = _format_flagged(items)
+        for i in range(100):
+            assert f'item-{i}' in text, (
+                f'Expected item-{i} description in rendered text; got:\n{text[:500]}...'
+            )
+
+    def test_no_truncation_footer_when_all_items_rendered(self):
+        """When all 100 items render, there must be no '... and N more' footer line."""
+        items = [{'description': f'item-{i}', 'severity': 'minor'} for i in range(100)]
+        text = _format_flagged(items)
+        assert '... and ' not in text, (
+            f'Unexpected truncation footer found in rendered text; got:\n{text[:500]}...'
+        )
+
+    def test_empty_list_returns_no_flagged_items(self):
+        """Empty list must return the sentinel string."""
+        result = _format_flagged([])
+        assert result == 'No flagged items.'
