@@ -72,7 +72,7 @@ Once you've identified `TARGET_PROJECT` and `TARGET_CONFIG`, every command and M
 | Where | Use |
 |-------|-----|
 | Launch / status command | `cd /home/leo/src/dark-factory` (binary lives there) **and** `--config "$TARGET_CONFIG"` |
-| `project_root="..."` in fused-memory MCP calls (`get_tasks`, `add_task`, `set_task_status`, `add_dependency`, `update_task`, etc.) | `"$TARGET_PROJECT"` |
+| `project_root="..."` in fused-memory MCP calls (`get_tasks`, `submit_task`, `resolve_ticket`, `set_task_status`, `add_dependency`, `update_task`, etc.) | `"$TARGET_PROJECT"` |
 | Worktree inspection paths | `"$TARGET_PROJECT"/.worktrees/<task-id>` |
 | `project_id` in `add_memory` writes | the `project_id` from `TARGET_CONFIG` (e.g. `"reify"`, `"dark_factory"`, `"autopilot_video"`) |
 | Manual git merge target | `"$TARGET_PROJECT"` (the target's `main` branch, not dark-factory's) |
@@ -97,7 +97,7 @@ The user will be in one of these situations. Read the request and jump to the ma
 
 ## Decompose PRD
 
-This is the critical step. You decompose the PRD into tasks interactively, using full codebase context, then write them to Taskmaster via `add_task`. Do not use taskmaster's `parse_prd` — it lacks the context to do this well.
+This is the critical step. You decompose the PRD into tasks interactively, using full codebase context, then write them to Taskmaster via `submit_task` + `resolve_ticket`. Do not use taskmaster's `parse_prd` — it lacks the context to do this well.
 
 ### 1. Read the PRD and the codebase
 
@@ -141,14 +141,36 @@ Iterate until the user is satisfied.
 
 Use the `TARGET_PROJECT` you captured at the top of the session as `project_root`. (`.taskmaster/tasks/tasks.json` lives under that directory.) **Never** hardcode `/home/leo/src/dark-factory` here unless the user is actually in dark-factory.
 
-Write each task via fused-memory MCP tools:
+Write each task via fused-memory MCP tools using the two-phase pattern:
+
+> **Note:** The `add_task` facade is deprecated and will be removed — always use the two-phase pattern shown below.
 
 ```
-add_task(
-  title="<title>",
-  description="<detailed description>",
-  project_root="$TARGET_PROJECT"
+# Phase 1: submit — returns immediately with a ticket id
+submit_result = submit_task(
+    title="<title>",
+    description="<detailed description>",
+    project_root="$TARGET_PROJECT",
+    priority="<medium|high>",
+    metadata={
+        "source": "prd-decomposition",
+        "spawn_context": "parse_prd",
+        "modules": ["<path/to/module>"],
+    },
 )
+ticket = submit_result["ticket"]
+
+# Phase 2: block until the curator decides (default 115 s)
+# "combined" is a normal outcome when PRD decomposition re-covers ground already in the task tree
+resolve = resolve_ticket(ticket=ticket, project_root="$TARGET_PROJECT")
+
+if resolve["status"] == "created":
+    task_id = resolve["task_id"]           # new task
+elif resolve["status"] == "combined":
+    task_id = resolve["task_id"]           # merged into existing task — normal, not an error
+elif resolve["status"] == "failed":
+    # reason: timeout | server_restart | server_closed | unknown_ticket | ...
+    handle_failure(resolve["reason"])
 ```
 
 Then set dependencies:
@@ -396,7 +418,7 @@ get_tasks(project_root="$TARGET_PROJECT")
 Review the task tree to understand the current state. **Do not change the status of existing tasks** — they may have been set by the user or another session. If a task's status looks wrong, ask the user before changing it.
 
 You may:
-- **Add missing tasks** (e.g., integration/e2e) → `add_task(...)` and wire dependencies
+- **Add missing tasks** (e.g., integration/e2e) → `submit_task(...)` + `resolve_ticket(...)` and wire dependencies
 - **Fix wrong dependencies** → `remove_dependency` / `add_dependency`
 
 ### 2. Execute
