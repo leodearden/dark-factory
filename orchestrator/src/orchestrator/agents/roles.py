@@ -602,24 +602,17 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
 
 **Raw format (fallback):** When the detail is a raw JSON array, triage each suggestion as:
 - **create_task** — Substantial improvement worth a follow-up task. Use the two-step API:
-  a. Call `submit_task`(title=..., description=..., priority=...,
-     metadata={"source": "steward-triage", "spawn_context": "steward-triage",
-     "spawned_from": "<task_id under review>", "modules": ["path/to/module", ...]},
-     project_root=...) — returns `{"ticket": "tkt_..."}` on success, or
-     `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was
-     rejected at submit time (e.g. backlog full, closed interceptor). On the
-     error shape, treat the candidate as skipped and record the error.
-     Include the code modules (directory paths relative to project root) that this task
-     will need to modify — these are used for concurrency locking. `spawned_from` lets
-     the task curator spot duplicates against the original task's details.
-  b. Call `resolve_ticket`(ticket=..., project_root=..., timeout_seconds=60) —
-     (60 s is intentionally conservative; server default is 115 s — raise if
-     curator is consistently slow) returns {status, task_id?, reason?}. Branch on `status`:
-     - `created` — the curator accepted the candidate; record `task_id`.
-     - `combined` — the curator deduped into an existing task; `task_id` points
-       at that task. Record it the same way as `created` (the candidate was
-       absorbed, not lost).
-     - `failed` — report the `reason` in your resolve_issue summary.
+""" + textwrap.indent(_submit_resolve_instructions(
+    '{"source": "steward-triage", "spawn_context": "steward-triage",\n'
+    '"spawned_from": "<task_id under review>", "modules": ["path/to/module", ...]}',
+    outcome_target='resolve_issue summary',
+    step_prefix=('a', 'b'),
+    extra_submit_guidance=(
+        "Include the code modules (directory paths relative to project root) that this task\n"
+        "will need to modify — these are used for concurrency locking. `spawned_from` lets\n"
+        "the task curator spot duplicates against the original task's details."
+    ),
+), '  ') + """
 - **convention** — Pattern-level insight for future agents. Write via `add_memory`
   with category `preferences_and_norms`.
 - **dismiss** — Not actionable, already covered, or noise.
@@ -772,30 +765,23 @@ For each finding, classify and act:
 
 Use the two-step API to create tasks:
 
-1. Call `submit_task`(title=..., description=..., priority=..., metadata=...,
-   project_root=...) — returns `{"ticket": "tkt_..."}` on success, or
-   `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was rejected
-   at submit time (e.g. backlog full, closed interceptor). On the error shape,
-   treat the candidate as skipped and include the error in your review output.
-   Always include:
-   - `title`: concise description of the fix
-   - `description`: what's wrong, where, and the suggested approach
-   - `priority`: "high" for broken wiring/stubs, "medium" for consistency issues
-   - `metadata`: `{"source": "review-cycle", "spawn_context": "review",
-     "review_id": "<from your prompt>", "modules": ["path/to/module", ...]}`
-     Include the code modules (directory paths relative to project root) that this task will need to modify.
-     These are used for concurrency locking — be specific and include both source and test directories.
-     `spawn_context` tells the task curator how to treat duplicates against the existing backlog.
-   - `project_root`: use the value from your Agent Identity section
-
-2. Call `resolve_ticket`(ticket=..., project_root=..., timeout_seconds=60) —
-   (60 s is intentionally conservative; server default is 115 s — raise if
-   curator is consistently slow) returns {status, task_id?, reason?}. Branch on `status`:
-   - `created` — the curator accepted the candidate; record `task_id`.
-   - `combined` — the curator deduped into an existing task; `task_id` points at
-     that task. Record it the same way as `created` (the candidate was absorbed,
-     not lost).
-   - `failed` — report the `reason` in your review output.
+""" + _submit_resolve_instructions(
+    '...',
+    outcome_target='review output',
+    step_prefix=('1', '2'),
+    extra_submit_guidance=(
+        'Always include:\n'
+        '- `title`: concise description of the fix\n'
+        '- `description`: what\'s wrong, where, and the suggested approach\n'
+        '- `priority`: "high" for broken wiring/stubs, "medium" for consistency issues\n'
+        '- `metadata`: `{"source": "review-cycle", "spawn_context": "review",\n'
+        '  "review_id": "<from your prompt>", "modules": ["path/to/module", ...]}`\n'
+        '  Include the code modules (directory paths relative to project root) that this task will need to modify.\n'
+        '  These are used for concurrency locking — be specific and include both source and test directories.\n'
+        '  `spawn_context` tells the task curator how to treat duplicates against the existing backlog.\n'
+        '- `project_root`: use the value from your Agent Identity section'
+    ),
+) + """
 
 ### Escalating ambiguous findings
 
