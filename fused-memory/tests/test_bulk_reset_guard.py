@@ -123,3 +123,67 @@ async def test_observe_attempt_rejects_at_threshold_within_window(tmp_path):
     # All four task IDs should be in affected_task_ids
     assert set(v4.affected_task_ids) == set(task_ids)
     assert len(v4.triggering_timestamps) == 4
+
+
+# ---------------------------------------------------------------------------
+# step-7: non-reversal transitions do not consume window slots
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_observe_attempt_ignores_non_reversal_transitions(tmp_path):
+    """Non-reversal transitions never count; reversals still trip at threshold."""
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    non_reversals = [
+        ('pending', 'in-progress'),
+        ('in-progress', 'done'),
+        ('blocked', 'pending'),
+        ('pending', 'done'),
+        ('done', 'blocked'),
+    ]
+    for old, new in non_reversals:
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='proj-a',
+            task_id=f'{old}->{new}',
+            old_status=old,
+            new_status=new,
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'{old}→{new}: expected ok, got {v.outcome}'
+
+    # Now fire three reversal attempts — should all be ok (threshold=3 allows 3)
+    for i in range(3):
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='proj-a',
+            task_id=f'rev-{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'reversal {i}: expected ok, got {v.outcome}'
+
+    # Fourth reversal should trip (non-reversals did not consume window slots)
+    clock[0] += 1.0
+    v4 = await guard.observe_attempt(
+        project_id='proj-a',
+        task_id='rev-3',
+        old_status='in-progress',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert v4.is_rejection is True, (
+        f'Expected rejection on 4th reversal, got {v4.outcome}'
+    )
