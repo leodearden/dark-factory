@@ -109,6 +109,30 @@ async def empty_merge_events_conn(empty_merge_events_db):
         yield conn
 
 
+@pytest.fixture()
+def counted_load_task_tree(monkeypatch):
+    """Patches dashboard.data.merge_queue.load_task_tree with a counting wrapper.
+
+    Yields an object with a ``count`` attribute that increments on every call
+    to the patched function. The original is restored automatically via
+    ``monkeypatch`` teardown.
+    """
+    import dashboard.data.merge_queue as _mq
+
+    class _Counter:
+        count = 0
+
+    counter = _Counter()
+    original = _mq.load_task_tree
+
+    def _counting(path):
+        counter.count += 1
+        return original(path)
+
+    monkeypatch.setattr(_mq, 'load_task_tree', _counting)
+    return counter
+
+
 # ---------------------------------------------------------------------------
 # Imports under test (deferred so the test file fails gracefully before impl)
 # ---------------------------------------------------------------------------
