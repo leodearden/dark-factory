@@ -1175,6 +1175,16 @@ class TaskInterceptor:
 
         Cleanup is centralised in a single ``finally`` block that removes just
         *this* event from the list (leaving other waiters' events untouched).
+
+        Shutdown race
+        -------------
+        ``close()`` signals all pending ticket events then calls
+        ``TicketStore.close()``.  Between the signal and the store close the
+        event loop may schedule woken waiters, which then call
+        ``_ticket_store.get()`` on a closed store; ``_require_db()`` raises
+        ``RuntimeError`` in that window.  Both ``get()`` call-sites are wrapped
+        in ``try/except RuntimeError`` so callers always receive the
+        ``server_closed`` sentinel rather than a bare exception.
         """
         if self._ticket_store is None:
             return (
@@ -1186,8 +1196,17 @@ class TaskInterceptor:
         event = asyncio.Event()
         self._ticket_events.setdefault(ticket, []).append(event)
         try:
-            # (2) Read the ticket row.
-            row = await self._ticket_store.get(ticket)
+            # (2) Read the ticket row.  Wrap in try/except RuntimeError so a
+            # store that was closed concurrently returns the server_closed
+            # sentinel rather than propagating the exception.
+            try:
+                row = await self._ticket_store.get(ticket)
+            except RuntimeError as exc:
+                logger.debug(
+                    'resolve_ticket: ticket_store closed during initial read for %s: %s',
+                    ticket, exc,
+                )
+                return ({'status': 'failed', 'reason': 'server_closed', 'task_id': None}, None)
             if row is None:
                 return ({'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None}, None)
 
@@ -1205,8 +1224,17 @@ class TaskInterceptor:
             except TimeoutError:
                 return ({'status': 'failed', 'reason': 'timeout', 'task_id': None}, None)
 
-            # (5) Re-load the (hopefully) now-terminal row.
-            row = await self._ticket_store.get(ticket)
+            # (5) Re-load the (hopefully) now-terminal row.  Same RuntimeError
+            # guard: close() may have run between the event signal and this
+            # re-read (the shutdown race flagged by reviewer_comprehensive).
+            try:
+                row = await self._ticket_store.get(ticket)
+            except RuntimeError as exc:
+                logger.debug(
+                    'resolve_ticket: ticket_store closed during post_wake read for %s: %s',
+                    ticket, exc,
+                )
+                return ({'status': 'failed', 'reason': 'server_closed', 'task_id': None}, None)
             if row is None:
                 return ({'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None}, None)
             # Guard: if the row is still 'pending' after the event was set, the

@@ -1111,3 +1111,114 @@ async def test_per_project_ticket_queues_do_not_serialise(
             await asyncio.gather(*tasks, return_exceptions=True)
         if ti._ticket_store is not None:
             await ti._ticket_store.close()
+
+
+# ---------------------------------------------------------------------------
+# step-69: shutdown race — store closes between event signal and re-read
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_ticket_returns_server_closed_when_store_closes_post_wake(
+    interceptor_with_store,
+    ticket_store,
+):
+    """Regression: if TicketStore.close() runs between the event signal and the
+    post-wake re-read, resolve_ticket must return
+    ``{'status': 'failed', 'reason': 'server_closed', 'task_id': None}``
+    instead of raising RuntimeError.
+
+    Scenario
+    --------
+    1. Submit a pending ticket directly via ticket_store.submit().
+    2. Monkeypatch ``ticket_store.get`` with a ``racing_get`` that:
+       - Call 1: returns the real pending row.
+       - Call 2 (post-wake re-read): raises RuntimeError, as would happen if
+         ``TicketStore.close()`` set ``_db = None`` between the signal and the
+         re-read.
+    3. Schedule ``interceptor._signal_ticket_event(ticket_id)`` to fire after a
+       short delay so the resolve_ticket waiter wakes and enters the re-read
+       path.
+    4. Assert ``resolve_ticket`` returns the ``server_closed`` sentinel.
+
+    Under the OLD code the RuntimeError propagates out of ``_resolve_ticket_raw``
+    and ``asyncio.wait_for`` raises it instead of returning the sentinel.
+    Under the FIXED code a ``try/except RuntimeError`` at the re-read site
+    catches it and returns ``server_closed``.
+    """
+    ti = interceptor_with_store
+
+    # Create a pending ticket directly so no worker is involved
+    ticket_id = await ticket_store.submit(
+        project_id='test_project_shutdown',
+        candidate_json='{"title": "ShutdownRaceTask"}',
+        ttl_seconds=600,
+    )
+
+    # Monkeypatch get: call 1 → pending row, call 2 → RuntimeError
+    real_get = ticket_store.get
+    call_count = 0
+
+    async def racing_get(tid: str):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return await real_get(tid)  # returns the real pending row
+        raise RuntimeError('TicketStore not initialized — call initialize() first')
+
+    ticket_store.get = racing_get
+
+    # Schedule the wakeup signal to fire after resolve_ticket has entered event.wait()
+    async def signal_after_delay() -> None:
+        await asyncio.sleep(0.05)
+        ti._signal_ticket_event(ticket_id)
+
+    asyncio.create_task(signal_after_delay(), name='test-signal-shutdown-race')
+
+    # Act: resolve_ticket should catch the RuntimeError from the post-wake read
+    result = await asyncio.wait_for(
+        ti.resolve_ticket(ticket_id, '/p', timeout_seconds=None),
+        timeout=2.0,
+    )
+
+    # Assert: server_closed sentinel returned, not a bare RuntimeError
+    assert result == {'status': 'failed', 'reason': 'server_closed', 'task_id': None}, (
+        f'Expected server_closed sentinel, got: {result!r}'
+    )
+    assert call_count == 2, (
+        f'Expected exactly 2 ticket_store.get() calls, got {call_count}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_ticket_returns_server_closed_when_store_closed_before_initial_read(
+    interceptor_with_store,
+    ticket_store,
+):
+    """Regression: if TicketStore.close() has already run when resolve_ticket
+    makes its initial ``ticket_store.get()`` call, the RuntimeError from
+    ``_require_db()`` must be caught and the server_closed sentinel returned —
+    not a bare RuntimeError escaping the coroutine.
+
+    Complements ``test_resolve_ticket_returns_server_closed_when_store_closes_post_wake``
+    by covering the *initial*-read call-site rather than the post-wake one.
+    """
+    ti = interceptor_with_store
+
+    # Monkeypatch get: always raises RuntimeError (every call, including the first)
+    async def always_raises(tid: str) -> dict:  # type: ignore[return]
+        raise RuntimeError('TicketStore not initialized — call initialize() first')
+
+    ticket_store.get = always_raises
+
+    # Use a syntactically valid ticket ID; the store raises before any DB access
+    fake_ticket_id = 'tkt_CLOSEDSTOREBEFOREREAD0000'
+
+    result = await asyncio.wait_for(
+        ti.resolve_ticket(fake_ticket_id, '/p', timeout_seconds=None),
+        timeout=2.0,
+    )
+
+    assert result == {'status': 'failed', 'reason': 'server_closed', 'task_id': None}, (
+        f'Expected server_closed sentinel from initial-read path, got: {result!r}'
+    )
