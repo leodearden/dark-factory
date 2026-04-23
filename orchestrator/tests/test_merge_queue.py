@@ -3619,3 +3619,82 @@ class TestMergeWorkerCasRetryEmitsMergeQueued:
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestWorkflowSubmitUsesEnqueueHelper — step-11 test
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowSubmitUsesEnqueueHelper:
+    """_submit_to_merge_queue delegates to enqueue_merge_request instead of put() directly."""
+
+    @pytest.mark.asyncio
+    async def test_submit_to_merge_queue_calls_enqueue_helper(self, tmp_path: Path):
+        """_submit_to_merge_queue calls enqueue_merge_request with (queue, req, event_store).
+
+        Before step-12 impl, the function calls self.merge_queue.put() directly and
+        never calls enqueue_merge_request — so mock_helper.assert_called_once() fails.
+        After step-12, the function calls enqueue_merge_request — assertion passes.
+        """
+        from orchestrator.merge_queue import MergeOutcome, MergeRequest
+        from orchestrator.workflow import TaskWorkflow
+
+        # Minimal assignment mock (mirrors test_workflow_escalation_warning pattern)
+        assignment = MagicMock()
+        assignment.task_id = '42'
+        assignment.task = {'id': '42', 'title': 'T', 'description': 'desc'}
+        assignment.modules = []
+
+        wf_config = MagicMock()
+        wf_config.fused_memory.project_id = 'test'
+        wf_config.fused_memory.url = 'http://localhost'
+        wf_config.max_review_cycles = 2
+        wf_config.max_amendment_rounds = 1
+        wf_config.lock_depth = 2
+        wf_config.steward_completion_timeout = 300.0
+
+        workflow = TaskWorkflow(
+            assignment=assignment,
+            config=wf_config,
+            git_ops=MagicMock(),
+            scheduler=MagicMock(),
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+        )
+
+        # Wire required attributes
+        merge_queue_mock: AsyncMock = AsyncMock()
+        event_store_mock = MagicMock()
+        workflow.merge_queue = merge_queue_mock
+        workflow.event_store = event_store_mock
+        workflow.worktree = tmp_path / 'wt'
+        workflow.worktree.mkdir()
+
+        # Before step-12: merge_queue.put() is called directly → resolve future
+        # so _submit_to_merge_queue doesn't hang.
+        async def _put_resolves_future(req):
+            if isinstance(req, MergeRequest) and not req.result.done():
+                req.result.set_result(MergeOutcome('done'))
+
+        merge_queue_mock.put.side_effect = _put_resolves_future
+
+        # After step-12: enqueue_merge_request is called → resolve future via mock.
+        async def _mock_enqueue(queue, req, es):
+            if not req.result.done():
+                req.result.set_result(MergeOutcome('done'))
+
+        mock_helper = AsyncMock(side_effect=_mock_enqueue)
+
+        # Patch the source module so both local and module-level imports get the mock.
+        with patch('orchestrator.merge_queue.enqueue_merge_request', mock_helper):
+            await workflow._submit_to_merge_queue('task/42')
+
+        # KEY: enqueue_merge_request must have been called exactly once
+        mock_helper.assert_called_once()
+        call_queue, call_req, call_es = mock_helper.call_args.args
+        assert call_queue is merge_queue_mock
+        assert isinstance(call_req, MergeRequest)
+        assert call_req.task_id == '42'
+        assert call_req.branch == 'task/42'
+        assert call_es is event_store_mock
