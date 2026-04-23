@@ -15,7 +15,7 @@ import pytest
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, ROLES
-from orchestrator.workflow import TaskWorkflow, _ESCALATION_CAPABLE_ROLES
+from orchestrator.workflow import _ESCALATION_CAPABLE_ROLES, TaskWorkflow
 
 
 def _make_workflow(*, escalation_queue=None) -> TaskWorkflow:
@@ -120,7 +120,7 @@ class TestEscalationCapableRolesDerivation:
         )
         missing = expected - _ESCALATION_CAPABLE_ROLES
         extra = _ESCALATION_CAPABLE_ROLES - expected
-        assert _ESCALATION_CAPABLE_ROLES == expected, (
+        assert expected == _ESCALATION_CAPABLE_ROLES, (
             f'_ESCALATION_CAPABLE_ROLES {_ESCALATION_CAPABLE_ROLES!r} '
             f'!= formula-derived {expected!r}; '
             f'missing: {missing!r}, extra: {extra!r}'
