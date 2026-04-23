@@ -1469,3 +1469,63 @@ class TestProcessAddTicketsBatch:
 
         # Only one tm.add_task call (t2 is a within-batch drop)
         assert taskmaster.add_task.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_per_ticket_dispatch_failure_is_isolated(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """A dispatch error on one ticket must not prevent the others from resolving."""
+        t1 = await ticket_store.submit('project', self._make_candidate_json('Task A'))
+        t2 = await ticket_store.submit('project', self._make_candidate_json('Task B'))
+        t3 = await ticket_store.submit('project', self._make_candidate_json('Task C'))
+
+        mock_curator = MagicMock()
+        mock_curator.curate_batch = AsyncMock(return_value=[
+            CuratorDecision(action='create', justification='new a'),
+            CuratorDecision(action='create', justification='new b'),
+            CuratorDecision(action='create', justification='new c'),
+        ])
+        mock_curator.note_created = MagicMock()
+        mock_curator.record_task = AsyncMock()
+
+        # Distinct task_ids for t1 and t3; t2 will raise before add_task is called.
+        taskmaster.add_task = AsyncMock(side_effect=[
+            {'id': '11', 'title': 'Task A'},
+            {'id': '33', 'title': 'Task C'},
+        ])
+
+        # Patch _dispatch_ticket_decision to raise on the second ticket (t2).
+        original_dispatch = interceptor_with_store._dispatch_ticket_decision
+        call_count = {'n': 0}
+
+        async def selective_dispatch(**kwargs):
+            call_count['n'] += 1
+            if call_count['n'] == 2:
+                raise RuntimeError('boom')
+            return await original_dispatch(**kwargs)
+
+        with patch.object(
+            type(interceptor_with_store), '_get_curator',
+            new=AsyncMock(return_value=mock_curator),
+        ), patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ), patch.object(
+            interceptor_with_store, '_dispatch_ticket_decision',
+            side_effect=selective_dispatch,
+        ):
+            # Must not raise
+            await interceptor_with_store._process_add_tickets_batch([t1, t2, t3])
+
+        r1 = await ticket_store.get(t1)
+        r2 = await ticket_store.get(t2)
+        r3 = await ticket_store.get(t3)
+
+        assert r1 is not None and r1['status'] == 'created'
+        assert r1['task_id'] == '11'
+
+        assert r2 is not None and r2['status'] == 'failed'
+        assert r2.get('reason') is not None and 'boom' in r2['reason']
+
+        assert r3 is not None and r3['status'] == 'created'
+        assert r3['task_id'] == '33'
