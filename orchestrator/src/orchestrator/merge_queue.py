@@ -666,6 +666,8 @@ class SpeculativeMergeWorker:
         # queue. Used by stop() to resolve Futures for requests that were
         # mid-processing when shutdown was initiated.
         self._inflight_req: MergeRequest | None = None
+        # Can be overridden in tests for fast shutdown (see stop()).
+        self._shutdown_timeout: float = 5.0
 
     def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome:
         """Build the terminal MergeOutcome for the loop-breaker.
@@ -785,7 +787,7 @@ class SpeculativeMergeWorker:
             if t is not None and not t.done()
         ]
         if tasks_to_wait:
-            timeout = getattr(self, '_shutdown_timeout', 5.0)
+            timeout = self._shutdown_timeout
             await asyncio.wait(tasks_to_wait, timeout=timeout)
 
         # Re-drain the verifier queue: the merger may have pushed SpeculativeItems

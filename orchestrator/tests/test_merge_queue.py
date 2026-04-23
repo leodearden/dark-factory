@@ -3356,7 +3356,6 @@ class TestEnqueueMergeRequest:
         self, tmp_path: Path, config: OrchestratorConfig,
     ):
         """enqueue_merge_request emits merge_queued and places req on queue."""
-        from orchestrator.event_store import EventType
         from orchestrator.merge_queue import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -3424,7 +3423,6 @@ class TestMergeWorkerDequeueEvent:
 
         Timestamp of merge_dequeued must be >= merge_queued timestamp.
         """
-        from orchestrator.event_store import EventType
         from orchestrator.merge_queue import enqueue_merge_request
 
         db_path = tmp_path / 'events.db'
@@ -3487,9 +3485,8 @@ class TestSpeculativeMergeWorkerDequeueEvent:
         Uses an immediate conflict path (merge_to_main returns conflicts=True)
         so the test is fast and doesn't need real git merge work.
         """
-        from orchestrator.event_store import EventType
-        from orchestrator.merge_queue import enqueue_merge_request
         from orchestrator.git_ops import MergeResult
+        from orchestrator.merge_queue import enqueue_merge_request
 
         db_path = tmp_path / 'events.db'
         event_store = EventStore(db_path=db_path, run_id='test-run')
@@ -3717,9 +3714,10 @@ class TestEscalationServerUsesEnqueueHelper:
         Must fail until escalation/server.py accepts the event_store kwarg (step-14)
         and replaces merge_queue.put() with the helper.
         """
-        from orchestrator.merge_queue import MergeOutcome, MergeRequest
-        from orchestrator.event_store import EventStore
         from escalation.server import create_server
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import MergeOutcome, MergeRequest
 
         merge_queue: asyncio.Queue = asyncio.Queue()
         event_store = EventStore(db_path=tmp_path / 'test.db', run_id='test')
@@ -3744,7 +3742,9 @@ class TestEscalationServerUsesEnqueueHelper:
                 orch_config=stub_config,
                 event_store=event_store,
             )
+            from fastmcp.tools.function_tool import FunctionTool
             tool = await mcp.get_tool('merge_request')
+            assert isinstance(tool, FunctionTool)
             await tool.fn(task_id='9', branch='task/9', worktree='/tmp/x')
 
         # Helper must have been called exactly once with the right args
