@@ -2123,12 +2123,11 @@ class TestBuildPerProjectMergeQueue:
             with patch(
                 'dashboard.data.merge_queue.queue_depth_timeseries',
                 side_effect=_raise_cancelled,
-            ):
-                with pytest.raises(asyncio.CancelledError):
-                    await build_per_project_merge_queue(
-                        [('/tmp/P', conn)],
-                        hours=24,
-                        now=now,
-                        recent_window_minutes=15,
-                    )
+            ), pytest.raises(asyncio.CancelledError):
+                await build_per_project_merge_queue(
+                    [('/tmp/P', conn)],
+                    hours=24,
+                    now=now,
+                    recent_window_minutes=15,
+                )
 
