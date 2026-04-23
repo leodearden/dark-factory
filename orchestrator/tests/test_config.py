@@ -9,7 +9,6 @@ from pydantic import ValidationError
 
 from orchestrator.config import (
     ConfigRequiredError,
-    EscalationConfig,
     ModuleConfig,
     OrchestratorConfig,
     TimeoutsConfig,
