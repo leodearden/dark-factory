@@ -903,3 +903,18 @@ class TestBuildCorpus:
             )
         assert sizes['module'] == 0
         assert not any(e.task_id == '300' for e in pool)
+
+
+# ----------------------------------------------------------------------
+# Batch config fields
+# ----------------------------------------------------------------------
+
+
+class TestCuratorConfigBatch:
+    def test_curator_config_has_batch_fields_with_documented_defaults(self):
+        config = CuratorConfig()
+        assert config.batch_max == 5
+        assert config.per_item_slack_seconds == 30.0
+        assert config.per_item_turns == 1
+        assert config.batch_timeout_cap_seconds == 540.0
+        assert config.batch_turns_cap == 10
