@@ -414,6 +414,80 @@ async def test_run_full_cycle_event_project_root_wins_over_configured(
         )
 
 
+@pytest.mark.asyncio
+async def test_run_full_cycle_with_relative_config_and_memory_only_events_still_fetches_tree(
+    journal, event_buffer, mock_memory_service
+):
+    """Regression: run_full_cycle with relative config '.' and memory-style events (no _project_root)
+    must resolve the relative config path to an absolute path and produce a non-empty
+    FilteredTaskTree for Stage 2.
+
+    This pins the full init-normalization → _resolve_project_root → _fetch_filtered_task_tree
+    pipeline against regression. Replicates the production symptom:
+    - PROJECT_ROOT env var unset → config.taskmaster.project_root = '.'
+    - Cycles driven by memory writes (episode_added/memory_added) → events lack _project_root
+    - Pre-927/pre-958 code: '.' passed to taskmaster → ValueError → silent empty tree
+    - Post-958 fix: '.' resolved to absolute at init → taskmaster called with absolute path
+    """
+    from pathlib import Path
+
+    from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+    from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+    # Harness with relative config '.' — init-time normalization (step-6) resolves to absolute
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service, '.')
+    expected_abs_root = str(Path('.').resolve())
+
+    # Configure taskmaster to return tasks when called with the resolved absolute path
+    harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+        'tasks': [
+            {'id': 1, 'title': 'T1', 'status': 'in-progress', 'dependencies': []},
+            {'id': 2, 'title': 'T2', 'status': 'pending', 'dependencies': []},
+            {'id': 3, 'title': 'T3', 'status': 'done', 'dependencies': []},
+        ]
+    }
+
+    # Push two memory-style events (no _project_root in payload) — simulates memory_service writes
+    await event_buffer.push(_make_event('dark_factory'))
+    await event_buffer.push(_make_event('dark_factory'))
+
+    # Capture Stage 2's filtered_task_tree at the moment stage.run fires
+    captured_stage2_trees: list[FilteredTaskTree] = []
+
+    async def capture_stage2_tree(stage):
+        if isinstance(stage, TaskKnowledgeSync):
+            captured_stage2_trees.append(stage.filtered_task_tree)
+
+    for stage in harness.stages:
+        _mock_stage_run(stage, before_return=capture_stage2_tree)
+
+    await harness.run_full_cycle('dark_factory', 'test')
+
+    # (a) taskmaster.get_tasks was called exactly once
+    harness.taskmaster.get_tasks.assert_called_once()  # type: ignore[union-attr,attr-defined]
+
+    # (b) the project_root arg passed was the resolved absolute path, not '.' or 'dark_factory'
+    call_kwargs = harness.taskmaster.get_tasks.call_args  # type: ignore[union-attr,attr-defined]
+    actual_root = call_kwargs.kwargs.get('project_root') or (
+        call_kwargs.args[0] if call_kwargs.args else None
+    )
+    assert actual_root == expected_abs_root, (
+        f"Expected get_tasks to be called with absolute root {expected_abs_root!r}, "
+        f"got {actual_root!r} — init-time normalization must resolve '.' before the fallback path uses it"
+    )
+
+    # (c) Stage 2 received a non-empty FilteredTaskTree (active tasks visible)
+    assert len(captured_stage2_trees) == 1, (
+        f"Expected exactly one Stage 2 run capture; got {len(captured_stage2_trees)}"
+    )
+    stage2_tree = captured_stage2_trees[0]
+    assert isinstance(stage2_tree, FilteredTaskTree)
+    assert len(stage2_tree.active_tasks) > 0, (
+        f"Stage 2 must see a non-empty active task list; got {stage2_tree.active_tasks!r}"
+        " — the relative-config silent-failure regression has re-occurred"
+    )
+
+
 # ── Tests for Task 74: Stage 3 findings feedback loop ────────────────
 
 
@@ -3002,3 +3076,84 @@ async def test_empty_fallback_resolves_and_short_circuits_filtered_task_tree(
 
     # (c) taskmaster.get_tasks was never called (short-circuit on empty project_root)
     harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_with_relative_config_and_memory_only_events_still_fetches_tree(
+    journal, event_buffer, mock_memory_service
+):
+    """End-to-end regression: relative project_root='.' in config + memory-style events
+    (no _project_root payload) must still produce a non-empty FilteredTaskTree in Stage 2.
+
+    Replicates the production symptom from task 958:
+    - config.taskmaster.project_root resolves to '.' when PROJECT_ROOT env is unset,
+    - memory-service events (episode_added/memory_added) never carry _project_root,
+    - so _resolve_project_root falls back to self._project_root.
+    Before this fix, self._project_root stored '.' (relative) which bypassed the
+    empty-string short-circuit but was rejected by TaskmasterBackend's absolute-path
+    validator, giving a silent empty tree to Stage 2.
+    After this fix, __init__ resolves '.' to str(Path('.').resolve()) so the full
+    pipeline succeeds.
+
+    Pins the init-normalization → resolver → fetcher pipeline end-to-end.
+    """
+    from pathlib import Path
+
+    from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+    # Build harness with RELATIVE project_root='.' — init must resolve to absolute
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service, project_root='.')
+    expected_abs = str(Path('.').resolve())
+    assert harness._project_root == expected_abs, (
+        "Pre-condition: harness._project_root must be absolute after init"
+    )
+
+    # Push two memory-style events (no _project_root in payload)
+    await event_buffer.push(_make_event('dark_factory'))
+    await event_buffer.push(_make_event('dark_factory'))
+
+    # Taskmaster returns one active task when called with the resolved absolute path
+    harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+        'tasks': [
+            {'id': 1, 'title': 'Task A', 'status': 'in-progress', 'dependencies': []},
+        ]
+    }
+
+    # Capture Stage 2 (TaskKnowledgeSync) filtered_task_tree at call time
+    captured_s2: dict = {}
+
+    async def capture_stage2(stage):
+        captured_s2['filtered_task_tree'] = getattr(stage, 'filtered_task_tree', None)
+
+    from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+    for stage in harness.stages:
+        if isinstance(stage, TaskKnowledgeSync):
+            _mock_stage_run(stage, before_return=capture_stage2)
+        else:
+            _mock_stage_run(stage)
+
+    await harness.run_full_cycle('dark_factory', 'buffer_size:2')
+
+    # (a) taskmaster.get_tasks was called exactly once
+    harness.taskmaster.get_tasks.assert_called_once()  # type: ignore[union-attr,attr-defined]
+
+    # (b) the project_root arg was the resolved absolute path (not '.')
+    call_kwargs = harness.taskmaster.get_tasks.call_args.kwargs  # type: ignore[union-attr,attr-defined]
+    assert call_kwargs.get('project_root') == expected_abs, (
+        f"get_tasks called with project_root={call_kwargs.get('project_root')!r}, "
+        f"expected {expected_abs!r} — init normalization must resolve relative '.' to absolute"
+    )
+
+    # (c) Stage 2's filtered_task_tree at run time is non-empty
+    assert 'filtered_task_tree' in captured_s2, (
+        "Stage 2 run was never captured — check _mock_stage_run wiring"
+    )
+    stage2_tree = captured_s2['filtered_task_tree']
+    assert isinstance(stage2_tree, FilteredTaskTree), (
+        f"Stage 2 filtered_task_tree must be FilteredTaskTree; got {type(stage2_tree)}"
+    )
+    assert stage2_tree.total_count > 0, (
+        f"Stage 2 must receive a non-empty FilteredTaskTree (total_count={stage2_tree.total_count}); "
+        "got empty tree — init normalization or fetcher pipeline is broken"
+    )
