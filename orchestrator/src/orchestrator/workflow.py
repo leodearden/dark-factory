@@ -2374,6 +2374,67 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             base_commit=base_commit,
         )
 
+    async def _recover_if_already_merged(self) -> WorkflowOutcome | None:
+        """Check if the task's branch is already on main and transition to DONE.
+
+        Called pre-PLAN to short-circuit ghost-loop re-runs: if a prior workflow
+        run merged the branch but failed before writing DONE status, this guard
+        detects the merged branch and immediately marks the task done.
+
+        Returns WorkflowOutcome.DONE if the branch is already merged to main AND
+        there is prior implementation work.  Returns None in all other cases
+        (branch not merged, no prior work, missing worktree/git_ops, exceptions).
+        """
+        if self.worktree is None or self.git_ops is None:
+            return None
+
+        # ── Git layer ─────────────────────────────────────
+        # Subprocess calls that can fail for git/infra reasons.
+        # Returns (wt_head, main_sha) when the branch is on main, else None.
+        _git_check: tuple[str, str] | None = None
+        _, _wt_head_raw, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=self.worktree,
+        )
+        _main_sha = await self.git_ops.get_main_sha()
+        if await self.git_ops.is_ancestor(_wt_head_raw.strip(), _main_sha):
+            _git_check = (_wt_head_raw.strip(), _main_sha)
+
+        if _git_check is None:
+            return None
+
+        wt_head, main_sha = _git_check
+
+        # ── Artifacts layer ────────────────────────────────
+        # Reads that can fail for filesystem/JSON reasons.
+        status = self._has_prior_implementation(wt_head)
+        if not status.has_work:
+            logger.warning(
+                'Task %s: branch HEAD %s is ancestor '
+                'of main %s but no implementation '
+                'entries (base=%s, entries=%d) — '
+                'proceeding with requeue',
+                self.task_id,
+                wt_head[:8],
+                main_sha[:8],
+                status.base_commit[:8] if status.base_commit else 'none',
+                len(status.entries),
+            )
+            return None
+
+        logger.info(
+            'Task %s: branch already on main — completing instead of re-queueing',
+            self.task_id,
+        )
+        self._enter_phase(WorkflowState.DONE)
+        await self.scheduler.set_task_status(
+            self.task_id, 'done',
+            done_provenance={
+                'note': 'branch already on main after escalation resolution',
+            },
+        )
+        return WorkflowOutcome.DONE
+
     def _escalate_plan_overwrite(self) -> None:
         """Submit a blocking escalation when plan.json ownership doesn't match.
 
