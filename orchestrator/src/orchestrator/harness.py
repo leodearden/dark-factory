@@ -924,12 +924,16 @@ Output JSON matching the schema. Every task must appear in the output.
                 lock_data = json.loads(lock_path.read_text())
                 if not isinstance(lock_data, dict):
                     raise ValueError('plan.lock is not a JSON object')
-                # artifacts.py is the sole plan.lock writer and has always
-                # included owner_pid; no legacy format without this key exists
-                # in the current fleet.  Missing or null owner_pid is therefore
-                # treated identically to a stale lock (see Gap-2 analysis).
                 owner_pid = lock_data.get('owner_pid')
-                if owner_pid is not None:
+                if owner_pid is None:
+                    # Missing or null owner_pid — surface this in logs so
+                    # unexpected lock formats don't fail silently.
+                    logger.warning(
+                        'Reconcile: plan.lock for task %s has no owner_pid;'
+                        ' treating as stale',
+                        tid,
+                    )
+                else:
                     try:
                         owner_alive = _pid_alive(int(owner_pid))
                     except (TypeError, ValueError):
@@ -958,6 +962,12 @@ Output JSON matching the schema. Every task must appear in the output.
                         ' (stale-lock); continuing',
                         tid, exc_info=True,
                     )
+                # Unconditionally unlink the stale lock so the next sweep
+                # doesn't re-encounter it.  If cleanup_worktree succeeded the
+                # whole worktree dir is gone and this is a cheap no-op;
+                # if cleanup failed we still guarantee the lock is cleared.
+                with contextlib.suppress(OSError):
+                    lock_path.unlink(missing_ok=True)
             else:
                 # Plan will be resumed — preserve worktree, only clear stale lock.
                 with contextlib.suppress(OSError):

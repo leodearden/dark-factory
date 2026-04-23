@@ -442,6 +442,7 @@ class TaskArtifacts:
 
         Uses O_CREAT|O_EXCL for atomic exclusive creation (POSIX).
         Returns True if the lock was acquired, False if already locked.
+        Raises ValueError if os.getpid() returns a non-int (unexpected env).
         """
         lock_path = self.root / 'plan.lock'
         try:
@@ -449,12 +450,22 @@ class TaskArtifacts:
         except FileExistsError:
             return False
         try:
+            owner_pid = os.getpid()
+            if not isinstance(owner_pid, int):
+                raise ValueError(
+                    f'plan.lock owner_pid must be a non-null int, got {owner_pid!r}'
+                )
             data = json.dumps({
                 'session_id': session_id,
                 'locked_at': datetime.now(UTC).isoformat(),
-                'owner_pid': os.getpid(),
+                'owner_pid': owner_pid,
             })
             os.write(fd, data.encode())
+        except Exception:
+            # Clean up the empty file created by O_CREAT|O_EXCL so a subsequent
+            # lock_plan call is not falsely blocked by a poison-pill empty file.
+            lock_path.unlink(missing_ok=True)
+            raise
         finally:
             os.close(fd)
         return True
