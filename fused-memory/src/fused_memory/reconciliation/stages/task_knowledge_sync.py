@@ -119,6 +119,10 @@ class TaskKnowledgeSync(BaseStage):
                 f'{format_task_list(sample)}\n'
             )
 
+        flagged_text, stage1_render_count = _format_flagged(
+            stage1_report.items_flagged if stage1_report else []
+        )
+
         return f"""## Stage 2: Task-Knowledge Sync
 ## Project: {self.project_id}
 
@@ -126,7 +130,7 @@ class TaskKnowledgeSync(BaseStage):
 {_format_report(stage1_report)}
 
 ### Stage 1 Flagged Items (Task-Relevant)
-{_format_flagged(stage1_report.items_flagged if stage1_report else [])}
+{flagged_text}
 
 {format_filtered_task_tree(filtered)}
 
@@ -238,6 +242,8 @@ class IntegrityCheck(BaseStage):
         if stage2_report:
             flagged.extend(stage2_report.items_flagged)
 
+        flagged_text, _ = _format_flagged(flagged)
+
         return f"""## Stage 3: Cross-System Integrity Check
 ## Project: {self.project_id}
 
@@ -248,7 +254,7 @@ class IntegrityCheck(BaseStage):
 {_format_report(stage2_report)}
 
 ### Items Flagged for Cross-System Verification ({len(flagged)})
-{_format_flagged(flagged)}
+{flagged_text}
 
 ## Your Task
 Verify consistency across all three systems:
@@ -279,9 +285,17 @@ def _format_report(report: StageReport | None) -> str:
 _FLAGGED_ITEMS_CHAR_BUDGET = 40_000
 
 
-def _format_flagged(items: list[dict], *, budget_chars: int = _FLAGGED_ITEMS_CHAR_BUDGET) -> str:
+def _format_flagged(
+    items: list[dict], *, budget_chars: int = _FLAGGED_ITEMS_CHAR_BUDGET
+) -> tuple[str, int]:
+    """Render flagged items as a bullet list, capped by *budget_chars*.
+
+    Returns ``(text, rendered_count)`` where *rendered_count* is the number of
+    items whose JSON appears in full in *text*.  Emits a structured
+    ``logger.warning`` when the budget truncates items.
+    """
     if not items:
-        return 'No flagged items.'
+        return ('No flagged items.', 0)
     lines: list[str] = []
     running_chars = 0
     rendered_count = 0
@@ -302,11 +316,11 @@ def _format_flagged(items: list[dict], *, budget_chars: int = _FLAGGED_ITEMS_CHA
                     'budget_chars': budget_chars,
                 },
             )
-            return '\n'.join(lines)
+            return ('\n'.join(lines), rendered_count)
         lines.append(line)
         running_chars += separator + len(line)
         rendered_count += 1
-    return '\n'.join(lines)
+    return ('\n'.join(lines), rendered_count)
 
 
 async def _render_done_provenance_section(

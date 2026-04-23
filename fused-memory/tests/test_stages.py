@@ -2603,7 +2603,7 @@ class TestFormatFlaggedNoSilentTruncation:
     def test_all_100_items_present_in_text(self):
         """100 items must all appear in the rendered text — no [:50] cap."""
         items = [{'description': f'item-{i}', 'severity': 'minor'} for i in range(100)]
-        text = _format_flagged(items)
+        text, _count = _format_flagged(items)
         for i in range(100):
             assert f'item-{i}' in text, (
                 f'Expected item-{i} description in rendered text; got:\n{text[:500]}...'
@@ -2612,15 +2612,16 @@ class TestFormatFlaggedNoSilentTruncation:
     def test_no_truncation_footer_when_all_items_rendered(self):
         """When all 100 items render, there must be no '... and N more' footer line."""
         items = [{'description': f'item-{i}', 'severity': 'minor'} for i in range(100)]
-        text = _format_flagged(items)
+        text, _count = _format_flagged(items)
         assert '... and ' not in text, (
             f'Unexpected truncation footer found in rendered text; got:\n{text[:500]}...'
         )
 
     def test_empty_list_returns_no_flagged_items(self):
         """Empty list must return the sentinel string."""
-        result = _format_flagged([])
-        assert result == 'No flagged items.'
+        text, count = _format_flagged([])
+        assert text == 'No flagged items.'
+        assert count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2653,7 +2654,7 @@ class TestFormatFlaggedCharBudget:
         """200 items with ~300-byte descriptions exceed 40000 chars; text is capped."""
         # Each item produces ~320+ chars when JSON-serialised + '- ' prefix
         items = [{'description': 'x' * 300, 'index': i} for i in range(200)]
-        text = _format_flagged(items)
+        text, _count = _format_flagged(items)
         # Budget is 40000; result should not wildly exceed it (footer is short)
         assert len(text) <= 42000, (
             f'Expected text ≤ 42000 chars but got {len(text)}'
@@ -2662,7 +2663,7 @@ class TestFormatFlaggedCharBudget:
     def test_over_budget_has_footer(self):
         """Over-budget render must end with a truncation footer line."""
         items = [{'description': 'x' * 300, 'index': i} for i in range(200)]
-        text = _format_flagged(items)
+        text, _count = _format_flagged(items)
         assert '... and ' in text, (
             f'Expected truncation footer in text; last 200 chars: {text[-200:]!r}'
         )
@@ -2674,7 +2675,7 @@ class TestFormatFlaggedCharBudget:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            _format_flagged(items)
+            _format_flagged(items)  # result not needed here; warning is what we check
 
         warning_records = [
             rec for rec in caplog.records
