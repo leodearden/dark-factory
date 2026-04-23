@@ -276,12 +276,36 @@ def _format_report(report: StageReport | None) -> str:
     )
 
 
-def _format_flagged(items: list[dict]) -> str:
+_FLAGGED_ITEMS_CHAR_BUDGET = 40_000
+
+
+def _format_flagged(items: list[dict], *, budget_chars: int = _FLAGGED_ITEMS_CHAR_BUDGET) -> str:
     if not items:
         return 'No flagged items.'
-    lines = []
+    lines: list[str] = []
+    running_chars = 0
+    rendered_count = 0
     for item in items:
-        lines.append(f'- {json.dumps(item, default=str)}')
+        line = f'- {json.dumps(item, default=str)}'
+        # +1 for the '\n' separator between lines
+        separator = 1 if lines else 0
+        if running_chars + separator + len(line) > budget_chars:
+            # Budget exceeded — stop and emit a truncation footer + warning
+            dropped = len(items) - rendered_count
+            lines.append(f'... and {dropped} more (truncated: char budget)')
+            logger.warning(
+                'reconciliation.flagged_items_truncated',
+                extra={
+                    'total': len(items),
+                    'rendered': rendered_count,
+                    'dropped': dropped,
+                    'budget_chars': budget_chars,
+                },
+            )
+            return '\n'.join(lines)
+        lines.append(line)
+        running_chars += separator + len(line)
+        rendered_count += 1
     return '\n'.join(lines)
 
 
