@@ -90,6 +90,68 @@ class TestParseUtc:
         )
 
 
+class TestSafeGatherResult:
+    """Tests for the safe_gather_result public helper in dashboard.data.utils."""
+
+    def test_returns_value_when_not_exception(self):
+        """A non-exception result is returned as-is (cast to _T)."""
+        from dashboard.data.utils import safe_gather_result
+
+        result = safe_gather_result({'key': 'value'}, {}, 'myop')
+        assert result == {'key': 'value'}
+
+    def test_returns_default_when_exception(self):
+        """An Exception result returns the declared default without re-raising."""
+        from dashboard.data.utils import safe_gather_result
+
+        default = {'labels': [], 'values': []}
+        result = safe_gather_result(RuntimeError('boom'), default, 'myop')
+        assert result is default
+
+    def test_logs_warning_with_label_on_exception(self, caplog):
+        """An Exception result emits exactly one WARNING under dashboard.data.utils containing the label."""
+        import logging
+
+        from dashboard.data.utils import safe_gather_result
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.utils'):
+            safe_gather_result(RuntimeError('something went wrong'), 'default', 'myop')
+
+        records = [r for r in caplog.records if r.name == 'dashboard.data.utils']
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert 'myop' in records[0].message
+
+    def test_reraises_cancelled_error(self):
+        """asyncio.CancelledError (BaseException, not Exception) must propagate, not be swallowed."""
+        import asyncio
+
+        import pytest
+
+        from dashboard.data.utils import safe_gather_result
+
+        with pytest.raises(asyncio.CancelledError):
+            safe_gather_result(asyncio.CancelledError(), 'default', 'myop')
+
+    def test_reraises_keyboard_interrupt(self):
+        """KeyboardInterrupt (BaseException, not Exception) must propagate, not be swallowed."""
+        import pytest
+
+        from dashboard.data.utils import safe_gather_result
+
+        with pytest.raises(KeyboardInterrupt):
+            safe_gather_result(KeyboardInterrupt(), 'default', 'myop')
+
+    def test_reraises_system_exit(self):
+        """SystemExit (BaseException, not Exception) must propagate, not be swallowed."""
+        import pytest
+
+        from dashboard.data.utils import safe_gather_result
+
+        with pytest.raises(SystemExit):
+            safe_gather_result(SystemExit(0), 'default', 'myop')
+
+
 class TestTimeagoUsesParseUtc:
     """Tests verifying that app.py uses parse_utc from dashboard.data.utils (DRY)."""
 
