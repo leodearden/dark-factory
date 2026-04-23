@@ -79,3 +79,44 @@ class TestStubMcpSessionSetTaskStatus:
         r1 = await stub.call_tool('set_task_status', {'id': 'x', 'status': 'done'})
         r2 = await stub.call_tool('set_task_status', {'id': 'y', 'status': 'done'})
         assert r2['id'] > r1['id']
+
+
+class TestStubMcpSessionGetTask:
+    """Tests for _StubMcpSession.call_tool('get_task', ...)."""
+
+    @pytest.mark.asyncio
+    async def test_get_task_no_status_returns_no_status_key(self):
+        """When no status has been set, decoded text has no 'status' key (or None).
+
+        The Scheduler.get_status parses content[0].text via json.loads, then
+        unwraps the Taskmaster envelope (data key), then reads .get('status').
+        When status is absent, get_status must return None.
+        """
+        stub = _StubMcpSession()
+        result = await stub.call_tool('get_task', {'id': 'unseen-task'})
+        block = result['result']['content'][0]
+        decoded = json.loads(block['text'])
+        # Either no 'status' key or status is None
+        assert decoded.get('status') is None
+
+    @pytest.mark.asyncio
+    async def test_get_task_after_set_returns_status(self):
+        """After a prior set_task_status, get_task reports the stored status."""
+        stub = _StubMcpSession()
+        await stub.call_tool('set_task_status', {'id': 'task-10', 'status': 'in-progress'})
+        result = await stub.call_tool('get_task', {'id': 'task-10'})
+        block = result['result']['content'][0]
+        decoded = json.loads(block['text'])
+        assert decoded['id'] == 'task-10'
+        assert decoded['status'] == 'in-progress'
+
+    @pytest.mark.asyncio
+    async def test_get_task_envelope_shape(self):
+        """get_task returns a correctly-shaped JSON-RPC envelope."""
+        stub = _StubMcpSession()
+        result = await stub.call_tool('get_task', {'id': 'task-11'})
+        assert result['jsonrpc'] == '2.0'
+        assert isinstance(result['id'], int)
+        content = result['result']['content']
+        assert isinstance(content, list) and len(content) >= 1
+        assert content[0]['type'] == 'text'
