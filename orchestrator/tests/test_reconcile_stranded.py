@@ -205,16 +205,18 @@ class TestReconcileStrandedInProgress:
             ),
             # (b) Missing owner_pid key → owner_pid=None via .get() → owner_alive=False
             #     → stale-lock path: cleanup_worktree called, task reverted, lock gone
+            #     → WARNING emitted for observability (Gap 2)
             pytest.param(
                 json.dumps({'session_id': 'test-10', 'locked_at': '2026-01-01T00:00:00+00:00'}),
-                '10', True, False, None,
+                '10', True, False, r'no owner_pid; treating as stale',
                 id='missing-owner-pid',
             ),
             # (b2) Explicit null owner_pid → owner_pid=None → owner_alive=False
             #      → stale-lock path: cleanup_worktree called, task reverted, lock gone
+            #      → WARNING emitted for observability (Gap 2)
             pytest.param(
                 json.dumps({'session_id': 'test-16', 'locked_at': '2026-01-01T00:00:00+00:00', 'owner_pid': None}),
-                16, True, False, None,
+                16, True, False, r'no owner_pid; treating as stale',
                 id='null-owner-pid',
             ),
             # (e) Non-dict JSON (list) → treated as corruption → revert + unlink
