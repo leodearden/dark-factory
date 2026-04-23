@@ -117,6 +117,31 @@ def _emit_merge_attempt(
         )
 
 
+async def enqueue_merge_request(
+    queue: asyncio.Queue,
+    req: 'MergeRequest',
+    event_store: EventStore | None,
+) -> None:
+    """Enqueue a MergeRequest and emit a merge_queued event.
+
+    Every request submitted to the merge worker must go through this helper
+    so that ``merge_queued`` events are emitted for pre-completion queue
+    visibility.
+
+    If ``event_store`` is None the request is still enqueued; emission is
+    silently skipped (mirrors the None-safe pattern used by
+    ``_emit_merge_attempt``).
+    """
+    if event_store is not None:
+        event_store.emit(
+            EventType.merge_queued,
+            task_id=req.task_id,
+            phase='merge',
+            data={'branch': req.branch},
+        )
+    await queue.put(req)
+
+
 @dataclass
 class MergeRequest:
     """A request to merge a task branch into main."""
