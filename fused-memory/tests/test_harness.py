@@ -2687,39 +2687,66 @@ async def test_backlog_iterator_uses_harness_project_root_when_events_lack_overr
 
 
 @pytest.mark.asyncio
-async def test_backlog_iterator_uses_project_root_peek_limit_constant(
+async def test_backlog_iterator_peek_window_finds_later_project_root_override(
     journal, event_buffer, mock_memory_service
 ):
-    """BacklogIterator.run's first peek_buffered call should use the
-    _PROJECT_ROOT_PEEK_LIMIT constant, not a raw literal.
+    """Regression guard: BacklogIterator's peek window must be wide enough that
+    a `_project_root` override on a LATER buffered event is still found, even
+    when several earlier buffered events lack the key.
 
-    Fails with ImportError until the constant is added to harness.py (step-2).
+    This pins the actual behavioral invariant (window >= N for realistic N)
+    without referencing the module-private `_PROJECT_ROOT_PEEK_LIMIT` constant
+    or its exact value — so the window size can be tuned freely as long as it
+    stays large enough to accommodate a realistic mix of buffered events.
+
+    Replaces the prior meta-test flagged by reviewer as locking implementation
+    detail (asserting `first_limit == _PROJECT_ROOT_PEEK_LIMIT` and
+    `_PROJECT_ROOT_PEEK_LIMIT == 10`).
     """
+    from datetime import timedelta
     from unittest.mock import AsyncMock, MagicMock, patch
 
-    from fused_memory.models.reconciliation import AssembledPayload
-    from fused_memory.reconciliation.harness import (  # step-2 adds this constant
-        _PROJECT_ROOT_PEEK_LIMIT,
-        BacklogIterator,
+    from fused_memory.models.reconciliation import (
+        AssembledPayload,
+        EventSource,
+        EventType,
+        ReconciliationEvent,
     )
+    from fused_memory.reconciliation.harness import BacklogIterator
 
-    # Push one event (no _project_root key — we only care about the peek limit)
-    await event_buffer.push(_make_event('dark_factory'))
+    # peek_buffered orders by `timestamp ASC LIMIT ?` (FIFO). Push 5 events that
+    # LACK _project_root with monotonically-increasing timestamps, then 1 event
+    # carrying _project_root='/from/event' with the latest timestamp. With FIFO
+    # peek, the override event is returned LAST — so the resolver only finds it
+    # if the window is wide enough to accommodate all 6 buffered events.
+    # Anchor base_ts 60 seconds in the past so that peek_buffered's
+    # `WHERE timestamp < cutoff` clause (cutoff ≈ datetime.now(UTC) at run() time)
+    # includes all 6 events.  Explicit offsets avoid sub-microsecond tie flakiness.
+    base_ts = datetime.now(UTC) - timedelta(seconds=60)
+    for i in range(5):
+        await event_buffer.push(ReconciliationEvent(
+            id=str(uuid.uuid4()),
+            type=EventType.episode_added,
+            source=EventSource.agent,
+            project_id='dark_factory',
+            timestamp=base_ts + timedelta(seconds=i),
+            payload={},  # NO _project_root key
+        ))
+    await event_buffer.push(ReconciliationEvent(
+        id=str(uuid.uuid4()),
+        type=EventType.task_status_changed,
+        source=EventSource.agent,
+        project_id='dark_factory',
+        timestamp=base_ts + timedelta(seconds=10),  # latest — FIFO peek returns last
+        payload={'_project_root': '/from/event', 'task_id': '1'},
+    ))
 
     harness = _make_harness_927(journal, event_buffer, mock_memory_service)
 
-    # Spy on peek_buffered, recording limit for each call
-    original_peek = event_buffer.peek_buffered
-    peek_calls: list[dict] = []
+    captured: dict = {}
 
-    async def spy_peek(project_id: str, limit: int, before=None):
-        peek_calls.append({'limit': limit, 'before': before})
-        return await original_peek(project_id, limit=limit, before=before)
-
-    event_buffer.peek_buffered = spy_peek  # type: ignore[method-assign]
-
-    # Stub ContextAssembler to return events=[] and exit the loop immediately
     def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
+        captured['project_root'] = project_root
         inst = MagicMock()
         inst.assemble = AsyncMock(return_value=AssembledPayload(events=[]))
         return inst
@@ -2731,15 +2758,15 @@ async def test_backlog_iterator_uses_project_root_peek_limit_constant(
         iterator = BacklogIterator(harness.config, harness.journal, harness.buffer, harness)
         await iterator.run('dark_factory')
 
-    assert peek_calls, 'peek_buffered was never called — iterator may not have run'
-    first_limit = peek_calls[0]['limit']
-    assert first_limit == _PROJECT_ROOT_PEEK_LIMIT, (
-        f'First peek_buffered call used limit={first_limit}, '
-        f'expected _PROJECT_ROOT_PEEK_LIMIT={_PROJECT_ROOT_PEEK_LIMIT}. '
-        'Replace the raw literal with the constant in BacklogIterator.run.'
+    assert 'project_root' in captured, (
+        'ContextAssembler was never constructed — iterator may not have run'
     )
-    assert _PROJECT_ROOT_PEEK_LIMIT == 10, (
-        f'_PROJECT_ROOT_PEEK_LIMIT should be 10, got {_PROJECT_ROOT_PEEK_LIMIT}'
+    assert captured['project_root'] == '/from/event', (
+        f"Expected project_root='/from/event' but got '{captured['project_root']}'. "
+        'The peek window must be wide enough to find a later-buffered _project_root '
+        'override past 5 earlier events that lack the key. If this test now fails, '
+        'the peek window has been tuned too narrow — consider whether 6 buffered '
+        'events is an unreasonable lookback and adjust accordingly.'
     )
 
 
