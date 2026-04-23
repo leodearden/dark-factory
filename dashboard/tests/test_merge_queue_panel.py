@@ -964,25 +964,27 @@ class TestMergeQueueCanvasIdCollision:
     """Two pids that css_id-collide must render distinct canvas id attributes."""
 
     def test_colliding_pids_render_distinct_canvases(self, client):
-        """html contains four distinct canvas ids: unsuffixed + _1 variants for each chart type."""
+        """Colliding pids render distinct canvas ids: both tmp_dark_factory and tmp_dark_factory_1
+        appear in the HTML (order-independent), and no two <canvas> elements share an id."""
         with _patch_per_project_merge_data(projects=_MOCK_COLLIDING_PROJECT_DATA):
             resp = client.get('/partials/merge-queue')
         assert resp.status_code == 200
         html = resp.text
 
-        # First project: unsuffixed
-        assert 'id="mergeQueueDepthChart-tmp_dark_factory"' in html, (
-            'Expected unsuffixed mergeQueueDepthChart canvas id for first project'
+        # Both css_id variants must appear as mergeQueueDepthChart canvas ids (order-independent)
+        depth_ids = set(re.findall(r'id="mergeQueueDepthChart-([^"]+)"', html))
+        assert depth_ids == {'tmp_dark_factory', 'tmp_dark_factory_1'}, (
+            f'Expected depth chart canvas ids {{tmp_dark_factory, tmp_dark_factory_1}}, got {depth_ids}'
         )
-        assert 'id="mergeOutcomeChart-tmp_dark_factory"' in html, (
-            'Expected unsuffixed mergeOutcomeChart canvas id for first project'
+        # Both css_id variants must appear as mergeOutcomeChart canvas ids (order-independent)
+        outcome_ids = set(re.findall(r'id="mergeOutcomeChart-([^"]+)"', html))
+        assert outcome_ids == {'tmp_dark_factory', 'tmp_dark_factory_1'}, (
+            f'Expected outcome chart canvas ids {{tmp_dark_factory, tmp_dark_factory_1}}, got {outcome_ids}'
         )
-        # Second project: suffixed with _1
-        assert 'id="mergeQueueDepthChart-tmp_dark_factory_1"' in html, (
-            'Expected _1-suffixed mergeQueueDepthChart canvas id for second project'
-        )
-        assert 'id="mergeOutcomeChart-tmp_dark_factory_1"' in html, (
-            'Expected _1-suffixed mergeOutcomeChart canvas id for second project'
+        # No two <canvas> elements may share the same id attribute
+        all_canvas_ids = re.findall(r'<canvas\b[^>]*\bid="([^"]+)"', html)
+        assert len(all_canvas_ids) == len(set(all_canvas_ids)), (
+            f'Duplicate canvas ids found: {[i for i in all_canvas_ids if all_canvas_ids.count(i) > 1]}'
         )
         # canvas_id key must appear in the serialized allProjects JSON in the inline script
         script_body = _extract_inline_script(html)
