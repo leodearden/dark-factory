@@ -352,6 +352,16 @@ class TaskWorkflow:
                 # Don't commit the removal separately — it'll be part of
                 # the first real commit the agent makes.
 
+            # ── Pre-PLAN ghost-loop recovery ──────────────────────────
+            # If the worktree's branch is already merged to main AND there
+            # is evidence of prior implementation work, mark the task DONE
+            # immediately — a prior run merged it but died before writing
+            # the DONE status.  Short-circuiting here prevents the architect
+            # from being invoked and keeps the run idempotent.
+            recovery = await self._recover_if_already_merged()
+            if recovery == WorkflowOutcome.DONE:
+                return recovery
+
             # PLAN (skip if initial_plan was provided — eval mode)
             if self.initial_plan:
                 plan_tid = self.initial_plan.get('task_id')
@@ -2418,8 +2428,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # iterations.jsonl, missing metadata).  Wrapped in a SEPARATE
         # try/except from the git layer so operators can distinguish the
         # root cause from the log message.
+        #
+        # Note: we call _has_prior_implementation() WITHOUT wt_head so that
+        # the iteration-log fallback is used.  SHA-primary is unreliable here
+        # because create_worktree may have rebased the branch onto main before
+        # this call — after rebase, wt_head == base_commit even on a genuinely
+        # implemented branch, causing a false-negative.  The iteration-log scan
+        # correctly identifies prior implementer/debugger entries regardless of
+        # rebasing.  See _has_prior_implementation() docstring.
         try:
-            status = self._has_prior_implementation(wt_head)
+            status = self._has_prior_implementation()
             if not status.has_work:
                 logger.warning(
                     'Task %s: branch HEAD %s is ancestor '
