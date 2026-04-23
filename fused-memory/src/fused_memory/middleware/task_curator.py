@@ -635,6 +635,25 @@ class TaskCurator:
         )
         return decision
 
+    async def curate_batch(
+        self,
+        candidates: list[CandidateTask],
+        project_id: str,
+        project_root: str,
+    ) -> list[CuratorDecision]:
+        """Issue a batched drop/combine/create decision for *candidates* in one round-trip.
+
+        * N=0 → return ``[]`` immediately.
+        * N=1 → delegate to :meth:`curate` (inherits caches + escalator wiring).
+        * N>1 → one :func:`invoke_with_cap_retry` call with the batched prompt/schema.
+                On whole-batch failure falls back to N serial :meth:`curate` calls.
+        """
+        if not candidates:
+            return []
+        if len(candidates) == 1:
+            return [await self.curate(candidates[0], project_id, project_root)]
+        raise NotImplementedError('curate_batch N>1 not yet implemented')
+
     async def record_task(
         self,
         task_id: str,
