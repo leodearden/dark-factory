@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -931,7 +932,7 @@ class TestRecentMerges:
         supported and returns every matching row without a row-count cap.
         """
         now = datetime.now(UTC)
-        with sqlite3.connect(str(merge_events_db)) as conn_sync:
+        with contextlib.closing(sqlite3.connect(str(merge_events_db))) as conn_sync:
             for i in range(60):
                 _insert_event(
                     conn_sync,
@@ -1842,10 +1843,10 @@ class TestBuildPerProjectMergeQueue:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('recent_window_minutes, in_window_offset_min, over_fetch_offset_min', [
-        (15,  5, 30),   # SQL hours=1, Python window=15 min; over-fetch zone=[15,60)
-        (30, 10, 45),   # SQL hours=1, Python window=30 min; over-fetch zone=[30,60)
-        (45, 20, 50),   # SQL hours=1, Python window=45 min; over-fetch zone=[45,60)
-        (90, 45, 100),  # SQL hours=2, Python window=90 min; over-fetch zone=[90,120)
+        (15,  5, 30),   # SQL hours=1, Python window=15 min; over-fetch zone=(15,60]
+        (30, 10, 45),   # SQL hours=1, Python window=30 min; over-fetch zone=(30,60]
+        (45, 20, 50),   # SQL hours=1, Python window=45 min; over-fetch zone=(45,60]
+        (90, 45, 100),  # SQL hours=2, Python window=90 min; over-fetch zone=(90,120]
     ])
     async def test_sql_over_fetches_are_trimmed_to_exact_minute_boundary(
         self, tmp_path, recent_window_minutes, in_window_offset_min, over_fetch_offset_min,
@@ -1853,7 +1854,7 @@ class TestBuildPerProjectMergeQueue:
         """SQL hour-granularity over-fetches are trimmed to the exact minute boundary by filter_merges_within.
 
         When recent_window_minutes is not a multiple of 60, SQL uses hours=ceil(minutes/60),
-        which over-fetches rows in the zone [recent_window_minutes, ceil(minutes/60)*60) minutes.
+        which over-fetches rows in the zone (recent_window_minutes, ceil(minutes/60)*60] minutes.
         build_per_project_merge_queue must call filter_merges_within to drop those extra rows.
 
         Setup: two events per case — one at -in_window_offset_min (inside Python window) and
