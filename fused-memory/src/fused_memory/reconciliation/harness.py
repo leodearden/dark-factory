@@ -82,7 +82,8 @@ class ReconciliationHarness:
         self.taskmaster = taskmaster
         self.journal = journal
         self.buffer = event_buffer
-        self._project_root = config.taskmaster.project_root if config.taskmaster else ''
+        _raw_root = config.taskmaster.project_root if config.taskmaster else ''
+        self._project_root = str(Path(_raw_root).resolve()) if _raw_root else ''
         self.config = config.reconciliation
         self._backlog_policy = backlog_policy
         # WP-D: track which halted projects we've already escalated so we
