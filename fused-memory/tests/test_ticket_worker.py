@@ -1222,3 +1222,135 @@ async def test_resolve_ticket_returns_server_closed_when_store_closed_before_ini
     assert result == {'status': 'failed', 'reason': 'server_closed', 'task_id': None}, (
         f'Expected server_closed sentinel from initial-read path, got: {result!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# _dispatch_ticket_decision helper — step-31
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchTicketDecision:
+    """Unit tests for the extracted _dispatch_ticket_decision helper.
+
+    The helper performs the drop/combine/create dispatch logic and returns a
+    (status, task_id, reason, result_dict, curator_degrade_reason) tuple.
+    It does NOT call mark_resolved or signal ticket events — those are the
+    caller's responsibility.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dispatch_create_decision_returns_created_status_and_task_id(
+        self, interceptor_with_store, taskmaster,
+    ):
+        """action='create' → calls tm.add_task, returns (created, '77', None, {...})."""
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        candidate = CandidateTask(title='New Feature', description='Details here')
+        decision = CuratorDecision(action='create', justification='novel')
+
+        mock_curator = MagicMock()
+        mock_curator.note_created = MagicMock()
+        mock_curator.record_task = AsyncMock()
+
+        taskmaster.add_task = AsyncMock(return_value={'id': '77', 'title': 'New Feature'})
+
+        with patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            status, task_id, reason, result_dict, degrade_reason = (
+                await interceptor_with_store._dispatch_ticket_decision(
+                    ticket_id='tkt_x',
+                    project_root='/p',
+                    project_id='p',
+                    candidate=candidate,
+                    decision=decision,
+                    kwargs={'title': 'New Feature', 'description': 'Details here'},
+                    metadata=None,
+                    curator=mock_curator,
+                )
+            )
+
+        assert status == 'created'
+        assert task_id == '77'
+        assert reason is None
+        assert isinstance(result_dict, dict)
+        assert result_dict.get('id') == '77'
+        assert degrade_reason is None
+
+    @pytest.mark.asyncio
+    async def test_dispatch_drop_returns_combined_with_target_id(
+        self, interceptor_with_store,
+    ):
+        """action='drop' with target_id → returns (combined, target_id, ...)."""
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        candidate = CandidateTask(title='Dup Task')
+        decision = CuratorDecision(
+            action='drop', target_id='99', justification='duplicate',
+        )
+
+        status, task_id, reason, result_dict, degrade_reason = (
+            await interceptor_with_store._dispatch_ticket_decision(
+                ticket_id='tkt_drop',
+                project_root='/p',
+                project_id='p',
+                candidate=candidate,
+                decision=decision,
+                kwargs={'title': 'Dup Task'},
+                metadata=None,
+                curator=None,
+            )
+        )
+
+        assert status == 'combined'
+        assert task_id == '99'
+        assert reason is not None and 'drop' in reason
+        assert isinstance(result_dict, dict)
+        assert result_dict.get('id') == '99'
+
+    @pytest.mark.asyncio
+    async def test_dispatch_combine_calls_execute_combine_and_returns_combined(
+        self, interceptor_with_store,
+    ):
+        """action='combine' → calls _execute_combine, returns (combined, target_id, ...)."""
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        candidate = CandidateTask(title='Overlap Task')
+        rewritten = RewrittenTask(
+            title='Merged', description='desc', details='det',
+            files_to_modify=[], priority='medium',
+        )
+        decision = CuratorDecision(
+            action='combine', target_id='88', justification='overlap',
+            rewritten_task=rewritten,
+        )
+
+        mock_executor = AsyncMock(return_value={'id': '88', 'title': 'Merged'})
+
+        mock_curator = MagicMock()
+        mock_curator.reembed_task = AsyncMock()
+
+        with patch.object(
+            interceptor_with_store, '_execute_combine',
+            new=mock_executor,
+        ):
+            status, task_id, reason, result_dict, degrade_reason = (
+                await interceptor_with_store._dispatch_ticket_decision(
+                    ticket_id='tkt_comb',
+                    project_root='/p',
+                    project_id='p',
+                    candidate=candidate,
+                    decision=decision,
+                    kwargs={'title': 'Overlap Task'},
+                    metadata=None,
+                    curator=mock_curator,
+                )
+            )
+
+        assert status == 'combined'
+        assert task_id == '88'
+        assert reason is not None and 'combine' in reason
+        assert isinstance(result_dict, dict)
+        assert result_dict.get('id') == '88'
+        assert mock_executor.await_count == 1
