@@ -1529,9 +1529,22 @@ class TaskInterceptor:
                         # tm.add_task returned a non-dict result or a dict without 'id'.
                         # Reserves 'created' for the case where a usable task_id exists;
                         # status='created' with task_id=None is semantically inconsistent
-                        # (the journal gate at L1519 silently skips it, but resolve_ticket
-                        # callers would get {status: 'created'} with no task_id — useless).
+                        # (the `if status == "created" and task_id` gate below silently
+                        # skips journal emission, and resolve_ticket callers would get
+                        # {status: 'created'} with no task_id — useless).
                         reason = 'tm_add_task_returned_no_id'
+                        # If taskmaster returned a non-empty dict but no 'id', the task
+                        # may still exist in tasks.json (malformed response).  Persist the
+                        # raw result in result_json so an operator / reconciliation sweep
+                        # can identify and recover the orphaned task without grepping logs.
+                        if isinstance(result, dict) and result:
+                            logger.warning(
+                                '_process_add_ticket: tm.add_task returned dict with no id '
+                                'for ticket %s; raw result persisted in result_json for '
+                                'recovery: %s',
+                                ticket_id, result,
+                            )
+                            result_dict = result
                         # status stays 'failed' (the initial default).
                     else:
                         # ── Latch success immediately — post-create errors must NOT
@@ -1588,6 +1601,43 @@ class TaskInterceptor:
                                 {'stage': 'record_task', 'error': str(exc)}
                             )
 
+        except asyncio.CancelledError:
+            # Worker task cancelled (close() path) while inside _process_add_ticket.
+            # Ensure the ticket reaches a terminal state even if mark_resolved wasn't
+            # reached yet — cancellation may have interrupted the flow AFTER
+            # tm.add_task already mutated tasks.json (status latched to 'created').
+            # asyncio.shield() protects the mark_resolved call itself from being
+            # interrupted by the propagated CancelledError.
+            # TicketStore.mark_resolved() is idempotent (returns False when row is
+            # already terminal), so calling it twice is harmless.
+            logger.debug(
+                '_process_add_ticket: cancelled for ticket %s; persisting status=%s',
+                ticket_id, status,
+            )
+            try:
+                await asyncio.shield(
+                    self._ticket_store.mark_resolved(
+                        ticket_id,
+                        status=status,
+                        task_id=task_id,
+                        reason=reason if reason else (
+                            'cancelled_during_write' if status != 'created' else None
+                        ),
+                        result_json=(
+                            json.dumps(result_dict) if result_dict is not None else None
+                        ),
+                    )
+                )
+                self._signal_ticket_event(ticket_id)
+            except Exception:
+                logger.exception(
+                    '_process_add_ticket: mark_resolved failed after cancellation '
+                    'for ticket %s; ticket remains pending and will be cleaned up '
+                    'by flush_pending_on_startup on next restart',
+                    ticket_id,
+                )
+            raise
+
         except Exception as exc:
             logger.exception(
                 '_process_add_ticket: unexpected error for ticket %s', ticket_id,
@@ -1611,12 +1661,17 @@ class TaskInterceptor:
                 result_dict = None
 
         # ── Persist terminal state ────────────────────────────────────────
-        await self._ticket_store.mark_resolved(
-            ticket_id,
-            status=status,
-            task_id=task_id,
-            reason=reason,
-            result_json=json.dumps(result_dict) if result_dict is not None else None,
+        # Shield from cancellation so that a close()-triggered CancelledError
+        # that arrives here (after the try/except block) does not prevent the
+        # ticket from reaching a terminal state.
+        await asyncio.shield(
+            self._ticket_store.mark_resolved(
+                ticket_id,
+                status=status,
+                task_id=task_id,
+                reason=reason,
+                result_json=json.dumps(result_dict) if result_dict is not None else None,
+            )
         )
 
         # ── Emit journal event and schedule commit (create path only) ────
@@ -1632,7 +1687,18 @@ class TaskInterceptor:
         self._signal_ticket_event(ticket_id)
 
     def _signal_ticket_event(self, ticket_id: str) -> None:
-        """Wake all callers waiting on resolve_ticket for this ticket."""
+        """Wake all callers waiting on resolve_ticket for this ticket.
+
+        Pops the entire event list for *ticket_id* atomically so no caller is
+        signalled twice.  Invariant: after this call there is no entry for
+        *ticket_id* in ``_ticket_events``; ``resolve_ticket``'s ``finally``
+        block harmlessly no-ops its subsequent ``evs.remove()`` attempt on the
+        already-popped (and discarded) list via ``contextlib.suppress(ValueError)``.
+        This pop-then-set ordering is intentional: asyncio is single-threaded, so
+        there is no true data race, but the explicit pop makes the ownership
+        transfer clear and prevents a future refactor from accidentally re-adding
+        an already-signalled event.
+        """
         events = self._ticket_events.pop(ticket_id, None)
         if events:
             for event in events:
@@ -1655,21 +1721,28 @@ class TaskInterceptor:
             Migrate callers to ``submit_task`` / ``resolve_ticket``.
         """
         project_id = resolve_project_id(project_root)
-        # Always emit a logger.warning on every call.
-        logger.warning(
-            'add_task: deprecated facade — migrate to submit_task/resolve_ticket (project=%s)',
-            project_id,
-        )
-        # Emit a DeprecationWarning only on the FIRST call per project_id so
-        # tooling that converts warnings to errors (e.g. pytest -W error) isn't
-        # flooded by repeated calls.
+        # Emit a logger.warning + DeprecationWarning on the FIRST call per project
+        # so tooling (e.g. pytest -W error) and logs both surface the migration
+        # signal without flooding the warning log on deployments that have many
+        # not-yet-migrated callers.  Subsequent calls log at DEBUG only.
         if project_id not in self._deprecation_warned_projects:
             self._deprecation_warned_projects.add(project_id)
+            logger.warning(
+                'add_task: deprecated facade — migrate to submit_task/resolve_ticket '
+                '(project=%s)',
+                project_id,
+            )
             warnings.warn(
                 f'TaskInterceptor.add_task is deprecated — migrate to '
                 f'submit_task/resolve_ticket (project={project_id})',
                 DeprecationWarning,
                 stacklevel=2,
+            )
+        else:
+            logger.debug(
+                'add_task: deprecated facade — migrate to submit_task/resolve_ticket '
+                '(project=%s)',
+                project_id,
             )
 
         # Delegate entirely to the two-phase path.

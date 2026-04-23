@@ -209,11 +209,12 @@ async def test_add_task_facade_delegates_to_submit_and_resolve(
 async def test_add_task_facade_emits_deprecation_warning_once_per_project(
     interceptor_facade, caplog,
 ):
-    """add_task emits a DeprecationWarning once per project_id, plus a logger.warning every time.
+    """add_task emits a DeprecationWarning + logger.warning once per project_id; logger.debug on repeat.
 
     - First call on /p1 → DeprecationWarning raised + logger.warning
-    - Second call on /p1 → NO DeprecationWarning, but logger.warning still fired
+    - Second call on /p1 → NO DeprecationWarning, NO logger.warning (logger.debug instead)
     - First call on /p2 → DeprecationWarning raised again + logger.warning
+    - Subsequent calls on /p1 still emit logger.debug mentioning 'deprecated'
     """
     import logging
     import warnings
@@ -255,12 +256,13 @@ async def test_add_task_facade_emits_deprecation_warning_once_per_project(
         f'Expected exactly one DeprecationWarning on first /p2 call: {dep_warnings_p2}'
     )
 
-    # logger.warning should appear on every call (3 total).
-    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+    # Subsequent calls on an already-warned project emit logger.debug (not warning),
+    # so capture at DEBUG level to detect the per-call log entry.
+    with caplog.at_level(logging.DEBUG, logger='fused_memory.middleware.task_interceptor'):
         await interceptor_facade.add_task('/p1', prompt='Task 4')
     deprecation_logs = [r for r in caplog.records if 'deprecated' in r.message.lower()]
     assert len(deprecation_logs) >= 1, (
-        f'Expected at least one logger.warning mentioning deprecated: {caplog.records}'
+        f'Expected at least one log entry mentioning deprecated: {caplog.records}'
     )
 
 
