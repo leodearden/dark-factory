@@ -379,7 +379,7 @@ An agent flagged a risk during development. Risk assessment requires human judgm
 
 Technical debt or cleanup discovered during development.
 
-- **Info**: queue as a follow-up task using `mcp__fused-memory__submit_task` → `mcp__fused-memory__resolve_ticket` (two-phase pattern; see `review_suggestions` §2 above for the full snippet — when reusing that snippet here, substitute `"source": "escalation-info"` and `"spawn_context": "steward-triage"` in place of the review-suggestions values; `escalation_id` stays the same). Resolve the escalation via `mcp__escalation__resolve_issue` once the ticket resolves.
+- **Info**: queue as a follow-up task using `mcp__fused-memory__submit_task` → `mcp__fused-memory__resolve_ticket` (two-phase pattern; see `review_suggestions` §2 above for the full snippet). When adapting that snippet: substitute only `"source": "escalation-info"` (`spawn_context: steward-triage` is unchanged — both sites feed the same steward pipeline). For the R4 idempotency key use `suggestion_hash = sha1(escalation.detail)[:8]`; for single-finding info escalations this is a retry token (not a per-item discriminator), but both `escalation_id` and `suggestion_hash` must be non-empty for the gate to activate. Resolve the escalation via `mcp__escalation__resolve_issue` once the ticket resolves.
 - **Blocking** (rare): spawn an interactive `/unblock` session (see `task_failure` for invocation pattern).
 
 ### `infra_issue` (blocking)
