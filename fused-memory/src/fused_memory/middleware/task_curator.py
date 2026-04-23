@@ -1707,4 +1707,66 @@ def _parse_batch_decisions(
                 cost_usd=cost_per_item,
             )
         results.append(decision)
+
+    # --- Post-parse: validate and sanitize batch_target_index references ---
+    # 1. Out-of-range or self-referential batch_target_index → degrade to create.
+    # 2. Cycle detection: walk the graph of i → batch_target_index[i]; any node
+    #    that is part of a cycle is degraded to create with 'batch-cycle'.
+    for i, d in enumerate(results):
+        if d.action == 'drop' and d.batch_target_index is not None:
+            bti = d.batch_target_index
+            if bti == i or not (0 <= bti < n):
+                results[i] = CuratorDecision(
+                    action='create',
+                    justification=(
+                        f'batch-target-out-of-range: batch_target_index={bti!r} '
+                        f'for item {i} (n={n})'
+                    ),
+                    pool_sizes=d.pool_sizes,
+                    latency_ms=d.latency_ms,
+                    cost_usd=d.cost_usd,
+                )
+
+    # Build the directed graph for cycle detection (only batch-drop edges).
+    def _find_cycle_members() -> set[int]:
+        """Return the set of indices that participate in any cycle."""
+        # Simple DFS with colour marking: 0=unvisited, 1=in-stack, 2=done.
+        colour = [0] * n
+        cycle_nodes: set[int] = set()
+
+        def dfs(node: int, path: list[int]) -> None:
+            if colour[node] == 2:
+                return
+            if colour[node] == 1:
+                # Found cycle — mark all nodes currently in the path back to
+                # where the cycle starts.
+                cycle_start = path.index(node)
+                cycle_nodes.update(path[cycle_start:])
+                return
+            colour[node] = 1
+            path.append(node)
+            d = results[node]
+            if d.action == 'drop' and d.batch_target_index is not None:
+                target = d.batch_target_index
+                if 0 <= target < n and target != node:
+                    dfs(target, path)
+            path.pop()
+            colour[node] = 2
+
+        for start in range(n):
+            if colour[start] == 0:
+                dfs(start, [])
+        return cycle_nodes
+
+    cycle_members = _find_cycle_members()
+    for i in cycle_members:
+        d = results[i]
+        results[i] = CuratorDecision(
+            action='create',
+            justification=f'batch-cycle: item {i} is part of a batch_target_index cycle',
+            pool_sizes=d.pool_sizes,
+            latency_ms=d.latency_ms,
+            cost_usd=d.cost_usd,
+        )
+
     return results
