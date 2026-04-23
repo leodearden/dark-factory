@@ -20,6 +20,10 @@ from fused_memory.middleware.task_curator import (
     _to_pool_entry,
     flatten_task_tree,
 )
+try:
+    from shared.cli_invoke import AllAccountsCappedException  # type: ignore[import]
+except ImportError:
+    AllAccountsCappedException = Exception  # type: ignore[assignment,misc]
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
@@ -1440,32 +1444,58 @@ class TaskInterceptor:
     async def _curator_worker(self, project_id: str) -> None:
         """Drain pending tickets for *project_id* from its per-project queue.
 
-        Processes tickets serially so ``curator.curate()`` is never called
-        concurrently for the same project — the key property that obsoletes
-        ``_curator_lock`` on the add_task path.  Independent workers per
-        project restore the per-project fairness of the old curator_lock
-        approach: project B is never blocked by a slow LLM call for project A.
+        Processes tickets in batches: blocks on ``queue.get()`` for the first
+        ticket, then opportunistically drains up to ``batch_max - 1`` more via
+        ``queue.get_nowait()`` (non-blocking).  This preserves low-latency for
+        single submitters (no wait for batch fill) while amortising LLM cost
+        when tickets arrive back-to-back under orchestrator load.
+
+        Independent workers per project restore the per-project fairness of the
+        old curator_lock approach: project B is never blocked by a slow LLM
+        call for project A.
 
         Lifecycle: cancellable; ``close()`` cancels all worker tasks and awaits
         them so in-flight work is not silently dropped.
         """
         queue = self._ticket_queues.setdefault(project_id, asyncio.Queue())
+        # Determine batch_max from config; fall back to the documented default (5)
+        # when no config is available so that tests without explicit config still
+        # exercise the batch path rather than silently falling back to serial.
+        try:
+            batch_max: int = self._config.curator.batch_max  # type: ignore[union-attr]
+        except AttributeError:
+            batch_max = 5  # matches CuratorConfig default
+
         try:
             while True:
-                ticket_id = await queue.get()
+                # Block on the first ticket — never spin.
+                first_ticket = await queue.get()
+                batch: list[str] = [first_ticket]
+
+                # Opportunistic drain: grab more tickets without waiting.
+                while len(batch) < batch_max:
+                    try:
+                        batch.append(queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+
                 try:
-                    await self._process_add_ticket(ticket_id)
+                    await self._process_add_tickets_batch(batch)
                 except Exception:
                     logger.exception(
-                        '_curator_worker: unhandled error processing ticket %s',
-                        ticket_id,
+                        '_curator_worker: unhandled error processing batch of %d '
+                        'tickets for project %s',
+                        len(batch), project_id,
                     )
-                    # Always wake resolve_ticket waiters even on unexpected errors
-                    # so callers never block forever when _process_add_ticket raises
-                    # before it can call _signal_ticket_event itself.
-                    self._signal_ticket_event(ticket_id)
+                    # Signal all ticket waiters so resolve_ticket callers are not
+                    # blocked forever if _process_add_tickets_batch raised before
+                    # calling _signal_ticket_event for each ticket.
+                    for tid in batch:
+                        self._signal_ticket_event(tid)
                 finally:
-                    queue.task_done()
+                    # Mark all drained tickets as done in the queue.
+                    for _ in batch:
+                        queue.task_done()
         except asyncio.CancelledError:
             pass
 
@@ -1942,11 +1972,40 @@ class TaskInterceptor:
             # Get curator once for the whole batch.
             curator = await self._get_curator()
 
+            # ── R4 idempotency checks (per-ticket, before curator call) ──────
+            # Same short-circuit that _process_add_ticket performs.  Tickets
+            # that match an existing non-cancelled task are resolved 'combined'
+            # immediately and excluded from the curate_batch call.
+            active_ticket_data: list[tuple] = []
+            for entry in ticket_data:
+                tid, _, _, t_pr, _, t_meta, _ = entry
+                idempotency_hit = await self._check_escalation_idempotency(
+                    project_root=t_pr, metadata=t_meta,
+                )
+                if idempotency_hit is not None:
+                    existing_id = str(idempotency_hit.get('id', ''))
+                    await self._ticket_store.mark_resolved(
+                        tid,
+                        status='combined',
+                        task_id=existing_id or None,
+                        reason='idempotency_hit',
+                        result_json=json.dumps(idempotency_hit),
+                    )
+                    self._signal_ticket_event(tid)
+                else:
+                    active_ticket_data.append(entry)
+            ticket_data = active_ticket_data
+
+            if not ticket_data:
+                return  # All tickets short-circuited by idempotency
+
             # Build candidates list for curate_batch.
             candidates: list[CandidateTask | None] = [
                 entry[6] for entry in ticket_data
             ]
             non_none_candidates = [c for c in candidates if c is not None]
+            # Per-ticket curator degrade reason (populated on fallback path).
+            curator_degrade_reasons: list[str | None] = [None] * len(ticket_data)
 
             # Call curate_batch — one LLM round-trip for all candidates.
             decisions: list[CuratorDecision | None]
@@ -1967,7 +2026,29 @@ class TaskInterceptor:
                                 else None
                             )
                             batch_idx += 1
-                except Exception:
+                except (CuratorFailureError, AllAccountsCappedException) as exc:
+                    # Whole batch LLM failure: fall back to individual curate() calls.
+                    # This path preserves per-ticket curator_degrade_reason so that
+                    # result_json records the failure reason (same as _process_add_ticket).
+                    logger.warning(
+                        '_process_add_tickets_batch: curate_batch raised %s for '
+                        'project %s; falling back to %d individual curate() calls',
+                        type(exc).__name__, project_id, len(non_none_candidates),
+                    )
+                    batch_idx = 0
+                    decisions = []
+                    for i, c in enumerate(candidates):
+                        if c is None:
+                            decisions.append(None)
+                        else:
+                            try:
+                                d = await curator.curate(c, project_id, project_root)
+                                decisions.append(d)
+                            except CuratorFailureError as e:
+                                decisions.append(CuratorDecision(action='create'))
+                                curator_degrade_reasons[i] = str(e)
+                            batch_idx += 1
+                except Exception:  # pyright: ignore[reportUnusedExcept]
                     logger.exception(
                         '_process_add_tickets_batch: curate_batch failed for project %s; '
                         'degrading all %d candidates to create',
@@ -2052,6 +2133,11 @@ class TaskInterceptor:
                                 kwargs=t_kwargs,
                                 metadata=t_metadata,
                                 curator=curator,
+                                curator_degrade_reason=(
+                                    curator_degrade_reasons[i]
+                                    if i < len(curator_degrade_reasons)
+                                    else None
+                                ),
                             )
                         )
                     except asyncio.CancelledError:

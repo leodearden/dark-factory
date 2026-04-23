@@ -1245,19 +1245,21 @@ class TestCallLlmBatchScaling:
         curator = TaskCurator(config=config, taskmaster=None)
         mock = AsyncMock(return_value=self._make_batch_result(3))
         candidates = [CandidateTask(title=f'T{i}') for i in range(3)]
-        with patch(
-            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
-            new=mock,
+        with (
+            patch(
+                'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                new=mock,
+            ),
+            patch.object(curator, '_build_corpus', side_effect=Exception('no corpus')),
         ):
-            with patch.object(curator, '_build_corpus', side_effect=Exception('no corpus')):
-                await curator._call_llm_batch(
-                    candidates,
-                    pools=[[], [], []],
-                    pool_sizes_list=[{}, {}, {}],
-                    start=0.0,
-                    project_id='p',
-                    project_root='/x',
-                )
+            await curator._call_llm_batch(
+                candidates,
+                pools=[[], [], []],
+                pool_sizes_list=[{}, {}, {}],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
         _, kwargs = mock.call_args
         assert kwargs['timeout_seconds'] == 330.0
         assert kwargs['max_turns'] == 6
@@ -1269,19 +1271,21 @@ class TestCallLlmBatchScaling:
         curator = TaskCurator(config=config, taskmaster=None)
         mock = AsyncMock(return_value=self._make_batch_result(20))
         candidates = [CandidateTask(title=f'T{i}') for i in range(20)]
-        with patch(
-            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
-            new=mock,
+        with (
+            patch(
+                'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                new=mock,
+            ),
+            patch.object(curator, '_build_corpus', side_effect=Exception('no corpus')),
         ):
-            with patch.object(curator, '_build_corpus', side_effect=Exception('no corpus')):
-                await curator._call_llm_batch(
-                    candidates,
-                    pools=[[] for _ in range(20)],
-                    pool_sizes_list=[{} for _ in range(20)],
-                    start=0.0,
-                    project_id='p',
-                    project_root='/x',
-                )
+            await curator._call_llm_batch(
+                candidates,
+                pools=[[] for _ in range(20)],
+                pool_sizes_list=[{} for _ in range(20)],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
         _, kwargs = mock.call_args
         assert kwargs['timeout_seconds'] == 540.0
         assert kwargs['max_turns'] == 10
@@ -1309,19 +1313,21 @@ class TestCallLlmBatchFailure:
         )
         mock = AsyncMock(return_value=failed_result)
         candidates = [CandidateTask(title='A'), CandidateTask(title='B')]
-        with pytest.raises(CuratorFailureError) as exc_info:
-            with patch(
+        with (
+            pytest.raises(CuratorFailureError) as exc_info,
+            patch(
                 'fused_memory.middleware.task_curator.invoke_with_cap_retry',
                 new=mock,
-            ):
-                await curator._call_llm_batch(
-                    candidates,
-                    pools=[[], []],
-                    pool_sizes_list=[{}, {}],
-                    start=0.0,
-                    project_id='p',
-                    project_root='/x',
-                )
+            ),
+        ):
+            await curator._call_llm_batch(
+                candidates,
+                pools=[[], []],
+                pool_sizes_list=[{}, {}],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
         msg = str(exc_info.value)
         assert 'batch_size=2' in msg
         assert 'error_max_turns' in msg
