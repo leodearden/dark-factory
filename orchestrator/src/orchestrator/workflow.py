@@ -48,12 +48,13 @@ from orchestrator.verify import VerifyResult, run_scoped_verification
 _ORCH_PROJECT_DIR = Path(__file__).resolve().parents[2]
 
 # Roles whose allowed_tools include at least one 'mcp__escalation__escalate*' tool.
-# Steward is excluded: it runs in its own TaskSteward dispatcher, not through TaskWorkflow._invoke.
+# 'steward' and 'deep_reviewer' are excluded: they run in their own dispatchers
+# (TaskSteward and ReviewCheckpoint respectively), not through TaskWorkflow._invoke.
 # All other roles are included or excluded based on their actual allowed_tools entries in ROLES.
 _ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset(
     name for name, role in ROLES.items()
     if any(t in _ESCALATION_TOOLS for t in (role.allowed_tools or []))
-    and name != 'steward'
+    and name not in {'steward', 'deep_reviewer'}
 )
 
 

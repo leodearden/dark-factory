@@ -73,7 +73,7 @@ class TestMaybeWarnMissingEscalation:
             if rec.levelno >= logging.WARNING
         ), 'unexpected WARNING about missing escalation_queue when queue is present'
 
-    @pytest.mark.parametrize('role_name', ['judge', 'reviewer_comprehensive', 'steward'])
+    @pytest.mark.parametrize('role_name', ['judge', 'reviewer_comprehensive', 'steward', 'deep_reviewer'])
     def test_no_warning_for_non_escalation_capable_role(self, caplog, role_name):
         """No WARNING is emitted for roles that do not use escalation tools."""
         wf = _make_workflow(escalation_queue=None)
@@ -113,17 +113,12 @@ class TestEscalationCapableRolesDerivation:
         requires a deliberate update here — a re-derived expected would be a
         tautology that can never fail.
 
-        'steward' is excluded by the dispatcher carve-out even though it carries
-        _ESCALATION_TOOLS; every member must also be a valid ROLES entry.
+        'steward' and 'deep_reviewer' are excluded by the dispatcher carve-out
+        even though they carry _ESCALATION_TOOLS; every member must also be a
+        valid ROLES entry.
         """
-        expected = frozenset({'architect', 'implementer', 'debugger', 'merger', 'deep_reviewer'})
-        missing = expected - _ESCALATION_CAPABLE_ROLES
-        extra = _ESCALATION_CAPABLE_ROLES - expected
-        assert expected == _ESCALATION_CAPABLE_ROLES, (
-            f'_ESCALATION_CAPABLE_ROLES {_ESCALATION_CAPABLE_ROLES!r} '
-            f'!= expected {expected!r}; '
-            f'missing: {missing!r}, extra: {extra!r}'
-        )
+        expected = frozenset({'architect', 'implementer', 'debugger', 'merger'})
+        assert expected == _ESCALATION_CAPABLE_ROLES
         assert 'steward' not in _ESCALATION_CAPABLE_ROLES, (
             "'steward' must not be in _ESCALATION_CAPABLE_ROLES (TaskSteward dispatcher carve-out)"
         )
