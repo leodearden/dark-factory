@@ -1455,3 +1455,72 @@ def _parse_decision(
         latency_ms=latency_ms,
         cost_usd=agent_result.cost_usd,
     )
+
+
+def _parse_batch_decisions(
+    agent_result: AgentResult,
+    *,
+    pools: list[list[_PoolEntry]],
+    pool_sizes_list: list[dict[str, int]],
+    latency_ms: int,
+) -> list[CuratorDecision]:
+    """Parse a batched LLM response into one :class:`CuratorDecision` per candidate.
+
+    The model may return decisions out of order; we re-index by ``candidate_index``.
+    Per-item parse failures degrade only that item to ``action='create'``; other
+    items are unaffected.  Whole-batch structural failures degrade ALL items.
+    """
+    n = len(pools)
+    cost_per_item = (agent_result.cost_usd or 0.0) / max(n, 1)
+
+    # Try to extract the decisions list from structured_output or raw JSON.
+    raw_decisions: list[Any] | None = None
+    try:
+        so = agent_result.structured_output
+        if isinstance(so, dict) and isinstance(so.get('decisions'), list):
+            raw_decisions = so['decisions']
+        else:
+            parsed = json.loads(agent_result.output or '{}')
+            if isinstance(parsed, dict) and isinstance(parsed.get('decisions'), list):
+                raw_decisions = parsed['decisions']
+    except Exception:
+        pass
+
+    # Build a lookup from candidate_index → raw dict.
+    index_to_raw: dict[int, dict] = {}
+    if raw_decisions is not None:
+        for item in raw_decisions:
+            if isinstance(item, dict):
+                idx = item.get('candidate_index')
+                if isinstance(idx, int) and 0 <= idx < n:
+                    index_to_raw[idx] = item
+
+    results: list[CuratorDecision] = []
+    for i in range(n):
+        if i not in index_to_raw:
+            results.append(CuratorDecision(
+                action='create',
+                justification='batch-item-missing',
+                pool_sizes=pool_sizes_list[i] if i < len(pool_sizes_list) else {},
+                latency_ms=latency_ms,
+                cost_usd=cost_per_item,
+            ))
+            continue
+        try:
+            decision = _parse_decision_dict(
+                index_to_raw[i],
+                pool=pools[i],
+                pool_sizes=pool_sizes_list[i] if i < len(pool_sizes_list) else {},
+                latency_ms=latency_ms,
+                cost_usd=cost_per_item,
+            )
+        except Exception as exc:  # noqa: BLE001
+            decision = CuratorDecision(
+                action='create',
+                justification=f'batch-item-parse-failed: {exc}',
+                pool_sizes=pool_sizes_list[i] if i < len(pool_sizes_list) else {},
+                latency_ms=latency_ms,
+                cost_usd=cost_per_item,
+            )
+        results.append(decision)
+    return results
