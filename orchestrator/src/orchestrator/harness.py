@@ -962,6 +962,12 @@ Output JSON matching the schema. Every task must appear in the output.
                         ' (stale-lock); continuing',
                         tid, exc_info=True,
                     )
+                # Unconditionally unlink the stale lock so the next sweep
+                # doesn't re-encounter it.  If cleanup_worktree succeeded the
+                # whole worktree dir is gone and this is a cheap no-op;
+                # if cleanup failed we still guarantee the lock is cleared.
+                with contextlib.suppress(OSError):
+                    lock_path.unlink(missing_ok=True)
             else:
                 # Plan will be resumed — preserve worktree, only clear stale lock.
                 with contextlib.suppress(OSError):

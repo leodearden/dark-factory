@@ -431,6 +431,54 @@ class TestReconcileStrandedInProgress:
         # Task must be reverted to pending
         harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
 
+    async def test_stale_lock_unlinked_when_cleanup_worktree_raises(
+        self, harness: Harness, monkeypatch, caplog
+    ):
+        """Stale lock must be unlinked even when cleanup_worktree raises (Gap 3).
+
+        If cleanup_worktree fails (e.g., permission error on the worktree dir),
+        the plan.lock file must still be removed before the task is reverted to
+        pending.  Without the fix, a subsequent reconcile sweep would re-encounter
+        the lock, find its owner dead again, and loop forever.
+        """
+        tid = 40
+        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
+            {'id': tid, 'status': 'in-progress'},
+        ]
+        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
+
+        # Create worktree with a plan.lock referencing a synthetic dead PID
+        lock_dir = harness.git_ops.worktree_base / str(tid) / '.task'
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': f'{tid}-dead',
+            'locked_at': '2026-01-01T00:00:00+00:00',
+            'owner_pid': 99999,
+        }))
+        worktree_path = harness.git_ops.worktree_base / str(tid)
+
+        # Make cleanup_worktree raise so we exercise the except-branch
+        harness.git_ops.cleanup_worktree = AsyncMock(side_effect=OSError('boom'))  # type: ignore[attr-defined]
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._reconcile_stranded_in_progress()
+
+        # cleanup_worktree must have been attempted
+        harness.git_ops.cleanup_worktree.assert_called_once_with(worktree_path, str(tid))  # type: ignore[attr-defined]
+        # Task must still be reverted to pending despite cleanup failure
+        harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
+        # Lock must be gone — the unlink must happen unconditionally after cleanup
+        assert not lock_path.exists(), 'plan.lock must be unlinked even when cleanup_worktree raises'
+        # Cleanup-failure WARNING must be present in logs
+        matching = [
+            r for r in caplog.records
+            if re.search(r'cleanup_worktree failed.*40.*stale-lock', r.message, re.IGNORECASE)
+        ]
+        assert len(matching) >= 1, (
+            f'Expected cleanup-failure WARNING in harness logs, got: {[r.message for r in caplog.records]}'
+        )
+
     async def test_unexpected_exception_propagates_out_of_reconcile(
         self, harness: Harness
     ):
