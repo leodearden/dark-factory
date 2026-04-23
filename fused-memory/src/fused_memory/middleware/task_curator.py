@@ -717,7 +717,49 @@ class TaskCurator:
             return []
         if len(candidates) == 1:
             return [await self.curate(candidates[0], project_id, project_root)]
-        raise NotImplementedError('curate_batch N>1 not yet implemented')
+
+        # N>1: build per-candidate corpus, call the batched LLM, cache results.
+        start = time.monotonic()
+        pools: list[list[_PoolEntry]] = []
+        pool_sizes_list: list[dict[str, int]] = []
+        for candidate in candidates:
+            try:
+                pool, pool_sizes = await self._build_corpus(
+                    candidate, project_id, project_root,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'task_curator: corpus assembly failed for candidate %r, '
+                    'continuing with empty pool: %s',
+                    candidate.title,
+                    exc,
+                    exc_info=True,
+                )
+                pool = []
+                pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            pools.append(pool)
+            pool_sizes_list.append(pool_sizes)
+
+        try:
+            decisions = await self._call_llm_batch(
+                candidates, pools, pool_sizes_list, start, project_id, project_root,
+            )
+        except (CuratorFailureError, AllAccountsCappedException) as exc:
+            logger.warning(
+                'curate_batch: whole-batch LLM failed (%s), falling back to '
+                '%d size-1 curate calls',
+                exc,
+                len(candidates),
+            )
+            return [
+                await self.curate(c, project_id, project_root) for c in candidates
+            ]
+
+        # Cache each decision so subsequent identical candidates hit the idempotency path.
+        for candidate, decision in zip(candidates, decisions):
+            self._store_cache(candidate.payload_hash(), decision)
+
+        return decisions
 
     async def record_task(
         self,
