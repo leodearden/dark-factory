@@ -229,8 +229,10 @@ class EscalationQueue:
     def make_id(self, task_id: str) -> str:
         """Generate a unique escalation ID.
 
-        Scans existing files to avoid overwriting resolved escalations
-        from prior process runs (the in-memory counter resets on restart).
+        Scans existing files in both the queue root and the archive
+        subdirectory to avoid reusing sequence numbers from escalations
+        that have been archived after resolution (the in-memory counter
+        resets on process restart, so we must re-derive max_seq from disk).
         """
         prefix = f'esc-{task_id}-'
         max_seq = 0
@@ -238,5 +240,13 @@ class EscalationQueue:
             suffix = path.stem[len(prefix):]
             with contextlib.suppress(ValueError):
                 max_seq = max(max_seq, int(suffix))
+        # Also scan the archive so post-restart calls don't return IDs
+        # already used by archived escalations for the same task.
+        archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
+        if archive_root.exists():
+            for path in archive_root.rglob(f'{prefix}*.json'):
+                suffix = path.stem[len(prefix):]
+                with contextlib.suppress(ValueError):
+                    max_seq = max(max_seq, int(suffix))
         seq = max(max_seq + 1, self._next_seq())
         return f'{prefix}{seq}'
