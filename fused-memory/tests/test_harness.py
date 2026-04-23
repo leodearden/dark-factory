@@ -1841,6 +1841,51 @@ class TestHarnessFetchFilteredTaskTree:
         assert result.active_tasks == []
         harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
 
+    @pytest.mark.asyncio
+    async def test_fetch_filtered_task_tree_rejects_non_absolute_project_root(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """_fetch_filtered_task_tree pre-checks that project_root is absolute.
+
+        When a non-absolute (relative) path is passed:
+        (a) returns an empty FilteredTaskTree (degrades gracefully),
+        (b) does NOT call taskmaster.get_tasks (pre-check short-circuits before
+            any network call),
+        (c) emits a WARNING containing the distinct marker 'non-absolute
+            project_root' and the rejected path repr so operators can grep
+            production logs to identify the failure mode.
+        """
+        import logging
+
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        with caplog.at_level(logging.WARNING):
+            result = await harness._fetch_filtered_task_tree('.')
+
+        # (a) graceful degradation — empty tree, no exception raised
+        assert isinstance(result, FilteredTaskTree)
+        assert result.active_tasks == []
+        assert result.total_count == 0
+
+        # (b) taskmaster.get_tasks must NOT be called (pre-check short-circuit)
+        harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
+
+        # (c) distinct WARNING marker present in logs
+        warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'non-absolute project_root' in msg and "'.'".replace("'", '') in msg.replace("'", '')
+            for msg in warning_msgs
+        ), (
+            f"Expected WARNING containing 'non-absolute project_root' and the rejected path '.'; "
+            f"got: {warning_msgs}"
+        )
+
 
 # ── Tests for task 455: harness wires filtered_task_tree into stages ──────────
 
