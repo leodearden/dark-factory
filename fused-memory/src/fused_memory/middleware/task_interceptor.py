@@ -1851,6 +1851,189 @@ class TaskInterceptor:
 
         self._signal_ticket_event(ticket_id)
 
+    async def _process_add_tickets_batch(self, ticket_ids: list[str]) -> None:
+        """Run the full curator + write pipeline for a batch of tickets.
+
+        Calls ``curator.curate_batch`` once for all candidates, then dispatches
+        each per-ticket decision under a single ``_curator_lock`` acquisition
+        (R3 invariant).  All tickets in a batch must share the same project_id
+        (guaranteed by the per-project queue draining in ``_curator_worker``).
+
+        Terminal status values written (per ticket):
+        - ``created``  — task was created via ``tm.add_task``
+        - ``combined`` — candidate was folded into an existing task (drop/combine)
+        - ``failed``   — an unrecoverable error occurred for that ticket
+
+        Per-ticket failures are isolated: one ticket failing does not prevent
+        other tickets from being processed.
+        """
+        if self._ticket_store is None:
+            return
+        if not ticket_ids:
+            return
+
+        # ── Load and validate all tickets ─────────────────────────────────────
+        # Build per-ticket data; skip missing or already-terminal rows.
+        ticket_data: list[tuple[str, dict, dict, str, dict, Any, CandidateTask | None]] = []
+        # (ticket_id, row, blob, project_root, kwargs, metadata, candidate)
+
+        project_id: str | None = None
+        project_root: str | None = None
+
+        for ticket_id in ticket_ids:
+            row = await self._ticket_store.get(ticket_id)
+            if row is None:
+                logger.warning(
+                    '_process_add_tickets_batch: ticket %s not found in store, skipping',
+                    ticket_id,
+                )
+                continue
+            if row['status'] != 'pending':
+                logger.warning(
+                    '_process_add_tickets_batch: ticket %s already terminal (%s), skipping',
+                    ticket_id, row['status'],
+                )
+                continue
+
+            try:
+                blob = json.loads(row['candidate_json'])
+            except Exception:
+                logger.exception(
+                    '_process_add_tickets_batch: bad candidate_json for %s', ticket_id,
+                )
+                await self._ticket_store.mark_resolved(
+                    ticket_id, status='failed', reason='bad_candidate_json',
+                )
+                self._signal_ticket_event(ticket_id)
+                continue
+
+            t_project_root: str = blob['project_root']
+            t_kwargs: dict = dict(blob.get('kwargs', {}))
+            t_metadata = blob.get('metadata')
+            t_project_id = resolve_project_id(t_project_root)
+
+            # All tickets in the batch must share project_id (per-project queue invariant).
+            if project_id is None:
+                project_id = t_project_id
+                project_root = t_project_root
+            elif t_project_id != project_id:
+                logger.warning(
+                    '_process_add_tickets_batch: ticket %s has project_id=%s, '
+                    'expected %s; skipping',
+                    ticket_id, t_project_id, project_id,
+                )
+                continue
+
+            # Rebuild candidate for curator.
+            kwargs_for_candidate = dict(t_kwargs)
+            if t_metadata is not None:
+                kwargs_for_candidate['metadata'] = t_metadata
+            candidate = self._build_candidate(kwargs_for_candidate)
+
+            ticket_data.append((
+                ticket_id, row, blob, t_project_root, t_kwargs, t_metadata, candidate,
+            ))
+
+        if not ticket_data or project_id is None or project_root is None:
+            return
+
+        # ── Curator + dispatch under a single curator_lock ─────────────────────
+        async with self._curator_lock(project_id):
+            # Get curator once for the whole batch.
+            curator = await self._get_curator()
+
+            # Build candidates list for curate_batch.
+            candidates: list[CandidateTask | None] = [
+                entry[6] for entry in ticket_data
+            ]
+            non_none_candidates = [c for c in candidates if c is not None]
+
+            # Call curate_batch — one LLM round-trip for all candidates.
+            decisions: list[CuratorDecision | None]
+            if curator is not None and non_none_candidates:
+                try:
+                    batch_decisions = await curator.curate_batch(
+                        non_none_candidates, project_id, project_root,
+                    )
+                    # Map decisions back to candidate indices (some may be None).
+                    batch_idx = 0
+                    decisions = []
+                    for c in candidates:
+                        if c is None:
+                            decisions.append(None)
+                        else:
+                            decisions.append(
+                                batch_decisions[batch_idx] if batch_idx < len(batch_decisions)
+                                else None
+                            )
+                            batch_idx += 1
+                except Exception:
+                    logger.exception(
+                        '_process_add_tickets_batch: curate_batch failed for project %s; '
+                        'degrading all %d candidates to create',
+                        project_id, len(non_none_candidates),
+                    )
+                    decisions = [None] * len(ticket_data)
+            else:
+                decisions = [None] * len(ticket_data)
+
+            # ── Dispatch each ticket ───────────────────────────────────────────
+            for i, (ticket_id, row, blob, t_project_root, t_kwargs, t_metadata, candidate) in enumerate(ticket_data):
+                decision = decisions[i] if i < len(decisions) else None
+
+                status = 'failed'
+                task_id: str | None = None
+                reason: str | None = None
+                result_dict: dict | None = None
+
+                try:
+                    status, task_id, reason, result_dict, _ = (
+                        await self._dispatch_ticket_decision(
+                            ticket_id=ticket_id,
+                            project_root=t_project_root,
+                            project_id=project_id,
+                            candidate=candidate,
+                            decision=decision,
+                            kwargs=t_kwargs,
+                            metadata=t_metadata,
+                            curator=curator,
+                        )
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.exception(
+                        '_process_add_tickets_batch: dispatch failed for ticket %s',
+                        ticket_id,
+                    )
+                    status = 'failed'
+                    reason = str(exc)
+                    task_id = None
+                    result_dict = None
+
+                # Persist terminal state.
+                await asyncio.shield(
+                    self._ticket_store.mark_resolved(
+                        ticket_id,
+                        status=status,
+                        task_id=task_id,
+                        reason=reason,
+                        result_json=json.dumps(result_dict) if result_dict is not None else None,
+                    )
+                )
+
+                # Emit journal event and schedule commit (create path only).
+                if status == 'created' and task_id:
+                    event = self._make_event(
+                        EventType.task_created,
+                        t_project_root,
+                        {'operation': 'add_task', 'task_id': task_id},
+                    )
+                    await self._journal(event)
+                    self._schedule_commit(t_project_root, 'add_task')
+
+                self._signal_ticket_event(ticket_id)
+
     def _signal_ticket_event(self, ticket_id: str) -> None:
         """Wake all callers waiting on resolve_ticket for this ticket.
 
