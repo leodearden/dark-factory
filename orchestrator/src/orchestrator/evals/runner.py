@@ -602,6 +602,14 @@ class _StubMcpSession:
             status = arguments['status']
             self._statuses[task_id] = status
             return self._envelope(json.dumps({'id': task_id, 'status': status}))
+        if name == 'get_task':
+            task_id = arguments['id']
+            status = self._statuses.get(task_id)
+            if status is not None:
+                payload = {'id': task_id, 'status': status}
+            else:
+                payload = {'id': task_id}
+            return self._envelope(json.dumps(payload))
         raise NotImplementedError(f'_StubMcpSession: tool {name!r} not implemented')
 
 
