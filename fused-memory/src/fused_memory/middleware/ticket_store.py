@@ -178,6 +178,15 @@ class TicketStore:
     async def sweep_expired(self, now: datetime | None = None) -> int:
         """Mark pending tickets past their ``expires_at`` as failed/expired.
 
+        Called once by :meth:`TaskInterceptor.start` at server startup so any
+        tickets whose TTL elapsed while the server was offline are immediately
+        cleaned up.  It is NOT called periodically during steady-state: tickets
+        submitted during a run that the worker never processes (e.g. worker
+        cancelled before picking them up) accumulate as ``pending`` until the
+        next restart.  Callers that need strict TTL enforcement during a
+        long-running process should call ``sweep_expired`` periodically from an
+        application-level background task.
+
         Returns the number of rows updated.
         """
         if now is None:

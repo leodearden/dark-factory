@@ -161,41 +161,48 @@ async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmas
 async def test_add_task_facade_delegates_to_submit_and_resolve(
     interceptor_facade, taskmaster,
 ):
-    """add_task facade calls submit_task then resolve_ticket in order,
+    """add_task facade calls submit_task then _resolve_ticket_raw in order,
     passing the ticket from submit to resolve with a 115s timeout.
+
+    The facade calls the internal _resolve_ticket_raw (not the public resolve_ticket)
+    so it gets both the public result and the raw row in one DB read.
     """
     submit_calls = []
-    resolve_calls = []
+    resolve_raw_calls = []
     original_submit = interceptor_facade.submit_task
-    original_resolve = interceptor_facade.resolve_ticket
+    original_resolve_raw = interceptor_facade._resolve_ticket_raw
 
     async def spy_submit(*args, **kwargs):
         submit_calls.append({'args': args, 'kwargs': kwargs})
         return await original_submit(*args, **kwargs)
 
-    async def spy_resolve(*args, **kwargs):
-        resolve_calls.append({'args': args, 'kwargs': kwargs})
-        return await original_resolve(*args, **kwargs)
+    async def spy_resolve_raw(*args, **kwargs):
+        resolve_raw_calls.append({'args': args, 'kwargs': kwargs})
+        return await original_resolve_raw(*args, **kwargs)
 
     interceptor_facade.submit_task = spy_submit
-    interceptor_facade.resolve_ticket = spy_resolve
+    interceptor_facade._resolve_ticket_raw = spy_resolve_raw
 
     await interceptor_facade.add_task(project_root='/p', title='T')
 
     # submit_task called once
     assert len(submit_calls) == 1, f'submit_task should be called once: {submit_calls}'
-    # resolve_ticket called once
-    assert len(resolve_calls) == 1, f'resolve_ticket should be called once: {resolve_calls}'
-    # resolve_ticket should receive the ticket id from submit and timeout=115
-    resolve_entry = resolve_calls[0]
+    # _resolve_ticket_raw called once
+    assert len(resolve_raw_calls) == 1, (
+        f'_resolve_ticket_raw should be called once: {resolve_raw_calls}'
+    )
+    # _resolve_ticket_raw should receive the ticket id from submit and timeout=115
+    resolve_entry = resolve_raw_calls[0]
     r_args = resolve_entry['args']
     r_kwargs = resolve_entry['kwargs']
     ticket = r_args[0] if r_args else r_kwargs.get('ticket')
     assert ticket is not None and ticket.startswith('tkt_'), (
-        f'resolve_ticket first arg should be the ticket id: {resolve_entry}'
+        f'_resolve_ticket_raw first arg should be the ticket id: {resolve_entry}'
     )
-    timeout = r_kwargs.get('timeout_seconds', r_args[2] if len(r_args) > 2 else None)
-    assert timeout == 115, f'resolve_ticket should be called with timeout_seconds=115: {resolve_entry}'
+    timeout = r_kwargs.get('timeout_seconds', r_args[1] if len(r_args) > 1 else None)
+    assert timeout == 115, (
+        f'_resolve_ticket_raw should be called with timeout_seconds=115: {resolve_entry}'
+    )
 
 
 @pytest.mark.asyncio
@@ -267,12 +274,13 @@ async def test_add_task_facade_timeout_raises_no_fallback(interceptor_facade, ta
     """
     from unittest.mock import patch
 
-    # Patch resolve_ticket to return a timeout result.
-    async def _fake_resolve(ticket, project_root, timeout_seconds=None):
-        return {'status': 'failed', 'reason': 'timeout', 'task_id': None}
+    # Patch _resolve_ticket_raw (called by the facade) to return a timeout sentinel.
+    # It returns (public_result, raw_row) — raw_row is None for sentinel outcomes.
+    async def _fake_resolve_raw(ticket, timeout_seconds=None):
+        return ({'status': 'failed', 'reason': 'timeout', 'task_id': None}, None)
 
     with (
-        patch.object(interceptor_facade, 'resolve_ticket', side_effect=_fake_resolve),
+        patch.object(interceptor_facade, '_resolve_ticket_raw', side_effect=_fake_resolve_raw),
         pytest.raises(RuntimeError) as exc_info,
     ):
         await interceptor_facade.add_task('/project', prompt='Timeout test')

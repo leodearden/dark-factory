@@ -151,9 +151,10 @@ class TaskInterceptor:
         # Per-project asyncio.Task handles for the curator workers.  Keyed by
         # project_id, lazily started on first submit_task for that project.
         self._worker_tasks: dict[str, asyncio.Task] = {}
-        # Per-ticket asyncio.Events: resolve_ticket registers one so the
-        # worker can wake a waiting caller the moment a ticket is terminal.
-        self._ticket_events: dict[str, asyncio.Event] = {}
+        # Per-ticket asyncio.Event lists: resolve_ticket appends one per caller
+        # so multiple concurrent waiters (e.g. reconnect/retry patterns) each
+        # get their own event.  _signal_ticket_event sets and removes all of them.
+        self._ticket_events: dict[str, list[asyncio.Event]] = {}
         # Tracks which project_ids have already received a DeprecationWarning
         # from the add_task facade so we only warn once per project.
         self._deprecation_warned_projects: set[str] = set()
@@ -293,9 +294,10 @@ class TaskInterceptor:
         # Wake all resolve_ticket callers that are waiting on an event so they
         # don't block forever after the worker has been cancelled.  The callers
         # will re-read the ticket row (still 'pending') and return the
-        # {status: failed, reason: timeout} sentinel.
-        for event in list(self._ticket_events.values()):
-            event.set()
+        # {status: failed, reason: server_closed} sentinel.
+        for events in list(self._ticket_events.values()):
+            for event in events:
+                event.set()
 
         await self.drain()
         if self._curator is not None:
@@ -1078,6 +1080,18 @@ class TaskInterceptor:
 
         Returns ``{'ticket': 'tkt_<id>'}`` so callers can poll or block via
         ``resolve_ticket``. Does NOT call ``tm.add_task``.
+
+        Cancellation caveat
+        -------------------
+        If ``close()`` cancels the worker while ``tm.add_task`` is already
+        mid-flight, the task may be written to ``tasks.json`` but the ticket
+        row stays ``pending`` (the worker was interrupted before
+        ``mark_resolved``).  On the next ``start()``, that ticket is marked
+        ``failed/server_restart`` — a caller that retries without passing
+        ``escalation_id`` + ``suggestion_hash`` metadata may therefore create a
+        duplicate.  Callers in contexts where duplication is unacceptable
+        should supply idempotency metadata so the R4 gate short-circuits the
+        retry.
         """
         if self._closed:
             return {'error': 'TaskInterceptor is closed; cannot submit new tasks', 'error_type': 'ClosedError'}
@@ -1119,61 +1133,59 @@ class TaskInterceptor:
         self._start_worker_if_needed(project_id)
         return {'ticket': ticket_id}
 
-    async def resolve_ticket(
+    async def _resolve_ticket_raw(
         self,
         ticket: str,
-        project_root: str,
         timeout_seconds: float | None = None,
-    ) -> dict:
-        """Phase-2 of the two-phase add: block until the worker decides.
+    ) -> tuple[dict, dict | None]:
+        """Core resolve logic shared by ``resolve_ticket`` and the ``add_task`` facade.
 
-        If the ticket is already terminal, returns immediately.  Otherwise
-        registers an asyncio.Event keyed on *ticket* and awaits it (optionally
-        with *timeout_seconds*).  On timeout, returns a synthetic failed dict
-        WITHOUT mutating the ticket row — the worker may still resolve it later,
-        and the TTL sweep cleans truly abandoned rows.
+        Returns ``(public_result, raw_row)`` where:
 
-        Returns ``{status, task_id?, reason?}`` — does NOT expose ``result_json``.
+        - *public_result* is ``{status, task_id?, reason?}`` suitable for MCP
+          callers.
+        - *raw_row* is the full ticket-store row dict (including ``result_json``)
+          when the ticket reached a terminal state, or ``None`` for sentinel
+          outcomes (unknown ticket, timeout, store not configured, server-closed).
+
+        Exposing *raw_row* lets the :meth:`add_task` facade reconstruct the
+        legacy result dict without a second SQLite round-trip.
 
         Lost-wakeup safety
         ------------------
-        The event is registered in ``_ticket_events`` BEFORE the first
-        ``ticket_store.get()`` call.  This closes the race where the worker
-        calls ``_signal_ticket_event`` between our terminal-status check and
-        our event registration: if that happens, ``_signal_ticket_event`` finds
-        the already-registered event and sets it, so the subsequent
-        ``event.wait()`` returns immediately instead of hanging.
+        The per-ticket :class:`asyncio.Event` is registered in
+        ``_ticket_events`` BEFORE the first ``ticket_store.get()`` call so the
+        worker cannot signal between the terminal-status check and the event
+        registration.
 
-        Cleanup is centralised in a single ``finally`` block that runs on
-        every exit path (unknown, terminal-found, wait-success, timeout).
-        ``_signal_ticket_event`` may have already popped the key; the
-        ``pop(…, None)`` is a harmless no-op in that case.
+        Multiple waiters
+        ----------------
+        Multiple concurrent callers may await the same ticket; each appends its
+        own event to the per-ticket list so no caller's ``event.wait()`` is
+        stranded by a later registration.  ``_signal_ticket_event`` sets and
+        removes all events atomically.
 
-        Single-waiter constraint
-        ------------------------
-        Only ONE caller may await a given ticket at a time.  A second
-        concurrent ``resolve_ticket`` call for the same ticket will overwrite
-        the first caller's event in ``_ticket_events``, leaving the first
-        caller's ``event.wait()`` stranded.  This is unlikely in normal use
-        (each MCP invocation gets its own ticket), but callers implementing
-        retry-on-reconnect or UI-polling patterns must not fan out multiple
-        concurrent ``resolve_ticket`` calls for the same ``ticket`` id.
+        Cleanup is centralised in a single ``finally`` block that removes just
+        *this* event from the list (leaving other waiters' events untouched).
         """
         if self._ticket_store is None:
-            return {'status': 'failed', 'reason': 'ticket_store not configured', 'task_id': None}
+            return (
+                {'status': 'failed', 'reason': 'ticket_store not configured', 'task_id': None},
+                None,
+            )
 
-        # (1) Register the event BEFORE reading the row.
+        # (1) Register the event BEFORE reading the row (lost-wakeup safety).
         event = asyncio.Event()
-        self._ticket_events[ticket] = event
+        self._ticket_events.setdefault(ticket, []).append(event)
         try:
             # (2) Read the ticket row.
             row = await self._ticket_store.get(ticket)
             if row is None:
-                return {'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None}
+                return ({'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None}, None)
 
             # (3) Terminal already — return immediately (finally cleans up).
             if row['status'] != 'pending':
-                return _format_ticket_result(row)
+                return (_format_ticket_result(row), row)
 
             # (4) Still pending — wait for the worker to signal.  The event
             # may already be set if the worker raced us between steps (1) and (2).
@@ -1183,23 +1195,55 @@ class TaskInterceptor:
                 else:
                     await event.wait()
             except TimeoutError:
-                return {'status': 'failed', 'reason': 'timeout', 'task_id': None}
+                return ({'status': 'failed', 'reason': 'timeout', 'task_id': None}, None)
 
             # (5) Re-load the (hopefully) now-terminal row.
             row = await self._ticket_store.get(ticket)
             if row is None:
-                return {'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None}
+                return ({'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None}, None)
             # Guard: if the row is still 'pending' after the event was set, the
             # worker was cancelled (close()) or raised before mark_resolved could
             # run.  Return a server_closed failure so the caller always receives a
             # terminal response — never a 'pending' state that could loop.
             if row['status'] == 'pending':
-                return {'status': 'failed', 'reason': 'server_closed', 'task_id': None}
-            return _format_ticket_result(row)
+                return ({'status': 'failed', 'reason': 'server_closed', 'task_id': None}, None)
+            return (_format_ticket_result(row), row)
         finally:
-            # (6) Uniform cleanup: remove the event on every exit path.
-            # _signal_ticket_event may have already popped it — no-op if so.
-            self._ticket_events.pop(ticket, None)
+            # (6) Remove just this event from the per-ticket list; others stay.
+            # _signal_ticket_event may have already popped the entire list —
+            # the get() + remove() is a harmless no-op in that case.
+            evs = self._ticket_events.get(ticket)
+            if evs is not None:
+                try:
+                    evs.remove(event)
+                except ValueError:
+                    pass  # already removed by _signal_ticket_event
+                if not evs:
+                    self._ticket_events.pop(ticket, None)
+
+    async def resolve_ticket(
+        self,
+        ticket: str,
+        project_root: str,
+        timeout_seconds: float | None = None,
+    ) -> dict:
+        """Phase-2 of the two-phase add: block until the worker decides.
+
+        If the ticket is already terminal, returns immediately.  Otherwise
+        registers an asyncio.Event and awaits it (optionally with
+        *timeout_seconds*).  On timeout, returns a synthetic failed dict
+        WITHOUT mutating the ticket row — the worker may still resolve it later,
+        and the TTL sweep cleans truly abandoned rows.
+
+        Returns ``{status, task_id?, reason?}`` — does NOT expose ``result_json``.
+
+        Multiple concurrent callers may await the same ticket; each receives
+        its own event so no caller is stranded by a later registration.
+
+        See :meth:`_resolve_ticket_raw` for implementation details.
+        """
+        result, _ = await self._resolve_ticket_raw(ticket, timeout_seconds)
+        return result
 
     def _start_worker_if_needed(self, project_id: str) -> None:
         """Lazily start the per-project curator worker asyncio.Task if not running.
@@ -1211,8 +1255,17 @@ class TaskInterceptor:
         Workers are intentionally NOT added to ``_background_tasks``: they are
         long-running infinite-loop tasks.  Adding them would cause ``drain()``
         to block forever.  Lifecycle is managed explicitly by ``close()``.
+
+        TOCTOU safety: ``_closed`` is re-checked here (not only in
+        ``submit_task``) so a worker created in the window between
+        ``submit_task``'s closed check and ``close()`` completing is never
+        left running untracked.  When closed, we simply don't start a new
+        worker; the already-queued ticket will be marked
+        ``failed/server_restart`` by the next ``start()`` call.
         """
         if self._ticket_store is None:
+            return
+        if self._closed:
             return
         existing = self._worker_tasks.get(project_id)
         if existing is None or existing.done():
@@ -1375,14 +1428,7 @@ class TaskInterceptor:
                     combine_result = await self._execute_combine(project_root, decision)
                 if combine_result is not None:
                     if decision.rewritten_task is not None and curator is not None:
-                        rt = decision.rewritten_task
-                        rt_candidate = CandidateTask(
-                            title=rt.title,
-                            description=rt.description,
-                            details=rt.details,
-                            files_to_modify=rt.files_to_modify,
-                            priority=rt.priority,
-                        )
+                        rt_candidate = CandidateTask.from_rewritten_task(decision.rewritten_task)
                         bg = asyncio.create_task(
                             curator.reembed_task(
                                 decision.target_id, rt_candidate, project_id,
@@ -1436,15 +1482,24 @@ class TaskInterceptor:
                 if isinstance(result, dict):
                     task_id_str = str(result.get('id', ''))
 
-                # ── Latch success immediately — post-create errors must NOT
-                # downgrade this to 'failed'.  Once tm.add_task returns, the
-                # task exists in tasks.json; marking the ticket 'failed' would
-                # strand the task and cause duplicate-on-retry.
-                task_id = task_id_str or None
-                status = 'created'
-                result_dict = result if isinstance(result, dict) else {}
-                if curator_degrade_reason is not None:
-                    result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
+                if not task_id_str:
+                    # tm.add_task returned a non-dict result or a dict without 'id'.
+                    # Reserves 'created' for the case where a usable task_id exists;
+                    # status='created' with task_id=None is semantically inconsistent
+                    # (the journal gate at L1519 silently skips it, but resolve_ticket
+                    # callers would get {status: 'created'} with no task_id — useless).
+                    reason = 'tm_add_task_returned_no_id'
+                    # status stays 'failed' (the initial default).
+                else:
+                    # ── Latch success immediately — post-create errors must NOT
+                    # downgrade this to 'failed'.  Once tm.add_task returns, the
+                    # task exists in tasks.json; marking the ticket 'failed' would
+                    # strand the task and cause duplicate-on-retry.
+                    task_id = task_id_str
+                    status = 'created'
+                    result_dict = result if isinstance(result, dict) else {}
+                    if curator_degrade_reason is not None:
+                        result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
 
                 if metadata_json and task_id_str and not atomic_metadata_written:
                     try:
@@ -1528,10 +1583,11 @@ class TaskInterceptor:
         self._signal_ticket_event(ticket_id)
 
     def _signal_ticket_event(self, ticket_id: str) -> None:
-        """Wake any caller waiting on resolve_ticket for this ticket."""
-        event = self._ticket_events.pop(ticket_id, None)
-        if event is not None:
-            event.set()
+        """Wake all callers waiting on resolve_ticket for this ticket."""
+        events = self._ticket_events.pop(ticket_id, None)
+        if events:
+            for event in events:
+                event.set()
 
     async def add_task(self, project_root: str, **kwargs: Any) -> dict:
         """Deprecated facade: submit a ticket then block until the worker decides.
@@ -1572,9 +1628,9 @@ class TaskInterceptor:
             return submit_result
 
         ticket = submit_result['ticket']
-        resolve_result = await self.resolve_ticket(
-            ticket, project_root, timeout_seconds=115,
-        )
+        # Use _resolve_ticket_raw so the facade receives the full ticket row
+        # (including result_json) in a single DB read — no second get() needed.
+        resolve_result, row = await self._resolve_ticket_raw(ticket, timeout_seconds=115)
 
         # Raise on timeout — no silent fallback.  Callers that need to
         # tolerate long waits should migrate to submit_task+resolve_ticket.
@@ -1589,17 +1645,16 @@ class TaskInterceptor:
 
         # Reconstruct the legacy result dict from result_json so in-flight
         # callers receive the same shape they observed before this rewrite.
-        if self._ticket_store is not None:
-            row = await self._ticket_store.get(ticket)
-            if row is not None and row.get('result_json'):
-                try:
-                    return json.loads(row['result_json'])
-                except Exception:
-                    logger.warning(
-                        'add_task facade: failed to decode result_json for %s', ticket,
-                    )
+        # ``row`` is already the terminal row — no second DB read.
+        if row is not None and row.get('result_json'):
+            try:
+                return json.loads(row['result_json'])
+            except Exception:
+                logger.warning(
+                    'add_task facade: failed to decode result_json for %s', ticket,
+                )
 
-        # Fallback: return what resolve_ticket gave us (status/task_id/reason).
+        # Fallback: return what _resolve_ticket_raw gave us (status/task_id/reason).
         return resolve_result
 
     async def update_task(
