@@ -1165,3 +1165,36 @@ class TestParseBatchDecisions:
         assert 'batch-item-missing' in result[1].justification
         assert result[2].action == 'create'
         assert result[2].justification == 'third'
+
+
+# ----------------------------------------------------------------------
+# TaskCurator._build_batch_user_prompt
+# ----------------------------------------------------------------------
+
+
+class TestBuildBatchUserPrompt:
+    def test_renders_per_candidate_sections_with_pools(self):
+        """Prompt contains a labelled block per candidate with its own pool."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        candidates = [
+            CandidateTask(title='Alpha task', description='do alpha'),
+            CandidateTask(title='Beta task', description='do beta'),
+        ]
+        pool0 = _pool_with_ids(('task-11', 'pending'), ('task-12', 'done'))
+        pool1 = _pool_with_ids(('task-99', 'in-progress'))
+
+        result = curator._build_batch_user_prompt(candidates, [pool0, pool1])
+
+        # Section headers
+        assert '# Candidate batch_index=0' in result
+        assert '# Candidate batch_index=1' in result
+        # Both candidate titles present
+        assert 'Alpha task' in result
+        assert 'Beta task' in result
+        # Pool task ids rendered for each candidate's pool
+        assert 'task-11' in result
+        assert 'task-12' in result
+        assert 'task-99' in result
+        # Final instruction line references 'decisions'
+        assert 'decisions' in result.lower()
