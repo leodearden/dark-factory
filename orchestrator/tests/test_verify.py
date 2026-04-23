@@ -8,8 +8,12 @@ import pytest
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
+    VerifyResult,
+    _aggregate_results,
     _apply_cargo_scope,
+    _extract_cause_hint,
     _run_cmd,
+    _scope_cargo_workspace,
     run_scoped_verification,
     run_verification,
     scope_module_config,
@@ -1030,3 +1034,594 @@ class TestApplyCargoScopePolyglotGuard:
         result = self._call_scoped(['Cargo.toml'])
         assert result.test_command == 'cargo test --workspace'
         assert result.lint_command == 'cargo clippy --workspace'
+
+
+class TestScopeCargoWorkspaceRewrite:
+    """Regression guards for `_scope_cargo_workspace` — the --workspace rewriter.
+
+    The fix that strips ``--exclude`` flags after rewriting ``--workspace`` →
+    ``-p <crate>`` landed in commit fd4758fcff.  These tests keep it from
+    regressing.  They invoke `_scope_cargo_workspace` directly (pure function,
+    no mocks needed).
+    """
+
+    # A1: single --exclude stripped
+    def test_single_exclude_stripped(self):
+        """A single ``--exclude foo`` is stripped after ``--workspace`` rewrite."""
+        cmd = 'cargo test --workspace --exclude foo -- --test-threads=1'
+        result = _scope_cargo_workspace(cmd, ['bar'])
+        assert result is not None
+        assert '-p bar' in result
+        assert '--workspace' not in result
+        assert '--exclude' not in result
+        assert 'foo' not in result  # the excluded crate name is gone too
+        assert '-- --test-threads=1' in result
+
+    # A2: three chained --exclude flags all stripped via the while-loop
+    def test_multiple_excludes_all_stripped(self):
+        """Three consecutive ``--exclude`` flags are all removed by the while-loop."""
+        cmd = (
+            'cargo test --workspace '
+            '--exclude alpha --exclude beta --exclude gamma '
+            '-- --test-threads=1'
+        )
+        result = _scope_cargo_workspace(cmd, ['delta'])
+        assert result is not None
+        assert '-p delta' in result
+        assert '--workspace' not in result
+        assert '--exclude' not in result
+        assert 'alpha' not in result
+        assert 'beta' not in result
+        assert 'gamma' not in result
+
+    # A3: --exclude=foo equals-form stripped
+    def test_exclude_equals_form_stripped(self):
+        """``--exclude=foo`` (equals-sign form) is also stripped."""
+        cmd = 'cargo test --workspace --exclude=foo -- --test-threads=1'
+        result = _scope_cargo_workspace(cmd, ['bar'])
+        assert result is not None
+        assert '-p bar' in result
+        assert '--workspace' not in result
+        assert '--exclude' not in result
+
+    # A4: full reify orchestrator.yaml 4-segment command
+    def test_reify_chained_command_rewrites_ungated_segments_only(self):
+        """Four-segment command: gated wrappers untouched, ungated segments rewritten.
+
+        This mirrors the real-world ``orchestrator.yaml`` test_command from the
+        reify project: two gated wrapper segments (no ``--workspace``) followed
+        by two ungated segments (with ``--workspace --exclude ...``).
+        Rewriting for ``crates=['reify-compiler']`` must:
+          - leave the gated segments byte-identical
+          - rewrite both ungated segments to ``-p reify-compiler``
+          - strip ALL ``--exclude`` flags from the ungated segments
+        """
+        gated_1 = (
+            './scripts/cargo-test-occt-gated.sh cargo test '
+            '-p reify-kernel-occt -p reify-eval -p reify-cli'
+        )
+        gated_2 = (
+            './scripts/cargo-test-occt-gated.sh cargo test '
+            '-p reify-kernel-occt-extra'
+        )
+        ungated_excludes = (
+            '--exclude reify-kernel-occt --exclude reify-eval '
+            '--exclude reify-cli --exclude reify-kernel-occt-extra'
+        )
+        ungated_1 = f'cargo test --workspace {ungated_excludes} -- --test-threads=1'
+        ungated_2 = f'cargo test --workspace {ungated_excludes} -- --test-threads=1'
+        cmd = f'{gated_1} && {gated_2} && {ungated_1} && {ungated_2}'
+
+        result = _scope_cargo_workspace(cmd, ['reify-compiler'])
+
+        assert result is not None
+        # Gated segments must be present verbatim
+        assert gated_1 in result, f'gated_1 missing from result: {result!r}'
+        assert gated_2 in result, f'gated_2 missing from result: {result!r}'
+        # Ungated segments must have been rewritten
+        assert '--workspace' not in result, f'--workspace still present: {result!r}'
+        assert '-p reify-compiler' in result
+        # Trailing args preserved in the rewritten segments
+        assert '-- --test-threads=1' in result
+
+    # A5: non-cargo --exclude in a chained command is NOT stripped
+    def test_non_cargo_exclude_not_stripped(self):
+        """A trailing ``npm test --exclude foo`` must not have its ``--exclude`` removed.
+
+        ``_CARGO_EXCLUDE_RE`` is anchored to ``cargo <subcmd>`` so it must not
+        bleed into adjacent non-cargo shell segments.
+        """
+        cmd = (
+            'cargo test --workspace --exclude some-crate -- --test-threads=1'
+            ' && npm test --exclude foo'
+        )
+        result = _scope_cargo_workspace(cmd, ['my-crate'])
+        assert result is not None
+        # The npm segment must be intact
+        assert 'npm test --exclude foo' in result, (
+            f'npm --exclude was incorrectly removed: {result!r}'
+        )
+        # But the cargo --exclude must be gone
+        # (the cargo segment is the only one _CARGO_EXCLUDE_RE touches)
+        # Split on '&&' to isolate the cargo part
+        cargo_part = result.split('&&')[0]
+        assert '--exclude' not in cargo_part, (
+            f'cargo --exclude not stripped from: {cargo_part!r}'
+        )
+
+    # A6: idempotency — already -p-scoped command returns byte-identical
+    def test_idempotent_on_already_scoped_command(self):
+        """Rewriting a command that is already ``-p``-scoped (no ``--workspace``) is a no-op."""
+        cmd = 'cargo test -p my-crate -- --test-threads=1'
+        result = _scope_cargo_workspace(cmd, ['my-crate'])
+        assert result == cmd, f'Expected unchanged cmd, got {result!r}'
+
+    # A7: no --exclude substring in the rewritten A4 cargo segments
+    def test_no_exclude_token_in_rewritten_ungated_segments(self):
+        """After rewrite, neither ``--exclude`` nor any excluded crate name appears in the ungated cargo segments."""
+        gated = (
+            './scripts/cargo-test-occt-gated.sh cargo test '
+            '-p reify-kernel-occt -p reify-eval -p reify-cli'
+        )
+        ungated = (
+            'cargo test --workspace '
+            '--exclude reify-kernel-occt --exclude reify-eval --exclude reify-cli '
+            '-- --test-threads=1'
+        )
+        cmd = f'{gated} && {ungated}'
+        result = _scope_cargo_workspace(cmd, ['reify-compiler'])
+
+        assert result is not None
+        # Split on && to isolate the rewritten cargo segment
+        segments = [s.strip() for s in result.split('&&')]
+        # The last segment is the rewritten ungated cargo test
+        rewritten = segments[-1]
+        assert '--exclude' not in rewritten, (
+            f'--exclude token found in rewritten segment: {rewritten!r}'
+        )
+
+
+class TestExtractCauseHint:
+    """Tests for the ``_extract_cause_hint(output: str) -> str`` helper.
+
+    These tests will *fail* until step 3 implements the helper — the import
+    itself triggers an ImportError on the current codebase.
+    """
+
+    # (a) cargo/clippy surface error → first ``error: …`` line returned
+    def test_cargo_error_line_returned(self):
+        """A cargo/clippy ``error: …`` line is detected and returned."""
+        output = (
+            'Compiling my-crate v0.1.0\n'
+            'error: --exclude can only be used together with --workspace\n'
+            'error[E0308]: mismatched types\n'
+            'Other noise\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == 'error: --exclude can only be used together with --workspace', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    # (b) Rust test runner FAILED line
+    def test_rust_test_failed_line_returned(self):
+        """A ``test my::mod::it FAILED`` line is detected and returned."""
+        output = (
+            'running 3 tests\n'
+            'test my::mod::passes ... ok\n'
+            'test my::mod::it FAILED\n'
+            'test my::mod::another ... ok\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == 'test my::mod::it FAILED', f'Unexpected hint: {hint!r}'
+
+    # (c) our own timeout message
+    def test_timeout_message_returned(self):
+        """``Command timed out after Ns: …`` is returned directly."""
+        output = 'Command timed out after 1800s: cargo test --workspace'
+        hint = _extract_cause_hint(output)
+        assert hint == 'Command timed out after 1800s: cargo test --workspace', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    # (d) flock/wrapper ERROR: line
+    def test_flock_error_line_returned(self):
+        """A flock/wrapper ``ERROR: …`` line is detected and returned."""
+        output = (
+            'Starting cargo test...\n'
+            'ERROR: cargo-test-occt-gated.sh: timed out\n'
+            'Cleanup done.\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == 'ERROR: cargo-test-occt-gated.sh: timed out', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    # (e) npm ERR! / npm error
+    def test_npm_err_line_returned(self):
+        """An ``npm ERR!`` line is detected and returned."""
+        output = (
+            'running build...\n'
+            'npm ERR! code ELIFECYCLE\n'
+            'npm ERR! errno 1\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert 'npm ERR!' in hint, f'Unexpected hint: {hint!r}'
+
+    def test_npm_error_lowercase_returned(self):
+        """An ``npm error …`` line (lowercase) is also detected."""
+        output = 'npm error peer dep missing: react@^18\n'
+        hint = _extract_cause_hint(output)
+        assert 'npm error' in hint, f'Unexpected hint: {hint!r}'
+
+    # (f) fallback — last non-blank line when no pattern matches
+    def test_fallback_last_nonblank_line(self):
+        """When no pattern matches, the last non-blank line is returned."""
+        output = 'Line one\nLine two\nLine three\n\n'
+        hint = _extract_cause_hint(output)
+        assert hint == 'Line three', f'Unexpected hint: {hint!r}'
+
+    # (g) empty / whitespace-only input → returns ''
+    def test_empty_input_returns_empty_string(self):
+        """Empty input returns ''."""
+        assert _extract_cause_hint('') == ''
+
+    def test_whitespace_only_returns_empty_string(self):
+        """Whitespace-only input returns ''."""
+        assert _extract_cause_hint('   \n\n\t  \n') == ''
+
+    # (h) a 500-char line is truncated to 200 chars
+    def test_long_line_truncated_to_200_chars(self):
+        """A line longer than 200 chars is capped at 200 characters."""
+        long_line = 'error: ' + 'x' * 500
+        output = long_line + '\n'
+        hint = _extract_cause_hint(output)
+        assert len(hint) == 200, f'Expected 200 chars, got {len(hint)}: {hint!r}'
+        assert hint == long_line[:200]
+
+    # (i) when multiple ``error:`` lines exist, the FIRST one is returned
+    def test_first_error_line_returned_when_multiple(self):
+        """When multiple ``error: …`` lines exist, the first one wins."""
+        output = (
+            'error: first error here\n'
+            'error: second error here\n'
+            'error: third error here\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == 'error: first error here', f'Unexpected hint: {hint!r}'
+
+
+class TestVerifyResultCauseHint:
+    """Tests for the ``cause_hint`` field on ``VerifyResult`` and its population.
+
+    Tests (a) will fail until step 5 adds ``cause_hint`` to ``VerifyResult``.
+    Tests (b)–(f) will also fail until step 5 wires hint population into
+    ``run_verification`` and ``_aggregate_results``.
+    """
+
+    # (a) VerifyResult accepts cause_hint kwarg with default ''
+    def test_verify_result_accepts_cause_hint_field(self):
+        """VerifyResult can be constructed with cause_hint kwarg; default is ''."""
+        vr_default = VerifyResult(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='All checks passed',
+        )
+        assert vr_default.cause_hint == '', (
+            f'Default cause_hint should be empty, got {vr_default.cause_hint!r}'
+        )
+
+        vr_explicit = VerifyResult(
+            passed=False,
+            test_output='error: bad',
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            cause_hint='error: bad',
+        )
+        assert vr_explicit.cause_hint == 'error: bad', (
+            f'Explicit cause_hint mismatch: {vr_explicit.cause_hint!r}'
+        )
+
+    # (b) run_verification populates cause_hint from test output when test_rc != 0
+    @pytest.mark.asyncio
+    async def test_run_verification_populates_cause_hint_from_test_failure(
+        self, tmp_path: Path,
+    ):
+        """run_verification sets cause_hint from _extract_cause_hint(test_output) when test fails."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cargo test' in cmd:
+                return 1, test_output, False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, config, max_retries=0)
+
+        assert not result.passed
+        assert result.cause_hint.startswith('error: --exclude'), (
+            f'Expected cause_hint to start with error: --exclude, got {result.cause_hint!r}'
+        )
+
+    # (c) both test and lint fail → cause_hint has both hints joined by ' | '
+    @pytest.mark.asyncio
+    async def test_run_verification_joins_hints_from_multiple_failures(
+        self, tmp_path: Path,
+    ):
+        """When test and lint both fail, cause_hint joins their hints with ' | '."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='ruff check src/',
+            type_check_command='echo ok',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cargo test' in cmd:
+                return 1, 'error: cargo-bad', False
+            if 'ruff' in cmd:
+                return 1, 'error: ruff-bad', False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, config, max_retries=0)
+
+        assert not result.passed
+        assert ' | ' in result.cause_hint, (
+            f'Expected " | " separator in cause_hint, got {result.cause_hint!r}'
+        )
+        assert 'cargo-bad' in result.cause_hint
+        assert 'ruff-bad' in result.cause_hint
+
+    # (d) _aggregate_results surfaces first non-empty cause_hint from failing children
+    def test_aggregate_results_surfaces_cause_hint_from_children(self):
+        """_aggregate_results joins cause_hint from failing child results."""
+        child1 = VerifyResult(
+            passed=False,
+            test_output='error: bad in child1',
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            cause_hint='error: bad in child1',
+        )
+        child2 = VerifyResult(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='All checks passed',
+            cause_hint='',
+        )
+        agg = _aggregate_results([child1, child2])
+        assert agg.cause_hint, (
+            f'Expected non-empty cause_hint in aggregated result, got {agg.cause_hint!r}'
+        )
+        assert 'bad in child1' in agg.cause_hint
+
+    # (e) passed=True → cause_hint is ''
+    @pytest.mark.asyncio
+    async def test_run_verification_cause_hint_empty_on_pass(self, tmp_path: Path):
+        """When verification passes, cause_hint must be ''."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='echo ok',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, config, max_retries=0)
+
+        assert result.passed
+        assert result.cause_hint == '', (
+            f'Passed verification should have empty cause_hint, got {result.cause_hint!r}'
+        )
+
+    # (f) pure timeout failure → cause_hint contains 'Command timed out after'
+    @pytest.mark.asyncio
+    async def test_run_verification_cause_hint_from_timeout(self, tmp_path: Path):
+        """When failure is a pure timeout, cause_hint contains 'Command timed out after'."""
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+            verify_command_timeout_secs=0.1,
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cargo test' in cmd:
+                return 1, f'Command timed out after {timeout}s: {cmd}', True
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, config, max_retries=0)
+
+        assert not result.passed
+        assert result.timed_out
+        assert 'Command timed out after' in result.cause_hint, (
+            f'Expected timeout hint in cause_hint, got {result.cause_hint!r}'
+        )
+
+
+class TestVerificationFailedLogCauseHint:
+    """The 'Verification failed' log line should carry the cause hint.
+
+    Tests will fail until step 7 appends `` — {cause_hint}`` to the log format.
+    """
+
+    @pytest.mark.asyncio
+    async def test_verification_failed_log_line_contains_cause_hint(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """When tests fail, the log record contains both the bucket label and the hint."""
+        import logging
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        test_output = 'error: --exclude can only be used together with --workspace\nOther noise'
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            if 'cargo test' in cmd:
+                return 1, test_output, False
+            return 0, '', False
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.verify'),
+            patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd),
+        ):
+            await run_verification(tmp_path, config, max_retries=0)
+
+        # At least one log record must carry both the bucket label and the hint.
+        matching = [
+            r for r in caplog.records
+            if 'tests failed' in r.getMessage() and 'error: --exclude' in r.getMessage()
+        ]
+        assert matching, (
+            f'Expected a log record containing "tests failed" AND "error: --exclude"; '
+            f'got records: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_verification_passed_log_unchanged_when_hint_empty(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """When verification passes, the log line does not contain ' — ' or double spaces."""
+        import logging
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='echo ok',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None):
+            return 0, '', False
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.verify'),
+            patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd),
+        ):
+            result = await run_verification(tmp_path, config, max_retries=0)
+
+        assert result.passed
+        # The 'Verification passed' log line must not contain a trailing '—' dash
+        for r in caplog.records:
+            msg = r.getMessage()
+            if 'Verification passed' in msg:
+                assert ' — ' not in msg, (
+                    f'Passed log line should not have " — " hint: {msg!r}'
+                )
+                assert '  ' not in msg, (
+                    f'Passed log line should not have double spaces: {msg!r}'
+                )
+
+
+class TestFailureReportCauseHint:
+    """Tests for ``VerifyResult.failure_report()`` interaction with ``cause_hint``.
+
+    Tests (a), (b), (d) will fail until step 9 inserts the ``## Failure Cause``
+    section.  Test (c) acts as a regression guard on the existing section order.
+    """
+
+    # (a) non-empty cause_hint → report starts with ## Failure Cause heading
+    def test_failure_report_starts_with_cause_hint_section(self):
+        """When cause_hint is non-empty, report starts with ## Failure Cause."""
+        vr = VerifyResult(
+            passed=False,
+            test_output='test my::mod::it FAILED\n',
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            cause_hint='test my::mod::it FAILED',
+        )
+        report = vr.failure_report()
+        assert report.startswith('## Failure Cause'), (
+            f'Expected report to start with "## Failure Cause"; got:\n{report[:200]!r}'
+        )
+        assert 'test my::mod::it FAILED' in report
+
+    # (b) empty cause_hint → ## Failure Cause must NOT appear
+    def test_failure_report_no_cause_section_when_hint_empty(self):
+        """When cause_hint is '', the report contains no ## Failure Cause section."""
+        vr = VerifyResult(
+            passed=False,
+            test_output='test my::mod::it FAILED\n',
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            cause_hint='',
+        )
+        report = vr.failure_report()
+        assert '## Failure Cause' not in report, (
+            f'"## Failure Cause" present despite empty cause_hint:\n{report[:300]!r}'
+        )
+
+    # (c) existing sections still appear after the cause hint (regression guard)
+    def test_failure_report_existing_sections_appear_in_order(self):
+        """## Test Failures, ## Lint Issues, ## Type Errors appear after ## Failure Cause."""
+        vr = VerifyResult(
+            passed=False,
+            test_output='test my::mod::it FAILED\nline2',
+            lint_output='lint error here',
+            type_output='error: type mismatch',
+            summary='Failures: tests failed, lint issues, type errors',
+            cause_hint='test my::mod::it FAILED',
+        )
+        report = vr.failure_report()
+        # All three sections must be present
+        assert '## Test Failures' in report, f'Missing ## Test Failures in:\n{report!r}'
+        assert '## Lint Issues' in report, f'Missing ## Lint Issues in:\n{report!r}'
+        assert '## Type Errors' in report, f'Missing ## Type Errors in:\n{report!r}'
+        # And they must come AFTER ## Failure Cause
+        cause_pos = report.find('## Failure Cause')
+        test_pos = report.find('## Test Failures')
+        lint_pos = report.find('## Lint Issues')
+        type_pos = report.find('## Type Errors')
+        assert cause_pos < test_pos, 'Expected ## Failure Cause before ## Test Failures'
+        assert test_pos < lint_pos, 'Expected ## Test Failures before ## Lint Issues'
+        assert lint_pos < type_pos, 'Expected ## Lint Issues before ## Type Errors'
+
+    # (d) timed_out=True: ## Verify Timed Out first, then ## Failure Cause
+    def test_failure_report_timeout_preamble_comes_before_cause_hint(self):
+        """When timed_out=True, ## Verify Timed Out appears first, ## Failure Cause after."""
+        vr = VerifyResult(
+            passed=False,
+            test_output='Command timed out after 1800s: cargo test --workspace',
+            lint_output='',
+            type_output='',
+            summary='Verification timed out',
+            timed_out=True,
+            cause_hint='Command timed out after 1800s: cargo test --workspace',
+        )
+        report = vr.failure_report()
+        assert '## Verify Timed Out' in report, (
+            f'Missing ## Verify Timed Out:\n{report!r}'
+        )
+        assert '## Failure Cause' in report, (
+            f'Missing ## Failure Cause:\n{report!r}'
+        )
+        timeout_pos = report.find('## Verify Timed Out')
+        cause_pos = report.find('## Failure Cause')
+        assert timeout_pos < cause_pos, (
+            f'Expected ## Verify Timed Out (pos {timeout_pos}) before '
+            f'## Failure Cause (pos {cause_pos})'
+        )

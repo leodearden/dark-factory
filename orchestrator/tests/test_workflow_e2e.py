@@ -1778,6 +1778,48 @@ class TestTaskFailureEscalation:
         assert outcome == WorkflowOutcome.BLOCKED
         assert scheduler.statuses['42'][-1] == 'blocked'
 
+    async def test_verify_exhausted_escalation_carries_cause_hint(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """Escalation detail includes cause hint from failing VerifyResult."""
+        stub = AgentStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=False,
+                test_output='error: --exclude can only be used together with --workspace\nmore noise',
+                lint_output='',
+                type_output='',
+                summary='Failures: tests failed',
+                cause_hint='error: --exclude can only be used together with --workspace',
+            )),
+        )
+
+        config_strict = OrchestratorConfig(
+            project_root=config.project_root,
+            max_verify_attempts=1,
+            git=config.git,
+        )
+        workflow.config = config_strict
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        escalations = queue.get_by_task('42')
+        assert len(escalations) == 1
+        esc = escalations[0]
+        assert esc.category == 'task_failure'
+        assert 'Verification attempts exhausted' in esc.summary
+        # detail must carry the cause hint from failure_report()
+        assert 'error: --exclude' in esc.detail
+        assert '## Failure Cause' in esc.detail
+
 
 # ---------------------------------------------------------------------------
 # Tests: Corrupted Iteration Log Escalation

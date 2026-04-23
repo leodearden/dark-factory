@@ -42,7 +42,7 @@ from orchestrator.task_status import (
     WORKFLOW_PRESERVE_STATUSES,
 )
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
-from orchestrator.verify import run_scoped_verification
+from orchestrator.verify import VerifyResult, run_scoped_verification
 
 # Orchestrator package directory — used to resolve ``uv run --project`` for
 # the plan-tools stdio MCP server.
@@ -258,6 +258,7 @@ class TaskWorkflow:
         self._old_plan_base: str | None = None  # base commit from prior session (for revalidation diff)
         self._merge_sha: str | None = None  # merge commit SHA set by _submit_to_merge_queue on success
         self._last_invoked_role: str | None = None  # role of the last successful invocation
+        self._last_verify_result: VerifyResult | None = None  # most recent failing VerifyResult from _verify_debugfix_loop
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -1061,7 +1062,8 @@ class TaskWorkflow:
             if verify_outcome == WorkflowOutcome.ESCALATED:
                 return WorkflowOutcome.ESCALATED
             if verify_outcome == WorkflowOutcome.BLOCKED:
-                return await self._mark_blocked('Verification attempts exhausted')
+                detail = self._last_verify_result.failure_report() if self._last_verify_result else ''
+                return await self._mark_blocked('Verification attempts exhausted', detail=detail)
 
             # REVIEW
             self._enter_phase(WorkflowState.REVIEW)
@@ -1437,6 +1439,8 @@ class TaskWorkflow:
 
         while True:
             result = await run_scoped_verification(self.worktree, self.config, self._module_configs, task_files=self._task_files)
+            if not result.passed:
+                self._last_verify_result = result
             if result.passed:
                 return WorkflowOutcome.DONE
 
