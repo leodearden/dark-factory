@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -931,19 +932,18 @@ class TestRecentMerges:
         supported and returns every matching row without a row-count cap.
         """
         now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        for i in range(60):
-            _insert_event(
-                conn_sync,
-                event_type='merge_attempt',
-                timestamp=now - timedelta(seconds=i * 5),
-                task_id=f'burst-{i:03d}',
-                run_id=f'run-burst-{i:03d}',
-                data={'outcome': 'done'},
-                duration_ms=100 + i,
-            )
-        conn_sync.commit()
-        conn_sync.close()
+        with contextlib.closing(sqlite3.connect(str(merge_events_db))) as conn_sync:
+            for i in range(60):
+                _insert_event(
+                    conn_sync,
+                    event_type='merge_attempt',
+                    timestamp=now - timedelta(seconds=i * 5),
+                    task_id=f'burst-{i:03d}',
+                    run_id=f'run-burst-{i:03d}',
+                    data={'outcome': 'done'},
+                    duration_ms=100 + i,
+                )
+            conn_sync.commit()
 
         async with aiosqlite.connect(str(merge_events_db)) as db:
             db.row_factory = aiosqlite.Row
@@ -1839,6 +1839,91 @@ class TestBuildPerProjectMergeQueue:
         assert captured_kwargs.get('hours') == expected_hours, (
             f'recent_window_minutes={recent_window_minutes}: '
             f'expected hours={expected_hours}, got hours={captured_kwargs.get("hours")!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('recent_window_minutes, in_window_offset_min, over_fetch_offset_min', [
+        (15,  5, 30),   # SQL hours=1, Python window=15 min; over-fetch zone=(15,60]
+        (30, 10, 45),   # SQL hours=1, Python window=30 min; over-fetch zone=(30,60]
+        (45, 20, 50),   # SQL hours=1, Python window=45 min; over-fetch zone=(45,60]
+        (90, 45, 100),  # SQL hours=2, Python window=90 min; over-fetch zone=(90,120]
+    ])
+    async def test_sql_over_fetches_are_trimmed_to_exact_minute_boundary(
+        self, tmp_path, recent_window_minutes, in_window_offset_min, over_fetch_offset_min,
+    ):
+        """SQL hour-granularity over-fetches are trimmed to the exact minute boundary by filter_merges_within.
+
+        When recent_window_minutes is not a multiple of 60, SQL uses hours=ceil(minutes/60),
+        which over-fetches rows in the zone (recent_window_minutes, ceil(minutes/60)*60] minutes.
+        build_per_project_merge_queue must call filter_merges_within to drop those extra rows.
+
+        Setup: two events per case — one at -in_window_offset_min (inside Python window) and
+        one at -over_fetch_offset_min (inside SQL hours window but outside Python window).
+        Asserts: only the in-window event survives in result['recent'], proving the two-layer
+        contract (SQL over-fetches, Python post-filter drops the excess).
+        """
+        from math import ceil
+
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+
+        # Sanity-check: over_fetch_offset_min must be in the over-fetch zone
+        sql_hours = max(1, ceil(recent_window_minutes / 60))
+        assert recent_window_minutes < over_fetch_offset_min <= sql_hours * 60, (
+            f'Test setup error: over_fetch_offset_min={over_fetch_offset_min} not in '
+            f'over-fetch zone ({recent_window_minutes}, {sql_hours * 60}]'
+        )
+        assert in_window_offset_min < recent_window_minutes, (
+            f'Test setup error: in_window_offset_min={in_window_offset_min} not inside '
+            f'Python window ({recent_window_minutes} min)'
+        )
+
+        in_window_task_id = f'in-window-{recent_window_minutes}min'
+        over_fetch_task_id = f'over-fetch-{recent_window_minutes}min'
+
+        db_path = _make_db(tmp_path, 'p.db', [
+            {
+                'event_type': 'merge_attempt',
+                'timestamp': now - timedelta(minutes=in_window_offset_min),
+                'task_id': in_window_task_id,
+                'run_id': f'run-in-{recent_window_minutes}',
+                'data': {'outcome': 'done'},
+                'duration_ms': 200,
+            },
+            {
+                'event_type': 'merge_attempt',
+                'timestamp': now - timedelta(minutes=over_fetch_offset_min),
+                'task_id': over_fetch_task_id,
+                'run_id': f'run-over-{recent_window_minutes}',
+                'data': {'outcome': 'done'},
+                'duration_ms': 300,
+            },
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue(
+                [('/tmp/P', conn)],
+                hours=24,
+                now=now,
+                recent_window_minutes=recent_window_minutes,
+            )
+
+        recent = result['/tmp/P']['recent']
+        assert len(recent) == 1, (
+            f'recent_window_minutes={recent_window_minutes}: '
+            f'expected 1 row (in-window only), got {len(recent)}. '
+            f'Rows: {[r["task_id"] for r in recent]}'
+        )
+        assert recent[0]['task_id'] == in_window_task_id, (
+            f'Expected in-window row task_id={in_window_task_id!r}, '
+            f'got task_id={recent[0]["task_id"]!r}'
+        )
+        over_fetch_ids = [r['task_id'] for r in recent if r['task_id'] == over_fetch_task_id]
+        assert not over_fetch_ids, (
+            f'Over-fetch row {over_fetch_task_id!r} survived filter_merges_within — '
+            f'the SQL+Python two-layer contract is broken (recent_window_minutes={recent_window_minutes})'
         )
 
     @pytest.mark.asyncio
