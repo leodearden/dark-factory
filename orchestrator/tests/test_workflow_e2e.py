@@ -2916,6 +2916,60 @@ class TestRecoverIfAlreadyMerged:
         )
         assert workflow.state == WorkflowState.DONE
 
+    async def test_returns_none_for_stale_branch_point(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Stale branch point (wt_head == base_commit) must return None, not DONE.
+
+        A fresh worktree with no implementation commits has wt_head equal to
+        base_commit.  The branch trivially satisfies is_ancestor(wt_head, main)
+        since it was never advanced.  The SHA-primary signal in
+        _has_prior_implementation sees wt_head == base_commit → has_work=False
+        and the recovery must return None (not DONE), so the task proceeds to PLAN.
+
+        Exercises the _has_prior_implementation SHA-primary guard path that
+        prevents a false-done on an empty branch.
+        """
+        import json as _json
+
+        # 1. Create a fresh worktree (no iteration entries, no implementation commits)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Read current HEAD (= base_commit) and stamp metadata.json
+        _, base_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        base_sha = base_sha_raw.strip()
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'metadata.json').write_text(
+            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': base_sha})
+        )
+        # No iterations.jsonl written — SHA-primary path must not need it
+
+        # 3. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 4. Call _recover_if_already_merged directly
+        outcome = await workflow._recover_if_already_merged()
+
+        # 5. Assertions: stale branch must return None with no DONE side-effects
+        assert outcome is None, (
+            f'Expected None for stale branch point but got {outcome!r} — '
+            '_has_prior_implementation SHA-primary guard is missing or broken'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses for stale branch: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE for stale branch: {workflow.state!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # File-structure invariants
