@@ -903,6 +903,39 @@ class TestRecentMerges:
         task_ids = [r['task_id'] for r in result]
         assert all(tid.startswith('recent-') for tid in task_ids)
 
+    @pytest.mark.asyncio
+    async def test_limit_none_returns_all_rows(self, merge_events_db):
+        """recent_merges with limit=None returns every matching row (no SQL LIMIT).
+
+        Inserts 60 merge_attempt events all within the last 5 minutes, then
+        asserts that limit=None returns all 60.  With the legacy ``LIMIT ?``
+        path, passing None causes a TypeError / sqlite adapter failure — so this
+        test fails on the pre-fix implementation, confirming the red step.
+        """
+        now = datetime.now(UTC)
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        for i in range(60):
+            _insert_event(
+                conn_sync,
+                event_type='merge_attempt',
+                timestamp=now - timedelta(seconds=i * 5),
+                task_id=f'burst-{i:03d}',
+                run_id=f'run-burst-{i:03d}',
+                data={'outcome': 'done'},
+                duration_ms=100 + i,
+            )
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await recent_merges(db, limit=None, hours=1)
+
+        assert len(result) == 60, (
+            f'Expected 60 rows with limit=None, got {len(result)}. '
+            'The SQL LIMIT clause must be omitted when limit is None.'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestSpeculativeStats
