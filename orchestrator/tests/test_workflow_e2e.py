@@ -2850,6 +2850,74 @@ class TestMarkBlockedFalseDoneGuard:
 
 
 # ---------------------------------------------------------------------------
+# Tests: _recover_if_already_merged unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRecoverIfAlreadyMerged:
+    """Unit tests for TaskWorkflow._recover_if_already_merged().
+
+    Each test exercises the method directly without a full workflow.run() cycle
+    or steward/escalation machinery.  The method is pure: it does git + artifact
+    reads and returns either WorkflowOutcome.DONE or None.
+    """
+
+    async def test_returns_done_when_branch_merged_with_prior_work(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Happy path: merged branch with implementer entry returns DONE.
+
+        Set up a worktree, stamp iterations.jsonl with an implementer entry,
+        commit a real file, merge to main, then call _recover_if_already_merged()
+        directly.  Asserts WorkflowOutcome.DONE is returned and scheduler
+        records 'done'.
+
+        Fails on unmodified code with AttributeError (method does not exist yet).
+        """
+        import json as _json
+
+        # 1. Create worktree and write an implementer iteration entry
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+
+        # 2. Make a real implementation commit and merge it to main
+        (wt / 'impl_merged.py').write_text('def impl():\n    return 42\n')
+        await git_ops.commit(wt, 'Implement feature (test_returns_done_when_branch_merged)')
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # 3. Build workflow, wire up worktree and artifacts (no steward needed)
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 4. Call _recover_if_already_merged directly
+        outcome = await workflow._recover_if_already_merged()
+
+        # 5. Assertions: must return DONE with scheduler 'done'
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE for merged branch with prior work but got {outcome!r}'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert statuses[-1] == 'done', (
+            f"Last scheduler status must be 'done', got: {statuses}"
+        )
+        assert workflow.state == WorkflowState.DONE
+
+
+# ---------------------------------------------------------------------------
 # File-structure invariants
 # ---------------------------------------------------------------------------
 
