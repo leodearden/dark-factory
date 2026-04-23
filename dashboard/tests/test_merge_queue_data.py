@@ -6,7 +6,7 @@ import asyncio
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import aiosqlite
 import pytest
