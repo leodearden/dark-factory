@@ -358,6 +358,31 @@ character — do not shorten, summarize, or reformat it. For "drop" and "create"
 leave `target_fingerprint` null.
 """
 
+_BATCH_SYSTEM_PROMPT = _SYSTEM_PROMPT + """
+
+## Within-batch duplicates
+
+When you are given a BATCH of N candidates in a single call (sections labelled
+`# Candidate batch_index=0`, `# Candidate batch_index=1`, …), use the following
+additional rules for duplicates that exist WITHIN the batch:
+
+1. **Drop to a sibling candidate**: if candidate A is a duplicate of another
+   candidate B in this batch (neither has been materialised as a task yet), emit
+   `action='drop'` for A and set `batch_target_index=<B's batch_index>`.  Leave
+   `target_id` null in this case — there is no existing pool task to reference.
+
+2. **Combine between two new batch items is NOT supported**: "combine" rewrites
+   an *existing* task; two candidates that are both new cannot combine with each
+   other.  Instead, choose one to "create" and emit `action='drop'` with
+   `batch_target_index` pointing at it for the other.
+
+3. **batch_target_index must be valid**: the value MUST reference a *different*
+   candidate index that appears within the batch (0 ≤ batch_target_index < N,
+   batch_target_index ≠ candidate_index).  Do not emit cycles (A→B and B→A).
+
+4. For non-duplicate candidates, batch_target_index MUST be null.
+"""
+
 
 class TaskCurator:
     """LLM-judged drop/combine/create gate plus the Qdrant corpus backing it."""
