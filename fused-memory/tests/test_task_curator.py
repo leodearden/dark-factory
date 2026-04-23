@@ -943,3 +943,27 @@ class TestCurateBatch:
         result = await curator.curate_batch([candidate], project_id='p', project_root='/x')
         assert result == [decision]
         curator.curate.assert_awaited_once_with(candidate, 'p', '/x')
+
+
+# ----------------------------------------------------------------------
+# Batch output schema
+# ----------------------------------------------------------------------
+
+
+class TestCuratorBatchOutputSchema:
+    def test_batch_schema_is_jsonable(self):
+        import json
+        from fused_memory.middleware.task_curator import CURATOR_BATCH_OUTPUT_SCHEMA
+        raw = json.dumps(CURATOR_BATCH_OUTPUT_SCHEMA)
+        assert 'decisions' in raw
+        assert 'candidate_index' in raw
+        assert 'batch_target_index' in raw
+        assert 'action' in raw
+
+    def test_batch_schema_requires_decisions(self):
+        from fused_memory.middleware.task_curator import CURATOR_BATCH_OUTPUT_SCHEMA
+        assert 'decisions' in CURATOR_BATCH_OUTPUT_SCHEMA['required']
+        items_schema = CURATOR_BATCH_OUTPUT_SCHEMA['properties']['decisions']['items']
+        assert 'action' in items_schema['required']
+        assert 'candidate_index' in items_schema['required']
+        assert 'justification' in items_schema['required']
