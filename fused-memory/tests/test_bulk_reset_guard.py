@@ -421,3 +421,100 @@ async def test_emits_l1_escalation_on_trip(tmp_path):
     assert data['threshold'] == 3
     assert data['window_seconds'] == 60.0
     assert data['project_id'] == 'proj-esc'
+
+
+# ---------------------------------------------------------------------------
+# step-15: escalation rate-limiting
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_escalation_rate_limited(tmp_path):
+    """A second trip within the rate-limit window returns 'rejection', not 'escalated',
+    and does NOT write a new escalation file."""
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    esc_dir = tmp_path / 'data' / 'escalations'
+
+    # Fire four reversals — fourth trips and writes escalation X.
+    for i in range(4):
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='proj-rl',
+            task_id=f'rl-{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    # v is now the fourth verdict (escalated)
+    assert v.outcome == 'escalated'
+    first_esc_path = v.escalation_path
+    assert first_esc_path is not None
+
+    # Advance clock by 1s (well within both the 60s window and 900s rate-limit).
+    # Advancing by 60s would prune most entries from the window (making the
+    # guard return ok rather than reaching the rate-limit check), so we use 1s
+    # to keep entries in the window while exercising the rate-limit path.
+    clock[0] += 1.0
+
+    # Fire another reversal — still inside the window AND inside the rate-limit.
+    v5 = await guard.observe_attempt(
+        project_id='proj-rl',
+        task_id='rl-4',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert v5.outcome == 'rejection', (
+        f'Expected rejection (rate-limited), got {v5.outcome}'
+    )
+    assert v5.is_rejection is True
+
+    # Only one escalation file should exist (not a second one).
+    esc_files = list(esc_dir.glob('*.json'))
+    assert len(esc_files) == 1, (
+        f'Expected 1 escalation file, found {len(esc_files)}: {esc_files}'
+    )
+
+    # Advance clock past both the rate-limit AND the window so a fresh trip fires.
+    # Rate-limit is 900s; window is 60s. Move to t = 1000 + 1000 = 2000 to be safe.
+    clock[0] = 2000.0
+
+    # Seed three new reversals (all ok at threshold=3).
+    for i in range(3):
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='proj-rl',
+            task_id=f'new-{i}',
+            old_status='in-progress',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok'
+
+    # Fourth new reversal — should write a SECOND escalation file.
+    clock[0] += 1.0
+    v_new = await guard.observe_attempt(
+        project_id='proj-rl',
+        task_id='new-3',
+        old_status='in-progress',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert v_new.outcome == 'escalated', (
+        f'Expected escalated (rate-limit reset), got {v_new.outcome}'
+    )
+    esc_files = list(esc_dir.glob('*.json'))
+    assert len(esc_files) == 2, (
+        f'Expected 2 escalation files, found {len(esc_files)}'
+    )
