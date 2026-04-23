@@ -406,7 +406,7 @@ async def recent_merges(
             sql, params = base_sql + " LIMIT ?", (since, probe)
         else:
             sql, params = base_sql + " LIMIT ?", (since, limit)
-        rows = await conn.execute_fetchall(sql, params)
+        rows = list(await conn.execute_fetchall(sql, params))
         if limit is None and len(rows) > _RECENT_MERGES_HARD_CAP:
             logger.warning(
                 'recent_merges: hard cap %d reached (fetched >%d rows, truncating);'
