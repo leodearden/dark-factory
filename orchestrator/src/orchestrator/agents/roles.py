@@ -527,14 +527,23 @@ def _submit_resolve_instructions(
         Plain unindented multi-line string with the shared skeleton.
     """
     a, b = step_prefix
+    # Pre-indent continuation lines so they align at the sub-continuation column
+    # (3 spaces inside the helper) after the caller applies textwrap.indent(...).
+    # A multi-line metadata_template like '{"a": 1,\n"b": 2}' would otherwise have
+    # its second line at column 0, landing at the step-letter column after caller indent
+    # instead of at the 'metadata=' column.
+    metadata_normalized = metadata_template.replace('\n', '\n   ')
     # extra_submit_guidance is inserted between the submit error-shape sentence and the
-    # resolve_ticket step.  Always emit at least one \n to separate the two steps.
-    extra = ('\n' + extra_submit_guidance.rstrip() + '\n') if extra_submit_guidance.strip() else '\n'
+    # resolve_ticket step.  Indent its lines 3 spaces so they sit at the sub-continuation
+    # column after the caller's textwrap.indent wrap.
+    extra = (
+        '\n' + textwrap.indent(extra_submit_guidance.rstrip(), '   ') + '\n'
+    ) if extra_submit_guidance.strip() else '\n'
     # Build the string with explicit \n so that multiline metadata_template values
     # (which introduce lines at column-0 when substituted) do not confuse textwrap.dedent.
     return (
         f'{a}. Call `submit_task`(title=..., description=..., priority=...,\n'
-        f'   metadata={metadata_template},\n'
+        f'   metadata={metadata_normalized},\n'
         f'   project_root={project_root_expr}) — returns `{{"ticket": "tkt_..."}}` on success, or\n'
         '   `{"error": ..., "error_type": ...}` (no `ticket` key) if the call was\n'
         '   rejected at submit time (e.g. backlog full, closed interceptor). On the\n'
