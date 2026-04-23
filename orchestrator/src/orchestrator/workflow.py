@@ -1741,13 +1741,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         paths suppress task-status transitions — the caller retries
         the merge in-place instead of requeueing via the scheduler.
         """
-        from orchestrator.merge_queue import MergeOutcome, MergeRequest
+        from orchestrator.merge_queue import MergeOutcome, MergeRequest, enqueue_merge_request
 
         assert self.worktree is not None
         assert self.merge_queue is not None
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
-        await self.merge_queue.put(MergeRequest(
+        merge_request = MergeRequest(
             task_id=self.task_id,
             branch=branch_name,
             worktree=self.worktree,
@@ -1756,7 +1756,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             module_configs=self._module_configs,
             config=self.config,
             result=future,
-        ))
+        )
+        await enqueue_merge_request(self.merge_queue, merge_request, self.event_store)
 
         result = await future
 
