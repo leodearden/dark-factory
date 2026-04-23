@@ -932,3 +932,14 @@ class TestCurateBatch:
         curator = TaskCurator(config=config, taskmaster=None)
         result = await curator.curate_batch([], project_id='p', project_root='/x')
         assert result == []
+
+    @pytest.mark.asyncio
+    async def test_curate_batch_single_item_delegates_to_curate(self):
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        decision = CuratorDecision(action='drop', target_id='7', justification='cached')
+        candidate = CandidateTask(title='Fix parser')
+        curator.curate = AsyncMock(return_value=decision)
+        result = await curator.curate_batch([candidate], project_id='p', project_root='/x')
+        assert result == [decision]
+        curator.curate.assert_awaited_once_with(candidate, 'p', '/x')
