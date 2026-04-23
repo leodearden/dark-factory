@@ -2741,3 +2741,53 @@ async def test_backlog_iterator_uses_project_root_peek_limit_constant(
     assert _PROJECT_ROOT_PEEK_LIMIT == 10, (
         f'_PROJECT_ROOT_PEEK_LIMIT should be 10, got {_PROJECT_ROOT_PEEK_LIMIT}'
     )
+
+
+@pytest.mark.asyncio
+async def test_backlog_iterator_event_project_root_wins_over_configured(
+    journal, event_buffer, mock_memory_service
+):
+    """BacklogIterator.run should use the project_root from peeked events over
+    the harness-configured fallback (regression guard for task-927 invariant).
+
+    Parallel to test_backlog_iterator_uses_harness_project_root_when_events_lack_override
+    but exercises the event-override path: events carry _project_root='/from/event'
+    while the harness is configured with '/from/config'.  The event value must win.
+
+    Peek-window semantics differ from run_full_cycle's full-drain coverage at
+    test_harness.py:341, making this a distinct regression guard.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from fused_memory.models.reconciliation import AssembledPayload
+    from fused_memory.reconciliation.harness import BacklogIterator
+
+    # Push two events WITH _project_root key — both within the peek window
+    await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
+    await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
+
+    # Build harness with a different configured root
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service, '/from/config')
+
+    captured: dict = {}
+
+    def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
+        captured['project_root'] = project_root
+        inst = MagicMock()
+        inst.assemble = AsyncMock(return_value=AssembledPayload(events=[]))
+        return inst
+
+    with patch(
+        'fused_memory.reconciliation.context_assembler.ContextAssembler',
+        side_effect=fake_assembler_factory,
+    ):
+        iterator = BacklogIterator(harness.config, harness.journal, harness.buffer, harness)
+        await iterator.run('dark_factory')
+
+    assert 'project_root' in captured, (
+        'ContextAssembler was never constructed — iterator may not have run'
+    )
+    assert captured['project_root'] == '/from/event', (
+        f"Expected project_root='/from/event' but got '{captured['project_root']}'"
+        " — event-provided root must win over the configured fallback in BacklogIterator"
+    )
