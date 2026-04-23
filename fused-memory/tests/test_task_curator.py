@@ -918,3 +918,17 @@ class TestCuratorConfigBatch:
         assert config.per_item_turns == 1
         assert config.batch_timeout_cap_seconds == 540.0
         assert config.batch_turns_cap == 10
+
+
+# ----------------------------------------------------------------------
+# curate_batch
+# ----------------------------------------------------------------------
+
+
+class TestCurateBatch:
+    @pytest.mark.asyncio
+    async def test_curate_batch_empty_returns_empty_list(self):
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        result = await curator.curate_batch([], project_id='p', project_root='/x')
+        assert result == []
