@@ -2,7 +2,7 @@
 
 
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -12,6 +12,7 @@ from orchestrator.config import (
     ModuleConfig,
     OrchestratorConfig,
 )
+from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules
 
@@ -2075,3 +2076,27 @@ class TestBlastRadiusRefinement:
         assert ok is False
         # Full release ran: 936 should no longer hold anything
         assert '936' not in lt._held
+
+
+class TestSchedulerMcpSessionDI:
+    """Tests for the optional mcp_session dependency-injection kwarg on Scheduler.
+
+    Each test injects a _StubMcpSession and monkeypatches orchestrator.scheduler.mcp_call
+    to raise AssertionError — proving the HTTP transport is never contacted when a
+    session is injected.
+    """
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_routes_through_stub(self):
+        """set_task_status writes to the stub, not to the HTTP mcp_call path."""
+        stub = _StubMcpSession()
+        cfg = OrchestratorConfig()
+        sched = Scheduler(cfg, mcp_session=stub)
+
+        with patch(
+            'orchestrator.scheduler.mcp_call',
+            new=AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected')),
+        ):
+            await sched.set_task_status('42', 'in-progress')
+
+        assert stub._statuses['42'] == 'in-progress'
