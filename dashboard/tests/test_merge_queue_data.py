@@ -2093,17 +2093,10 @@ class TestBuildPerProjectMergeQueue:
 
     @pytest.mark.asyncio
     async def test_cancelled_error_from_sub_query_propagates(self, tmp_path):
-        """CancelledError raised inside a sub-query must propagate out of build_per_project_merge_queue.
+        """CancelledError from any sub-query must not be swallowed.
 
-        The inner _safe closure (pre-step-5) treats all BaseException subclasses —
-        including CancelledError — as recoverable and returns the default, silently
-        swallowing asyncio cancellation.  After step-5 swaps in safe_gather_result,
-        CancelledError re-raises through _one_project's ``except Exception`` guard
-        (which only catches Exception, not BaseException) and propagates out of
-        the outer asyncio.gather call.
-
-        This test pins the corrected behaviour: any CancelledError from a sub-query
-        must NOT be swallowed.
+        It propagates through _one_project's ``except Exception`` guard
+        (which only catches Exception, not BaseException) to the outer asyncio.gather call.
         """
         import asyncio
         from unittest.mock import patch

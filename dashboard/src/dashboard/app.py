@@ -467,9 +467,9 @@ async def memory_graphs_partial(request: Request):
         get_agent_breakdown(db),
         return_exceptions=True,
     )
-    timeseries = safe_gather_result(ts_r, {'labels': [], 'reads': [], 'writes': []}, 'timeseries')
-    operations: ChartData = cast(ChartData, safe_gather_result(ops_r, {'labels': [], 'values': []}, 'operations'))
-    agents: ChartData = cast(ChartData, safe_gather_result(agents_r, {'labels': [], 'values': []}, 'agents'))
+    timeseries = safe_gather_result(ts_r, {'labels': [], 'reads': [], 'writes': []}, 'memory_graphs/timeseries')
+    operations: ChartData = cast(ChartData, safe_gather_result(ops_r, {'labels': [], 'values': []}, 'memory_graphs/operations'))
+    agents: ChartData = cast(ChartData, safe_gather_result(agents_r, {'labels': [], 'values': []}, 'memory_graphs/agents'))
     return templates.TemplateResponse(
         request, 'partials/memory_graphs.html',
         context={
@@ -497,16 +497,16 @@ async def partials_recon(request: Request):
         return_exceptions=True,
     )
     buffer_stats = safe_gather_result(
-        bs_r, {'buffered_count': 0, 'oldest_event_age_seconds': None}, 'buffer_stats',
+        bs_r, {'buffered_count': 0, 'oldest_event_age_seconds': None}, 'recon/buffer_stats',
     )
-    burst_state_raw = safe_gather_result(burst_r, [], 'burst_state')
+    burst_state_raw = safe_gather_result(burst_r, [], 'recon/burst_state')
     # Drop stale idle agents: keep only agents with state != 'idle'
     # OR last_write_at within the last hour (partition_burst_state threshold).
     active_burst, _ = partition_burst_state(burst_state_raw)
-    watermarks_list = safe_gather_result(wm_r, [], 'watermarks')
-    verdict = safe_gather_result(verdict_r, None, 'latest_verdict')
-    runs = safe_gather_result(runs_r, [], 'recent_runs')
-    last_attempted_map = safe_gather_result(la_r, {}, 'last_attempted_run')
+    watermarks_list = safe_gather_result(wm_r, [], 'recon/watermarks')
+    verdict = safe_gather_result(verdict_r, None, 'recon/latest_verdict')
+    runs = safe_gather_result(runs_r, [], 'recon/recent_runs')
+    last_attempted_map = safe_gather_result(la_r, {}, 'recon/last_attempted_run')
 
     # Build per-project view: merge watermarks + last attempted run
     projects: dict[str, dict] = {}
@@ -574,10 +574,10 @@ async def partials_performance(request: Request):
         aggregate_time_centiles(dbs),
         return_exceptions=True,
     )
-    paths = safe_gather_result(paths_r, {}, 'completion_paths')
-    escalations = safe_gather_result(esc_r, {}, 'escalation_rates')
-    histograms = safe_gather_result(hist_r, {}, 'loop_histograms')
-    ttc = safe_gather_result(ttc_r, {}, 'time_centiles')
+    paths = safe_gather_result(paths_r, {}, 'performance/completion_paths')
+    escalations = safe_gather_result(esc_r, {}, 'performance/escalation_rates')
+    histograms = safe_gather_result(hist_r, {}, 'performance/loop_histograms')
+    ttc = safe_gather_result(ttc_r, {}, 'performance/time_centiles')
     return templates.TemplateResponse(
         request, 'partials/performance.html',
         context={
