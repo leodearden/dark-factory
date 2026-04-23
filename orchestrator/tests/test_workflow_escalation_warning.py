@@ -122,6 +122,9 @@ class TestEscalationCapableRolesDerivation:
         assert 'steward' not in _ESCALATION_CAPABLE_ROLES, (
             "'steward' must not be in _ESCALATION_CAPABLE_ROLES (TaskSteward dispatcher carve-out)"
         )
+        assert 'deep_reviewer' not in _ESCALATION_CAPABLE_ROLES, (
+            "'deep_reviewer' must not be in _ESCALATION_CAPABLE_ROLES (ReviewCheckpoint dispatcher carve-out)"
+        )
         unknown = _ESCALATION_CAPABLE_ROLES - set(ROLES)
         assert not unknown, (
             f'All members of _ESCALATION_CAPABLE_ROLES must be valid ROLES entries; '
