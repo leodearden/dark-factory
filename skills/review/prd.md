@@ -201,7 +201,7 @@ This is the expensive, high-value phase. An Opus agent (or coordinated team) rea
    - Flag tasks that are blocked on something that no longer exists
 
 4. **Create tasks**
-   - Use `submit_task` + `resolve_ticket` via fused-memory MCP (two-phase pattern): call `submit_task(...)` with the metadata below to receive a `ticket`, then call `resolve_ticket(ticket=ticket, project_root=...)` to block until the curator decides — `created` or `combined` → `task_id` is the new or merged task id; `failed` → log the `reason` and surface to the user. See `references/phase3-triage.md` for the full code snippet including all required metadata fields (`source`, `review_id`, `spawn_context`, `modules`, `memory_hints`).
+   - Use `submit_task` + `resolve_ticket` via fused-memory MCP (two-phase pattern): call `submit_task(...)` with the metadata below to receive a `ticket`, then call `resolve_ticket(ticket=ticket, project_root=...)` to block until the curator decides — `created` or `combined` → `task_id` is the new or merged task id; `failed` → if `reason` in {`server_restart`, `timeout`}, retry the `submit_task`+`resolve_ticket` pair once with the same metadata; if `reason` in {`unknown_ticket`, `server_closed`, `expired`}, record the reason in the review report and skip the finding. See `references/phase3-triage.md` for the full snippet.
    - The legacy `add_task` facade is deprecated and slated for removal; all new triage tasks must use `submit_task` + `resolve_ticket`
    - Each task tagged with `metadata.source: "review-cycle"` and `metadata.review_id: "<timestamp>"`
    - Include `memory_hints` pointing to the review findings and relevant briefing sections
