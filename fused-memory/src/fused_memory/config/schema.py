@@ -235,6 +235,19 @@ class ReconciliationConfig(BaseModel):
     backlog_hard_limit: int = Field(default=500)
     backlog_escalation_rate_limit_seconds: float = Field(default=900.0)
 
+    # Defence-in-depth bulk-reset circuit-breaker (task 918).
+    # Two autopilot_video incidents (2026-04-21, 2026-04-22) pushed large
+    # batches of tasks from done/in-progress back to pending despite the
+    # orchestrator's _safe_stash_pop_with_recovery fix being deployed.  This
+    # guard refuses ≥threshold simultaneous done→pending or in-progress→pending
+    # reversals within window_seconds, halts further reversals, and emits an
+    # L1 escalation.  Enabled by default because the primary fix owns
+    # prevention; the guard limits blast radius when prevention fails.
+    bulk_reset_guard_enabled: bool = Field(default=True)
+    bulk_reset_guard_threshold: int = Field(default=10, ge=1)
+    bulk_reset_guard_window_seconds: float = Field(default=60.0, gt=0)
+    bulk_reset_guard_escalation_rate_limit_seconds: float = Field(default=900.0, ge=0)
+
     # Agent settings
     agent_llm_provider: str = Field(default='claude_cli')
     agent_llm_model: str = Field(default='sonnet')

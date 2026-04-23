@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -348,7 +349,10 @@ async def test_task_interceptor_add_task_rejects_when_over_limit(
     event_buffer, tmp_path, _taskmaster_mock,
 ):
     """When policy rejects, interceptor returns error dict without mutating state."""
+    import contextlib
+
     from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.middleware.ticket_store import TicketStore
 
     await _seed_buffered(event_buffer, 'proj_root', n=20)
 
@@ -358,21 +362,32 @@ async def test_task_interceptor_add_task_rejects_when_over_limit(
         lambda _: False,  # no orchestrator
         hard_limit=5,
     )
-    interceptor = TaskInterceptor(
-        _taskmaster_mock,
-        targeted_reconciler=None,
-        event_buffer=event_buffer,
-        backlog_policy=policy,
-    )
-    project_root = str(tmp_path / 'proj_root')
-    result = await interceptor.add_task(
-        project_root=project_root, title='Should be rejected',
-    )
-    assert result.get('error_type') == 'ReconciliationBacklogExceeded'
-    assert result['backlog'] == 20
-    assert result['threshold'] == 5
-    # taskmaster.add_task must NOT be called — the whole point of the rejection.
-    _taskmaster_mock.add_task.assert_not_called()
+    store = TicketStore(tmp_path / 'reject_tickets.db')
+    await store.initialize()
+    try:
+        interceptor = TaskInterceptor(
+            _taskmaster_mock,
+            targeted_reconciler=None,
+            event_buffer=event_buffer,
+            backlog_policy=policy,
+            ticket_store=store,
+        )
+        project_root = str(tmp_path / 'proj_root')
+        result = await interceptor.add_task(
+            project_root=project_root, title='Should be rejected',
+        )
+        assert result.get('error_type') == 'ReconciliationBacklogExceeded'
+        assert result['backlog'] == 20
+        assert result['threshold'] == 5
+        # taskmaster.add_task must NOT be called — the whole point of the rejection.
+        _taskmaster_mock.add_task.assert_not_called()
+    finally:
+        await store.close()
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
 
 
 @pytest.mark.asyncio
@@ -380,7 +395,10 @@ async def test_task_interceptor_add_task_ok_when_under_limit(
     event_buffer, tmp_path, _taskmaster_mock,
 ):
     """Under-threshold → normal add_task flow, taskmaster called."""
+    import contextlib
+
     from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.middleware.ticket_store import TicketStore
 
     policy = BacklogPolicy(
         event_buffer,
@@ -390,16 +408,27 @@ async def test_task_interceptor_add_task_ok_when_under_limit(
     )
     config = MagicMock()
     config.curator.enabled = False
-    interceptor = TaskInterceptor(
-        _taskmaster_mock,
-        targeted_reconciler=None,
-        event_buffer=event_buffer,
-        backlog_policy=policy,
-        config=config,
-    )
-    project_root = str(tmp_path / 'proj_root')
-    result = await interceptor.add_task(
-        project_root=project_root, title='Under the limit',
-    )
-    assert result == {'id': '2', 'title': 'New'}
-    _taskmaster_mock.add_task.assert_called_once()
+    store = TicketStore(tmp_path / 'ok_tickets.db')
+    await store.initialize()
+    try:
+        interceptor = TaskInterceptor(
+            _taskmaster_mock,
+            targeted_reconciler=None,
+            event_buffer=event_buffer,
+            backlog_policy=policy,
+            config=config,
+            ticket_store=store,
+        )
+        project_root = str(tmp_path / 'proj_root')
+        result = await interceptor.add_task(
+            project_root=project_root, title='Under the limit',
+        )
+        assert result == {'id': '2', 'title': 'New'}
+        _taskmaster_mock.add_task.assert_called_once()
+    finally:
+        await store.close()
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt

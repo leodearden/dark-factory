@@ -158,6 +158,7 @@ async def run_server():
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.backlog_policy import BacklogPolicy
+        from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard
         from fused_memory.reconciliation.event_buffer import EventBuffer
         from fused_memory.reconciliation.event_queue import EventQueue
         from fused_memory.reconciliation.harness import ReconciliationHarness
@@ -255,6 +256,19 @@ async def run_server():
 
         from fused_memory.middleware.task_file_committer import TaskFileCommitter
 
+        # Task 918: defence-in-depth bulk-reset circuit-breaker.  Constructed
+        # here (inside the reconciliation branch) so it shares the same lifecycle
+        # as the other reconciliation-layer guards.  When reconciliation is
+        # disabled the guard is left as None in the TaskInterceptor (no guard).
+        bulk_reset_guard = BulkResetGuard(
+            enabled=config.reconciliation.bulk_reset_guard_enabled,
+            threshold=config.reconciliation.bulk_reset_guard_threshold,
+            window_seconds=config.reconciliation.bulk_reset_guard_window_seconds,
+            escalation_rate_limit_seconds=(
+                config.reconciliation.bulk_reset_guard_escalation_rate_limit_seconds
+            ),
+        )
+
         task_committer = TaskFileCommitter()
         ticket_store = await _build_ticket_store(Path(config.reconciliation.data_dir))
         task_interceptor = TaskInterceptor(
@@ -264,6 +278,7 @@ async def run_server():
             backlog_policy=backlog_policy,
             usage_gate=curator_usage_gate,
             ticket_store=ticket_store,
+            bulk_reset_guard=bulk_reset_guard,
         )
         await task_interceptor.start()
 

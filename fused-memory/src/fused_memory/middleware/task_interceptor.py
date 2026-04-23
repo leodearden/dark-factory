@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from fused_memory.middleware.task_file_committer import TaskFileCommitter
     from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.backlog_policy import BacklogPolicy
+    from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.targeted import TargetedReconciler
 
@@ -84,6 +85,7 @@ class TaskInterceptor:
         backlog_policy: 'BacklogPolicy | None' = None,
         usage_gate: 'UsageGate | None' = None,
         ticket_store: 'TicketStore | None' = None,
+        bulk_reset_guard: 'BulkResetGuard | None' = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
@@ -99,6 +101,12 @@ class TaskInterceptor:
         # the project lock; a rejection verdict short-circuits to a structured
         # error dict with no taskmaster mutation.
         self._backlog_policy = backlog_policy
+        # Task 918: defence-in-depth bulk-reset circuit-breaker.  When set,
+        # _apply_status_transition calls observe_attempt after the same-status
+        # no-op check and before the terminal-exit gate.  Rejections
+        # short-circuit without any taskmaster mutation, event emission, or
+        # reconciliation scheduling.
+        self._bulk_reset_guard = bulk_reset_guard
         self._background_tasks: set[asyncio.Task] = set()
 
         # Task curator: LLM-judged drop/combine/create gate. Lazy-initialized in
@@ -421,6 +429,41 @@ class TaskInterceptor:
             old_status = _extract_status(before)
             if status == old_status:
                 return {'success': True, 'no_op': True, 'task_id': task_id}
+
+            # 2a-pre. Bulk-reset circuit-breaker (task 918): observe the attempt
+            # before the terminal-exit gate so the guard catches reversal patterns
+            # regardless of whether individual attempts carry a reopen_reason.
+            # The 2026-04 bulk resets DID carry reopen_reason — the guard fires on
+            # the *pattern*, not the per-id legitimacy check.
+            #
+            # Trade-off: placing the guard BEFORE the terminal-exit gate means that
+            # done→pending attempts *without* a reopen_reason also consume window
+            # slots, even though the terminal-exit gate below would reject them
+            # anyway.  In a pathological burst of unauthorised (no-reopen_reason)
+            # done→pending attempts, the guard will trip and emit an escalation even
+            # though no actual reversals were allowed.  This is intentional: the
+            # *attempt pattern* is the signal.  False-positive trips from such bursts
+            # are acceptable because (a) the escalation text names the affected task
+            # IDs so a steward can distinguish legitimate from illegitimate reversals,
+            # and (b) the guard's primary goal is limiting blast radius, not
+            # distinguishing authorised from unauthorised reversals.
+            #
+            # IMPORTANT: This block MUST remain outside (before) the
+            # ``if old_status in TERMINAL_STATUSES:`` check below.  Moving it
+            # inside that branch would leave in-progress→pending reversals (which
+            # are non-terminal and bypass that gate entirely) completely unguarded.
+            # The guard's _is_reversal predicate handles its own filtering; the
+            # interceptor must not pre-filter by old_status.
+            if self._bulk_reset_guard is not None:
+                _brg_verdict = await self._bulk_reset_guard.observe_attempt(
+                    project_id=project_id,
+                    task_id=task_id,
+                    old_status=old_status,
+                    new_status=status,
+                    project_root=project_root,
+                )
+                if _brg_verdict.is_rejection:
+                    return _brg_verdict.to_error_dict()
 
             # 2a. Terminal-exit gate: reject done→non-done and cancelled→non-done
             # unless a non-empty reopen_reason is provided. Moves the terminal
