@@ -23,7 +23,7 @@ from orchestrator.config import (
     SandboxConfig,
 )
 from orchestrator.git_ops import GitOps
-from orchestrator.scheduler import TaskAssignment
+from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 from .configs import EVAL_CONFIGS, EvalConfig
@@ -226,7 +226,7 @@ async def run_eval(
 
     # 4. Set up workflow dependencies
     git_ops = GitOps(orch_config.git, orch_config.project_root)
-    scheduler = _EvalScheduler(orch_config)
+    scheduler, _ = _build_eval_scheduler(orch_config, task_id, list(modules))
     briefing = BriefingAssembler(orch_config)
     mcp = _EvalMcpStub(orch_config.fused_memory.url)
 
@@ -501,64 +501,30 @@ def load_results() -> list[EvalResult]:
 
 
 # ---------------------------------------------------------------------------
-# Stubs for eval mode (no real scheduler/MCP needed)
+# Stubs and helpers for eval mode (no real MCP HTTP connection needed)
 # ---------------------------------------------------------------------------
 
-class _EvalScheduler:
-    """Minimal scheduler stub for eval runs."""
 
-    def __init__(self, config: OrchestratorConfig):
-        self.config = config
-        # NOTE: duplicates the production Scheduler status cache that was
-        # removed when terminal-state enforcement moved server-side (see the
-        # feat(task-interceptor) commit that added _terminal_exit_error).
-        # Kept so the eval harness still runs without rewiring. See deferred
-        # task "Unify scheduler/evals-runner status tracking" for the
-        # long-term cleanup.
-        self._status_cache: dict[str, str] = {}
+def _build_eval_scheduler(
+    orch_config: OrchestratorConfig,
+    task_id: str,
+    modules: list[str],
+) -> tuple[Scheduler, '_StubMcpSession']:
+    """Build a production Scheduler wired with an in-memory MCP session stub.
 
-    async def get_tasks(self):
-        return []
+    Pre-installs the module lock for ``task_id`` so that a later
+    ``handle_blast_radius_expansion`` call cannot ``KeyError`` (production
+    normally installs the lock in ``acquire_next``; eval mode bypasses that).
 
-    async def set_task_status(
-        self,
-        task_id: str,
-        status: str,
-        *,
-        done_provenance: dict | None = None,
-        reopen_reason: str | None = None,
-    ) -> None:
-        extras = []
-        if done_provenance is not None:
-            extras.append(f'provenance={done_provenance!r}')
-        if reopen_reason is not None:
-            extras.append(f'reopen_reason={reopen_reason!r}')
-        log_extra = f' ({", ".join(extras)})' if extras else ''
-        logger.info(f'[eval] Task {task_id} → {status}{log_extra}')
-        self._set_cached_status(task_id, status)
-
-    async def get_status(self, task_id: str) -> str | None:
-        return self._status_cache.get(task_id)
-
-    def get_cached_status(self, task_id: str) -> str | None:
-        return self._status_cache.get(task_id)
-
-    def _set_cached_status(self, task_id: str, status: str) -> None:
-        """Write the cached status for a task.
-
-        Write-side counterpart to get_cached_status().  Mirrors the helper on
-        Scheduler for structural symmetry.
-
-        TODO: this is an exact one-liner duplicate of Scheduler._set_cached_status
-        (orchestrator/src/orchestrator/scheduler.py).  The two classes share no
-        base class, so the duplication is unavoidable today.  Revisit if cache
-        management grows (TTL, instrumentation, invalidation) to keep both sites
-        in sync.
-        """
-        self._status_cache[task_id] = status
-
-    async def handle_blast_radius_expansion(self, task_id: str, current: list[str], needed: list[str]) -> bool:
-        return True  # always allow in eval mode
+    Returns ``(scheduler, stub_session)`` so callers can inspect the stub when
+    needed (e.g. tests asserting on ``_statuses``).
+    """
+    stub = _StubMcpSession()
+    scheduler = Scheduler(orch_config, mcp_session=stub)
+    # Pre-install the module lock so handle_blast_radius_expansion's
+    # try_acquire_additional can find the _held[task_id] entry.
+    scheduler.lock_table.try_acquire(task_id, modules)
+    return scheduler, stub
 
 
 class _StubMcpSession:
