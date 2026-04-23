@@ -294,6 +294,14 @@ class MergeWorker:
             if req is None:
                 break  # shutdown sentinel
 
+            if self._event_store is not None:
+                self._event_store.emit(
+                    EventType.merge_dequeued,
+                    task_id=req.task_id,
+                    phase='merge',
+                    data={'branch': req.branch},
+                )
+
             outcome = await self._process(req)
             # outcome is None when the request was re-enqueued (CAS failure)
             if outcome is not None and not req.result.done():
