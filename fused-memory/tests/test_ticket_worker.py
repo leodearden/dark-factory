@@ -995,3 +995,117 @@ async def test_worker_record_task_failure_still_resolves_as_created(
 
     # (6) task_committer.commit was scheduled
     mock_committer.commit.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# step-67: per-project queues do not serialise across projects
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_per_project_ticket_queues_do_not_serialise(
+    taskmaster, event_buffer, ticket_store,
+):
+    """Per-project fairness: a slow curator on project-a must NOT block
+    project-b's tickets from being processed.
+
+    With a single global worker (old impl) project-b's ticket sits behind
+    project-a's blocked curator.curate() and resolve_ticket(project_b) times
+    out. With per-project workers, project-b drains independently.
+
+    Sequence:
+    1. Submit ticket for project-a — worker picks it up and blocks inside curate().
+    2. Submit ticket for project-b — served by a separate worker.
+    3. resolve_ticket(project_b, timeout=1.0) returns before the timeout.
+    4. Unblock project-a's curator, then resolve_ticket(project_a) also completes.
+    5. Assert len(interceptor._worker_tasks) == 2 and worker names are distinct.
+    """
+    # Asyncio event to block project-a's curator
+    unblock_a: asyncio.Event = asyncio.Event()
+
+    async def curate_side_effect(candidate, project_id, *args, **kwargs):
+        # resolve_project_id converts hyphens to underscores:
+        # '/project-a' -> 'project_a', '/project-b' -> 'project_b'
+        if project_id == 'project_a':
+            await unblock_a.wait()
+        return CuratorDecision(action='create')
+
+    mock_curator = MagicMock()
+    mock_curator.curate = AsyncMock(side_effect=curate_side_effect)
+    mock_curator.note_created = MagicMock()
+    mock_curator.record_task = AsyncMock()
+
+    # Two separate project roots map to two project_ids
+    project_root_a = '/project-a'
+    project_root_b = '/project-b'
+
+    ti = TaskInterceptor(taskmaster, None, event_buffer, ticket_store=ticket_store)
+
+    try:
+        with patch.object(
+            type(ti), '_get_curator',
+            new=AsyncMock(return_value=mock_curator),
+        ):
+            # (1) Submit project-a — worker picks it up immediately and blocks
+            submit_a = await ti.submit_task(project_root=project_root_a, title='Task A')
+            assert submit_a.get('ticket', '').startswith('tkt_'), f'Got: {submit_a}'
+            ticket_a = submit_a['ticket']
+
+            # Let the event loop run so the worker starts and picks up the ticket
+            await asyncio.sleep(0.05)
+
+            # (2) Submit project-b — must get an independent worker
+            submit_b = await ti.submit_task(project_root=project_root_b, title='Task B')
+            assert submit_b.get('ticket', '').startswith('tkt_'), f'Got: {submit_b}'
+            ticket_b = submit_b['ticket']
+
+            # (3) project-b resolves within timeout (1.0 s) while project-a is blocked
+            result_b = await asyncio.wait_for(
+                ti.resolve_ticket(ticket_b, project_root_b, timeout_seconds=None),
+                timeout=2.0,
+            )
+            assert result_b.get('status') == 'created', (
+                f'project-b should resolve while project-a is blocked: {result_b!r}'
+            )
+
+            # (4) Unblock project-a and wait for its resolution
+            unblock_a.set()
+            result_a = await asyncio.wait_for(
+                ti.resolve_ticket(ticket_a, project_root_a, timeout_seconds=None),
+                timeout=5.0,
+            )
+            assert result_a.get('status') == 'created', (
+                f'project-a should resolve after unblock: {result_a!r}'
+            )
+
+            # (5) Two workers with distinct names
+            assert hasattr(ti, '_worker_tasks'), (
+                'Expected _worker_tasks dict (per-project sharding not implemented)'
+            )
+            assert len(ti._worker_tasks) == 2, (
+                f'Expected 2 workers (one per project), got {len(ti._worker_tasks)}: '
+                f'{list(ti._worker_tasks.keys())}'
+            )
+            worker_names = {t.get_name() for t in ti._worker_tasks.values()}
+            assert any('project-a' in n for n in worker_names), (
+                f'Expected a worker named for project-a: {worker_names}'
+            )
+            assert any('project-b' in n for n in worker_names), (
+                f'Expected a worker named for project-b: {worker_names}'
+            )
+
+    finally:
+        # Clean up all per-project workers
+        unblock_a.set()  # ensure worker-a is not stuck
+        if hasattr(ti, '_worker_tasks'):
+            tasks = list(ti._worker_tasks.values())
+        elif ti._worker_task is not None:
+            tasks = [ti._worker_task]
+        else:
+            tasks = []
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if ti._ticket_store is not None:
+            await ti._ticket_store.close()
