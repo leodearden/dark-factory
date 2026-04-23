@@ -2714,16 +2714,18 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
     )
     from fused_memory.reconciliation.harness import BacklogIterator
 
-    # peek_buffered orders by `timestamp ASC LIMIT ?` (FIFO). Push 5 events that
+    # peek_buffered orders by `timestamp ASC LIMIT ?` (FIFO). Push 9 events that
     # LACK _project_root with monotonically-increasing timestamps, then 1 event
     # carrying _project_root='/from/event' with the latest timestamp. With FIFO
     # peek, the override event is returned LAST — so the resolver only finds it
-    # if the window is wide enough to accommodate all 6 buffered events.
+    # if the window is wide enough to accommodate all 10 buffered events.
+    # Using 9+1=10 puts the override right at the current limit, so any
+    # reduction of the peek window (even to 9) will cause this test to fail.
     # Anchor base_ts 60 seconds in the past so that peek_buffered's
     # `WHERE timestamp < cutoff` clause (cutoff ≈ datetime.now(UTC) at run() time)
-    # includes all 6 events.  Explicit offsets avoid sub-microsecond tie flakiness.
+    # includes all 10 events.  Explicit offsets avoid sub-microsecond tie flakiness.
     base_ts = datetime.now(UTC) - timedelta(seconds=60)
-    for i in range(5):
+    for i in range(9):
         await event_buffer.push(ReconciliationEvent(
             id=str(uuid.uuid4()),
             type=EventType.episode_added,
@@ -2737,7 +2739,7 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
         type=EventType.task_status_changed,
         source=EventSource.agent,
         project_id='dark_factory',
-        timestamp=base_ts + timedelta(seconds=10),  # latest — FIFO peek returns last
+        timestamp=base_ts + timedelta(seconds=20),  # latest — FIFO peek returns last
         payload={'_project_root': '/from/event', 'task_id': '1'},
     ))
 
@@ -2764,8 +2766,8 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
     assert captured['project_root'] == '/from/event', (
         f"Expected project_root='/from/event' but got '{captured['project_root']}'. "
         'The peek window must be wide enough to find a later-buffered _project_root '
-        'override past 5 earlier events that lack the key. If this test now fails, '
-        'the peek window has been tuned too narrow — consider whether 6 buffered '
+        'override past 9 earlier events that lack the key. If this test now fails, '
+        'the peek window has been tuned too narrow — consider whether 10 buffered '
         'events is an unreasonable lookback and adjust accordingly.'
     )
 

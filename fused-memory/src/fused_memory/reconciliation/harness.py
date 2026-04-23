@@ -1107,10 +1107,6 @@ class BacklogIterator:
         # Snapshot: only process events that existed when we started.
         cutoff = datetime.now(UTC)
 
-        # Resolve project_root: peek several events so that an older event
-        # lacking _project_root doesn't force a fallback when a later event in
-        # the buffer carries the key.  Uses the shared helper for identical
-        # fallback semantics as run_full_cycle (task 927).
         peeked_for_root = await self.buffer.peek_buffered(project_id, limit=_PROJECT_ROOT_PEEK_LIMIT, before=cutoff)
         project_root = self.harness._resolve_project_root(peeked_for_root)
 
