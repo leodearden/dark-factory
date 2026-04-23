@@ -1412,9 +1412,8 @@ class TestLoadTaskTitles:
         assert '1' not in result
         assert result.get('2') == 'B'
 
-    def test_repeat_calls_cached_via_mtime(self, tmp_path, monkeypatch):
+    def test_repeat_calls_cached_via_mtime(self, tmp_path, counted_load_task_tree):
         """Two calls with unchanged mtime invoke load_task_tree exactly once."""
-        import dashboard.data.merge_queue as _mq
         from dashboard.data.merge_queue import (
             _load_task_titles_cached,
             load_task_titles,
@@ -1425,20 +1424,10 @@ class TestLoadTaskTitles:
         tasks_path = tmp_path / 'tasks.json'
         self._write_tasks_json(tasks_path, [{'id': 1, 'title': 'A'}])
 
-        call_count = 0
-        original_load_task_tree = _mq.load_task_tree
-
-        def counting_load_task_tree(path):
-            nonlocal call_count
-            call_count += 1
-            return original_load_task_tree(path)
-
-        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
-
         result1 = load_task_titles(tasks_path)
         result2 = load_task_titles(tasks_path)
 
-        assert call_count == 1, f"load_task_tree called {call_count} times, expected 1"
+        assert counted_load_task_tree.count == 1, f"load_task_tree called {counted_load_task_tree.count} times, expected 1"
         assert result1 == {'1': 'A'}
         assert result2 == {'1': 'A'}
 
