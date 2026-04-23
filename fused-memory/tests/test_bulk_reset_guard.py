@@ -571,8 +571,15 @@ def test_verdict_to_error_dict_ok():
     assert v.to_error_dict() == {}
 
 
-def test_verdict_to_error_dict_rejection():
-    """outcome='rejection' produces a structured error payload."""
+@pytest.mark.parametrize("threshold,window_seconds", [(10, 60.0), (6, 60.0)])
+def test_verdict_to_error_dict_rejection(threshold, window_seconds):
+    """outcome='rejection' produces a structured error payload.
+
+    Parametrized with (10, 60.0) and the "gotcha" case (6, 60.0):
+    threshold=6 with window_seconds=60.0 demonstrates the antipattern —
+    str(6)="6" would spuriously match "60" inside "60.0s", so plain
+    substring checks are fragile.  The bound forms pin the label prefix.
+    """
     v = BulkResetVerdict(
         outcome='rejection',
         affected_task_ids=('5', '6', '7'),
@@ -581,8 +588,8 @@ def test_verdict_to_error_dict_rejection():
             '2026-04-23T00:00:01+00:00',
             '2026-04-23T00:00:02+00:00',
         ),
-        threshold=10,
-        window_seconds=60.0,
+        threshold=threshold,
+        window_seconds=window_seconds,
         project_id='proj',
         error_type='BulkResetGuardTripped',
     )
@@ -596,14 +603,23 @@ def test_verdict_to_error_dict_rejection():
     assert str(d['window_seconds']) in d['error'], (
         f"error string {d['error']!r} should contain window_seconds {d['window_seconds']}"
     )
+    # Bound-form assertions: pin the label prefix to avoid numeric substring coincidences.
+    # e.g. threshold=6 with window_seconds=60.0 — "6" would match "60" in "60.0s";
+    # "threshold 6" only appears in the right place.
+    assert f"threshold {d['threshold']}" in d['error'], (
+        f"error string {d['error']!r} should contain bound form 'threshold {d['threshold']}'"
+    )
+    assert f"within {d['window_seconds']}s window" in d['error'], (
+        f"error string {d['error']!r} should contain bound form 'within {d['window_seconds']}s window'"
+    )
     assert d['affected_task_ids'] == ['5', '6', '7']
     assert d['triggering_timestamps'] == [
         '2026-04-23T00:00:00+00:00',
         '2026-04-23T00:00:01+00:00',
         '2026-04-23T00:00:02+00:00',
     ]
-    assert d['threshold'] == 10
-    assert d['window_seconds'] == 60.0
+    assert d['threshold'] == threshold
+    assert d['window_seconds'] == window_seconds
     assert d['project_id'] == 'proj'
     assert 'hint' in d
     # No escalation_path for plain rejection
