@@ -239,7 +239,8 @@
 
   function renderAll() {
     Object.keys(allProjects).forEach(function(pid) {
-      var safeId = pid.replace(/[^a-zA-Z0-9_]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '') || 'unknown';
+      var safeId = allProjects[pid].canvas_id;
+      if (!safeId) return;
       renderDepthChart(safeId, allProjects[pid].depth_timeseries);
       renderOutcomeChart(safeId, allProjects[pid].outcomes);
     });
