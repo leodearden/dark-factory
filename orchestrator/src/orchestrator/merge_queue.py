@@ -119,7 +119,7 @@ def _emit_merge_attempt(
 
 async def enqueue_merge_request(
     queue: asyncio.Queue,
-    req: 'MergeRequest',
+    req: MergeRequest,
     event_store: EventStore | None,
 ) -> None:
     """Enqueue a MergeRequest and emit a merge_queued event.
