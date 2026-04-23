@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -195,3 +196,33 @@ class TestDismissAllPendingResilience:
             count = queue.dismiss_all_pending('Stale from prior run')
 
         assert count == 0
+
+
+class TestResolveArchives:
+    """EscalationQueue.resolve() moves the file into archive/YYYY-MM-DD/ after resolution."""
+
+    def test_resolve_moves_file_to_dated_archive_subdir(self, tmp_path: Path):
+        """After resolve(), the esc-*.json is in archive/<date>/ not the queue root."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'All good')
+
+        # (a) File no longer in queue root
+        assert not (queue.queue_dir / 'esc-1-1.json').exists()
+
+        # (b) File is in the archive under the correct date
+        # Derive expected directory from the resolved_at that was written to disk
+        archived_files = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archived_files) == 1
+        archived_path = archived_files[0]
+
+        # (c) The archived JSON parses back correctly
+        data = json.loads(archived_path.read_text())
+        assert data['status'] == 'resolved'
+        assert data['resolution'] == 'All good'
+
+        # (d) The parent directory name matches the date in resolved_at
+        resolved_at = data['resolved_at']
+        expected_date = resolved_at[:10]  # YYYY-MM-DD prefix
+        assert archived_path.parent.name == expected_date
