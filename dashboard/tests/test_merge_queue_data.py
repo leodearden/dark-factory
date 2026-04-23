@@ -931,19 +931,18 @@ class TestRecentMerges:
         supported and returns every matching row without a row-count cap.
         """
         now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        for i in range(60):
-            _insert_event(
-                conn_sync,
-                event_type='merge_attempt',
-                timestamp=now - timedelta(seconds=i * 5),
-                task_id=f'burst-{i:03d}',
-                run_id=f'run-burst-{i:03d}',
-                data={'outcome': 'done'},
-                duration_ms=100 + i,
-            )
-        conn_sync.commit()
-        conn_sync.close()
+        with sqlite3.connect(str(merge_events_db)) as conn_sync:
+            for i in range(60):
+                _insert_event(
+                    conn_sync,
+                    event_type='merge_attempt',
+                    timestamp=now - timedelta(seconds=i * 5),
+                    task_id=f'burst-{i:03d}',
+                    run_id=f'run-burst-{i:03d}',
+                    data={'outcome': 'done'},
+                    duration_ms=100 + i,
+                )
+            conn_sync.commit()
 
         async with aiosqlite.connect(str(merge_events_db)) as db:
             db.row_factory = aiosqlite.Row
