@@ -186,6 +186,13 @@ class EscalationQueue:
             raise
 
         # Best-effort: move resolved file into dated archive subdir.
+        #
+        # Two-step design (write-to-root then os.replace to archive) is
+        # intentional: if the archive move fails, the *resolved* file remains in
+        # queue_dir so get() can still return it — no data is lost.  Writing
+        # directly to the archive dir would leave the file as *pending* in
+        # queue_dir on failure, which is a worse fallback state.
+        #
         # Failure logs a warning but does not abort the resolution.
         try:
             archive_dir = archive.archive_dir_for_date(self.queue_dir, esc.resolved_at)

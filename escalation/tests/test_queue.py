@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -263,7 +265,16 @@ class TestGetByTaskAcrossArchive:
 
 
 class TestResolveArchives:
-    """EscalationQueue.resolve() moves the file into archive/YYYY-MM-DD/ after resolution."""
+    """EscalationQueue.resolve() moves the file into archive/YYYY-MM-DD/ after resolution.
+
+    The implementation uses a two-step approach:
+      1. Atomically write the resolved JSON to queue_dir/{id}.json (tmp+rename).
+      2. Best-effort os.replace() into archive/YYYY-MM-DD/{id}.json.
+    If step 2 fails, the resolved file stays in queue_dir — still readable by
+    get() — so the resolution is never lost.  This is intentionally more robust
+    than writing directly to the archive dir: a failed archive write would leave
+    the file in queue_dir as *pending* rather than as *resolved*.
+    """
 
     def test_resolve_moves_file_to_dated_archive_subdir(self, tmp_path: Path):
         """After resolve(), the esc-*.json is in archive/<date>/ not the queue root."""
@@ -290,6 +301,39 @@ class TestResolveArchives:
         resolved_at = data['resolved_at']
         expected_date = resolved_at[:10]  # YYYY-MM-DD prefix
         assert archived_path.parent.name == expected_date
+
+    def test_resolve_archive_failure_leaves_file_in_queue_root(
+        self, tmp_path: Path, caplog,
+    ):
+        """When the archive move (os.replace) fails, resolve() still succeeds.
+
+        Contract (the except OSError arm at queue.py:~180):
+        - resolve() returns the resolved Escalation.
+        - The file stays in queue_dir (readable by get()).
+        - A WARNING is emitted naming the escalation.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        with patch('os.replace', side_effect=OSError('cross-device link')):
+            with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+                result = queue.resolve('esc-1-1', 'Force archive failure')
+
+        # resolve() must return the updated escalation despite the OSError
+        assert result is not None
+        assert result.status == 'resolved'
+        assert result.resolution == 'Force archive failure'
+
+        # File must remain readable from queue root (archive move failed → stayed)
+        from_queue = queue.get('esc-1-1')
+        assert from_queue is not None
+        assert from_queue.status == 'resolved'
+
+        # A warning naming the escalation ID must have been logged
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('esc-1-1' in msg for msg in warning_messages), (
+            f'Expected a warning mentioning esc-1-1; got: {warning_messages}'
+        )
 
 
 class TestMakeIdAcrossArchive:
