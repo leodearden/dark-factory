@@ -925,12 +925,13 @@ class TestRecentMerges:
         assert all(tid.startswith('recent-') for tid in task_ids)
 
     @pytest.mark.asyncio
-    async def test_limit_none_returns_all_rows(self, merge_events_db):
-        """recent_merges with limit=None returns every matching row (no SQL LIMIT).
+    async def test_limit_none_returns_all_rows(self, merge_events_db, caplog):
+        """recent_merges with limit=None returns every matching row up to _RECENT_MERGES_HARD_CAP.
 
         Inserts 60 merge_attempt events all within the last 5 minutes, then
-        asserts that limit=None returns all 60, verifying that limit=None is
-        supported and returns every matching row without a row-count cap.
+        asserts that limit=None returns all 60 (60 < 100_000 default hard cap,
+        so no truncation occurs) and that no WARNING is emitted (the 'below
+        cap → silent' branch).
         """
         now = datetime.now(UTC)
         with contextlib.closing(sqlite3.connect(str(merge_events_db))) as conn_sync:
@@ -946,13 +947,20 @@ class TestRecentMerges:
                 )
             conn_sync.commit()
 
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await recent_merges(db, limit=None, hours=1)
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.merge_queue'):
+            async with aiosqlite.connect(str(merge_events_db)) as db:
+                db.row_factory = aiosqlite.Row
+                result = await recent_merges(db, limit=None, hours=1)
 
         assert len(result) == 60, (
             f'Expected 60 rows with limit=None, got {len(result)}. '
-            'The SQL LIMIT clause must be omitted when limit is None.'
+            'limit=None returns every matching row up to _RECENT_MERGES_HARD_CAP '
+            '(no truncation for normal-sized result sets).'
+        )
+        warn_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warn_records, (
+            f'Expected no WARNING for 60 rows (well below hard cap), '
+            f'but got: {[r.message for r in warn_records]}'
         )
 
     @pytest.mark.asyncio
