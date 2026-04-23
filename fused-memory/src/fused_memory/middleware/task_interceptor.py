@@ -435,6 +435,13 @@ class TaskInterceptor:
             # regardless of whether individual attempts carry a reopen_reason.
             # The 2026-04 bulk resets DID carry reopen_reason — the guard fires on
             # the *pattern*, not the per-id legitimacy check.
+            #
+            # IMPORTANT: This block MUST remain outside (before) the
+            # ``if old_status in TERMINAL_STATUSES:`` check below.  Moving it
+            # inside that branch would leave in-progress→pending reversals (which
+            # are non-terminal and bypass that gate entirely) completely unguarded.
+            # The guard's _is_reversal predicate handles its own filtering; the
+            # interceptor must not pre-filter by old_status.
             if self._bulk_reset_guard is not None:
                 _brg_verdict = await self._bulk_reset_guard.observe_attempt(
                     project_id=project_id,
