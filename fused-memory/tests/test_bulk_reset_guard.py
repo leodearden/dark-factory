@@ -571,8 +571,32 @@ def test_verdict_to_error_dict_ok():
     assert v.to_error_dict() == {}
 
 
-def test_verdict_to_error_dict_rejection():
-    """outcome='rejection' produces a structured error payload."""
+@pytest.mark.parametrize("threshold,window_seconds", [
+    (10, 60.0),  # original case
+    (6, 60.0),   # threshold "gotcha": str(6)="6" collides with "60" inside "60.0s"
+    (10, 6.0),   # window_seconds "gotcha": varies window_seconds so bound-form is
+                 # tested against a distinct value ("within 6.0s window")
+])
+def test_verdict_to_error_dict_rejection(threshold, window_seconds):
+    """outcome='rejection' produces a structured error payload.
+
+    Three parametrized cases exercise bound-form assertions on both axes:
+    - (10, 60.0): the original baseline values.
+    - (6,  60.0): threshold "gotcha" — str(6)="6" would spuriously match "60"
+      inside "60.0s" under a naive substring check; bound form "threshold 6"
+      is unambiguous.
+    - (10, 6.0):  window_seconds "gotcha" — varies window_seconds so the
+      "within {window_seconds}s window" bound assertion is exercised against a
+      distinct value; without this row the 60.0 path would never be exercised
+      differently across parametrize iterations.
+
+    Note: affected_task_ids is kept short (3 items) across all cases.  In
+    production a rejection verdict is only constructed when
+    len(affected_task_ids) > threshold, so the 3-vs-6 and 3-vs-10
+    combinations are semantically impossible.  BulkResetVerdict.to_error_dict()
+    does not enforce that invariant, so this test intentionally decouples
+    formatting correctness from semantic validity.
+    """
     v = BulkResetVerdict(
         outcome='rejection',
         affected_task_ids=('5', '6', '7'),
@@ -581,8 +605,8 @@ def test_verdict_to_error_dict_rejection():
             '2026-04-23T00:00:01+00:00',
             '2026-04-23T00:00:02+00:00',
         ),
-        threshold=10,
-        window_seconds=60.0,
+        threshold=threshold,
+        window_seconds=window_seconds,
         project_id='proj',
         error_type='BulkResetGuardTripped',
     )
@@ -590,11 +614,14 @@ def test_verdict_to_error_dict_rejection():
     assert d['success'] is False
     assert d['error_type'] == 'BulkResetGuardTripped'
     assert 'BulkResetGuardTripped' in d['error']
-    assert str(d['threshold']) in d['error'], (
-        f"error string {d['error']!r} should contain threshold {d['threshold']}"
+    # Bound-form assertions: pin the label prefix to avoid numeric substring coincidences.
+    # e.g. threshold=6 with window_seconds=60.0 — str(6)="6" would match "60" inside
+    # "60.0s", but "threshold 6" only appears in the right label position.
+    assert f"threshold {d['threshold']}" in d['error'], (
+        f"error string {d['error']!r} should contain bound form 'threshold {d['threshold']}'"
     )
-    assert str(d['window_seconds']) in d['error'], (
-        f"error string {d['error']!r} should contain window_seconds {d['window_seconds']}"
+    assert f"within {d['window_seconds']}s window" in d['error'], (
+        f"error string {d['error']!r} should contain bound form 'within {d['window_seconds']}s window'"
     )
     assert d['affected_task_ids'] == ['5', '6', '7']
     assert d['triggering_timestamps'] == [
@@ -602,8 +629,8 @@ def test_verdict_to_error_dict_rejection():
         '2026-04-23T00:00:01+00:00',
         '2026-04-23T00:00:02+00:00',
     ]
-    assert d['threshold'] == 10
-    assert d['window_seconds'] == 60.0
+    assert d['threshold'] == threshold
+    assert d['window_seconds'] == window_seconds
     assert d['project_id'] == 'proj'
     assert 'hint' in d
     # No escalation_path for plain rejection
