@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import traceback
 from contextlib import suppress
 from dataclasses import dataclass
@@ -81,7 +82,10 @@ class ReconciliationHarness:
         self.taskmaster = taskmaster
         self.journal = journal
         self.buffer = event_buffer
-        self._project_root = config.taskmaster.project_root if config.taskmaster else ''
+        _raw_root = config.taskmaster.project_root if config.taskmaster else ''
+        if _raw_root:
+            _raw_root = os.path.expanduser(_raw_root)
+        self._project_root = str(Path(_raw_root).resolve()) if _raw_root else ''
         self.config = config.reconciliation
         self._backlog_policy = backlog_policy
         # WP-D: track which halted projects we've already escalated so we
@@ -290,12 +294,27 @@ class ReconciliationHarness:
         Returns:
             FilteredTaskTree with active tasks sorted by priority and aggregate
             counts. Returns empty FilteredTaskTree if taskmaster is unavailable,
-            project_root is empty, or the fetch fails.
+            project_root is empty, non-absolute, or the fetch fails.
+            Non-absolute paths are rejected before calling taskmaster to avoid
+            silent failures from TaskmasterBackend's absolute-path validator.
         """
         if not self.taskmaster or not project_root:
             return FilteredTaskTree()
+        if not os.path.isabs(project_root):
+            logger.warning(
+                '_fetch_filtered_task_tree rejected non-absolute project_root %r'
+                ' — cannot fetch tasks; Stage 2 will see empty tree',
+                project_root,
+            )
+            return FilteredTaskTree()
         try:
             tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
+            raw_count = len(tasks_data.get('tasks', [])) if isinstance(tasks_data, dict) else 0
+            logger.debug(
+                '_fetch_filtered_task_tree fetched %d raw tasks for %r',
+                raw_count,
+                project_root,
+            )
             return filter_task_tree(tasks_data)
         except Exception as exc:
             logger.warning(

@@ -308,6 +308,59 @@ async def test_harness_init_stores_project_root_from_taskmaster_config(
 
 
 @pytest.mark.asyncio
+async def test_harness_init_resolves_relative_project_root_to_absolute(
+    journal, event_buffer, mock_memory_service
+):
+    """ReconciliationHarness.__init__ must resolve relative project_root values to absolute.
+
+    Three cases:
+    (a) Relative path '.' is resolved to str(Path('.').resolve()) — an absolute path.
+    (b) Already-absolute '/abs/already' passes through unchanged (idempotent).
+    (c) project_root=None (no taskmaster) stays '' (preserves task-927 short-circuit).
+
+    Both _project_root attribute and the public project_root property must reflect
+    the normalized value.
+    """
+    from pathlib import Path
+
+    # (a) Relative '.' must be resolved to an absolute path
+    harness_a = _make_harness_927(journal, event_buffer, mock_memory_service, '.')
+    expected_resolved = str(Path('.').resolve())
+    assert harness_a._project_root == expected_resolved, (
+        f"Expected _project_root={expected_resolved!r} (resolved absolute path), "
+        f"got {harness_a._project_root!r}"
+    )
+    assert harness_a._project_root != '.', "relative '.' must not remain as-is"
+    assert harness_a.project_root == harness_a._project_root, (
+        "project_root property must mirror _project_root"
+    )
+
+    # (b) Already-absolute path passes through unchanged
+    harness_b = _make_harness_927(journal, event_buffer, mock_memory_service, '/abs/already')
+    assert harness_b._project_root == '/abs/already', (
+        f"Absolute path should pass through unchanged; got {harness_b._project_root!r}"
+    )
+    assert harness_b.project_root == '/abs/already'
+
+    # (c) None (no taskmaster configured) → empty string — task-927 short-circuit preserved
+    harness_c = _make_harness_927(journal, event_buffer, mock_memory_service, None)
+    assert harness_c._project_root == '', (
+        f"taskmaster=None should give _project_root=''; got {harness_c._project_root!r}"
+    )
+    assert harness_c.project_root == ''
+
+    # (d) Empty-string project_root → empty string — distinct from None, exercises the
+    # truthiness guard `if _raw_root` branch (not the `config.taskmaster is None` branch).
+    # If the guard were removed, empty string would silently resolve to CWD, breaking the
+    # task-927 short-circuit in _fetch_filtered_task_tree.
+    harness_d = _make_harness_927(journal, event_buffer, mock_memory_service, '')
+    assert harness_d._project_root == '', (
+        f"empty-string project_root must stay ''; got {harness_d._project_root!r}"
+    )
+    assert harness_d.project_root == ''
+
+
+@pytest.mark.asyncio
 async def test_run_full_cycle_uses_configured_project_root_when_events_lack_override(
     journal, event_buffer, mock_memory_service
 ):
@@ -1841,6 +1894,102 @@ class TestHarnessFetchFilteredTaskTree:
         assert result.active_tasks == []
         harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
 
+    @pytest.mark.asyncio
+    async def test_fetch_filtered_task_tree_rejects_non_absolute_project_root(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """_fetch_filtered_task_tree pre-checks that project_root is absolute.
+
+        When a non-absolute (relative) path is passed:
+        (a) returns an empty FilteredTaskTree (degrades gracefully),
+        (b) does NOT call taskmaster.get_tasks (pre-check short-circuits before
+            any network call),
+        (c) emits a WARNING containing the distinct marker 'non-absolute
+            project_root' and the rejected path repr so operators can grep
+            production logs to identify the failure mode.
+        """
+        import logging
+
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        with caplog.at_level(logging.WARNING):
+            result = await harness._fetch_filtered_task_tree('.')
+
+        # (a) graceful degradation — empty tree, no exception raised
+        assert isinstance(result, FilteredTaskTree)
+        assert result.active_tasks == []
+        assert result.total_count == 0
+
+        # (b) taskmaster.get_tasks must NOT be called (pre-check short-circuit)
+        harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
+
+        # (c) distinct WARNING marker present in logs, including repr of the rejected path
+        warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'non-absolute project_root' in msg and repr('.') in msg
+            for msg in warning_msgs
+        ), (
+            f"Expected WARNING containing 'non-absolute project_root' and repr(\".\") == \"'.'\";"
+            f" got: {warning_msgs}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fetch_filtered_task_tree_logs_raw_task_count(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """_fetch_filtered_task_tree emits a DEBUG log with the raw task count after a successful fetch.
+
+        The log message must contain 'raw tasks', the integer count of tasks
+        returned by taskmaster, and the project_root so operators can distinguish
+        'get_tasks returned 0 raw tasks' (upstream Taskmaster issue) from
+        'get_tasks returned N tasks but filter partitioned all into other'
+        (task_filter regression).  DEBUG level keeps the happy-path heartbeat out
+        of the default INFO log stream at scale.
+        """
+        import logging
+
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # Four tasks with mixed statuses
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+            'tasks': [
+                {'id': 1, 'title': 'T1', 'status': 'in-progress', 'dependencies': []},
+                {'id': 2, 'title': 'T2', 'status': 'done', 'dependencies': []},
+                {'id': 3, 'title': 'T3', 'status': 'cancelled', 'dependencies': []},
+                {'id': 4, 'title': 'T4', 'status': 'pending', 'dependencies': []},
+            ]
+        }
+
+        with caplog.at_level(logging.DEBUG):
+            result = await harness._fetch_filtered_task_tree('/abs/path')
+
+        # (a) DEBUG log must contain 'raw tasks', the count 4, and the project_root
+        debug_msgs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any(
+            'raw tasks' in msg and '4' in msg and '/abs/path' in msg
+            for msg in debug_msgs
+        ), (
+            f"Expected DEBUG log containing 'raw tasks', '4', '/abs/path'; got: {debug_msgs}"
+        )
+
+        # (b) sanity: returned tree reflects the actual data
+        assert isinstance(result, FilteredTaskTree)
+        assert len(result.active_tasks) == 2   # in-progress + pending
+        assert result.done_count == 1
+        assert result.cancelled_count == 1
+
 
 # ── Tests for task 455: harness wires filtered_task_tree into stages ──────────
 
@@ -2864,3 +3013,84 @@ async def test_empty_fallback_resolves_and_short_circuits_filtered_task_tree(
 
     # (c) taskmaster.get_tasks was never called (short-circuit on empty project_root)
     harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_with_relative_config_and_memory_only_events_still_fetches_tree(
+    journal, event_buffer, mock_memory_service
+):
+    """End-to-end regression: relative project_root='.' in config + memory-style events
+    (no _project_root payload) must still produce a non-empty FilteredTaskTree in Stage 2.
+
+    Replicates the production symptom from task 958:
+    - config.taskmaster.project_root resolves to '.' when PROJECT_ROOT env is unset,
+    - memory-service events (episode_added/memory_added) never carry _project_root,
+    - so _resolve_project_root falls back to self._project_root.
+    Before this fix, self._project_root stored '.' (relative) which bypassed the
+    empty-string short-circuit but was rejected by TaskmasterBackend's absolute-path
+    validator, giving a silent empty tree to Stage 2.
+    After this fix, __init__ resolves '.' to str(Path('.').resolve()) so the full
+    pipeline succeeds.
+
+    Pins the init-normalization → resolver → fetcher pipeline end-to-end.
+    """
+    from pathlib import Path
+
+    from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+    # Build harness with RELATIVE project_root='.' — init must resolve to absolute
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service, project_root='.')
+    expected_abs = str(Path('.').resolve())
+    assert harness._project_root == expected_abs, (
+        "Pre-condition: harness._project_root must be absolute after init"
+    )
+
+    # Push two memory-style events (no _project_root in payload)
+    await event_buffer.push(_make_event('dark_factory'))
+    await event_buffer.push(_make_event('dark_factory'))
+
+    # Taskmaster returns one active task when called with the resolved absolute path
+    harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+        'tasks': [
+            {'id': 1, 'title': 'Task A', 'status': 'in-progress', 'dependencies': []},
+        ]
+    }
+
+    # Capture Stage 2 (TaskKnowledgeSync) filtered_task_tree at call time
+    captured_s2: dict = {}
+
+    async def capture_stage2(stage):
+        captured_s2['filtered_task_tree'] = getattr(stage, 'filtered_task_tree', None)
+
+    from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+    for stage in harness.stages:
+        if isinstance(stage, TaskKnowledgeSync):
+            _mock_stage_run(stage, before_return=capture_stage2)
+        else:
+            _mock_stage_run(stage)
+
+    await harness.run_full_cycle('dark_factory', 'buffer_size:2')
+
+    # (a) taskmaster.get_tasks was called exactly once
+    harness.taskmaster.get_tasks.assert_called_once()  # type: ignore[union-attr,attr-defined]
+
+    # (b) the project_root arg was the resolved absolute path (not '.')
+    call_kwargs = harness.taskmaster.get_tasks.call_args.kwargs  # type: ignore[union-attr,attr-defined]
+    assert call_kwargs.get('project_root') == expected_abs, (
+        f"get_tasks called with project_root={call_kwargs.get('project_root')!r}, "
+        f"expected {expected_abs!r} — init normalization must resolve relative '.' to absolute"
+    )
+
+    # (c) Stage 2's filtered_task_tree at run time is non-empty
+    assert 'filtered_task_tree' in captured_s2, (
+        "Stage 2 run was never captured — check _mock_stage_run wiring"
+    )
+    stage2_tree = captured_s2['filtered_task_tree']
+    assert isinstance(stage2_tree, FilteredTaskTree), (
+        f"Stage 2 filtered_task_tree must be FilteredTaskTree; got {type(stage2_tree)}"
+    )
+    assert stage2_tree.total_count > 0, (
+        f"Stage 2 must receive a non-empty FilteredTaskTree (total_count={stage2_tree.total_count}); "
+        "got empty tree — init normalization or fetcher pipeline is broken"
+    )
