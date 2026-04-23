@@ -1672,7 +1672,8 @@ class TestBuildPerProjectMergeQueue:
         assert 'out-window' not in task_ids
 
     async def test_none_db_entry_skipped(self, tmp_path):
-        """A (pid, None) pair results in empty/default stats for that project."""
+        """A (pid, None) pair yields the declared full-default shape (all 5 keys,
+        each matching its _DEFAULT_* constant) for that project."""
         from dashboard.data.merge_queue import build_per_project_merge_queue
 
         now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
@@ -1683,8 +1684,12 @@ class TestBuildPerProjectMergeQueue:
 
         assert '/tmp/nofile' in result
         data = result['/tmp/nofile']
-        assert data['latency']['count'] == 0
+        assert set(data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
+        assert data['depth_timeseries'] == {'labels': [], 'values': []}
+        assert data['outcomes'] == {'labels': [], 'values': []}
+        assert data['latency'] == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
         assert data['recent'] == []
+        assert data['speculative'] == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
 
     async def test_mixed_real_and_none_dbs(self, tmp_path):
         """Mixed (pid, real_conn) and (pid, None) entries all appear in the result.
