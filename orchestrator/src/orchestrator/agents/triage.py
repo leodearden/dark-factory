@@ -229,7 +229,7 @@ def format_pretriaged_detail(
             '',
             f'ESCALATION_ID: `{escalation_id}`',
             '',
-            'When you call `add_task` for a group below, include this '
+            'When you call `submit_task` for a group below, include this '
             'metadata JSON so the interceptor can dedupe re-queued '
             'triages (see plan R4):',
             '',
