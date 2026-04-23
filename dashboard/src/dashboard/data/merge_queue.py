@@ -29,7 +29,7 @@ from dashboard.data.chart_utils import ChartData
 from dashboard.data.db import with_db
 from dashboard.data.orchestrator import load_task_tree
 from dashboard.data.stats_utils import percentile
-from dashboard.data.utils import parse_utc
+from dashboard.data.utils import parse_utc, safe_gather_result
 
 logger = logging.getLogger(__name__)
 
@@ -638,12 +638,6 @@ async def build_per_project_merge_queue(
     _DEFAULT_LATENCY = {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
     _DEFAULT_SPEC = {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
 
-    def _safe(result: object, default: object, label: str) -> object:
-        if isinstance(result, BaseException):
-            logger.warning('build_per_project_merge_queue %s: %s', label, result)
-            return default
-        return result
-
     recent_hours = max(1, math.ceil(recent_window_minutes / 60))
 
     async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
@@ -656,11 +650,11 @@ async def build_per_project_merge_queue(
                 speculative_stats(db, hours=hours, now=now),
                 return_exceptions=True,
             )
-            depth = _safe(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
-            outcomes = _safe(outcomes_r, _DEFAULT_OUTCOMES, f'{pid}/outcomes')
-            latency = _safe(latency_r, _DEFAULT_LATENCY, f'{pid}/latency')
-            recent_raw = _safe(recent_r, [], f'{pid}/recent')
-            spec = _safe(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
+            depth = safe_gather_result(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
+            outcomes = safe_gather_result(outcomes_r, _DEFAULT_OUTCOMES, f'{pid}/outcomes')
+            latency = safe_gather_result(latency_r, _DEFAULT_LATENCY, f'{pid}/latency')
+            recent_raw = safe_gather_result(recent_r, [], f'{pid}/recent')
+            spec = safe_gather_result(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
             if len(recent_raw) > _RECENT_MERGES_BURST_WARN:  # type: ignore[arg-type]
                 logger.warning(
                     'build_per_project_merge_queue %s: recent_merges returned %d rows'

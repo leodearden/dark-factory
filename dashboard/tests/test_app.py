@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 import runpy
@@ -11,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from dashboard.app import _parse_window, _safe_gather_result
+from dashboard.app import _parse_window
 
 PARTIAL_URLS = (
     "/partials/memory",
@@ -1049,20 +1048,6 @@ class TestNavBar:
         html = client.get('/').text
         tag = _get_nav_link(html, '/costs')
         assert 'text-gray-400' in tag
-
-
-class TestSafeGatherResult:
-    """Tests for the _safe_gather_result helper."""
-
-    def test_safe_gather_result_reraises_cancelled_error(self):
-        """CancelledError (BaseException, not Exception) must propagate, not be swallowed."""
-        with pytest.raises(asyncio.CancelledError):
-            _safe_gather_result(asyncio.CancelledError(), 'default', 'test')
-
-    def test_safe_gather_result_reraises_keyboard_interrupt(self):
-        """KeyboardInterrupt (BaseException, not Exception) must propagate, not be swallowed."""
-        with pytest.raises(KeyboardInterrupt):
-            _safe_gather_result(KeyboardInterrupt(), 'default', 'test')
 
 
 class TestPollingErrorRecovery:
