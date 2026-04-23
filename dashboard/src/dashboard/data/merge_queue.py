@@ -526,6 +526,7 @@ def enrich_merges_with_titles(
     return result
 
 
+# 32 ≈ max projects we expect to enumerate concurrently; JSON re-parse on eviction is acceptable.
 @functools.lru_cache(maxsize=32)
 def _load_task_titles_cached(path_str: str, mtime_ns: int) -> dict[str, str]:
     """Cache body for :func:`load_task_titles`, keyed on ``(path, mtime_ns)``.
