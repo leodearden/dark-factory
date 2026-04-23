@@ -378,16 +378,9 @@ class Scheduler:
         (post-steward terminal check).
         """
         try:
-            result = await mcp_call(
-                f'{self._memory_url}/mcp',
-                'tools/call',
-                {
-                    'name': 'get_task',
-                    'arguments': {
-                        'id': task_id,
-                        'project_root': self._project_root,
-                    },
-                },
+            result = await self._dispatch_tool(
+                'get_task',
+                {'id': task_id, 'project_root': self._project_root},
                 timeout=15,
             )
         except Exception as e:
