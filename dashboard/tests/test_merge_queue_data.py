@@ -2519,8 +2519,6 @@ class TestLoadTaskTitles:
 
     def test_distinct_paths_cached_separately(self, tmp_path):
         """Different task files produce independent cache entries."""
-        import os
-
         from dashboard.data.merge_queue import _load_task_titles_cached, load_task_titles
 
         _load_task_titles_cached.cache_clear()
@@ -2531,12 +2529,6 @@ class TestLoadTaskTitles:
         path_b.parent.mkdir()
         self._write_tasks_json(path_a, [{'id': 1, 'title': 'Alpha'}])
         self._write_tasks_json(path_b, [{'id': 2, 'title': 'Beta'}])
-
-        # Force distinct mtimes so there's no accidental key collision
-        stat_a = os.stat(path_a)
-        os.utime(path_a, ns=(stat_a.st_atime_ns, stat_a.st_mtime_ns))
-        stat_b = os.stat(path_b)
-        os.utime(path_b, ns=(stat_b.st_atime_ns, stat_b.st_mtime_ns + 1_000_000_000))
 
         result_a = load_task_titles(path_a)
         result_b = load_task_titles(path_b)
