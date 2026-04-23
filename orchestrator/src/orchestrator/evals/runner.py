@@ -561,6 +561,50 @@ class _EvalScheduler:
         return True  # always allow in eval mode
 
 
+class _StubMcpSession:
+    """In-process MCP session stub for eval runs.
+
+    Mirrors ``McpSession.call_tool``'s signature and JSON-RPC envelope shape
+    so the production ``Scheduler`` can use it via duck-typing without any
+    changes to its parsing code.
+
+    Currently handles: ``set_task_status``.
+    Other tool names raise ``NotImplementedError`` (filled in by later steps).
+    """
+
+    def __init__(self) -> None:
+        self._statuses: dict[str, str] = {}
+        self._request_id: int = 0
+
+    def _next_id(self) -> int:
+        self._request_id += 1
+        return self._request_id
+
+    def _envelope(self, text: str) -> dict:
+        return {
+            'jsonrpc': '2.0',
+            'id': self._next_id(),
+            'result': {
+                'content': [
+                    {'type': 'text', 'text': text},
+                ],
+            },
+        }
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict,
+        timeout: float = 30,
+    ) -> dict:
+        if name == 'set_task_status':
+            task_id = arguments['id']
+            status = arguments['status']
+            self._statuses[task_id] = status
+            return self._envelope(json.dumps({'id': task_id, 'status': status}))
+        raise NotImplementedError(f'_StubMcpSession: tool {name!r} not implemented')
+
+
 class _EvalMcpStub:
     """Minimal MCP lifecycle stub for eval runs."""
 
