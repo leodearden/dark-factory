@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from fused_memory.middleware.task_file_committer import TaskFileCommitter
     from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.backlog_policy import BacklogPolicy
+    from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.targeted import TargetedReconciler
 
@@ -84,6 +85,7 @@ class TaskInterceptor:
         backlog_policy: 'BacklogPolicy | None' = None,
         usage_gate: 'UsageGate | None' = None,
         ticket_store: 'TicketStore | None' = None,
+        bulk_reset_guard: 'BulkResetGuard | None' = None,
     ):
         self.taskmaster = taskmaster
         self.reconciler = targeted_reconciler
@@ -99,6 +101,12 @@ class TaskInterceptor:
         # the project lock; a rejection verdict short-circuits to a structured
         # error dict with no taskmaster mutation.
         self._backlog_policy = backlog_policy
+        # Task 918: defence-in-depth bulk-reset circuit-breaker.  When set,
+        # _apply_status_transition calls observe_attempt after the same-status
+        # no-op check and before the terminal-exit gate.  Rejections
+        # short-circuit without any taskmaster mutation, event emission, or
+        # reconciliation scheduling.
+        self._bulk_reset_guard = bulk_reset_guard
         self._background_tasks: set[asyncio.Task] = set()
 
         # Task curator: LLM-judged drop/combine/create gate. Lazy-initialized in
