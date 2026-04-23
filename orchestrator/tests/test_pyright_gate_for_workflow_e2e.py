@@ -149,7 +149,7 @@ def test_project_checks_hook_invokes_pyright_on_orchestrator() -> None:
 
     If this test fails, the commit-gate that enforces the TYPE_CHECKING Protocol
     conformance block in test_workflow_e2e.py no longer exists for the orchestrator
-    package. Protocol drift between FakeScheduler/_EvalScheduler and _SchedulerLike
+    package. Protocol drift between FakeScheduler/Scheduler and _SchedulerLike
     will go undetected until runtime. See task 699.
     """
     hook_path = _REPO_ROOT / "hooks" / "project-checks"
@@ -176,36 +176,6 @@ def test_project_checks_hook_invokes_pyright_on_orchestrator() -> None:
         "'uv run pyright' in the loop body. The hook must loop over "
         "PYRIGHT_PACKAGES and invoke pyright inside the loop. See task 699."
     )
-
-
-# ---------------------------------------------------------------------------
-# (d) The TYPE_CHECKING conformance block must still exist in test_workflow_e2e.py
-# ---------------------------------------------------------------------------
-
-
-def test_workflow_e2e_conformance_block_is_present() -> None:
-    """The TYPE_CHECKING Protocol conformance block must be present in test_workflow_e2e.py.
-
-    This pins the block's existence so it cannot be deleted without also updating
-    this regression test. Without the block, Protocol drift between FakeScheduler/
-    _EvalScheduler and _SchedulerLike would be undetectable by pyright regardless
-    of how the gate is configured. See task 699.
-    """
-    e2e_path = _PACKAGE_ROOT / "tests" / "test_workflow_e2e.py"
-    assert e2e_path.is_file(), f"test_workflow_e2e.py not found at {e2e_path}"
-    content = e2e_path.read_text()
-    required_fragments = [
-        "if TYPE_CHECKING:",
-        "_fake_scheduler_conforms: _SchedulerLike",
-        "_eval_scheduler_conforms: _SchedulerLike",
-    ]
-    for fragment in required_fragments:
-        assert fragment in content, (
-            f"Expected fragment {fragment!r} not found in {e2e_path}. "
-            "The TYPE_CHECKING Protocol conformance block must be present for "
-            "pyright to enforce _SchedulerLike conformance on FakeScheduler and "
-            "_EvalScheduler. See task 699."
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -340,11 +310,11 @@ def test_hook_invokes_pyright_in_loop_rejects_loop_without_pyright() -> None:
 def test_module_docstrings_do_not_cite_stale_line_numbers() -> None:
     """This file must not contain line-number citations into test_workflow_e2e.py.
 
-    Line numbers go stale every time test_workflow_e2e.py is edited. The block
-    existence is pinned by content in test_workflow_e2e_conformance_block_is_present,
-    so line numbers add no value and only mislead. This meta-test catches any
-    future regression to line-number citations without requiring a code reviewer
-    to notice.
+    Line numbers go stale every time test_workflow_e2e.py is edited. Protocol
+    conformance is enforced by pyright-on-assignment via the TYPE_CHECKING block
+    in test_workflow_e2e.py, so line numbers add no value and only mislead.
+    This meta-test catches any future regression to line-number citations
+    without requiring a code reviewer to notice.
 
     The regex patterns used here deliberately do not self-match:
     - ``test_workflow_e2e\\.py:\\d+`` contains ``\\d+`` literal characters

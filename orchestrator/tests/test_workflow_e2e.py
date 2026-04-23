@@ -2286,54 +2286,6 @@ class TestFakeSchedulerGetStatus:
 
 
 # ---------------------------------------------------------------------------
-# Tests: _EvalScheduler status tracking
-# ---------------------------------------------------------------------------
-
-
-class TestEvalSchedulerStatus:
-    """_EvalScheduler exposes status via get_status for workflow consumption."""
-
-    @pytest.mark.asyncio
-    async def test_eval_scheduler_get_status_returns_none_initially(self):
-        from orchestrator.config import OrchestratorConfig
-        from orchestrator.evals.runner import _EvalScheduler
-
-        sched = _EvalScheduler(OrchestratorConfig())
-        assert await sched.get_status('99') is None
-
-    @pytest.mark.asyncio
-    async def test_eval_scheduler_get_status_tracks_set_task_status(self):
-        from orchestrator.config import OrchestratorConfig
-        from orchestrator.evals.runner import _EvalScheduler
-
-        sched = _EvalScheduler(OrchestratorConfig())
-        await sched.set_task_status('99', 'done')
-        assert await sched.get_status('99') == 'done'
-
-    @pytest.mark.asyncio
-    async def test_eval_scheduler_set_task_status_accepts_done_provenance(self):
-        """Eval mode accepts done_provenance kwarg without error."""
-        from orchestrator.config import OrchestratorConfig
-        from orchestrator.evals.runner import _EvalScheduler
-
-        sched = _EvalScheduler(OrchestratorConfig())
-        await sched.set_task_status('99', 'done', done_provenance={'commit': 'abc'})
-        assert await sched.get_status('99') == 'done'
-
-    @pytest.mark.asyncio
-    async def test_eval_scheduler_set_task_status_accepts_reopen_reason(self):
-        """Eval mode accepts reopen_reason kwarg without error."""
-        from orchestrator.config import OrchestratorConfig
-        from orchestrator.evals.runner import _EvalScheduler
-
-        sched = _EvalScheduler(OrchestratorConfig())
-        await sched.set_task_status(
-            '99', 'pending', reopen_reason='un-defer script',
-        )
-        assert await sched.get_status('99') == 'pending'
-
-
-# ---------------------------------------------------------------------------
 # Tests: Prerequisites format validation
 # ---------------------------------------------------------------------------
 
@@ -3662,8 +3614,8 @@ class TestMarkBlockedPhantomDone:
 
 
 if TYPE_CHECKING:
-    from orchestrator.evals.runner import _EvalScheduler as _EvalSchedulerStatic
+    from orchestrator.scheduler import Scheduler
     from orchestrator.workflow import _SchedulerLike
 
     _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()
-    _eval_scheduler_conforms: _SchedulerLike = _EvalSchedulerStatic(OrchestratorConfig())
+    _scheduler_conforms: _SchedulerLike = Scheduler(OrchestratorConfig())

@@ -10,6 +10,7 @@ import statistics
 import time
 from collections import deque
 from dataclasses import dataclass
+from typing import Protocol
 
 from shared.locking import files_to_modules, normalize_lock
 
@@ -36,10 +37,29 @@ logger = logging.getLogger(__name__)
 __all__ = [
     'normalize_lock',
     'files_to_modules',
+    'McpSessionLike',
     'TaskAssignment',
     'ModuleLockTable',
     'Scheduler',
 ]
+
+
+class McpSessionLike(Protocol):
+    """Structural interface for MCP session objects.
+
+    Both ``McpSession`` (production) and ``_StubMcpSession`` (eval mode)
+    conform to this interface.  Typing the optional *mcp_session* kwarg on
+    ``Scheduler.__init__`` against this Protocol lets pyright verify that any
+    injected stub actually provides the expected API — a mis-shaped stub will
+    be caught at type-check time rather than at runtime.
+    """
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict,
+        timeout: float = ...,
+    ) -> dict: ...
 
 
 @dataclass
@@ -247,10 +267,17 @@ class ModuleLockTable:
 class Scheduler:
     """Selects next eligible task and manages module locks."""
 
-    def __init__(self, config: OrchestratorConfig, event_store: EventStore | None = None):
+    def __init__(
+        self,
+        config: OrchestratorConfig,
+        event_store: EventStore | None = None,
+        *,
+        mcp_session: McpSessionLike | None = None,
+    ):
         self.config = config
         self.lock_table = ModuleLockTable(config)
         self.event_store = event_store
+        self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
@@ -274,16 +301,35 @@ class Scheduler:
         self._pending_anchor: dict[str, int] = {}
         self._was_non_pending: set[str] = set()
 
+    async def _dispatch_tool(
+        self,
+        name: str,
+        arguments: dict,
+        *,
+        timeout: float = 15,
+    ) -> dict:
+        """Route an MCP tool call through the injected session or HTTP fallback.
+
+        When ``self._mcp_session`` is set (e.g. a ``_StubMcpSession`` in eval
+        mode), the call is dispatched directly via its ``call_tool`` method.
+        Otherwise the existing ``mcp_call`` HTTP path is used unchanged so
+        production semantics, retries, and error handling are preserved.
+        """
+        if self._mcp_session is not None:
+            return await self._mcp_session.call_tool(name, arguments, timeout=timeout)
+        return await mcp_call(
+            f'{self._memory_url}/mcp',
+            'tools/call',
+            {'name': name, 'arguments': arguments},
+            timeout=timeout,
+        )
+
     async def get_tasks(self) -> list[dict]:
         """Fetch all tasks from fused-memory/taskmaster."""
         try:
-            result = await mcp_call(
-                f'{self._memory_url}/mcp',
-                'tools/call',
-                {
-                    'name': 'get_tasks',
-                    'arguments': {'project_root': self._project_root},
-                },
+            result = await self._dispatch_tool(
+                'get_tasks',
+                {'project_root': self._project_root},
                 timeout=15,
             )
             content = result.get('result', {}).get('content', [])
@@ -332,15 +378,7 @@ class Scheduler:
                 arguments['done_provenance'] = done_provenance
             if reopen_reason is not None:
                 arguments['reopen_reason'] = reopen_reason
-            await mcp_call(
-                f'{self._memory_url}/mcp',
-                'tools/call',
-                {
-                    'name': 'set_task_status',
-                    'arguments': arguments,
-                },
-                timeout=15,
-            )
+            await self._dispatch_tool('set_task_status', arguments, timeout=15)
         except Exception as e:
             logger.exception(
                 'Failed to set task %s status to %s: %s: %s',
@@ -356,16 +394,9 @@ class Scheduler:
         (post-steward terminal check).
         """
         try:
-            result = await mcp_call(
-                f'{self._memory_url}/mcp',
-                'tools/call',
-                {
-                    'name': 'get_task',
-                    'arguments': {
-                        'id': task_id,
-                        'project_root': self._project_root,
-                    },
-                },
+            result = await self._dispatch_tool(
+                'get_task',
+                {'id': task_id, 'project_root': self._project_root},
                 timeout=15,
             )
         except Exception as e:
@@ -394,16 +425,12 @@ class Scheduler:
         if isinstance(metadata, dict):
             metadata = json.dumps(metadata)
         try:
-            result = await mcp_call(
-                f'{self._memory_url}/mcp',
-                'tools/call',
+            result = await self._dispatch_tool(
+                'update_task',
                 {
-                    'name': 'update_task',
-                    'arguments': {
-                        'id': task_id,
-                        'metadata': metadata,
-                        'project_root': self._project_root,
-                    },
+                    'id': task_id,
+                    'metadata': metadata,
+                    'project_root': self._project_root,
                 },
                 timeout=15,
             )

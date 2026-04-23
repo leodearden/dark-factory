@@ -2,7 +2,7 @@
 
 
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -12,6 +12,7 @@ from orchestrator.config import (
     ModuleConfig,
     OrchestratorConfig,
 )
+from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.scheduler import ModuleLockTable, Scheduler, files_to_modules
 
@@ -2075,3 +2076,102 @@ class TestBlastRadiusRefinement:
         assert ok is False
         # Full release ran: 936 should no longer hold anything
         assert '936' not in lt._held
+
+
+class TestSchedulerMcpSessionDI:
+    """Tests for the optional mcp_session dependency-injection kwarg on Scheduler.
+
+    Each test injects a _StubMcpSession and monkeypatches orchestrator.scheduler.mcp_call
+    to raise AssertionError — proving the HTTP transport is never contacted when a
+    session is injected.
+    """
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_routes_through_stub(self):
+        """set_task_status writes to the stub, not to the HTTP mcp_call path."""
+        stub = _StubMcpSession()
+        cfg = OrchestratorConfig()
+        sched = Scheduler(cfg, mcp_session=stub)
+
+        with patch(
+            'orchestrator.scheduler.mcp_call',
+            new=AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected')),
+        ):
+            await sched.set_task_status('42', 'in-progress')
+
+        assert stub._statuses['42'] == 'in-progress'
+
+    @pytest.mark.asyncio
+    async def test_get_status_round_trips_through_stub(self):
+        """get_status reads from the stub after a prior set_task_status."""
+        stub = _StubMcpSession()
+        cfg = OrchestratorConfig()
+        sched = Scheduler(cfg, mcp_session=stub)
+        no_http = AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected'))
+
+        with patch('orchestrator.scheduler.mcp_call', new=no_http):
+            await sched.set_task_status('77', 'done')
+            result = await sched.get_status('77')
+            unknown = await sched.get_status('unknown-id')
+
+        assert result == 'done'
+        assert unknown is None
+        no_http.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_routes_through_stub(self):
+        """get_tasks returns [] from the stub without calling mcp_call."""
+        stub = _StubMcpSession()
+        cfg = OrchestratorConfig()
+        sched = Scheduler(cfg, mcp_session=stub)
+        no_http = AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected'))
+
+        with patch('orchestrator.scheduler.mcp_call', new=no_http):
+            tasks = await sched.get_tasks()
+
+        assert tasks == []
+        no_http.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_task_routes_through_stub(self):
+        """update_task returns True (non-error envelope) via the stub without calling mcp_call."""
+        stub = _StubMcpSession()
+        cfg = OrchestratorConfig()
+        sched = Scheduler(cfg, mcp_session=stub)
+        no_http = AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected'))
+
+        with patch('orchestrator.scheduler.mcp_call', new=no_http):
+            ok = await sched.update_task('77', {'modules': ['foo']})
+
+        assert ok is True
+        no_http.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_accepts_done_provenance(self):
+        """set_task_status with done_provenance passes through the stub without error."""
+        stub = _StubMcpSession()
+        cfg = OrchestratorConfig()
+        sched = Scheduler(cfg, mcp_session=stub)
+
+        with patch(
+            'orchestrator.scheduler.mcp_call',
+            new=AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected')),
+        ):
+            await sched.set_task_status('42', 'done', done_provenance={'commit': 'abc123'})
+
+        assert stub._statuses['42'] == 'done'
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_accepts_reopen_reason(self):
+        """set_task_status with reopen_reason passes through the stub without error."""
+        stub = _StubMcpSession()
+        cfg = OrchestratorConfig()
+        sched = Scheduler(cfg, mcp_session=stub)
+
+        with patch(
+            'orchestrator.scheduler.mcp_call',
+            new=AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected')),
+        ):
+            await sched.set_task_status('42', 'pending', reopen_reason='un-defer script')
+
+        assert stub._statuses['42'] == 'pending'
