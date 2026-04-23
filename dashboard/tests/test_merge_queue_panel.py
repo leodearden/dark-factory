@@ -114,6 +114,7 @@ def _patch_merge_queue_data(
     latency=_UNSET,
     recent=_UNSET,
     spec=_UNSET,
+    active=_UNSET,
 ):
     """Return an ExitStack patching merge queue functions for a single default project.
 
@@ -126,6 +127,7 @@ def _patch_merge_queue_data(
     l_ = latency if latency is not _UNSET else MOCK_LATENCY
     r = recent if recent is not _UNSET else MOCK_RECENT
     s = spec if spec is not _UNSET else MOCK_SPEC
+    a = active if active is not _UNSET else []
 
     projects = {
         _DEFAULT_PID: {
@@ -134,6 +136,7 @@ def _patch_merge_queue_data(
             'latency': l_,
             'recent': r,
             'speculative': s,
+            'active': a,
         }
     }
 
@@ -1042,3 +1045,82 @@ class TestUniqueCssIds:
         """Non-colliding and colliding entries are interleaved correctly."""
         result = unique_css_ids(['x', '/tmp/a', 'y', '/tmp/a'])
         assert result == ['x', 'tmp_a', 'y', 'tmp_a_1']
+
+
+# ---------------------------------------------------------------------------
+# TestActiveQueueSection — step-19 tests for active queue HTML rendering
+# ---------------------------------------------------------------------------
+
+
+class TestActiveQueueSection:
+    """Tests for active-queue section in merge_queue.html partial."""
+
+    def test_active_rows_rendered_with_queued_badge(self, client):
+        """A queued active row renders the task_id and a 'queued' badge."""
+        active_row = {
+            'task_id': 'task-888',
+            'run_id': 'run-888',
+            'state': 'queued',
+            'timestamp': '2026-04-23T11:55:00+00:00',
+            'branch': 'task/task-888',
+            'outcome': None,
+        }
+        with _patch_merge_queue_data(
+            recent=[],
+            latency={'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0},
+            active=[active_row],
+        ):
+            resp = client.get('/partials/merge-queue')
+        assert resp.status_code == 200
+        html = resp.text
+        # Task ID must appear in the page
+        assert 'task-888' in html, 'Expected task-888 in active queue section'
+        # Some queued badge text or class must appear
+        assert 'queued' in html.lower(), "Expected 'queued' badge in active queue section"
+
+    def test_active_rows_in_flight_badge(self, client):
+        """An in_flight active row renders the task_id and an 'in flight' badge."""
+        active_row = {
+            'task_id': 'task-999',
+            'run_id': 'run-999',
+            'state': 'in_flight',
+            'timestamp': '2026-04-23T11:58:00+00:00',
+            'branch': 'task/task-999',
+            'outcome': 'cas_retry',
+        }
+        with _patch_merge_queue_data(
+            recent=[],
+            latency={'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0},
+            active=[active_row],
+        ):
+            resp = client.get('/partials/merge-queue')
+        assert resp.status_code == 200
+        html = resp.text
+        assert 'task-999' in html, 'Expected task-999 in active queue section'
+        # 'in flight' or 'in_flight' badge must appear
+        assert 'in' in html.lower() and ('flight' in html.lower() or 'in_flight' in html.lower()), (
+            "Expected 'in flight' or 'in_flight' badge in active queue section"
+        )
+
+    def test_has_activity_flag_considers_active_list(self, client):
+        """Project with only active rows (no recent) must NOT show 'No merge activity'."""
+        active_row = {
+            'task_id': 'task-777',
+            'run_id': 'run-777',
+            'state': 'queued',
+            'timestamp': '2026-04-23T11:59:00+00:00',
+            'branch': 'task/task-777',
+            'outcome': None,
+        }
+        with _patch_merge_queue_data(
+            recent=[],
+            latency={'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0},
+            active=[active_row],
+        ):
+            resp = client.get('/partials/merge-queue')
+        assert resp.status_code == 200
+        html = resp.text
+        # Must NOT show the "No merge activity" empty-state message
+        assert 'No merge activity' not in html, (
+            'Expected active list to suppress "No merge activity" empty-state'
+        )
