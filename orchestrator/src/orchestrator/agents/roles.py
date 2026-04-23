@@ -502,7 +502,8 @@ _STEWARD_MEMORY_TOOLS = [
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_entity',
     'mcp__fused-memory__add_memory',
-    'mcp__fused-memory__add_task',
+    'mcp__fused-memory__submit_task',
+    'mcp__fused-memory__resolve_ticket',
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__get_task',
 ]
@@ -630,7 +631,8 @@ _DEEP_REVIEW_TOOLS = [
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_entity',
     'mcp__fused-memory__add_memory',
-    'mcp__fused-memory__add_task',
+    'mcp__fused-memory__submit_task',
+    'mcp__fused-memory__resolve_ticket',
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__update_task',
 ]
