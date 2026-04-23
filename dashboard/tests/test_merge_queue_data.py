@@ -2537,8 +2537,9 @@ class TestLoadTaskTitles:
         assert result_b == {'2': 'Beta'}, f"project B returned unexpected titles: {result_b}"
         assert result_a != result_b
 
-    def test_symlink_and_relative_path_share_cache_entry(self, tmp_path, monkeypatch):
+    def test_symlink_shares_cache_entry_with_real_path(self, tmp_path, monkeypatch):
         """A symlink and the real path resolve to the same LRU entry via os.path.realpath."""
+        import pytest
         import dashboard.data.merge_queue as _mq
         from dashboard.data.merge_queue import (
             _load_task_titles_cached,
@@ -2556,7 +2557,6 @@ class TestLoadTaskTitles:
         try:
             link_path.symlink_to(real_path)
         except (OSError, NotImplementedError):
-            import pytest
             pytest.skip("symlinks unsupported on this filesystem")
 
         call_count = 0
@@ -2579,10 +2579,18 @@ class TestLoadTaskTitles:
             "(os.path.realpath should collapse both spellings to one cache key)"
         )
 
-    def test_corrupt_json_then_valid_refreshes_cache(self, tmp_path):
-        """Empty-dict cached under corrupt mtime is invalidated when mtime bumps to valid content."""
+    def test_corrupt_json_then_valid_refreshes_cache(self, tmp_path, monkeypatch):
+        """Empty-dict from corrupt JSON is cached and then invalidated when mtime bumps.
+
+        Verifies two distinct behaviors:
+        1. {} is a legitimate cached value (not a cache-skipping sentinel): a second call
+           with unchanged mtime must not re-invoke load_task_tree.
+        2. Bumping st_mtime_ns by 1s causes the next call to pick up the valid content,
+           distinct from test_mtime_change_invalidates_cache where both sides are valid.
+        """
         import os
 
+        import dashboard.data.merge_queue as _mq
         from dashboard.data.merge_queue import _load_task_titles_cached, load_task_titles
 
         _load_task_titles_cached.cache_clear()
@@ -2590,13 +2598,33 @@ class TestLoadTaskTitles:
         tasks_path = tmp_path / 'tasks.json'
         tasks_path.write_text('{ invalid json ]')
 
+        call_count = 0
+        original_load_task_tree = _mq.load_task_tree
+
+        def counting_load_task_tree(path):
+            nonlocal call_count
+            call_count += 1
+            return original_load_task_tree(path)
+
+        monkeypatch.setattr(_mq, 'load_task_tree', counting_load_task_tree)
+
         result_corrupt = load_task_titles(tasks_path)
         assert result_corrupt == {}, f"corrupt JSON should return {{}}, got {result_corrupt!r}"
 
-        # Overwrite with valid content and bump mtime to guarantee a new cache key
+        # Second call with unchanged mtime must hit the cache — {} is not a sentinel
+        result_corrupt2 = load_task_titles(tasks_path)
+        assert result_corrupt2 == {}
+        assert call_count == 1, (
+            f"load_task_tree called {call_count} time(s) for two reads with unchanged mtime; "
+            "expected 1 (empty dict must be a legitimate cached value, not a sentinel)"
+        )
+
+        # Overwrite with valid content and bump mtime by 1s to guarantee a distinct cache key.
+        # Capture stat before the overwrite so the bump is relative to the corrupt-JSON mtime;
+        # 1_000_000_000 ns = 1 s ensures the delta is honored even on second-resolution filesystems.
         stat = os.stat(tasks_path)
         self._write_tasks_json(tasks_path, [{'id': 1, 'title': 'A'}])
-        os.utime(tasks_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+        os.utime(tasks_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
 
         result_valid = load_task_titles(tasks_path)
         assert result_valid == {'1': 'A'}, (
