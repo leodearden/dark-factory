@@ -60,9 +60,17 @@ def _serialize_temporal(
     """
     if valid_at is None and invalid_at is None:
         return None
+
+    def _to_iso(v: Any) -> str | None:
+        if v is None:
+            return None
+        if hasattr(v, 'isoformat'):
+            return v.isoformat()
+        return str(v)
+
     return {
-        'valid_at': valid_at.isoformat() if hasattr(valid_at, 'isoformat') else str(valid_at) if valid_at is not None else None,
-        'invalid_at': invalid_at.isoformat() if hasattr(invalid_at, 'isoformat') else str(invalid_at) if invalid_at is not None else None,
+        'valid_at': _to_iso(valid_at),
+        'invalid_at': _to_iso(invalid_at),
     }
 
 
