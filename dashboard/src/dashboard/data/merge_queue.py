@@ -660,7 +660,7 @@ async def build_per_project_merge_queue(
             latency = _safe(latency_r, _DEFAULT_LATENCY, f'{pid}/latency')
             recent_raw = _safe(recent_r, [], f'{pid}/recent')
             spec = _safe(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
-            if len(recent_raw) > 1_000:  # type: ignore[arg-type]
+            if len(recent_raw) > _RECENT_MERGES_BURST_WARN:  # type: ignore[arg-type]
                 logger.warning(
                     'build_per_project_merge_queue %s: recent_merges returned %d rows'
                     ' (limit=None, hours=%d) — possible runaway burst; consider'
