@@ -3012,6 +3012,63 @@ class TestRecoverIfAlreadyMerged:
             f'workflow.state must not be DONE for unmerged branch: {workflow.state!r}'
         )
 
+    async def test_returns_none_and_logs_on_git_exception(
+        self, config, git_ops, task_assignment, tmp_path, caplog
+    ):
+        """Git-layer exception must return None and log 'merge-check failed'.
+
+        Monkeypatch git_ops.is_ancestor to raise RuntimeError.  The git-layer
+        try/except must catch it, log a WARNING containing 'merge-check failed',
+        and return None (not re-raise).  Mirrors the existing
+        test_git_exception_in_ancestor_check_requeues but targets the new helper
+        directly.
+
+        Fails on unmodified code with RuntimeError propagating uncaught.
+        """
+        import logging
+
+        # 1. Create a worktree (needed for the worktree guard to pass)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. Monkeypatch is_ancestor to raise
+        async def _raise_git(*args, **kwargs):
+            raise RuntimeError('simulated git failure')
+
+        workflow.git_ops.is_ancestor = _raise_git  # type: ignore[method-assign]
+
+        # 4. Call _recover_if_already_merged, capturing WARNING logs
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+            outcome = await workflow._recover_if_already_merged()
+
+        # 5. Assertions: must return None with 'merge-check failed' log
+        assert outcome is None, (
+            f'Expected None on git exception but got {outcome!r} — '
+            'git-layer exception must be caught and return None'
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE after git exception: {workflow.state!r}'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear after git exception: {statuses}"
+        )
+        assert any(
+            'merge-check failed' in r.message
+            for r in caplog.records
+        ), (
+            f"Expected 'merge-check failed' in log records but only got: "
+            f"{[r.message for r in caplog.records]}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # File-structure invariants
