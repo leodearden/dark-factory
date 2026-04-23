@@ -3,6 +3,7 @@
 import json
 import logging
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2754,4 +2755,125 @@ class TestFormatFlaggedReturnsRenderedCount:
         assert warning_records[0].rendered == rendered_count, (
             f"Warning extra 'rendered'={warning_records[0].rendered} must match "
             f'returned rendered_count={rendered_count}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 handoff shortfall warning (step-7)
+# ---------------------------------------------------------------------------
+
+
+def _make_stage1_report_with_n_large_items(n: int) -> StageReport:
+    """Build a Stage 1 StageReport whose items_flagged list has *n* large dicts.
+
+    Each item's 'description' is ~300 bytes so that 200 items exceed the
+    40000-char budget when rendered by _format_flagged.
+    """
+    now = datetime.now(tz=timezone.utc)
+    return StageReport(
+        stage=StageId.memory_consolidator,
+        started_at=now,
+        completed_at=now,
+        items_flagged=[
+            {'description': 'x' * 300, 'index': i, 'severity': 'critical'}
+            for i in range(n)
+        ],
+    )
+
+
+class TestStage2HandoffShortfallWarning:
+    """TaskKnowledgeSync.assemble_payload warns when rendered_count < reported_count."""
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='reify')
+
+    @pytest.mark.asyncio
+    async def test_shortfall_warning_emitted_when_budget_truncates(
+        self, mock_deps, watermark, caplog
+    ):
+        """When stage1 items exceed the char budget, a shortfall warning is emitted."""
+        # 200 items × ~330 chars each = ~66000 chars — well over the 40000-char budget
+        n_items = 200
+        stage1_report = _make_stage1_report_with_n_large_items(n_items)
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await stage.assemble_payload([], watermark, [stage1_report])
+
+        shortfall_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'reconciliation.stage2_flagged_items_shortfall' in rec.message
+        ]
+        assert len(shortfall_records) == 1, (
+            f'Expected exactly 1 stage2_flagged_items_shortfall WARNING; '
+            f'got {len(shortfall_records)}: '
+            f'{[(r.message, r.__dict__) for r in shortfall_records]}'
+        )
+        rec = shortfall_records[0]
+        for key in ('reported_count', 'received_count', 'dropped', 'run_stage'):
+            assert hasattr(rec, key), (
+                f'Expected extra key {key!r} on shortfall WARNING; '
+                f'record __dict__: {rec.__dict__}'
+            )
+        assert rec.reported_count == n_items
+        assert rec.received_count < n_items
+        assert rec.dropped == n_items - rec.received_count
+        assert rec.run_stage == 'stage2'
+
+    @pytest.mark.asyncio
+    async def test_no_shortfall_warning_when_all_items_rendered(
+        self, mock_deps, watermark, caplog
+    ):
+        """When all stage1 items fit in the budget, no shortfall warning is emitted."""
+        # 5 small items — far under the 40000-char budget
+        now = datetime.now(tz=timezone.utc)
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=now,
+            completed_at=now,
+            items_flagged=[
+                {'description': f'flag-{i}', 'severity': 'minor'} for i in range(5)
+            ],
+        )
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await stage.assemble_payload([], watermark, [stage1_report])
+
+        shortfall_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'stage2_flagged_items_shortfall' in rec.message
+        ]
+        assert len(shortfall_records) == 0, (
+            f'Expected no shortfall WARNING for 5 small items; '
+            f'got: {[(r.message, r.__dict__) for r in shortfall_records]}'
         )
