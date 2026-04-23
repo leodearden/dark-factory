@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -952,6 +953,61 @@ class TestRecentMerges:
         assert len(result) == 60, (
             f'Expected 60 rows with limit=None, got {len(result)}. '
             'The SQL LIMIT clause must be omitted when limit is None.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_recent_merges_limit_none_hard_cap_truncates_and_warns(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """recent_merges(limit=None) truncates to _RECENT_MERGES_HARD_CAP rows and logs WARN.
+
+        Patches _RECENT_MERGES_HARD_CAP to 5, inserts 10 events (all within the
+        1-hour window), and asserts:
+          1. Only 5 rows are returned (truncation to the patched cap).
+          2. At least one WARNING log record contains 'hard cap' (or 'hard_cap')
+             so operators can identify the cap was hit.
+        """
+        monkeypatch.setattr(_mqmod, '_RECENT_MERGES_HARD_CAP', 5)
+
+        now = datetime.now(UTC)
+        db_path = tmp_path / 'hard_cap_test.db'
+
+        with contextlib.closing(sqlite3.connect(str(db_path))) as conn_sync:
+            conn_sync.executescript(MERGE_EVENTS_SCHEMA)
+            for i in range(10):
+                _insert_event(
+                    conn_sync,
+                    event_type='merge_attempt',
+                    timestamp=now - timedelta(seconds=i * 5),
+                    task_id=f'cap-task-{i:03d}',
+                    run_id=f'cap-run-{i:03d}',
+                    data={'outcome': 'done'},
+                    duration_ms=100 + i,
+                )
+            conn_sync.commit()
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+            with caplog.at_level(logging.WARNING, logger='dashboard.data.merge_queue'):
+                result = await recent_merges(db, limit=None, hours=1)
+
+        assert len(result) == 5, (
+            f'Expected 5 rows (hard cap=5), got {len(result)}. '
+            'recent_merges(limit=None) must truncate to _RECENT_MERGES_HARD_CAP rows.'
+        )
+        warn_msgs = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ]
+        assert any('hard cap' in m or 'hard_cap' in m for m in warn_msgs), (
+            f'Expected a WARNING containing "hard cap" or "hard_cap", got: {warn_msgs}'
+        )
+        # The row count must appear in the warning so it is actionable.
+        assert any(
+            ('hard cap' in m or 'hard_cap' in m) and ('5' in m or '6' in m)
+            for m in warn_msgs
+        ), (
+            f'Expected the row count (5 or 6) in the hard-cap WARNING, got: {warn_msgs}'
         )
 
 
