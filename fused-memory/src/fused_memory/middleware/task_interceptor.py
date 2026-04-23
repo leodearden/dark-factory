@@ -1416,6 +1416,17 @@ class TaskInterceptor:
                 task_id_str: str = ''
                 if isinstance(result, dict):
                     task_id_str = str(result.get('id', ''))
+
+                # ── Latch success immediately — post-create errors must NOT
+                # downgrade this to 'failed'.  Once tm.add_task returns, the
+                # task exists in tasks.json; marking the ticket 'failed' would
+                # strand the task and cause duplicate-on-retry.
+                task_id = task_id_str or None
+                status = 'created'
+                result_dict = result if isinstance(result, dict) else {}
+                if curator_degrade_reason is not None:
+                    result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
+
                 if metadata_json and task_id_str and not atomic_metadata_written:
                     try:
                         await tm.update_task(
@@ -1429,30 +1440,52 @@ class TaskInterceptor:
                             task_id_str, e,
                         )
 
-                # note_created + record_task under write_lock (R3 invariant)
+                # note_created + record_task under write_lock (R3 invariant).
+                # Each is wrapped independently: a failure appends to
+                # post_create_warnings and is logged, but does NOT flip status.
                 if curator is not None and candidate is not None and task_id_str:
-                    curator.note_created(project_id, candidate, task_id_str)
+                    try:
+                        curator.note_created(project_id, candidate, task_id_str)
+                    except Exception as exc:
+                        logger.warning(
+                            '_process_add_ticket: curator.note_created failed for %s: %s',
+                            task_id_str, exc,
+                        )
+                        result_dict.setdefault('post_create_warnings', []).append(
+                            {'stage': 'note_created', 'error': str(exc)}
+                        )
                     try:
                         await curator.record_task(task_id_str, candidate, project_id)
-                    except Exception:
+                    except Exception as exc:
                         logger.warning(
                             '_process_add_ticket: curator.record_task failed for %s',
                             task_id_str, exc_info=True,
                         )
-
-            task_id = task_id_str or None
-            status = 'created'
-            result_dict = result if isinstance(result, dict) else {}
-            if curator_degrade_reason is not None:
-                result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
+                        result_dict.setdefault('post_create_warnings', []).append(
+                            {'stage': 'record_task', 'error': str(exc)}
+                        )
 
         except Exception as exc:
             logger.exception(
                 '_process_add_ticket: unexpected error for ticket %s', ticket_id,
             )
-            reason = str(exc)
-            status = 'failed'
-            result_dict = None
+            if status == 'created':
+                # Failure happened after tm.add_task succeeded — preserve the
+                # 'created' resolution; demote the error to a warning so the
+                # facade and callers can surface it without losing the task.
+                logger.warning(
+                    '_process_add_ticket: post-create error for ticket %s, task %s: %s',
+                    ticket_id, task_id, exc,
+                )
+                if result_dict is None:
+                    result_dict = {}
+                result_dict.setdefault('post_create_warnings', []).append(
+                    {'stage': 'post_create', 'error': str(exc)}
+                )
+            else:
+                reason = str(exc)
+                status = 'failed'
+                result_dict = None
 
         # ── Persist terminal state ────────────────────────────────────────
         await self._ticket_store.mark_resolved(
