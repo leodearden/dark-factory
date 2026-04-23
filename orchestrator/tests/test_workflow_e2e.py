@@ -3193,6 +3193,93 @@ class TestRecoverIfAlreadyMerged:
 
 
 # ---------------------------------------------------------------------------
+# Tests: pre-PLAN recovery in workflow.run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunPrePlanRecovery:
+    """workflow.run returns DONE before PLAN when the branch is already on main.
+
+    The pre-PLAN call to _recover_if_already_merged() must fire before the
+    architect (PLAN phase) is invoked — neither architect nor implementer
+    should be called when the recovery detects a prior merge.
+    """
+
+    async def test_run_returns_done_early_via_pre_plan_recovery(
+        self, config, git_ops, task_assignment, monkeypatch
+    ):
+        """workflow.run exits DONE before architect is called on a merged branch.
+
+        Set up: pre-create a worktree, stamp iterations.jsonl with an
+        implementer entry, commit a real file, merge to main.
+
+        The AgentStub's _architect is overridden to raise AssertionError so
+        the test fails loudly if workflow.run enters the PLAN phase.
+
+        After step-14 adds the pre-PLAN recovery call in workflow.run, the
+        recovery fires before PLAN and the architect is never invoked.
+        """
+        import json as _json
+
+        # 1. Create worktree, stamp implementer entry, commit + merge to main
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+        (wt / 'pre_plan_recovery.py').write_text('def work():\n    return 42\n')
+        await git_ops.commit(wt, 'Implement feature (pre-plan recovery test)')
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # 2. Build workflow with a stub that raises if architect/implementer called
+        class _NoCallStub(AgentStub):
+            async def _architect(self, cwd):
+                raise AssertionError(
+                    'architect must NOT be called when branch is already on main '
+                    '— pre-PLAN recovery should have short-circuited'
+                )
+
+            async def _implementer(self, cwd):
+                raise AssertionError(
+                    'implementer must NOT be called when branch is already on main '
+                    '— pre-PLAN recovery should have short-circuited'
+                )
+
+        stub = _NoCallStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        # 3. Run workflow — should detect prior merge before PLAN
+        outcome = await workflow.run()
+
+        # 4. Assert DONE with no agent calls
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE but got {outcome!r}'
+        )
+        assert 'architect' not in stub.calls, (
+            f'architect was unexpectedly called: {stub.calls}'
+        )
+        assert 'implementer' not in stub.calls, (
+            f'implementer was unexpectedly called: {stub.calls}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # File-structure invariants
 # ---------------------------------------------------------------------------
 
