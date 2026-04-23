@@ -229,6 +229,10 @@ class CuratorDecision:
     pool_sizes: dict[str, int] = field(default_factory=dict)
     latency_ms: int = 0
     cost_usd: float = 0.0
+    # Set only by curate_batch when a candidate is a duplicate of another
+    # candidate in the same batch (neither yet materialised as a task).
+    # The worker substitutes the sibling's resulting task_id at dispatch time.
+    batch_target_index: int | None = None
 
     def to_log_fields(self) -> dict[str, Any]:
         return {
@@ -1281,6 +1285,133 @@ def _trim_pool(pool: list[_PoolEntry], total_cap: int) -> list[_PoolEntry]:
     return result[:total_cap]
 
 
+def _parse_decision_dict(
+    raw: dict,
+    *,
+    pool: list[_PoolEntry],
+    pool_sizes: dict[str, int],
+    latency_ms: int,
+    cost_usd: float,
+) -> CuratorDecision:
+    """Validate and parse a single raw decision dict into a ``CuratorDecision``.
+
+    Called by both :func:`_parse_decision` (single-item) and
+    :func:`_parse_batch_decisions` (per-item inside a batch).  Per-item parse
+    failures raise ``ValueError`` so batch callers can degrade only that item.
+    For the single-item caller the wrapping :func:`_parse_decision` returns a
+    ``create`` decision instead of propagating the exception.
+    """
+    action = str(raw.get('action', '')).lower()
+    if action not in ('drop', 'combine', 'create'):
+        return CuratorDecision(
+            action='create',
+            justification=f'invalid-action: {action!r}',
+            pool_sizes=pool_sizes,
+            latency_ms=latency_ms,
+            cost_usd=cost_usd,
+        )
+
+    justification = str(raw.get('justification', ''))
+    target_id = raw.get('target_id')
+    if target_id is not None:
+        target_id = str(target_id)
+    target_fingerprint = raw.get('target_fingerprint')
+    if target_fingerprint is not None:
+        target_fingerprint = str(target_fingerprint)
+
+    # batch_target_index: valid only for 'drop'; carries the sibling index when
+    # the candidate is a duplicate of another batch item (not yet materialised).
+    batch_target_index_raw = raw.get('batch_target_index')
+    batch_target_index: int | None = (
+        int(batch_target_index_raw)
+        if batch_target_index_raw is not None
+        else None
+    )
+
+    # Safety: drop/combine must reference a pool task id that actually exists,
+    # UNLESS this is a within-batch drop (batch_target_index set, target_id None).
+    valid_ids = {e.task_id for e in pool}
+    if action in ('drop', 'combine'):
+        is_within_batch_drop = (
+            action == 'drop'
+            and batch_target_index is not None
+            and target_id is None
+        )
+        if not is_within_batch_drop and (not target_id or target_id not in valid_ids):
+            return CuratorDecision(
+                action='create',
+                justification=(
+                    f'invalid-target: action={action} target_id={target_id!r}; '
+                    f'not in pool'
+                ),
+                pool_sizes=pool_sizes,
+                latency_ms=latency_ms,
+                cost_usd=cost_usd,
+            )
+        # combine-only tasks must also be combine_eligible (pending status).
+        if action == 'combine' and target_id:
+            target_entry = next(e for e in pool if e.task_id == target_id)
+            if not target_entry.combine_eligible:
+                return CuratorDecision(
+                    action='create',
+                    justification=(
+                        f'invalid-combine-target: {target_id} has status '
+                        f'{target_entry.status}, not pending'
+                    ),
+                    pool_sizes=pool_sizes,
+                    latency_ms=latency_ms,
+                    cost_usd=cost_usd,
+                )
+
+    rewritten: RewrittenTask | None = None
+    if action == 'combine':
+        rt = raw.get('rewritten_task')
+        if not isinstance(rt, dict):
+            return CuratorDecision(
+                action='create',
+                justification='combine-missing-rewrite',
+                pool_sizes=pool_sizes,
+                latency_ms=latency_ms,
+                cost_usd=cost_usd,
+            )
+        try:
+            rewritten = RewrittenTask(
+                title=str(rt.get('title', '')),
+                description=str(rt.get('description', '')),
+                details=str(rt.get('details', '')),
+                files_to_modify=[str(f) for f in (rt.get('files_to_modify') or [])],
+                priority=str(rt.get('priority', DEFAULT_PRIORITY)),
+            )
+        except Exception as exc:
+            return CuratorDecision(
+                action='create',
+                justification=f'rewrite-parse-failed: {exc}',
+                pool_sizes=pool_sizes,
+                latency_ms=latency_ms,
+                cost_usd=cost_usd,
+            )
+        if not rewritten.title or not rewritten.details:
+            return CuratorDecision(
+                action='create',
+                justification='rewrite-empty-title-or-details',
+                pool_sizes=pool_sizes,
+                latency_ms=latency_ms,
+                cost_usd=cost_usd,
+            )
+
+    return CuratorDecision(
+        action=action,  # type: ignore[arg-type]
+        target_id=target_id,
+        target_fingerprint=target_fingerprint,
+        rewritten_task=rewritten,
+        justification=justification,
+        pool_sizes=pool_sizes,
+        latency_ms=latency_ms,
+        cost_usd=cost_usd,
+        batch_target_index=batch_target_index,
+    )
+
+
 def _parse_decision(
     agent_result: AgentResult,
     *,
@@ -1288,6 +1419,12 @@ def _parse_decision(
     latency_ms: int,
     pool: list[_PoolEntry],
 ) -> CuratorDecision:
+    """Parse a single-item :class:`AgentResult` into a :class:`CuratorDecision`.
+
+    Extracts the raw dict from ``structured_output`` (or falls back to
+    ``json.loads(output)``) then delegates to :func:`_parse_decision_dict`.
+    Any parse failure returns ``action='create'`` — never raises.
+    """
     raw = agent_result.structured_output
     if raw is None:
         # Try to parse from raw output
@@ -1311,95 +1448,9 @@ def _parse_decision(
             cost_usd=agent_result.cost_usd,
         )
 
-    action = str(raw.get('action', '')).lower()
-    if action not in ('drop', 'combine', 'create'):
-        return CuratorDecision(
-            action='create',
-            justification=f'invalid-action: {action!r}',
-            pool_sizes=pool_sizes,
-            latency_ms=latency_ms,
-            cost_usd=agent_result.cost_usd,
-        )
-
-    justification = str(raw.get('justification', ''))
-    target_id = raw.get('target_id')
-    if target_id is not None:
-        target_id = str(target_id)
-    target_fingerprint = raw.get('target_fingerprint')
-    if target_fingerprint is not None:
-        target_fingerprint = str(target_fingerprint)
-
-    # Safety: drop/combine must reference a pool task id that actually exists.
-    valid_ids = {e.task_id for e in pool}
-    if action in ('drop', 'combine'):
-        if not target_id or target_id not in valid_ids:
-            return CuratorDecision(
-                action='create',
-                justification=(
-                    f'invalid-target: action={action} target_id={target_id!r}; '
-                    f'not in pool'
-                ),
-                pool_sizes=pool_sizes,
-                latency_ms=latency_ms,
-                cost_usd=agent_result.cost_usd,
-            )
-        # combine-only tasks must also be combine_eligible (pending status).
-        if action == 'combine':
-            target_entry = next(e for e in pool if e.task_id == target_id)
-            if not target_entry.combine_eligible:
-                return CuratorDecision(
-                    action='create',
-                    justification=(
-                        f'invalid-combine-target: {target_id} has status '
-                        f'{target_entry.status}, not pending'
-                    ),
-                    pool_sizes=pool_sizes,
-                    latency_ms=latency_ms,
-                    cost_usd=agent_result.cost_usd,
-                )
-
-    rewritten: RewrittenTask | None = None
-    if action == 'combine':
-        rt = raw.get('rewritten_task')
-        if not isinstance(rt, dict):
-            return CuratorDecision(
-                action='create',
-                justification='combine-missing-rewrite',
-                pool_sizes=pool_sizes,
-                latency_ms=latency_ms,
-                cost_usd=agent_result.cost_usd,
-            )
-        try:
-            rewritten = RewrittenTask(
-                title=str(rt.get('title', '')),
-                description=str(rt.get('description', '')),
-                details=str(rt.get('details', '')),
-                files_to_modify=[str(f) for f in (rt.get('files_to_modify') or [])],
-                priority=str(rt.get('priority', DEFAULT_PRIORITY)),
-            )
-        except Exception as exc:
-            return CuratorDecision(
-                action='create',
-                justification=f'rewrite-parse-failed: {exc}',
-                pool_sizes=pool_sizes,
-                latency_ms=latency_ms,
-                cost_usd=agent_result.cost_usd,
-            )
-        if not rewritten.title or not rewritten.details:
-            return CuratorDecision(
-                action='create',
-                justification='rewrite-empty-title-or-details',
-                pool_sizes=pool_sizes,
-                latency_ms=latency_ms,
-                cost_usd=agent_result.cost_usd,
-            )
-
-    return CuratorDecision(
-        action=action,  # type: ignore[arg-type]
-        target_id=target_id,
-        target_fingerprint=target_fingerprint,
-        rewritten_task=rewritten,
-        justification=justification,
+    return _parse_decision_dict(
+        raw,
+        pool=pool,
         pool_sizes=pool_sizes,
         latency_ms=latency_ms,
         cost_usd=agent_result.cost_usd,

@@ -9,12 +9,14 @@ from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.task_curator import (
+    CURATOR_BATCH_OUTPUT_SCHEMA,
     CURATOR_OUTPUT_SCHEMA,
     CandidateTask,
     CuratorDecision,
     CuratorFailureError,
     TaskCurator,
     _parse_decision,
+    _parse_decision_dict,
     _PoolEntry,
     _task_dependencies,
     _task_files,
@@ -953,7 +955,6 @@ class TestCurateBatch:
 class TestCuratorBatchOutputSchema:
     def test_batch_schema_is_jsonable(self):
         import json
-        from fused_memory.middleware.task_curator import CURATOR_BATCH_OUTPUT_SCHEMA
         raw = json.dumps(CURATOR_BATCH_OUTPUT_SCHEMA)
         assert 'decisions' in raw
         assert 'candidate_index' in raw
@@ -961,7 +962,6 @@ class TestCuratorBatchOutputSchema:
         assert 'action' in raw
 
     def test_batch_schema_requires_decisions(self):
-        from fused_memory.middleware.task_curator import CURATOR_BATCH_OUTPUT_SCHEMA
         assert 'decisions' in CURATOR_BATCH_OUTPUT_SCHEMA['required']
         items_schema = CURATOR_BATCH_OUTPUT_SCHEMA['properties']['decisions']['items']
         assert 'action' in items_schema['required']
@@ -978,7 +978,6 @@ class TestParseDecisionDict:
     """Mirrors TestParseDecision but calls _parse_decision_dict directly."""
 
     def _call(self, raw: dict, pool=None, *, pool_sizes=None, latency_ms=50, cost_usd=0.01):
-        from fused_memory.middleware.task_curator import _parse_decision_dict
         return _parse_decision_dict(
             raw,
             pool=pool or [],
