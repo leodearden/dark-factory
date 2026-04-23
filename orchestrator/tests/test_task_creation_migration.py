@@ -12,12 +12,9 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
-
 from orchestrator.agents.roles import DEEP_REVIEWER, STEWARD
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.verify import VerifyResult
-
 
 # ---------------------------------------------------------------------------
 # Helpers
