@@ -274,3 +274,74 @@ async def test_window_drains_after_expiry(tmp_path):
         f'Expected 4 triggering timestamps (threshold+1), got '
         f'{len(v_trip.triggering_timestamps)}: {v_trip.triggering_timestamps}'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-11: per-project isolation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_per_project_isolation(tmp_path):
+    """Each project's reversal count is tracked independently."""
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    # Interleave three reversals on proj-a and three on proj-b (all ok).
+    for i in range(3):
+        clock[0] += 1.0
+        va = await guard.observe_attempt(
+            project_id='proj-a',
+            task_id=f'a-{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert va.outcome == 'ok', f'proj-a attempt {i}: expected ok'
+
+        clock[0] += 1.0
+        vb = await guard.observe_attempt(
+            project_id='proj-b',
+            task_id=f'b-{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert vb.outcome == 'ok', f'proj-b attempt {i}: expected ok'
+
+    # Fourth on proj-a trips proj-a independently.
+    clock[0] += 1.0
+    va4 = await guard.observe_attempt(
+        project_id='proj-a',
+        task_id='a-3',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert va4.is_rejection is True, (
+        f'proj-a 4th: expected rejection, got {va4.outcome}'
+    )
+    assert va4.project_id == 'proj-a'
+
+    # Fourth on proj-b trips proj-b independently.
+    clock[0] += 1.0
+    vb4 = await guard.observe_attempt(
+        project_id='proj-b',
+        task_id='b-3',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert vb4.is_rejection is True, (
+        f'proj-b 4th: expected rejection, got {vb4.outcome}'
+    )
+    assert vb4.project_id == 'proj-b'
