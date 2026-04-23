@@ -174,8 +174,14 @@ if resolve["status"] == "created":
 elif resolve["status"] == "combined":
     task_id = resolve["task_id"]           # folded into existing task — still counts as queued
 elif resolve["status"] == "failed":
-    # reason: timeout | server_restart | server_closed | unknown_ticket | ...
-    # Retry once; if it fails again, escalate to the user with resolve["reason"]
+    # reason determines how to proceed:
+    # Retryable (transient): server_restart | timeout
+    #   → retry the submit_task + resolve_ticket pair ONCE with the same metadata.
+    #     (Unblock-triage tasks do not currently set escalation_id/suggestion_hash,
+    #     so the R4 idempotency gate does not fire — the curator may de-duplicate
+    #     via "combined", or a duplicate may slip through that the user can merge later.)
+    # Unrecoverable (terminal): unknown_ticket | server_closed | expired
+    #   → escalate the reason to the user and skip queuing this non-blocker.
     handle_failure(resolve["reason"])
 ```
 
