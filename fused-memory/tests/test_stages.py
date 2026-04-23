@@ -2702,3 +2702,55 @@ class TestFormatFlaggedCharBudget:
         assert rendered > 0, f'rendered must be > 0, got {rendered}'
         assert dropped > 0, f'dropped must be > 0, got {dropped}'
         assert budget_chars == 40000, f'budget_chars must be 40000, got {budget_chars}'
+
+
+# ---------------------------------------------------------------------------
+# _format_flagged: returns rendered_count as second element (step-5)
+# ---------------------------------------------------------------------------
+
+
+class TestFormatFlaggedReturnsRenderedCount:
+    """_format_flagged returns a (str, int) tuple where int is rendered_count."""
+
+    def test_empty_list_returns_tuple_with_zero_count(self):
+        """Empty list → ('No flagged items.', 0)."""
+        result = _format_flagged([])
+        assert isinstance(result, tuple), f'Expected tuple, got {type(result)}'
+        text, count = result
+        assert text == 'No flagged items.'
+        assert count == 0
+
+    def test_two_items_returns_rendered_count_two(self):
+        """2 items under budget → (str, 2)."""
+        items = [{'description': 'a'}, {'description': 'b'}]
+        result = _format_flagged(items)
+        assert isinstance(result, tuple), f'Expected tuple, got {type(result)}'
+        text, count = result
+        assert isinstance(text, str)
+        assert count == 2
+
+    def test_over_budget_rendered_count_less_than_total(self, caplog):
+        """Over-budget render → rendered_count < total and matches warning extra."""
+        items = [{'description': 'x' * 300, 'index': i} for i in range(200)]
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = _format_flagged(items)
+
+        assert isinstance(result, tuple), f'Expected tuple, got {type(result)}'
+        text, rendered_count = result
+        assert rendered_count < 200, (
+            f'Expected rendered_count < 200 for over-budget input; got {rendered_count}'
+        )
+        # The rendered_count must match the warning's extra 'rendered' value
+        warning_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        ]
+        assert len(warning_records) == 1
+        assert warning_records[0].rendered == rendered_count, (
+            f"Warning extra 'rendered'={warning_records[0].rendered} must match "
+            f'returned rendered_count={rendered_count}'
+        )
