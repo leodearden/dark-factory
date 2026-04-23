@@ -1157,6 +1157,75 @@ class TaskCurator:
             latency_ms=latency_ms, pool=pool,
         )
 
+    async def _call_llm_batch(
+        self,
+        candidates: list[CandidateTask],
+        pools: list[list[_PoolEntry]],
+        pool_sizes_list: list[dict[str, int]],
+        start: float,
+        project_id: str,
+        project_root: str,
+    ) -> list[CuratorDecision]:
+        """Invoke one batched LLM call for N candidates and parse the result.
+
+        Timeout and turn-cap scale linearly with the batch size, capped by the
+        configured hard limits in :class:`~fused_memory.config.schema.CuratorConfig`.
+        On failure, raises :exc:`CuratorFailureError`; the caller in
+        :meth:`curate_batch` is responsible for the per-item fallback.
+        """
+        from pathlib import Path as _Path
+
+        cwd = self._cwd or _Path(project_root)
+        n = len(candidates)
+        user_prompt = self._build_batch_user_prompt(candidates, pools)
+
+        timeout = min(
+            self._config.curator.timeout_seconds
+            + self._config.curator.per_item_slack_seconds * n,
+            self._config.curator.batch_timeout_cap_seconds,
+        )
+        max_turns = min(
+            3 + self._config.curator.per_item_turns * n,
+            self._config.curator.batch_turns_cap,
+        )
+
+        agent_result: AgentResult = await invoke_with_cap_retry(
+            usage_gate=self._usage_gate,
+            label=f'task-curator-batch[{project_id}]',
+            project_id=project_id,
+            prompt=user_prompt,
+            system_prompt=_BATCH_SYSTEM_PROMPT,
+            cwd=cwd,
+            model=self._config.curator.model,
+            max_turns=max_turns,
+            max_budget_usd=self._config.curator.max_budget_usd,
+            disallowed_tools=['*'],
+            output_schema=CURATOR_BATCH_OUTPUT_SCHEMA,
+            permission_mode='bypassPermissions',
+            timeout_seconds=timeout,
+            max_cap_retries=3,
+        )
+
+        latency_ms = int((time.monotonic() - start) * 1000)
+        if not agent_result.success:
+            raise CuratorFailureError(
+                f'curator batch LLM call failed: batch_size={n} '
+                f'output={agent_result.output[:200]!r} '
+                f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
+                f'timed_out={agent_result.timed_out} '
+                f'duration_ms={agent_result.duration_ms} '
+                f'configured_timeout_secs={timeout}',
+                timed_out=agent_result.timed_out,
+                duration_ms=agent_result.duration_ms,
+            )
+
+        return _parse_batch_decisions(
+            agent_result,
+            pools=pools,
+            pool_sizes_list=pool_sizes_list,
+            latency_ms=latency_ms,
+        )
+
     def _build_user_prompt(
         self, candidate: CandidateTask, pool: list[_PoolEntry],
     ) -> str:
