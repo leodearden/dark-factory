@@ -1977,62 +1977,139 @@ class TaskInterceptor:
             else:
                 decisions = [None] * len(ticket_data)
 
-            # ── Dispatch each ticket ───────────────────────────────────────────
-            for i, (ticket_id, row, blob, t_project_root, t_kwargs, t_metadata, candidate) in enumerate(ticket_data):
-                decision = decisions[i] if i < len(decisions) else None
+            # ── Topologically-ordered dispatch ────────────────────────────────
+            # Items with batch_target_index wait for their target to be
+            # dispatched first so we can substitute the target's task_id into
+            # the dependent's mark_resolved.  We use an iterative pass that
+            # drains items that are ready (target already resolved or no
+            # batch_target_index).  After each full pass we check for progress;
+            # if none is made (all remaining items form a cycle), we coerce them
+            # to create and drain.  Cycles should not occur in practice because
+            # _parse_batch_decisions already degrades cycles, but we handle them
+            # defensively here too.
 
-                status = 'failed'
-                task_id: str | None = None
-                reason: str | None = None
-                result_dict: dict | None = None
+            # resolved_task_ids[i] = task_id string (or None on failure) once item i is done.
+            resolved_task_ids: dict[int, str | None] = {}
+            pending_indices: list[int] = list(range(len(ticket_data)))
 
-                try:
-                    status, task_id, reason, result_dict, _ = (
-                        await self._dispatch_ticket_decision(
-                            ticket_id=ticket_id,
-                            project_root=t_project_root,
-                            project_id=project_id,
-                            candidate=candidate,
-                            decision=decision,
-                            kwargs=t_kwargs,
-                            metadata=t_metadata,
-                            curator=curator,
+            while pending_indices:
+                made_progress = False
+                still_pending: list[int] = []
+                for i in pending_indices:
+                    dec = decisions[i] if i < len(decisions) else None
+                    batch_target = dec.batch_target_index if dec is not None else None
+
+                    # Can dispatch if: no batch_target_index, OR target already resolved.
+                    if batch_target is not None and batch_target not in resolved_task_ids:
+                        still_pending.append(i)
+                        continue
+
+                    # Resolve the decision: if this is a within-batch drop, substitute
+                    # the sibling's task_id (or degrade to create if sibling failed).
+                    effective_decision = dec
+                    if (
+                        dec is not None
+                        and dec.action == 'drop'
+                        and batch_target is not None
+                    ):
+                        sibling_task_id = resolved_task_ids.get(batch_target)
+                        if sibling_task_id:
+                            # Sibling created or combined — use its task_id.
+                            effective_decision = CuratorDecision(
+                                action='drop',
+                                target_id=sibling_task_id,
+                                justification=(
+                                    f'batch_target_index={batch_target}: '
+                                    f'{dec.justification}'
+                                ),
+                            )
+                        else:
+                            # Sibling failed — degrade this item to create.
+                            logger.warning(
+                                '_process_add_tickets_batch: batch_target_index=%d '
+                                'for ticket %s had no task_id; degrading to create',
+                                batch_target, ticket_data[i][0],
+                            )
+                            effective_decision = CuratorDecision(
+                                action='create',
+                                justification='batch-sibling-failed: degraded to create',
+                            )
+
+                    ticket_id, _, _, t_project_root, t_kwargs, t_metadata, candidate = ticket_data[i]
+                    status = 'failed'
+                    task_id: str | None = None
+                    reason: str | None = None
+                    result_dict: dict | None = None
+
+                    try:
+                        status, task_id, reason, result_dict, _ = (
+                            await self._dispatch_ticket_decision(
+                                ticket_id=ticket_id,
+                                project_root=t_project_root,
+                                project_id=project_id,
+                                candidate=candidate,
+                                decision=effective_decision,
+                                kwargs=t_kwargs,
+                                metadata=t_metadata,
+                                curator=curator,
+                            )
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.exception(
+                            '_process_add_tickets_batch: dispatch failed for ticket %s',
+                            ticket_id,
+                        )
+                        status = 'failed'
+                        reason = str(exc)
+                        task_id = None
+                        result_dict = None
+
+                    # Persist terminal state.
+                    await asyncio.shield(
+                        self._ticket_store.mark_resolved(
+                            ticket_id,
+                            status=status,
+                            task_id=task_id,
+                            reason=reason,
+                            result_json=json.dumps(result_dict) if result_dict is not None else None,
                         )
                     )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    logger.exception(
-                        '_process_add_tickets_batch: dispatch failed for ticket %s',
-                        ticket_id,
-                    )
-                    status = 'failed'
-                    reason = str(exc)
-                    task_id = None
-                    result_dict = None
 
-                # Persist terminal state.
-                await asyncio.shield(
-                    self._ticket_store.mark_resolved(
-                        ticket_id,
-                        status=status,
-                        task_id=task_id,
-                        reason=reason,
-                        result_json=json.dumps(result_dict) if result_dict is not None else None,
-                    )
-                )
+                    # Emit journal event and schedule commit (create path only).
+                    if status == 'created' and task_id:
+                        event = self._make_event(
+                            EventType.task_created,
+                            t_project_root,
+                            {'operation': 'add_task', 'task_id': task_id},
+                        )
+                        await self._journal(event)
+                        self._schedule_commit(t_project_root, 'add_task')
 
-                # Emit journal event and schedule commit (create path only).
-                if status == 'created' and task_id:
-                    event = self._make_event(
-                        EventType.task_created,
-                        t_project_root,
-                        {'operation': 'add_task', 'task_id': task_id},
-                    )
-                    await self._journal(event)
-                    self._schedule_commit(t_project_root, 'add_task')
+                    self._signal_ticket_event(ticket_id)
 
-                self._signal_ticket_event(ticket_id)
+                    # Record this item's result for downstream sibling drops.
+                    resolved_task_ids[i] = task_id
+                    made_progress = True
+
+                pending_indices = still_pending
+
+                if pending_indices and not made_progress:
+                    # Remaining items form a cycle (should not happen after parser
+                    # cycle detection, but handle defensively).
+                    logger.warning(
+                        '_process_add_tickets_batch: cycle in batch_target_index '
+                        'graph for project %s; coercing %d items to create',
+                        project_id, len(pending_indices),
+                    )
+                    for i in pending_indices:
+                        dec = decisions[i] if i < len(decisions) else None
+                        decisions[i] = CuratorDecision(
+                            action='create',
+                            justification='batch-cycle: coerced to create',
+                        )
+                    # Don't update pending_indices — the next iteration will drain them.
 
     def _signal_ticket_event(self, ticket_id: str) -> None:
         """Wake all callers waiting on resolve_ticket for this ticket.
