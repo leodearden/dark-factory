@@ -290,3 +290,48 @@ class TestResolveArchives:
         resolved_at = data['resolved_at']
         expected_date = resolved_at[:10]  # YYYY-MM-DD prefix
         assert archived_path.parent.name == expected_date
+
+
+class TestMakeIdAcrossArchive:
+    """make_id() must consider archived sequence numbers to avoid post-restart collisions."""
+
+    def test_make_id_does_not_collide_with_archived_after_restart(self, tmp_path: Path):
+        """After all escalations are archived and process restarts, make_id() skips used IDs.
+
+        Scenario:
+        - Submit esc-42-1 and esc-42-2 for task '42', resolve both (moves to archive).
+        - Simulate restart: create a new EscalationQueue (in-memory _seq resets to 0).
+        - make_id('42') must return 'esc-42-3', NOT 'esc-42-1' which is already in archive.
+        - Submitting that new escalation and calling get_by_task('42') returns three distinct IDs.
+        """
+        queue_dir = tmp_path / 'queue'
+
+        # First process: submit two escalations and resolve (archive) both.
+        queue = EscalationQueue(queue_dir)
+        queue.submit(_make_escalation('esc-42-1', task_id='42'))
+        queue.submit(_make_escalation('esc-42-2', task_id='42'))
+        queue.resolve('esc-42-1', 'fixed first')
+        queue.resolve('esc-42-2', 'fixed second')
+
+        # Queue root should now be empty for task 42.
+        assert not (queue_dir / 'esc-42-1.json').exists()
+        assert not (queue_dir / 'esc-42-2.json').exists()
+
+        # Simulate process restart: fresh EscalationQueue, _seq resets to 0.
+        queue2 = EscalationQueue(queue_dir)
+
+        # make_id() MUST return 'esc-42-3', not 'esc-42-1'.
+        new_id = queue2.make_id('42')
+        assert new_id == 'esc-42-3', (
+            f'Expected esc-42-3 (avoids archive collision) but got {new_id!r}'
+        )
+
+        # Submit the new escalation and verify all three are visible via get_by_task.
+        new_esc = _make_escalation(new_id, task_id='42')
+        queue2.submit(new_esc)
+
+        all_escs = queue2.get_by_task('42')
+        all_ids = {e.id for e in all_escs}
+        assert all_ids == {'esc-42-1', 'esc-42-2', 'esc-42-3'}, (
+            f'Expected three distinct IDs but got: {all_ids}'
+        )
