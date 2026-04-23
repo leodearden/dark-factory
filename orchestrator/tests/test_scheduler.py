@@ -2117,3 +2117,31 @@ class TestSchedulerMcpSessionDI:
         assert result == 'done'
         assert unknown is None
         no_http.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_routes_through_stub(self):
+        """get_tasks returns [] from the stub without calling mcp_call."""
+        stub = _StubMcpSession()
+        cfg = OrchestratorConfig()
+        sched = Scheduler(cfg, mcp_session=stub)
+        no_http = AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected'))
+
+        with patch('orchestrator.scheduler.mcp_call', new=no_http):
+            tasks = await sched.get_tasks()
+
+        assert tasks == []
+        no_http.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_task_routes_through_stub(self):
+        """update_task returns True (non-error envelope) via the stub without calling mcp_call."""
+        stub = _StubMcpSession()
+        cfg = OrchestratorConfig()
+        sched = Scheduler(cfg, mcp_session=stub)
+        no_http = AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected'))
+
+        with patch('orchestrator.scheduler.mcp_call', new=no_http):
+            ok = await sched.update_task('77', {'modules': ['foo']})
+
+        assert ok is True
+        no_http.assert_not_called()
