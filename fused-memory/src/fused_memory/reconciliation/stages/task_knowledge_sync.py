@@ -280,10 +280,8 @@ def _format_flagged(items: list[dict]) -> str:
     if not items:
         return 'No flagged items.'
     lines = []
-    for item in items[:50]:
+    for item in items:
         lines.append(f'- {json.dumps(item, default=str)}')
-    if len(items) > 50:
-        lines.append(f'... and {len(items) - 50} more')
     return '\n'.join(lines)
 
 
