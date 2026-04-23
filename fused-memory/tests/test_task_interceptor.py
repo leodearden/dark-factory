@@ -2447,8 +2447,13 @@ async def test_two_projects_do_not_serialise(
         tracker._global_in_flight += 1
         tracker.total_peak = max(tracker.total_peak, tracker._global_in_flight)
         try:
-            # Enough ticks for the other project's task to enter
-            for _ in range(10):
+            # Enough ticks for the other project's task to enter.
+            # aiosqlite's background thread needs multiple event-loop ticks to
+            # complete ticket_store.get() (execute + fetchone, each routed
+            # through the thread executor).  Under system load (e.g. 16 xdist
+            # workers in parallel), the thread takes longer; 50 iterations gives
+            # comfortable margin even on a heavily loaded CI machine.
+            for _ in range(50):
                 await asyncio.sleep(0)
             return {'id': '1', 'title': kwargs.get('title', '')}
         finally:
