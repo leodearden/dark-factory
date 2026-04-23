@@ -194,6 +194,7 @@ escalation:
   queue_dir: "data/escalations"
   port: 8100
   host: "127.0.0.1"
+  archive_retention_days: 30
 
 # Git
 git:
