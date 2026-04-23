@@ -110,6 +110,38 @@ class TestEventStore:
             assert isinstance(et.value, str)
             assert et.value == et.name
 
+    def test_event_type_includes_merge_queued_and_dequeued(self, tmp_path: Path) -> None:
+        """merge_queued and merge_dequeued EventType members must exist and round-trip."""
+        # Members exist
+        assert EventType.merge_queued == 'merge_queued'
+        assert EventType.merge_dequeued == 'merge_dequeued'
+
+        # value == name (matching project convention)
+        assert EventType.merge_queued.value == EventType.merge_queued.name
+        assert EventType.merge_dequeued.value == EventType.merge_dequeued.name
+
+        # Round-trip: emit and verify the row
+        db_path = tmp_path / 'test.db'
+        store = EventStore(db_path, 'run-1')
+        store.emit(
+            EventType.merge_queued,
+            task_id='42',
+            phase='merge',
+            data={'branch': 'task/42'},
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, json_extract(data, '$.branch') AS branch "
+            "FROM events WHERE event_type = 'merge_queued'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'merge_queued'
+        assert rows[0][1] == '42'
+        assert rows[0][2] == 'task/42'
+
     def test_query_by_event_type(self, tmp_path: Path) -> None:
         """Verify SQL queries against the events table work."""
         db_path = tmp_path / 'test.db'
