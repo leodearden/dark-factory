@@ -1097,8 +1097,8 @@ class TestActiveQueueSection:
         assert resp.status_code == 200
         html = resp.text
         assert 'task-999' in html, 'Expected task-999 in active queue section'
-        # 'in flight' or 'in_flight' badge must appear
-        assert 'in' in html.lower() and ('flight' in html.lower() or 'in_flight' in html.lower()), (
+        # The exact badge text ('in flight' or 'in_flight') must appear.
+        assert 'in flight' in html.lower() or 'in_flight' in html, (
             "Expected 'in flight' or 'in_flight' badge in active queue section"
         )
 

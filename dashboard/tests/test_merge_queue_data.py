@@ -2264,6 +2264,7 @@ class TestActiveQueuedMerges:
         assert row['branch'] == 'task/T1'
         assert 'run_id' in row
         assert 'timestamp' in row
+        assert 'outcome' in row  # key always present; None for merge_queued rows
 
     async def test_merge_queued_then_dequeued_returns_in_flight(self, tmp_path):
         """merge_queued → merge_dequeued produces state='in_flight'."""

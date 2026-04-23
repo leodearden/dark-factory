@@ -535,23 +535,30 @@ async def active_queued_merges(
     et_placeholders = ','.join('?' * len(_ACTIVE_EVENT_TYPES))
 
     async def _query(conn: aiosqlite.Connection) -> list[dict]:
+        # Use ROW_NUMBER() window function for a single-pass plan that:
+        # (a) avoids the O(N²) correlated-subquery scan, and
+        # (b) deterministically picks one row per task_id when two events
+        #     share an identical timestamp (ties broken by insertion order
+        #     via id DESC, which is unique by AUTOINCREMENT).
         sql = f"""
-            SELECT task_id, run_id, event_type,
-                   json_extract(data, '$.outcome') AS outcome,
-                   json_extract(data, '$.branch') AS branch,
-                   timestamp
-            FROM events e
-            WHERE event_type IN ({et_placeholders})
-              AND timestamp >= ?
-              AND timestamp = (
-                  SELECT MAX(timestamp)
-                  FROM events e2
-                  WHERE e2.task_id = e.task_id
-                    AND e2.event_type IN ({et_placeholders})
-                    AND e2.timestamp >= ?
-              )
+            WITH ranked AS (
+                SELECT task_id, run_id, event_type,
+                       json_extract(data, '$.outcome') AS outcome,
+                       json_extract(data, '$.branch') AS branch,
+                       timestamp,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY task_id
+                           ORDER BY timestamp DESC, id DESC
+                       ) AS rn
+                FROM events
+                WHERE event_type IN ({et_placeholders})
+                  AND timestamp >= ?
+            )
+            SELECT task_id, run_id, event_type, outcome, branch, timestamp
+            FROM ranked
+            WHERE rn = 1
         """
-        params = (*_ACTIVE_EVENT_TYPES, cutoff, *_ACTIVE_EVENT_TYPES, cutoff)
+        params = (*_ACTIVE_EVENT_TYPES, cutoff)
         rows = await conn.execute_fetchall(sql, params)
 
         result = []
