@@ -48,6 +48,16 @@ def _ts_sort_key(entry: dict) -> datetime:
 
 _CANONICAL_OUTCOMES = ['done', 'conflict', 'blocked', 'already_merged']
 
+# Soft operational-warning threshold: warn when recent_merges returns more rows
+# than this while running unbounded (limit=None).  Signals a possible producer
+# burst worth investigating before memory pressure is reached.
+_RECENT_MERGES_BURST_WARN = 1_000
+
+# Hard memory-safety bound for recent_merges(limit=None).  Enforced via a
+# SQL LIMIT probe (_RECENT_MERGES_HARD_CAP + 1) so that a probe result of
+# exactly hard_cap rows does NOT fire a false-positive WARN.
+_RECENT_MERGES_HARD_CAP = 100_000
+
 # ---------------------------------------------------------------------------
 # Adaptive bucket ladder: (max_hours | None, bucket_minutes)
 # None as max_hours means "catch-all / no upper bound".
@@ -361,9 +371,11 @@ async def recent_merges(
 
     Args:
         db: Async SQLite connection, or None (returns []).
-        limit: Maximum number of rows to return.  When ``None``, no SQL
-            ``LIMIT`` clause is added and every matching row is returned.
-            The SQL WHERE window (``hours``) then becomes the sole bound.
+        limit: Maximum number of rows to return.  When ``None``, rows are
+            bounded by ``_RECENT_MERGES_HARD_CAP`` (enforced via a SQL probe)
+            rather than returned without bound.  A WARNING is logged if the
+            hard cap is reached.  The SQL WHERE window (``hours``) is the
+            primary bound; the hard cap is a memory-safety backstop.
         hours: Look-back window in hours (default 168 = 7 days).  Only
             events with ``timestamp >= now - hours`` are included.
         now: Reference timestamp for the cutoff window (default:
@@ -388,10 +400,21 @@ async def recent_merges(
             "ORDER BY timestamp DESC"
         )
         if limit is None:
-            sql, params = base_sql, (since,)
+            # Probe with hard_cap + 1 rows so we can distinguish "exactly
+            # hard_cap rows existed" from "window exceeded hard_cap".
+            probe = _RECENT_MERGES_HARD_CAP + 1
+            sql, params = base_sql + " LIMIT ?", (since, probe)
         else:
             sql, params = base_sql + " LIMIT ?", (since, limit)
         rows = await conn.execute_fetchall(sql, params)
+        if limit is None and len(rows) > _RECENT_MERGES_HARD_CAP:
+            logger.warning(
+                'recent_merges: hard cap %d reached (fetched >%d rows, truncating);'
+                ' consider adding a tighter time window or rate-limiting the producer',
+                _RECENT_MERGES_HARD_CAP,
+                _RECENT_MERGES_HARD_CAP,
+            )
+            rows = rows[:_RECENT_MERGES_HARD_CAP]
         return [
             {
                 'task_id': row['task_id'],
