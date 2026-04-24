@@ -169,18 +169,12 @@ if resolve["status"] == "created":
 elif resolve["status"] == "combined":
     task_id = resolve["task_id"]           # merged into existing task — normal, not an error
 elif resolve["status"] == "failed":
-    # reason determines how to proceed:
-    # server_restart → retry the submit_task + resolve_ticket pair ONCE with the same
-    #   metadata (original ticket is dead; a fresh submit is the only path forward).
-    #   PRD-decomposition tasks do not set escalation_id/suggestion_hash, so the R4
-    #   idempotency gate does not fire — the curator may de-duplicate via "combined"
-    #   if the duplicate matches an existing task; otherwise a second task will be
-    #   created and the user can merge them via the task tree.
-    # timeout → first retry resolve_ticket(ticket=same_ticket, ...) with the same ticket —
-    #   the worker may still be processing. Only re-submit_task if that retry returns
-    #   unknown_ticket or expired. Same dedup caveat as server_restart if re-submit needed.
-    # unknown_ticket | server_closed | expired → terminal: surface the reason to the
-    #   user and skip this task (user can resubmit manually after investigating).
+    # On `failed`: surface the reason to the user and skip this task (user can
+    # resubmit manually after investigating).
+    # See skills/_shared/ticket-failure-handling.md for the retryable/terminal reason
+    # matrix and R4 idempotency guidance. PRD-decomposition tasks don't natively set
+    # escalation_id/suggestion_hash; to opt into R4 de-duplication on retry, synthesize
+    # a stable pair per that doc's guidance.
     handle_failure(resolve["reason"])
 ```
 

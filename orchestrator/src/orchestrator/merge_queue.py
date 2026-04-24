@@ -35,19 +35,27 @@ async def _check_plan_targets_in_tree(
     merge_commit_sha: str,
     task_worktree: Path,
     git_ops: GitOps,
+    *,
+    task_id: str | None = None,
 ) -> list[str]:
-    """Return plan.json `files` entries missing from the merge commit tree.
+    """Return plan.json `files` entries dropped by the merge.
+
+    A "drop" means the file was on the task branch tip but is absent from
+    the merge commit — i.e. conflict resolution discarded work the task
+    actually produced. Paths that are absent from *both* task HEAD and the
+    merge commit are not drops: the task branch itself intentionally
+    doesn't carry them (e.g. a plan step that adds a scaffold and a later
+    step that deletes it per review). Flagging those would trip on plans
+    whose terminal state legitimately removes a listed file.
 
     Reads the plan from the task worktree (plan.json lives in gitignored
     .task/, so it's only in the source worktree — not the merge worktree).
-    For each file in ``plan['files']``, checks whether the path exists at
-    the given commit.  Missing files mean conflict resolution dropped
-    planned content.
 
     Returns an empty list when:
     - no plan.json exists (architect never ran — nothing to check)
     - plan['files'] is empty or missing
-    - all planned files are present in the merge commit
+    - every planned file that exists at task HEAD also exists at the merge
+      commit
     """
     artifacts = TaskArtifacts(task_worktree)
     plan = artifacts.read_plan()
@@ -55,13 +63,44 @@ async def _check_plan_targets_in_tree(
     if not files:
         return []
 
+    rc_head, task_head_out, head_err = await _run(
+        ['git', 'rev-parse', 'HEAD'],
+        cwd=task_worktree,
+    )
+    if rc_head == 0:
+        task_head = task_head_out.strip()
+    else:
+        # rev-parse HEAD on a valid worktree essentially always succeeds;
+        # a non-zero rc signals an unexpected problem (corrupt worktree,
+        # detached state with no HEAD). Log visibly so regressions surface
+        # in operations rather than as mystery false positives — with an
+        # empty task_head the loop below falls back to the pre-narrow
+        # behaviour of flagging every missing planned file as a drop.
+        logger.warning(
+            'drop-guard: git rev-parse HEAD failed in %s (rc=%d, stderr=%s); '
+            'falling back to flag-every-missing behaviour. '
+            'task_id=%s merge_commit_sha=%s',
+            task_worktree, rc_head, head_err.strip(),
+            task_id or '<unknown>', merge_commit_sha,
+        )
+        task_head = ''
+
     missing: list[str] = []
     for f in files:
-        rc, _, _ = await _run(
+        rc_merge, _, _ = await _run(
             ['git', 'cat-file', '-e', f'{merge_commit_sha}:{f}'],
             cwd=git_ops.project_root,
         )
-        if rc != 0:
+        if rc_merge == 0:
+            continue
+        if not task_head:
+            missing.append(f)
+            continue
+        rc_head_f, _, _ = await _run(
+            ['git', 'cat-file', '-e', f'{task_head}:{f}'],
+            cwd=git_ops.project_root,
+        )
+        if rc_head_f == 0:
             missing.append(f)
 
     if not missing:
@@ -483,6 +522,7 @@ class MergeWorker:
         assert merge_result.merge_commit is not None
         dropped = await _check_plan_targets_in_tree(
             merge_result.merge_commit, req.worktree, self._git_ops,
+            task_id=req.task_id,
         )
         if dropped:
             if merge_result.merge_worktree:
@@ -1059,6 +1099,7 @@ class SpeculativeMergeWorker:
                     # Drop-guard: every file the task planned must survive.
                     dropped = await _check_plan_targets_in_tree(
                         merge_commit, req.worktree, self._git_ops,
+                        task_id=req.task_id,
                     )
                     if dropped:
                         if merge_result.merge_worktree:

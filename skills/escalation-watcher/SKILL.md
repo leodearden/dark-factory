@@ -261,18 +261,10 @@ After the sub-agent returns:
    elif resolve["status"] == "combined":
        task_id = resolve["task_id"]           # merged into existing task — normal, not an error
    elif resolve["status"] == "failed":
-       # reason determines how to proceed:
-       # server_restart → retry the submit_task + resolve_ticket pair ONCE with the same
-       #   metadata (original ticket is dead; a fresh submit is the only path forward).
-       #   The (escalation_id, suggestion_hash) pair is the R4 idempotency gate
-       #   (task_interceptor.py:_check_escalation_idempotency) — the retry returns the
-       #   existing task if the first call already created one.
-       # timeout → first retry resolve_ticket(ticket=same_ticket, ...) with the same
-       #   ticket — the worker may still be processing. Only re-submit_task if that retry
-       #   returns unknown_ticket or expired. The R4 gate still fires on re-submit when
-       #   the same (escalation_id, suggestion_hash) metadata is sent.
-       # unknown_ticket | server_closed | expired → terminal: record the reason in the
-       #   escalation resolution note and skip this suggestion group.
+       # On `failed`: record the reason in the escalation resolution note and skip this
+       # suggestion group. This caller DOES set (escalation_id, suggestion_hash), so the
+       # R4 gate fires natively.
+       # See skills/_shared/ticket-failure-handling.md for the retryable/terminal reason matrix.
        handle_failure(resolve["reason"])
    ```
 
@@ -392,8 +384,13 @@ Technical debt or cleanup discovered during development.
 - **Info**: queue as a follow-up task using `mcp__fused-memory__submit_task` → `mcp__fused-memory__resolve_ticket` (two-phase pattern; see `review_suggestions` §2 above for the full snippet). When adapting the snippet:
   1. Substitute `"source": "escalation-info"` (only this field changes).
   2. Keep `"spawn_context": "steward-triage"` — unchanged from §2; both sites feed the same steward pipeline.
-  3. Set `"suggestion_hash"` to `hashlib.sha256((escalation['detail'] or escalation['summary'] or escalation['id']).encode()).hexdigest()[:16]` (stdlib `hashlib` only — no orchestrator import needed) — a retry token (not a per-item discriminator) for single-finding info escalations. The fallback chain is required: if `detail` is blank, `sha256(b'')` returns the fixed prefix `e3b0c44298fc1c14` and would collapse unrelated blank-detail escalations into the same R4 follow-up task; falling through to `summary` then `id` guarantees a non-empty payload (`id` is always `"esc-{task_id}-{seq}"` by the `Escalation` dataclass contract). This expression mirrors the canonical 16-char sha256-hex shape owned by `orchestrator.agents.triage.sha256_16`; any algorithm change must be made at both sites.
-  4. Both `escalation_id` and `suggestion_hash` must be non-empty strings for the R4 gate (`task_interceptor.py :: _check_escalation_idempotency`) to activate.
+  3. For the `suggestion_hash` / `escalation_id` synthesis recipe and R4 gate details, see
+     [`skills/_shared/ticket-failure-handling.md`](../_shared/ticket-failure-handling.md).
+     At this callsite (Case A — the escalation's id is already in scope), the concrete
+     synthesis is:
+     ```python
+     suggestion_hash = hashlib.sha256((escalation['detail'] or escalation['summary'] or escalation['id']).encode()).hexdigest()[:16]
+     ```
 
   Resolve via `mcp__escalation__resolve_issue` once the ticket resolves.
 - **Blocking** (rare): spawn an interactive `/unblock` session (see `task_failure` for invocation pattern).

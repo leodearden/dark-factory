@@ -209,10 +209,17 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
-    async def test_one_plan_target_missing(
+    async def test_plan_target_never_created_not_flagged(
         self, git_ops: GitOps,
     ):
-        """Plan lists a file the task never created → returned in missing."""
+        """Plan lists a file the task never created — not a merge drop.
+
+        The file isn't on task HEAD either, so its absence from the merge
+        commit reflects the task branch's own state, not conflict loss.
+        Plan-delivery gaps (listed in plan.files, never produced by the
+        task) are a different class of problem and are out of scope for
+        the merge-time drop-guard; catching them belongs to review/verify.
+        """
         worktree = (await git_ops.create_worktree('plan-one-missing')).path
         (worktree / 'present.py').write_text('present = 1\n')
         await git_ops.commit(worktree, 'Add present only')
@@ -232,10 +239,170 @@ class TestCheckPlanTargetsInTree:
             missing = await _check_plan_targets_in_tree(
                 merge_result.merge_commit, worktree, git_ops,
             )
-            assert missing == ['absent.py']
+            assert missing == []
         finally:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_plan_target_added_then_deleted_on_branch_not_flagged(
+        self, git_ops: GitOps,
+    ):
+        """File added then deleted on the task branch → intentional, not flagged.
+
+        Real-world case (task/982): a plan adds a scaffold, a later reviewed
+        step deletes it as an anti-pattern. The file is listed in
+        plan.files, is absent from the merge commit, and is absent from
+        task HEAD — that matches task intent, not conflict loss.
+        """
+        worktree = (
+            await git_ops.create_worktree('plan-added-then-deleted')
+        ).path
+        (worktree / 'keep.py').write_text('keep = 1\n')
+        (worktree / 'scratch.py').write_text('scratch = 1\n')
+        await git_ops.commit(worktree, 'Add keep + scratch')
+        (worktree / 'scratch.py').unlink()
+        await git_ops.commit(worktree, 'Remove scratch per review')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t2b', 'T2b', 'desc')
+        artifacts.write_plan({
+            'files': ['keep.py', 'scratch.py'],
+            'modules': [],
+            'steps': [],
+        })
+
+        merge_result = await git_ops.merge_to_main(
+            worktree, 'plan-added-then-deleted',
+        )
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            assert missing == []
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_plan_target_on_head_dropped_by_merge_is_flagged(
+        self, git_ops: GitOps,
+    ):
+        """File present on task HEAD but absent from merge commit → flagged.
+
+        Simulates the real failure mode the guard was built for: conflict
+        resolution accepts origin and drops a file the task branch
+        produced. We synthesise the detector input by pointing the
+        `merge_commit_sha` at an earlier task-branch commit that predates
+        the addition of the dropped file — it has the retained file but
+        not the dropped one, matching what a bad conflict resolution would
+        have produced.
+        """
+        worktree = (await git_ops.create_worktree('plan-dropped')).path
+        (worktree / 'retained.py').write_text('retained = 1\n')
+        await git_ops.commit(worktree, 'Add retained')
+        rc, pre_drop_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
+        )
+        assert rc == 0
+        pre_drop_sha = pre_drop_sha.strip()
+
+        (worktree / 'dropped.py').write_text('dropped = 1\n')
+        await git_ops.commit(worktree, 'Add dropped')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t2c', 'T2c', 'desc')
+        artifacts.write_plan({
+            'files': ['retained.py', 'dropped.py'],
+            'modules': [],
+            'steps': [],
+        })
+
+        # pre_drop_sha has retained.py but not dropped.py, and task HEAD
+        # has both — so only dropped.py should be flagged as a merge drop.
+        missing = await _check_plan_targets_in_tree(
+            pre_drop_sha, worktree, git_ops,
+        )
+        assert missing == ['dropped.py']
+
+    async def test_real_conflict_resolution_drop_is_flagged(
+        self, git_ops: GitOps,
+    ):
+        """Genuine conflict-time drop (file removed during resolution) → flagged.
+
+        Complements ``test_plan_target_on_head_dropped_by_merge_is_flagged``
+        which synthesises the detector input from a pre-drop task commit.
+        Here we build an actual merge commit produced by resolving a
+        real conflict via `git rm`, which is the failure mode the guard
+        was originally designed to catch.
+        """
+        # Task branch: adds contested.py + other.py
+        worktree = (await git_ops.create_worktree('real-conflict-drop')).path
+        full_branch = f'{git_ops.config.branch_prefix}real-conflict-drop'
+        (worktree / 'contested.py').write_text('task_version = 1\n')
+        (worktree / 'other.py').write_text('other = 1\n')
+        await git_ops.commit(worktree, 'Task: add contested + other')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t2d', 'T2d', 'desc')
+        artifacts.write_plan({
+            'files': ['contested.py', 'other.py'],
+            'modules': [],
+            'steps': [],
+        })
+
+        # Main: independently add contested.py with different content →
+        # guaranteed conflict when task branch is merged in.
+        (git_ops.project_root / 'contested.py').write_text(
+            'main_version = 1\n'
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main: add contested'],
+            cwd=git_ops.project_root,
+        )
+
+        # Manually build a merge commit that resolves the conflict by
+        # dropping contested.py — emulating a human (or LLM) resolving
+        # the merge by removing the contested file entirely.
+        merge_wt = (
+            git_ops.worktree_base / '_real-merge'
+        )
+        await _run(
+            ['git', 'worktree', 'add', '--detach', str(merge_wt), 'main'],
+            cwd=git_ops.project_root,
+        )
+        try:
+            rc, out, err = await _run(
+                ['git', 'merge', '--no-ff', '--no-commit', full_branch],
+                cwd=merge_wt,
+            )
+            # Expect a real conflict
+            assert 'CONFLICT' in out or 'CONFLICT' in err, (
+                f'Expected conflict; got rc={rc} out={out!r} err={err!r}'
+            )
+            # Resolve by dropping contested.py entirely
+            await _run(['git', 'rm', '-f', 'contested.py'], cwd=merge_wt)
+            rc, _, err = await _run(
+                ['git', 'commit', '--no-edit'], cwd=merge_wt,
+            )
+            assert rc == 0, f'merge commit failed: {err}'
+            _, merge_sha, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'], cwd=merge_wt,
+            )
+            merge_sha = merge_sha.strip()
+
+            # Detector must flag contested.py (on task HEAD, absent from merge)
+            # but leave other.py (present on both) alone.
+            missing = await _check_plan_targets_in_tree(
+                merge_sha, worktree, git_ops,
+            )
+            assert missing == ['contested.py']
+        finally:
+            await _run(
+                ['git', 'worktree', 'remove', str(merge_wt), '--force'],
+                cwd=git_ops.project_root,
+            )
 
     async def test_no_plan_json_returns_empty(
         self, git_ops: GitOps,
@@ -588,14 +755,20 @@ class TestMergeWorker:
     async def test_blocks_when_merge_drops_plan_target(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """Plan lists a file absent from merge commit → MergeWorker blocks."""
+        """MergeWorker blocks and surfaces a clear reason on a real drop.
+
+        Drop semantics: file was on task HEAD but is absent from the
+        merge commit. Reproducing a real conflict-time drop in a unit
+        test is awkward, so we mock the detector to simulate the drop
+        and verify MergeWorker's handling (reason text, no advance).
+        """
         worktree = (await git_ops.create_worktree('drop-guard-task')).path
         (worktree / 'kept.py').write_text('kept = True\n')
-        await git_ops.commit(worktree, 'Add kept file')
+        (worktree / 'dropped.py').write_text('dropped = True\n')
+        await git_ops.commit(worktree, 'Add kept + dropped')
 
         artifacts = TaskArtifacts(worktree)
         artifacts.init('drop-guard', 'Drop guard', 'desc')
-        # Plan claims two files but the task branch only created one.
         artifacts.write_plan({
             'files': ['kept.py', 'dropped.py'],
             'modules': [],
@@ -606,8 +779,14 @@ class TestMergeWorker:
         worker = MergeWorker(git_ops, queue)
         worker_task = asyncio.create_task(worker.run())
 
+        async def _fake_drop_check(*_args, **_kwargs):
+            return ['dropped.py']
+
         with patch(
             'orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass(),
+        ), patch(
+            'orchestrator.merge_queue._check_plan_targets_in_tree',
+            _fake_drop_check,
         ):
             req = _make_request('drop-guard', 'drop-guard-task', worktree, config)
             await queue.put(req)
@@ -623,6 +802,71 @@ class TestMergeWorker:
             cwd=git_ops.project_root,
         )
         assert 'kept.py' not in main_files
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_blocks_when_merge_drops_plan_target_real_detector(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """MergeWorker drives the real detector and blocks on a synthesised drop.
+
+        Companion to ``test_blocks_when_merge_drops_plan_target``: that test
+        mocks the detector to pin the reason-text contract; this one leaves
+        the detector in place and mocks ``git_ops.merge_to_main`` so a
+        future refactor of the wiring (argument order, return-value
+        interpretation) cannot pass both tests while silently breaking the
+        guard in production.
+        """
+        worktree = (await git_ops.create_worktree('drop-guard-real')).path
+        (worktree / 'retained.py').write_text('retained = 1\n')
+        await git_ops.commit(worktree, 'Add retained')
+        rc, pre_drop_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
+        )
+        assert rc == 0
+        pre_drop_sha = pre_drop_sha.strip()
+
+        (worktree / 'dropped.py').write_text('dropped = 1\n')
+        await git_ops.commit(worktree, 'Add dropped')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('drop-guard-real', 'Drop guard real', 'desc')
+        artifacts.write_plan({
+            'files': ['retained.py', 'dropped.py'],
+            'modules': [],
+            'steps': [],
+        })
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # Point the "merge commit" at a task-branch SHA that predates the
+        # addition of dropped.py. The real detector sees dropped.py on task
+        # HEAD but absent from that tree → flags it as a drop.
+        async def _fake_merge_to_main(*_args: Any, **_kwargs: Any) -> MergeResult:
+            return MergeResult(
+                success=True,
+                merge_commit=pre_drop_sha,
+                pre_merge_sha=pre_drop_sha,
+                merge_worktree=None,
+            )
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass(),
+        ), patch.object(git_ops, 'merge_to_main', _fake_merge_to_main):
+            req = _make_request(
+                'drop-guard-real', 'drop-guard-real', worktree, config,
+            )
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked'
+        assert 'dropped.py' in outcome.reason
+        assert 'plan target' in outcome.reason.lower()
 
         await worker.stop()
         worker_task.cancel()
