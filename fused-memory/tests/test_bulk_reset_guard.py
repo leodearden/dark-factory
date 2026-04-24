@@ -921,9 +921,13 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
     """
     # Count only "outer" mkdir calls from _maybe_write_escalation, not
     # recursive internal calls made by Path.mkdir(parents=True) when creating
-    # intermediate parent directories.  Match by absolute path equality rather
-    # than suffix to avoid accidental matches from sibling fixtures or parent
-    # mkdir calls whose last segment happens to be 'escalations'.
+    # intermediate parent directories.  Pathlib's internal parents-creation
+    # sequence calls self.mkdir(mode, parents=False, exist_ok=…) as a retry step
+    # after creating parent dirs, so path-equality alone is not sufficient.  We
+    # combine path equality with a parents=True check that reads from both
+    # keyword form (kwargs.get) and positional form (args[1], since mode is
+    # args[0]).  The retry call always passes parents=False as a keyword arg, so
+    # it is correctly excluded regardless of how the outer call site passes it.
     expected_esc_dir = tmp_path / 'data' / 'escalations'
     outer_mkdir_calls: list[int] = [0]
     write_text_calls: list[int] = [0]
@@ -931,7 +935,7 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
     real_write_text = Path.write_text
 
     def intercepting_mkdir(self, *args, **kwargs):
-        is_outer = kwargs.get('parents', False) and self == expected_esc_dir
+        is_outer = (self == expected_esc_dir) and (args[1] if len(args) > 1 else kwargs.get('parents', False))
         if is_outer:
             outer_mkdir_calls[0] += 1
             if outer_mkdir_calls[0] == 1:
