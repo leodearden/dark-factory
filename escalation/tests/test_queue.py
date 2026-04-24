@@ -445,6 +445,53 @@ class TestResolveIdempotent:
         )
 
 
+class TestGetByTaskDedupAcrossArchive:
+    """get_by_task() must deduplicate when the same escalation id appears in both
+    the queue root and the archive (crash-mid-resolve / backup-restore scenario)."""
+
+    def test_get_by_task_dedups_when_id_in_both_queue_and_archive(self, tmp_path: Path):
+        """get_by_task() returns exactly one item when id exists in both locations.
+
+        Failure mode in current main: two-tier scan concatenates without dedup,
+        so the caller receives two Escalation instances for the same id.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Submit and resolve esc-42-1 — moves into archive
+        queue.submit(_make_escalation('esc-42-1', task_id='42'))
+        queue.resolve('esc-42-1', 'original_resolution')
+
+        # Sanity: file should now be in archive, not in queue root
+        assert not (queue.queue_dir / 'esc-42-1.json').exists()
+        archive_files = list((queue.queue_dir / 'archive').rglob('esc-42-1.json'))
+        assert len(archive_files) == 1
+
+        # Simulate crash-mid-resolve / backup-restore: copy the archived file
+        # back into the queue root with a modified resolution to test dedup precedence.
+        archived_path = archive_files[0]
+        archived_esc = _make_escalation('esc-42-1', task_id='42', status='resolved')
+        archived_esc.resolution = 'from_queue_root'
+        (queue.queue_dir / 'esc-42-1.json').write_text(archived_esc.to_json())
+
+        # Confirm the "maybe-in-two-places" state
+        assert (queue.queue_dir / 'esc-42-1.json').exists()
+        assert len(list((queue.queue_dir / 'archive').rglob('esc-42-1.json'))) == 1
+
+        # get_by_task must return exactly one item (deduped)
+        results = queue.get_by_task('42')
+        ids = [e.id for e in results]
+        assert ids.count('esc-42-1') == 1, (
+            f'Expected exactly one esc-42-1 in results, got {len(ids)} entries: {ids}'
+        )
+
+        # queue_dir copy must win (iteration order: root first, archive second)
+        returned_esc = next(e for e in results if e.id == 'esc-42-1')
+        assert returned_esc.resolution == 'from_queue_root', (
+            f"Expected queue_dir copy to win (resolution='from_queue_root'), "
+            f"got {returned_esc.resolution!r}"
+        )
+
+
 class TestMakeIdAcrossArchive:
     """make_id() must consider archived sequence numbers to avoid post-restart collisions."""
 
