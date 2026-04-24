@@ -8,6 +8,15 @@ test_command: "pytest"
 lint_command: "ruff check shared escalation fused-memory orchestrator dashboard"
 type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright"
 
+# Verification timeouts — dark-factory is Python-only (no cargo builds), so the
+# package defaults (1800s warm / 5400s cold, sized for reify's big Rust builds)
+# are much too loose. Full warm verify here is ~2 min; cold adds uv sync across
+# 6 subprojects (~3 min). Tight timeouts surface hangs (e.g. asyncio-sleep
+# loops in a misconfigured mock) on the first verify that touches the module,
+# not 8 days later at a post-completion full review.
+verify_command_timeout_secs: 600
+verify_cold_command_timeout_secs: 1200
+
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
 fused_memory:

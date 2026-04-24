@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.testing import make_gate_mock
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
@@ -767,7 +768,7 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
 
     from shared.cli_invoke import AgentResult
 
-    fake_gate = MagicMock()
+    fake_gate = make_gate_mock()
     config = _make_judge_config(
         judge_llm_provider='claude_cli',
         judge_llm_model='claude-sonnet-4-5',
@@ -823,7 +824,7 @@ async def test_call_judge_cli_empty_output_returns_empty_string(mock_journal):
 
     from shared.cli_invoke import AgentResult
 
-    fake_gate = MagicMock()
+    fake_gate = make_gate_mock()
     config = _make_judge_config(
         judge_llm_provider='claude_cli',
         judge_llm_model='claude-sonnet-4-5',
@@ -917,7 +918,7 @@ async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_runtime_err
     """
     from shared.cli_invoke import AgentResult
 
-    fake_gate = MagicMock()
+    fake_gate = make_gate_mock()
     config = _make_judge_config(
         judge_llm_provider='claude_cli',
         judge_llm_model='claude-sonnet-4-5',

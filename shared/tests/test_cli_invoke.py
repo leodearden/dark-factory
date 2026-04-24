@@ -26,6 +26,7 @@ from shared.cli_invoke import (
     invoke_claude_agent,
     invoke_with_cap_retry,
 )
+from shared.testing import make_gate_mock
 
 
 class TestToTokenCount:
@@ -83,12 +84,11 @@ class TestAccountNameThreading:
 
     async def test_account_name_set_from_usage_gate(self):
         """account_name is stamped from usage_gate.active_account_name on success."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate.active_account_name = 'acct-a'
-        gate.on_agent_complete = MagicMock()
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(return_value='token-a'),
+            active_account_name='acct-a',
+        )
 
         result = _make_result()
 
@@ -103,12 +103,11 @@ class TestAccountNameThreading:
 
     async def test_account_name_none_coerced_to_empty(self):
         """When active_account_name is None, result.account_name is ''."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate.active_account_name = None
-        gate.on_agent_complete = MagicMock()
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(return_value='token-a'),
+            active_account_name=None,
+        )
 
         result = _make_result()
 
@@ -125,16 +124,16 @@ class TestAccountNameThreading:
         """After cap hit + failover, account_name reflects the retry account."""
         from unittest.mock import PropertyMock
 
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-        gate.detect_cap_hit = MagicMock(side_effect=[True, False])
-        # active_account_name is read 3 times:
-        #   loop 1 capture, loop 1 logging (cap hit), loop 2 capture
-        type(gate).active_account_name = PropertyMock(
-            side_effect=['acct-a', 'acct-b', 'acct-b'],
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['token-a', 'token-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
         )
-        gate.on_agent_complete = MagicMock()
+        # active_account_name is read on each loop iteration (slot
+        # __aenter__ captures it, and the cap-hit path logs it).
+        type(gate).active_account_name = PropertyMock(
+            side_effect=['acct-a', 'acct-b', 'acct-b', 'acct-b'],
+        )
 
         result = _make_result()
 
@@ -174,12 +173,12 @@ class TestCapHitBackoff:
 
     async def test_sleeps_before_retry_on_cap_hit(self):
         """invoke_with_cap_retry sleeps _CAP_HIT_COOLDOWN_SECS on cap hit."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-        gate.detect_cap_hit = MagicMock(side_effect=[True, False])
-        gate.active_account_name = 'acct-b'
-        gate.on_agent_complete = MagicMock()
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['token-a', 'token-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
 
         result = _make_result()
 
@@ -200,11 +199,10 @@ class TestCapHitBackoff:
 
     async def test_no_sleep_when_no_cap_hit(self):
         """No sleep when invocation succeeds on first try."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate.on_agent_complete = MagicMock()
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(return_value='token-a'),
+        )
 
         result = _make_result()
 
@@ -224,14 +222,14 @@ class TestCapHitBackoff:
 
     async def test_multiple_cap_hits_within_first_cycle_use_base_cooldown(self):
         """Cap hits within the first cycle through accounts use base cooldown."""
-        gate = MagicMock()
-        gate.account_count = 3  # 3 accounts → first 3 hits are cycle 0
-        gate.before_invoke = AsyncMock(
-            side_effect=['token-a', 'token-b', 'token-c'],
+        gate = make_gate_mock(
+            account_count=3,  # 3 accounts → first 3 hits are cycle 0
+            before_invoke=AsyncMock(
+                side_effect=['token-a', 'token-b', 'token-c'],
+            ),
+            detect_cap_hit=MagicMock(side_effect=[True, True, False]),
+            active_account_name='next-acct',
         )
-        gate.detect_cap_hit = MagicMock(side_effect=[True, True, False])
-        gate.active_account_name = 'next-acct'
-        gate.on_agent_complete = MagicMock()
 
         result = _make_result()
 
@@ -252,15 +250,15 @@ class TestCapHitBackoff:
 
     async def test_backoff_escalates_after_full_account_cycle(self):
         """Cooldown doubles after cycling through all accounts once."""
-        gate = MagicMock()
-        gate.account_count = 2  # 2 accounts → cycle boundary at hit 2
-        gate.before_invoke = AsyncMock(
-            side_effect=['token-a', 'token-b', 'token-a', 'token-b'],
+        gate = make_gate_mock(
+            account_count=2,  # 2 accounts → cycle boundary at hit 2
+            before_invoke=AsyncMock(
+                side_effect=['token-a', 'token-b', 'token-a', 'token-b'],
+            ),
+            # 3 cap hits then success: hits 1-2 are cycle 0 (5s), hit 3 is cycle 1 (10s)
+            detect_cap_hit=MagicMock(side_effect=[True, True, True, False]),
+            active_account_name='next-acct',
         )
-        # 3 cap hits then success: hits 1-2 are cycle 0 (5s), hit 3 is cycle 1 (10s)
-        gate.detect_cap_hit = MagicMock(side_effect=[True, True, True, False])
-        gate.active_account_name = 'next-acct'
-        gate.on_agent_complete = MagicMock()
 
         result = _make_result()
 
@@ -282,18 +280,18 @@ class TestCapHitBackoff:
 
     async def test_backoff_caps_at_max(self):
         """Cooldown never exceeds _MAX_CAP_COOLDOWN_SECS."""
-        gate = MagicMock()
-        gate.account_count = 1  # 1 account → every hit starts a new cycle
         # Need enough hits to exceed max: 5 * 2^6 = 320 > 300
         num_hits = 8
-        gate.before_invoke = AsyncMock(
-            side_effect=['token-a'] * (num_hits + 1),
+        gate = make_gate_mock(
+            account_count=1,  # 1 account → every hit starts a new cycle
+            before_invoke=AsyncMock(
+                side_effect=['token-a'] * (num_hits + 1),
+            ),
+            detect_cap_hit=MagicMock(
+                side_effect=[True] * num_hits + [False],
+            ),
+            active_account_name='acct-a',
         )
-        gate.detect_cap_hit = MagicMock(
-            side_effect=[True] * num_hits + [False],
-        )
-        gate.active_account_name = 'acct-a'
-        gate.on_agent_complete = MagicMock()
 
         result = _make_result()
 
@@ -319,12 +317,11 @@ class TestInvokeWithCapRetryCostStore:
 
     async def test_save_invocation_called_on_success(self):
         """save_invocation is awaited with correct args after successful invoke."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate.active_account_name = 'acct-a'
-        gate.on_agent_complete = MagicMock()
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(return_value='token-a'),
+            active_account_name='acct-a',
+        )
 
         cost_store = MagicMock()
         cost_store.save_invocation = AsyncMock()
@@ -367,12 +364,12 @@ class TestInvokeWithCapRetryCostStore:
 
     async def test_save_account_event_on_cap_hit(self):
         """save_account_event is awaited with cap_hit on cap detection."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-        gate.detect_cap_hit = MagicMock(side_effect=[True, False])
-        gate.active_account_name = 'acct-b'
-        gate.on_agent_complete = MagicMock()
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['token-a', 'token-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
 
         cost_store = MagicMock()
         cost_store.save_invocation = AsyncMock()
@@ -403,12 +400,11 @@ class TestInvokeWithCapRetryCostStore:
 
     async def test_no_error_when_cost_store_none(self):
         """No CostStore-related errors when cost_store=None (default)."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate.active_account_name = 'acct-a'
-        gate.on_agent_complete = MagicMock()
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(return_value='token-a'),
+            active_account_name='acct-a',
+        )
 
         result = _make_result()
 
@@ -423,12 +419,11 @@ class TestInvokeWithCapRetryCostStore:
 
     async def test_save_invocation_error_swallowed(self, caplog):
         """save_invocation failure is logged but does not break the return."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(return_value='token-a')
-        gate.detect_cap_hit = MagicMock(return_value=False)
-        gate.active_account_name = 'acct-a'
-        gate.on_agent_complete = MagicMock()
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(return_value='token-a'),
+            active_account_name='acct-a',
+        )
 
         cost_store = MagicMock()
         cost_store.save_invocation = AsyncMock(side_effect=RuntimeError('db error'))
@@ -450,12 +445,12 @@ class TestInvokeWithCapRetryCostStore:
 
     async def test_save_account_event_error_swallowed(self, caplog):
         """save_account_event failure is logged but retry still happens."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-        gate.detect_cap_hit = MagicMock(side_effect=[True, False])
-        gate.active_account_name = 'acct-b'
-        gate.on_agent_complete = MagicMock()
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['token-a', 'token-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
 
         cost_store = MagicMock()
         cost_store.save_invocation = AsyncMock()
@@ -485,12 +480,12 @@ class TestInvokeWithCapRetryCostStore:
 
     async def test_capped_false_on_successful_invocation(self):
         """capped=False on save_invocation even after prior cap hits."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-        gate.detect_cap_hit = MagicMock(side_effect=[True, False])
-        gate.active_account_name = 'acct-b'
-        gate.on_agent_complete = MagicMock()
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['token-a', 'token-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
 
         cost_store = MagicMock()
         cost_store.save_invocation = AsyncMock()
@@ -520,12 +515,12 @@ class TestCapHitResume:
 
     async def test_resume_session_id_passed_on_cap_hit(self):
         """Cap hit with session_id in result → second invoke uses --resume."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-        gate.detect_cap_hit = MagicMock(side_effect=[True, False])
-        gate.active_account_name = 'acct-b'
-        gate.on_agent_complete = MagicMock()
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['token-a', 'token-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
 
         capped_result = _make_result(session_id='sess-123')
         ok_result = _make_result()
@@ -548,12 +543,12 @@ class TestCapHitResume:
 
     async def test_fresh_start_when_no_session_id(self):
         """Cap hit with empty session_id → second invoke uses original prompt."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b'])
-        gate.detect_cap_hit = MagicMock(side_effect=[True, False])
-        gate.active_account_name = 'acct-b'
-        gate.on_agent_complete = MagicMock()
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['token-a', 'token-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
 
         capped_result = _make_result(session_id='')
         ok_result = _make_result()
@@ -575,12 +570,12 @@ class TestCapHitResume:
 
     async def test_resume_failure_falls_back_to_fresh(self):
         """Resume returns success=False (not cap hit) → retry with original prompt."""
-        gate = MagicMock()
-        gate.account_count = 2
-        gate.before_invoke = AsyncMock(side_effect=['token-a', 'token-b', 'token-a'])
-        gate.detect_cap_hit = MagicMock(side_effect=[True, False, False])
-        gate.active_account_name = 'acct-b'
-        gate.on_agent_complete = MagicMock()
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['token-a', 'token-b', 'token-a']),
+            detect_cap_hit=MagicMock(side_effect=[True, False, False]),
+            active_account_name='acct-b',
+        )
 
         capped_result = _make_result(session_id='sess-123')
         failed_resume = _make_result(success=False, output='resume error')
@@ -608,13 +603,13 @@ class TestCapHitResume:
 
     async def test_original_prompt_preserved_across_multiple_retries(self):
         """Multiple cap hits → fallback always uses original prompt, never mutated."""
-        gate = MagicMock()
-        gate.account_count = 3
-        gate.before_invoke = AsyncMock(side_effect=['t-a', 't-b', 't-c'])
-        # Two cap hits (with session), then success
-        gate.detect_cap_hit = MagicMock(side_effect=[True, True, False])
-        gate.active_account_name = 'next'
-        gate.on_agent_complete = MagicMock()
+        gate = make_gate_mock(
+            account_count=3,
+            before_invoke=AsyncMock(side_effect=['t-a', 't-b', 't-c']),
+            # Two cap hits (with session), then success
+            detect_cap_hit=MagicMock(side_effect=[True, True, False]),
+            active_account_name='next',
+        )
 
         r1 = _make_result(session_id='sess-1')
         r2 = _make_result(session_id='sess-2')
@@ -1436,23 +1431,21 @@ def _make_gate(
     handle_cap_detected: bool = False,
     active_account_name: str = 'acct-a',
 ) -> MagicMock:
-    """Factory for a MagicMock gate used in TestHeuristicCapGating.
+    """Factory for a gate mock used in TestHeuristicCapGating.
 
-    Exposes the four attributes that vary across the six test cases; the three
-    constant attributes (detect_cap_hit, confirm_account_ok, on_agent_complete)
-    are set unconditionally.
+    Layers the heuristic-specific ``_handle_cap_detected`` attribute onto the
+    canonical ``make_gate_mock()`` so the heuristic cap path can be exercised.
     """
-    gate = MagicMock()
-    gate.account_count = account_count
     if isinstance(before_invoke_tokens, list):
-        gate.before_invoke = AsyncMock(side_effect=before_invoke_tokens)
+        before_invoke = AsyncMock(side_effect=before_invoke_tokens)
     else:
-        gate.before_invoke = AsyncMock(return_value=before_invoke_tokens)
-    gate.detect_cap_hit = MagicMock(return_value=False)
+        before_invoke = AsyncMock(return_value=before_invoke_tokens)
+    gate = make_gate_mock(
+        account_count=account_count,
+        before_invoke=before_invoke,
+        active_account_name=active_account_name,
+    )
     gate._handle_cap_detected = MagicMock(return_value=handle_cap_detected)
-    gate.confirm_account_ok = MagicMock()
-    gate.active_account_name = active_account_name
-    gate.on_agent_complete = MagicMock()
     return gate
 
 

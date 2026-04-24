@@ -20,6 +20,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=7.1.0",
+    "pytest-timeout>=2.4.0",
     "ruff>=0.4",
     "aiohttp>=3.9",
 ]
@@ -28,6 +29,14 @@ dev = [
 markers = ["integration: live CLI tests requiring OAuth accounts (deselect: -m 'not integration')"]
 addopts = "-m 'not integration'"
 asyncio_mode = "auto"
+# Default per-test timeout. Catches accidental asyncio-sleep hangs (e.g. a
+# misconfigured UsageGate mock whose slot.detect_cap_hit returns a truthy
+# MagicMock, sending invoke_with_cap_retry through 19 real exponential-
+# backoff sleeps). Slow tests can opt out with @pytest.mark.timeout(N).
+# signal method is load-bearing: thread method prints a stack trace but
+# can't actually interrupt a blocking asyncio.sleep in the main thread.
+timeout = 60
+timeout_method = "signal"
 
 [tool.ruff]
 line-length = 100

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
+from shared.testing import make_gate_mock
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.reconciliation.agent_loop import (
@@ -1061,7 +1062,7 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
 
     from fused_memory.reconciliation.agent_loop import CLAUDE_CLI_RESPONSE_SCHEMA
 
-    fake_gate = MagicMock()
+    fake_gate = make_gate_mock()
     config = _make_cli_config()
     tools = [{'name': 'read_file', 'description': 'read', 'input_schema': {}}]
 
@@ -1134,7 +1135,7 @@ async def test_call_claude_cli_threads_session_id_across_turns():
     """
     from shared.cli_invoke import AgentResult
 
-    fake_gate = MagicMock()
+    fake_gate = make_gate_mock()
     config = _make_cli_config()
     tools: list = []
     structured = {'thinking': '', 'tool_calls': []}
@@ -1190,7 +1191,7 @@ async def test_call_claude_cli_clears_session_id_on_exception(raised_exc):
     raises must leave agent._cli_session_id as None — not the stale 'sess-A' — so
     that a retry attempt doesn't --resume an abandoned session.
     """
-    fake_gate = MagicMock()
+    fake_gate = make_gate_mock()
     config = _make_cli_config()
     tools: list = []
     structured = {'thinking': '', 'tool_calls': []}
@@ -1280,7 +1281,7 @@ async def test_run_threads_serialized_tool_results_into_claude_cli_prompt():
     """
     from shared.cli_invoke import AgentResult
 
-    fake_gate = MagicMock()
+    fake_gate = make_gate_mock()
     config = _make_cli_config()
 
     async def my_tool_fn(x: int = 0):
@@ -1376,7 +1377,7 @@ async def test_run_threads_parallel_tool_results_with_double_newline_joiner():
     """
     from shared.cli_invoke import AgentResult
 
-    fake_gate = MagicMock()
+    fake_gate = make_gate_mock()
     config = _make_cli_config()
 
     async def my_tool_fn(x: int = 0):
@@ -1488,7 +1489,7 @@ async def test_call_claude_cli_failure_surfaces_stderr_and_summary_in_runtime_er
     """
     from shared.cli_invoke import AgentResult
 
-    fake_gate = MagicMock()
+    fake_gate = make_gate_mock()
     config = _make_cli_config()
 
     failing_result = AgentResult(
