@@ -20,11 +20,25 @@ def sha256_16(data: str) -> str:
 
     Canonical shape contract: every 16-char sha256-hex token in this module
     (``suggestion_hash``, ``_combine_suggestion_hashes``) is produced through
-    this helper.  The ``cleanup_needed`` R4 snippet in
-    ``skills/escalation-watcher/SKILL.md`` uses an equivalent inline
-    ``hashlib.sha256(payload.encode()).hexdigest()[:16]`` expression (stdlib-only,
-    so the skill works without the orchestrator package installed); any change to
-    the length or algorithm here must be mirrored there.
+    this helper.  Three additional sites in
+    ``fused_memory/src/fused_memory/middleware/task_curator.py`` use equivalent
+    inline ``hashlib.sha256(...).hexdigest()[:16]`` expressions and share the
+    same shape contract (stdlib-only — ``fused-memory`` does not depend on
+    ``orchestrator``, so routing through this helper is not possible without
+    adding a new workspace dependency edge):
+
+    * ``CandidateTask.payload_hash()`` (~line 187) — curator decision-cache key;
+      combine-on-combine drift guard.
+    * ``TaskCurator._intra_batch_key()`` (~line 532) — intra-batch dedup for
+      bulk-created subtasks from ``expand_task`` / ``parse_prd``.
+    * ``TaskCurator._normalize_key()`` (~line 549) — R3 pre-LLM short-circuit
+      for raced-reviewer dedupe.
+
+    The ``cleanup_needed`` R4 snippet in ``skills/escalation-watcher/SKILL.md``
+    also uses an equivalent inline expression for the same stdlib-only reason.
+
+    Any change to the length or algorithm here must be mirrored at all mirror
+    sites listed above.
 
     :raises ValueError: if *data* is empty — callers must ensure a non-empty
         payload (e.g. via a ``detail or summary or id`` fallback chain) before
