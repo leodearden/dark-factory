@@ -1812,3 +1812,54 @@ class TestLoadEscalationsIncludesArchive:
             f'Archive-only multi-date duplicate must be deduplicated to exactly 1 entry; '
             f'got {len(matching)}: {matching}'
         )
+
+
+class TestLoadEscalationsLogsWarningOnCorruptFile:
+    """_load_escalations emits a WARNING for corrupt files and still loads valid siblings."""
+
+    def test_corrupt_json_emits_warning_and_continues(self, tmp_path, caplog):
+        """Corrupt esc-*.json emits WARNING; valid sibling is still returned.
+
+        Asserts:
+        (a) _load_escalations returns without raising.
+        (b) The valid file's dict appears in the returned list.
+        (c) At least one WARNING record on 'dashboard.data.performance' whose
+            formatted message contains the bad file's name and the failure wording.
+        """
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+
+        # Valid escalation file
+        valid_esc = {
+            'id': 'esc-ok-1',
+            'task_id': '1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'A valid escalation',
+        }
+        (esc_dir / 'esc-ok-1.json').write_text(json.dumps(valid_esc))
+
+        # Corrupt file — invalid JSON
+        (esc_dir / 'esc-bad-1.json').write_text('{ not-valid-json')
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.performance'):
+            result = _load_escalations(esc_dir)  # (a) must not raise
+
+        # (b) Good file still loaded
+        loaded_ids = [d.get('id') for d in result]
+        assert 'esc-ok-1' in loaded_ids, (
+            f'Valid escalation must survive a corrupt sibling; loaded ids: {loaded_ids}'
+        )
+
+        # (c) A WARNING record mentions the bad file and failure wording
+        warning_texts = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any(
+            'esc-bad-1.json' in t and 'Failed to load escalation' in t
+            for t in warning_texts
+        ), (
+            f'Expected WARNING mentioning esc-bad-1.json and "Failed to load escalation"; '
+            f'got: {warning_texts}'
+        )
