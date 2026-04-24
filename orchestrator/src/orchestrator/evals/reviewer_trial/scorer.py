@@ -113,13 +113,16 @@ async def match_issues(
     ground_truth: list[GroundTruthIssue],
     diff_text: str,
     confidence_threshold: float = 0.5,
-) -> tuple[list[IssueMatch], list[dict]]:
+) -> tuple[list[IssueMatch], list[dict], float]:
     """Use haiku to match reviewer findings to ground truth.
 
-    Returns (matches, unmatched_reviewer_issues).
+    Returns (matches, unmatched_reviewer_issues, match_cost_usd).
+    The third element is the USD cost of the haiku matcher call, or 0.0 if
+    no LLM call was made (empty inputs).  The cost is still reported even
+    when the output is unparseable — the tokens were billed regardless.
     """
     if not reviewer_issues or not ground_truth:
-        return [], reviewer_issues
+        return [], reviewer_issues, 0.0
 
     # Format issues for the matcher prompt
     ri_lines = []
@@ -191,6 +194,8 @@ Output your matches as JSON.
         allowed_tools=[],  # no tools needed — all context is in the prompt
     )
 
+    match_cost = result.cost_usd
+
     # Parse matches
     matches: list[IssueMatch] = []
     matched_indices: set[int] = set()
@@ -203,7 +208,7 @@ Output your matches as JSON.
             match_data = json.loads(result.output)
         except (json.JSONDecodeError, TypeError):
             logger.warning('Issue matcher produced unparseable output: %s', result.output[:200])
-            return [], reviewer_issues
+            return [], reviewer_issues, match_cost
 
     gt_ids = {gt.id for gt in ground_truth}
     matched_gt_ids: set[str] = set()
@@ -238,7 +243,7 @@ Output your matches as JSON.
         if i not in matched_indices
     ]
 
-    return matches, unmatched
+    return matches, unmatched, match_cost
 
 
 async def score_panel_run(
@@ -262,7 +267,7 @@ async def score_panel_run(
     deduped = _deduplicate_issues(clean_reviews)
 
     # Match against ground truth
-    matches, false_positives = await match_issues(
+    matches, false_positives, _match_cost_usd = await match_issues(
         reviewer_issues=deduped,
         ground_truth=corpus_diff.ground_truth,
         diff_text=corpus_diff.diff_text,
