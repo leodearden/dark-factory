@@ -428,12 +428,8 @@ class TaskWorkflow:
             # memory); this guard falls through to the SUCCESS path which
             # writes completion memory.  The two guards cover complementary
             # failure modes — do not collapse them.
-            wt_head = await self._get_head_commit()
-            current_main = await self.git_ops.get_main_sha()
-            already_on_main = (
-                wt_head == current_main
-                or await self.git_ops.is_ancestor(wt_head, current_main)
-            )
+            _branch_check = await self._check_branch_on_main()
+            already_on_main = _branch_check is not None
             if already_on_main and not self._worktree_external:
                 # Guard: a stale branch point (requeued task that was planned
                 # but never implemented, or a freshly-created worktree) also
@@ -448,6 +444,8 @@ class TaskWorkflow:
                 # the branch has real work and we should skip to DONE.  Passing
                 # wt_head would cause the SHA-primary check to return has_work=False
                 # on any rebased branch, silently discarding completed work.
+                assert _branch_check is not None  # narrowing: already_on_main is True
+                wt_head, _ = _branch_check
                 has_work = (
                     self._has_prior_implementation().has_work
                     or await self.git_ops.has_uncommitted_work(self.worktree)
@@ -2372,6 +2370,37 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         stdout, _ = await proc.communicate()
         return stdout.decode().strip()
 
+    async def _check_branch_on_main(self) -> tuple[str, str] | None:
+        """Probe whether the worktree HEAD is reachable from main.
+
+        Returns ``(wt_head, main_sha)`` when ``git merge-base --is-ancestor
+        wt_head main_sha`` succeeds (i.e. the branch has been merged to main
+        or the HEAD is exactly main).  Returns ``None`` in three cases:
+
+        1. ``self.worktree`` or ``self.git_ops`` is None — partially-wired
+           workflow; callers that reach this state should treat the branch as
+           not-on-main.
+        2. HEAD is not an ancestor of main — branch has unmerged commits.
+        3. Any of the above when combined with the caller's own guard logic.
+
+        Does NOT catch subprocess or git exceptions — callers wrap as needed.
+        ``_recover_if_already_merged`` wraps the call in ``try/except`` and
+        logs ``'merge-check failed'`` before returning None; the pre-EXECUTE
+        ghost-loop guard in ``workflow.run()`` lets exceptions propagate.  The
+        divergent downstream logic at each call site is intentional — do not
+        collapse them.
+
+        See also: ``_recover_if_already_merged`` (pre-PLAN guard) and the
+        ghost-loop guard around ``workflow.py:431`` (pre-EXECUTE guard).
+        """
+        if self.worktree is None or self.git_ops is None:
+            return None
+        wt_head = await self._get_head_commit()
+        main_sha = await self.git_ops.get_main_sha()
+        if await self.git_ops.is_ancestor(wt_head, main_sha):
+            return (wt_head, main_sha)
+        return None
+
     def _has_prior_implementation(self, wt_head: str | None = None) -> _PriorImplStatus:
         """Check whether a prior run did any implementation in this worktree.
 
@@ -2442,6 +2471,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         there is prior implementation work.  Returns None in all other cases
         (branch not merged, no prior work, missing worktree/git_ops, exceptions).
         """
+        # Intentional double-check: _check_branch_on_main() has its own
+        # None-guard and would return None silently, but this outer check lets
+        # us emit the 'skipping merge-recovery' DEBUG log so the missing-wiring
+        # condition is observable at the call-site level.
         if self.worktree is None or self.git_ops is None:
             logger.debug(
                 'Task %s: skipping merge-recovery (no worktree or git_ops)',
@@ -2450,18 +2483,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return None
 
         # ── Git layer ─────────────────────────────────────
-        # Subprocess calls that can fail for git/infra reasons
-        # (e.g. corrupted index, network mount offline).
+        # Delegates to _check_branch_on_main() which can fail for git/infra
+        # reasons (e.g. corrupted index, network mount offline).
         # Returns (wt_head, main_sha) when the branch is on main, else None.
-        _git_check: tuple[str, str] | None = None
         try:
-            _, _wt_head_raw, _ = await _run(
-                ['git', 'rev-parse', 'HEAD'],
-                cwd=self.worktree,
-            )
-            _main_sha = await self.git_ops.get_main_sha()
-            if await self.git_ops.is_ancestor(_wt_head_raw.strip(), _main_sha):
-                _git_check = (_wt_head_raw.strip(), _main_sha)
+            _git_check = await self._check_branch_on_main()
         except Exception:
             logger.warning(
                 'Task %s: merge-check failed, proceeding with requeue',

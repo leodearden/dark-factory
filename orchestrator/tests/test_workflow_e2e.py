@@ -2474,6 +2474,175 @@ class TestMarkBlockedFalseDoneGuard:
 
 
 # ---------------------------------------------------------------------------
+# Tests: _check_branch_on_main helper unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCheckBranchOnMain:
+    """Unit tests for TaskWorkflow._check_branch_on_main().
+
+    Each test exercises the helper directly without a full workflow.run() cycle.
+    The helper returns (wt_head, main_sha) when the branch is merged to main,
+    else None.
+    """
+
+    async def test_returns_tuple_for_merged_branch(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Happy path: merged branch returns (wt_head, main_sha) tuple.
+
+        Create a worktree, commit a real file, merge to main, advance main,
+        then call _check_branch_on_main() directly.  Asserts a non-None tuple
+        is returned where both elements are 40-char SHAs, wt_head matches the
+        worktree's git rev-parse HEAD, and main_sha matches git_ops.get_main_sha().
+
+        Fails on unmodified code with AttributeError
+        ('TaskWorkflow object has no attribute _check_branch_on_main').
+        """
+        # 1. Create worktree and make a real implementation commit
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        (wt / 'cbom_impl.py').write_text('def impl():\n    return 1\n')
+        await git_ops.commit(wt, 'Implement feature (test_returns_tuple_for_merged_branch)')
+
+        # 2. Merge to main, advance main, cleanup merge worktree
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # 3. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 4. Call _check_branch_on_main directly
+        result_tuple = await workflow._check_branch_on_main()
+
+        # 5. Assertions
+        assert result_tuple is not None, (
+            '_check_branch_on_main() must return a tuple for a merged branch'
+        )
+        wt_head, main_sha = result_tuple
+        assert len(wt_head) >= 40, f'wt_head must be a ≥40-char SHA, got: {wt_head!r}'
+        assert len(main_sha) >= 40, f'main_sha must be a ≥40-char SHA, got: {main_sha!r}'
+
+        # wt_head must match the actual worktree HEAD
+        _, actual_wt_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert wt_head == actual_wt_head_raw.strip(), (
+            f'wt_head {wt_head!r} must match actual HEAD {actual_wt_head_raw.strip()!r}'
+        )
+        # main_sha must match git_ops.get_main_sha()
+        expected_main = await git_ops.get_main_sha()
+        assert main_sha == expected_main, (
+            f'main_sha {main_sha!r} must match git_ops.get_main_sha() {expected_main!r}'
+        )
+
+    async def test_returns_none_for_unmerged_branch(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Branch with real commit but NOT merged to main must return None.
+
+        Create a worktree, write and commit a file, but do NOT merge to main.
+        is_ancestor(wt_head, main_sha) returns False, so _check_branch_on_main()
+        must return None.
+
+        Fails on the step-2 minimal impl which returns (wt_head, main_sha)
+        unconditionally without the ancestor check.
+        """
+        # 1. Create worktree and make a real implementation commit (no merge)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        (wt / 'unmerged_impl.py').write_text('def impl():\n    return 99\n')
+        await git_ops.commit(wt, 'Implement feature (unmerged)')
+
+        # 2. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. Call _check_branch_on_main directly
+        result = await workflow._check_branch_on_main()
+
+        # 4. Assert: unmerged branch must return None
+        assert result is None, (
+            f'unmerged branch must return None; is_ancestor=False guard missing, got {result!r}'
+        )
+
+    async def test_returns_none_when_worktree_missing(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """workflow.worktree = None must short-circuit before any git call.
+
+        Build workflow but explicitly set workflow.worktree = None.  The helper
+        must return None immediately without attempting git subprocess calls.
+
+        Fails on the step-4 impl which calls self._get_head_commit() first,
+        crashing when self.worktree is None (passes cwd=str(None) to subprocess).
+        """
+        # 1. Build workflow without wiring up a real worktree
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        # Explicitly clear the worktree to trigger the None-guard
+        workflow.worktree = None
+
+        # 2. Call _check_branch_on_main — must return None without crashing
+        result = await workflow._check_branch_on_main()
+
+        # 3. Assert
+        assert result is None, (
+            f'None worktree must short-circuit before any git call; got {result!r}'
+        )
+
+    async def test_propagates_git_exceptions(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch
+    ):
+        """git/infra exceptions must propagate — helper must NOT swallow them.
+
+        Patches git_ops.is_ancestor to raise RuntimeError and asserts the
+        exception bubbles out of _check_branch_on_main().  This pins the
+        design decision that the helper is exception-transparent so that:
+        - _recover_if_already_merged's outer try/except can log 'merge-check failed'
+        - the pre-EXECUTE ghost-loop guard can let exceptions propagate to the
+          workflow's outer error handler
+
+        If a future maintainer adds try/except inside _check_branch_on_main, this
+        test will fail, surfacing the silent-swallow regression before it ships.
+        """
+        # 1. Create a real worktree so the None-guard passes and we reach is_ancestor
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Build workflow and wire up worktree
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. Patch is_ancestor to simulate a git/infra failure
+        async def _raise(*_args, **_kwargs):
+            raise RuntimeError('simulated git failure in is_ancestor')
+
+        monkeypatch.setattr(workflow.git_ops, 'is_ancestor', _raise)
+
+        # 4. Assert the exception propagates — helper must NOT catch it
+        with pytest.raises(RuntimeError, match='simulated git failure in is_ancestor'):
+            await workflow._check_branch_on_main()
+
+
+# ---------------------------------------------------------------------------
 # Tests: _recover_if_already_merged unit tests
 # ---------------------------------------------------------------------------
 
