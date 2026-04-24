@@ -32,6 +32,7 @@ import json
 import logging
 import time
 import uuid as uuid_mod
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -592,9 +593,6 @@ class TaskCurator:
                 task = await self._taskmaster.get_task(cached_id, project_root)
             except Exception:
                 task = None
-            data = task.get('data') if isinstance(task, dict) else None
-            if isinstance(data, dict):
-                task = data
             status = (
                 str(task.get('status', '')) if isinstance(task, dict) else ''
             )
@@ -1561,8 +1559,8 @@ def _to_pool_entry(
     )
 
 
-def flatten_task_tree(tasks_result: dict) -> list[dict]:
-    """Walk a get_tasks response and return a flat list of task dicts."""
+def flatten_task_tree(tasks_result: Mapping[str, Any]) -> list[dict]:
+    """Walk a get_tasks DTO and return a flat list of task dicts."""
     out: list[dict] = []
 
     def _walk(items: Any) -> None:
@@ -1573,12 +1571,7 @@ def flatten_task_tree(tasks_result: dict) -> list[dict]:
                 out.append(t)
                 _walk(t.get('subtasks') or [])
 
-    # Taskmaster get_tasks shapes vary; try common keys.
-    if isinstance(tasks_result, dict):
-        _walk(tasks_result.get('tasks'))
-        data = tasks_result.get('data')
-        if isinstance(data, dict):
-            _walk(data.get('tasks'))
+    _walk(tasks_result.get('tasks'))
     return out
 
 

@@ -113,10 +113,6 @@ class TestFlattenTaskTree:
         }
         assert [t['id'] for t in flatten_task_tree(tasks)] == ['1', '1.1', '1.2', '2']
 
-    def test_data_wrapper(self):
-        tasks = {'data': {'tasks': [{'id': '1'}]}}
-        assert [t['id'] for t in flatten_task_tree(tasks)] == ['1']
-
     def test_empty(self):
         assert flatten_task_tree({}) == []
 

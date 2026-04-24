@@ -23,7 +23,6 @@ from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.backends.taskmaster_types import TaskmasterError
 from fused_memory.config.schema import TaskmasterConfig
 
-
 # ── fixtures ────────────────────────────────────────────────────────
 
 

@@ -56,7 +56,7 @@ def _unwrap(method_name: str, raw: Any) -> dict:
         message = first_line[len('Error:'):].strip() or 'taskmaster tool error'
         raise TaskmasterError('TASKMASTER_TOOL_ERROR', message, raw=raw)
     data = raw.get('data')
-    if not isinstance(data, (dict, list)):
+    if not isinstance(data, dict):
         raise TaskmasterError(
             'UNEXPECTED_RESPONSE_SHAPE',
             f"{method_name}: missing 'data' in envelope",

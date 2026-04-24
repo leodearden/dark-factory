@@ -145,15 +145,12 @@ async def _classify(
         return not keep_unverified
 
     try:
-        task_raw = await taskmaster.get_task(candidate.task_id, project_root)
+        task = await taskmaster.get_task(candidate.task_id, project_root)
     except Exception as e:
         candidate.reason = f'task_lookup_failed: {type(e).__name__}: {e}'
         return not keep_unverified
 
-    inner = task_raw
-    if isinstance(task_raw, dict) and 'data' in task_raw and isinstance(task_raw['data'], dict):
-        inner = task_raw['data']
-    metadata = inner.get('metadata') if isinstance(inner, dict) else None
+    metadata = task.get('metadata') if isinstance(task, dict) else None
     prov = metadata.get('done_provenance') if isinstance(metadata, dict) else None
 
     if not isinstance(prov, dict):
