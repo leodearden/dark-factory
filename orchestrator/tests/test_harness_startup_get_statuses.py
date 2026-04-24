@@ -76,10 +76,8 @@ def startup_harness(tmp_path: Path) -> Harness:
     h.scheduler.get_tasks = AsyncMock(return_value=[
         {'id': '99', 'status': 'pending'},
     ])
-    h.scheduler.get_statuses = AsyncMock(return_value={})
+    h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()
-    # Default: no cached transport error (tests that need one set it explicitly).
-    h.scheduler.last_get_statuses_error = None
     # Raise on acquire_next to stop the scheduler loop after startup.
     h.scheduler.acquire_next = AsyncMock(side_effect=RuntimeError('stop'))
 
@@ -106,7 +104,7 @@ async def test_startup_noprd_uses_get_statuses_to_check_pending(
     # Pre-migration: get_tasks returns [] → any(...) is False → RuntimeError.
     # Post-migration: get_statuses returns {} → 'pending' not in values → RuntimeError.
     get_tasks_mock.return_value = []
-    get_statuses_mock.return_value = {}
+    get_statuses_mock.return_value = ({}, None)
 
     with pytest.raises(RuntimeError, match='No PRD given and no pending tasks found'):
         await h.run(prd_path=None)
@@ -134,11 +132,10 @@ async def test_startup_total_tasks_counted_via_get_statuses(
     get_tasks_mock = cast(AsyncMock, h.scheduler.get_tasks)
     get_statuses_mock = cast(AsyncMock, h.scheduler.get_statuses)
     # Three tasks: two pending, one done.
-    get_statuses_mock.return_value = {
-        '1': 'pending',
-        '2': 'done',
-        '3': 'pending',
-    }
+    get_statuses_mock.return_value = (
+        {'1': 'pending', '2': 'done', '3': 'pending'},
+        None,
+    )
 
     with pytest.raises(RuntimeError, match='stop'):
         await h.run(prd_path=None)
@@ -168,10 +165,10 @@ async def test_populate_prd_uses_get_statuses_for_pre_ids(
     h = startup_harness
     get_tasks_mock = cast(AsyncMock, h.scheduler.get_tasks)
     get_statuses_mock = cast(AsyncMock, h.scheduler.get_statuses)
-    get_statuses_mock.return_value = {
-        '10': 'done',
-        '20': 'pending',
-    }
+    get_statuses_mock.return_value = (
+        {'10': 'done', '20': 'pending'},
+        None,
+    )
 
     captured_pre_ids: set[str] | None = None
 
@@ -199,14 +196,14 @@ async def test_startup_noprd_transport_failure_raises_distinct_error(
 ):
     """No-PRD startup: a get_statuses transport failure raises a distinct error.
 
-    When get_statuses returns {} AND _last_get_statuses_error is set, Harness
-    must raise RuntimeError('Failed to reach fused-memory: …') chained from
-    the original exception — NOT the generic 'No PRD given' message.
+    When get_statuses returns ({}, OSError), Harness must raise
+    RuntimeError('Failed to reach fused-memory: …') chained from the original
+    exception — NOT the generic 'No PRD given' message.
     """
     h = startup_harness
-    # Simulate: get_statuses swallowed a transport error and cached it.
-    h.scheduler.get_statuses = AsyncMock(return_value={})
-    h.scheduler.last_get_statuses_error = OSError(2, 'No such file')  # type: ignore[misc]
+    # Simulate: get_statuses returns ({}, OSError) — transport failure in the tuple.
+    expected_err = OSError(2, 'No such file')
+    h.scheduler.get_statuses = AsyncMock(return_value=({}, expected_err))
 
     with pytest.raises(RuntimeError, match=r'[Ff]ailed to reach fused-memory') as excinfo:
         await h.run(prd_path=None)
@@ -214,13 +211,12 @@ async def test_startup_noprd_transport_failure_raises_distinct_error(
     msg = str(excinfo.value)
     # Error message must include the exception class name and the message.
     # Note: OSError(2, ...) raises as FileNotFoundError (errno 2 = ENOENT remapping).
-    cached_err = h.scheduler.last_get_statuses_error
-    expected_cls = type(cached_err).__name__
+    expected_cls = type(expected_err).__name__
     assert expected_cls in msg, f'Expected {expected_cls!r} class name in message: {msg}'
     assert 'No such file' in msg, f'Expected OSError message in error: {msg}'
 
     # Exception must be chained from the original OSError.
-    assert excinfo.value.__cause__ is cached_err
+    assert excinfo.value.__cause__ is expected_err
 
 
 @pytest.mark.asyncio
@@ -229,14 +225,12 @@ async def test_startup_noprd_empty_without_cached_error_raises_legitimate_error(
 ):
     """No-PRD startup: genuinely empty task tree still raises the original error.
 
-    When get_statuses returns {} AND _last_get_statuses_error is None (no
-    transport failure), the existing 'No PRD given and no pending tasks found'
-    RuntimeError is raised unchanged — regression protection for the
-    legitimately-empty path.
+    When get_statuses returns ({}, None) (no transport failure), the existing
+    'No PRD given and no pending tasks found' RuntimeError is raised unchanged
+    — regression protection for the legitimately-empty path.
     """
     h = startup_harness
-    h.scheduler.get_statuses = AsyncMock(return_value={})
-    h.scheduler._last_get_statuses_error = None
+    h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
 
     with pytest.raises(RuntimeError, match='No PRD given and no pending tasks found'):
         await h.run(prd_path=None)
