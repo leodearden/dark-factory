@@ -910,22 +910,29 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
     NOT wrapped in try/except — the OSError propagates rather than arming the
     backoff.
     """
-    mkdir_calls: list[int] = [0]
+    # Count only "outer" mkdir calls from _maybe_write_escalation, not
+    # recursive internal calls made by Path.mkdir(parents=True) when creating
+    # intermediate parent directories.  The outer call always passes
+    # parents=True to the escalation directory (path ends with 'escalations');
+    # recursive calls either target a parent directory or pass parents=False.
+    outer_mkdir_calls: list[int] = [0]
     write_text_calls: list[int] = [0]
     real_mkdir = Path.mkdir
     real_write_text = Path.write_text
 
-    def flaky_mkdir(self, *args, **kwargs):
-        mkdir_calls[0] += 1
-        if mkdir_calls[0] == 1:
-            raise OSError('simulated read-only mount')
+    def intercepting_mkdir(self, *args, **kwargs):
+        is_outer = kwargs.get('parents', False) and str(self).endswith('escalations')
+        if is_outer:
+            outer_mkdir_calls[0] += 1
+            if outer_mkdir_calls[0] == 1:
+                raise OSError('simulated read-only mount')
         return real_mkdir(self, *args, **kwargs)
 
     def tracking_write_text(self, data, *args, **kwargs):
         write_text_calls[0] += 1
         return real_write_text(self, data, *args, **kwargs)
 
-    monkeypatch.setattr(Path, 'mkdir', flaky_mkdir)
+    monkeypatch.setattr(Path, 'mkdir', intercepting_mkdir)
     monkeypatch.setattr(Path, 'write_text', tracking_write_text)
 
     clock = [1000.0]
@@ -955,8 +962,8 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
         )
     assert v is not None
     assert v.outcome == 'rejection', f'Phase 1: expected rejection, got {v.outcome}'
-    assert mkdir_calls[0] == 1, (
-        f'Phase 1: expected 1 mkdir call, got {mkdir_calls[0]}'
+    assert outer_mkdir_calls[0] == 1, (
+        f'Phase 1: expected 1 outer mkdir call, got {outer_mkdir_calls[0]}'
     )
     assert write_text_calls[0] == 0, (
         f'Phase 1: OSError from mkdir should short-circuit before write_text; '
@@ -975,9 +982,9 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
     assert v2.outcome == 'rejection', (
         f'Phase 2: expected rejection (backoff suppressed retry), got {v2.outcome}'
     )
-    assert mkdir_calls[0] == 1, (
+    assert outer_mkdir_calls[0] == 1, (
         f'Phase 2: backoff should have suppressed mkdir retry; '
-        f'mkdir call count is {mkdir_calls[0]}'
+        f'outer mkdir call count is {outer_mkdir_calls[0]}'
     )
     assert write_text_calls[0] == 0, (
         f'Phase 2: write_text should not be called during backoff; '
@@ -997,7 +1004,7 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
         )
         assert v.outcome == 'ok', f'Phase 3 ok reversal {i}: expected ok, got {v.outcome}'
 
-    # Trip again — mkdir 2nd time (succeeds), write_text 1st time (succeeds) → escalated.
+    # Trip again — outer mkdir called 2nd time (succeeds), write_text called once → escalated.
     clock[0] += 1.0
     v3 = await guard.observe_attempt(
         project_id='proj',
@@ -1006,8 +1013,8 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
         new_status='pending',
         project_root=str(tmp_path),
     )
-    assert mkdir_calls[0] == 2, (
-        f'Phase 3: expected 2 mkdir calls total, got {mkdir_calls[0]}'
+    assert outer_mkdir_calls[0] == 2, (
+        f'Phase 3: expected 2 outer mkdir calls total, got {outer_mkdir_calls[0]}'
     )
     assert write_text_calls[0] == 1, (
         f'Phase 3: expected 1 write_text call after backoff cleared, got {write_text_calls[0]}'

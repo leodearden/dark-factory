@@ -349,7 +349,16 @@ class BulkResetGuard:
             return None
 
         esc_dir = _esc_base
-        await asyncio.to_thread(esc_dir.mkdir, parents=True, exist_ok=True)
+        try:
+            await asyncio.to_thread(esc_dir.mkdir, parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.error(
+                'bulk_reset_guard: failed to create escalation dir %s: %s', esc_dir, exc,
+            )
+            async with self._lock:
+                state3 = self._state.setdefault(project_id, _GuardState())
+                state3.last_write_failure_ts = now
+            return None
 
         ts = datetime.fromtimestamp(now, tz=UTC).isoformat()
         safe_ts = ts.replace(':', '').replace('+', '').replace('.', '_')
