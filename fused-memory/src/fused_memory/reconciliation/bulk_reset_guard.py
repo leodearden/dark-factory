@@ -250,6 +250,21 @@ class BulkResetGuard:
             while state.entries and state.entries[0].ts < cutoff:
                 state.entries.popleft()
 
+            # 3a. Safe eviction: remove idle project state when entries is
+            # empty AND neither rate-limit timestamp has been set, preventing
+            # unbounded dict growth for high-cardinality project_id sets.
+            # Unlike the removed unconditional eviction (commit 7d7b3dd16a),
+            # this only fires when there is truly no state worth preserving
+            # (project was never escalated and never suffered a write failure).
+            if (
+                not state.entries
+                and state.last_escalation_ts == 0.0
+                and state.last_write_failure_ts == 0.0
+            ):
+                self._state.pop(project_id, None)
+                state = _GuardState()
+                self._state[project_id] = state
+
             # 4. Record this attempt (always, even if we will reject it).
             state.entries.append(_Entry(ts=now, task_id=task_id))
 
@@ -300,6 +315,16 @@ class BulkResetGuard:
     # Escalation write
     # ------------------------------------------------------------------
 
+    async def _record_write_failure(self, project_id: str, now: float) -> None:
+        """Record a write-failure timestamp for per-project backoff tracking.
+
+        Acquires the lock briefly so the update is visible to all concurrent
+        callers of ``_maybe_write_escalation``.
+        """
+        async with self._lock:
+            state = self._state.setdefault(project_id, _GuardState())
+            state.last_write_failure_ts = now
+
     async def _maybe_write_escalation(
         self,
         *,
@@ -317,6 +342,9 @@ class BulkResetGuard:
 
         async with self._lock:
             state = self._state.setdefault(project_id, _GuardState())
+            # NOTE: last_escalation_ts is updated AFTER a successful write (below)
+            # so that a disk failure does not silently suppress the next escalation
+            # for the full rate-limit period (900 s by default).
             if (now - state.last_escalation_ts) < self._rate_limit_seconds:
                 logger.info(
                     'bulk_reset_guard: rate-limited escalation for %s '
@@ -325,9 +353,11 @@ class BulkResetGuard:
                     now - state.last_escalation_ts,
                 )
                 return None
-            # NOTE: last_escalation_ts is updated AFTER a successful write (below)
-            # so that a disk failure does not silently suppress the next escalation
-            # for the full rate-limit period (900 s by default).
+            # Write-failure backoff: suppress I/O retries for
+            # write_failure_backoff_seconds after an OSError from mkdir or
+            # write_text.  last_write_failure_ts is set by _record_write_failure
+            # and is per-project so a flaky mount for one project does not
+            # block sibling projects.
             if (now - state.last_write_failure_ts) < self._write_failure_backoff_seconds:
                 logger.info(
                     'bulk_reset_guard: write-failure backoff active for %s '
@@ -355,9 +385,7 @@ class BulkResetGuard:
             logger.error(
                 'bulk_reset_guard: failed to create escalation dir %s: %s', esc_dir, exc,
             )
-            async with self._lock:
-                state3 = self._state.setdefault(project_id, _GuardState())
-                state3.last_write_failure_ts = now
+            await self._record_write_failure(project_id, now)
             return None
 
         ts = datetime.fromtimestamp(now, tz=UTC).isoformat()
@@ -417,9 +445,7 @@ class BulkResetGuard:
             logger.error(
                 'bulk_reset_guard: failed to write escalation %s: %s', path, exc,
             )
-            async with self._lock:
-                state3 = self._state.setdefault(project_id, _GuardState())
-                state3.last_write_failure_ts = now
+            await self._record_write_failure(project_id, now)
             return None
 
         # Only advance the rate-limit timestamp AFTER a successful write.

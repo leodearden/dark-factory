@@ -912,16 +912,17 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
     """
     # Count only "outer" mkdir calls from _maybe_write_escalation, not
     # recursive internal calls made by Path.mkdir(parents=True) when creating
-    # intermediate parent directories.  The outer call always passes
-    # parents=True to the escalation directory (path ends with 'escalations');
-    # recursive calls either target a parent directory or pass parents=False.
+    # intermediate parent directories.  Match by absolute path equality rather
+    # than suffix to avoid accidental matches from sibling fixtures or parent
+    # mkdir calls whose last segment happens to be 'escalations'.
+    expected_esc_dir = tmp_path / 'data' / 'escalations'
     outer_mkdir_calls: list[int] = [0]
     write_text_calls: list[int] = [0]
     real_mkdir = Path.mkdir
     real_write_text = Path.write_text
 
     def intercepting_mkdir(self, *args, **kwargs):
-        is_outer = kwargs.get('parents', False) and str(self).endswith('escalations')
+        is_outer = kwargs.get('parents', False) and self == expected_esc_dir
         if is_outer:
             outer_mkdir_calls[0] += 1
             if outer_mkdir_calls[0] == 1:
