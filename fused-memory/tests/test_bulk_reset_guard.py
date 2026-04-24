@@ -87,7 +87,8 @@ async def test_observe_attempt_returns_ok_under_threshold(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=10,
+        done_threshold=10,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -120,7 +121,8 @@ async def test_observe_attempt_rejects_at_threshold_within_window(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -171,7 +173,8 @@ async def test_observe_attempt_ignores_non_reversal_transitions(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -243,7 +246,8 @@ async def test_window_drains_after_expiry(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -321,7 +325,8 @@ async def test_per_project_isolation(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -393,7 +398,8 @@ async def test_emits_l1_escalation_on_trip(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -469,7 +475,8 @@ async def test_escalation_rate_limited(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -569,7 +576,8 @@ async def test_guard_disabled_returns_ok(tmp_path):
 
     guard = BulkResetGuard(
         enabled=False,
-        threshold=1,  # Would trip on the first attempt if enabled
+        done_threshold=1,  # Would trip on the first attempt if enabled
+        in_progress_threshold=1,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -708,7 +716,8 @@ async def test_escalation_write_offloads_io_to_thread(tmp_path, monkeypatch):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -770,7 +779,8 @@ async def test_idle_project_state_is_not_evicted_across_attempts(tmp_path):
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         time_provider=fake_clock,
@@ -858,7 +868,8 @@ async def test_write_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         write_failure_backoff_seconds=60.0,
@@ -990,7 +1001,8 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
         return clock[0]
 
     guard = BulkResetGuard(
-        threshold=3,
+        done_threshold=3,
+        in_progress_threshold=100,
         window_seconds=60.0,
         escalation_rate_limit_seconds=900.0,
         write_failure_backoff_seconds=60.0,

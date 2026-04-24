@@ -136,7 +136,8 @@ class _Entry:
 
 @dataclass
 class _GuardState:
-    entries: deque[_Entry] = field(default_factory=deque)
+    done_entries: deque[_Entry] = field(default_factory=deque)
+    in_progress_entries: deque[_Entry] = field(default_factory=deque)
     last_escalation_ts: float = 0.0
     last_write_failure_ts: float = 0.0
 
@@ -153,12 +154,18 @@ class BulkResetGuard:
     enabled:
         When ``False`` every call returns ``ok`` immediately; no state is
         mutated.  Lets operators disable the guard without code changes.
-    threshold:
-        Number of reversal attempts within ``window_seconds`` that trips the
-        circuit.  Up to ``threshold`` reversals are allowed; the
-        ``(threshold+1)``-th attempt in the window is the first to be
-        rejected.  For example, ``threshold=10`` means the 11th reversal in
-        the window is the first rejection.
+    done_threshold:
+        Number of ``done``→``pending`` reversal attempts within
+        ``window_seconds`` that trips the circuit.  Up to ``done_threshold``
+        reversals are allowed; the ``(done_threshold+1)``-th attempt is the
+        first rejection.  Default 10 — inherited from the original
+        single-threshold design (task 918).
+    in_progress_threshold:
+        Number of ``in-progress``→``pending`` reversal attempts within
+        ``window_seconds`` that trips the circuit.  Default 100 — set
+        comfortably above the 27-task startup stranded-task reconcile seen
+        in the 2026-04-24 reify incident while still catching pathological
+        runaways.
     window_seconds:
         Length of the sliding window in seconds.  Entries older than
         ``now - window_seconds`` are pruned before each check.
@@ -189,7 +196,8 @@ class BulkResetGuard:
         self,
         *,
         enabled: bool = True,
-        threshold: int = 10,
+        done_threshold: int = 10,
+        in_progress_threshold: int = 100,
         window_seconds: float = 60.0,
         escalation_rate_limit_seconds: float = 900.0,
         write_failure_backoff_seconds: float = 60.0,
@@ -197,7 +205,8 @@ class BulkResetGuard:
         escalations_fallback_dir: Path | None = None,
     ) -> None:
         self._enabled = enabled
-        self._threshold = threshold
+        self._done_threshold = done_threshold
+        self._in_progress_threshold = in_progress_threshold
         self._window_seconds = window_seconds
         self._rate_limit_seconds = escalation_rate_limit_seconds
         self._write_failure_backoff_seconds = write_failure_backoff_seconds
@@ -247,17 +256,19 @@ class BulkResetGuard:
 
             # 3. Prune expired entries.
             cutoff = now - self._window_seconds
-            while state.entries and state.entries[0].ts < cutoff:
-                state.entries.popleft()
+            while state.done_entries and state.done_entries[0].ts < cutoff:
+                state.done_entries.popleft()
+            while state.in_progress_entries and state.in_progress_entries[0].ts < cutoff:
+                state.in_progress_entries.popleft()
 
-            # 3a. Safe eviction: remove idle project state when entries is
-            # empty AND neither rate-limit timestamp has been set, preventing
-            # unbounded dict growth for high-cardinality project_id sets.
-            # Unlike the removed unconditional eviction (commit 7d7b3dd16a),
-            # this only fires when there is truly no state worth preserving
-            # (project was never escalated and never suffered a write failure).
+            # 3a. Safe eviction: remove idle project state when BOTH entry
+            # deques are empty AND neither rate-limit timestamp has been set,
+            # preventing unbounded dict growth for high-cardinality project_id
+            # sets.  Requires both deques to be empty because done_entries and
+            # in_progress_entries track independent counters.
             if (
-                not state.entries
+                not state.done_entries
+                and not state.in_progress_entries
                 and state.last_escalation_ts == 0.0
                 and state.last_write_failure_ts == 0.0
             ):
@@ -266,22 +277,24 @@ class BulkResetGuard:
                 self._state[project_id] = state
 
             # 4. Record this attempt (always, even if we will reject it).
-            state.entries.append(_Entry(ts=now, task_id=task_id))
+            # Until step-8 introduces _reversal_kind routing, all reversals
+            # accumulate in done_entries; step-8 will route to the correct
+            # per-kind deque.
+            state.done_entries.append(_Entry(ts=now, task_id=task_id))
 
             # 5. Check threshold.
             # Trip fires when the count EXCEEDS threshold (len > threshold),
             # i.e. the (threshold+1)-th attempt in the window is the first
             # rejection.  This means "up to threshold reversals are allowed;
-            # the next one trips the circuit-breaker."  Steps 5, 13, 15 all
-            # assume threshold=3 allows exactly three ok reversals.
-            if len(state.entries) <= self._threshold:
+            # the next one trips the circuit-breaker."
+            if len(state.done_entries) <= self._done_threshold:
                 return BulkResetVerdict(outcome='ok', project_id=project_id)
 
             # 6. Threshold crossed — collect window contents for the verdict.
-            affected_ids = tuple(e.task_id for e in state.entries)
+            affected_ids = tuple(e.task_id for e in state.done_entries)
             trig_ts = tuple(
                 datetime.fromtimestamp(e.ts, tz=UTC).isoformat()
-                for e in state.entries
+                for e in state.done_entries
             )
 
         # 7. Try to write escalation (outside lock to avoid I/O under lock).
@@ -297,7 +310,7 @@ class BulkResetGuard:
                 outcome='escalated',
                 affected_task_ids=affected_ids,
                 triggering_timestamps=trig_ts,
-                threshold=self._threshold,
+                threshold=self._done_threshold,
                 window_seconds=self._window_seconds,
                 project_id=project_id,
                 escalation_path=str(esc_path),
@@ -306,7 +319,7 @@ class BulkResetGuard:
             outcome='rejection',
             affected_task_ids=affected_ids,
             triggering_timestamps=trig_ts,
-            threshold=self._threshold,
+            threshold=self._done_threshold,
             window_seconds=self._window_seconds,
             project_id=project_id,
         )
@@ -406,14 +419,14 @@ class BulkResetGuard:
             'summary': (
                 f'Bulk task-status reversal detected for {project_id}: '
                 f'{len(affected_task_ids)} reversals in {self._window_seconds}s '
-                f'(threshold={self._threshold})'
+                f'(threshold={self._done_threshold})'
             ),
             'detail': (
                 f'The bulk-reset circuit-breaker (task 918) tripped for project '
                 f'{project_id}. {len(affected_task_ids)} done→pending or '
                 f'in-progress→pending reversal attempts landed within a '
                 f'{self._window_seconds}s window, exceeding the threshold of '
-                f'{self._threshold}. The first triggering attempt was at '
+                f'{self._done_threshold}. The first triggering attempt was at '
                 f'{triggering_timestamps[0] if triggering_timestamps else "unknown"}.'
             ),
             'suggested_action': (
@@ -428,7 +441,7 @@ class BulkResetGuard:
             'workflow_state': 'infra',
             'affected_task_ids': list(affected_task_ids),
             'triggering_timestamps': list(triggering_timestamps),
-            'threshold': self._threshold,
+            'threshold': self._done_threshold,
             'window_seconds': self._window_seconds,
             'project_id': project_id,
         }
@@ -439,7 +452,7 @@ class BulkResetGuard:
                 '(affected=%d, threshold=%d)',
                 path,
                 len(affected_task_ids),
-                self._threshold,
+                self._done_threshold,
             )
         except OSError as exc:
             logger.error(
