@@ -32,9 +32,8 @@ if str(_TESTS_DIR) not in sys.path:
 
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
-from starlette.testclient import TestClient  # noqa: E402
-
 from _dashboard_helpers import RECONCILIATION_SCHEMA  # noqa: E402
+from starlette.testclient import TestClient  # noqa: E402
 
 # Path to the generated tailwind.css (gitignored, built via `make css`)
 _STATIC_DIR = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'static'
