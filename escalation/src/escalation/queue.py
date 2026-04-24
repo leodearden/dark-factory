@@ -135,17 +135,42 @@ class EscalationQueue:
 
         Deduplication: if the same escalation id appears in both the queue root
         and the archive (e.g. crash mid-resolve), only the first occurrence that
-        passes all filters is returned and a WARNING is logged for any later
-        same-id path that also passes.  Filters (task_id / status / level) are
-        applied BEFORE adding to ``seen``, so a copy that fails its own filter
-        never shadows a matching copy in the other tier.  Iteration order is
-        queue root first, archive second, so the queue_dir copy wins when both
-        copies pass the filter.
+        passes all filters is returned and a DEBUG message is logged for any
+        later same-id path that also passes.  Filters (task_id / status / level)
+        are applied BEFORE adding to ``seen``, so a copy that fails its own
+        filter never shadows a matching copy in the other tier.  Iteration order
+        is queue root first, archive second, so the queue_dir copy wins when
+        both copies pass the filter.
+
+        Pre-scan warning: before applying any filter, if the same escalation id
+        appears in BOTH the queue_dir root AND the archive subtree, a single
+        WARNING is logged regardless of which (if any) copies pass the caller's
+        filter.  Note: the pre-scan covers only the paths that are actually
+        scanned — when ``status == 'pending'`` the archive is skipped entirely,
+        so a cross-tier duplicate is invisible to the pre-scan in that mode.
         """
         # Build the candidate path list.
         paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
         if status != 'pending':
             paths.extend(self._iter_archive_paths('esc-*.json'))
+
+        # Pre-scan: detect ids that span both queue_dir root and archive subtree.
+        # Uses filename stems only (no JSON parsing) to avoid extra I/O.
+        #
+        # Tier-membership invariant: self.queue_dir.glob('esc-*.json') is
+        # non-recursive, so every path from that source has parent ==
+        # self.queue_dir; every path from _iter_archive_paths comes from
+        # archive_root.rglob(...) and cannot have parent == self.queue_dir.
+        # Therefore any id with len(paths) >= 2 necessarily spans both tiers.
+        id_to_paths: dict[str, list[Path]] = {}
+        for path in paths:
+            id_to_paths.setdefault(path.stem, []).append(path)
+        for esc_id, esc_paths in id_to_paths.items():
+            if len(esc_paths) >= 2:
+                logger.warning(
+                    f'Escalation {esc_id!r} exists in both queue_dir and archive: '
+                    f'{[str(p) for p in esc_paths]}; reconciliation may be needed'
+                )
 
         seen: set[str] = set()
         results = []
@@ -159,9 +184,9 @@ class EscalationQueue:
                 if level is not None and esc.level != level:
                     continue
                 if esc.id in seen:
-                    logger.warning(
+                    logger.debug(
                         f'Duplicate escalation id {esc.id!r} at {path}; '
-                        'skipping (queue_dir copy takes precedence)'
+                        'skipping (pre-scan WARNING already logged; queue_dir copy takes precedence)'
                     )
                     continue
                 seen.add(esc.id)
@@ -187,7 +212,8 @@ class EscalationQueue:
                 esc = Escalation.from_json(path.read_text())
                 if esc.status == 'pending':
                     results.append(esc)
-            except (json.JSONDecodeError, KeyError, TypeError):
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse {path}: {e}')
                 continue
         return results
 
