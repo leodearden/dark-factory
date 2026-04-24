@@ -43,6 +43,7 @@ find_near_duplicate_groups = _mod.find_near_duplicate_groups
 pick_survivor = _mod.pick_survivor
 compute_dependency_updates = _mod.compute_dependency_updates
 DependencyUpdate = _mod.DependencyUpdate
+apply_changes = _mod.apply_changes
 
 
 # ---------------------------------------------------------------------------
@@ -545,3 +546,164 @@ class TestComputeDependencyUpdatesIntDependencies:
         assert u.dependent_id == '351'
         assert u.remove_dep == '399'
         assert u.add_dep == '350'
+
+
+# ===========================================================================
+# Step-9: apply_changes
+# ===========================================================================
+
+# apply_changes signature:
+#   apply_changes(backend, project_root, plan, tag=None) -> None (async)
+#
+# plan dict shape:
+#   {'cancellations': [task_id, ...], 'dependency_updates': [dict, ...]}
+#
+# Uses assert_awaited_* (not assert_called_*) per check_asyncmock_assertion_style.py lint rule.
+
+import pytest
+
+
+@pytest.mark.asyncio
+class TestApplyChangesCancellations:
+    """Cancellation calls: one set_task_status per ID in plan['cancellations']."""
+
+    async def test_set_task_status_called_once_per_cancellation(self):
+        """Each cancellation ID triggers exactly one set_task_status('cancelled') call."""
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        backend = MagicMock()
+        backend.set_task_status = AsyncMock(return_value={})
+        backend.remove_dependency = AsyncMock(return_value={})
+        backend.add_dependency = AsyncMock(return_value={})
+
+        plan = {'cancellations': ['401', '402'], 'dependency_updates': []}
+        await apply_changes(backend, '/project', plan, tag='master')
+
+        assert backend.set_task_status.await_count == 2
+        # Both calls should pass 'cancelled' as the status and the correct project_root.
+        calls = backend.set_task_status.await_args_list
+        called_ids = {c.args[0] for c in calls}
+        called_statuses = {c.args[1] for c in calls}
+        assert called_ids == {'401', '402'}
+        assert called_statuses == {'cancelled'}
+        # project_root and tag must be passed through.
+        for c in calls:
+            assert c.args[2] == '/project'
+            assert c.args[3] == 'master'
+
+    async def test_no_cancellations_set_task_status_not_called(self):
+        """Empty cancellations list → set_task_status never awaited."""
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        backend = MagicMock()
+        backend.set_task_status = AsyncMock(return_value={})
+        backend.remove_dependency = AsyncMock(return_value={})
+        backend.add_dependency = AsyncMock(return_value={})
+
+        plan = {'cancellations': [], 'dependency_updates': []}
+        await apply_changes(backend, '/project', plan)
+
+        backend.set_task_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestApplyChangesDependencyUpdates:
+    """Dependency remap calls: remove + optional add per DependencyUpdate."""
+
+    async def test_remove_dependency_called_per_update(self):
+        """Each dep update triggers a remove_dependency call."""
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        backend = MagicMock()
+        backend.set_task_status = AsyncMock(return_value={})
+        backend.remove_dependency = AsyncMock(return_value={})
+        backend.add_dependency = AsyncMock(return_value={})
+
+        plan = {
+            'cancellations': [],
+            'dependency_updates': [
+                {'dependent_id': '410', 'remove_dep': '499', 'add_dep': '400'},
+            ],
+        }
+        await apply_changes(backend, '/project', plan)
+
+        backend.remove_dependency.assert_awaited_once_with('410', '499', '/project', None)
+        backend.add_dependency.assert_awaited_once_with('410', '400', '/project', None)
+
+    async def test_add_dependency_not_called_when_add_dep_is_none(self):
+        """When add_dep is None, add_dependency must not be called."""
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        backend = MagicMock()
+        backend.set_task_status = AsyncMock(return_value={})
+        backend.remove_dependency = AsyncMock(return_value={})
+        backend.add_dependency = AsyncMock(return_value={})
+
+        plan = {
+            'cancellations': [],
+            'dependency_updates': [
+                {'dependent_id': '420', 'remove_dep': '499', 'add_dep': None},
+            ],
+        }
+        await apply_changes(backend, '/project', plan)
+
+        backend.remove_dependency.assert_awaited_once_with('420', '499', '/project', None)
+        backend.add_dependency.assert_not_awaited()
+
+    async def test_cancellations_precede_dependency_updates(self):
+        """Call order: all set_task_status calls complete before any remove/add_dependency."""
+        from unittest.mock import AsyncMock, MagicMock, call  # noqa: PLC0415
+
+        call_order: list[str] = []
+
+        backend = MagicMock()
+
+        async def _cancel(tid, status, pr, tag=None):
+            call_order.append(f'cancel:{tid}')
+            return {}
+
+        async def _remove(dep, rem, pr, tag=None):
+            call_order.append(f'remove:{dep}->{rem}')
+            return {}
+
+        async def _add(dep, add, pr, tag=None):
+            call_order.append(f'add:{dep}->{add}')
+            return {}
+
+        backend.set_task_status = AsyncMock(side_effect=_cancel)
+        backend.remove_dependency = AsyncMock(side_effect=_remove)
+        backend.add_dependency = AsyncMock(side_effect=_add)
+
+        plan = {
+            'cancellations': ['430'],
+            'dependency_updates': [
+                {'dependent_id': '431', 'remove_dep': '430', 'add_dep': '429'},
+            ],
+        }
+        await apply_changes(backend, '/project', plan)
+
+        # Cancellations first, then dep updates.
+        assert call_order[0].startswith('cancel:')
+        assert call_order[1].startswith('remove:')
+
+    async def test_partial_failure_does_not_abort_remaining_ops(self):
+        """A failing set_task_status should not prevent subsequent operations."""
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        backend = MagicMock()
+        backend.set_task_status = AsyncMock(side_effect=RuntimeError('Taskmaster offline'))
+        backend.remove_dependency = AsyncMock(return_value={})
+        backend.add_dependency = AsyncMock(return_value={})
+
+        plan = {
+            'cancellations': ['440'],
+            'dependency_updates': [
+                {'dependent_id': '441', 'remove_dep': '440', 'add_dep': '439'},
+            ],
+        }
+        # Should NOT raise; partial failure is tolerated.
+        await apply_changes(backend, '/project', plan)
+
+        # Dep updates still proceed despite cancel failure.
+        backend.remove_dependency.assert_awaited_once()
+        backend.add_dependency.assert_awaited_once()
