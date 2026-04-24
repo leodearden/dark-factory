@@ -649,25 +649,24 @@ async def test_escalation_write_offloads_io_to_thread(tmp_path, monkeypatch):
     """mkdir and write_text in _maybe_write_escalation must be offloaded to a
     thread via asyncio.to_thread so they do not block the event loop.
 
-    Monkeypatches asyncio.to_thread with a tracking wrapper that records the
-    callable name and then delegates to the real asyncio.to_thread.  The guard
-    is tripped (4 reversals, threshold=3) and the test asserts that the wrapper
-    saw at least one call for 'mkdir' and one for 'write_text'.
-
-    This test fails today because _maybe_write_escalation calls both
-    synchronously on the event loop.
+    Monkeypatches asyncio.to_thread with a tracking wrapper that records each
+    raw callable passed and then delegates to the real asyncio.to_thread.  The
+    guard is tripped (4 reversals, threshold=3) and the test asserts that
+    exactly one tracked call is Path.mkdir bound to the escalation directory and
+    exactly one is Path.write_text bound to a file inside that directory.
     """
     import asyncio as _asyncio
 
-    tracked_callables: list[str] = []
+    tracked_callables: list = []
     real_to_thread = _asyncio.to_thread
 
     async def tracking_to_thread(func, *args, **kwargs):
-        tracked_callables.append(getattr(func, '__name__', repr(func)))
+        tracked_callables.append(func)
         return await real_to_thread(func, *args, **kwargs)
 
     monkeypatch.setattr(_asyncio, 'to_thread', tracking_to_thread)
 
+    expected_esc_dir = tmp_path / 'data' / 'escalations'
     clock = [1000.0]
 
     def fake_clock() -> float:
@@ -691,13 +690,23 @@ async def test_escalation_write_offloads_io_to_thread(tmp_path, monkeypatch):
             project_root=str(tmp_path),
         )
 
-    assert 'mkdir' in tracked_callables, (
-        f'Expected asyncio.to_thread called with mkdir; '
-        f'recorded callables: {tracked_callables}'
+    mkdir_calls = [
+        f for f in tracked_callables
+        if getattr(getattr(f, '__func__', None), '__name__', None) == 'mkdir'
+        and getattr(f, '__self__', None) == expected_esc_dir
+    ]
+    write_text_calls = [
+        f for f in tracked_callables
+        if getattr(getattr(f, '__func__', None), '__name__', None) == 'write_text'
+        and getattr(getattr(f, '__self__', None), 'parent', None) == expected_esc_dir
+    ]
+    assert len(mkdir_calls) == 1, (
+        f'Expected exactly 1 Path.mkdir bound-method call on {expected_esc_dir}; '
+        f'got {len(mkdir_calls)}. Tracked callables: {tracked_callables}'
     )
-    assert 'write_text' in tracked_callables, (
-        f'Expected asyncio.to_thread called with write_text; '
-        f'recorded callables: {tracked_callables}'
+    assert len(write_text_calls) == 1, (
+        f'Expected exactly 1 Path.write_text bound-method call inside {expected_esc_dir}; '
+        f'got {len(write_text_calls)}. Tracked callables: {tracked_callables}'
     )
 
 
@@ -912,9 +921,13 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
     """
     # Count only "outer" mkdir calls from _maybe_write_escalation, not
     # recursive internal calls made by Path.mkdir(parents=True) when creating
-    # intermediate parent directories.  Match by absolute path equality rather
-    # than suffix to avoid accidental matches from sibling fixtures or parent
-    # mkdir calls whose last segment happens to be 'escalations'.
+    # intermediate parent directories.  Pathlib's internal parents-creation
+    # sequence calls self.mkdir(mode, parents=False, exist_ok=…) as a retry step
+    # after creating parent dirs, so path-equality alone is not sufficient.  We
+    # combine path equality with a parents=True check that reads from both
+    # keyword form (kwargs.get) and positional form (args[1], since mode is
+    # args[0]).  The retry call always passes parents=False (whether positional
+    # or keyword), which this check excludes either way.
     expected_esc_dir = tmp_path / 'data' / 'escalations'
     outer_mkdir_calls: list[int] = [0]
     write_text_calls: list[int] = [0]
@@ -922,7 +935,7 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
     real_write_text = Path.write_text
 
     def intercepting_mkdir(self, *args, **kwargs):
-        is_outer = kwargs.get('parents', False) and self == expected_esc_dir
+        is_outer = (self == expected_esc_dir) and (args[1] if len(args) > 1 else kwargs.get('parents', False))
         if is_outer:
             outer_mkdir_calls[0] += 1
             if outer_mkdir_calls[0] == 1:
