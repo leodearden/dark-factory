@@ -2610,51 +2610,6 @@ async def test_two_projects_do_not_serialise(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('setter,waiter,expected_msg', [
-    ('A', 'B', 'project A entered but B never did'),
-    ('B', 'A', 'project B entered but A never did'),
-])
-async def test_rendezvous_timeout_surfaces_per_project_diagnostic(
-    setter, waiter, expected_msg,
-):
-    """Regression: when one project enters the rendezvous but the other never
-    does, the hardened try/except pattern calls pytest.fail with a legible
-    per-project diagnostic rather than surfacing an opaque asyncio.TimeoutError.
-
-    This test replicates the rendezvous pattern inline (with a short 0.05s
-    timeout) so that the diagnostic string/shape pinned here is exactly the
-    one applied to the real rendezvous in test_two_projects_do_not_serialise.
-    """
-    projA_entered = asyncio.Event()
-    projB_entered = asyncio.Event()
-
-    # Simulate one project entering but the other never arriving
-    if setter == 'A':
-        projA_entered.set()
-        other_event = projB_entered
-    else:
-        projB_entered.set()
-        other_event = projA_entered
-
-    # Replicate the hardened rendezvous pattern with a short timeout to force
-    # the TimeoutError path; pytest.raises captures the resulting pytest.fail.
-    with pytest.raises(pytest.fail.Exception) as exc_info:
-        try:
-            await asyncio.wait_for(other_event.wait(), timeout=0.05)
-        except TimeoutError:
-            pytest.fail(
-                f"project {setter} entered but {waiter} never did — "
-                f"projA_entered={projA_entered.is_set()} "
-                f"projB_entered={projB_entered.is_set()}"
-            )
-
-    # Both the direction phrase and the per-project flag state must appear
-    assert expected_msg in str(exc_info.value)
-    expected_state = f"projA_entered={setter == 'A'} projB_entered={setter == 'B'}"
-    assert expected_state in str(exc_info.value)
-
-
-@pytest.mark.asyncio
 async def test_set_task_status_holds_lock_across_read_and_write(
     overlap_tm, reconciler, event_buffer,
 ):
