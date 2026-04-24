@@ -2345,3 +2345,30 @@ class TestGetStatuses:
         result_ok = await scheduler.get_statuses()
         assert result_ok == {'1': 'pending'}
         assert scheduler._last_get_statuses_error is None
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_consecutive_failures_store_latest_error(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Two consecutive transport failures: second exception overwrites the first.
+
+        Validates that the cached attribute is updated per-call, not stuck on
+        the first error seen.
+        """
+        # First failing call: OSError.
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(side_effect=OSError(2, 'No such file')),
+        )
+        await scheduler.get_statuses()
+        assert isinstance(scheduler._last_get_statuses_error, OSError)
+
+        # Second failing call: ValueError should overwrite OSError.
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(side_effect=ValueError('malformed response')),
+        )
+        result2 = await scheduler.get_statuses()
+        assert result2 == {}
+        assert isinstance(scheduler._last_get_statuses_error, ValueError)
+        assert 'malformed response' in str(scheduler._last_get_statuses_error)

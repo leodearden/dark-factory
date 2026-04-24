@@ -373,7 +373,7 @@ class Harness:
                 if 'pending' not in existing_statuses.values():
                     if not existing_statuses:
                         # Distinguish transport failure from genuinely empty tree.
-                        err = self.scheduler._last_get_statuses_error
+                        err = self.scheduler.last_get_statuses_error
                         if err is not None:
                             raise RuntimeError(
                                 f'Failed to reach fused-memory: '

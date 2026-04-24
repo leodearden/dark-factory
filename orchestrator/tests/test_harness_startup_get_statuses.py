@@ -78,7 +78,7 @@ def startup_harness(tmp_path: Path) -> Harness:
     h.scheduler.get_statuses = AsyncMock(return_value={})
     h.scheduler.set_task_status = AsyncMock()
     # Default: no cached transport error (tests that need one set it explicitly).
-    h.scheduler._last_get_statuses_error = None
+    h.scheduler.last_get_statuses_error = None
     # Raise on acquire_next to stop the scheduler loop after startup.
     h.scheduler.acquire_next = AsyncMock(side_effect=RuntimeError('stop'))
 
@@ -199,7 +199,7 @@ async def test_startup_noprd_transport_failure_raises_distinct_error(
     h = startup_harness
     # Simulate: get_statuses swallowed a transport error and cached it.
     h.scheduler.get_statuses = AsyncMock(return_value={})
-    h.scheduler._last_get_statuses_error = OSError(2, 'No such file')
+    h.scheduler.last_get_statuses_error = OSError(2, 'No such file')
 
     with pytest.raises(RuntimeError, match=r'[Ff]ailed to reach fused-memory') as excinfo:
         await h.run(prd_path=None)
@@ -207,7 +207,7 @@ async def test_startup_noprd_transport_failure_raises_distinct_error(
     msg = str(excinfo.value)
     # Error message must include the exception class name and the message.
     # Note: OSError(2, ...) raises as FileNotFoundError (errno 2 = ENOENT remapping).
-    cached_err = h.scheduler._last_get_statuses_error
+    cached_err = h.scheduler.last_get_statuses_error
     expected_cls = type(cached_err).__name__
     assert expected_cls in msg, f'Expected {expected_cls!r} class name in message: {msg}'
     assert 'No such file' in msg, f'Expected OSError message in error: {msg}'
@@ -229,7 +229,7 @@ async def test_startup_noprd_empty_without_cached_error_raises_legitimate_error(
     """
     h = startup_harness
     h.scheduler.get_statuses = AsyncMock(return_value={})
-    h.scheduler._last_get_statuses_error = None
+    h.scheduler.last_get_statuses_error = None
 
     with pytest.raises(RuntimeError, match='No PRD given and no pending tasks found'):
         await h.run(prd_path=None)
