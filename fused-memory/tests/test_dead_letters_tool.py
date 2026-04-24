@@ -375,7 +375,31 @@ class TestTruncatePayloadHardening:
         assert truncated is True
         assert isinstance(result, str)
         assert result == str(payload)
-        assert result is not payload
+
+    def test_non_serialisable_large_payload_returns_capped_envelope(self):
+        """Non-serialisable payload whose str() also exceeds the budget returns capped envelope."""
+        # Self-referencing dict with extra bulk so str() representation exceeds 2 KB.
+        payload: dict = {}
+        payload['self'] = payload
+        payload['filler'] = 'x' * (_DEAD_LETTER_PAYLOAD_MAX_BYTES * 2)
+
+        # Sanity-guard 1: circular reference still triggers the except branch.
+        with pytest.raises((TypeError, ValueError)):
+            json.dumps(payload, default=str)
+
+        # Sanity-guard 2: confirm str() representation exceeds the budget.
+        assert len(str(payload).encode('utf-8')) > _DEAD_LETTER_PAYLOAD_MAX_BYTES
+
+        result, truncated = _truncate_payload(payload)
+
+        # Expects the capped envelope dict, not the raw str or the original object.
+        assert truncated is True
+        assert isinstance(result, dict)
+        assert result.get('_truncated') is True
+        assert 'text' in result
+        assert 'original_type' in result
+        # The 'text' field must fit within the byte budget — the whole point of the cap.
+        assert len(result['text'].encode('utf-8')) <= _DEAD_LETTER_PAYLOAD_MAX_BYTES
 
     def test_unicode_heavy_payload_fits_under_utf8_budget_not_truncated(self):
         """A payload that fits in UTF-8 but exceeds ASCII-escape size must not be truncated."""
@@ -394,4 +418,3 @@ class TestTruncatePayloadHardening:
         # With ensure_ascii=False (the fix), the UTF-8 form fits and passes through.
         assert truncated is False
         assert result == payload
-        assert result is payload

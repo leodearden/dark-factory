@@ -174,13 +174,26 @@ def _truncate_payload(payload: Any) -> tuple[Any, bool]:
 
     Non-JSON-serialisable payloads (e.g. circular references) cannot be safely
     passed through — the MCP transport would crash trying to JSON-encode them.
-    In that case the payload is coerced to ``str(payload)`` and returned with
-    ``truncated=True`` to signal the lossy conversion to the caller.
+    In that case the payload is coerced to ``str(payload)``, which is itself
+    subject to the same byte-budget check: if it fits, ``(str_value, True)`` is
+    returned; if it also exceeds the budget, the capped-envelope form is returned
+    (with ``original_type`` reflecting the real payload type, not ``str``).
+    Either way ``truncated=True`` signals the lossy conversion to the caller.
     """
     try:
         serialised = json.dumps(payload, default=str, ensure_ascii=False)
     except (TypeError, ValueError):
-        return str(payload), True
+        serialised = str(payload)
+        if len(serialised.encode('utf-8')) <= _DEAD_LETTER_PAYLOAD_MAX_BYTES:
+            return serialised, True
+        text = serialised.encode('utf-8')[:_DEAD_LETTER_PAYLOAD_MAX_BYTES].decode(
+            'utf-8', errors='replace'
+        )
+        return {
+            '_truncated': True,
+            'text': text,
+            'original_type': type(payload).__name__,
+        }, True
     if len(serialised.encode('utf-8')) <= _DEAD_LETTER_PAYLOAD_MAX_BYTES:
         return payload, False
     # Cap the raw JSON text to the byte budget, then return a stable-typed
