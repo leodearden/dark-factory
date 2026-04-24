@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
@@ -15,7 +16,11 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.reconciliation.event_queue import EventQueue
-from fused_memory.server.tools import create_mcp_server
+from fused_memory.server.tools import (
+    _DEAD_LETTER_PAYLOAD_MAX_BYTES,
+    _truncate_payload,
+    create_mcp_server,
+)
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -343,3 +348,73 @@ class TestGetDeadLettersPayloadTruncation:
         assert 'original_type' in payload
         # The 'text' field must fit within the byte budget.
         assert len(payload['text'].encode()) <= 2048
+
+
+# ── _truncate_payload unit tests ───────────────────────────────────────────
+
+
+class TestTruncatePayloadHardening:
+    """Direct unit tests for _truncate_payload edge cases."""
+
+    def test_non_serialisable_small_payload_returned_as_string_with_truncated_true(self):
+        """Non-JSON-serialisable payload that fits the budget must NOT be returned raw."""
+        # Build a self-referencing dict — reliably raises ValueError from json.dumps.
+        payload: dict = {}
+        payload['self'] = payload
+
+        # Sanity-guard 1: confirm the payload genuinely triggers the except branch.
+        with pytest.raises((TypeError, ValueError)):
+            json.dumps(payload, default=str)
+
+        # Sanity-guard 2: confirm str() form fits under the budget.
+        assert len(str(payload).encode('utf-8')) < _DEAD_LETTER_PAYLOAD_MAX_BYTES
+
+        result, truncated = _truncate_payload(payload)
+
+        # The buggy behaviour returns (payload, False); the fix must return (str, True).
+        assert truncated is True
+        assert isinstance(result, str)
+        assert result == str(payload)
+
+    def test_non_serialisable_large_payload_returns_capped_envelope(self):
+        """Non-serialisable payload whose str() also exceeds the budget returns capped envelope."""
+        # Self-referencing dict with extra bulk so str() representation exceeds 2 KB.
+        payload: dict = {}
+        payload['self'] = payload
+        payload['filler'] = 'x' * (_DEAD_LETTER_PAYLOAD_MAX_BYTES * 2)
+
+        # Sanity-guard 1: circular reference still triggers the except branch.
+        with pytest.raises((TypeError, ValueError)):
+            json.dumps(payload, default=str)
+
+        # Sanity-guard 2: confirm str() representation exceeds the budget.
+        assert len(str(payload).encode('utf-8')) > _DEAD_LETTER_PAYLOAD_MAX_BYTES
+
+        result, truncated = _truncate_payload(payload)
+
+        # Expects the capped envelope dict, not the raw str or the original object.
+        assert truncated is True
+        assert isinstance(result, dict)
+        assert result.get('_truncated') is True
+        assert 'text' in result
+        assert 'original_type' in result
+        # The 'text' field must fit within the byte budget — the whole point of the cap.
+        assert len(result['text'].encode('utf-8')) <= _DEAD_LETTER_PAYLOAD_MAX_BYTES
+
+    def test_unicode_heavy_payload_fits_under_utf8_budget_not_truncated(self):
+        """A payload that fits in UTF-8 but exceeds ASCII-escape size must not be truncated."""
+        # '日' is 3 bytes UTF-8 but 6 bytes as \uXXXX ASCII escape.
+        # 500×3=1500 bytes UTF-8 (fits 2048); 500×6=3000 bytes ASCII-escaped (exceeds 2048).
+        payload = {'blob': '日' * 500}
+
+        # Sanity-guard 1: UTF-8 form fits the budget.
+        assert len(json.dumps(payload, default=str, ensure_ascii=False).encode('utf-8')) <= _DEAD_LETTER_PAYLOAD_MAX_BYTES
+        # Sanity-guard 2: ASCII-escaped form exceeds the budget.
+        assert len(json.dumps(payload, default=str).encode('utf-8')) > _DEAD_LETTER_PAYLOAD_MAX_BYTES
+
+        result, truncated = _truncate_payload(payload)
+
+        # With ensure_ascii=True (the bug), the inflated form triggers truncation.
+        # With ensure_ascii=False (the fix), the UTF-8 form fits and passes through.
+        assert truncated is False
+        assert result == payload
