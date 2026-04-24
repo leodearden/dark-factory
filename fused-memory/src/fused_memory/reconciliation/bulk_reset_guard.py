@@ -138,6 +138,7 @@ class _Entry:
 class _GuardState:
     entries: deque[_Entry] = field(default_factory=deque)
     last_escalation_ts: float = 0.0
+    last_write_failure_ts: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +176,13 @@ class BulkResetGuard:
         empty or ``None``.  Production paths always supply ``project_root``
         via ``observe_attempt``; this parameter is primarily for tests that
         construct the guard without a real project tree.
+    write_failure_backoff_seconds:
+        Minimum gap between write attempts for the same project after an
+        ``OSError`` from ``path.write_text`` or ``esc_dir.mkdir``.  During
+        this backoff window subsequent trips return ``rejection`` without
+        retrying the write, preventing tight-loop retries on a flaky mount.
+        Defaults to ``60.0`` s — shorter than ``escalation_rate_limit_seconds``
+        so transient failures recover quickly once the mount stabilises.
     """
 
     def __init__(
@@ -184,6 +192,7 @@ class BulkResetGuard:
         threshold: int = 10,
         window_seconds: float = 60.0,
         escalation_rate_limit_seconds: float = 900.0,
+        write_failure_backoff_seconds: float = 60.0,
         time_provider: Callable[[], float] = time.time,
         escalations_fallback_dir: Path | None = None,
     ) -> None:
@@ -191,6 +200,7 @@ class BulkResetGuard:
         self._threshold = threshold
         self._window_seconds = window_seconds
         self._rate_limit_seconds = escalation_rate_limit_seconds
+        self._write_failure_backoff_seconds = write_failure_backoff_seconds
         self._now = time_provider
         self._fallback_dir = escalations_fallback_dir
         self._state: dict[str, _GuardState] = {}
@@ -318,6 +328,14 @@ class BulkResetGuard:
             # NOTE: last_escalation_ts is updated AFTER a successful write (below)
             # so that a disk failure does not silently suppress the next escalation
             # for the full rate-limit period (900 s by default).
+            if (now - state.last_write_failure_ts) < self._write_failure_backoff_seconds:
+                logger.info(
+                    'bulk_reset_guard: write-failure backoff active for %s '
+                    '(%.0fs since last failure)',
+                    project_id,
+                    now - state.last_write_failure_ts,
+                )
+                return None
 
         # Use project_root when available; fall back to the constructor-supplied dir.
         _esc_base: Path | None = None
@@ -390,6 +408,9 @@ class BulkResetGuard:
             logger.error(
                 'bulk_reset_guard: failed to write escalation %s: %s', path, exc,
             )
+            async with self._lock:
+                state3 = self._state.setdefault(project_id, _GuardState())
+                state3.last_write_failure_ts = now
             return None
 
         # Only advance the rate-limit timestamp AFTER a successful write.
