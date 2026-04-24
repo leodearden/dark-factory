@@ -2589,6 +2589,45 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
         return await tm.get_tasks(project_root, tag)
 
+    async def get_statuses(
+        self,
+        project_root: str,
+        ids: list[str] | None = None,
+        tag: str | None = None,
+    ) -> dict[str, str]:
+        """Return a ``{id_str: status_str}`` mapping for tasks in *project_root*.
+
+        This is a pure read — no events are emitted, no journal entry is written.
+
+        Args:
+            project_root: Absolute path to project root.
+            ids: When given, only these task ids are returned (unknown ids are
+                 silently omitted).  ``None`` returns all tasks.  ``[]`` returns
+                 ``{}``.
+            tag: Tag context forwarded to ``get_tasks`` (optional).
+        """
+        tm = await self._ensure_taskmaster()
+        raw = await tm.get_tasks(project_root, tag)
+
+        # Resolve envelope: handles {tasks: [...]} and {data: {tasks: [...]}}
+        if isinstance(raw.get('data'), dict) and 'tasks' in raw['data']:
+            task_list = raw['data']['tasks']
+        else:
+            task_list = raw.get('tasks', [])
+
+        mapping: dict[str, str] = {}
+        for t in task_list:
+            tid = str(t.get('id', ''))
+            if not tid:
+                continue
+            mapping[tid] = str(t.get('status', 'unknown'))
+
+        if ids is not None:
+            ids_set = {str(i) for i in ids}
+            mapping = {k: v for k, v in mapping.items() if k in ids_set}
+
+        return mapping
+
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict:
