@@ -3980,6 +3980,71 @@ class TestSessionBudgetExhaustionEscalation:
         assert 'architect' in detail, f'Expected "architect" (last completed role) in detail, got: {detail!r}'
 
 
+@pytest.mark.asyncio
+class TestFirstInvocationBudgetExhaustion:
+    """When SessionBudgetExhausted fires before any role completes, the escalation
+    uses the 'last_completed_role' label and resolves to 'n/a' (None fallback).
+
+    This test drives workflow.run() through the _SessionBudgetExhausted handler
+    on the FIRST invoke_agent call — before the architect writes plan.json, so
+    _last_completed_role stays None throughout.
+    """
+
+    async def test_label_is_last_completed_role_na_when_no_role_completed(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        """Before any role completes, _last_completed_role is None → label resolves to n/a.
+
+        Asserts:
+          (i)   outcome is BLOCKED
+          (ii)  exactly one escalation in the queue
+          (iii) detail contains 'last_completed_role=n/a'  (new label + default fallback)
+          (iv)  summary contains 'last completed role: n/a'  (new summary wording)
+        """
+        from orchestrator.usage_gate import SessionBudgetExhausted
+
+        stub = AgentStub()
+        config.usage_cap.session_budget_usd = 0.10
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+            spawn_merge_worker=False,
+        )
+
+        # Raise SessionBudgetExhausted on the very first invoke_agent call —
+        # the architect never writes plan.json, so _last_completed_role stays None.
+        async def always_raise(*args, **kwargs):
+            raise SessionBudgetExhausted(cumulative_cost=0.50)
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', always_raise)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+
+        outcome = await workflow.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED outcome, got: {outcome!r}'
+        )
+
+        escalations = queue.get_by_task(task_assignment.task_id)
+        assert len(escalations) == 1, (
+            f'Expected exactly 1 escalation, got {len(escalations)}'
+        )
+        esc = escalations[0]
+        detail = esc.detail
+        summary = esc.summary
+
+        # (iii) detail label
+        assert 'last_completed_role=n/a' in detail, (
+            f'Expected "last_completed_role=n/a" in detail, got: {detail!r}'
+        )
+        # (iv) summary wording
+        assert 'last completed role: n/a' in summary, (
+            f'Expected "last completed role: n/a" in summary, got: {summary!r}'
+        )
+
+
 def _make_done_setting_steward(
     queue: EscalationQueue, scheduler, task_id: str,
 ) -> type:
