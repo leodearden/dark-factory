@@ -36,10 +36,13 @@ addopts = "-n auto --dist loadgroup"
 # shared.testing.make_gate_mock) and the TaskInterceptor._curator_worker
 # queue.get() infinite loop (see fused_memory.middleware.task_interceptor).
 # Slow tests opt out with @pytest.mark.timeout(N).
-# thread method is load-bearing: signal method only works in main thread and is
-# incompatible with pytest-xdist ("-n auto --dist loadgroup" above).
-# Note: shared/pyproject.toml intentionally uses signal (no xdist there); this
-# subproject diverges to thread for xdist compatibility.
+# thread method is load-bearing: signal method only works in the main thread and
+# is incompatible with pytest-xdist ("-n auto --dist loadgroup" above). thread
+# terminates hung tests via _thread.interrupt_main/os._exit — less clean than
+# signal, but the only xdist-compatible option. (shared/pyproject.toml uses
+# signal and warns thread "can't interrupt a blocking asyncio.sleep"; that caveat
+# applies to C-level blocking syscalls like selector.poll, not pure-Python
+# asyncio.sleep, which both methods catch.)
 timeout = 60
 timeout_method = "thread"
 

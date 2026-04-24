@@ -78,12 +78,12 @@ filterwarnings = [
 # Default per-test timeout. Catches accidental asyncio-sleep hangs (misconfigured
 # UsageGate mock returning a truthy MagicMock from slot.detect_cap_hit — see
 # shared.testing.make_gate_mock). Slow tests opt out with @pytest.mark.timeout(N).
-# thread method chosen for cross-subproject consistency with fused-memory (which
-# requires thread for xdist compat); orchestrator does not run xdist today.
-# Note: shared/pyproject.toml intentionally uses signal (no xdist there); thread
-# here for consistency with fused-memory and to future-proof if xdist is added.
+# signal method matches shared/pyproject.toml: cleanly interrupts asyncio.sleep
+# in the main thread via SIGALRM. If xdist is ever introduced here, switch to
+# thread (xdist workers need thread; signal only fires in the main thread —
+# see fused-memory/pyproject.toml for that divergence).
 timeout = 60
-timeout_method = "thread"
+timeout_method = "signal"
 
 [dependency-groups]
 dev = [
