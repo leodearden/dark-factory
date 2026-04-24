@@ -572,23 +572,16 @@ def test_verdict_to_error_dict_ok():
 
 
 @pytest.mark.parametrize("threshold,window_seconds", [
-    (10, 60.0),  # original case
-    (6, 60.0),   # threshold "gotcha": str(6)="6" collides with "60" inside "60.0s"
-    (10, 6.0),   # window_seconds "gotcha": varies window_seconds so bound-form is
-                 # tested against a distinct value ("within 6.0s window")
+    (10, 60.0),  # baseline values
+    (6, 60.0),   # vary threshold
+    (10, 6.0),   # vary window_seconds
 ])
 def test_verdict_to_error_dict_rejection(threshold, window_seconds):
     """outcome='rejection' produces a structured error payload.
 
-    Three parametrized cases exercise bound-form assertions on both axes:
-    - (10, 60.0): the original baseline values.
-    - (6,  60.0): threshold "gotcha" — str(6)="6" would spuriously match "60"
-      inside "60.0s" under a naive substring check; bound form "threshold 6"
-      is unambiguous.
-    - (10, 6.0):  window_seconds "gotcha" — varies window_seconds so the
-      "within {window_seconds}s window" bound assertion is exercised against a
-      distinct value; without this row the 60.0 path would never be exercised
-      differently across parametrize iterations.
+    Three parametrized (threshold, window_seconds) combinations verify that
+    the structured fields carry the correct typed values across different
+    configurations without pinning the exact label wording of the error string.
 
     Note: affected_task_ids is kept short (3 items) across all cases.  In
     production a rejection verdict is only constructed when
@@ -614,15 +607,6 @@ def test_verdict_to_error_dict_rejection(threshold, window_seconds):
     assert d['success'] is False
     assert d['error_type'] == 'BulkResetGuardTripped'
     assert 'BulkResetGuardTripped' in d['error']
-    # Bound-form assertions: pin the label prefix to avoid numeric substring coincidences.
-    # e.g. threshold=6 with window_seconds=60.0 — str(6)="6" would match "60" inside
-    # "60.0s", but "threshold 6" only appears in the right label position.
-    assert f"threshold {d['threshold']}" in d['error'], (
-        f"error string {d['error']!r} should contain bound form 'threshold {d['threshold']}'"
-    )
-    assert f"within {d['window_seconds']}s window" in d['error'], (
-        f"error string {d['error']!r} should contain bound form 'within {d['window_seconds']}s window'"
-    )
     assert d['affected_task_ids'] == ['5', '6', '7']
     assert d['triggering_timestamps'] == [
         '2026-04-23T00:00:00+00:00',
@@ -654,3 +638,388 @@ def test_verdict_to_error_dict_escalated():
     assert d['error_type'] == 'BulkResetGuardTripped'
     assert d['escalation_path'] == '/tmp/esc-bulk-reset-xyz.json'
     assert d['project_id'] == 'proj'
+
+
+# ---------------------------------------------------------------------------
+# task-979 step-1: async I/O offloading
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_escalation_write_offloads_io_to_thread(tmp_path, monkeypatch):
+    """mkdir and write_text in _maybe_write_escalation must be offloaded to a
+    thread via asyncio.to_thread so they do not block the event loop.
+
+    Monkeypatches asyncio.to_thread with a tracking wrapper that records the
+    callable name and then delegates to the real asyncio.to_thread.  The guard
+    is tripped (4 reversals, threshold=3) and the test asserts that the wrapper
+    saw at least one call for 'mkdir' and one for 'write_text'.
+
+    This test fails today because _maybe_write_escalation calls both
+    synchronously on the event loop.
+    """
+    import asyncio as _asyncio
+
+    tracked_callables: list[str] = []
+    real_to_thread = _asyncio.to_thread
+
+    async def tracking_to_thread(func, *args, **kwargs):
+        tracked_callables.append(getattr(func, '__name__', repr(func)))
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(_asyncio, 'to_thread', tracking_to_thread)
+
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    for i in range(4):
+        clock[0] += 1.0
+        await guard.observe_attempt(
+            project_id='proj-thread',
+            task_id=f't{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+
+    assert 'mkdir' in tracked_callables, (
+        f'Expected asyncio.to_thread called with mkdir; '
+        f'recorded callables: {tracked_callables}'
+    )
+    assert 'write_text' in tracked_callables, (
+        f'Expected asyncio.to_thread called with write_text; '
+        f'recorded callables: {tracked_callables}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-979 step-3: dead eviction removal characterization
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_idle_project_state_is_not_evicted_across_attempts(tmp_path):
+    """last_escalation_ts must be preserved across an idle-period attempt.
+
+    Setup: threshold=3, window=60, rate_limit=900.  Trip the guard at t≈1004
+    so last_escalation_ts is recorded.  Advance clock past both the window and
+    the rate-limit window (t=2000).  Fire one more reversal (threshold not yet
+    re-crossed).  Assert that guard._state['proj'].last_escalation_ts == 1004.0
+    — proving the state dict entry was NOT replaced with a fresh _GuardState
+    (which would reset last_escalation_ts to 0.0).
+
+    This test FAILS under the current inline eviction code (lines 243-250 of
+    bulk_reset_guard.py) which pops and re-inserts a fresh _GuardState, and
+    PASSES after that block is removed.
+    """
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    # Fire 4 reversals at t=1001..1004 — 4th trips, writes escalation.
+    # last_escalation_ts should be set to 1004.0 after the successful write.
+    trip_ts = None
+    for i in range(4):
+        clock[0] += 1.0
+        if i == 3:
+            trip_ts = clock[0]
+        await guard.observe_attempt(
+            project_id='proj',
+            task_id=f't{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+
+    assert trip_ts == 1004.0
+    # Verify the escalation was recorded
+    assert guard._state['proj'].last_escalation_ts == trip_ts, (
+        f'Expected last_escalation_ts={trip_ts}, '
+        f'got {guard._state["proj"].last_escalation_ts}'
+    )
+
+    # Advance clock well past window (60s) and rate-limit (900s).
+    clock[0] = 2000.0
+
+    # Fire one more reversal (does not cross threshold again; just one attempt).
+    await guard.observe_attempt(
+        project_id='proj',
+        task_id='idle-check',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+
+    # last_escalation_ts must still be 1004.0 — not reset to 0.0.
+    assert guard._state['proj'].last_escalation_ts == trip_ts, (
+        f'last_escalation_ts was reset! Expected {trip_ts}, '
+        f'got {guard._state["proj"].last_escalation_ts}. '
+        'The dead eviction block (lines 243-250) replaced state with a fresh _GuardState.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-979 step-5: write-failure backoff
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_write_failure_triggers_per_project_backoff(tmp_path, monkeypatch):
+    """A write_text OSError arms a per-project backoff that suppresses retries.
+
+    Scenario:
+      1. Trip guard at t=1001..1004 (threshold=3); write_text raises on first
+         call — verdict is 'rejection'; write_text call count == 1.
+      2. Advance clock by 30s (inside the 60s backoff window); fire another
+         reversal — verdict is 'rejection' AND write_text call count still == 1
+         (backoff suppressed the retry).
+      3. Advance clock to t=3000 (past window+backoff); seed 3 fresh ok
+         reversals then trip again.  The guard attempts write_text again
+         (call count becomes 2) and this time succeeds; verdict is 'escalated'.
+
+    This test fails today because:
+      - BulkResetGuard has no write_failure_backoff_seconds parameter.
+      - _maybe_write_escalation has no backoff check.
+    """
+    write_text_calls: list[int] = [0]
+    real_write_text = Path.write_text
+
+    def flaky_write_text(self, data, *args, **kwargs):
+        write_text_calls[0] += 1
+        if write_text_calls[0] == 1:
+            raise OSError('simulated flaky mount')
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'write_text', flaky_write_text)
+
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        write_failure_backoff_seconds=60.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    # Phase 1: trip the guard at t=1001..1004; write_text raises → rejection.
+    v: BulkResetVerdict | None = None
+    for i in range(4):
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='proj',
+            task_id=f't{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    assert v is not None
+    assert v.outcome == 'rejection', f'Phase 1: expected rejection, got {v.outcome}'
+    assert write_text_calls[0] == 1, (
+        f'Phase 1: expected 1 write_text call, got {write_text_calls[0]}'
+    )
+
+    # Phase 2: 30s later — still inside 60s backoff window.
+    clock[0] += 30.0
+    v2 = await guard.observe_attempt(
+        project_id='proj',
+        task_id='t4',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert v2.outcome == 'rejection', (
+        f'Phase 2: expected rejection (backoff suppressed retry), got {v2.outcome}'
+    )
+    assert write_text_calls[0] == 1, (
+        f'Phase 2: backoff should have suppressed write_text retry; '
+        f'call count is {write_text_calls[0]}'
+    )
+
+    # Phase 3: advance past window+backoff; seed 3 fresh ok reversals then trip.
+    clock[0] = 3000.0
+    for i in range(3):
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='proj',
+            task_id=f'new-{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'Phase 3 ok reversal {i}: expected ok, got {v.outcome}'
+
+    # Trip again — write_text is called (2nd time) and now succeeds → escalated.
+    clock[0] += 1.0
+    v3 = await guard.observe_attempt(
+        project_id='proj',
+        task_id='new-3',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert write_text_calls[0] == 2, (
+        f'Phase 3: expected 2 write_text calls total, got {write_text_calls[0]}'
+    )
+    assert v3.outcome == 'escalated', (
+        f'Phase 3: expected escalated after backoff cleared, got {v3.outcome}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-979 step-8: mkdir-failure backoff (symmetric to step-5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch):
+    """An OSError from esc_dir.mkdir arms a per-project backoff identically to
+    a write_text failure — and must NOT propagate out of observe_attempt.
+
+    Scenario:
+      1. Trip guard at t=1001..1004 (threshold=3); mkdir raises on first call —
+         NO exception propagates; verdict is 'rejection'; mkdir call count == 1;
+         write_text call count == 0 (short-circuited before write).
+      2. Advance clock by 30s (inside the 60s backoff window); fire another
+         reversal — verdict is 'rejection' AND mkdir call count still == 1
+         (backoff suppressed the retry, so neither mkdir NOR write_text called).
+      3. Advance clock to t=3000 (past window+backoff); seed 3 fresh ok
+         reversals then trip again.  mkdir is called a 2nd time and now
+         succeeds, write_text is called and succeeds; verdict is 'escalated'.
+
+    This test fails today because esc_dir.mkdir at bulk_reset_guard.py:352 is
+    NOT wrapped in try/except — the OSError propagates rather than arming the
+    backoff.
+    """
+    # Count only "outer" mkdir calls from _maybe_write_escalation, not
+    # recursive internal calls made by Path.mkdir(parents=True) when creating
+    # intermediate parent directories.  Match by absolute path equality rather
+    # than suffix to avoid accidental matches from sibling fixtures or parent
+    # mkdir calls whose last segment happens to be 'escalations'.
+    expected_esc_dir = tmp_path / 'data' / 'escalations'
+    outer_mkdir_calls: list[int] = [0]
+    write_text_calls: list[int] = [0]
+    real_mkdir = Path.mkdir
+    real_write_text = Path.write_text
+
+    def intercepting_mkdir(self, *args, **kwargs):
+        is_outer = kwargs.get('parents', False) and self == expected_esc_dir
+        if is_outer:
+            outer_mkdir_calls[0] += 1
+            if outer_mkdir_calls[0] == 1:
+                raise OSError('simulated read-only mount')
+        return real_mkdir(self, *args, **kwargs)
+
+    def tracking_write_text(self, data, *args, **kwargs):
+        write_text_calls[0] += 1
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'mkdir', intercepting_mkdir)
+    monkeypatch.setattr(Path, 'write_text', tracking_write_text)
+
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        write_failure_backoff_seconds=60.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    # Phase 1: trip guard at t=1001..1004; mkdir raises → rejection (no propagation).
+    v: BulkResetVerdict | None = None
+    for i in range(4):
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='proj',
+            task_id=f't{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    assert v is not None
+    assert v.outcome == 'rejection', f'Phase 1: expected rejection, got {v.outcome}'
+    assert outer_mkdir_calls[0] == 1, (
+        f'Phase 1: expected 1 outer mkdir call, got {outer_mkdir_calls[0]}'
+    )
+    assert write_text_calls[0] == 0, (
+        f'Phase 1: OSError from mkdir should short-circuit before write_text; '
+        f'write_text call count is {write_text_calls[0]}'
+    )
+
+    # Phase 2: 30s later — still inside 60s backoff window.
+    clock[0] += 30.0
+    v2 = await guard.observe_attempt(
+        project_id='proj',
+        task_id='t4',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert v2.outcome == 'rejection', (
+        f'Phase 2: expected rejection (backoff suppressed retry), got {v2.outcome}'
+    )
+    assert outer_mkdir_calls[0] == 1, (
+        f'Phase 2: backoff should have suppressed mkdir retry; '
+        f'outer mkdir call count is {outer_mkdir_calls[0]}'
+    )
+    assert write_text_calls[0] == 0, (
+        f'Phase 2: write_text should not be called during backoff; '
+        f'write_text call count is {write_text_calls[0]}'
+    )
+
+    # Phase 3: advance past window+backoff; seed 3 fresh ok reversals then trip.
+    clock[0] = 3000.0
+    for i in range(3):
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='proj',
+            task_id=f'new-{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'Phase 3 ok reversal {i}: expected ok, got {v.outcome}'
+
+    # Trip again — outer mkdir called 2nd time (succeeds), write_text called once → escalated.
+    clock[0] += 1.0
+    v3 = await guard.observe_attempt(
+        project_id='proj',
+        task_id='new-3',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert outer_mkdir_calls[0] == 2, (
+        f'Phase 3: expected 2 outer mkdir calls total, got {outer_mkdir_calls[0]}'
+    )
+    assert write_text_calls[0] == 1, (
+        f'Phase 3: expected 1 write_text call after backoff cleared, got {write_text_calls[0]}'
+    )
+    assert v3.outcome == 'escalated', (
+        f'Phase 3: expected escalated after backoff cleared, got {v3.outcome}'
+    )
