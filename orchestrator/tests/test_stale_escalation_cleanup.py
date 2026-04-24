@@ -41,6 +41,7 @@ def harness(tmp_path: Path, git_config: GitConfig) -> Harness:
     h.scheduler = MagicMock()
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.set_task_status = AsyncMock()
+    h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
 
     return h
 

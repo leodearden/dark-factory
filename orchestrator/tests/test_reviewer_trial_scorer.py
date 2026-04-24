@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
-import pytest
+from unittest.mock import AsyncMock, patch
 
+import pytest
+from shared.cli_invoke import AgentResult
+
+from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, GroundTruthIssue
+from orchestrator.evals.reviewer_trial.runner import PanelRunResult
 from orchestrator.evals.reviewer_trial.scorer import (
     IssueMatch,
     ScoringResult,
     _deduplicate_issues,
     _normalize_location,
+    match_issues,
+    score_panel_run,
 )
 
 
@@ -155,3 +162,195 @@ class TestScoringMetrics:
         assert result.recall == pytest.approx(0.5)
         assert result.precision == pytest.approx(0.6667, abs=0.001)
         assert result.f1 > 0
+
+
+def _make_matcher_result(cost_usd: float = 0.42, structured: dict | None = None, output: str = '') -> AgentResult:
+    """Build a real AgentResult for invoke_agent in match_issues.
+
+    Uses the actual AgentResult dataclass so that field-shape changes are
+    caught at test time rather than silently diverging via SimpleNamespace.
+    """
+    return AgentResult(
+        success=True,
+        output=output,
+        cost_usd=cost_usd,
+        structured_output=structured if structured is not None else {'matches': []},
+    )
+
+
+def _make_gt(gt_id: str = 'gt1') -> GroundTruthIssue:
+    return GroundTruthIssue(
+        id=gt_id,
+        location='a.py:1',
+        category='bug',
+        severity='blocking',
+        description='A bug',
+        mutation_type='logic',
+    )
+
+
+class TestMatchIssuesCost:
+    """Tests that match_issues returns a 3-tuple (matches, unmatched, cost_usd)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_three_tuple_with_cost(self) -> None:
+        """match_issues returns (matches, unmatched, cost_usd) capturing the LLM call cost."""
+        fake_result = _make_matcher_result(cost_usd=0.42, structured={'matches': []})
+        reviewer_issues = [{'location': 'a.py:1', 'category': 'bug', 'description': 'x'}]
+        ground_truth = [_make_gt('gt1')]
+
+        with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = fake_result
+            result = await match_issues(
+                reviewer_issues=reviewer_issues,
+                ground_truth=ground_truth,
+                diff_text='diff',
+            )
+
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+        matches, unmatched, cost = result
+        assert isinstance(matches, list)
+        assert isinstance(unmatched, list)
+        assert cost == pytest.approx(0.42)
+
+    @pytest.mark.asyncio
+    async def test_empty_inputs_cost_is_zero(self) -> None:
+        """match_issues returns 0.0 cost and does NOT call invoke_agent for empty inputs."""
+        with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            result_empty_reviewers = await match_issues(
+                reviewer_issues=[],
+                ground_truth=[_make_gt('gt1')],
+                diff_text='diff',
+            )
+            result_empty_gt = await match_issues(
+                reviewer_issues=[{'location': 'a.py:1', 'category': 'bug', 'description': 'x'}],
+                ground_truth=[],
+                diff_text='diff',
+            )
+            mock_invoke.assert_not_called()
+
+        assert result_empty_reviewers[2] == 0.0
+        assert result_empty_gt[2] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_unparseable_output_still_reports_cost(self) -> None:
+        """match_issues reports incurred cost even when LLM output is unparseable."""
+        fake_result = _make_matcher_result(cost_usd=0.42, structured=None, output='not json at all')
+        # Override structured_output to be None explicitly
+        fake_result.structured_output = None
+
+        reviewer_issues = [{'location': 'a.py:1', 'category': 'bug', 'description': 'x'}]
+        ground_truth = [_make_gt('gt1')]
+
+        with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = fake_result
+            result = await match_issues(
+                reviewer_issues=reviewer_issues,
+                ground_truth=ground_truth,
+                diff_text='diff',
+            )
+
+        matches, unmatched, cost = result
+        assert matches == []
+        assert unmatched == reviewer_issues
+        assert cost == pytest.approx(0.42)
+
+
+class TestScoringResultMatchCost:
+    """ScoringResult should carry a match_cost_usd field with default 0.0."""
+
+    def test_default_match_cost_is_zero(self) -> None:
+        result = ScoringResult(variant_name='v', diff_id='d')
+        assert result.match_cost_usd == 0.0
+        assert result.cost_usd == 0.0
+
+    def test_total_cost_usd_property_sums_panel_and_matcher(self) -> None:
+        """total_cost_usd property returns cost_usd + match_cost_usd."""
+        result = ScoringResult(variant_name='v', diff_id='d', cost_usd=1.25, match_cost_usd=0.37)
+        assert result.total_cost_usd == pytest.approx(1.25 + 0.37)
+
+    def test_total_cost_usd_defaults_to_zero(self) -> None:
+        """total_cost_usd is 0.0 when both components are at their defaults."""
+        result = ScoringResult(variant_name='v', diff_id='d')
+        assert result.total_cost_usd == pytest.approx(0.0)
+
+
+class TestScorePanelRunCost:
+    """score_panel_run should populate match_cost_usd from the matcher."""
+
+    @pytest.mark.asyncio
+    async def test_match_cost_populated_from_matcher(self) -> None:
+        """score_panel_run sets cost_usd=panel cost and match_cost_usd=matcher cost."""
+        diff = CorpusDiff(
+            diff_id='d1',
+            language='python',
+            source='synthetic',
+            diff_text='--- a/f.py\n+++ b/f.py',
+            description='Test diff',
+            ground_truth=[],
+        )
+        run = PanelRunResult(
+            variant_name='v1',
+            diff_id='d1',
+            total_cost_usd=1.25,
+            reviews={},
+            wall_clock_ms=100,
+        )
+
+        with patch('orchestrator.evals.reviewer_trial.scorer.match_issues', new_callable=AsyncMock) as mock_match:
+            mock_match.return_value = ([], [], 0.37)
+            score = await score_panel_run(run, diff)
+
+        assert score.cost_usd == pytest.approx(1.25)
+        assert score.match_cost_usd == pytest.approx(0.37)
+
+    @pytest.mark.asyncio
+    async def test_match_cost_and_recall_both_flow_with_nonempty_inputs(self) -> None:
+        """score_panel_run propagates non-zero recall/precision alongside match_cost_usd.
+
+        Integration guard: verifies that both cost legs AND the metric pipeline
+        fire correctly when reviews + ground_truth are non-empty.
+        """
+        gt_issue = _make_gt('gt1')
+        diff = CorpusDiff(
+            diff_id='d2',
+            language='python',
+            source='synthetic',
+            diff_text='--- a/f.py\n+++ b/f.py',
+            description='Test diff with GT',
+            ground_truth=[gt_issue],
+        )
+        reviewer_issue = {'location': 'a.py:1', 'category': 'bug', 'description': 'A bug'}
+        run = PanelRunResult(
+            variant_name='v1',
+            diff_id='d2',
+            total_cost_usd=2.00,
+            reviews={
+                'r1': {
+                    'verdict': 'NEEDS_CHANGES',
+                    'issues': [reviewer_issue],
+                }
+            },
+            wall_clock_ms=200,
+        )
+
+        matched = IssueMatch(
+            reviewer_issue=reviewer_issue,
+            ground_truth_id='gt1',
+            match_confidence=0.9,
+            match_reasoning='Same location and category.',
+        )
+
+        with patch('orchestrator.evals.reviewer_trial.scorer.match_issues', new_callable=AsyncMock) as mock_match:
+            # Return one match, no false positives, and a non-zero matcher cost
+            mock_match.return_value = ([matched], [], 0.25)
+            score = await score_panel_run(run, diff)
+
+        assert score.cost_usd == pytest.approx(2.00)
+        assert score.match_cost_usd == pytest.approx(0.25)
+        # 1 GT found out of 1 → recall == 1.0
+        assert score.recall == pytest.approx(1.0)
+        # 1 true positive out of 1 finding → precision == 1.0
+        assert score.precision == pytest.approx(1.0)
+        assert score.f1 == pytest.approx(1.0)

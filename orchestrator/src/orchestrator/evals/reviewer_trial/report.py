@@ -80,7 +80,7 @@ def _build_variant_summary(
     precisions = [s.precision for s in scores]
     f1s = [s.f1 for s in scores]
     blocking_recalls = [s.blocking_recall for s in scores]
-    costs = [s.cost_usd for s in scores]
+    costs = [s.total_cost_usd for s in scores]
     wall_clocks = [s.wall_clock_ms for s in scores]
 
     total_cost = sum(costs)
@@ -194,7 +194,7 @@ def build_trial_report(
             found_by_any.add(m.ground_truth_id)
     missed_by_all = sorted(all_gt_ids - found_by_any)
 
-    total_cost = sum(s.cost_usd for s in scores)
+    total_cost = sum(s.total_cost_usd for s in scores)
 
     return TrialReport(
         summaries=summaries,
