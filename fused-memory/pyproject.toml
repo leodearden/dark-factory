@@ -37,6 +37,13 @@ addopts = "-n auto --dist loadgroup"
 # thread method instead of signal: signal proved unreliable under pytest-xdist
 # workers in practice ("-n auto --dist loadgroup" above). See
 # orchestrator/pyproject.toml where signal is used without xdist.
+# Caveat: thread method is best-effort — it prints a stack trace but can't
+# actually interrupt a blocking asyncio.sleep in the main thread (see shared/
+# pyproject.toml where signal is load-bearing for that reason). Under xdist a
+# UsageGate-mock hang will still wedge the worker; the timeout logs the
+# traceback but the run may not abort cleanly. Converting such hangs into hard
+# failures requires fixing the mock (use shared.testing.make_gate_mock), not
+# leaning on this cap.
 timeout = 60
 timeout_method = "thread"
 
