@@ -123,7 +123,7 @@ async def test_graphiti_write_logs_backend_op(service, write_journal):
 @pytest.mark.asyncio
 async def test_dual_write_callback_enqueues_with_causation(service, write_journal):
     """Dual-write callback batch-enqueues facts with causation_id in payload."""
-    from tests.conftest import MockAddEpisodeResult, MockEdge
+    from conftest import MockAddEpisodeResult, MockEdge
 
     cid = str(uuid.uuid4())
     result = MockAddEpisodeResult(entity_edges=[

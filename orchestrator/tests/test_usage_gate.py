@@ -15,7 +15,7 @@ from shared.usage_gate import (
     _parse_resets_at,
 )
 
-from tests.conftest import build_usage_gate
+from conftest import build_usage_gate
 
 # --- Helpers ---
 

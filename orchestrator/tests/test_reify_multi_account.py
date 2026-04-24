@@ -20,7 +20,7 @@ import yaml
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import UsageGate
 
-from tests.conftest import build_usage_gate
+from conftest import build_usage_gate
 
 # ---------------------------------------------------------------------------
 # Constants — expected reify automation account pool (F→E→C→D)

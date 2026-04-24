@@ -13,13 +13,13 @@ def test_relaxed_schema_constant_exists_and_differs():
     """RELAXED_RECONCILIATION_SCHEMA must exist in conftest and correctly relax started_at.
 
     Asserts:
-    - RELAXED_RECONCILIATION_SCHEMA is importable from tests.conftest
+    - RELAXED_RECONCILIATION_SCHEMA is importable from conftest
     - 'started_at TEXT NOT NULL' is NOT in the relaxed schema
     - 'started_at TEXT' IS in the relaxed schema
     - The two schemas differ only in the NOT NULL constraint on started_at
       (forward check: RECONCILIATION_SCHEMA with that one replacement == RELAXED)
     """
-    from tests.conftest import RECONCILIATION_SCHEMA, RELAXED_RECONCILIATION_SCHEMA
+    from conftest import RECONCILIATION_SCHEMA, RELAXED_RECONCILIATION_SCHEMA
 
     # Relaxed schema must not have the NOT NULL constraint
     assert 'started_at TEXT NOT NULL' not in RELAXED_RECONCILIATION_SCHEMA
@@ -120,7 +120,7 @@ class TestGetRecentRuns:
     async def test_duration_with_mixed_naive_aware_timestamps(self, tmp_path):
         """Duration calculated correctly when started_at is naive and completed_at is aware."""
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
@@ -141,7 +141,7 @@ class TestGetRecentRuns:
         started_at) to simulate such production data corruption.
         """
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import RELAXED_RECONCILIATION_SCHEMA, make_recon_db
+        from conftest import RELAXED_RECONCILIATION_SCHEMA, make_recon_db
 
         inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
@@ -168,7 +168,7 @@ class TestGetRecentRuns:
         This exercises the ValueError branch of the try/except in get_recent_runs.
         """
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
@@ -196,7 +196,7 @@ class TestGetRecentRuns:
         (via 'started_at=' and 'completed_at=' substrings) for diagnosability.
         """
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
@@ -224,7 +224,7 @@ class TestGetRecentRuns:
         a healthy sibling row still has its duration computed correctly.
         """
         from dashboard.data.reconciliation import get_recent_runs
-        from tests.conftest import RELAXED_RECONCILIATION_SCHEMA, make_recon_db
+        from conftest import RELAXED_RECONCILIATION_SCHEMA, make_recon_db
 
         inserts = [
             # Bad row: NULL started_at, valid completed_at
@@ -291,7 +291,7 @@ class TestGetWatermarks:
     async def test_multiple_projects(self, tmp_path):
         """Returns watermarks for all projects ordered by project_id."""
         from dashboard.data.reconciliation import get_watermarks
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         inserts = [
             "INSERT INTO watermarks (project_id, last_full_run_completed)"
@@ -324,7 +324,7 @@ class TestGetLastAttemptedRun:
     async def test_failed_most_recent(self, tmp_path):
         """Returns a failed run when it's the most recent."""
         from dashboard.data.reconciliation import get_last_attempted_run
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
@@ -340,7 +340,7 @@ class TestGetLastAttemptedRun:
     async def test_multiple_projects(self, tmp_path):
         """Returns one entry per project, each the most recent run."""
         from dashboard.data.reconciliation import get_last_attempted_run
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
@@ -439,7 +439,7 @@ class TestGetBurstState:
         from datetime import UTC, datetime, timedelta
 
         from dashboard.data.reconciliation import get_burst_state
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         now = datetime.now(UTC)
         # last_write_at is 10 minutes ago — well past default 150s cooldown
@@ -462,7 +462,7 @@ class TestGetBurstState:
         from datetime import UTC, datetime, timedelta
 
         from dashboard.data.reconciliation import get_burst_state
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         now = datetime.now(UTC)
         # last_write_at is 30 seconds ago — within 150s cooldown
@@ -497,7 +497,7 @@ class TestGetBurstState:
     async def test_malformed_timestamp_logs_debug(self, tmp_path, caplog):
         """A malformed last_write_at in burst_state emits a DEBUG log with agent_id."""
         from dashboard.data.reconciliation import get_burst_state
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         inserts = [
             (
@@ -983,7 +983,7 @@ class TestMakeReconDb:
 
     async def test_creates_schema_and_executes_plain_sql_inserts(self, tmp_path):
         """make_recon_db creates schema tables and executes plain SQL inserts."""
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         inserts = [
             "INSERT INTO watermarks (project_id) VALUES ('proj-a')",
@@ -1001,7 +1001,7 @@ class TestMakeReconDb:
         """make_recon_db executes (sql, params) tuple inserts with bound parameters."""
         from datetime import UTC, datetime
 
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         now = datetime.now(UTC).isoformat()
         inserts = [
@@ -1023,14 +1023,14 @@ class TestMakeReconDb:
         """Connection yielded by make_recon_db has aiosqlite.Row as row_factory."""
         import aiosqlite as _aiosqlite
 
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         async with make_recon_db(tmp_path, []) as conn:
             assert conn.row_factory is _aiosqlite.Row
 
     async def test_custom_schema_kwarg(self, tmp_path):
         """Optional schema= kwarg overrides the default RECONCILIATION_SCHEMA."""
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         tiny_schema = 'CREATE TABLE IF NOT EXISTS foo (bar TEXT)'
         inserts = ["INSERT INTO foo (bar) VALUES ('hello')"]
@@ -1043,7 +1043,7 @@ class TestMakeReconDb:
 
     async def test_custom_name_kwarg(self, tmp_path):
         """Optional name= kwarg controls the DB filename."""
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         async with make_recon_db(tmp_path, [], name='custom.db') as conn:
             # Connection should still be functional
@@ -1052,7 +1052,7 @@ class TestMakeReconDb:
 
     async def test_connection_closed_after_context_exit(self, tmp_path):
         """Connection is closed after the context manager exits."""
-        from tests.conftest import make_recon_db
+        from conftest import make_recon_db
 
         captured = []
         async with make_recon_db(tmp_path, []) as conn:
