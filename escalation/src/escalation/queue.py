@@ -166,7 +166,8 @@ class EscalationQueue:
                     continue
                 seen.add(esc.id)
                 results.append(esc)
-            except (json.JSONDecodeError, KeyError, TypeError):
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse {path}: {e}')
                 continue
         return results
 

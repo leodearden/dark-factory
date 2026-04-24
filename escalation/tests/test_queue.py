@@ -263,10 +263,19 @@ class TestGetWithDuplicateArchiveCandidates:
             f"Expected resolution='newer' (from 2025-06-15 dir), got {result.resolution!r}"
         )
 
-        # (b) A WARNING must be emitted at logger 'escalation.queue' mentioning the id.
+        # (b) A WARNING must be emitted at logger 'escalation.queue' mentioning the id
+        # and both candidate paths, so an operator can locate the duplicate files.
+        older_path_str = str(older_dir / 'esc-1-1.json')
+        newer_path_str = str(newer_dir / 'esc-1-1.json')
         warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert any('esc-1-1' in msg for msg in warning_messages), (
             f'Expected a WARNING mentioning esc-1-1; got: {warning_messages}'
+        )
+        assert any(older_path_str in msg for msg in warning_messages), (
+            f'Expected WARNING to include older path {older_path_str!r}; got: {warning_messages}'
+        )
+        assert any(newer_path_str in msg for msg in warning_messages), (
+            f'Expected WARNING to include newer path {newer_path_str!r}; got: {warning_messages}'
         )
 
 
