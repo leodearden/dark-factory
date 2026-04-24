@@ -314,16 +314,15 @@ def _format_flagged(
         return 'No flagged items.'
     lines: list[str] = []
     running_chars = 0
-    rendered_count = 0
     first_item_fragmented = False
-    for item in items:
+    for idx, item in enumerate(items):
         json_str = json.dumps(item, default=str)
         line = f'- {json_str}'
         # +1 for the '\n' separator between lines
         separator = 1 if lines else 0
         if running_chars + separator + len(line) > budget_chars:
             # Budget exceeded — stop and emit a truncation footer + warning.
-            if rendered_count == 0:
+            if idx == 0:
                 # First item alone exceeds the budget.  Always show at least a
                 # truncated fragment so the LLM has some signal rather than an
                 # opaque footer-only body.
@@ -332,7 +331,7 @@ def _format_flagged(
                 if available > 0:
                     lines.append(f'- {json_str[:available]}{marker}')
                     first_item_fragmented = True
-            dropped = len(items) - rendered_count
+            dropped = len(items) - idx
             # Footer shows only items that are completely absent (not the
             # fragmented first item, which already appears as a truncated line).
             completely_missing = dropped - (1 if first_item_fragmented else 0)
@@ -340,7 +339,7 @@ def _format_flagged(
                 lines.append(f'... and {completely_missing} more (truncated: char budget)')
             extra: dict = {
                 'total': len(items),
-                'rendered': rendered_count,
+                'rendered': idx,
                 'dropped': dropped,
                 'budget_chars': budget_chars,
                 'first_item_fragmented': first_item_fragmented,
@@ -351,7 +350,6 @@ def _format_flagged(
             return '\n'.join(lines)
         lines.append(line)
         running_chars += separator + len(line)
-        rendered_count += 1
     return '\n'.join(lines)
 
 
