@@ -182,6 +182,34 @@ class TestCandidateHash:
         assert a.payload_hash() != b.payload_hash()
 
 
+class TestHashShapeContract16:
+    """Shape-contract regression guard for the two task_curator.py sha256 mirror sites
+    that lack an existing 16-char length assertion.
+
+    The canonical 16-char sha256-hex shape is owned by
+    ``orchestrator.agents.triage.sha256_16`` — see the docstring there for the full
+    enumeration of mirror sites.  The third curator mirror site,
+    ``TaskCurator._intra_batch_key``, is already guarded by
+    ``TestIntraBatchKey.test_returns_16_hex_chars`` (line ~1868); do not add duplicate
+    coverage here.  Anyone adding a fourth mirror site should add a corresponding
+    assertion to that test or this class.
+
+    These tests do NOT introspect docstrings — they verify actual hash output length,
+    mirroring the ``TestSha256_16.test_length_is_16`` pattern in
+    ``orchestrator/tests/test_triage_module.py``.
+    """
+
+    def test_payload_hash_is_16_chars(self):
+        """CandidateTask.payload_hash() returns a 16-char hex string."""
+        c = CandidateTask(title='t', description='d', details='x', files_to_modify=['f'])
+        assert len(c.payload_hash()) == 16
+
+    def test_normalize_key_is_16_chars(self):
+        """TaskCurator._normalize_key() returns a 16-char hex string."""
+        c = CandidateTask(title='t', files_to_modify=['f'])
+        assert len(TaskCurator._normalize_key(c)) == 16
+
+
 # ----------------------------------------------------------------------
 # Decision parsing tests — test the pure _parse_decision helper
 # ----------------------------------------------------------------------
