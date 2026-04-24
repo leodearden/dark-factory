@@ -119,8 +119,9 @@ class TestGetRecentRuns:
 
     async def test_duration_with_mixed_naive_aware_timestamps(self, tmp_path):
         """Duration calculated correctly when started_at is naive and completed_at is aware."""
-        from dashboard.data.reconciliation import get_recent_runs
         from conftest import make_recon_db
+
+        from dashboard.data.reconciliation import get_recent_runs
 
         inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
@@ -140,8 +141,9 @@ class TestGetRecentRuns:
         migrations or schema changes.  We create a relaxed schema (no NOT NULL on
         started_at) to simulate such production data corruption.
         """
-        from dashboard.data.reconciliation import get_recent_runs
         from conftest import RELAXED_RECONCILIATION_SCHEMA, make_recon_db
+
+        from dashboard.data.reconciliation import get_recent_runs
 
         inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
@@ -167,8 +169,9 @@ class TestGetRecentRuns:
 
         This exercises the ValueError branch of the try/except in get_recent_runs.
         """
-        from dashboard.data.reconciliation import get_recent_runs
         from conftest import make_recon_db
+
+        from dashboard.data.reconciliation import get_recent_runs
 
         inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
@@ -195,8 +198,9 @@ class TestGetRecentRuns:
         The debug log must include the raw started_at and completed_at values
         (via 'started_at=' and 'completed_at=' substrings) for diagnosability.
         """
-        from dashboard.data.reconciliation import get_recent_runs
         from conftest import make_recon_db
+
+        from dashboard.data.reconciliation import get_recent_runs
 
         inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at,"
@@ -223,8 +227,9 @@ class TestGetRecentRuns:
         Verifies per-row isolation: a bad row yields duration_seconds=None while
         a healthy sibling row still has its duration computed correctly.
         """
-        from dashboard.data.reconciliation import get_recent_runs
         from conftest import RELAXED_RECONCILIATION_SCHEMA, make_recon_db
+
+        from dashboard.data.reconciliation import get_recent_runs
 
         inserts = [
             # Bad row: NULL started_at, valid completed_at
@@ -290,8 +295,9 @@ class TestGetWatermarks:
 
     async def test_multiple_projects(self, tmp_path):
         """Returns watermarks for all projects ordered by project_id."""
-        from dashboard.data.reconciliation import get_watermarks
         from conftest import make_recon_db
+
+        from dashboard.data.reconciliation import get_watermarks
 
         inserts = [
             "INSERT INTO watermarks (project_id, last_full_run_completed)"
@@ -323,8 +329,9 @@ class TestGetLastAttemptedRun:
 
     async def test_failed_most_recent(self, tmp_path):
         """Returns a failed run when it's the most recent."""
-        from dashboard.data.reconciliation import get_last_attempted_run
         from conftest import make_recon_db
+
+        from dashboard.data.reconciliation import get_last_attempted_run
 
         inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
@@ -339,8 +346,9 @@ class TestGetLastAttemptedRun:
 
     async def test_multiple_projects(self, tmp_path):
         """Returns one entry per project, each the most recent run."""
-        from dashboard.data.reconciliation import get_last_attempted_run
         from conftest import make_recon_db
+
+        from dashboard.data.reconciliation import get_last_attempted_run
 
         inserts = [
             "INSERT INTO runs (id, project_id, run_type, trigger_reason, started_at, "
@@ -438,8 +446,9 @@ class TestGetBurstState:
         """Agents with last_write older than cooldown are reported as idle."""
         from datetime import UTC, datetime, timedelta
 
-        from dashboard.data.reconciliation import get_burst_state
         from conftest import make_recon_db
+
+        from dashboard.data.reconciliation import get_burst_state
 
         now = datetime.now(UTC)
         # last_write_at is 10 minutes ago — well past default 150s cooldown
@@ -461,8 +470,9 @@ class TestGetBurstState:
         """Agents with recent last_write keep bursting state."""
         from datetime import UTC, datetime, timedelta
 
-        from dashboard.data.reconciliation import get_burst_state
         from conftest import make_recon_db
+
+        from dashboard.data.reconciliation import get_burst_state
 
         now = datetime.now(UTC)
         # last_write_at is 30 seconds ago — within 150s cooldown
@@ -496,8 +506,9 @@ class TestGetBurstState:
 
     async def test_malformed_timestamp_logs_debug(self, tmp_path, caplog):
         """A malformed last_write_at in burst_state emits a DEBUG log with agent_id."""
-        from dashboard.data.reconciliation import get_burst_state
         from conftest import make_recon_db
+
+        from dashboard.data.reconciliation import get_burst_state
 
         inserts = [
             (
@@ -1022,7 +1033,6 @@ class TestMakeReconDb:
     async def test_row_factory_is_set(self, tmp_path):
         """Connection yielded by make_recon_db has aiosqlite.Row as row_factory."""
         import aiosqlite as _aiosqlite
-
         from conftest import make_recon_db
 
         async with make_recon_db(tmp_path, []) as conn:

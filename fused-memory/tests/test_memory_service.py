@@ -1934,8 +1934,9 @@ class TestSearchGraphitiFiltering:
         self, service_with_registry
     ):
         """Edge whose ALL episode UUIDs are in the planned registry is excluded by default."""
-        from fused_memory.models.scope import Scope
         from conftest import MockEdge
+
+        from fused_memory.models.scope import Scope
 
         ep1, ep2 = 'plan-ep-1', 'plan-ep-2'
         service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
@@ -1961,8 +1962,9 @@ class TestSearchGraphitiFiltering:
         self, service_with_registry
     ):
         """Edge with mixed episodes (some planned, some not) is NOT excluded."""
-        from fused_memory.models.scope import Scope
         from conftest import MockEdge
+
+        from fused_memory.models.scope import Scope
 
         ep_planned = 'plan-ep-1'
         ep_real = 'real-ep-2'
@@ -1989,8 +1991,9 @@ class TestSearchGraphitiFiltering:
         self, service_with_registry
     ):
         """Edge with no episode provenance is NOT excluded (not a planned edge)."""
-        from fused_memory.models.scope import Scope
         from conftest import MockEdge
+
+        from fused_memory.models.scope import Scope
 
         service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
             return_value={'plan-ep-1'}
@@ -2013,8 +2016,9 @@ class TestSearchGraphitiFiltering:
         self, service_with_registry
     ):
         """Edge with all non-planned episodes is NOT excluded."""
-        from fused_memory.models.scope import Scope
         from conftest import MockEdge
+
+        from fused_memory.models.scope import Scope
 
         service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
             return_value={'plan-ep-1'}
@@ -2035,8 +2039,9 @@ class TestSearchGraphitiFiltering:
     @pytest.mark.asyncio
     async def test_no_registry_does_not_filter(self, service):
         """When planned_episode_registry is None, no filtering occurs."""
-        from fused_memory.models.scope import Scope
         from conftest import MockEdge
+
+        from fused_memory.models.scope import Scope
 
         service.planned_episode_registry = None
         service.graphiti.search = AsyncMock(return_value=[
@@ -2066,8 +2071,9 @@ class TestSearchGraphitiIncludePlanned:
         self, service_with_registry
     ):
         """With include_planned=True, edges that would normally be filtered are included."""
-        from fused_memory.models.scope import Scope
         from conftest import MockEdge
+
+        from fused_memory.models.scope import Scope
 
         ep1, ep2 = 'plan-ep-1', 'plan-ep-2'
         service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
@@ -2095,8 +2101,9 @@ class TestSearchGraphitiIncludePlanned:
         self, service_with_registry
     ):
         """With include_planned=True, planned edges have metadata['planned'] = True."""
-        from fused_memory.models.scope import Scope
         from conftest import MockEdge
+
+        from fused_memory.models.scope import Scope
 
         ep1 = 'plan-ep-1'
         service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
@@ -2308,8 +2315,9 @@ class TestSearchGraphitiInvalidatedFiltering:
     @pytest.mark.asyncio
     async def test_edge_with_invalid_at_excluded(self, service):
         """Edge with non-null invalid_at is excluded from _search_graphiti results."""
-        from fused_memory.models.scope import Scope
         from conftest import MockEdge
+
+        from fused_memory.models.scope import Scope
 
         dt_invalid = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
         service.graphiti.search = AsyncMock(return_value=[
@@ -2332,8 +2340,9 @@ class TestSearchGraphitiInvalidatedFiltering:
     @pytest.mark.asyncio
     async def test_edge_without_invalid_at_not_excluded(self, service):
         """Edge with invalid_at=None (valid fact) is included in _search_graphiti results."""
-        from fused_memory.models.scope import Scope
         from conftest import MockEdge
+
+        from fused_memory.models.scope import Scope
 
         dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
         service.graphiti.search = AsyncMock(return_value=[
@@ -2357,8 +2366,9 @@ class TestSearchGraphitiInvalidatedFiltering:
     @pytest.mark.asyncio
     async def test_mixed_valid_and_invalidated_edges_filtered(self, service):
         """3 edges (2 valid, 1 invalidated) → exactly 2 results, invalidated excluded."""
-        from fused_memory.models.scope import Scope
         from conftest import MockEdge
+
+        from fused_memory.models.scope import Scope
 
         dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
         dt_invalid = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
@@ -2405,8 +2415,9 @@ class TestSearchGraphitiInvalidatedFiltering:
     @pytest.mark.asyncio
     async def test_results_truncated_to_limit(self, service):
         """When Graphiti returns more valid edges than limit, results are capped at limit."""
-        from fused_memory.models.scope import Scope
         from conftest import MockEdge
+
+        from fused_memory.models.scope import Scope
 
         dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
         # 15 valid edges returned by Graphiti
@@ -2433,8 +2444,9 @@ class TestSearchGraphitiInvalidatedFiltering:
         and 4 must score 1.0, 0.9, 0.8 respectively (score = max(0, 1 - i*0.05)),
         NOT re-ranked to 1.0, 0.95, 0.9 based on their post-filter positions.
         """
-        from fused_memory.models.scope import Scope
         from conftest import MockEdge
+
+        from fused_memory.models.scope import Scope
 
         dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
         dt_invalid = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)

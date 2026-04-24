@@ -13,9 +13,9 @@ from unittest.mock import patch
 
 import aiosqlite
 import pytest
+from _dt_helpers import make_fixed_datetime_cls
 
 import dashboard.data.merge_queue as _mqmod
-from _dt_helpers import make_fixed_datetime_cls
 
 # ---------------------------------------------------------------------------
 # Schema — events table from orchestrator/src/orchestrator/event_store.py
