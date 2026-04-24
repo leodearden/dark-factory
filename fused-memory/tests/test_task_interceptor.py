@@ -2534,6 +2534,13 @@ async def test_two_projects_do_not_serialise(
     tracker = _OverlapTracker()
     assert resolve_project_id('/projA') != resolve_project_id('/projB')
 
+    # Events for guaranteed rendezvous: each project signals when it has
+    # entered tm.add_task and waits for the other project to also be in-flight.
+    # This replaces the previous timing-based approach (50 sleep(0) iterations)
+    # which was flaky under heavy CI load (16 xdist workers).
+    projA_entered = asyncio.Event()
+    projB_entered = asyncio.Event()
+
     async def side_effect(**kwargs):
         pr = kwargs.get('project_root', '')
         key = resolve_project_id(pr)
@@ -2541,14 +2548,21 @@ async def test_two_projects_do_not_serialise(
         tracker._global_in_flight += 1
         tracker.total_peak = max(tracker.total_peak, tracker._global_in_flight)
         try:
-            # Enough ticks for the other project's task to enter.
-            # aiosqlite's background thread needs multiple event-loop ticks to
-            # complete ticket_store.get() (execute + fetchone, each routed
-            # through the thread executor).  Under system load (e.g. 16 xdist
-            # workers in parallel), the thread takes longer; 50 iterations gives
-            # comfortable margin even on a heavily loaded CI machine.
-            for _ in range(50):
-                await asyncio.sleep(0)
+            # Signal this project's entry and wait for the other project to
+            # enter too — guaranteeing true simultaneous overlap (total_peak==2)
+            # without relying on event-loop scheduling timing.
+            if key == resolve_project_id('/projA'):
+                projA_entered.set()
+                try:
+                    await asyncio.wait_for(projB_entered.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                projB_entered.set()
+                try:
+                    await asyncio.wait_for(projA_entered.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    pass
             return {'id': '1', 'title': kwargs.get('title', '')}
         finally:
             tracker.in_flight[key] -= 1
