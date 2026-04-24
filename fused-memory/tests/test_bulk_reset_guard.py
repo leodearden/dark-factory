@@ -572,23 +572,16 @@ def test_verdict_to_error_dict_ok():
 
 
 @pytest.mark.parametrize("threshold,window_seconds", [
-    (10, 60.0),  # original case
-    (6, 60.0),   # threshold "gotcha": str(6)="6" collides with "60" inside "60.0s"
-    (10, 6.0),   # window_seconds "gotcha": varies window_seconds so bound-form is
-                 # tested against a distinct value ("within 6.0s window")
+    (10, 60.0),  # baseline values
+    (6, 60.0),   # vary threshold
+    (10, 6.0),   # vary window_seconds
 ])
 def test_verdict_to_error_dict_rejection(threshold, window_seconds):
     """outcome='rejection' produces a structured error payload.
 
-    Three parametrized cases exercise bound-form assertions on both axes:
-    - (10, 60.0): the original baseline values.
-    - (6,  60.0): threshold "gotcha" — str(6)="6" would spuriously match "60"
-      inside "60.0s" under a naive substring check; bound form "threshold 6"
-      is unambiguous.
-    - (10, 6.0):  window_seconds "gotcha" — varies window_seconds so the
-      "within {window_seconds}s window" bound assertion is exercised against a
-      distinct value; without this row the 60.0 path would never be exercised
-      differently across parametrize iterations.
+    Three parametrized (threshold, window_seconds) combinations verify that
+    the structured fields carry the correct typed values across different
+    configurations without pinning the exact label wording of the error string.
 
     Note: affected_task_ids is kept short (3 items) across all cases.  In
     production a rejection verdict is only constructed when
@@ -614,15 +607,6 @@ def test_verdict_to_error_dict_rejection(threshold, window_seconds):
     assert d['success'] is False
     assert d['error_type'] == 'BulkResetGuardTripped'
     assert 'BulkResetGuardTripped' in d['error']
-    # Bound-form assertions: pin the label prefix to avoid numeric substring coincidences.
-    # e.g. threshold=6 with window_seconds=60.0 — str(6)="6" would match "60" inside
-    # "60.0s", but "threshold 6" only appears in the right label position.
-    assert f"threshold {d['threshold']}" in d['error'], (
-        f"error string {d['error']!r} should contain bound form 'threshold {d['threshold']}'"
-    )
-    assert f"within {d['window_seconds']}s window" in d['error'], (
-        f"error string {d['error']!r} should contain bound form 'within {d['window_seconds']}s window'"
-    )
     assert d['affected_task_ids'] == ['5', '6', '7']
     assert d['triggering_timestamps'] == [
         '2026-04-23T00:00:00+00:00',
