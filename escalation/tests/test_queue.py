@@ -468,7 +468,6 @@ class TestGetByTaskDedupAcrossArchive:
 
         # Simulate crash-mid-resolve / backup-restore: copy the archived file
         # back into the queue root with a modified resolution to test dedup precedence.
-        archived_path = archive_files[0]
         archived_esc = _make_escalation('esc-42-1', task_id='42', status='resolved')
         archived_esc.resolution = 'from_queue_root'
         (queue.queue_dir / 'esc-42-1.json').write_text(archived_esc.to_json())
