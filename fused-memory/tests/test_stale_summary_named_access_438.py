@@ -16,7 +16,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from conftest import make_rebuild_detail
+from _fm_helpers import make_rebuild_detail
 
 from fused_memory.backends.graphiti_client import (
     EdgeDict,

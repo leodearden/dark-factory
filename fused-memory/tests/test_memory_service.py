@@ -373,7 +373,7 @@ class TestDualWriteCallback:
     @pytest.mark.asyncio
     async def test_callback_enqueues_facts_as_batch(self, service):
         """_dual_write_callback should batch-enqueue extracted facts."""
-        from conftest import MockAddEpisodeResult, MockEdge
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
 
         result = MockAddEpisodeResult(entity_edges=[
             MockEdge(fact='Redis uses port 6379'),
@@ -396,7 +396,7 @@ class TestDualWriteCallback:
     @pytest.mark.asyncio
     async def test_callback_no_edges_is_noop(self, service):
         """No entity_edges → no enqueue."""
-        from conftest import MockAddEpisodeResult
+        from _fm_helpers import MockAddEpisodeResult
 
         result = MockAddEpisodeResult(entity_edges=[])
         await service._dual_write_callback('dual_write_episode', result, {'project_id': 'test'})
@@ -415,7 +415,7 @@ class TestDualWriteCallbackTemporalContext:
     @pytest.mark.asyncio
     async def test_temporal_context_planning_propagated(self, service):
         """When payload has temporal_context='planning', each batch item includes it."""
-        from conftest import MockAddEpisodeResult, MockEdge
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
 
         result = MockAddEpisodeResult(entity_edges=[
             MockEdge(fact='CostStore extends AgentResult'),
@@ -434,7 +434,7 @@ class TestDualWriteCallbackTemporalContext:
     @pytest.mark.asyncio
     async def test_no_temporal_context_absent_from_batch(self, service):
         """When temporal_context is absent in payload, it should NOT appear in batch items."""
-        from conftest import MockAddEpisodeResult, MockEdge
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
 
         result = MockAddEpisodeResult(entity_edges=[
             MockEdge(fact='Auth depends on Redis'),
@@ -603,7 +603,7 @@ class TestSearch:
     ):
         """When filtering by a GRAPHITI_PRIMARY category, Graphiti results
         (which have category=None) must NOT be silently dropped."""
-        from conftest import MockEdge, MockNode
+        from _fm_helpers import MockEdge, MockNode
 
         # Mock Graphiti returning edges (category=None in MemoryResult)
         service.graphiti.search = AsyncMock(return_value=[
@@ -643,7 +643,7 @@ class TestSearch:
     ):
         """When filtering by only MEM0_PRIMARY categories (e.g. preferences_and_norms),
         Graphiti results (category=None) should be correctly excluded."""
-        from conftest import MockEdge, MockNode
+        from _fm_helpers import MockEdge, MockNode
 
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
@@ -680,7 +680,7 @@ class TestSearch:
     ):
         """When exactly one GRAPHITI_PRIMARY category is in the filter,
         Graphiti results should have that category assigned (not left as None)."""
-        from conftest import MockEdge, MockNode
+        from _fm_helpers import MockEdge, MockNode
 
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
@@ -705,7 +705,7 @@ class TestSearch:
     @pytest.mark.asyncio
     async def test_search_graphiti_temporal_valid_at_only(self, service):
         """Graphiti search results with only valid_at set get temporal dict with null invalid_at."""
-        from conftest import MockEdge, MockNode
+        from _fm_helpers import MockEdge, MockNode
 
         dt_valid = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
         service.graphiti.search = AsyncMock(return_value=[
@@ -737,7 +737,7 @@ class TestSearch:
         with only invalid_at set was returned (len==1). After the fix, superseded
         edges are filtered out, so the result must be empty (len==0).
         """
-        from conftest import MockEdge, MockNode
+        from _fm_helpers import MockEdge, MockNode
 
         dt_invalid = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
         service.graphiti.search = AsyncMock(return_value=[
@@ -856,7 +856,7 @@ class TestSearchDeleteRoundtrip:
     @pytest.mark.asyncio
     async def test_search_then_delete_graphiti_roundtrip(self, service):
         """End-to-end contract test: search returns edge UUIDs that work with delete_memory."""
-        from conftest import MockEdge, MockNode
+        from _fm_helpers import MockEdge, MockNode
 
         edge_uuid = 'edge-roundtrip-uuid-42'
         service.graphiti.search = AsyncMock(return_value=[
@@ -1100,7 +1100,7 @@ class TestGetEntity:
     @pytest.mark.asyncio
     async def test_success_returns_nodes_and_edges(self, service):
         """Baseline regression: get_entity returns correct node and edge data."""
-        from conftest import MockEdge, MockNode
+        from _fm_helpers import MockEdge, MockNode
 
         mock_node = MockNode(name='Auth Service', uuid='node-uuid-1')
         mock_edge = MockEdge(fact='Auth service depends on Redis', uuid='edge-uuid-1')
@@ -1393,7 +1393,7 @@ class TestGetEntity:
     @pytest.mark.asyncio
     async def test_edges_include_temporal(self, service):
         """Edge dicts in get_entity result include a 'temporal' key with ISO 8601 strings."""
-        from conftest import MockEdge
+        from _fm_helpers import MockEdge
 
         dt_valid = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
         dt_invalid = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
@@ -1419,7 +1419,7 @@ class TestGetEntity:
     @pytest.mark.asyncio
     async def test_edges_only_valid_at_has_null_invalid_at(self, service):
         """When edge has only valid_at, temporal['invalid_at'] is None (not 'None')."""
-        from conftest import MockEdge
+        from _fm_helpers import MockEdge
 
         dt_valid = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
         mock_edge = MockEdge(
@@ -1529,7 +1529,7 @@ class TestDedupEpisodeEdges:
         """step-1: 3 edges with same (source, target, fact) → 2 removed."""
         from unittest.mock import AsyncMock
 
-        from conftest import MockAddEpisodeResult, MockEdge
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
 
         service.graphiti.bulk_remove_edges = AsyncMock(return_value=2)
 
@@ -1569,7 +1569,7 @@ class TestDedupEpisodeEdges:
         """step-3: all edges distinct → 0 removed, bulk_remove_edges NOT called."""
         from unittest.mock import AsyncMock
 
-        from conftest import MockAddEpisodeResult, MockEdge
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
 
         service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
 
@@ -1618,7 +1618,7 @@ class TestDedupEpisodeEdges:
         """step-5b: result with empty edges list → 0, no backend calls."""
         from unittest.mock import AsyncMock
 
-        from conftest import MockAddEpisodeResult
+        from _fm_helpers import MockAddEpisodeResult
 
         service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
 
@@ -1635,7 +1635,7 @@ class TestDedupEpisodeEdges:
         """step-6: case + whitespace normalization catches near-duplicate facts."""
         from unittest.mock import AsyncMock
 
-        from conftest import MockAddEpisodeResult, MockEdge
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
 
         service.graphiti.bulk_remove_edges = AsyncMock(return_value=1)
 
@@ -1668,7 +1668,7 @@ class TestDedupEpisodeEdges:
         """step-7: same fact text but different source/target pairs → distinct edges."""
         from unittest.mock import AsyncMock
 
-        from conftest import MockAddEpisodeResult, MockEdge
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
 
         service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
 
@@ -1720,7 +1720,7 @@ class TestExecuteGraphitiWriteWithDedup:
         """step-8: dedup is called after add_episode; duplicates are removed."""
         from unittest.mock import AsyncMock
 
-        from conftest import MockAddEpisodeResult, MockEdge
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
 
         dup_edges = [
             MockEdge(fact='X depends on Y', uuid='u1', source_node_uuid='s1', target_node_uuid='t1'),
@@ -1780,7 +1780,7 @@ class TestDualWriteCallbackEdgesField:
     @pytest.mark.asyncio
     async def test_callback_reads_real_edges_field(self, service):
         """result.edges (not result.entity_edges) drives dual-write enqueue."""
-        from conftest import MockAddEpisodeResult, MockEdge
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
 
         # Build a mock where entity_edges is empty but edges has content.
         # After our pre-1 fix, MockAddEpisodeResult mirrors entity_edges→edges,
@@ -1934,7 +1934,7 @@ class TestSearchGraphitiFiltering:
         self, service_with_registry
     ):
         """Edge whose ALL episode UUIDs are in the planned registry is excluded by default."""
-        from conftest import MockEdge
+        from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
 
@@ -1962,7 +1962,7 @@ class TestSearchGraphitiFiltering:
         self, service_with_registry
     ):
         """Edge with mixed episodes (some planned, some not) is NOT excluded."""
-        from conftest import MockEdge
+        from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
 
@@ -1991,7 +1991,7 @@ class TestSearchGraphitiFiltering:
         self, service_with_registry
     ):
         """Edge with no episode provenance is NOT excluded (not a planned edge)."""
-        from conftest import MockEdge
+        from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
 
@@ -2016,7 +2016,7 @@ class TestSearchGraphitiFiltering:
         self, service_with_registry
     ):
         """Edge with all non-planned episodes is NOT excluded."""
-        from conftest import MockEdge
+        from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
 
@@ -2039,7 +2039,7 @@ class TestSearchGraphitiFiltering:
     @pytest.mark.asyncio
     async def test_no_registry_does_not_filter(self, service):
         """When planned_episode_registry is None, no filtering occurs."""
-        from conftest import MockEdge
+        from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
 
@@ -2071,7 +2071,7 @@ class TestSearchGraphitiIncludePlanned:
         self, service_with_registry
     ):
         """With include_planned=True, edges that would normally be filtered are included."""
-        from conftest import MockEdge
+        from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
 
@@ -2101,7 +2101,7 @@ class TestSearchGraphitiIncludePlanned:
         self, service_with_registry
     ):
         """With include_planned=True, planned edges have metadata['planned'] = True."""
-        from conftest import MockEdge
+        from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
 
@@ -2315,7 +2315,7 @@ class TestSearchGraphitiInvalidatedFiltering:
     @pytest.mark.asyncio
     async def test_edge_with_invalid_at_excluded(self, service):
         """Edge with non-null invalid_at is excluded from _search_graphiti results."""
-        from conftest import MockEdge
+        from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
 
@@ -2340,7 +2340,7 @@ class TestSearchGraphitiInvalidatedFiltering:
     @pytest.mark.asyncio
     async def test_edge_without_invalid_at_not_excluded(self, service):
         """Edge with invalid_at=None (valid fact) is included in _search_graphiti results."""
-        from conftest import MockEdge
+        from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
 
@@ -2366,7 +2366,7 @@ class TestSearchGraphitiInvalidatedFiltering:
     @pytest.mark.asyncio
     async def test_mixed_valid_and_invalidated_edges_filtered(self, service):
         """3 edges (2 valid, 1 invalidated) → exactly 2 results, invalidated excluded."""
-        from conftest import MockEdge
+        from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
 
@@ -2415,7 +2415,7 @@ class TestSearchGraphitiInvalidatedFiltering:
     @pytest.mark.asyncio
     async def test_results_truncated_to_limit(self, service):
         """When Graphiti returns more valid edges than limit, results are capped at limit."""
-        from conftest import MockEdge
+        from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
 
@@ -2444,7 +2444,7 @@ class TestSearchGraphitiInvalidatedFiltering:
         and 4 must score 1.0, 0.9, 0.8 respectively (score = max(0, 1 - i*0.05)),
         NOT re-ranked to 1.0, 0.95, 0.9 based on their post-filter positions.
         """
-        from conftest import MockEdge
+        from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
 

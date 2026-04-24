@@ -1,17 +1,21 @@
-"""Shared test fixtures and test helper utilities."""
+"""pytest fixtures for fused-memory tests.
+
+Non-fixture helpers (MockEdge, make_rebuild_detail, extract_cypher, …)
+live in `_fm_helpers.py` — a uniquely-named sibling module — so they can
+be imported from test files without conflicting with sibling subprojects'
+conftests under `sys.modules['conftest']`.
+"""
 
 import os
 import sys
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-# Make this file directly importable by test modules via `from conftest import ...`.
-# Needed because the tests/ directory has __init__.py (package layout), so pytest
-# adds fused-memory/ (the parent) to sys.path rather than tests/ itself.
+# Make this file's directory importable by test modules so
+# `from _fm_helpers import ...` resolves regardless of whether pytest
+# is invoked from the subproject root or the workspace root.
 _tests_dir = os.path.dirname(os.path.abspath(__file__))
 if _tests_dir not in sys.path:
     sys.path.insert(0, _tests_dir)
@@ -38,50 +42,6 @@ from fused_memory.config.schema import (  # noqa: E402
     QueueConfig,
     RoutingConfig,
 )
-
-
-@dataclass
-class MockNode:
-    """Simulates a Graphiti entity node (source/target of an edge)."""
-
-    name: str
-    uuid: str = ''
-    labels: list[str] = field(default_factory=list)
-
-
-@dataclass
-class MockEdge:
-    """Simulates a Graphiti entity edge returned from add_episode or search."""
-
-    fact: str
-    uuid: str = ''
-    source_node: MockNode | None = None
-    target_node: MockNode | None = None
-    source_node_uuid: str = ''
-    target_node_uuid: str = ''
-    episodes: list[str] = field(default_factory=list)
-    valid_at: Any = None
-    invalid_at: Any = None
-
-
-@dataclass
-class MockAddEpisodeResult:
-    """Simulates the AddEpisodeResults returned by Graphiti's add_episode.
-
-    The real AddEpisodeResults class uses 'edges' as the field name.
-    We keep 'entity_edges' for backward compat with existing tests that
-    construct MockAddEpisodeResult(entity_edges=[...]).
-    """
-
-    entity_edges: list[MockEdge] = field(default_factory=list)
-    edges: list[MockEdge] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        # If only entity_edges was provided, mirror it to edges so both fields
-        # are populated.  This preserves backward compat while ensuring the
-        # 'edges' field (used by the real AddEpisodeResults) is accessible.
-        if self.edges == [] and self.entity_edges:
-            self.edges = list(self.entity_edges)
 
 
 @pytest.fixture(autouse=True)
@@ -120,14 +80,7 @@ def standard_mock_config() -> MagicMock:
 
 @pytest.fixture
 def make_backend():
-    """Factory fixture: returns a callable(config) -> GraphitiBackend with mock client.
-
-    Usage::
-
-        def test_foo(self, mock_config, make_backend):
-            backend = make_backend(mock_config)
-            backend.client.some_method.return_value = ...
-    """
+    """Factory fixture: returns a callable(config) -> GraphitiBackend with mock client."""
     def _factory(config) -> GraphitiBackend:
         backend = GraphitiBackend(config)
         backend.client = MagicMock()
@@ -142,21 +95,6 @@ def make_graph_mock():
     """Factory fixture: returns a callable(rows, *, ro_rows, q_rows) -> MagicMock graph.
 
     The returned mock has both .query and .ro_query as AsyncMocks.
-
-    Basic usage (backward-compatible): both .query and .ro_query return the same
-    result whose .result_set is *rows*::
-
-        graph = make_graph_mock([['uuid-1', 'label']])
-
-    Split usage: supply *ro_rows* and/or *q_rows* to give each path a distinct
-    result_set.  This is useful when ro_query and query must return different data
-    (e.g. delete_entity_node: pre-check returns a row, DETACH DELETE returns [])::
-
-        graph = make_graph_mock(ro_rows=[['NodeName', 'summary']], q_rows=[])
-
-    The returned graph mock can be wired up as::
-
-        backend._driver._get_graph = MagicMock(return_value=graph)
     """
     def _factory(
         rows: list[list] | None = None,
@@ -165,13 +103,11 @@ def make_graph_mock():
         q_rows: list[list] | None = None,
     ) -> MagicMock:
         if ro_rows is not None or q_rows is not None:
-            # Split mode: create separate result objects for each path.
             ro_result = MagicMock()
             ro_result.result_set = ro_rows if ro_rows is not None else (rows or [])
             q_result = MagicMock()
             q_result.result_set = q_rows if q_rows is not None else (rows or [])
         else:
-            # Shared mode (backward-compatible): both paths use the same result.
             ro_result = MagicMock()
             ro_result.result_set = rows if rows is not None else []
             q_result = ro_result
@@ -186,22 +122,7 @@ def make_graph_mock():
 
 @pytest.fixture
 def make_fake_maintenance_service():
-    """Factory fixture: returns a callable(mock_cfg, mock_service) -> async context manager.
-
-    The returned async context manager yields (mock_cfg, mock_service) and is
-    suitable for use as the side_effect of a patched maintenance_service.
-
-    Usage::
-
-        def test_foo(self, make_fake_maintenance_service):
-            mock_cfg = MagicMock()
-            mock_service = AsyncMock()
-            with patch(
-                'fused_memory.maintenance.reindex.maintenance_service',
-                side_effect=make_fake_maintenance_service(mock_cfg, mock_service),
-            ):
-                ...
-    """
+    """Factory fixture: returns a callable(mock_cfg, mock_service) -> async context manager."""
     def _factory(mock_cfg, mock_service):
         @asynccontextmanager
         async def fake(config_path):
@@ -214,17 +135,7 @@ def make_fake_maintenance_service():
 
 @pytest.fixture
 def make_edge_backend():
-    """Factory fixture: returns a callable(backend, *, nodes, edges) -> backend.
-
-    Takes a pre-built backend, wires list_entity_nodes and get_all_valid_edges
-    as AsyncMocks, and returns the same backend for one-line composition.
-
-    Usage::
-
-        def test_foo(self, mock_config, make_backend, make_edge_backend):
-            backend = make_edge_backend(make_backend(mock_config), nodes=[...], edges={...})
-            result = await backend.detect_stale_summaries(group_id='test')
-    """
+    """Factory fixture: returns a callable(backend, *, nodes, edges) -> backend."""
     def _factory(backend, *, nodes, edges):
         backend.list_entity_nodes = AsyncMock(return_value=nodes)
         backend.get_all_valid_edges = AsyncMock(return_value=edges)
@@ -265,115 +176,3 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
             data_dir=str(tmp_path / 'queue'),
         ),
     )
-
-
-# ---------------------------------------------------------------------------
-# call_args extraction helpers (task-435)
-#
-# Graph query methods (graph.query / graph.ro_query) may be called with the
-# Cypher string and params dict either positionally or as keyword arguments.
-# These two helpers extract the relevant value from a mock call_args object
-# regardless of calling convention, eliminating fragile bare args[N] accesses
-# that throw opaque IndexError when the implementation switches to keyword-passing.
-#
-# Usage in tests:
-#   call_args = graph.ro_query.call_args
-#   cypher = extract_cypher(call_args)   # str
-#   params = extract_params(call_args)   # dict
-# ---------------------------------------------------------------------------
-
-
-async def assert_ro_query_only(
-    backend,
-    make_graph_mock_fn,
-    rows: list[list],
-    method_name: str,
-    *args,
-    **kwargs,
-) -> MagicMock:
-    """Assert that a backend method uses ro_query and never calls query.
-
-    Creates a graph mock via *make_graph_mock_fn*, wires it into
-    *backend._driver._get_graph*, invokes the named method, then asserts:
-      - graph.ro_query was awaited exactly once
-      - graph.query was not awaited at all
-
-    Returns the graph mock so callers can add additional assertions (e.g.
-    inspecting Cypher content via graph.ro_query.call_args).
-
-    Usage::
-
-        graph = await assert_ro_query_only(
-            backend, make_graph_mock, [['Node', 'Summary']],
-            'get_node_text', 'uuid-1', group_id='test',
-        )
-    """
-    graph = make_graph_mock_fn(rows)
-    backend._driver._get_graph = MagicMock(return_value=graph)
-    await getattr(backend, method_name)(*args, **kwargs)
-    graph.ro_query.assert_awaited_once()
-    graph.query.assert_not_awaited()
-    return graph
-
-
-_REBUILD_DETAIL_NO_ERROR = object()  # sentinel — distinguishes "error not provided" from None
-
-
-def make_rebuild_detail(
-    uuid: str,
-    name: str,
-    *,
-    old_summary: str = '',
-    new_summary: str = '',
-    edge_count: int = 0,
-    status: str = 'rebuilt',
-    error: Any = _REBUILD_DETAIL_NO_ERROR,
-) -> dict:
-    """Return a rebuild-detail dict for use in rebuild pipeline tests.
-
-    uuid and name are positional; all other parameters are keyword-only.
-
-    The base 6-key shape (uuid, name, old_summary, new_summary, edge_count,
-    status) matches the detail-entry shape that rebuild_entity_summaries
-    constructs when it aggregates results.  Note that the lower-level helpers
-    _rebuild_entity_from_edges and refresh_entity_summary return only the
-    5-key subset (no 'status'); pass a raw 5-key dict when mocking those
-    methods to preserve production fidelity.
-
-    Pass ``error=None`` (or any value) to include an 'error' key in the
-    returned dict — useful for rebuild_entity_summaries detail entries that
-    carry an error field.  When omitted, 'error' is absent from the dict.
-    """
-    d: dict = {
-        'uuid': uuid,
-        'name': name,
-        'old_summary': old_summary,
-        'new_summary': new_summary,
-        'edge_count': edge_count,
-        'status': status,
-    }
-    if error is not _REBUILD_DETAIL_NO_ERROR:
-        d['error'] = error
-    return d
-
-
-def extract_cypher(call_args: Any) -> str:
-    """Return the Cypher query string from a mock call_args object.
-
-    Checks positional args[0] first, then falls back to the 'query' keyword
-    argument. Returns '' if neither is present.
-    """
-    if call_args.args:
-        return call_args.args[0]
-    return call_args.kwargs.get('query', '')
-
-
-def extract_params(call_args: Any) -> dict:
-    """Return the Cypher params dict from a mock call_args object.
-
-    Checks positional args[1] first, then falls back to the 'params' keyword
-    argument. Returns {} if neither is present.
-    """
-    if len(call_args.args) > 1:
-        return call_args.args[1]
-    return call_args.kwargs.get('params', {})

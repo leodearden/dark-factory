@@ -1,0 +1,131 @@
+"""Non-fixture test helpers for fused-memory tests.
+
+Lives outside conftest.py to avoid the `sys.modules['conftest']` collision
+that arises when root-level pytest loads multiple subprojects' conftests in
+the same process.  Each subproject exports its helpers under a unique
+module name so test files can `from _fm_helpers import X` without
+colliding with sibling subprojects' helpers.
+"""
+
+from dataclasses import dataclass, field
+from typing import Any
+from unittest.mock import MagicMock
+
+
+@dataclass
+class MockNode:
+    """Simulates a Graphiti entity node (source/target of an edge)."""
+
+    name: str
+    uuid: str = ''
+    labels: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MockEdge:
+    """Simulates a Graphiti entity edge returned from add_episode or search."""
+
+    fact: str
+    uuid: str = ''
+    source_node: MockNode | None = None
+    target_node: MockNode | None = None
+    source_node_uuid: str = ''
+    target_node_uuid: str = ''
+    episodes: list[str] = field(default_factory=list)
+    valid_at: Any = None
+    invalid_at: Any = None
+
+
+@dataclass
+class MockAddEpisodeResult:
+    """Simulates the AddEpisodeResults returned by Graphiti's add_episode.
+
+    The real AddEpisodeResults class uses 'edges' as the field name.
+    We keep 'entity_edges' for backward compat with existing tests that
+    construct MockAddEpisodeResult(entity_edges=[...]).
+    """
+
+    entity_edges: list[MockEdge] = field(default_factory=list)
+    edges: list[MockEdge] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.edges == [] and self.entity_edges:
+            self.edges = list(self.entity_edges)
+
+
+async def assert_ro_query_only(
+    backend,
+    make_graph_mock_fn,
+    rows: list[list],
+    method_name: str,
+    *args,
+    **kwargs,
+) -> MagicMock:
+    """Assert that a backend method uses ro_query and never calls query.
+
+    Creates a graph mock via *make_graph_mock_fn*, wires it into
+    *backend._driver._get_graph*, invokes the named method, then asserts:
+      - graph.ro_query was awaited exactly once
+      - graph.query was not awaited at all
+
+    Returns the graph mock so callers can add additional assertions.
+    """
+    graph = make_graph_mock_fn(rows)
+    backend._driver._get_graph = MagicMock(return_value=graph)
+    await getattr(backend, method_name)(*args, **kwargs)
+    graph.ro_query.assert_awaited_once()
+    graph.query.assert_not_awaited()
+    return graph
+
+
+_REBUILD_DETAIL_NO_ERROR = object()  # sentinel — distinguishes "error not provided" from None
+
+
+def make_rebuild_detail(
+    uuid: str,
+    name: str,
+    *,
+    old_summary: str = '',
+    new_summary: str = '',
+    edge_count: int = 0,
+    status: str = 'rebuilt',
+    error: Any = _REBUILD_DETAIL_NO_ERROR,
+) -> dict:
+    """Return a rebuild-detail dict for use in rebuild pipeline tests.
+
+    Pass ``error=None`` (or any value) to include an 'error' key in the
+    returned dict.  When omitted, 'error' is absent from the dict.
+    """
+    d: dict = {
+        'uuid': uuid,
+        'name': name,
+        'old_summary': old_summary,
+        'new_summary': new_summary,
+        'edge_count': edge_count,
+        'status': status,
+    }
+    if error is not _REBUILD_DETAIL_NO_ERROR:
+        d['error'] = error
+    return d
+
+
+def extract_cypher(call_args: Any) -> str:
+    """Return the Cypher query string from a mock call_args object.
+
+    Checks positional args[0] first, then falls back to the 'query' keyword
+    argument. Returns '' if neither is present.
+    """
+    if call_args.args:
+        return call_args.args[0]
+    return call_args.kwargs.get('query', '')
+
+
+def extract_params(call_args: Any) -> dict:
+    """Return the Cypher params dict from a mock call_args object.
+
+    Checks positional args[1] first, then falls back to the 'params' keyword
+    argument. Returns {} if neither is present.
+    """
+    if len(call_args.args) > 1:
+        return call_args.args[1]
+    return call_args.kwargs.get('params', {})

@@ -1,13 +1,16 @@
 """Structural invariants ensuring root pytest can collect all subprojects.
 
 These tests are file-content / filesystem checks (no subprocess, no pytest-in-pytest).
-They guard the four conditions that together prevent the tests.conftest namespace
+They guard the conditions that together prevent the tests.conftest namespace
 collision under --import-mode=importlib:
 
 1. Each subproject's conftest.py adds its own tests/ dir to sys.path.
 2. No test file uses `from tests.<module> import ...` (namespace-relative imports).
 3. No subproject has tests/__init__.py (which causes the collision).
 4. Root pyproject.toml does not set norecursedirs (the workaround is no longer needed).
+5. No test file uses `from conftest import ...`.  The bare `conftest` module name
+   collides in `sys.modules` across subprojects — each subproject exports its
+   non-fixture helpers under a uniquely-named sibling module instead.
 
 See also:
   - tests/scripts/test_dashboard_service_template.py  — file-content pattern reference
@@ -34,6 +37,9 @@ _TESTS_DIR_INSERT_RE = re.compile(
 
 # Regex that matches `from tests.<module> import ...` imports (including indented).
 _FROM_TESTS_RE = re.compile(r'^\s*from\s+tests\.')
+
+# Regex that matches `from conftest import ...` (including indented, lazy imports).
+_FROM_CONFTEST_RE = re.compile(r'^\s*from\s+conftest\s+import\b')
 
 # All test directories to scan for namespace-relative imports and __init__.py files.
 # Vendored sub-libraries (graphiti, mem0, taskmaster-ai) inside fused-memory are excluded.
@@ -115,6 +121,46 @@ def test_no_tests_namespace_imports_in_subproject_tests() -> None:
         + '  `from tests.conftest import X` → `from conftest import X`\n'
         + '  `from tests._dt_helpers import X` → `from _dt_helpers import X`\n'
         + '  `from tests.test_costs_data import X` → `from test_costs_data import X`\n'
+        + 'Offenders:\n'
+        + '\n'.join(f'  {o}' for o in offenders)
+    )
+
+
+def test_no_from_conftest_imports_in_subproject_tests() -> None:
+    """No test file may use `from conftest import ...`.
+
+    The bare name `conftest` is shared across every subproject's conftest.py,
+    and Python's `sys.modules` can only cache one module under that name at a
+    time.  When root-level pytest loads multiple subprojects in the same
+    process, whichever conftest loads first wins the cache slot — subsequent
+    `from conftest import X` calls in other subprojects resolve to the wrong
+    module and fail with ImportError at test-execution time.
+
+    Each subproject instead exports its non-fixture helpers under a uniquely-
+    named sibling module (``_fm_helpers.py``, ``_orch_helpers.py``,
+    ``_dashboard_helpers.py``).  Test files import from those modules.
+
+    Offender format in the assertion message: path:lineno: line
+    """
+    offenders: list[str] = []
+    for test_dir in _ALL_TEST_DIRS:
+        if not test_dir.exists():
+            continue
+        for py_file in sorted(test_dir.rglob('*.py')):
+            rel = py_file.relative_to(REPO_ROOT)
+            if _VENDORED_PARTS & set(rel.parts):
+                continue
+            source = py_file.read_text(encoding='utf-8')
+            for lineno, line in enumerate(source.splitlines(), start=1):
+                if _FROM_CONFTEST_RE.match(line):
+                    offenders.append(f'{rel}:{lineno}: {line.rstrip()}')
+
+    assert not offenders, (
+        f'Found {len(offenders)} `from conftest import` call(s) in test files.\n'
+        + 'Rewrite to the subproject-specific helper module:\n'
+        + '  fused-memory/tests/*  → `from _fm_helpers import X`\n'
+        + '  orchestrator/tests/*  → `from _orch_helpers import X`\n'
+        + '  dashboard/tests/*     → `from _dashboard_helpers import X`\n'
         + 'Offenders:\n'
         + '\n'.join(f'  {o}' for o in offenders)
     )
