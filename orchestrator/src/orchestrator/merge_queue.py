@@ -63,7 +63,46 @@ async def _check_plan_targets_in_tree(
         )
         if rc != 0:
             missing.append(f)
-    return missing
+
+    if not missing:
+        return []
+
+    # Cross-reference missing files against intentional deletions performed
+    # by done plan-steps.  A file absent from the merge tree but deleted by
+    # a done step is "expected absent" and should NOT be flagged as a drop.
+    expected_absent: set[str] = set()
+    for step_idx, step in enumerate(plan.get('steps') or []):
+        if step.get('status') != 'done':
+            continue
+        commit = step.get('commit')
+        if not commit:
+            continue
+        rc, stdout, stderr = await _run(
+            [
+                'git', 'show',
+                '--diff-filter=D',
+                '--name-only',
+                '--format=',
+                commit,
+            ],
+            cwd=git_ops.project_root,
+        )
+        if rc != 0:
+            logger.warning(
+                'git show --diff-filter=D failed for step %d commit %s: %s',
+                step_idx, commit, stderr.strip(),
+            )
+            continue
+        for line in stdout.splitlines():
+            path = line.strip()
+            if path:
+                expected_absent.add(path)
+                logger.debug(
+                    'File %s expected absent (deleted in step %d: %s)',
+                    path, step_idx, commit,
+                )
+
+    return [f for f in missing if f not in expected_absent]
 
 
 ABANDONED_REASON_PREFIX = 'Post-merge verify timed out'
