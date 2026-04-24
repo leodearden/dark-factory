@@ -715,3 +715,77 @@ async def test_escalation_write_offloads_io_to_thread(tmp_path, monkeypatch):
         f'Expected asyncio.to_thread called with write_text; '
         f'recorded callables: {tracked_callables}'
     )
+
+
+# ---------------------------------------------------------------------------
+# task-979 step-3: dead eviction removal characterization
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_idle_project_state_is_not_evicted_across_attempts(tmp_path):
+    """last_escalation_ts must be preserved across an idle-period attempt.
+
+    Setup: threshold=3, window=60, rate_limit=900.  Trip the guard at t≈1004
+    so last_escalation_ts is recorded.  Advance clock past both the window and
+    the rate-limit window (t=2000).  Fire one more reversal (threshold not yet
+    re-crossed).  Assert that guard._state['proj'].last_escalation_ts == 1004.0
+    — proving the state dict entry was NOT replaced with a fresh _GuardState
+    (which would reset last_escalation_ts to 0.0).
+
+    This test FAILS under the current inline eviction code (lines 243-250 of
+    bulk_reset_guard.py) which pops and re-inserts a fresh _GuardState, and
+    PASSES after that block is removed.
+    """
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    # Fire 4 reversals at t=1001..1004 — 4th trips, writes escalation.
+    # last_escalation_ts should be set to 1004.0 after the successful write.
+    trip_ts = None
+    for i in range(4):
+        clock[0] += 1.0
+        if i == 3:
+            trip_ts = clock[0]
+        await guard.observe_attempt(
+            project_id='proj',
+            task_id=f't{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+
+    assert trip_ts == 1004.0
+    # Verify the escalation was recorded
+    assert guard._state['proj'].last_escalation_ts == trip_ts, (
+        f'Expected last_escalation_ts={trip_ts}, '
+        f'got {guard._state["proj"].last_escalation_ts}'
+    )
+
+    # Advance clock well past window (60s) and rate-limit (900s).
+    clock[0] = 2000.0
+
+    # Fire one more reversal (does not cross threshold again; just one attempt).
+    await guard.observe_attempt(
+        project_id='proj',
+        task_id='idle-check',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+
+    # last_escalation_ts must still be 1004.0 — not reset to 0.0.
+    assert guard._state['proj'].last_escalation_ts == trip_ts, (
+        f'last_escalation_ts was reset! Expected {trip_ts}, '
+        f'got {guard._state["proj"].last_escalation_ts}. '
+        'The dead eviction block (lines 243-250) replaced state with a fresh _GuardState.'
+    )
