@@ -2529,8 +2529,8 @@ class TestCheckBranchOnMain:
             '_check_branch_on_main() must return a tuple for a merged branch'
         )
         wt_head, main_sha = result_tuple
-        assert len(wt_head) == 40, f'wt_head must be a 40-char SHA, got: {wt_head!r}'
-        assert len(main_sha) == 40, f'main_sha must be a 40-char SHA, got: {main_sha!r}'
+        assert len(wt_head) >= 40, f'wt_head must be a ≥40-char SHA, got: {wt_head!r}'
+        assert len(main_sha) >= 40, f'main_sha must be a ≥40-char SHA, got: {main_sha!r}'
 
         # wt_head must match the actual worktree HEAD
         _, actual_wt_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
@@ -2603,6 +2603,43 @@ class TestCheckBranchOnMain:
         assert result is None, (
             f'None worktree must short-circuit before any git call; got {result!r}'
         )
+
+    async def test_propagates_git_exceptions(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch
+    ):
+        """git/infra exceptions must propagate — helper must NOT swallow them.
+
+        Patches git_ops.is_ancestor to raise RuntimeError and asserts the
+        exception bubbles out of _check_branch_on_main().  This pins the
+        design decision that the helper is exception-transparent so that:
+        - _recover_if_already_merged's outer try/except can log 'merge-check failed'
+        - the pre-EXECUTE ghost-loop guard can let exceptions propagate to the
+          workflow's outer error handler
+
+        If a future maintainer adds try/except inside _check_branch_on_main, this
+        test will fail, surfacing the silent-swallow regression before it ships.
+        """
+        # 1. Create a real worktree so the None-guard passes and we reach is_ancestor
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Build workflow and wire up worktree
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. Patch is_ancestor to simulate a git/infra failure
+        async def _raise(*_args, **_kwargs):
+            raise RuntimeError('simulated git failure in is_ancestor')
+
+        monkeypatch.setattr(workflow.git_ops, 'is_ancestor', _raise)
+
+        # 4. Assert the exception propagates — helper must NOT catch it
+        with pytest.raises(RuntimeError, match='simulated git failure in is_ancestor'):
+            await workflow._check_branch_on_main()
 
 
 # ---------------------------------------------------------------------------

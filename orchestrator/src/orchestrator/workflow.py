@@ -2471,6 +2471,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         there is prior implementation work.  Returns None in all other cases
         (branch not merged, no prior work, missing worktree/git_ops, exceptions).
         """
+        # Intentional double-check: _check_branch_on_main() has its own
+        # None-guard and would return None silently, but this outer check lets
+        # us emit the 'skipping merge-recovery' DEBUG log so the missing-wiring
+        # condition is observable at the call-site level.
         if self.worktree is None or self.git_ops is None:
             logger.debug(
                 'Task %s: skipping merge-recovery (no worktree or git_ops)',
