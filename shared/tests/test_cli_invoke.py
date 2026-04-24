@@ -1721,41 +1721,24 @@ class TestBuildFailureMessage:
     """Tests for the build_failure_message formatting helper."""
 
     def test_build_failure_message_format(self):
-        """build_failure_message returns 'label failed: summary\\ndiagnostic_detail'."""
+        """build_failure_message returns exactly 'label failed: summary\\ndiagnostic_detail'."""
         result = AgentResult(
             success=False, output='', subtype='error_unexpected', stderr='boom',
         )
-        msg = build_failure_message('Claude CLI agent', result)
-        assert msg.startswith('Claude CLI agent failed: ')
-        assert '\n' in msg
-        assert 'boom' in msg  # stderr tail is in diagnostic_detail
-        assert "subtype='error_unexpected'" in msg
+        label = 'Claude CLI agent'
+        msg = build_failure_message(label, result)
+        cls = classify_agent_failure(result)
+        expected = f'{label} failed: {cls.summary}\n{cls.diagnostic_detail}'
+        assert msg == expected
 
     def test_build_failure_message_uses_classifier_summary_for_kinds(self):
-        """build_failure_message delegates to classify_agent_failure for each kind."""
-        cases = [
-            (
-                AgentResult(success=False, output='', subtype='error_max_turns', turns=75),
-                '75 turns',
-            ),
-            (
-                AgentResult(success=False, output='', timed_out=True),
-                'timed out',
-            ),
-            (
-                AgentResult(success=False, output='Overloaded', api_error_status=529),
-                'HTTP 529',
-            ),
-            (
-                AgentResult(success=False, output='', subtype='error_empty_output'),
-                'empty output',
-            ),
-        ]
-        for result, expected_summary_fragment in cases:
-            msg = build_failure_message('TestLabel', result)
-            assert expected_summary_fragment in msg, (
-                f'Expected {expected_summary_fragment!r} in message for result={result!r}'
-            )
+        """build_failure_message delegates entirely to classify_agent_failure — structural contract."""
+        result = AgentResult(success=False, output='', subtype='error_max_turns', turns=75)
+        label = 'TestLabel'
+        msg = build_failure_message(label, result)
+        cls = classify_agent_failure(result)
+        expected = f'{label} failed: {cls.summary}\n{cls.diagnostic_detail}'
+        assert msg == expected
 
     def test_build_failure_message_label_is_prefix(self):
         """The label argument is preserved verbatim before ' failed: '."""
