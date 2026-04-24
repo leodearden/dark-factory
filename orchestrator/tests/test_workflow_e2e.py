@@ -2577,6 +2577,33 @@ class TestCheckBranchOnMain:
             f'unmerged branch must return None; is_ancestor=False guard missing, got {result!r}'
         )
 
+    async def test_returns_none_when_worktree_missing(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """workflow.worktree = None must short-circuit before any git call.
+
+        Build workflow but explicitly set workflow.worktree = None.  The helper
+        must return None immediately without attempting git subprocess calls.
+
+        Fails on the step-4 impl which calls self._get_head_commit() first,
+        crashing when self.worktree is None (passes cwd=str(None) to subprocess).
+        """
+        # 1. Build workflow without wiring up a real worktree
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        # Explicitly clear the worktree to trigger the None-guard
+        workflow.worktree = None
+
+        # 2. Call _check_branch_on_main — must return None without crashing
+        result = await workflow._check_branch_on_main()
+
+        # 3. Assert
+        assert result is None, (
+            f'None worktree must short-circuit before any git call; got {result!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: _recover_if_already_merged unit tests
