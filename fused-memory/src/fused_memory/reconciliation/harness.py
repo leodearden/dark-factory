@@ -298,7 +298,14 @@ class ReconciliationHarness:
             Non-absolute paths are rejected before calling taskmaster to avoid
             silent failures from TaskmasterBackend's absolute-path validator.
         """
-        if not self.taskmaster or not project_root:
+        if not self.taskmaster:
+            logger.info(
+                'reconciliation.task_tree_taskmaster_disabled',
+                extra={'project_root': project_root},
+            )
+            return FilteredTaskTree()
+        if not project_root:
+            logger.info('reconciliation.task_tree_empty_project_root', extra={})
             return FilteredTaskTree()
         if not os.path.isabs(project_root):
             logger.warning(
@@ -309,13 +316,29 @@ class ReconciliationHarness:
             return FilteredTaskTree()
         try:
             tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
+            # Defensively unwrap {'data': {'tasks': [...]}} wrapper shape that
+            # some Taskmaster MCP calls emit (analogous to _extract_task_dict at
+            # task_interceptor.py:2820, but applied to the list response shape).
+            wrapper_unwrapped = False
+            if (
+                isinstance(tasks_data, dict)
+                and isinstance(tasks_data.get('data'), dict)
+                and 'tasks' in tasks_data['data']
+            ):
+                tasks_data = tasks_data['data']
+                wrapper_unwrapped = True
             raw_count = len(tasks_data.get('tasks', [])) if isinstance(tasks_data, dict) else 0
-            logger.debug(
-                '_fetch_filtered_task_tree fetched %d raw tasks for %r',
-                raw_count,
-                project_root,
+            filtered = filter_task_tree(tasks_data)
+            logger.info(
+                'reconciliation.task_tree_fetched',
+                extra={
+                    'project_root': project_root,
+                    'raw_count': raw_count,
+                    'total_count': filtered.total_count,
+                    'wrapper_unwrapped': wrapper_unwrapped,
+                },
             )
-            return filter_task_tree(tasks_data)
+            return filtered
         except Exception as exc:
             logger.warning(
                 f'_fetch_filtered_task_tree failed for {project_root!r}: {exc}'

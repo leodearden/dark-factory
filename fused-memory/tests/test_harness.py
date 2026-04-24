@@ -1947,14 +1947,17 @@ class TestHarnessFetchFilteredTaskTree:
         mock_memory_service,
         caplog,
     ):
-        """_fetch_filtered_task_tree emits a DEBUG log with the raw task count after a successful fetch.
+        """_fetch_filtered_task_tree emits a log with the raw task count after a successful fetch.
 
-        The log message must contain 'raw tasks', the integer count of tasks
-        returned by taskmaster, and the project_root so operators can distinguish
+        The log record must contain the integer count of tasks returned by
+        taskmaster and the project_root so operators can distinguish
         'get_tasks returned 0 raw tasks' (upstream Taskmaster issue) from
         'get_tasks returned N tasks but filter partitioned all into other'
-        (task_filter regression).  DEBUG level keeps the happy-path heartbeat out
-        of the default INFO log stream at scale.
+        (task_filter regression).
+
+        Updated in task-958: the log was promoted from DEBUG to INFO under the
+        event marker 'reconciliation.task_tree_fetched' with raw_count and
+        project_root in the extra dict.
         """
         import logging
 
@@ -1975,13 +1978,17 @@ class TestHarnessFetchFilteredTaskTree:
         with caplog.at_level(logging.DEBUG):
             result = await harness._fetch_filtered_task_tree('/abs/path')
 
-        # (a) DEBUG log must contain 'raw tasks', the count 4, and the project_root
-        debug_msgs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
-        assert any(
-            'raw tasks' in msg and '4' in msg and '/abs/path' in msg
-            for msg in debug_msgs
-        ), (
-            f"Expected DEBUG log containing 'raw tasks', '4', '/abs/path'; got: {debug_msgs}"
+        # (a) A log record at >= DEBUG level must contain the count 4 and project_root.
+        #     The record is now at INFO level with raw_count=4 in the extra dict.
+        fetched_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.DEBUG
+            and getattr(r, 'raw_count', None) == 4
+            and getattr(r, 'project_root', None) == '/abs/path'
+        ]
+        assert fetched_records, (
+            f"Expected a log record with raw_count=4 and project_root='/abs/path';"
+            f" got records: {[r.__dict__ for r in caplog.records]}"
         )
 
         # (b) sanity: returned tree reflects the actual data
@@ -1989,6 +1996,334 @@ class TestHarnessFetchFilteredTaskTree:
         assert len(result.active_tasks) == 2   # in-progress + pending
         assert result.done_count == 1
         assert result.cancelled_count == 1
+
+    @pytest.mark.asyncio
+    async def test_fetch_filtered_task_tree_logs_info_when_taskmaster_none(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """_fetch_filtered_task_tree emits an INFO log when taskmaster is None.
+
+        When taskmaster is None (disabled or not configured), the short-circuit
+        must emit a distinct INFO-level marker so ops can grep logs and confirm
+        the branch that fired rather than wondering why Stage 2 sees an empty tree.
+
+        Asserts:
+        (a) an INFO-level record exists with the marker
+            'reconciliation.task_tree_taskmaster_disabled'
+        (b) the project_root '/abs/path' appears in the record (via message or
+            extra so structured-log tools can correlate it)
+        (c) no WARNING-level records from this branch (the non-absolute-path
+            warning must not fire here — different branch)
+        """
+        import logging
+
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.taskmaster = None
+
+        with caplog.at_level(logging.INFO):
+            result = await harness._fetch_filtered_task_tree('/abs/path')
+
+        # Still returns empty tree
+        assert isinstance(result, FilteredTaskTree)
+        assert result.active_tasks == []
+
+        # (a) INFO record with distinct event marker
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            'reconciliation.task_tree_taskmaster_disabled' in r.getMessage()
+            for r in info_records
+        ), (
+            f"Expected INFO record containing 'reconciliation.task_tree_taskmaster_disabled';"
+            f" got INFO messages: {[r.getMessage() for r in info_records]}"
+        )
+
+        # (b) project_root must appear somewhere in the record (message or extra)
+        marker_record = next(
+            r for r in info_records
+            if 'reconciliation.task_tree_taskmaster_disabled' in r.getMessage()
+        )
+        record_repr = repr(marker_record.__dict__)
+        assert '/abs/path' in record_repr or '/abs/path' in marker_record.getMessage(), (
+            f"project_root '/abs/path' not found in record; record={record_repr}"
+        )
+
+        # (c) no WARNING from this branch (non-absolute-path warning belongs to a
+        #     different code path)
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warning_records, (
+            f"Expected no WARNING records from taskmaster-None branch; got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fetch_filtered_task_tree_logs_info_when_project_root_empty(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """_fetch_filtered_task_tree emits an INFO log when project_root is empty string.
+
+        When project_root is '' the short-circuit returns an empty tree without
+        calling taskmaster.get_tasks.  Ops must be able to see this happening so
+        they can distinguish 'project root never set' from a healthy-but-empty
+        project in production logs.
+
+        Asserts:
+        (a) an INFO-level record with marker 'reconciliation.task_tree_empty_project_root'
+        (b) taskmaster.get_tasks was NOT called (short-circuit still fires)
+        """
+        import logging
+
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        with caplog.at_level(logging.INFO):
+            result = await harness._fetch_filtered_task_tree('')
+
+        # Still returns empty tree
+        assert isinstance(result, FilteredTaskTree)
+        assert result.active_tasks == []
+
+        # (a) INFO record with distinct event marker
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            'reconciliation.task_tree_empty_project_root' in r.getMessage()
+            for r in info_records
+        ), (
+            f"Expected INFO record containing 'reconciliation.task_tree_empty_project_root';"
+            f" got INFO messages: {[r.getMessage() for r in info_records]}"
+        )
+
+        # (b) short-circuit must NOT call taskmaster.get_tasks
+        harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_fetch_filtered_task_tree_logs_info_after_successful_fetch_with_both_counts(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """_fetch_filtered_task_tree emits an INFO log with both raw_count and total_count.
+
+        After a successful get_tasks call the log must include:
+        (a) the distinct event marker 'reconciliation.task_tree_fetched' at INFO level
+        (b) raw_count = 4 (number of tasks before filtering)
+        (c) total_count = 4 (post-filter total from FilteredTaskTree)
+        (d) the project_root
+
+        This gives ops the exact signal to distinguish:
+          - raw=0, total=0  → Taskmaster returned empty (upstream issue)
+          - raw>0, total=0  → filter_task_tree shape mismatch
+          - raw>0, total>0  → data flowing correctly
+        """
+        import logging
+
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # Four tasks with mixed statuses
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+            'tasks': [
+                {'id': 1, 'title': 'T1', 'status': 'in-progress', 'dependencies': []},
+                {'id': 2, 'title': 'T2', 'status': 'done', 'dependencies': []},
+                {'id': 3, 'title': 'T3', 'status': 'cancelled', 'dependencies': []},
+                {'id': 4, 'title': 'T4', 'status': 'pending', 'dependencies': []},
+            ]
+        }
+
+        with caplog.at_level(logging.INFO):
+            result = await harness._fetch_filtered_task_tree('/abs/path')
+
+        # Result is correct
+        assert isinstance(result, FilteredTaskTree)
+        assert len(result.active_tasks) == 2
+        assert result.done_count == 1
+        assert result.cancelled_count == 1
+
+        # (a) INFO log with the distinct event marker
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        fetched_records = [
+            r for r in info_records
+            if 'reconciliation.task_tree_fetched' in r.getMessage()
+        ]
+        assert fetched_records, (
+            f"Expected INFO record containing 'reconciliation.task_tree_fetched';"
+            f" got INFO messages: {[r.getMessage() for r in info_records]}"
+        )
+
+        rec = fetched_records[0]
+        rec_dict = rec.__dict__
+
+        # (b) raw_count = 4
+        assert rec_dict.get('raw_count') == 4, (
+            f"Expected raw_count=4 in log extra; got: {rec_dict}"
+        )
+
+        # (c) total_count = 4 (all tasks counted in total_count)
+        assert rec_dict.get('total_count') == 4, (
+            f"Expected total_count=4 in log extra; got: {rec_dict}"
+        )
+
+        # (d) project_root present
+        assert rec_dict.get('project_root') == '/abs/path', (
+            f"Expected project_root='/abs/path' in log extra; got: {rec_dict}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fetch_filtered_task_tree_unwraps_data_wrapper_response_shape(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """_fetch_filtered_task_tree transparently unwraps the {'data': {...}} wrapper.
+
+        Some Taskmaster MCP calls return {'data': {'tasks': [...]}} instead of
+        the canonical {'tasks': [...]} shape (cf. _extract_task_dict in
+        task_interceptor.py:2820).  If the harness does not unwrap this shape,
+        filter_task_tree silently returns an empty FilteredTaskTree.
+
+        After unwrapping, the behaviour must be:
+        (a) result.active_tasks has the 3 active tasks (wrapper was unwrapped)
+        (b) result.total_count == 3
+        (c) INFO log fires with marker 'reconciliation.task_tree_fetched'
+        (d) the log record carries extra field wrapper_unwrapped=True so ops can
+            spot response-shape drift in production
+        """
+        import logging
+
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # Wrapped response shape returned by some Taskmaster MCP calls
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+            'data': {
+                'tasks': [
+                    {'id': 1, 'title': 'T1', 'status': 'in-progress', 'dependencies': []},
+                    {'id': 2, 'title': 'T2', 'status': 'pending', 'dependencies': []},
+                    {'id': 3, 'title': 'T3', 'status': 'in-progress', 'dependencies': []},
+                ]
+            }
+        }
+
+        with caplog.at_level(logging.INFO):
+            result = await harness._fetch_filtered_task_tree('/abs/path')
+
+        # (a) + (b) wrapper was unwrapped and filter_task_tree operated on inner dict
+        assert isinstance(result, FilteredTaskTree)
+        assert len(result.active_tasks) == 3, (
+            f"Expected 3 active tasks after wrapper unwrap; got {len(result.active_tasks)}"
+        )
+        assert result.total_count == 3
+
+        # (c) INFO log with fetch marker
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        fetched_records = [
+            r for r in info_records
+            if 'reconciliation.task_tree_fetched' in r.getMessage()
+        ]
+        assert fetched_records, (
+            f"Expected INFO record containing 'reconciliation.task_tree_fetched';"
+            f" got INFO messages: {[r.getMessage() for r in info_records]}"
+        )
+
+        # (d) wrapper_unwrapped=True in extra dict
+        rec = fetched_records[0]
+        assert getattr(rec, 'wrapper_unwrapped', None) is True, (
+            f"Expected wrapper_unwrapped=True in log extra; got: {rec.__dict__}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fetch_filtered_task_tree_distinguishes_fetch_zero_from_filter_zero_in_logs(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """INFO log unambiguously distinguishes zero-from-upstream vs zero-from-filter.
+
+        Two sub-scenarios:
+        (a) Taskmaster returns genuinely empty tasks list:
+            → raw_count=0, total_count=0 in log.
+        (b) Taskmaster returns tasks but filter_task_tree partitions all into
+            other_count (unknown status):
+            → raw_count=1, total_count=1, result.other_count=1, active/done/cancelled empty.
+
+        This is the exact signal Step 4 of the task description calls for:
+        operators can read a single log line and know whether the zero came
+        from upstream Taskmaster or from filter_task_tree's partitioning.
+        """
+        import logging
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # ── Sub-scenario (a): Taskmaster returned genuinely empty ──────────
+        harness.taskmaster.get_tasks.return_value = {'tasks': []}  # type: ignore[union-attr,attr-defined]
+
+        with caplog.at_level(logging.INFO):
+            result_a = await harness._fetch_filtered_task_tree('/abs/path')
+
+        info_records_a = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO
+            and 'reconciliation.task_tree_fetched' in r.getMessage()
+        ]
+        assert info_records_a, "Expected reconciliation.task_tree_fetched for empty-tasks scenario"
+        rec_a = info_records_a[0]
+        assert getattr(rec_a, 'raw_count', None) == 0, (
+            f"Scenario (a): expected raw_count=0; got {rec_a.__dict__}"
+        )
+        assert getattr(rec_a, 'total_count', None) == 0, (
+            f"Scenario (a): expected total_count=0; got {rec_a.__dict__}"
+        )
+        assert result_a.total_count == 0
+        assert result_a.active_tasks == []
+
+        # ── Sub-scenario (b): tasks returned but all unknown status ────────
+        caplog.clear()
+        harness.taskmaster.get_tasks.reset_mock()  # type: ignore[union-attr,attr-defined]
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+            'tasks': [
+                {'id': 1, 'title': 'T1', 'status': 'some-unknown-status', 'dependencies': []}
+            ]
+        }
+
+        with caplog.at_level(logging.INFO):
+            result_b = await harness._fetch_filtered_task_tree('/abs/path')
+
+        info_records_b = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO
+            and 'reconciliation.task_tree_fetched' in r.getMessage()
+        ]
+        assert info_records_b, "Expected reconciliation.task_tree_fetched for unknown-status scenario"
+        rec_b = info_records_b[0]
+        assert getattr(rec_b, 'raw_count', None) == 1, (
+            f"Scenario (b): expected raw_count=1; got {rec_b.__dict__}"
+        )
+        assert getattr(rec_b, 'total_count', None) == 1, (
+            f"Scenario (b): expected total_count=1; got {rec_b.__dict__}"
+        )
+        assert result_b.total_count == 1
+        assert result_b.other_count == 1
+        assert result_b.active_tasks == []
+        assert result_b.done_count == 0
+        assert result_b.cancelled_count == 0
 
 
 # ── Tests for task 455: harness wires filtered_task_tree into stages ──────────
