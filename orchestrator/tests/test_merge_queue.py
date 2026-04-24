@@ -840,6 +840,83 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_done_step_diff_tree_calls_run_concurrently(
+        self, git_ops: GitOps,
+    ):
+        """diff-tree queries for done steps run concurrently via asyncio.gather.
+
+        Performance concern: the merge hot-path must scale O(1) not O(N) in
+        done-step count.  asyncio.gather over independent git queries is the
+        minimal fix.  This test verifies concurrent execution by confirming
+        all three intercepted coroutines enter before any exits:
+
+            max(start_times) < min(end_times)
+
+        With a sequential for-loop each call is spaced 0.05 s apart, so
+        max(starts) ≈ 0.10 >= min(ends) ≈ 0.05 and the assertion fails.
+        With asyncio.gather all three overlap and the invariant holds.
+        """
+        worktree = (await git_ops.create_worktree('concurrent-done')).path
+
+        # Create a real commit so the three done steps have a valid SHA.
+        (worktree / 'stays.py').write_text('stays = 1\n')
+        sha_c1 = await git_ops.commit(worktree, 'Add stays.py')
+        assert sha_c1
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-concurrent', 'T-concurrent', 'desc')
+        # forces_loop.py is a phantom file: it is absent from the merge tree,
+        # so missing is non-empty and the done-step loop is entered.
+        artifacts.write_plan({
+            'files': ['stays.py', 'forces_loop.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': f'step-{i}',
+                    'description': f's{i}',
+                    'status': 'done',
+                    'commit': sha_c1,
+                }
+                for i in range(1, 4)
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'concurrent-done')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            from orchestrator import merge_queue as mq
+            original_run = mq._run
+            start_times: list[float] = []
+            end_times: list[float] = []
+
+            async def _intercept(cmd, cwd=None, **kwargs):
+                if '--diff-filter=D' in cmd:
+                    start_times.append(asyncio.get_running_loop().time())
+                    await asyncio.sleep(0.05)
+                    end_times.append(asyncio.get_running_loop().time())
+                    return 0, '', ''
+                return await original_run(cmd, cwd=cwd, **kwargs)
+
+            with patch('orchestrator.merge_queue._run', new=_intercept):
+                await _check_plan_targets_in_tree(
+                    merge_result.merge_commit, worktree, git_ops,
+                )
+
+            assert len(start_times) == 3, (
+                f'Expected 3 diff-tree calls, got {len(start_times)}'
+            )
+            assert len(end_times) == 3, (
+                f'Expected 3 diff-tree calls to complete, got {len(end_times)}'
+            )
+            assert max(start_times) < min(end_times), (
+                f'Sequential execution detected: starts={start_times}, '
+                f'ends={end_times}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 class TestMergeWorker:
