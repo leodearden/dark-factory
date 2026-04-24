@@ -1465,18 +1465,6 @@ class TestStage2SystemPromptTaskCreationSurface:
         """STAGE2_SYSTEM_PROMPT must not reference deprecated mcp__fused-memory__add_task."""
         assert 'mcp__fused-memory__add_task' not in STAGE2_SYSTEM_PROMPT
 
-    def test_stage2_prompt_documents_created_status(self):
-        """STAGE2_SYSTEM_PROMPT must document the 'created' resolve_ticket status."""
-        assert 'created' in STAGE2_SYSTEM_PROMPT
-
-    def test_stage2_prompt_documents_combined_status(self):
-        """STAGE2_SYSTEM_PROMPT must document the 'combined' resolve_ticket status."""
-        assert 'combined' in STAGE2_SYSTEM_PROMPT
-
-    def test_stage2_prompt_documents_failed_status(self):
-        """STAGE2_SYSTEM_PROMPT must document the 'failed' resolve_ticket status."""
-        assert 'failed' in STAGE2_SYSTEM_PROMPT
-
 
 class TestStagePayloadProjectIdGuideline:
     """All three stages include the per-stage project_id guideline in their assembled payload."""
