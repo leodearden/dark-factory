@@ -4,7 +4,14 @@ Documentation=file://__REPO_ROOT__/DESIGN.md
 After=network.target
 
 [Service]
-Type=simple
+# Type=notify: process signals readiness via sd_notify("READY=1") and
+# heartbeats via sd_notify("WATCHDOG=1"). See fused_memory/server/main.py.
+# NotifyAccess=all — ExecStart is `uv run ...` which spawns python as a
+# child; the child is the notifier, not the main PID, so NotifyAccess=main
+# would reject us.
+Type=notify
+NotifyAccess=all
+WatchdogSec=30
 WorkingDirectory=__REPO_ROOT__
 ExecStart=__UV_PATH__ run --project fused-memory \
   python -m fused_memory.server.main \
@@ -17,13 +24,21 @@ Environment=CONFIG_PATH=__REPO_ROOT__/fused-memory/config/config.yaml
 Environment=PROJECT_ROOT=__REPO_ROOT__
 Environment=TASKMASTER_DIR=__REPO_ROOT__/taskmaster-ai
 
-# Restart policy: always restart on failure, back off up to 60s
+# Restart policy: always restart on failure (including watchdog-triggered),
+# back off up to 60s
 Restart=on-failure
 RestartSec=5
 RestartMaxDelaySec=60
 
-# Give it time to shut down gracefully (async cleanup)
-TimeoutStopSec=30
+# Give it time to shut down gracefully (async cleanup). Must exceed the
+# in-process shutdown watchdog (_FORCE_EXIT_BUDGET in main.py).
+TimeoutStopSec=60
+
+# Startup can take longer than systemd's 90s default: FalkorDB + Qdrant
+# cold-start handshake plus event-buffer replay routinely runs 30-60s.
+# READY=1 fires immediately before uvicorn.serve(), so this bound has to
+# cover the full init path.
+TimeoutStartSec=300
 
 # Logging goes to journalctl --user -u fused-memory
 StandardOutput=journal
