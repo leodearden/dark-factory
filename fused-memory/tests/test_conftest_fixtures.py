@@ -10,7 +10,7 @@ import os
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
-from conftest import extract_cypher, extract_params, make_rebuild_detail
+from _fm_helpers import extract_cypher, extract_params, make_rebuild_detail
 
 # ---------------------------------------------------------------------------
 # preserve_config_path fixture tests

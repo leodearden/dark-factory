@@ -5,8 +5,7 @@ implemented.
 """
 
 import pytest
-
-from .test_helpers import _get_opening_tag
+from test_helpers import _get_opening_tag
 
 
 class TestSingleLineTag:

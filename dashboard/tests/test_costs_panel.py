@@ -14,8 +14,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
-from tests.test_costs_data import COSTS_SCHEMA
+from test_costs_data import COSTS_SCHEMA
 
 # ---------------------------------------------------------------------------
 # Mock data — mirrors test_costs_page.py for consistency, with values

@@ -4,7 +4,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from conftest import assert_ro_query_only, extract_cypher, extract_params
+from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params
 
 from fused_memory.backends.graphiti_client import (
     EdgeNotFoundError,

@@ -112,7 +112,7 @@ class TestTemporalGuardRoundTrip:
         self, service_with_real_registry
     ):
         """After registering a planning episode, _search_graphiti excludes its edges."""
-        from tests.conftest import MockEdge
+        from _fm_helpers import MockEdge
         svc, reg = service_with_real_registry
         ep_uuid = 'integration-ep-plan-002'
         project_id = 'integ-project'
@@ -142,7 +142,7 @@ class TestTemporalGuardRoundTrip:
         self, service_with_real_registry
     ):
         """With include_planned=True, planning edges are included and marked."""
-        from tests.conftest import MockEdge
+        from _fm_helpers import MockEdge
         svc, reg = service_with_real_registry
         ep_uuid = 'integration-ep-plan-003'
         project_id = 'integ-project'
@@ -171,7 +171,7 @@ class TestTemporalGuardRoundTrip:
         self, service_with_real_registry
     ):
         """After promoting a planning episode, its edges appear in normal search."""
-        from tests.conftest import MockEdge
+        from _fm_helpers import MockEdge
         svc, reg = service_with_real_registry
         ep_uuid = 'integration-ep-plan-004'
         project_id = 'integ-project'
@@ -212,7 +212,7 @@ class TestTemporalGuardRoundTrip:
         self, service_with_real_registry
     ):
         """Complete pipeline: planning write → registered → excluded → promoted → visible."""
-        from tests.conftest import MockEdge
+        from _fm_helpers import MockEdge
         svc, reg = service_with_real_registry
         ep_uuid = 'integration-ep-full-001'
         project_id = 'integ-project'

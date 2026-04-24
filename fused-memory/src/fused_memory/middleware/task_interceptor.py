@@ -173,6 +173,9 @@ class TaskInterceptor:
         self._backfill_triggered: bool = False
         # Set by close(); prevents _get_curator() from re-creating a curator.
         self._closed: bool = False
+        # Set on first start() call; makes a second start() a true no-op so
+        # flush_pending_on_startup cannot flip in-flight tickets to failed.
+        self._started: bool = False
         # Two-phase ticket store: persists submitted tickets across restarts.
         self._ticket_store = ticket_store
         # Per-project in-memory queues of ticket_ids pending worker processing.
@@ -343,10 +346,12 @@ class TaskInterceptor:
     async def start(self) -> None:
         """Initialise runtime state after construction.
 
-        Call once after constructing the interceptor and before accepting
-        requests.  Idempotent: safe to call multiple times (the underlying
-        store operations only touch ``status='pending'`` rows so they are
-        no-ops on a clean store).
+        Call exactly once after constructing the interceptor and before
+        accepting submit_task traffic.  Guarded by an ``_started`` flag so a
+        second invocation is a true no-op — without the guard,
+        ``flush_pending_on_startup`` would flip any in-flight tickets (rows
+        submitted by the current run but not yet resolved by the worker) to
+        ``failed/server_restart`` and corrupt their waiters.
 
         Performs:
         - ``flush_pending_on_startup``: marks any pending tickets left from a
@@ -356,6 +361,9 @@ class TaskInterceptor:
 
         If no ``ticket_store`` is wired in, this is a no-op.
         """
+        if self._started:
+            return
+        self._started = True
         if self._ticket_store is None:
             return
         flushed = await self._ticket_store.flush_pending_on_startup()

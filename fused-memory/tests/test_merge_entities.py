@@ -13,7 +13,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from conftest import extract_cypher, extract_params, make_rebuild_detail
+from _fm_helpers import extract_cypher, extract_params, make_rebuild_detail
 
 from fused_memory.backends.graphiti_client import GraphitiBackend, NodeNotFoundError
 

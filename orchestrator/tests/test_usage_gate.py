@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
+from _orch_helpers import build_usage_gate
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import (
     SessionBudgetExhausted,
@@ -14,8 +15,6 @@ from shared.usage_gate import (
     _extract_cap_message,
     _parse_resets_at,
 )
-
-from tests.conftest import build_usage_gate
 
 # --- Helpers ---
 

@@ -17,10 +17,9 @@ from unittest.mock import patch
 
 import pytest
 import yaml
+from _orch_helpers import build_usage_gate
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import UsageGate
-
-from tests.conftest import build_usage_gate
 
 # ---------------------------------------------------------------------------
 # Constants — expected reify automation account pool (F→E→C→D)

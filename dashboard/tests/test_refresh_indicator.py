@@ -2,7 +2,7 @@
 
 import re
 
-from .test_helpers import _get_opening_tag
+from test_helpers import _get_opening_tag
 
 _SECTIONS = ('orchestrators', 'performance', 'merge-queue', 'memory', 'memory-graphs', 'recon')
 
