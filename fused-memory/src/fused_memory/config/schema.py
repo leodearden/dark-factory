@@ -406,6 +406,18 @@ class CuratorConfig(BaseModel):
     entry_description_chars: int = Field(default=500)
     entry_details_chars: int = Field(default=1500)
 
+    # Batch-curator knobs — the worker drains up to batch_max tickets per
+    # round-trip; timeout and turns scale linearly with N and are clamped at
+    # the caps so no single batch blocks resolve_ticket callers indefinitely.
+    # Formula: timeout = min(timeout_seconds + per_item_slack_seconds * N,
+    #                        batch_timeout_cap_seconds)
+    #          max_turns = min(3 + per_item_turns * N, batch_turns_cap)
+    batch_max: int = Field(default=5)
+    per_item_slack_seconds: float = Field(default=30.0)
+    per_item_turns: int = Field(default=1)
+    batch_timeout_cap_seconds: float = Field(default=540.0)
+    batch_turns_cap: int = Field(default=10)
+
 
 # --- Top-level ---
 

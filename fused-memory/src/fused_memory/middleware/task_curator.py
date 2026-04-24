@@ -14,6 +14,14 @@ docs/reify-task-fragmentation-report-2026-04-11.txt for the motivating analysis.
 
 The curator is best-effort: any failure (embedder, Qdrant, LLM, taskmaster) degrades
 to ``action="create"`` so task creation is never blocked.
+
+Batch API (task 924)
+--------------------
+:meth:`TaskCurator.curate_batch` is the preferred entry point for the ticket worker:
+one ``invoke_with_cap_retry`` round-trip for up to ``CuratorConfig.batch_max`` candidates.
+Identical candidates in the same batch are short-circuited via pre-batch payload-hash
+dedup; each unique candidate gets its own four-stream pool.  See plan.json for task 924
+for the full design rationale (batch prompt, schema, topo-sort dispatch, fallback).
 """
 
 from __future__ import annotations
@@ -24,16 +32,15 @@ import json
 import logging
 import time
 import uuid as uuid_mod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
 from shared.locking import files_to_modules
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from shared.usage_gate import UsageGate
 
     from fused_memory.backends.taskmaster_client import TaskmasterBackend
@@ -84,7 +91,7 @@ if DEFAULT_PRIORITY not in _PRIORITY_RANK:
     raise ValueError(f'{DEFAULT_PRIORITY!r} not in _PRIORITY_RANK')
 
 # JSON schema for the curator's structured output — used by invoke_with_cap_retry
-# to constrain the LLM's response.
+# to constrain the LLM's response.  See also CURATOR_BATCH_OUTPUT_SCHEMA below.
 CURATOR_OUTPUT_SCHEMA: dict[str, Any] = {
     'type': 'object',
     'required': ['action', 'justification'],
@@ -107,6 +114,42 @@ CURATOR_OUTPUT_SCHEMA: dict[str, Any] = {
                     'items': {'type': 'string'},
                 },
                 'priority': {'type': 'string'},
+            },
+        },
+    },
+}
+
+# JSON schema for the batched curator output — wraps N per-item decisions.
+# Each item mirrors the single-item shape plus candidate_index (for safe
+# reordering) and batch_target_index (for within-batch duplicates).
+_REWRITTEN_TASK_SCHEMA: dict[str, Any] = {
+    'type': ['object', 'null'],
+    'properties': {
+        'title': {'type': 'string'},
+        'description': {'type': 'string'},
+        'details': {'type': 'string'},
+        'files_to_modify': {'type': 'array', 'items': {'type': 'string'}},
+        'priority': {'type': 'string'},
+    },
+}
+CURATOR_BATCH_OUTPUT_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'required': ['decisions'],
+    'properties': {
+        'decisions': {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'required': ['candidate_index', 'action', 'justification'],
+                'properties': {
+                    'candidate_index': {'type': 'integer'},
+                    'action': {'type': 'string', 'enum': ['drop', 'combine', 'create']},
+                    'target_id': {'type': ['string', 'null']},
+                    'batch_target_index': {'type': ['integer', 'null']},
+                    'target_fingerprint': {'type': ['string', 'null']},
+                    'justification': {'type': 'string'},
+                    'rewritten_task': _REWRITTEN_TASK_SCHEMA,
+                },
             },
         },
     },
@@ -193,6 +236,10 @@ class CuratorDecision:
     pool_sizes: dict[str, int] = field(default_factory=dict)
     latency_ms: int = 0
     cost_usd: float = 0.0
+    # Set only by curate_batch when a candidate is a duplicate of another
+    # candidate in the same batch (neither yet materialised as a task).
+    # The worker substitutes the sibling's resulting task_id at dispatch time.
+    batch_target_index: int | None = None
 
     def to_log_fields(self) -> dict[str, Any]:
         return {
@@ -316,6 +363,31 @@ if it does not match, the combine is refused and the candidate is created fresh 
 instead of silently clobbering an unrelated task. Copy the title character-for-\
 character — do not shorten, summarize, or reformat it. For "drop" and "create", \
 leave `target_fingerprint` null.
+"""
+
+_BATCH_SYSTEM_PROMPT = _SYSTEM_PROMPT + """
+
+## Within-batch duplicates
+
+When you are given a BATCH of N candidates in a single call (sections labelled
+`# Candidate batch_index=0`, `# Candidate batch_index=1`, …), use the following
+additional rules for duplicates that exist WITHIN the batch:
+
+1. **Drop to a sibling candidate**: if candidate A is a duplicate of another
+   candidate B in this batch (neither has been materialised as a task yet), emit
+   `action='drop'` for A and set `batch_target_index=<B's batch_index>`.  Leave
+   `target_id` null in this case — there is no existing pool task to reference.
+
+2. **Combine between two new batch items is NOT supported**: "combine" rewrites
+   an *existing* task; two candidates that are both new cannot combine with each
+   other.  Instead, choose one to "create" and emit `action='drop'` with
+   `batch_target_index` pointing at it for the other.
+
+3. **batch_target_index must be valid**: the value MUST reference a *different*
+   candidate index that appears within the batch (0 ≤ batch_target_index < N,
+   batch_target_index ≠ candidate_index).  Do not emit cycles (A→B and B→A).
+
+4. For non-duplicate candidates, batch_target_index MUST be null.
 """
 
 
@@ -634,6 +706,164 @@ class TaskCurator:
             decision.cost_usd,
         )
         return decision
+
+    async def curate_batch(
+        self,
+        candidates: list[CandidateTask],
+        project_id: str,
+        project_root: str,
+    ) -> list[CuratorDecision]:
+        """Issue a batched drop/combine/create decision for *candidates* in one round-trip.
+
+        * N=0 → return ``[]`` immediately.
+        * N=1 → delegate to :meth:`curate` (inherits caches + escalator wiring).
+        * N>1 → one :func:`invoke_with_cap_retry` call with the batched prompt/schema.
+                On whole-batch failure falls back to N serial :meth:`curate` calls.
+        """
+        if not candidates:
+            return []
+        if len(candidates) == 1:
+            return [await self.curate(candidates[0], project_id, project_root)]
+
+        # N>1: build per-candidate corpus, call the batched LLM, cache results.
+        start = time.monotonic()
+
+        # ── Pre-batch deduplication by payload_hash ────────────────────────────
+        # If two candidates in the batch are identical (same payload_hash),
+        # only the FIRST goes through the LLM or fallback curate() path.
+        # The duplicate gets a synthetic batch_target_index drop decision so
+        # the worker's topo-sort can substitute the first candidate's resulting
+        # task_id.  This preserves the single-ticket invariant where the second
+        # identical add_task call sees the first's outcome via note_created/cache.
+        hash_to_first_idx: dict[str, int] = {}
+        # Maps full-list index → synthetic drop decision (for duplicates)
+        pre_dedup_decisions: dict[int, CuratorDecision] = {}
+        # Indices of candidates that will go to the LLM (unique ones only)
+        unique_indices: list[int] = []
+        for i, candidate in enumerate(candidates):
+            h = candidate.payload_hash()
+            if h in hash_to_first_idx:
+                pre_dedup_decisions[i] = CuratorDecision(
+                    action='drop',
+                    batch_target_index=hash_to_first_idx[h],
+                    justification='pre-batch-dedup: identical payload_hash',
+                )
+            else:
+                hash_to_first_idx[h] = i
+                unique_indices.append(i)
+
+        unique_candidates = [candidates[i] for i in unique_indices]
+        # ── End pre-batch dedup ────────────────────────────────────────────────
+
+        # ── Decision cache check ───────────────────────────────────────────────
+        # Consult the idempotency cache for each unique candidate before issuing
+        # an LLM call.  Under steady-state load (the same candidates repeat),
+        # cache-hit items are resolved without an LLM round-trip.
+        # `llm_k_list` holds positions *within unique_indices* (k values) for
+        # candidates that were NOT in the cache.
+        llm_k_list: list[int] = []
+        cache_hit_map: dict[int, CuratorDecision] = {}  # unique-space k → decision
+        for k, original_i in enumerate(unique_indices):
+            cached = self._check_cache(candidates[original_i].payload_hash())
+            if cached is not None:
+                cache_hit_map[k] = cached
+            else:
+                llm_k_list.append(k)
+
+        # ── Corpus assembly (only for non-cached unique candidates) ───────────
+        pools: list[list[_PoolEntry]] = []
+        pool_sizes_list: list[dict[str, int]] = []
+        for k in llm_k_list:
+            candidate = candidates[unique_indices[k]]
+            try:
+                pool, pool_sizes = await self._build_corpus(
+                    candidate, project_id, project_root,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'task_curator: corpus assembly failed for candidate %r, '
+                    'continuing with empty pool: %s',
+                    candidate.title,
+                    exc,
+                    exc_info=True,
+                )
+                pool = []
+                pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            pools.append(pool)
+            pool_sizes_list.append(pool_sizes)
+
+        # ── LLM call (only for non-cached unique candidates) ──────────────────
+        llm_raw_decisions: list[CuratorDecision] = []
+        if llm_k_list:
+            to_llm_candidates = [unique_candidates[k] for k in llm_k_list]
+            try:
+                llm_raw_decisions = await self._call_llm_batch(
+                    to_llm_candidates, pools, pool_sizes_list, start,
+                    project_id, project_root,
+                )
+            except Exception as exc:
+                # Catches CuratorFailureError, AllAccountsCappedException, and
+                # unexpected LLM-layer errors.  CancelledError (BaseException)
+                # is not caught here.
+                logger.warning(
+                    'curate_batch: whole-batch LLM failed (%s), falling back to '
+                    '%d size-1 curate calls',
+                    exc,
+                    len(to_llm_candidates),
+                )
+                # Each curate() call handles its own caching, so no re-store
+                # is needed for fallback decisions below.
+                llm_raw_decisions = [
+                    await self.curate(unique_candidates[k], project_id, project_root)
+                    for k in llm_k_list
+                ]
+
+        # ── Merge: build unique_decision_map with original-space indices ───────
+        # The LLM (or fallback curate()) saw to_llm_candidates at LLM-local
+        # positions 0..M-1 (M = len(llm_k_list)).  batch_target_index from the
+        # LLM is in LLM-local space; remap to original-space via:
+        #   LLM-local j → llm_k_list[j] (unique-space k) → unique_indices[k]
+        # Cache hits have batch_target_index=None (within-batch drops are never
+        # cached, so there is nothing to remap for them).
+        unique_decisions_by_k: dict[int, CuratorDecision] = dict(cache_hit_map)
+        for llm_j, k in enumerate(llm_k_list):
+            dec = llm_raw_decisions[llm_j]
+            if dec.batch_target_index is not None:
+                local_target = dec.batch_target_index
+                if 0 <= local_target < len(llm_k_list):
+                    orig_target = unique_indices[llm_k_list[local_target]]
+                    dec = replace(dec, batch_target_index=orig_target)
+                else:
+                    # Out-of-range in LLM-local space; _parse_batch_decisions
+                    # should have caught this — degrade defensively.
+                    logger.warning(
+                        'curate_batch: LLM batch_target_index=%d out of '
+                        'LLM-local range [0, %d); clearing for unique k=%d',
+                        local_target, len(llm_k_list), k,
+                    )
+                    dec = replace(dec, batch_target_index=None)
+            unique_decisions_by_k[k] = dec
+
+        unique_decision_map: dict[int, CuratorDecision] = {
+            unique_indices[k]: unique_decisions_by_k[k]
+            for k in range(len(unique_indices))
+        }
+
+        decisions = [
+            pre_dedup_decisions[i] if i in pre_dedup_decisions else unique_decision_map[i]
+            for i in range(len(candidates))
+        ]
+
+        # Cache only new LLM decisions (not cache hits — they're already stored;
+        # not batch_target_index decisions — they can't safely serve as single-item
+        # cache entries since they carry sibling references that become stale).
+        for k in llm_k_list:
+            dec = unique_decisions_by_k[k]
+            if dec.batch_target_index is not None:
+                continue
+            self._store_cache(candidates[unique_indices[k]].payload_hash(), dec)
+
+        return decisions
 
     async def record_task(
         self,
@@ -1027,9 +1257,7 @@ class TaskCurator:
         project_id: str,
         project_root: str,
     ) -> CuratorDecision:
-        from pathlib import Path as _Path
-
-        cwd = self._cwd or _Path(project_root)
+        cwd = self._cwd or Path(project_root)
         user_prompt = self._build_user_prompt(candidate, pool)
 
         agent_result: AgentResult = await invoke_with_cap_retry(
@@ -1073,6 +1301,77 @@ class TaskCurator:
             latency_ms=latency_ms, pool=pool,
         )
 
+    async def _call_llm_batch(
+        self,
+        candidates: list[CandidateTask],
+        pools: list[list[_PoolEntry]],
+        pool_sizes_list: list[dict[str, int]],
+        start: float,
+        project_id: str,
+        project_root: str,
+    ) -> list[CuratorDecision]:
+        """Invoke one batched LLM call for N candidates and parse the result.
+
+        Timeout and turn-cap scale linearly with the batch size, capped by the
+        configured hard limits in :class:`~fused_memory.config.schema.CuratorConfig`.
+        On failure, raises :exc:`CuratorFailureError`; the caller in
+        :meth:`curate_batch` is responsible for the per-item fallback.
+        """
+        cwd = self._cwd or Path(project_root)
+        n = len(candidates)
+        user_prompt = self._build_batch_user_prompt(candidates, pools)
+
+        # Scale by (n-1): timeout_seconds / 3-turns already cover the first
+        # item's baseline; each additional item beyond the first adds its slack.
+        # This avoids over-provisioning a size-2 batch at 2× the single-call
+        # budget.  Note: _call_llm_batch is never called for n<2.
+        timeout = min(
+            self._config.curator.timeout_seconds
+            + self._config.curator.per_item_slack_seconds * (n - 1),
+            self._config.curator.batch_timeout_cap_seconds,
+        )
+        max_turns = min(
+            3 + self._config.curator.per_item_turns * (n - 1),
+            self._config.curator.batch_turns_cap,
+        )
+
+        agent_result: AgentResult = await invoke_with_cap_retry(
+            usage_gate=self._usage_gate,
+            label=f'task-curator-batch[{project_id}]',
+            project_id=project_id,
+            prompt=user_prompt,
+            system_prompt=_BATCH_SYSTEM_PROMPT,
+            cwd=cwd,
+            model=self._config.curator.model,
+            max_turns=max_turns,
+            max_budget_usd=self._config.curator.max_budget_usd,
+            disallowed_tools=['*'],
+            output_schema=CURATOR_BATCH_OUTPUT_SCHEMA,
+            permission_mode='bypassPermissions',
+            timeout_seconds=timeout,
+            max_cap_retries=3,
+        )
+
+        latency_ms = int((time.monotonic() - start) * 1000)
+        if not agent_result.success:
+            raise CuratorFailureError(
+                f'curator batch LLM call failed: batch_size={n} '
+                f'output={agent_result.output[:200]!r} '
+                f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
+                f'timed_out={agent_result.timed_out} '
+                f'duration_ms={agent_result.duration_ms} '
+                f'configured_timeout_secs={timeout}',
+                timed_out=agent_result.timed_out,
+                duration_ms=agent_result.duration_ms,
+            )
+
+        return _parse_batch_decisions(
+            agent_result,
+            pools=pools,
+            pool_sizes_list=pool_sizes_list,
+            latency_ms=latency_ms,
+        )
+
     def _build_user_prompt(
         self, candidate: CandidateTask, pool: list[_PoolEntry],
     ) -> str:
@@ -1108,6 +1407,54 @@ class TaskCurator:
         lines.append(
             'Decide drop / combine / create per the system-prompt rules. '
             'Return only the JSON object required by the schema.',
+        )
+        return '\n'.join(lines)
+
+    def _build_batch_user_prompt(
+        self,
+        candidates: list[CandidateTask],
+        pools: list[list[_PoolEntry]],
+    ) -> str:
+        """Build a batched user prompt containing one labelled section per candidate.
+
+        Each section mirrors the single-item :meth:`_build_user_prompt` layout but
+        is prefixed ``# Candidate batch_index={i}`` so the model can address
+        decisions by index.  Pools are kept per-candidate (not unioned).
+        """
+        desc_cap = self._config.curator.entry_description_chars
+        details_cap = self._config.curator.entry_details_chars
+
+        lines: list[str] = []
+        for i, (candidate, pool) in enumerate(zip(candidates, pools, strict=True)):
+            lines.append(f'# Candidate batch_index={i}')
+            lines.append(f'  title: {candidate.title}')
+            lines.append(f'  priority: {candidate.priority}')
+            lines.append(f'  spawn_context: {candidate.spawn_context}')
+            if candidate.spawned_from:
+                lines.append(f'  spawned_from: {candidate.spawned_from}')
+            if candidate.description:
+                lines.append(f'  description: {candidate.description[:desc_cap]}')
+            if candidate.details:
+                lines.append(f'  details: {candidate.details[:details_cap]}')
+            if candidate.files_to_modify:
+                lines.append(
+                    '  files_to_modify: '
+                    + ', '.join(candidate.files_to_modify),
+                )
+            lines.append('')
+
+            lines.append(f'# Pool for batch_index={i} ({len(pool)} tasks)')
+            if not pool:
+                lines.append('  (empty — no candidates; answer "create")')
+            else:
+                for entry in pool:
+                    lines.append(entry.render(desc_cap, details_cap))
+                    lines.append('')
+            lines.append('')
+
+        lines.append(
+            'Return one decision per candidate as {"decisions": [...]} '
+            'with a candidate_index field on each item, per the schema.',
         )
         return '\n'.join(lines)
 
@@ -1226,6 +1573,156 @@ def _trim_pool(pool: list[_PoolEntry], total_cap: int) -> list[_PoolEntry]:
     return result[:total_cap]
 
 
+def _parse_decision_dict(
+    raw: dict,
+    *,
+    pool: list[_PoolEntry],
+    pool_sizes: dict[str, int],
+    latency_ms: int,
+    cost_usd: float,
+) -> CuratorDecision:
+    """Validate and parse a single raw decision dict into a ``CuratorDecision``.
+
+    Called by both :func:`_parse_decision` (single-item) and
+    :func:`_parse_batch_decisions` (per-item inside a batch).  The function
+    **never raises**: every malformed-input path returns a degraded
+    ``CuratorDecision(action='create', ...)`` instead of propagating an
+    exception.  Per-item isolation in the batch path is provided by the
+    ``try/except`` wrapper in :func:`_parse_batch_decisions`, not by
+    ``ValueError`` from this function.
+    """
+    action = str(raw.get('action', '')).lower()
+    if action not in ('drop', 'combine', 'create'):
+        return CuratorDecision(
+            action='create',
+            justification=f'invalid-action: {action!r}',
+            pool_sizes=pool_sizes,
+            latency_ms=latency_ms,
+            cost_usd=cost_usd,
+        )
+
+    justification = str(raw.get('justification', ''))
+    target_id = raw.get('target_id')
+    if target_id is not None:
+        target_id = str(target_id)
+    target_fingerprint = raw.get('target_fingerprint')
+    if target_fingerprint is not None:
+        target_fingerprint = str(target_fingerprint)
+
+    # batch_target_index: valid only for 'drop'; carries the sibling index when
+    # the candidate is a duplicate of another batch item (not yet materialised).
+    # Wrap int() coercion: if the LLM emits a non-numeric string or other
+    # schema-drifted value, treat it as absent (degrade gracefully like every
+    # other invalid field in this parser) rather than raising ValueError out
+    # of the single-item path where no try/except wraps us.
+    batch_target_index_raw = raw.get('batch_target_index')
+    batch_target_index: int | None
+    if batch_target_index_raw is None:
+        batch_target_index = None
+    else:
+        try:
+            batch_target_index = int(batch_target_index_raw)
+        except (TypeError, ValueError):
+            batch_target_index = None
+
+    # Safety: drop/combine must reference a pool task id that actually exists,
+    # UNLESS this is a within-batch drop (batch_target_index set, target_id None).
+    valid_ids = {e.task_id for e in pool}
+    if action in ('drop', 'combine'):
+        # Guard: LLM emitted BOTH a pool target_id and a within-batch
+        # batch_target_index.  We cannot resolve the intent safely, so degrade.
+        if action == 'drop' and batch_target_index is not None and target_id is not None:
+            return CuratorDecision(
+                action='create',
+                justification=(
+                    f'ambiguous-drop: both target_id={target_id!r} and '
+                    f'batch_target_index={batch_target_index} set; '
+                    'cannot determine intent'
+                ),
+                pool_sizes=pool_sizes,
+                latency_ms=latency_ms,
+                cost_usd=cost_usd,
+            )
+        is_within_batch_drop = (
+            action == 'drop'
+            and batch_target_index is not None
+            and target_id is None
+        )
+        if not is_within_batch_drop and (not target_id or target_id not in valid_ids):
+            return CuratorDecision(
+                action='create',
+                justification=(
+                    f'invalid-target: action={action} target_id={target_id!r}; '
+                    f'not in pool'
+                ),
+                pool_sizes=pool_sizes,
+                latency_ms=latency_ms,
+                cost_usd=cost_usd,
+            )
+        # combine-only tasks must also be combine_eligible (pending status).
+        if action == 'combine' and target_id:
+            target_entry = next(e for e in pool if e.task_id == target_id)
+            if not target_entry.combine_eligible:
+                return CuratorDecision(
+                    action='create',
+                    justification=(
+                        f'invalid-combine-target: {target_id} has status '
+                        f'{target_entry.status}, not pending'
+                    ),
+                    pool_sizes=pool_sizes,
+                    latency_ms=latency_ms,
+                    cost_usd=cost_usd,
+                )
+
+    rewritten: RewrittenTask | None = None
+    if action == 'combine':
+        rt = raw.get('rewritten_task')
+        if not isinstance(rt, dict):
+            return CuratorDecision(
+                action='create',
+                justification='combine-missing-rewrite',
+                pool_sizes=pool_sizes,
+                latency_ms=latency_ms,
+                cost_usd=cost_usd,
+            )
+        try:
+            rewritten = RewrittenTask(
+                title=str(rt.get('title', '')),
+                description=str(rt.get('description', '')),
+                details=str(rt.get('details', '')),
+                files_to_modify=[str(f) for f in (rt.get('files_to_modify') or [])],
+                priority=str(rt.get('priority', DEFAULT_PRIORITY)),
+            )
+        except Exception as exc:
+            return CuratorDecision(
+                action='create',
+                justification=f'rewrite-parse-failed: {exc}',
+                pool_sizes=pool_sizes,
+                latency_ms=latency_ms,
+                cost_usd=cost_usd,
+            )
+        if not rewritten.title or not rewritten.details:
+            return CuratorDecision(
+                action='create',
+                justification='rewrite-empty-title-or-details',
+                pool_sizes=pool_sizes,
+                latency_ms=latency_ms,
+                cost_usd=cost_usd,
+            )
+
+    return CuratorDecision(
+        action=action,  # type: ignore[arg-type]
+        target_id=target_id,
+        target_fingerprint=target_fingerprint,
+        rewritten_task=rewritten,
+        justification=justification,
+        pool_sizes=pool_sizes,
+        latency_ms=latency_ms,
+        cost_usd=cost_usd,
+        batch_target_index=batch_target_index,
+    )
+
+
 def _parse_decision(
     agent_result: AgentResult,
     *,
@@ -1233,6 +1730,12 @@ def _parse_decision(
     latency_ms: int,
     pool: list[_PoolEntry],
 ) -> CuratorDecision:
+    """Parse a single-item :class:`AgentResult` into a :class:`CuratorDecision`.
+
+    Extracts the raw dict from ``structured_output`` (or falls back to
+    ``json.loads(output)``) then delegates to :func:`_parse_decision_dict`.
+    Any parse failure returns ``action='create'`` — never raises.
+    """
     raw = agent_result.structured_output
     if raw is None:
         # Try to parse from raw output
@@ -1256,96 +1759,147 @@ def _parse_decision(
             cost_usd=agent_result.cost_usd,
         )
 
-    action = str(raw.get('action', '')).lower()
-    if action not in ('drop', 'combine', 'create'):
-        return CuratorDecision(
-            action='create',
-            justification=f'invalid-action: {action!r}',
-            pool_sizes=pool_sizes,
-            latency_ms=latency_ms,
-            cost_usd=agent_result.cost_usd,
-        )
-
-    justification = str(raw.get('justification', ''))
-    target_id = raw.get('target_id')
-    if target_id is not None:
-        target_id = str(target_id)
-    target_fingerprint = raw.get('target_fingerprint')
-    if target_fingerprint is not None:
-        target_fingerprint = str(target_fingerprint)
-
-    # Safety: drop/combine must reference a pool task id that actually exists.
-    valid_ids = {e.task_id for e in pool}
-    if action in ('drop', 'combine'):
-        if not target_id or target_id not in valid_ids:
-            return CuratorDecision(
-                action='create',
-                justification=(
-                    f'invalid-target: action={action} target_id={target_id!r}; '
-                    f'not in pool'
-                ),
-                pool_sizes=pool_sizes,
-                latency_ms=latency_ms,
-                cost_usd=agent_result.cost_usd,
-            )
-        # combine-only tasks must also be combine_eligible (pending status).
-        if action == 'combine':
-            target_entry = next(e for e in pool if e.task_id == target_id)
-            if not target_entry.combine_eligible:
-                return CuratorDecision(
-                    action='create',
-                    justification=(
-                        f'invalid-combine-target: {target_id} has status '
-                        f'{target_entry.status}, not pending'
-                    ),
-                    pool_sizes=pool_sizes,
-                    latency_ms=latency_ms,
-                    cost_usd=agent_result.cost_usd,
-                )
-
-    rewritten: RewrittenTask | None = None
-    if action == 'combine':
-        rt = raw.get('rewritten_task')
-        if not isinstance(rt, dict):
-            return CuratorDecision(
-                action='create',
-                justification='combine-missing-rewrite',
-                pool_sizes=pool_sizes,
-                latency_ms=latency_ms,
-                cost_usd=agent_result.cost_usd,
-            )
-        try:
-            rewritten = RewrittenTask(
-                title=str(rt.get('title', '')),
-                description=str(rt.get('description', '')),
-                details=str(rt.get('details', '')),
-                files_to_modify=[str(f) for f in (rt.get('files_to_modify') or [])],
-                priority=str(rt.get('priority', DEFAULT_PRIORITY)),
-            )
-        except Exception as exc:
-            return CuratorDecision(
-                action='create',
-                justification=f'rewrite-parse-failed: {exc}',
-                pool_sizes=pool_sizes,
-                latency_ms=latency_ms,
-                cost_usd=agent_result.cost_usd,
-            )
-        if not rewritten.title or not rewritten.details:
-            return CuratorDecision(
-                action='create',
-                justification='rewrite-empty-title-or-details',
-                pool_sizes=pool_sizes,
-                latency_ms=latency_ms,
-                cost_usd=agent_result.cost_usd,
-            )
-
-    return CuratorDecision(
-        action=action,  # type: ignore[arg-type]
-        target_id=target_id,
-        target_fingerprint=target_fingerprint,
-        rewritten_task=rewritten,
-        justification=justification,
+    return _parse_decision_dict(
+        raw,
+        pool=pool,
         pool_sizes=pool_sizes,
         latency_ms=latency_ms,
         cost_usd=agent_result.cost_usd,
     )
+
+
+def _parse_batch_decisions(
+    agent_result: AgentResult,
+    *,
+    pools: list[list[_PoolEntry]],
+    pool_sizes_list: list[dict[str, int]],
+    latency_ms: int,
+) -> list[CuratorDecision]:
+    """Parse a batched LLM response into one :class:`CuratorDecision` per candidate.
+
+    The model may return decisions out of order; we re-index by ``candidate_index``.
+    Per-item parse failures degrade only that item to ``action='create'``; other
+    items are unaffected.  Whole-batch structural failures degrade ALL items.
+    """
+    n = len(pools)
+    cost_per_item = (agent_result.cost_usd or 0.0) / max(n, 1)
+
+    # Try to extract the decisions list from structured_output or raw JSON.
+    raw_decisions: list[Any] | None = None
+    try:
+        so = agent_result.structured_output
+        if isinstance(so, dict) and isinstance(so.get('decisions'), list):
+            raw_decisions = so['decisions']
+        else:
+            parsed = json.loads(agent_result.output or '{}')
+            if isinstance(parsed, dict) and isinstance(parsed.get('decisions'), list):
+                raw_decisions = parsed['decisions']
+    except Exception:
+        pass
+
+    # Build a lookup from candidate_index → raw dict.
+    index_to_raw: dict[int, dict] = {}
+    if raw_decisions is not None:
+        for item in raw_decisions:
+            if isinstance(item, dict):
+                idx = item.get('candidate_index')
+                if isinstance(idx, int) and 0 <= idx < n:
+                    index_to_raw[idx] = item
+
+    results: list[CuratorDecision] = []
+    for i in range(n):
+        if i not in index_to_raw:
+            results.append(CuratorDecision(
+                action='create',
+                justification='batch-item-missing',
+                pool_sizes=pool_sizes_list[i] if i < len(pool_sizes_list) else {},
+                latency_ms=latency_ms,
+                cost_usd=cost_per_item,
+            ))
+            continue
+        try:
+            decision = _parse_decision_dict(
+                index_to_raw[i],
+                pool=pools[i],
+                pool_sizes=pool_sizes_list[i] if i < len(pool_sizes_list) else {},
+                latency_ms=latency_ms,
+                cost_usd=cost_per_item,
+            )
+        except Exception as exc:  # noqa: BLE001
+            decision = CuratorDecision(
+                action='create',
+                justification=f'batch-item-parse-failed: {exc}',
+                pool_sizes=pool_sizes_list[i] if i < len(pool_sizes_list) else {},
+                latency_ms=latency_ms,
+                cost_usd=cost_per_item,
+            )
+        results.append(decision)
+
+    # --- Post-parse: validate and sanitize batch_target_index references ---
+    # 1. Out-of-range or self-referential batch_target_index → degrade to create.
+    # 2. Cycle detection: walk the graph of i → batch_target_index[i]; any node
+    #    that is part of a cycle is degraded to create with 'batch-cycle'.
+    for i, d in enumerate(results):
+        if d.action == 'drop' and d.batch_target_index is not None:
+            bti = d.batch_target_index
+            if bti == i or not (0 <= bti < n):
+                results[i] = CuratorDecision(
+                    action='create',
+                    justification=(
+                        f'batch-target-out-of-range: batch_target_index={bti!r} '
+                        f'for item {i} (n={n})'
+                    ),
+                    pool_sizes=d.pool_sizes,
+                    latency_ms=d.latency_ms,
+                    cost_usd=d.cost_usd,
+                )
+
+    # Build the directed graph for cycle detection (only batch-drop edges).
+    def _find_cycle_members() -> set[int]:
+        """Return the set of indices that participate in any cycle.
+
+        Uses recursive DFS.  Recursion depth is bounded by the batch size
+        (``n``), which is capped at ``CuratorConfig.batch_max`` (default 5).
+        If ``batch_max`` is ever raised to hundreds, convert to an iterative
+        DFS with an explicit stack to avoid Python's 1000-frame limit.
+        """
+        # Simple DFS with colour marking: 0=unvisited, 1=in-stack, 2=done.
+        colour = [0] * n
+        cycle_nodes: set[int] = set()
+
+        def dfs(node: int, path: list[int]) -> None:
+            if colour[node] == 2:
+                return
+            if colour[node] == 1:
+                # Found cycle — mark all nodes currently in the path back to
+                # where the cycle starts.
+                cycle_start = path.index(node)
+                cycle_nodes.update(path[cycle_start:])
+                return
+            colour[node] = 1
+            path.append(node)
+            d = results[node]
+            if d.action == 'drop' and d.batch_target_index is not None:
+                target = d.batch_target_index
+                if 0 <= target < n and target != node:
+                    dfs(target, path)
+            path.pop()
+            colour[node] = 2
+
+        for start in range(n):
+            if colour[start] == 0:
+                dfs(start, [])
+        return cycle_nodes
+
+    cycle_members = _find_cycle_members()
+    for i in cycle_members:
+        d = results[i]
+        results[i] = CuratorDecision(
+            action='create',
+            justification=f'batch-cycle: item {i} is part of a batch_target_index cycle',
+            pool_sizes=d.pool_sizes,
+            latency_ms=d.latency_ms,
+            cost_usd=d.cost_usd,
+        )
+
+    return results

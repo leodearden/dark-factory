@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -10,6 +11,20 @@ import warnings
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+try:
+    from shared.cli_invoke import AllAccountsCappedException  # type: ignore[import]
+except ImportError:
+    # Sentinel that can never be raised by real code, so the
+    # `except (CuratorFailureError, AllAccountsCappedException)` clause
+    # below still has tuple-compatible semantics without silently catching
+    # every Exception (which would collapse the cap-retry fallback path
+    # into the generic decisions=[None]*N degrade path and make the
+    # subsequent `except Exception` branch dead code).
+    class _UnavailableAllAccountsCapped(Exception):
+        """Placeholder used only when shared.cli_invoke is not importable."""
+
+    AllAccountsCappedException = _UnavailableAllAccountsCapped  # type: ignore[assignment,misc]
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.middleware.task_curator import (
@@ -1440,34 +1455,238 @@ class TaskInterceptor:
     async def _curator_worker(self, project_id: str) -> None:
         """Drain pending tickets for *project_id* from its per-project queue.
 
-        Processes tickets serially so ``curator.curate()`` is never called
-        concurrently for the same project — the key property that obsoletes
-        ``_curator_lock`` on the add_task path.  Independent workers per
-        project restore the per-project fairness of the old curator_lock
-        approach: project B is never blocked by a slow LLM call for project A.
+        Processes tickets in batches: blocks on ``queue.get()`` for the first
+        ticket, then opportunistically drains up to ``batch_max - 1`` more via
+        ``queue.get_nowait()`` (non-blocking).  This preserves low-latency for
+        single submitters (no wait for batch fill) while amortising LLM cost
+        when tickets arrive back-to-back under orchestrator load.
+
+        Independent workers per project restore the per-project fairness of the
+        old curator_lock approach: project B is never blocked by a slow LLM
+        call for project A.
 
         Lifecycle: cancellable; ``close()`` cancels all worker tasks and awaits
         them so in-flight work is not silently dropped.
         """
         queue = self._ticket_queues.setdefault(project_id, asyncio.Queue())
+        # Determine batch_max from config; fall back to the documented default (5)
+        # when no config is available so that tests without explicit config still
+        # exercise the batch path rather than silently falling back to serial.
+        try:
+            batch_max: int = self._config.curator.batch_max  # type: ignore[union-attr]
+        except AttributeError:
+            batch_max = 5  # matches CuratorConfig default
+
         try:
             while True:
-                ticket_id = await queue.get()
+                # Block on the first ticket — never spin.
+                first_ticket = await queue.get()
+                batch: list[str] = [first_ticket]
+
+                # Opportunistic drain: grab more tickets without waiting.
+                while len(batch) < batch_max:
+                    try:
+                        batch.append(queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+
                 try:
-                    await self._process_add_ticket(ticket_id)
+                    await self._process_add_tickets_batch(batch)
                 except Exception:
                     logger.exception(
-                        '_curator_worker: unhandled error processing ticket %s',
-                        ticket_id,
+                        '_curator_worker: unhandled error processing batch of %d '
+                        'tickets for project %s',
+                        len(batch), project_id,
                     )
-                    # Always wake resolve_ticket waiters even on unexpected errors
-                    # so callers never block forever when _process_add_ticket raises
-                    # before it can call _signal_ticket_event itself.
-                    self._signal_ticket_event(ticket_id)
+                    # Signal all ticket waiters so resolve_ticket callers are not
+                    # blocked forever if _process_add_tickets_batch raised before
+                    # calling _signal_ticket_event for each ticket.
+                    for tid in batch:
+                        self._signal_ticket_event(tid)
                 finally:
-                    queue.task_done()
+                    # Mark all drained tickets as done in the queue.
+                    for _ in batch:
+                        queue.task_done()
         except asyncio.CancelledError:
             pass
+
+    async def _dispatch_ticket_decision(
+        self,
+        *,
+        ticket_id: str,
+        project_root: str,
+        project_id: str,
+        candidate: CandidateTask | None,
+        decision: CuratorDecision | None,
+        kwargs: dict,
+        metadata: Any,
+        curator: Any,  # TaskCurator | None
+        curator_degrade_reason: str | None = None,
+    ) -> tuple[str, str | None, str | None, dict | None, str | None]:
+        """Execute the drop/combine/create dispatch for one curator decision.
+
+        Returns (status, task_id, reason, result_dict, curator_degrade_reason).
+        Does NOT call mark_resolved, _signal_ticket_event, journal, or commit —
+        those are the caller's responsibility.
+        """
+        if decision is not None and decision.action == 'drop' and decision.target_id:
+            # Drop: fold candidate into the existing target task (status='combined').
+            # Preserves legacy result shape for the add_task facade.
+            result_dict = {
+                'id': decision.target_id,
+                'title': candidate.title if candidate else '',
+                'deduplicated': True,
+                'action': 'drop',
+                'justification': decision.justification,
+            }
+            return (
+                'combined',
+                decision.target_id,
+                f'drop: {decision.justification}',
+                result_dict,
+                None,
+            )
+
+        if decision is not None and decision.action == 'combine' and decision.target_id:
+            # Combine: rewrite target task under write_lock, spawn reembed background task.
+            async with self._write_lock(project_id):
+                combine_result = await self._execute_combine(project_root, decision)
+            if combine_result is not None:
+                if decision.rewritten_task is not None and curator is not None:
+                    rt_candidate = CandidateTask.from_rewritten_task(decision.rewritten_task)
+                    bg = asyncio.create_task(
+                        curator.reembed_task(
+                            decision.target_id, rt_candidate, project_id,
+                        ),
+                        name=f'curator-reembed-{decision.target_id}',
+                    )
+                    self._background_tasks.add(bg)
+                    bg.add_done_callback(lambda t: self._background_tasks.discard(t))
+                result_dict = {
+                    'id': decision.target_id,
+                    'title': (
+                        decision.rewritten_task.title
+                        if decision.rewritten_task else (candidate.title if candidate else '')
+                    ),
+                    'deduplicated': True,
+                    'action': 'combine',
+                    'justification': decision.justification,
+                }
+                return (
+                    'combined',
+                    decision.target_id,
+                    f'combine: {decision.justification}',
+                    result_dict,
+                    None,
+                )
+            # combine failed → fall through to create
+
+        # ── Create task ───────────────────────────────────────────────
+        status: str = 'failed'
+        task_id: str | None = None
+        reason: str | None = None
+        result_dict: dict | None = None
+
+        tm = await self._ensure_taskmaster()
+        metadata_json: str | None = None
+        if metadata:
+            metadata_json = (
+                metadata if isinstance(metadata, str) else json.dumps(metadata)
+            )
+
+        async with self._write_lock(project_id):
+            try:
+                result = await tm.add_task(
+                    project_root=project_root,
+                    metadata=metadata_json,
+                    **kwargs,
+                )
+                atomic_metadata_written = metadata_json is not None
+            except TypeError:
+                result = await tm.add_task(project_root=project_root, **kwargs)
+                atomic_metadata_written = False
+
+            task_id_str: str = ''
+            if isinstance(result, dict):
+                task_id_str = str(result.get('id', ''))
+
+            if not task_id_str:
+                # tm.add_task returned a non-dict result or a dict without 'id'.
+                # Reserves 'created' for the case where a usable task_id exists;
+                # status='created' with task_id=None is semantically inconsistent
+                # (the `if status == "created" and task_id` gate below silently
+                # skips journal emission, and resolve_ticket callers would get
+                # {status: 'created'} with no task_id — useless).
+                reason = 'tm_add_task_returned_no_id'
+                # If taskmaster returned a non-empty dict but no 'id', the task
+                # may still exist in tasks.json (malformed response).  Persist the
+                # raw result in result_json so an operator / reconciliation sweep
+                # can identify and recover the orphaned task without grepping logs.
+                if isinstance(result, dict) and result:
+                    logger.warning(
+                        '_dispatch_ticket_decision: tm.add_task returned dict with no id '
+                        'for ticket %s; raw result persisted in result_json for '
+                        'recovery: %s',
+                        ticket_id, result,
+                    )
+                    result_dict = result
+                # status stays 'failed' (the initial default).
+            else:
+                # ── Latch success immediately — post-create errors must NOT
+                # downgrade this to 'failed'.  Once tm.add_task returns, the
+                # task exists in tasks.json; marking the ticket 'failed' would
+                # strand the task and cause duplicate-on-retry.
+                task_id = task_id_str
+                status = 'created'
+                result_dict = result if isinstance(result, dict) else {}
+                if curator_degrade_reason is not None:
+                    result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
+
+            if metadata_json and task_id_str and not atomic_metadata_written:
+                try:
+                    await tm.update_task(
+                        task_id=task_id_str,
+                        metadata=metadata_json,
+                        project_root=project_root,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        '_dispatch_ticket_decision: metadata follow-up for %s failed: %s',
+                        task_id_str, e,
+                    )
+
+            # note_created + record_task under curator_lock + write_lock
+            # (R3 invariant): by holding curator_lock across curate() →
+            # note_created, concurrent add_subtask curator calls cannot
+            # race on a stale in-memory snapshot.
+            # Each is wrapped independently: a failure appends to
+            # post_create_warnings and is logged, but does NOT flip status.
+            if curator is not None and candidate is not None and task_id_str:
+                # task_id_str truthy ↔ we took the else-branch above, so
+                # result_dict was assigned; assert to satisfy the type checker.
+                assert result_dict is not None
+                try:
+                    curator.note_created(project_id, candidate, task_id_str)
+                except Exception as exc:
+                    logger.warning(
+                        '_dispatch_ticket_decision: curator.note_created failed for %s: %s',
+                        task_id_str, exc,
+                    )
+                    result_dict.setdefault('post_create_warnings', []).append(
+                        {'stage': 'note_created', 'error': str(exc)}
+                    )
+                try:
+                    await curator.record_task(task_id_str, candidate, project_id)
+                except Exception as exc:
+                    logger.warning(
+                        '_dispatch_ticket_decision: curator.record_task failed for %s',
+                        task_id_str, exc_info=True,
+                    )
+                    result_dict.setdefault('post_create_warnings', []).append(
+                        {'stage': 'record_task', 'error': str(exc)}
+                    )
+
+        return (status, task_id, reason, result_dict, curator_degrade_reason)
 
     async def _process_add_ticket(self, ticket_id: str) -> None:
         """Run the full curator + write pipeline for a single ticket.
@@ -1574,161 +1793,19 @@ class TaskInterceptor:
                         curator_degrade_reason = str(exc)
                         decision = CuratorDecision(action='create')
 
-                if decision is not None and decision.action == 'drop' and decision.target_id:
-                    # Drop: fold candidate into the existing target task (status='combined').
-                    # Preserves legacy result shape for the add_task facade.
-                    result_dict = {
-                        'id': decision.target_id,
-                        'title': candidate.title if candidate else '',
-                        'deduplicated': True,
-                        'action': 'drop',
-                        'justification': decision.justification,
-                    }
-                    await self._ticket_store.mark_resolved(
-                        ticket_id,
-                        status='combined',
-                        task_id=decision.target_id,
-                        reason=f'drop: {decision.justification}',
-                        result_json=json.dumps(result_dict),
+                status, task_id, reason, result_dict, _ = (
+                    await self._dispatch_ticket_decision(
+                        ticket_id=ticket_id,
+                        project_root=project_root,
+                        project_id=project_id,
+                        candidate=candidate,
+                        decision=decision,
+                        kwargs=kwargs,
+                        metadata=metadata,
+                        curator=curator,
+                        curator_degrade_reason=curator_degrade_reason,
                     )
-                    self._signal_ticket_event(ticket_id)
-                    return
-
-                if decision is not None and decision.action == 'combine' and decision.target_id:
-                    # Combine: rewrite target task under write_lock, spawn reembed background task.
-                    async with self._write_lock(project_id):
-                        combine_result = await self._execute_combine(project_root, decision)
-                    if combine_result is not None:
-                        if decision.rewritten_task is not None and curator is not None:
-                            rt_candidate = CandidateTask.from_rewritten_task(decision.rewritten_task)
-                            bg = asyncio.create_task(
-                                curator.reembed_task(
-                                    decision.target_id, rt_candidate, project_id,
-                                ),
-                                name=f'curator-reembed-{decision.target_id}',
-                            )
-                            self._background_tasks.add(bg)
-                            bg.add_done_callback(lambda t: self._background_tasks.discard(t))
-                        result_dict = {
-                            'id': decision.target_id,
-                            'title': (
-                                decision.rewritten_task.title
-                                if decision.rewritten_task else (candidate.title if candidate else '')
-                            ),
-                            'deduplicated': True,
-                            'action': 'combine',
-                            'justification': decision.justification,
-                        }
-                        await self._ticket_store.mark_resolved(
-                            ticket_id,
-                            status='combined',
-                            task_id=decision.target_id,
-                            reason=f'combine: {decision.justification}',
-                            result_json=json.dumps(result_dict),
-                        )
-                        self._signal_ticket_event(ticket_id)
-                        return
-                    # combine failed → fall through to create
-
-                # ── Create task ───────────────────────────────────────────────
-                tm = await self._ensure_taskmaster()
-                metadata_json: str | None = None
-                if metadata:
-                    metadata_json = (
-                        metadata if isinstance(metadata, str) else json.dumps(metadata)
-                    )
-
-                async with self._write_lock(project_id):
-                    try:
-                        result = await tm.add_task(
-                            project_root=project_root,
-                            metadata=metadata_json,
-                            **kwargs,
-                        )
-                        atomic_metadata_written = metadata_json is not None
-                    except TypeError:
-                        result = await tm.add_task(project_root=project_root, **kwargs)
-                        atomic_metadata_written = False
-
-                    task_id_str: str = ''
-                    if isinstance(result, dict):
-                        task_id_str = str(result.get('id', ''))
-
-                    if not task_id_str:
-                        # tm.add_task returned a non-dict result or a dict without 'id'.
-                        # Reserves 'created' for the case where a usable task_id exists;
-                        # status='created' with task_id=None is semantically inconsistent
-                        # (the `if status == "created" and task_id` gate below silently
-                        # skips journal emission, and resolve_ticket callers would get
-                        # {status: 'created'} with no task_id — useless).
-                        reason = 'tm_add_task_returned_no_id'
-                        # If taskmaster returned a non-empty dict but no 'id', the task
-                        # may still exist in tasks.json (malformed response).  Persist the
-                        # raw result in result_json so an operator / reconciliation sweep
-                        # can identify and recover the orphaned task without grepping logs.
-                        if isinstance(result, dict) and result:
-                            logger.warning(
-                                '_process_add_ticket: tm.add_task returned dict with no id '
-                                'for ticket %s; raw result persisted in result_json for '
-                                'recovery: %s',
-                                ticket_id, result,
-                            )
-                            result_dict = result
-                        # status stays 'failed' (the initial default).
-                    else:
-                        # ── Latch success immediately — post-create errors must NOT
-                        # downgrade this to 'failed'.  Once tm.add_task returns, the
-                        # task exists in tasks.json; marking the ticket 'failed' would
-                        # strand the task and cause duplicate-on-retry.
-                        task_id = task_id_str
-                        status = 'created'
-                        result_dict = result if isinstance(result, dict) else {}
-                        if curator_degrade_reason is not None:
-                            result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
-
-                    if metadata_json and task_id_str and not atomic_metadata_written:
-                        try:
-                            await tm.update_task(
-                                task_id=task_id_str,
-                                metadata=metadata_json,
-                                project_root=project_root,
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                '_process_add_ticket: metadata follow-up for %s failed: %s',
-                                task_id_str, e,
-                            )
-
-                    # note_created + record_task under curator_lock + write_lock
-                    # (R3 invariant): by holding curator_lock across curate() →
-                    # note_created, concurrent add_subtask curator calls cannot
-                    # race on a stale in-memory snapshot.
-                    # Each is wrapped independently: a failure appends to
-                    # post_create_warnings and is logged, but does NOT flip status.
-                    if curator is not None and candidate is not None and task_id_str:
-                        # task_id_str truthy ↔ we took the else-branch above, so
-                        # result_dict was assigned; assert to satisfy the type checker.
-                        assert result_dict is not None
-                        try:
-                            curator.note_created(project_id, candidate, task_id_str)
-                        except Exception as exc:
-                            logger.warning(
-                                '_process_add_ticket: curator.note_created failed for %s: %s',
-                                task_id_str, exc,
-                            )
-                            result_dict.setdefault('post_create_warnings', []).append(
-                                {'stage': 'note_created', 'error': str(exc)}
-                            )
-                        try:
-                            await curator.record_task(task_id_str, candidate, project_id)
-                        except Exception as exc:
-                            logger.warning(
-                                '_process_add_ticket: curator.record_task failed for %s',
-                                task_id_str, exc_info=True,
-                            )
-                            result_dict.setdefault('post_create_warnings', []).append(
-                                {'stage': 'record_task', 'error': str(exc)}
-                            )
+                )
 
         except asyncio.CancelledError:
             # Worker task cancelled (close() path) while inside _process_add_ticket.
@@ -1814,6 +1891,358 @@ class TaskInterceptor:
             self._schedule_commit(project_root, 'add_task')
 
         self._signal_ticket_event(ticket_id)
+
+    async def _process_add_tickets_batch(self, ticket_ids: list[str]) -> None:
+        """Run the full curator + write pipeline for a batch of tickets.
+
+        Calls ``curator.curate_batch`` once for all candidates, then dispatches
+        each per-ticket decision under a single ``_curator_lock`` acquisition
+        (R3 invariant).  All tickets in a batch must share the same project_id
+        (guaranteed by the per-project queue draining in ``_curator_worker``).
+
+        Terminal status values written (per ticket):
+        - ``created``  — task was created via ``tm.add_task``
+        - ``combined`` — candidate was folded into an existing task (drop/combine)
+        - ``failed``   — an unrecoverable error occurred for that ticket
+
+        Per-ticket failures are isolated: one ticket failing does not prevent
+        other tickets from being processed.
+        """
+        if self._ticket_store is None:
+            return
+        if not ticket_ids:
+            return
+
+        # ── Load and validate all tickets ─────────────────────────────────────
+        # Build per-ticket data; skip missing or already-terminal rows.
+        ticket_data: list[tuple[str, dict, dict, str, dict, Any, CandidateTask | None]] = []
+        # (ticket_id, row, blob, project_root, kwargs, metadata, candidate)
+
+        project_id: str | None = None
+        project_root: str | None = None
+
+        for ticket_id in ticket_ids:
+            row = await self._ticket_store.get(ticket_id)
+            if row is None:
+                logger.warning(
+                    '_process_add_tickets_batch: ticket %s not found in store, skipping',
+                    ticket_id,
+                )
+                continue
+            if row['status'] != 'pending':
+                logger.warning(
+                    '_process_add_tickets_batch: ticket %s already terminal (%s), skipping',
+                    ticket_id, row['status'],
+                )
+                continue
+
+            try:
+                blob = json.loads(row['candidate_json'])
+            except Exception:
+                logger.exception(
+                    '_process_add_tickets_batch: bad candidate_json for %s', ticket_id,
+                )
+                await self._ticket_store.mark_resolved(
+                    ticket_id, status='failed', reason='bad_candidate_json',
+                )
+                self._signal_ticket_event(ticket_id)
+                continue
+
+            t_project_root: str = blob['project_root']
+            t_kwargs: dict = dict(blob.get('kwargs', {}))
+            t_metadata = blob.get('metadata')
+            t_project_id = resolve_project_id(t_project_root)
+
+            # All tickets in the batch must share project_id (per-project queue invariant).
+            if project_id is None:
+                project_id = t_project_id
+                project_root = t_project_root
+            elif t_project_id != project_id:
+                logger.warning(
+                    '_process_add_tickets_batch: ticket %s has project_id=%s, '
+                    'expected %s; skipping',
+                    ticket_id, t_project_id, project_id,
+                )
+                continue
+
+            # Rebuild candidate for curator.
+            kwargs_for_candidate = dict(t_kwargs)
+            if t_metadata is not None:
+                kwargs_for_candidate['metadata'] = t_metadata
+            candidate = self._build_candidate(kwargs_for_candidate)
+
+            ticket_data.append((
+                ticket_id, row, blob, t_project_root, t_kwargs, t_metadata, candidate,
+            ))
+
+        if not ticket_data or project_id is None or project_root is None:
+            return
+
+        # ── Curator + dispatch under a single curator_lock ─────────────────────
+        async with self._curator_lock(project_id):
+            # Get curator once for the whole batch.
+            curator = await self._get_curator()
+
+            # ── R4 idempotency checks (per-ticket, before curator call) ──────
+            # Same short-circuit that _process_add_ticket performs.  Tickets
+            # that match an existing non-cancelled task are resolved 'combined'
+            # immediately and excluded from the curate_batch call.
+            active_ticket_data: list[tuple] = []
+            for entry in ticket_data:
+                tid, _, _, t_pr, _, t_meta, _ = entry
+                idempotency_hit = await self._check_escalation_idempotency(
+                    project_root=t_pr, metadata=t_meta,
+                )
+                if idempotency_hit is not None:
+                    existing_id = str(idempotency_hit.get('id', ''))
+                    await self._ticket_store.mark_resolved(
+                        tid,
+                        status='combined',
+                        task_id=existing_id or None,
+                        reason='idempotency_hit',
+                        result_json=json.dumps(idempotency_hit),
+                    )
+                    self._signal_ticket_event(tid)
+                else:
+                    active_ticket_data.append(entry)
+            ticket_data = active_ticket_data
+
+            if not ticket_data:
+                return  # All tickets short-circuited by idempotency
+
+            # Build candidates list for curate_batch.
+            candidates: list[CandidateTask | None] = [
+                entry[6] for entry in ticket_data
+            ]
+            non_none_candidates = [c for c in candidates if c is not None]
+            # Per-ticket curator degrade reason (populated on fallback path).
+            curator_degrade_reasons: list[str | None] = [None] * len(ticket_data)
+
+            # Call curate_batch — one LLM round-trip for all candidates.
+            decisions: list[CuratorDecision | None]
+            if curator is not None and non_none_candidates:
+                try:
+                    batch_decisions = await curator.curate_batch(
+                        non_none_candidates, project_id, project_root,
+                    )
+                    # Map decisions back to ticket_data-space (some candidates are None).
+                    # batch_target_index emitted by curate_batch is in non_none-space
+                    # (positions within non_none_candidates, which is what the LLM saw).
+                    # We must remap it to ticket_data-space (positions in candidates)
+                    # before the topological dispatch loop, which keys resolved_task_ids
+                    # by ticket_data-space indices.
+                    non_none_to_ticket_data = [
+                        i for i, c in enumerate(candidates) if c is not None
+                    ]
+                    batch_idx = 0
+                    decisions = []
+                    for c in candidates:
+                        if c is None:
+                            decisions.append(None)
+                        else:
+                            bd = (
+                                batch_decisions[batch_idx]
+                                if batch_idx < len(batch_decisions)
+                                else None
+                            )
+                            # Remap batch_target_index: non_none-space → ticket_data-space.
+                            # Single-item curate() calls in the fallback path cannot emit
+                            # batch_target_index, so no remap is needed there.
+                            if bd is not None and bd.batch_target_index is not None:
+                                local_bti = bd.batch_target_index
+                                if 0 <= local_bti < len(non_none_to_ticket_data):
+                                    remapped_bti = non_none_to_ticket_data[local_bti]
+                                    bd = dataclasses.replace(
+                                        bd, batch_target_index=remapped_bti,
+                                    )
+                                else:
+                                    # Out-of-range in non_none-space: degrade to create
+                                    # to avoid substituting a wrong task_id.
+                                    logger.warning(
+                                        '_process_add_tickets_batch: batch_target_index=%d '
+                                        'out of non_none range [0, %d) for ticket %d; '
+                                        'degrading to create',
+                                        local_bti, len(non_none_to_ticket_data), batch_idx,
+                                    )
+                                    bd = CuratorDecision(
+                                        action='create',
+                                        justification=(
+                                            f'batch-target-out-of-range: '
+                                            f'local={local_bti}'
+                                        ),
+                                    )
+                            decisions.append(bd)
+                            batch_idx += 1
+                except (CuratorFailureError, AllAccountsCappedException) as exc:
+                    # Whole batch LLM failure: fall back to individual curate() calls.
+                    # This path preserves per-ticket curator_degrade_reason so that
+                    # result_json records the failure reason (same as _process_add_ticket).
+                    logger.warning(
+                        '_process_add_tickets_batch: curate_batch raised %s for '
+                        'project %s; falling back to %d individual curate() calls',
+                        type(exc).__name__, project_id, len(non_none_candidates),
+                    )
+                    batch_idx = 0
+                    decisions = []
+                    for i, c in enumerate(candidates):
+                        if c is None:
+                            decisions.append(None)
+                        else:
+                            try:
+                                d = await curator.curate(c, project_id, project_root)
+                                decisions.append(d)
+                            except CuratorFailureError as e:
+                                decisions.append(CuratorDecision(action='create'))
+                                curator_degrade_reasons[i] = str(e)
+                            batch_idx += 1
+                except Exception:  # pyright: ignore[reportUnusedExcept]
+                    logger.exception(
+                        '_process_add_tickets_batch: curate_batch failed for project %s; '
+                        'degrading all %d candidates to create',
+                        project_id, len(non_none_candidates),
+                    )
+                    decisions = [None] * len(ticket_data)
+            else:
+                decisions = [None] * len(ticket_data)
+
+            # ── Topologically-ordered dispatch ────────────────────────────────
+            # Items with batch_target_index wait for their target to be
+            # dispatched first so we can substitute the target's task_id into
+            # the dependent's mark_resolved.  We use an iterative pass that
+            # drains items that are ready (target already resolved or no
+            # batch_target_index).  After each full pass we check for progress;
+            # if none is made (all remaining items form a cycle), we coerce them
+            # to create and drain.  Cycles should not occur in practice because
+            # _parse_batch_decisions already degrades cycles, but we handle them
+            # defensively here too.
+
+            # resolved_task_ids[i] = task_id string (or None on failure) once item i is done.
+            resolved_task_ids: dict[int, str | None] = {}
+            pending_indices: list[int] = list(range(len(ticket_data)))
+
+            while pending_indices:
+                made_progress = False
+                still_pending: list[int] = []
+                for i in pending_indices:
+                    dec = decisions[i] if i < len(decisions) else None
+                    batch_target = dec.batch_target_index if dec is not None else None
+
+                    # Can dispatch if: no batch_target_index, OR target already resolved.
+                    if batch_target is not None and batch_target not in resolved_task_ids:
+                        still_pending.append(i)
+                        continue
+
+                    # Resolve the decision: if this is a within-batch drop, substitute
+                    # the sibling's task_id (or degrade to create if sibling failed).
+                    effective_decision = dec
+                    if (
+                        dec is not None
+                        and dec.action == 'drop'
+                        and batch_target is not None
+                    ):
+                        sibling_task_id = resolved_task_ids.get(batch_target)
+                        if sibling_task_id:
+                            # Sibling created or combined — use its task_id.
+                            effective_decision = CuratorDecision(
+                                action='drop',
+                                target_id=sibling_task_id,
+                                justification=(
+                                    f'batch_target_index={batch_target}: '
+                                    f'{dec.justification}'
+                                ),
+                            )
+                        else:
+                            # Sibling failed — degrade this item to create.
+                            logger.warning(
+                                '_process_add_tickets_batch: batch_target_index=%d '
+                                'for ticket %s had no task_id; degrading to create',
+                                batch_target, ticket_data[i][0],
+                            )
+                            effective_decision = CuratorDecision(
+                                action='create',
+                                justification='batch-sibling-failed: degraded to create',
+                            )
+
+                    ticket_id, _, _, t_project_root, t_kwargs, t_metadata, candidate = ticket_data[i]
+                    status = 'failed'
+                    task_id: str | None = None
+                    reason: str | None = None
+                    result_dict: dict | None = None
+
+                    try:
+                        status, task_id, reason, result_dict, _ = (
+                            await self._dispatch_ticket_decision(
+                                ticket_id=ticket_id,
+                                project_root=t_project_root,
+                                project_id=project_id,
+                                candidate=candidate,
+                                decision=effective_decision,
+                                kwargs=t_kwargs,
+                                metadata=t_metadata,
+                                curator=curator,
+                                curator_degrade_reason=(
+                                    curator_degrade_reasons[i]
+                                    if i < len(curator_degrade_reasons)
+                                    else None
+                                ),
+                            )
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.exception(
+                            '_process_add_tickets_batch: dispatch failed for ticket %s',
+                            ticket_id,
+                        )
+                        status = 'failed'
+                        reason = str(exc)
+                        task_id = None
+                        result_dict = None
+
+                    # Persist terminal state.
+                    await asyncio.shield(
+                        self._ticket_store.mark_resolved(
+                            ticket_id,
+                            status=status,
+                            task_id=task_id,
+                            reason=reason,
+                            result_json=json.dumps(result_dict) if result_dict is not None else None,
+                        )
+                    )
+
+                    # Emit journal event and schedule commit (create path only).
+                    if status == 'created' and task_id:
+                        event = self._make_event(
+                            EventType.task_created,
+                            t_project_root,
+                            {'operation': 'add_task', 'task_id': task_id},
+                        )
+                        await self._journal(event)
+                        self._schedule_commit(t_project_root, 'add_task')
+
+                    self._signal_ticket_event(ticket_id)
+
+                    # Record this item's result for downstream sibling drops.
+                    resolved_task_ids[i] = task_id
+                    made_progress = True
+
+                pending_indices = still_pending
+
+                if pending_indices and not made_progress:
+                    # Remaining items form a cycle (should not happen after parser
+                    # cycle detection, but handle defensively).
+                    logger.warning(
+                        '_process_add_tickets_batch: cycle in batch_target_index '
+                        'graph for project %s; coercing %d items to create',
+                        project_id, len(pending_indices),
+                    )
+                    for i in pending_indices:
+                        dec = decisions[i] if i < len(decisions) else None
+                        decisions[i] = CuratorDecision(
+                            action='create',
+                            justification='batch-cycle: coerced to create',
+                        )
+                    # Don't update pending_indices — the next iteration will drain them.
 
     def _signal_ticket_event(self, ticket_id: str) -> None:
         """Wake all callers waiting on resolve_ticket for this ticket.
