@@ -39,6 +39,7 @@ def _load_module() -> types.ModuleType:
 
 _mod = _load_module()
 find_exact_duplicate_groups = _mod.find_exact_duplicate_groups
+find_near_duplicate_groups = _mod.find_near_duplicate_groups
 
 
 # ---------------------------------------------------------------------------
@@ -204,3 +205,114 @@ class TestFindExactDuplicateGroupsNoStatusFiltering:
         assert len(result) == 1
         ids = {t['id'] for t in result[0]}
         assert ids == {'90', '91'}
+
+
+# ===========================================================================
+# Step-3: find_near_duplicate_groups
+# ===========================================================================
+
+class TestFindNearDuplicateGroupsPairwise:
+    """Pairwise near-duplicate detection at different thresholds."""
+
+    def test_similar_titles_grouped_at_lower_threshold(self):
+        """'Refactor task pipeline' and 'Refactor the task pipeline' are near-dup at 0.85."""
+        tasks = [
+            _task('100', 'Refactor task pipeline'),
+            _task('101', 'Refactor the task pipeline'),
+        ]
+        result = find_near_duplicate_groups(tasks, threshold=0.85)
+        assert len(result) == 1
+        ids = {t['id'] for t in result[0]}
+        assert ids == {'100', '101'}
+
+    def test_same_titles_not_grouped_at_very_high_threshold(self):
+        """Those two titles are NOT grouped at threshold=0.99 (ratio is < 0.99)."""
+        tasks = [
+            _task('110', 'Refactor task pipeline'),
+            _task('111', 'Refactor the task pipeline'),
+        ]
+        result = find_near_duplicate_groups(tasks, threshold=0.99)
+        assert result == []
+
+    def test_completely_unrelated_titles_not_grouped(self):
+        """Titles with very low similarity are never grouped."""
+        tasks = [
+            _task('120', 'Fix authentication bug'),
+            _task('121', 'Deploy new database index'),
+        ]
+        result = find_near_duplicate_groups(tasks, threshold=0.90)
+        assert result == []
+
+
+class TestFindNearDuplicateGroupsTransitive:
+    """Transitive closure via union-find merges chains into a single group."""
+
+    def test_three_transitively_similar_titles_merge_into_one_group(self):
+        """'Foo bar', 'Foo baz', 'Foo bar baz' — all near each other → one merged group."""
+        tasks = [
+            _task('130', 'Foo bar'),
+            _task('131', 'Foo baz'),
+            _task('132', 'Foo bar baz'),
+        ]
+        # At threshold 0.60 all three are near-similar transitively.
+        result = find_near_duplicate_groups(tasks, threshold=0.60)
+        assert len(result) == 1
+        group = result[0]
+        assert len(group) == 3
+        ids = {t['id'] for t in group}
+        assert ids == {'130', '131', '132'}
+
+
+class TestFindNearDuplicateGroupsExcludeIds:
+    """Tasks in exclude_ids are dropped before pairwise comparison."""
+
+    def test_excluded_ids_not_present_in_any_group(self):
+        """If task '140' is in exclude_ids, it must not appear in any near-dup group."""
+        tasks = [
+            _task('140', 'Build widget'),
+            _task('141', 'Build widget v2'),
+            _task('142', 'Build widget v3'),
+        ]
+        result = find_near_duplicate_groups(tasks, threshold=0.75, exclude_ids={'140'})
+        # Group for 141 + 142 may still form, but 140 must not be present.
+        all_ids = {t['id'] for g in result for t in g}
+        assert '140' not in all_ids
+
+    def test_all_candidates_excluded_returns_empty(self):
+        """Excluding all tasks leaves nothing to compare → []."""
+        tasks = [
+            _task('150', 'Setup CI'),
+            _task('151', 'Setup CI pipeline'),
+        ]
+        result = find_near_duplicate_groups(tasks, threshold=0.80, exclude_ids={'150', '151'})
+        assert result == []
+
+
+class TestFindNearDuplicateGroupsEdgeCases:
+    """Edge cases: empty input, single task, no groups for singletons."""
+
+    def test_empty_list_returns_empty(self):
+        result = find_near_duplicate_groups([], threshold=0.90)
+        assert result == []
+
+    def test_single_task_returns_empty(self):
+        result = find_near_duplicate_groups([_task('160', 'Only task')], threshold=0.90)
+        assert result == []
+
+    def test_result_is_deterministic(self):
+        """Shuffling input order should yield the same groups (sorted by min ID)."""
+        import random  # noqa: PLC0415
+        tasks = [
+            _task('170', 'Deploy backend service'),
+            _task('171', 'Deploy backend services'),
+            _task('172', 'Deploy frontend service'),
+            _task('173', 'Some unrelated task here'),
+        ]
+        result_a = find_near_duplicate_groups(list(tasks), threshold=0.80)
+        shuffled = list(tasks)
+        random.shuffle(shuffled)
+        result_b = find_near_duplicate_groups(shuffled, threshold=0.80)
+        # Groups should contain the same IDs regardless of input order.
+        ids_a = sorted(sorted(t['id'] for t in g) for g in result_a)
+        ids_b = sorted(sorted(t['id'] for t in g) for g in result_b)
+        assert ids_a == ids_b
