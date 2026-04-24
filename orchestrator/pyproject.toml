@@ -30,7 +30,7 @@ orchestrator = "orchestrator.cli:main"
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src", "../shared/src", "../escalation/src"]
+extraPaths = ["src", "tests", "../shared/src", "../escalation/src"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 
