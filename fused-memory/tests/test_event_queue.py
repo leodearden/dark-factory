@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pathlib
 import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
@@ -634,3 +635,74 @@ async def test_read_dead_letters_tolerates_malformed_line(tmp_path):
     # Must not raise, must return the 1 valid record (malformed line skipped).
     records = q.read_dead_letters()
     assert len(records) == 1
+
+
+@pytest.mark.asyncio
+async def test_read_dead_letters_streams_without_loading_whole_files(tmp_path, monkeypatch):
+    """Streaming implementation never calls read_text; older rotation files not opened when limit satisfied."""
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dl.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=1000,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+        max_bytes=500,
+        keep_rotations=2,
+    )
+    await q.start()
+    try:
+        for _ in range(10):
+            q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+    finally:
+        await q.close()
+
+    # Precondition: both dl.jsonl and dl.jsonl.1 must exist so the test
+    # exercises the short-circuit optimization across rotation files.
+    assert dl.exists(), 'dl.jsonl must exist (precondition)'
+    assert (tmp_path / 'dl.jsonl.1').exists(), (
+        'dl.jsonl.1 must exist after rotation (precondition)'
+    )
+
+    # Track every path opened by read_dead_letters.
+    opened_paths: list[str] = []
+    _original_open = pathlib.Path.open
+
+    def _tracking_open(self: pathlib.Path, *args, **kwargs):
+        opened_paths.append(str(self))
+        return _original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, 'open', _tracking_open)
+
+    # Patch read_text to raise — the new implementation must NOT call it.
+    # If the old implementation is still in place it will call read_text,
+    # the AssertionError is caught by the outer `except Exception` guard,
+    # and read_dead_letters returns [] — causing the len==1 assertion below
+    # to fail and clearly pinpointing the regression.
+    def _raise_on_read_text(self: pathlib.Path, *args, **kwargs):
+        raise AssertionError('read_text must not be called; use streaming open()')
+
+    monkeypatch.setattr(pathlib.Path, 'read_text', _raise_on_read_text)
+
+    result = q.read_dead_letters(limit=1)
+
+    # (1) Exactly 1 record returned — implicitly proves read_text was never called.
+    assert len(result) == 1, (
+        f'Expected 1 record; got {len(result)}. '
+        'If 0, read_text was called (raising AssertionError caught by outer guard).'
+    )
+
+    # (2) Older rotation files must not have been opened when limit is already
+    #     satisfied by the current file.
+    rotation_opens = [
+        p for p in opened_paths if 'dl.jsonl.1' in p or 'dl.jsonl.2' in p
+    ]
+    assert rotation_opens == [], (
+        f'Older rotation files should not be opened when limit is satisfied '
+        f'by the current file, but found: {rotation_opens}'
+    )
