@@ -127,10 +127,10 @@ def harness(tmp_path: Path, git_config: GitConfig):
 class TestReconcileStrandedInProgress:
     async def test_orphan_without_worktree_reverted(self, harness: Harness):
         """In-progress task with no worktree dir → reverted to pending (no-lock)."""
-        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
-            {'id': 5, 'status': 'in-progress'},
-            {'id': 6, 'status': 'pending'},
-        ]
+        harness.scheduler.get_statuses.return_value = {  # type: ignore[attr-defined]
+            '5': 'in-progress',
+            '6': 'pending',
+        }
         # No worktree directory for task 5 exists (worktree_base not even created)
 
         await harness._reconcile_stranded_in_progress()
@@ -144,9 +144,7 @@ class TestReconcileStrandedInProgress:
         self, harness: Harness, tmp_path: Path, caplog
     ):
         """In-progress task with plan.lock pointing to live PID → untouched, no revert logged."""
-        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
-            {'id': 7, 'status': 'in-progress'},
-        ]
+        harness.scheduler.get_statuses.return_value = {'7': 'in-progress'}  # type: ignore[attr-defined]
         # Create worktree with a plan.lock containing our own (live) PID
         lock_dir = harness.git_ops.worktree_base / '7' / '.task'
         lock_dir.mkdir(parents=True)
@@ -171,9 +169,7 @@ class TestReconcileStrandedInProgress:
         self, harness: Harness, monkeypatch
     ):
         """In-progress task with stale plan.lock (dead PID) → lock cleared and task reverted."""
-        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
-            {'id': 8, 'status': 'in-progress'},
-        ]
+        harness.scheduler.get_statuses.return_value = {'8': 'in-progress'}  # type: ignore[attr-defined]
         # Use a synthetic owner_pid — _pid_alive is mocked to always return False,
         # so no real PID is needed and there is no kernel-recycle race.
         owner_pid = 99999
@@ -258,9 +254,7 @@ class TestReconcileStrandedInProgress:
         """Parametrized coverage of plan.lock format edge cases."""
         import logging
 
-        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
-            {'id': task_id, 'status': 'in-progress'},
-        ]
+        harness.scheduler.get_statuses.return_value = {str(task_id): 'in-progress'}  # type: ignore[attr-defined]
 
         tid_str = str(task_id)
         lock_dir = harness.git_ops.worktree_base / tid_str / '.task'
@@ -327,9 +321,7 @@ class TestReconcileStrandedInProgress:
         """Worktree dir exists but has no plan.lock and task is NOT in _recovered_plans
         → cleanup_worktree is called and task is reverted to pending."""
         tid = 30
-        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
-            {'id': tid, 'status': 'in-progress'},
-        ]
+        harness.scheduler.get_statuses.return_value = {str(tid): 'in-progress'}  # type: ignore[attr-defined]
         # Create the worktree directory (no .task/plan.lock inside)
         worktree_path = harness.git_ops.worktree_base / str(tid)
         worktree_path.mkdir(parents=True)
@@ -348,9 +340,7 @@ class TestReconcileStrandedInProgress:
         """Worktree dir exists but has no plan.lock and task IS in _recovered_plans
         → cleanup_worktree is NOT called (worktree preserved), task still reverted."""
         tid = 31
-        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
-            {'id': tid, 'status': 'in-progress'},
-        ]
+        harness.scheduler.get_statuses.return_value = {str(tid): 'in-progress'}  # type: ignore[attr-defined]
         # Create the worktree directory (no .task/plan.lock inside)
         worktree_path = harness.git_ops.worktree_base / str(tid)
         worktree_path.mkdir(parents=True)
@@ -372,9 +362,7 @@ class TestReconcileStrandedInProgress:
         """In-progress task with stale plan.lock (dead PID), not in _recovered_plans
         → cleanup_worktree called (removing entire worktree dir), task reverted."""
         tid = 32
-        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
-            {'id': tid, 'status': 'in-progress'},
-        ]
+        harness.scheduler.get_statuses.return_value = {str(tid): 'in-progress'}  # type: ignore[attr-defined]
         monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
         # Create worktree with a plan.lock referencing a synthetic dead PID
@@ -411,9 +399,7 @@ class TestReconcileStrandedInProgress:
         This test exists to lock the invariant against future drift in the recovery path.
         """
         tid = 33
-        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
-            {'id': tid, 'status': 'in-progress'},
-        ]
+        harness.scheduler.get_statuses.return_value = {str(tid): 'in-progress'}  # type: ignore[attr-defined]
         monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
         # Create worktree with a plan.lock referencing a synthetic dead PID
@@ -451,9 +437,7 @@ class TestReconcileStrandedInProgress:
         the lock, find its owner dead again, and loop forever.
         """
         tid = 40
-        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
-            {'id': tid, 'status': 'in-progress'},
-        ]
+        harness.scheduler.get_statuses.return_value = {str(tid): 'in-progress'}  # type: ignore[attr-defined]
         monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
 
         # Create worktree with a plan.lock referencing a synthetic dead PID
@@ -498,9 +482,7 @@ class TestReconcileStrandedInProgress:
         still call set_task_status so the task escapes in-progress.
         """
         tid = 41
-        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
-            {'id': tid, 'status': 'in-progress'},
-        ]
+        harness.scheduler.get_statuses.return_value = {str(tid): 'in-progress'}  # type: ignore[attr-defined]
         # Create worktree dir with NO plan.lock inside
         worktree_path = harness.git_ops.worktree_base / str(tid)
         worktree_path.mkdir(parents=True)
@@ -524,6 +506,29 @@ class TestReconcileStrandedInProgress:
             f'Expected cleanup-failure WARNING in harness logs, got: {[r.message for r in caplog.records]}'
         )
 
+    async def test_reconcile_uses_get_statuses_not_get_tasks(self, harness: Harness):
+        """_reconcile_stranded_in_progress must use get_statuses, not get_tasks.
+
+        RED against current code: harness still calls get_tasks.
+        After the migration (step-14 impl), get_statuses is called and
+        get_tasks is never called for the reconcile sweep.
+        """
+        harness.scheduler.get_statuses.return_value = {  # type: ignore[attr-defined]
+            '5': 'in-progress',
+            '6': 'pending',
+        }
+        # No worktree for task 5 (orphan → will be reverted to pending)
+        # Task 6 is pending → not touched
+
+        await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.get_statuses.assert_called_once()  # type: ignore[attr-defined]
+        harness.scheduler.get_tasks.assert_not_called()  # type: ignore[attr-defined]
+        calls = harness.scheduler.set_task_status.call_args_list  # type: ignore[attr-defined]
+        assert len(calls) == 1
+        assert calls[0].args[0] == '5'
+        assert calls[0].args[1] == 'pending'
+
     async def test_unexpected_exception_propagates_out_of_reconcile(
         self, harness: Harness
     ):
@@ -536,9 +541,7 @@ class TestReconcileStrandedInProgress:
         """
         from unittest.mock import patch as _patch
 
-        harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
-            {'id': 15, 'status': 'in-progress'},
-        ]
+        harness.scheduler.get_statuses.return_value = {'15': 'in-progress'}  # type: ignore[attr-defined]
         lock_dir = harness.git_ops.worktree_base / '15' / '.task'
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
@@ -645,14 +648,14 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
 async def test_non_in_progress_statuses_ignored(harness: Harness):
     """The sweep only touches in-progress tasks; other statuses are untouched."""
     # Only the 'in-progress' task has no lock (worktree doesn't exist)
-    harness.scheduler.get_tasks.return_value = [  # type: ignore[attr-defined]
-        {'id': 20, 'status': 'pending'},
-        {'id': 21, 'status': 'done'},
-        {'id': 22, 'status': 'blocked'},
-        {'id': 23, 'status': 'cancelled'},
-        {'id': 24, 'status': 'review'},
-        {'id': 25, 'status': 'in-progress'},  # <-- only this one
-    ]
+    harness.scheduler.get_statuses.return_value = {  # type: ignore[attr-defined]
+        '20': 'pending',
+        '21': 'done',
+        '22': 'blocked',
+        '23': 'cancelled',
+        '24': 'review',
+        '25': 'in-progress',  # <-- only this one
+    }
     # No worktree for task 25 (orphan)
 
     await harness._reconcile_stranded_in_progress()
