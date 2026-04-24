@@ -80,7 +80,7 @@ def _build_variant_summary(
     precisions = [s.precision for s in scores]
     f1s = [s.f1 for s in scores]
     blocking_recalls = [s.blocking_recall for s in scores]
-    costs = [s.cost_usd for s in scores]
+    costs = [s.cost_usd + s.match_cost_usd for s in scores]
     wall_clocks = [s.wall_clock_ms for s in scores]
 
     total_cost = sum(costs)
