@@ -1771,3 +1771,44 @@ class TestLoadEscalationsIncludesArchive:
             f'Root copy (level=0) must win over archive copy (level=1); '
             f'got level={matching[0]["level"]!r}'
         )
+
+    def test_load_escalations_archive_only_multidate_dedup(self, tmp_path):
+        """(d) _load_escalations deduplicates the same id across multiple archive dates.
+
+        Write the same esc id under two different archive/<date>/ subdirs with
+        nothing in the queue root.  _load_escalations must return exactly one
+        dict for that id.  rglob ordering across sibling dated subdirs is
+        non-deterministic, so we assert cardinality only (not which copy won).
+
+        This test pins the dedup contract at the dashboard boundary — a regression
+        in _load_escalations (e.g. calling the helper incorrectly) would not be
+        caught by the escalation-level test_archive_only_multidate_dedup which
+        only exercises iter_all_escalation_paths directly.
+        """
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+
+        esc_dict = {
+            'id': 'esc-106-1',
+            'task_id': '106',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'Archived esc duplicated across dates',
+            'level': 1,
+            'status': 'resolved',
+            'resolution': 'Human resolved it',
+        }
+        _write_archived_escalation(esc_dir, '2026-04-20', esc_dict)
+        _write_archived_escalation(esc_dir, '2026-04-21', esc_dict)
+
+        # Confirm no root copy exists
+        assert not (esc_dir / 'esc-106-1.json').exists()
+
+        result = _load_escalations(esc_dir)
+
+        matching = [d for d in result if d.get('id') == 'esc-106-1']
+        assert len(matching) == 1, (
+            f'Archive-only multi-date duplicate must be deduplicated to exactly 1 entry; '
+            f'got {len(matching)}: {matching}'
+        )
