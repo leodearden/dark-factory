@@ -12,6 +12,15 @@ Covers:
   - Escalation rate-limiting (step-15)
   - Guard disabled short-circuits everything (step-17)
   - BulkResetVerdict.to_error_dict() shape (step-19)
+  - task-979: async I/O offloading, idle-state preservation, write-failure backoff
+  - task-1016: per-kind counter isolation (test_per_kind_counter_isolation)
+  - task-1016: _reversal_kind classifier (test_reversal_kind_classifier)
+  - task-1016: BulkResetVerdict.kind field (test_verdict_carries_tripped_kind)
+  - task-1016: kind slug in escalation filename/JSON
+    (test_escalation_filename_and_body_include_kind)
+  - task-1016: acceptance regression — 2026-04-24 reify incident
+    esc-bulk-reset-reify-2026-04-24T070944_6456580000
+    (test_acceptance_scenario_startup_reconcile_does_not_trip)
 """
 
 from __future__ import annotations
