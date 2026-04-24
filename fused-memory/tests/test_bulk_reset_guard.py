@@ -649,25 +649,24 @@ async def test_escalation_write_offloads_io_to_thread(tmp_path, monkeypatch):
     """mkdir and write_text in _maybe_write_escalation must be offloaded to a
     thread via asyncio.to_thread so they do not block the event loop.
 
-    Monkeypatches asyncio.to_thread with a tracking wrapper that records the
-    callable name and then delegates to the real asyncio.to_thread.  The guard
-    is tripped (4 reversals, threshold=3) and the test asserts that the wrapper
-    saw at least one call for 'mkdir' and one for 'write_text'.
-
-    This test fails today because _maybe_write_escalation calls both
-    synchronously on the event loop.
+    Monkeypatches asyncio.to_thread with a tracking wrapper that records each
+    raw callable passed and then delegates to the real asyncio.to_thread.  The
+    guard is tripped (4 reversals, threshold=3) and the test asserts that
+    exactly one tracked call is Path.mkdir bound to the escalation directory and
+    exactly one is Path.write_text bound to a file inside that directory.
     """
     import asyncio as _asyncio
 
-    tracked_callables: list[str] = []
+    tracked_callables: list = []
     real_to_thread = _asyncio.to_thread
 
     async def tracking_to_thread(func, *args, **kwargs):
-        tracked_callables.append(getattr(func, '__name__', repr(func)))
+        tracked_callables.append(func)
         return await real_to_thread(func, *args, **kwargs)
 
     monkeypatch.setattr(_asyncio, 'to_thread', tracking_to_thread)
 
+    expected_esc_dir = tmp_path / 'data' / 'escalations'
     clock = [1000.0]
 
     def fake_clock() -> float:
@@ -691,13 +690,23 @@ async def test_escalation_write_offloads_io_to_thread(tmp_path, monkeypatch):
             project_root=str(tmp_path),
         )
 
-    assert 'mkdir' in tracked_callables, (
-        f'Expected asyncio.to_thread called with mkdir; '
-        f'recorded callables: {tracked_callables}'
+    mkdir_calls = [
+        f for f in tracked_callables
+        if getattr(f, '__func__', None) is Path.mkdir
+        and getattr(f, '__self__', None) == expected_esc_dir
+    ]
+    write_text_calls = [
+        f for f in tracked_callables
+        if getattr(f, '__func__', None) is Path.write_text
+        and getattr(getattr(f, '__self__', None), 'parent', None) == expected_esc_dir
+    ]
+    assert len(mkdir_calls) == 1, (
+        f'Expected exactly 1 Path.mkdir bound-method call on {expected_esc_dir}; '
+        f'got {len(mkdir_calls)}. Tracked callables: {tracked_callables}'
     )
-    assert 'write_text' in tracked_callables, (
-        f'Expected asyncio.to_thread called with write_text; '
-        f'recorded callables: {tracked_callables}'
+    assert len(write_text_calls) == 1, (
+        f'Expected exactly 1 Path.write_text bound-method call inside {expected_esc_dir}; '
+        f'got {len(write_text_calls)}. Tracked callables: {tracked_callables}'
     )
 
 
