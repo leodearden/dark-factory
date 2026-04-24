@@ -344,6 +344,62 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_true_drop_still_reported_when_mixed_with_expected_deletion(
+        self, git_ops: GitOps,
+    ):
+        """True conflict-resolution drops are still returned alongside expected deletions.
+
+        Plan has three files:
+        - kept.py:         present in the merge tree (no issue)
+        - deleted.py:      absent from the merge tree, but deleted by a done step → expected_absent
+        - never_created.py: absent from the merge tree with no done-step deletion → real drop
+
+        Only never_created.py should be in the returned list.
+        """
+        worktree = (await git_ops.create_worktree('plan-mixed-drops')).path
+
+        # kept.py stays in the tree
+        (worktree / 'kept.py').write_text('kept = 1\n')
+        # deleted.py will be created and then deleted
+        (worktree / 'deleted.py').write_text('deleted = 1\n')
+        await git_ops.commit(worktree, 'Add kept.py and deleted.py')
+
+        # Deletion commit — only deleted.py is removed
+        (worktree / 'deleted.py').unlink()
+        delete_sha = await git_ops.commit(worktree, 'Delete deleted.py')
+        assert delete_sha is not None
+
+        # never_created.py is never committed — simulates a conflict-resolution drop
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-mixed', 'T-mixed', 'desc')
+        artifacts.write_plan({
+            'files': ['kept.py', 'deleted.py', 'never_created.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'delete deleted.py',
+                    'status': 'done',
+                    'commit': delete_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'plan-mixed-drops')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            # kept.py is present, deleted.py is expected_absent, only the
+            # true drop remains.
+            assert missing == ['never_created.py']
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 class TestMergeWorker:
