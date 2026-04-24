@@ -428,12 +428,8 @@ class TaskWorkflow:
             # memory); this guard falls through to the SUCCESS path which
             # writes completion memory.  The two guards cover complementary
             # failure modes — do not collapse them.
-            wt_head = await self._get_head_commit()
-            current_main = await self.git_ops.get_main_sha()
-            already_on_main = (
-                wt_head == current_main
-                or await self.git_ops.is_ancestor(wt_head, current_main)
-            )
+            _branch_check = await self._check_branch_on_main()
+            already_on_main = _branch_check is not None
             if already_on_main and not self._worktree_external:
                 # Guard: a stale branch point (requeued task that was planned
                 # but never implemented, or a freshly-created worktree) also
@@ -448,6 +444,8 @@ class TaskWorkflow:
                 # the branch has real work and we should skip to DONE.  Passing
                 # wt_head would cause the SHA-primary check to return has_work=False
                 # on any rebased branch, silently discarding completed work.
+                assert _branch_check is not None  # narrowing: already_on_main is True
+                wt_head, _ = _branch_check
                 has_work = (
                     self._has_prior_implementation().has_work
                     or await self.git_ops.has_uncommitted_work(self.worktree)
