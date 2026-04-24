@@ -12,7 +12,6 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.scheduler import RequeueRecord, Scheduler
 
-
 # --- Fixtures -----------------------------------------------------------------
 
 
