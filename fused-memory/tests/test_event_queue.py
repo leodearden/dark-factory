@@ -470,6 +470,60 @@ async def test_dead_letter_rotation_zero_keep_discards_file(tmp_path):
         await q.close()
 
 
+@pytest.mark.asyncio
+async def test_rotation_purges_orphan_rotations(tmp_path):
+    """After keep_rotations is reduced, orphaned rotation files are purged on next rotation.
+
+    Simulates a previous run with keep_rotations=5 by pre-creating dead_letter.jsonl.3,
+    .4, and .5 on disk.  The current run uses keep_rotations=2 and max_bytes=300.
+    After triggering a rotation (by enqueuing ~5 events), the orphan files beyond
+    keep_rotations must be unlinked while retained siblings (.1, .2) are untouched.
+    """
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dead_letter.jsonl'
+
+    # Pre-create orphan rotation files from a prior run with a higher keep_rotations.
+    orphan_3 = tmp_path / 'dead_letter.jsonl.3'
+    orphan_4 = tmp_path / 'dead_letter.jsonl.4'
+    orphan_5 = tmp_path / 'dead_letter.jsonl.5'
+    for orphan in (orphan_3, orphan_4, orphan_5):
+        orphan.write_text('{"orphan": true}\n', encoding='utf-8')
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=1000,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+        max_bytes=300,  # tight — triggers rotation after ~1 record (~300 bytes each)
+        keep_rotations=2,
+    )
+    await q.start()
+    try:
+        # Enqueue enough events to trigger at least one rotation.
+        for _ in range(5):
+            q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+
+        # Orphan files beyond keep_rotations must be purged.
+        assert not orphan_3.exists(), 'dead_letter.jsonl.3 must be purged after rotation'
+        assert not orphan_4.exists(), 'dead_letter.jsonl.4 must be purged after rotation'
+        assert not orphan_5.exists(), 'dead_letter.jsonl.5 must be purged after rotation'
+
+        # Retained siblings (index ≤ keep_rotations) must not have been deleted.
+        retained_1 = tmp_path / 'dead_letter.jsonl.1'
+        retained_2 = tmp_path / 'dead_letter.jsonl.2'
+        if retained_1.exists():
+            assert retained_1.stat().st_size > 0, '.jsonl.1 should have event data'
+        if retained_2.exists():
+            assert retained_2.stat().st_size > 0, '.jsonl.2 should have event data'
+
+    finally:
+        await q.close()
+
+
 # ── read_dead_letters ──────────────────────────────────────────────────
 
 
