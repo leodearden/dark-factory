@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -493,7 +494,6 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
-
     async def test_git_log_error_logs_warning_and_treats_file_as_dropped(
         self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
     ):
@@ -503,14 +503,10 @@ class TestCheckPlanTargetsInTree:
         The implementation must (a) log a WARNING mentioning the step/commit, and (b)
         conservatively leave the file as a real drop (not mask it as expected_absent).
         """
-        import logging
-
         worktree = (await git_ops.create_worktree('plan-bad-sha')).path
 
         # gone.py is never committed to the worktree → it will be missing from
-        # the merge tree (simulates a conflict-resolution drop)
-        await git_ops.commit(worktree, 'Empty initial commit')  # returns None if nothing staged
-
+        # the merge tree (simulates a conflict-resolution drop).
         # We need at least one file so merge_to_main succeeds
         (worktree / 'anchor.py').write_text('anchor = 1\n')
         await git_ops.commit(worktree, 'Add anchor.py')

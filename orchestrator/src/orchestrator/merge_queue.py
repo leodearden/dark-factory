@@ -79,17 +79,17 @@ async def _check_plan_targets_in_tree(
             continue
         rc, stdout, stderr = await _run(
             [
-                'git', 'log', '-1',
+                'git', 'show',
                 '--diff-filter=D',
                 '--name-only',
                 '--format=',
-                f'{commit}~1..{commit}',
+                commit,
             ],
             cwd=git_ops.project_root,
         )
         if rc != 0:
             logger.warning(
-                'git log --diff-filter=D failed for step %d commit %s: %s',
+                'git show --diff-filter=D failed for step %d commit %s: %s',
                 step_idx, commit, stderr.strip(),
             )
             continue
