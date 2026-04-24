@@ -374,7 +374,10 @@ async def _run(args: argparse.Namespace) -> int:
     await backend.initialize()
     try:
         raw = await backend.get_tasks(args.project_root, args.tag)
-        # Taskmaster wraps results; unwrap the task list.
+        # Taskmaster response shape (verified 2026-04-25):
+        #   {'data': {'tasks': [...], 'filter': ..., 'stats': ...},
+        #    'version': {...}, 'tag': 'master'}
+        # Unwrap defensively to handle future shape changes.
         tasks: list[dict] = []
         if isinstance(raw, dict):
             data = raw.get('data') or raw.get('tasks') or raw
