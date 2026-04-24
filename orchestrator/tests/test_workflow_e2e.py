@@ -2636,7 +2636,7 @@ class TestCheckBranchOnMain:
         workflow.artifacts = TaskArtifacts(wt)
 
         # 3. Clear git_ops to trigger the second arm of the None-guard
-        workflow.git_ops = None
+        workflow.git_ops = None  # type: ignore[assignment]
 
         # 4. Call _check_branch_on_main — must return None without crashing
         result = await workflow._check_branch_on_main()
