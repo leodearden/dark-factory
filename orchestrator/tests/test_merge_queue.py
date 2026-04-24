@@ -494,6 +494,66 @@ class TestCheckPlanTargetsInTree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
 
+    async def test_git_log_error_logs_warning_and_treats_file_as_dropped(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        """git log non-zero rc → warning logged, file remains in dropped list (fail-closed).
+
+        A done step with a non-existent/bad commit SHA causes the git log call to fail.
+        The implementation must (a) log a WARNING mentioning the step/commit, and (b)
+        conservatively leave the file as a real drop (not mask it as expected_absent).
+        """
+        import logging
+
+        worktree = (await git_ops.create_worktree('plan-bad-sha')).path
+
+        # gone.py is never committed to the worktree → it will be missing from
+        # the merge tree (simulates a conflict-resolution drop)
+        await git_ops.commit(worktree, 'Empty initial commit')  # returns None if nothing staged
+
+        # We need at least one file so merge_to_main succeeds
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        bad_sha = '0' * 40  # plausible SHA shape but non-existent
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-bad-sha', 'T-bad-sha', 'desc')
+        artifacts.write_plan({
+            'files': ['gone.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'supposedly deleted gone.py',
+                    'status': 'done',
+                    'commit': bad_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'plan-bad-sha')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                missing = await _check_plan_targets_in_tree(
+                    merge_result.merge_commit, worktree, git_ops,
+                )
+            # (a) git log fails → file stays as dropped (fail-closed)
+            assert missing == ['gone.py']
+            # (b) a warning was emitted mentioning the bad commit
+            warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert warning_records, 'Expected at least one WARNING log record'
+            assert any(bad_sha in r.getMessage() for r in warning_records), (
+                f'Expected WARNING mentioning the bad SHA {bad_sha!r}; '
+                f'got: {[r.getMessage() for r in warning_records]}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+
 @pytest.mark.asyncio
 class TestMergeWorker:
     async def test_basic_merge_through_queue(
