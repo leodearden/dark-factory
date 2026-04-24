@@ -178,6 +178,22 @@ class TestFormatPretriagedDetail:
         assert 'escalation_id' in detail
         assert 'suggestion_hash' in detail
         assert 'interceptor will' in detail
+        # Two-step API contract: legacy add_task must be absent
+        assert 'add_task' not in detail, (
+            'Legacy add_task must not appear in the pre-triaged R4 block'
+        )
+        # submit_task call must show the metadata= kwarg form
+        assert 'submit_task' in detail
+        assert 'metadata=' in detail
+        # Two-step resolution: resolve_ticket and combined status must be named
+        assert 'resolve_ticket' in detail, (
+            'Pre-triaged block must name resolve_ticket so the steward '
+            'knows to call it after submit_task'
+        )
+        assert 'combined' in detail, (
+            "Pre-triaged block must name the 'combined' status returned by "
+            'resolve_ticket on an R4 idempotency hit'
+        )
 
     def test_escalation_id_absent_keeps_legacy_format(self):
         triage_result = {
