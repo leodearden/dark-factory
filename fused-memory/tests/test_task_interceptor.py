@@ -3817,3 +3817,57 @@ async def test_dedupe_bulk_remove_failure_keeps_task_in_both_errors_and_kept(
     # (e) Both '10' and '11' reach pass-2 (curate called twice: '11' was
     # re-appended to unique_new_tasks after the except block).
     assert curator_interceptor._curator.curate.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_dedupe_bulk_blank_title_tasks_bypass_intra_batch_pre_pass(
+    curator_interceptor, taskmaster,
+):
+    """Blank-title bypass: tasks with whitespace-only titles must not be
+    collapsed by the intra-batch pre-pass into the first occurrence.
+
+    Without the guard at task_interceptor.py:1049 every blank-title task
+    would hash to the same _intra_batch_key('', ...) bucket regardless of
+    description (because title normalises to ''), so the second and subsequent
+    malformed subtasks would be incorrectly removed.  The guard passes them
+    straight through; the curator path's own empty-title short-circuit at
+    task_interceptor.py:1103 then handles them — ensuring both end up in
+    `kept` without ever calling remove_task or curator.curate.
+    """
+    post_snapshot = {'tasks': [
+        {'id': '20', 'title': '   ', 'description': 'first malformed task'},
+        {'id': '21', 'title': '\t\n', 'description': 'second malformed task'},
+    ]}
+
+    taskmaster.get_tasks = AsyncMock(return_value=post_snapshot)
+    taskmaster.remove_task = AsyncMock(return_value={'success': True})
+    curator_interceptor._curator = _mock_curator(
+        CuratorDecision(action='create', justification='novel')
+    )
+
+    result = await curator_interceptor._dedupe_bulk_created(
+        '/project', pre_snapshot={'tasks': []},
+    )
+
+    # (a) No removals.
+    assert result['removed'] == [], f"expected no removals, got: {result['removed']}"
+
+    # (b) No errors.
+    assert result['errors'] == [], f"expected no errors, got: {result['errors']}"
+
+    # (c) Both tasks present in kept.
+    kept_ids = {k['task_id'] for k in result['kept']}
+    assert kept_ids == {'20', '21'}, f"kept_ids={kept_ids}"
+
+    # (d) remove_task was never called (the pre-pass guard fired so no removal
+    # attempt was made for these malformed tasks).
+    assert taskmaster.remove_task.await_count == 0, (
+        f'remove_task should not have been called: {taskmaster.remove_task.call_args_list}'
+    )
+
+    # (e) curator.curate was never called (pass-2 empty-title short-circuit at
+    # task_interceptor.py:1103 fired before reaching curate for both tasks).
+    assert curator_interceptor._curator.curate.await_count == 0, (
+        f'curate should not have been called: '
+        f'{curator_interceptor._curator.curate.call_args_list}'
+    )
