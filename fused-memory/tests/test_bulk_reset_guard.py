@@ -692,12 +692,12 @@ async def test_escalation_write_offloads_io_to_thread(tmp_path, monkeypatch):
 
     mkdir_calls = [
         f for f in tracked_callables
-        if getattr(f, '__func__', None) is Path.mkdir
+        if getattr(getattr(f, '__func__', None), '__name__', None) == 'mkdir'
         and getattr(f, '__self__', None) == expected_esc_dir
     ]
     write_text_calls = [
         f for f in tracked_callables
-        if getattr(f, '__func__', None) is Path.write_text
+        if getattr(getattr(f, '__func__', None), '__name__', None) == 'write_text'
         and getattr(getattr(f, '__self__', None), 'parent', None) == expected_esc_dir
     ]
     assert len(mkdir_calls) == 1, (
@@ -926,8 +926,8 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
     # after creating parent dirs, so path-equality alone is not sufficient.  We
     # combine path equality with a parents=True check that reads from both
     # keyword form (kwargs.get) and positional form (args[1], since mode is
-    # args[0]).  The retry call always passes parents=False as a keyword arg, so
-    # it is correctly excluded regardless of how the outer call site passes it.
+    # args[0]).  The retry call always passes parents=False (whether positional
+    # or keyword), which this check excludes either way.
     expected_esc_dir = tmp_path / 'data' / 'escalations'
     outer_mkdir_calls: list[int] = [0]
     write_text_calls: list[int] = [0]
