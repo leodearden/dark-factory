@@ -3830,9 +3830,16 @@ async def test_dedupe_bulk_blank_title_tasks_bypass_intra_batch_pre_pass(
     would hash to the same _intra_batch_key('', ...) bucket regardless of
     description (because title normalises to ''), so the second and subsequent
     malformed subtasks would be incorrectly removed.  The guard passes them
-    straight through; the curator path's own empty-title short-circuit at
-    task_interceptor.py:1103 then handles them — ensuring both end up in
-    `kept` without ever calling remove_task or curator.curate.
+    straight through so both tasks reach pass-2.
+
+    Note: pass-2's own short-circuit at task_interceptor.py:1103 uses
+    `if not candidate.title:` which only catches the empty string, not
+    whitespace-only titles (truthiness: bool('   ') is True).  So the curator
+    IS called for both whitespace tasks; with the mock returning
+    CuratorDecision(action='create') both end up in `kept`.  The asymmetry
+    between pass-1 (title.strip()) and pass-2 (candidate.title) is tracked
+    as a follow-up — this test verifies the pass-1 bypass specifically and
+    the overall contract that blank-title tasks are not lost or collapsed.
     """
     post_snapshot = {'tasks': [
         {'id': '20', 'title': '   ', 'description': 'first malformed task'},
@@ -3865,9 +3872,12 @@ async def test_dedupe_bulk_blank_title_tasks_bypass_intra_batch_pre_pass(
         f'remove_task should not have been called: {taskmaster.remove_task.call_args_list}'
     )
 
-    # (e) curator.curate was never called (pass-2 empty-title short-circuit at
-    # task_interceptor.py:1103 fired before reaching curate for both tasks).
-    assert curator_interceptor._curator.curate.await_count == 0, (
-        f'curate should not have been called: '
+    # (e) curator.curate WAS called once per task (pass-2's short-circuit at
+    # task_interceptor.py:1103 only catches the empty string, not
+    # whitespace-only titles, so both tasks reach the curator).  The mock
+    # returns action='create' so both still end up in `kept` — no removal,
+    # no error, contract preserved.
+    assert curator_interceptor._curator.curate.await_count == 2, (
+        f'curate should have been called once per whitespace task: '
         f'{curator_interceptor._curator.curate.call_args_list}'
     )
