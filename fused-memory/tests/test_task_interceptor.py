@@ -1592,6 +1592,57 @@ async def test_get_statuses_returns_all_id_to_status_mapping(taskmaster, event_b
     assert stats['size'] == 0
 
 
+@pytest.mark.asyncio
+async def test_get_statuses_filters_by_ids_list(taskmaster, event_buffer):
+    """When ids=['1', '3'], only those two keys appear in the result."""
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {'id': 1, 'status': 'pending'},
+            {'id': 2, 'status': 'done'},
+            {'id': 3, 'status': 'in-progress'},
+        ]
+    })
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+
+    result = await interceptor.get_statuses('/project', ids=['1', '3'])
+
+    assert result == {'1': 'pending', '3': 'in-progress'}
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_omits_unknown_ids(taskmaster, event_buffer):
+    """Unknown ids in the filter list are silently omitted (no error, no key)."""
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {'id': 1, 'status': 'pending'},
+        ]
+    })
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+
+    result = await interceptor.get_statuses('/project', ids=['1', '9999'])
+
+    assert result == {'1': 'pending'}
+    assert '9999' not in result
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_handles_data_envelope(taskmaster, event_buffer):
+    """get_statuses unwraps {data: {tasks: [...]}} envelope like get_task does."""
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'data': {
+            'tasks': [
+                {'id': 10, 'status': 'blocked'},
+                {'id': 11, 'status': 'done'},
+            ]
+        }
+    })
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+
+    result = await interceptor.get_statuses('/project')
+
+    assert result == {'10': 'blocked', '11': 'done'}
+
+
 # ── Tests for None / disconnected taskmaster ───────────────────────
 
 
