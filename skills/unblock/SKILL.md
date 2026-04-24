@@ -166,7 +166,7 @@ submit_result = submit_task(
 )
 ticket = submit_result["ticket"]
 
-# Phase 2: block until the curator decides (60 s is intentionally conservative; server default is 115 s)
+# Phase 2: block until the curator decides (timeout_seconds=60; see _shared/ticket-failure-handling.md)
 resolve = resolve_ticket(ticket=ticket, project_root="<PROJECT_ROOT>", timeout_seconds=60)
 
 if resolve["status"] == "created":
