@@ -134,9 +134,13 @@ class EscalationQueue:
           include resolved/dismissed escalations that have been moved out.
 
         Deduplication: if the same escalation id appears in both the queue root
-        and the archive (e.g. crash mid-resolve), only the first occurrence is
-        returned and a WARNING is logged.  Iteration order is queue root first,
-        archive second, so the queue_dir copy wins when both exist.
+        and the archive (e.g. crash mid-resolve), only the first occurrence that
+        passes all filters is returned and a WARNING is logged for any later
+        same-id path that also passes.  Filters (task_id / status / level) are
+        applied BEFORE adding to ``seen``, so a copy that fails its own filter
+        never shadows a matching copy in the other tier.  Iteration order is
+        queue root first, archive second, so the queue_dir copy wins when both
+        copies pass the filter.
         """
         # Build the candidate path list.
         paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
@@ -148,6 +152,12 @@ class EscalationQueue:
         for path in paths:
             try:
                 esc = Escalation.from_json(path.read_text())
+                if esc.task_id != task_id:
+                    continue
+                if status is not None and esc.status != status:
+                    continue
+                if level is not None and esc.level != level:
+                    continue
                 if esc.id in seen:
                     logger.warning(
                         f'Duplicate escalation id {esc.id!r} at {path}; '
@@ -155,12 +165,6 @@ class EscalationQueue:
                     )
                     continue
                 seen.add(esc.id)
-                if esc.task_id != task_id:
-                    continue
-                if status is not None and esc.status != status:
-                    continue
-                if level is not None and esc.level != level:
-                    continue
                 results.append(esc)
             except (json.JSONDecodeError, KeyError, TypeError):
                 continue
