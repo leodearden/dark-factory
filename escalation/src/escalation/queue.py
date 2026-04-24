@@ -187,7 +187,8 @@ class EscalationQueue:
                 esc = Escalation.from_json(path.read_text())
                 if esc.status == 'pending':
                     results.append(esc)
-            except (json.JSONDecodeError, KeyError, TypeError):
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse {path}: {e}')
                 continue
         return results
 
