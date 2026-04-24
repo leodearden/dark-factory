@@ -267,7 +267,7 @@ class TaskWorkflow:
         self._config_dir: TaskConfigDir | None = None
         self._old_plan_base: str | None = None  # base commit from prior session (for revalidation diff)
         self._merge_sha: str | None = None  # merge commit SHA set by _submit_to_merge_queue on success
-        self._last_invoked_role: str | None = None  # role of the last successful invocation
+        self._last_completed_role: str | None = None  # role of the last successfully-completed invocation
         self._last_verify_result: VerifyResult | None = None  # most recent failing VerifyResult from _verify_debugfix_loop
 
     @property
@@ -659,7 +659,7 @@ class TaskWorkflow:
             )
 
         except _SessionBudgetExhausted as e:
-            last_role = self._last_invoked_role or 'n/a'
+            last_role = self._last_completed_role or 'n/a'
             budget_limit = self.config.usage_cap.session_budget_usd
             # Use the gate's own cumulative figure for the summary — it is the
             # value that actually exceeded the budget, whereas
@@ -668,7 +668,7 @@ class TaskWorkflow:
             # invocation contributed cost without completing.
             reason = (
                 f'Session budget exhausted: ${e.cumulative_cost:.2f} spent of '
-                f'${budget_limit:.2f} budget (last role: {last_role})'
+                f'${budget_limit:.2f} budget (last completed role: {last_role})'
             )
             detail = (
                 f'budget_limit=${budget_limit:.2f}\n'
@@ -676,7 +676,7 @@ class TaskWorkflow:
                 f'cumulative_cost (gate)=${e.cumulative_cost:.2f}\n'
                 f'agent_invocations={self.metrics.agent_invocations}\n'
                 f'total_turns={self.metrics.total_turns}\n'
-                f'last_role={last_role}'
+                f'last_completed_role={last_role}'
             )
             # _mark_blocked logs "Task %s BLOCKED: %s" — only log the
             # gate-specific cross-check figure that's unique to this call site.
@@ -2239,7 +2239,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # Record the last successfully-completed role (updated only on success,
         # mirrors the cost-accumulation path below — failed/raised invocations
         # do not advance either field).
-        self._last_invoked_role = role.name
+        self._last_completed_role = role.name
 
         # Track metrics
         self.metrics.total_cost_usd += result.cost_usd
