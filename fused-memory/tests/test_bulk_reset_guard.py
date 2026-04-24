@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard, BulkResetVerdict
+from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard, BulkResetVerdict, _reversal_kind
 
 # ---------------------------------------------------------------------------
 # step-1: ReconciliationConfig defaults
@@ -72,6 +72,37 @@ def test_guard_constructor_accepts_split_thresholds(tmp_path):
     # (b) Legacy ``threshold=`` kwarg must be rejected.
     with pytest.raises(TypeError, match="threshold"):
         BulkResetGuard(threshold=10, window_seconds=60.0)
+
+
+# ---------------------------------------------------------------------------
+# step-4b: _reversal_kind classifier
+# ---------------------------------------------------------------------------
+
+def test_reversal_kind_classifier():
+    """_reversal_kind returns the correct kind string for guarded transitions
+    and None for all non-guarded transitions.
+
+    Guarded:
+      - done → pending        → 'done_to_pending'
+      - in-progress → pending → 'in_progress_to_pending'
+
+    Non-guarded (must all return None):
+      - pending → in-progress
+      - in-progress → done
+      - blocked → pending     (blocked→pending is NOT guarded)
+      - pending → done
+      - done → blocked
+      - cancelled → pending
+    """
+    assert _reversal_kind('done', 'pending') == 'done_to_pending'
+    assert _reversal_kind('in-progress', 'pending') == 'in_progress_to_pending'
+
+    assert _reversal_kind('pending', 'in-progress') is None
+    assert _reversal_kind('in-progress', 'done') is None
+    assert _reversal_kind('blocked', 'pending') is None
+    assert _reversal_kind('pending', 'done') is None
+    assert _reversal_kind('done', 'blocked') is None
+    assert _reversal_kind('cancelled', 'pending') is None
 
 
 # ---------------------------------------------------------------------------
