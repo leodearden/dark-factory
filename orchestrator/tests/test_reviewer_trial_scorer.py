@@ -255,3 +255,42 @@ class TestMatchIssuesCost:
         assert matches == []
         assert unmatched == reviewer_issues
         assert cost == pytest.approx(0.42)
+
+
+class TestScoringResultMatchCost:
+    """ScoringResult should carry a match_cost_usd field with default 0.0."""
+
+    def test_default_match_cost_is_zero(self) -> None:
+        result = ScoringResult(variant_name='v', diff_id='d')
+        assert result.match_cost_usd == 0.0
+        assert result.cost_usd == 0.0
+
+
+class TestScorePanelRunCost:
+    """score_panel_run should populate match_cost_usd from the matcher."""
+
+    @pytest.mark.asyncio
+    async def test_match_cost_populated_from_matcher(self) -> None:
+        """score_panel_run sets cost_usd=panel cost and match_cost_usd=matcher cost."""
+        diff = CorpusDiff(
+            diff_id='d1',
+            language='python',
+            source='synthetic',
+            diff_text='--- a/f.py\n+++ b/f.py',
+            description='Test diff',
+            ground_truth=[],
+        )
+        run = PanelRunResult(
+            variant_name='v1',
+            diff_id='d1',
+            total_cost_usd=1.25,
+            reviews={},
+            wall_clock_ms=100,
+        )
+
+        with patch('orchestrator.evals.reviewer_trial.scorer.match_issues', new_callable=AsyncMock) as mock_match:
+            mock_match.return_value = ([], [], 0.37)
+            score = await score_panel_run(run, diff)
+
+        assert score.cost_usd == pytest.approx(1.25)
+        assert score.match_cost_usd == pytest.approx(0.37)
