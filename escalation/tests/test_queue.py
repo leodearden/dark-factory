@@ -336,6 +336,60 @@ class TestResolveArchives:
         )
 
 
+class TestResolveIdempotent:
+    """EscalationQueue.resolve() is idempotent: a second call returns the first resolution unchanged."""
+
+    def test_resolve_twice_returns_same_escalation_without_orphan(self, tmp_path: Path):
+        """Second resolve() call must be a no-op: same resolution, same archive file.
+
+        Failure mode in current main: the second call re-reads from archive, writes a
+        fresh queue_dir copy, and archives it again — creating an orphan archive file
+        and overwriting resolution/resolved_at.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        # First resolve
+        first_result = queue.resolve('esc-1-1', 'Fixed once')
+        assert first_result is not None
+        assert first_result.status == 'resolved'
+
+        # Exactly one archive file after first resolve
+        archive_files_after_first = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archive_files_after_first) == 1, (
+            f'Expected 1 archive file after first resolve, got {archive_files_after_first}'
+        )
+        first_archive_path = archive_files_after_first[0]
+        first_resolved_at = first_result.resolved_at
+
+        # Second resolve — must be a no-op
+        second_result = queue.resolve('esc-1-1', 'Fixed again')
+
+        # (a) Return value is non-None with status='resolved'
+        assert second_result is not None
+        assert second_result.status == 'resolved'
+
+        # (b) Resolution and resolved_at are from the FIRST call, not overwritten
+        assert second_result.resolution == 'Fixed once', (
+            f"Expected resolution='Fixed once' (first call), got {second_result.resolution!r}"
+        )
+        assert second_result.resolved_at == first_resolved_at, (
+            f'Expected resolved_at to be unchanged; '
+            f'first={first_resolved_at!r}, second={second_result.resolved_at!r}'
+        )
+
+        # (c) Still exactly one archive file, same path as before (no orphan)
+        archive_files_after_second = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archive_files_after_second) == 1, (
+            f'Expected 1 archive file after second resolve (no orphan), '
+            f'got {[str(p) for p in archive_files_after_second]}'
+        )
+        assert archive_files_after_second[0] == first_archive_path, (
+            f'Archive file path changed: first={first_archive_path}, '
+            f'second={archive_files_after_second[0]}'
+        )
+
+
 class TestMakeIdAcrossArchive:
     """make_id() must consider archived sequence numbers to avoid post-restart collisions."""
 
