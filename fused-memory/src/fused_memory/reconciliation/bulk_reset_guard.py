@@ -240,15 +240,6 @@ class BulkResetGuard:
             while state.entries and state.entries[0].ts < cutoff:
                 state.entries.popleft()
 
-            # 3a. Evict idle per-project state to prevent unbounded map growth.
-            # A project is considered idle when its window is empty AND the last
-            # escalation is older than the rate-limit period (no imminent re-trip).
-            if not state.entries and (now - state.last_escalation_ts) >= self._rate_limit_seconds:
-                self._state.pop(project_id, None)
-                # Re-acquire a fresh state for this attempt (setdefault below adds it back).
-                state = _GuardState()
-                self._state[project_id] = state
-
             # 4. Record this attempt (always, even if we will reject it).
             state.entries.append(_Entry(ts=now, task_id=task_id))
 
