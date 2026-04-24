@@ -229,3 +229,102 @@ class TestGetDeadLettersEventQueue:
         assert 'event_queue' in sources
         # 2 from durable_queue + 5 from event_queue = 7 total
         assert len(items) == 7, f'Expected 7 merged items; got {len(items)}'
+
+
+# ── step-13 tests ──────────────────────────────────────────────────────────
+
+
+class TestGetDeadLettersPayloadTruncation:
+    """Payload truncation: items whose serialised payload exceeds 2048 bytes."""
+
+    @pytest.mark.asyncio
+    async def test_large_durable_queue_payload_is_truncated(self):
+        """Durable-queue items with large payloads are truncated and flagged."""
+        big_payload = {'blob': 'x' * 5000}
+        dead_item = {
+            'id': 99,
+            'group_id': 'proj1',
+            'operation': 'add_episode',
+            'payload': big_payload,
+            'attempts': 3,
+            'error': 'timeout',
+            'created_at': 1_700_000_099.0,
+        }
+        svc = _make_mock_service(get_dead_items_return=[dead_item])
+        server = create_mcp_server(svc)
+
+        result = await server._tool_manager.call_tool('get_dead_letters', {})
+
+        assert 'items' in result
+        items = result['items']
+        assert len(items) == 1
+        item = items[0]
+        assert item.get('payload_truncated') is True
+        # payload must serialise to ≤ 2048 bytes
+        import json as _json
+        serialised = _json.dumps(item['payload'], default=str)
+        assert len(serialised.encode()) <= 2048
+
+    @pytest.mark.asyncio
+    async def test_small_durable_queue_payload_not_truncated(self):
+        """Small payloads pass through unchanged without a truncation flag."""
+        small_payload = {'content': 'hello'}
+        dead_item = {
+            'id': 1,
+            'group_id': 'proj1',
+            'operation': 'add_episode',
+            'payload': small_payload,
+            'attempts': 1,
+            'error': 'timeout',
+            'created_at': 1_700_000_001.0,
+        }
+        svc = _make_mock_service(get_dead_items_return=[dead_item])
+        server = create_mcp_server(svc)
+
+        result = await server._tool_manager.call_tool('get_dead_letters', {})
+
+        items = result['items']
+        assert len(items) == 1
+        item = items[0]
+        # no truncation flag on small payloads
+        assert not item.get('payload_truncated', False)
+        assert item['payload'] == small_payload
+
+    @pytest.mark.asyncio
+    async def test_large_event_queue_payload_is_truncated(self, tmp_path):
+        """Event-queue items with large payloads are also truncated and flagged."""
+        import json as _json
+
+        dl = tmp_path / 'dl.jsonl'
+        big_payload = {'blob': 'x' * 5000}
+        event = _make_recon_event('proj-trunc')
+        # Manually write a record with an oversized payload
+        record = {
+            'event': {
+                **event.model_dump(mode='json'),
+                'payload': big_payload,
+            },
+            'reason': 'non_retriable',
+            'attempts': 1,
+            'failed_at': '2026-01-01T00:00:00+00:00',
+        }
+        dl.write_text(_json.dumps(record) + '\n')
+
+        buf = AsyncMock()
+        eq = EventQueue(buf, dead_letter_path=dl)
+
+        svc = AsyncMock()
+        svc.durable_queue = None
+        server = create_mcp_server(svc, event_queue=eq)
+
+        result = await server._tool_manager.call_tool(
+            'get_dead_letters',
+            {'project_id': 'proj-trunc'},
+        )
+
+        items = result['items']
+        assert len(items) == 1
+        item = items[0]
+        assert item.get('payload_truncated') is True
+        serialised = _json.dumps(item['payload'], default=str)
+        assert len(serialised.encode()) <= 2048
