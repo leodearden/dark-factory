@@ -34,14 +34,13 @@ import time
 import uuid as uuid_mod
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
 from shared.locking import files_to_modules
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from shared.usage_gate import UsageGate
 
     from fused_memory.backends.taskmaster_client import TaskmasterBackend
@@ -1223,9 +1222,7 @@ class TaskCurator:
         project_id: str,
         project_root: str,
     ) -> CuratorDecision:
-        from pathlib import Path as _Path
-
-        cwd = self._cwd or _Path(project_root)
+        cwd = self._cwd or Path(project_root)
         user_prompt = self._build_user_prompt(candidate, pool)
 
         agent_result: AgentResult = await invoke_with_cap_retry(
@@ -1285,9 +1282,7 @@ class TaskCurator:
         On failure, raises :exc:`CuratorFailureError`; the caller in
         :meth:`curate_batch` is responsible for the per-item fallback.
         """
-        from pathlib import Path as _Path
-
-        cwd = self._cwd or _Path(project_root)
+        cwd = self._cwd or Path(project_root)
         n = len(candidates)
         user_prompt = self._build_batch_user_prompt(candidates, pools)
 
@@ -1550,10 +1545,12 @@ def _parse_decision_dict(
     """Validate and parse a single raw decision dict into a ``CuratorDecision``.
 
     Called by both :func:`_parse_decision` (single-item) and
-    :func:`_parse_batch_decisions` (per-item inside a batch).  Per-item parse
-    failures raise ``ValueError`` so batch callers can degrade only that item.
-    For the single-item caller the wrapping :func:`_parse_decision` returns a
-    ``create`` decision instead of propagating the exception.
+    :func:`_parse_batch_decisions` (per-item inside a batch).  The function
+    **never raises**: every malformed-input path returns a degraded
+    ``CuratorDecision(action='create', ...)`` instead of propagating an
+    exception.  Per-item isolation in the batch path is provided by the
+    ``try/except`` wrapper in :func:`_parse_batch_decisions`, not by
+    ``ValueError`` from this function.
     """
     action = str(raw.get('action', '')).lower()
     if action not in ('drop', 'combine', 'create'):
@@ -1593,6 +1590,20 @@ def _parse_decision_dict(
     # UNLESS this is a within-batch drop (batch_target_index set, target_id None).
     valid_ids = {e.task_id for e in pool}
     if action in ('drop', 'combine'):
+        # Guard: LLM emitted BOTH a pool target_id and a within-batch
+        # batch_target_index.  We cannot resolve the intent safely, so degrade.
+        if action == 'drop' and batch_target_index is not None and target_id is not None:
+            return CuratorDecision(
+                action='create',
+                justification=(
+                    f'ambiguous-drop: both target_id={target_id!r} and '
+                    f'batch_target_index={batch_target_index} set; '
+                    'cannot determine intent'
+                ),
+                pool_sizes=pool_sizes,
+                latency_ms=latency_ms,
+                cost_usd=cost_usd,
+            )
         is_within_batch_drop = (
             action == 'drop'
             and batch_target_index is not None
@@ -1806,7 +1817,13 @@ def _parse_batch_decisions(
 
     # Build the directed graph for cycle detection (only batch-drop edges).
     def _find_cycle_members() -> set[int]:
-        """Return the set of indices that participate in any cycle."""
+        """Return the set of indices that participate in any cycle.
+
+        Uses recursive DFS.  Recursion depth is bounded by the batch size
+        (``n``), which is capped at ``CuratorConfig.batch_max`` (default 5).
+        If ``batch_max`` is ever raised to hundreds, convert to an iterative
+        DFS with an explicit stack to avoid Python's 1000-frame limit.
+        """
         # Simple DFS with colour marking: 0=unvisited, 1=in-stack, 2=done.
         colour = [0] * n
         cycle_nodes: set[int] = set()
