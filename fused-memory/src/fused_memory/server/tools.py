@@ -151,8 +151,13 @@ def _truncate_payload(payload: Any) -> tuple[Any, bool]:
 
     Returns ``(payload, truncated)`` where *truncated* is ``True`` when the
     payload was cut.  When truncated, *payload* is returned as a JSON string
-    (not a dict) that fits within the budget.  Small payloads are returned
-    unchanged with ``False``.
+    (not a dict) whose own ``json.dumps`` encoding fits within the budget.
+    Small payloads are returned unchanged with ``False``.
+
+    The budget check is applied to ``json.dumps(payload)`` so that the result
+    is safe for MCP JSON transport (where the payload field gets JSON-encoded).
+    When truncating, the final candidate satisfies
+    ``len(json.dumps(candidate).encode()) <= _DEAD_LETTER_PAYLOAD_MAX_BYTES``.
     """
     try:
         serialised = json.dumps(payload, default=str)
@@ -160,11 +165,19 @@ def _truncate_payload(payload: Any) -> tuple[Any, bool]:
         serialised = str(payload)
     if len(serialised.encode()) <= _DEAD_LETTER_PAYLOAD_MAX_BYTES:
         return payload, False
-    # Truncate to byte budget (leave room for truncation marker)
-    truncated_str = serialised.encode()[:_DEAD_LETTER_PAYLOAD_MAX_BYTES].decode(
-        'utf-8', errors='replace'
-    )
-    return truncated_str, True
+    # The serialised form exceeds the budget. Produce a truncated *string* of
+    # the JSON text.  When this string is itself JSON-encoded (for MCP transport)
+    # it gets wrapped in quotes and has its '"' / '\' escaped, so we must
+    # account for that overhead.  We subtract a conservative 10-byte margin
+    # (2 for the outer quotes + up to 8 for worst-case escape overhead) and
+    # then verify, reducing by 1 char at a time if needed.
+    candidate = serialised.encode()[
+        : _DEAD_LETTER_PAYLOAD_MAX_BYTES - 10
+    ].decode('utf-8', errors='replace')
+    # Shrink until json.dumps(candidate).encode() fits within the budget.
+    while candidate and len(json.dumps(candidate).encode()) > _DEAD_LETTER_PAYLOAD_MAX_BYTES:
+        candidate = candidate[:-1]
+    return candidate, True
 
 
 def create_mcp_server(
