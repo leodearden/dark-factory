@@ -1775,7 +1775,6 @@ class TestCurateBatchCacheCheck:
         curator._store_cache(c_cached1.payload_hash(), d_cached1)
         curator._store_cache(c_cached2.payload_hash(), d_cached2)
 
-        d_new = CuratorDecision(action='create', justification='new-from-llm')
         llm_result = AgentResult(
             success=True,
             output='',
@@ -1793,7 +1792,6 @@ class TestCurateBatchCacheCheck:
         async def capture_batch(candidates, pools, pool_sizes_list, start, pid, proot):
             call_candidates.extend(candidates)
             from fused_memory.middleware.task_curator import _parse_batch_decisions
-            from shared.cli_invoke import AgentResult as AR
             return _parse_batch_decisions(
                 llm_result, pools=pools, pool_sizes_list=pool_sizes_list, latency_ms=0,
             )
