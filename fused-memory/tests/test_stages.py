@@ -1413,6 +1413,41 @@ class TestProjectIdGuidelineConstants:
         assert 'set_task_status' not in _STAGE3_PROJECT_ID_GUIDELINE
         assert 'add_task' not in _STAGE3_PROJECT_ID_GUIDELINE
 
+    def test_stage2_guideline_includes_submit_task(self):
+        """Stage 2 guideline must list submit_task (new two-phase task creation)."""
+        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
+        assert 'submit_task' in _STAGE2_PROJECT_ID_GUIDELINE
+
+    def test_stage2_guideline_includes_resolve_ticket(self):
+        """Stage 2 guideline must list resolve_ticket (new two-phase task creation)."""
+        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
+        assert 'resolve_ticket' in _STAGE2_PROJECT_ID_GUIDELINE
+
+    def test_stage2_guideline_does_not_include_add_task(self):
+        """Stage 2 guideline must not list deprecated add_task."""
+        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
+        assert 'add_task' not in _STAGE2_PROJECT_ID_GUIDELINE
+
+    def test_stage1_guideline_does_not_include_submit_task(self):
+        """Stage 1 guideline must not mention submit_task (Stage 1 has no task tools)."""
+        from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+        assert 'submit_task' not in _STAGE1_PROJECT_ID_GUIDELINE
+
+    def test_stage1_guideline_does_not_include_resolve_ticket(self):
+        """Stage 1 guideline must not mention resolve_ticket (Stage 1 has no task tools)."""
+        from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
+        assert 'resolve_ticket' not in _STAGE1_PROJECT_ID_GUIDELINE
+
+    def test_stage3_guideline_does_not_include_submit_task(self):
+        """Stage 3 guideline must not mention submit_task (Stage 3 is read-only)."""
+        from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'submit_task' not in _STAGE3_PROJECT_ID_GUIDELINE
+
+    def test_stage3_guideline_does_not_include_resolve_ticket(self):
+        """Stage 3 guideline must not mention resolve_ticket (Stage 3 is read-only)."""
+        from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'resolve_ticket' not in _STAGE3_PROJECT_ID_GUIDELINE
+
 
 class TestStagePayloadProjectIdGuideline:
     """All three stages include the per-stage project_id guideline in their assembled payload."""
