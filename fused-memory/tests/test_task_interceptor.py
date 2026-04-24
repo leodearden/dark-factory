@@ -3545,9 +3545,11 @@ async def test_expand_task_removes_intra_batch_duplicates(
       - taskmaster.remove_task called exactly once (for '1.2')
       - curator.curate called exactly twice (for '1.1' and '1.3' only)
     """
-    pre_snapshot = {'tasks': []}
+    # Parent task '1' exists before expand; subtasks are newly created.
+    parent_task = {'id': '1', 'title': 'Parent', 'status': 'pending'}
+    pre_snapshot = {'tasks': [parent_task]}
     post_snapshot = {'tasks': [
-        {'id': '1', 'title': 'Parent', 'status': 'pending', 'subtasks': [
+        {**parent_task, 'subtasks': [
             {'id': '1.1', 'title': 'Fix foo', 'description': 'bar'},
             {'id': '1.2', 'title': 'FIX FOO', 'description': ' bar '},
             {'id': '1.3', 'title': 'Unrelated', 'description': 'baz'},

@@ -1003,16 +1003,56 @@ class TaskInterceptor:
         if not new_task_dicts:
             return {'removed': removed, 'kept': kept, 'errors': errors}
 
+        # ── Intra-batch dedup pre-pass ──────────────────────────────────────
+        # Detect and remove tasks that are near-identical duplicates of another
+        # task created in the SAME batch (e.g. the LLM emits 3 variants of the
+        # same subtask).  This runs BEFORE the per-task curator loop so we
+        # avoid wasting LLM calls on tasks we are about to remove.
+        #
+        # Key: normalised (title, description) hash — case + whitespace
+        # insensitive, excluding files_to_modify (often absent).
+        # First occurrence wins (matches curate_batch hash_to_first_idx
+        # convention).  Each removal acquires _write_lock independently to
+        # match WP-E discipline (same pattern as post-hoc drop/combine).
+        seen_keys: dict[str, str] = {}   # key → first-occurrence task_id
+        unique_new_tasks: list[dict] = []
+        for t in new_task_dicts:
+            tid = str(t.get('id', ''))
+            title = str(t.get('title', ''))
+            description = str(t.get('description', '') or '')
+            key = TaskCurator._intra_batch_key(title, description)
+            if key not in seen_keys:
+                seen_keys[key] = tid
+                unique_new_tasks.append(t)
+            else:
+                # Duplicate — remove it under the write lock.
+                first_id = seen_keys[key]
+                try:
+                    async with self._write_lock(project_id):
+                        await tm.remove_task(tid, project_root)
+                    removed.append({
+                        'task_id': tid,
+                        'title': title,
+                        'reason': 'intra_batch_duplicate',
+                        'matched_task_id': first_id,
+                    })
+                    logger.info(
+                        'bulk_dedup: intra-batch duplicate %s removed (matches %s)',
+                        tid, first_id,
+                    )
+                except Exception as exc:
+                    errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
+
         curator = await self._get_curator()
         if curator is None:
-            for t in new_task_dicts:
+            for t in unique_new_tasks:
                 kept.append({
                     'task_id': str(t.get('id', '')),
                     'title': str(t.get('title', '')),
                 })
             return {'removed': removed, 'kept': kept, 'errors': errors}
 
-        for t in new_task_dicts:
+        for t in unique_new_tasks:
             tid = str(t.get('id', ''))
             title = str(t.get('title', ''))
             pool_entry = _to_pool_entry(t, source='module', lock_depth=2)
