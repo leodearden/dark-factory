@@ -396,6 +396,12 @@ class EventQueue:
         When ``keep_rotations == 0``, the current file is simply unlinked so
         the byte cap is still honoured (nothing is archived).
 
+        After the cascade, :meth:`_purge_orphan_rotations` removes any
+        siblings whose numeric suffix exceeds ``keep_rotations``.  This makes
+        retention self-repairing: if an operator lowers ``keep_rotations``
+        between runs (e.g. 5 → 2), previously-created ``.3``, ``.4``, ``.5``
+        files are cleaned up the next time a rotation fires.
+
         Uses ``os.replace`` for atomicity — it already overwrites the
         destination on POSIX and Windows, so no pre-unlink is needed.
         Any error is caught and logged to preserve the best-effort contract.
@@ -414,10 +420,44 @@ class EventQueue:
                 dst = Path(f'{self._dead_letter_path}.{i}')
                 if src.exists():
                     os.replace(src, dst)
+            # After the cascade, remove any siblings whose numeric suffix
+            # exceeds the current keep_rotations bound (orphans from a prior
+            # run with a higher keep_rotations setting).
+            self._purge_orphan_rotations()
         except Exception as exc:
             logger.error(
                 'EventQueue: dead-letter rotation failed: %s', exc,
             )
+
+    def _purge_orphan_rotations(self) -> None:
+        """Remove rotation siblings whose index exceeds ``keep_rotations``.
+
+        Scans the parent directory for files whose name matches
+        ``{dead_letter_path.name}.{N}`` where N is an integer greater than
+        ``keep_rotations``, and unlinks them.  Non-numeric suffixes (e.g.
+        ``.bak``, ``.swp``) are left untouched.
+
+        This is a best-effort cleanup: a permission error on any individual
+        sibling is silently suppressed so the rotation as a whole succeeds.
+        A missing or unreadable directory is also silently ignored.
+        """
+        parent = self._dead_letter_path.parent
+        prefix = f'{self._dead_letter_path.name}.'
+        try:
+            siblings = list(parent.iterdir())
+        except (FileNotFoundError, OSError):
+            return
+        for sibling in siblings:
+            if not sibling.name.startswith(prefix):
+                continue
+            suffix = sibling.name[len(prefix):]
+            try:
+                index = int(suffix)
+            except ValueError:
+                continue  # non-numeric suffix — leave it alone
+            if index > self._keep_rotations:
+                with contextlib.suppress(OSError):
+                    sibling.unlink(missing_ok=True)
 
     # ── read dead-letters ──────────────────────────────────────────────
 
