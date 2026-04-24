@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import random
 import time
 from collections import deque
@@ -58,6 +59,8 @@ class EventQueue:
         retry_max_seconds: float = 30.0,
         shutdown_flush_seconds: float = 10.0,
         overflow_warn_interval_seconds: float = 60.0,
+        max_bytes: int | None = None,
+        keep_rotations: int = 3,
     ):
         self._buffer = event_buffer
         self._dead_letter_path = Path(dead_letter_path)
@@ -66,6 +69,8 @@ class EventQueue:
         self._retry_max = retry_max_seconds
         self._shutdown_flush = shutdown_flush_seconds
         self._overflow_warn_interval = overflow_warn_interval_seconds
+        self._max_bytes = max_bytes
+        self._keep_rotations = keep_rotations
         self._drainer_task: asyncio.Task | None = None
         self._closed = False
         # Stats surface for WP-C watchdog / WP-D policy.
@@ -303,6 +308,13 @@ class EventQueue:
         }
         try:
             self._dead_letter_path.parent.mkdir(parents=True, exist_ok=True)
+            # Rotate before appending when the file has grown past the byte cap.
+            if (
+                self._max_bytes is not None
+                and self._dead_letter_path.exists()
+                and self._dead_letter_path.stat().st_size >= self._max_bytes
+            ):
+                self._rotate_dead_letter()
             with self._dead_letter_path.open('a', encoding='utf-8') as fh:
                 fh.write(json.dumps(record) + '\n')
             self._dead_letters += 1
@@ -310,4 +322,30 @@ class EventQueue:
             logger.error(
                 'EventQueue: failed to append dead-letter record for event=%s: %s',
                 event.id, exc,
+            )
+
+    def _rotate_dead_letter(self) -> None:
+        """Cascade-rotate dead-letter files.
+
+        ``dead_letter.jsonl``   → ``dead_letter.jsonl.1``
+        ``dead_letter.jsonl.1`` → ``dead_letter.jsonl.2``
+        …
+        ``dead_letter.jsonl.{keep}`` → unlinked (dropped)
+
+        Uses ``os.replace`` for atomicity.  Any single-file error is caught
+        and logged so the caller's best-effort contract is preserved.
+        """
+        try:
+            # Work from oldest → newest so we never overwrite unsaved data.
+            for i in range(self._keep_rotations, 0, -1):
+                src = Path(f'{self._dead_letter_path}.{i - 1}') if i > 1 else self._dead_letter_path
+                dst = Path(f'{self._dead_letter_path}.{i}')
+                if src.exists():
+                    if i == self._keep_rotations and dst.exists():
+                        # Drop the file that would become .{keep+1}.
+                        dst.unlink(missing_ok=True)
+                    os.replace(src, dst)
+        except Exception as exc:
+            logger.error(
+                'EventQueue: dead-letter rotation failed: %s', exc,
             )

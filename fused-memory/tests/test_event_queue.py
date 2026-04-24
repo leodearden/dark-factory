@@ -357,6 +357,7 @@ async def test_dead_letter_rotation_basic(tmp_path):
     buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
     dl = tmp_path / 'dead_letter.jsonl'
 
+    # max_bytes=500 — each record is ~300 bytes, so rotation fires after 2 events.
     q = EventQueue(
         buf,
         dead_letter_path=dl,
@@ -369,9 +370,9 @@ async def test_dead_letter_rotation_basic(tmp_path):
     )
     await q.start()
     try:
-        # Enqueue enough events so dead-letter JSONL exceeds 500 bytes.
-        # Each dead-letter record is ~300+ bytes, so 3 events should trigger rotation.
-        for _ in range(6):
+        # 3 events: events 1+2 fill the file (~600 bytes), event 3 triggers rotation.
+        # After rotation dl.jsonl starts fresh with event 3 only (~300 bytes < 500).
+        for _ in range(3):
             q.enqueue(_make_event())
         await asyncio.wait_for(q._queue.join(), timeout=2.0)
 
@@ -379,10 +380,10 @@ async def test_dead_letter_rotation_basic(tmp_path):
         assert dl.exists(), 'dead_letter.jsonl must exist'
         current_size = dl.stat().st_size
         assert current_size < 500, (
-            f'After rotation .jsonl should be under 500 bytes, got {current_size}'
+            f'After rotation .jsonl should hold only 1 record (<500 bytes), got {current_size}'
         )
 
-        # (b) At least one rotation must have been made.
+        # (b) At least one rotation must have been made (.jsonl.1 contains the older events).
         rotated = tmp_path / 'dead_letter.jsonl.1'
         assert rotated.exists(), 'dead_letter.jsonl.1 must exist after rotation'
         assert rotated.stat().st_size > 0
