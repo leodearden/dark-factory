@@ -8,8 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from starlette.testclient import TestClient
-
-from .test_helpers import _get_opening_tag
+from test_helpers import _get_opening_tag
 
 
 class TestFormatTriggerFilter:
