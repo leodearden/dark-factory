@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import pathlib
 import uuid
 from datetime import UTC, datetime
@@ -19,7 +20,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
-from fused_memory.reconciliation.event_queue import EventQueue
+from fused_memory.reconciliation.event_queue import EventQueue, _iter_lines_reversed
 
 
 def _make_event(
@@ -470,6 +471,62 @@ async def test_dead_letter_rotation_zero_keep_discards_file(tmp_path):
         await q.close()
 
 
+@pytest.mark.asyncio
+async def test_rotation_purges_orphan_rotations(tmp_path):
+    """After keep_rotations is reduced, orphaned rotation files are purged on next rotation.
+
+    Simulates a previous run with keep_rotations=5 by pre-creating dead_letter.jsonl.3,
+    .4, and .5 on disk.  The current run uses keep_rotations=2 and max_bytes=300.
+    After triggering a rotation (by enqueuing ~5 events), the orphan files beyond
+    keep_rotations must be unlinked while retained siblings (.1, .2) are untouched.
+    """
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dead_letter.jsonl'
+
+    # Pre-create orphan rotation files from a prior run with a higher keep_rotations.
+    orphan_3 = tmp_path / 'dead_letter.jsonl.3'
+    orphan_4 = tmp_path / 'dead_letter.jsonl.4'
+    orphan_5 = tmp_path / 'dead_letter.jsonl.5'
+    for orphan in (orphan_3, orphan_4, orphan_5):
+        orphan.write_text('{"orphan": true}\n', encoding='utf-8')
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=1000,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+        max_bytes=300,  # tight — triggers rotation after ~1 record (~300 bytes each)
+        keep_rotations=2,
+    )
+    await q.start()
+    try:
+        # Enqueue enough events to trigger at least one rotation.
+        for _ in range(5):
+            q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+
+        # Orphan files beyond keep_rotations must be purged.
+        assert not orphan_3.exists(), 'dead_letter.jsonl.3 must be purged after rotation'
+        assert not orphan_4.exists(), 'dead_letter.jsonl.4 must be purged after rotation'
+        assert not orphan_5.exists(), 'dead_letter.jsonl.5 must be purged after rotation'
+
+        # Retained siblings (index ≤ keep_rotations) must not have been deleted.
+        retained_1 = tmp_path / 'dead_letter.jsonl.1'
+        retained_2 = tmp_path / 'dead_letter.jsonl.2'
+        # With max_bytes=300 and ~5 records of ~300 bytes each, at least one
+        # rotation must have fired — so .1 must exist regardless of timing.
+        assert retained_1.exists(), 'rotation should have fired at least once given max_bytes=300 and 5 records'
+        assert retained_1.stat().st_size > 0, '.jsonl.1 should have event data'
+        if retained_2.exists():
+            assert retained_2.stat().st_size > 0, '.jsonl.2 should have event data'
+
+    finally:
+        await q.close()
+
+
 # ── read_dead_letters ──────────────────────────────────────────────────
 
 
@@ -708,6 +765,62 @@ async def test_read_dead_letters_streams_without_loading_whole_files(tmp_path, m
     )
 
 
+@pytest.mark.asyncio
+async def test_read_dead_letters_tolerates_oserror(tmp_path, monkeypatch, caplog):
+    """read_dead_letters never raises when a dead-letter file cannot be opened.
+
+    The OSError handler at event_queue.py:481 catches OSError raised by
+    _iter_lines_reversed() (which opens the file via path.open('rb')), emits a
+    WARNING containing 'cannot read', and continues.  The result is an empty
+    list rather than a raised exception.
+
+    The monkeypatch is selective: only the dead-letter path's open() raises;
+    all other Path.open calls (SQLite fixtures, etc.) use the real open.
+    """
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dl.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+    finally:
+        await q.close()
+
+    # Confirm the dead-letter file was actually written.
+    assert dl.exists(), 'dead-letter file must exist before patching open'
+
+    # Patch Path.open selectively: only fail when opening the dead-letter path.
+    _original_open = pathlib.Path.open
+
+    def _failing_open(self: pathlib.Path, *args, **kwargs):
+        if str(self) == str(dl):
+            raise OSError('simulated unreadable file')
+        return _original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, 'open', _failing_open)
+
+    with caplog.at_level(logging.WARNING):
+        result = q.read_dead_letters()
+
+    # (a) Returns [] without raising.
+    assert result == [], f'expected empty list, got {result!r}'
+
+    # (b) At least one WARNING containing 'cannot read'.
+    assert any(
+        'cannot read' in r.message for r in caplog.records
+    ), f"Expected 'cannot read' warning; got: {[r.message for r in caplog.records]}"
+
+
 def test_read_dead_letters_cross_file_ordering(tmp_path):
     """Newest-first ordering holds across file boundaries (current file → rotated .1).
 
@@ -783,3 +896,75 @@ def test_read_dead_letters_cross_file_ordering(tmp_path):
         f'last current-file record ({boundary_current_oldest}) should be newer than '
         f'first rotated-file record ({boundary_rotated_newest})'
     )
+
+
+# ── _iter_lines_reversed ───────────────────────────────────────────────
+
+
+def test_iter_lines_reversed_handles_chunk_boundaries(tmp_path):
+    """All three carry-stitching branches execute when the file spans multiple chunks.
+
+    The default chunk_size=8192 means existing tests (dead-letter records ~300 bytes
+    each, ≤ 5 per file) never cross a chunk boundary. This test writes 30 lines of
+    ~400 bytes each (~12 KiB total) so that every chunk boundary fires:
+
+      - carry-prepend: ``data = chunk + carry`` at each iteration
+      - ``reversed(lines[1:])`` emitting multiple complete lines per chunk
+      - final ``if carry:`` yielding the first line in the file (no preceding '\\n')
+
+    Asserts all 30 lines are returned newest-first with no loss or duplication.
+    """
+    lines_written = [f'line-{i:04d}-' + 'x' * 380 for i in range(30)]  # ~400 bytes × 30 ≈ 12 KB
+    dl = tmp_path / 'multi_chunk.jsonl'
+    with dl.open('w', encoding='utf-8') as fh:
+        for line in lines_written:
+            fh.write(line + '\n')
+
+    # Precondition: file must exceed the default chunk_size so carry/stitch paths fire.
+    assert dl.stat().st_size > 8192, (
+        f'file too small ({dl.stat().st_size} bytes) — increase line count or width'
+    )
+
+    result = [line for line in _iter_lines_reversed(dl) if line]  # drop empty trailing split
+
+    # All 30 lines yielded — no loss, no duplication.
+    assert len(result) == 30, f'expected 30 lines, got {len(result)}'
+    assert len(set(result)) == 30, 'duplicate lines in result'
+    # Newest-first across chunk boundaries.
+    assert result == list(reversed(lines_written)), (
+        'Lines not in newest-first order across chunk boundaries'
+    )
+
+
+def test_iter_lines_reversed_max_line_bytes_overflow(tmp_path, caplog):
+    """Carry-buffer overflow guard fires when a single line exceeds max_line_bytes.
+
+    The guard at event_queue.py:86-94 logs a WARNING containing 'carry buffer exceeded'
+    and yields the accumulated bytes as a malformed fragment rather than raising.
+    With the default max_line_bytes=1_048_576 (1 MiB) the branch is unreachable
+    in production; this test drives it with chunk_size=50 and max_line_bytes=100.
+
+    Asserts:
+      (a) No exception propagates — the generator completes cleanly.
+      (b) A WARNING containing 'carry buffer exceeded' is logged.
+      (c) No bytes are silently lost — the 500 'X' chars appear across all yields.
+    """
+    dl = tmp_path / 'huge_line.jsonl'
+    # Single line of 500 bytes. With chunk_size=50 and max_line_bytes=100 the
+    # carry accumulates until it exceeds 100 bytes, triggering the overflow guard.
+    huge_line = 'X' * 500
+    with dl.open('w', encoding='utf-8') as fh:
+        fh.write(huge_line + '\n')
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.event_queue'):
+        results = list(_iter_lines_reversed(dl, chunk_size=50, max_line_bytes=100))
+
+    # (a) No exception — generator completed.
+    # (b) Overflow warning logged.
+    assert any(
+        'carry buffer exceeded' in r.message for r in caplog.records
+    ), f"Expected 'carry buffer exceeded' warning; got: {[r.message for r in caplog.records]}"
+
+    # (c) No bytes lost — all 500 'X's appear across the yielded fragments.
+    total_x = sum(line.count('X') for line in results)
+    assert total_x == 500, f"expected 500 X's across yields, got {total_x}"
