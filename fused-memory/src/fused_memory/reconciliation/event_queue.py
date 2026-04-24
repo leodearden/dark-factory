@@ -437,9 +437,10 @@ class EventQueue:
         ``keep_rotations``, and unlinks them.  Non-numeric suffixes (e.g.
         ``.bak``, ``.swp``) are left untouched.
 
-        This is a best-effort cleanup: a permission error on any individual
-        sibling is silently suppressed so the rotation as a whole succeeds.
-        A missing or unreadable directory is also silently ignored.
+        This is a best-effort cleanup: any OSError on an individual sibling
+        (permission denied, race-deleted, etc.) is silently suppressed so
+        the rotation as a whole succeeds.  A missing or unreadable directory
+        is also silently ignored.
         """
         parent = self._dead_letter_path.parent
         prefix = f'{self._dead_letter_path.name}.'
@@ -451,10 +452,9 @@ class EventQueue:
             if not sibling.name.startswith(prefix):
                 continue
             suffix = sibling.name[len(prefix):]
-            try:
-                index = int(suffix)
-            except ValueError:
-                continue  # non-numeric suffix — leave it alone
+            if not suffix.isdigit():
+                continue  # non-numeric suffix (or '-1', '+3', '01', …) — leave it alone
+            index = int(suffix)
             if index > self._keep_rotations:
                 with contextlib.suppress(OSError):
                     sibling.unlink(missing_ok=True)

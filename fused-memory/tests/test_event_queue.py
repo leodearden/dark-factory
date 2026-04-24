@@ -516,8 +516,10 @@ async def test_rotation_purges_orphan_rotations(tmp_path):
         # Retained siblings (index ≤ keep_rotations) must not have been deleted.
         retained_1 = tmp_path / 'dead_letter.jsonl.1'
         retained_2 = tmp_path / 'dead_letter.jsonl.2'
-        if retained_1.exists():
-            assert retained_1.stat().st_size > 0, '.jsonl.1 should have event data'
+        # With max_bytes=300 and ~5 records of ~300 bytes each, at least one
+        # rotation must have fired — so .1 must exist regardless of timing.
+        assert retained_1.exists(), 'rotation should have fired at least once given max_bytes=300 and 5 records'
+        assert retained_1.stat().st_size > 0, '.jsonl.1 should have event data'
         if retained_2.exists():
             assert retained_2.stat().st_size > 0, '.jsonl.2 should have event data'
 
