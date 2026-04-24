@@ -651,7 +651,11 @@ class TestApplyChangesDependencyUpdates:
         backend.add_dependency.assert_not_awaited()
 
     async def test_cancellations_precede_dependency_updates(self):
-        """Call order: all set_task_status calls complete before any remove/add_dependency."""
+        """ALL cancellations complete before ANY dep operation — verified with 2+2 ops.
+
+        Uses 2 cancellations and 2 dep updates so a single index check can't
+        mask future interleaving: asserts max(cancel_indices) < min(dep_indices).
+        """
         from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
 
         call_order: list[str] = []
@@ -675,16 +679,22 @@ class TestApplyChangesDependencyUpdates:
         backend.add_dependency = AsyncMock(side_effect=_add)
 
         plan = {
-            'cancellations': ['430'],
+            'cancellations': ['430', '431'],
             'dependency_updates': [
-                {'dependent_id': '431', 'remove_dep': '430', 'add_dep': '429'},
+                {'dependent_id': '432', 'remove_dep': '430', 'add_dep': '429'},
+                {'dependent_id': '433', 'remove_dep': '431', 'add_dep': '429'},
             ],
         }
         await apply_changes(backend, '/project', plan)
 
-        # Cancellations first, then dep updates.
-        assert call_order[0].startswith('cancel:')
-        assert call_order[1].startswith('remove:')
+        # All cancel: entries must appear before any remove:/add: entry.
+        cancel_indices = [i for i, e in enumerate(call_order) if e.startswith('cancel:')]
+        dep_indices = [i for i, e in enumerate(call_order) if not e.startswith('cancel:')]
+        assert len(cancel_indices) == 2, f'Expected 2 cancel ops, got: {call_order}'
+        assert len(dep_indices) >= 2, f'Expected ≥2 dep ops, got: {call_order}'
+        assert max(cancel_indices) < min(dep_indices), (
+            f'Some cancellation came after a dep op: {call_order}'
+        )
 
     async def test_partial_failure_does_not_abort_remaining_ops(self):
         """A failing set_task_status should not prevent subsequent operations."""
