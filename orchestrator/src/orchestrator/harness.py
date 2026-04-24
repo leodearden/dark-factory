@@ -372,10 +372,15 @@ class Harness:
                 existing_statuses = await self.scheduler.get_statuses()
                 if 'pending' not in existing_statuses.values():
                     if not existing_statuses:
-                        # An empty mapping could mean a genuine empty task tree
-                        # OR a transport failure in get_statuses (which swallows
-                        # exceptions and returns {}).  Point operators at the
-                        # fused-memory logs so they can distinguish the two.
+                        # Distinguish transport failure from genuinely empty tree.
+                        err = self.scheduler._last_get_statuses_error
+                        if err is not None:
+                            raise RuntimeError(
+                                f'Failed to reach fused-memory: '
+                                f'{type(err).__name__}: {err}'
+                            ) from err
+                        # Genuinely empty: point operators at the fused-memory
+                        # logs in case tasks should exist but weren't returned.
                         logger.error(
                             'get_statuses returned an empty mapping — if tasks '
                             'should exist, check fused-memory logs for transport '
