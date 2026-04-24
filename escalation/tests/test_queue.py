@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from escalation.models import Escalation
-from escalation.queue import EscalationQueue
+from escalation.queue import EscalationQueue, iter_all_escalation_paths
 
 
 def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending') -> Escalation:
@@ -1082,5 +1082,111 @@ class TestMakeIdAcrossArchive:
             f'Expected esc-42-{expected_next} '
             f'(max across archive={archived_seq} and queue_root={pending_seq}) '
             f'but got {new_id!r}'
+        )
+
+
+class TestIterAllEscalationPaths:
+    """iter_all_escalation_paths(escalations_dir) yields all esc-*.json paths,
+    scanning queue root first then archive subtree, deduplicating by stem with
+    queue root taking precedence over archive on id collisions.
+    """
+
+    def test_missing_dir_returns_empty(self, tmp_path: Path):
+        """(a) Non-existent escalations_dir -> empty iterator, no raise."""
+        result = list(iter_all_escalation_paths(tmp_path / 'does_not_exist'))
+        assert result == []
+
+    def test_empty_dir_returns_empty(self, tmp_path: Path):
+        """(b) Empty escalations_dir (exists, no files) -> empty iterator."""
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+        result = list(iter_all_escalation_paths(esc_dir))
+        assert result == []
+
+    def test_root_only_yields_matching_files(self, tmp_path: Path):
+        """(c) Root-only: two esc-*.json in root, non-matching file not yielded."""
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+
+        esc1 = _make_escalation('esc-1-1', task_id='1')
+        esc2 = _make_escalation('esc-2-1', task_id='2')
+        (esc_dir / 'esc-1-1.json').write_text(esc1.to_json())
+        (esc_dir / 'esc-2-1.json').write_text(esc2.to_json())
+        (esc_dir / 'other.json').write_text('{"not": "an escalation"}')
+
+        result = list(iter_all_escalation_paths(esc_dir))
+        stems = {p.stem for p in result}
+        assert stems == {'esc-1-1', 'esc-2-1'}, (
+            f'Expected only esc-1-1 and esc-2-1, got: {stems}'
+        )
+        assert all(p.parent == esc_dir for p in result), (
+            'Root-only files should have parent == esc_dir'
+        )
+
+    def test_archive_only_yields_archived_files(self, tmp_path: Path):
+        """(d) archive-only: files under archive/YYYY-MM-DD/ are yielded."""
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+
+        arc1_dir = esc_dir / 'archive' / '2026-04-20'
+        arc2_dir = esc_dir / 'archive' / '2026-04-21'
+        arc1_dir.mkdir(parents=True)
+        arc2_dir.mkdir(parents=True)
+
+        esc1 = _make_escalation('esc-1-1', task_id='1')
+        esc2 = _make_escalation('esc-2-1', task_id='2')
+        (arc1_dir / 'esc-1-1.json').write_text(esc1.to_json())
+        (arc2_dir / 'esc-2-1.json').write_text(esc2.to_json())
+
+        result = list(iter_all_escalation_paths(esc_dir))
+        stems = {p.stem for p in result}
+        assert stems == {'esc-1-1', 'esc-2-1'}, (
+            f'Expected esc-1-1 and esc-2-1 from archive, got: {stems}'
+        )
+
+    def test_dedup_root_wins_over_archive(self, tmp_path: Path):
+        """(e) Same esc id in root and archive: root path is yielded (root wins)."""
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+
+        arc_dir = esc_dir / 'archive' / '2026-04-20'
+        arc_dir.mkdir(parents=True)
+
+        esc = _make_escalation('esc-42-1', task_id='42')
+        (esc_dir / 'esc-42-1.json').write_text(esc.to_json())
+        (arc_dir / 'esc-42-1.json').write_text(esc.to_json())
+
+        result = list(iter_all_escalation_paths(esc_dir))
+        stems = [p.stem for p in result]
+        assert stems.count('esc-42-1') == 1, (
+            f'Expected exactly one esc-42-1 in results, got {stems}'
+        )
+        # The yielded path must be the root copy (its parent is esc_dir)
+        yielded = next(p for p in result if p.stem == 'esc-42-1')
+        assert yielded.parent == esc_dir, (
+            f'Root copy must win; expected parent={esc_dir}, got {yielded.parent}'
+        )
+
+    def test_archive_only_multidate_dedup(self, tmp_path: Path):
+        """(f) Same stem in two archive dated subdirs (no root copy): yielded exactly once."""
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+
+        arc1_dir = esc_dir / 'archive' / '2026-04-20'
+        arc2_dir = esc_dir / 'archive' / '2026-04-21'
+        arc1_dir.mkdir(parents=True)
+        arc2_dir.mkdir(parents=True)
+
+        esc = _make_escalation('esc-42-1', task_id='42')
+        (arc1_dir / 'esc-42-1.json').write_text(esc.to_json())
+        (arc2_dir / 'esc-42-1.json').write_text(esc.to_json())
+
+        # Confirm no root copy
+        assert not (esc_dir / 'esc-42-1.json').exists()
+
+        result = list(iter_all_escalation_paths(esc_dir))
+        stems = [p.stem for p in result]
+        assert stems.count('esc-42-1') == 1, (
+            f'Archive-only multi-date duplicate must be yielded exactly once, got: {stems}'
         )
 
