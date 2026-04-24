@@ -263,22 +263,19 @@ class TestGetWithDuplicateArchiveCandidates:
             f"Expected resolution='newer' (from 2025-06-15 dir), got {result.resolution!r}"
         )
 
-        # (b) A warning must mention the escalation id and both candidate paths.
-        # We check for the full path strings rather than just date substrings so
-        # that the assertion remains meaningful if the log format changes (e.g. a
-        # refactor that logs a count instead of the date components would still
-        # need to include the actual paths to be useful).
-        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        # (b) A WARNING must be emitted at logger 'escalation.queue' mentioning the id
+        # and both candidate paths, so an operator can locate the duplicate files.
         older_path_str = str(older_dir / 'esc-1-1.json')
         newer_path_str = str(newer_dir / 'esc-1-1.json')
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert any('esc-1-1' in msg for msg in warning_messages), (
             f'Expected a WARNING mentioning esc-1-1; got: {warning_messages}'
         )
         assert any(older_path_str in msg for msg in warning_messages), (
-            f'Expected a WARNING mentioning {older_path_str!r}; got: {warning_messages}'
+            f'Expected WARNING to include older path {older_path_str!r}; got: {warning_messages}'
         )
         assert any(newer_path_str in msg for msg in warning_messages), (
-            f'Expected a WARNING mentioning {newer_path_str!r}; got: {warning_messages}'
+            f'Expected WARNING to include newer path {newer_path_str!r}; got: {warning_messages}'
         )
 
 
@@ -494,6 +491,72 @@ class TestGetByTaskDedupAcrossArchive:
         assert returned_esc.resolution == 'from_queue_root', (
             f"Expected queue_dir copy to win (resolution='from_queue_root'), "
             f"got {returned_esc.resolution!r}"
+        )
+
+    def test_get_by_task_status_filter_returns_archive_copy_when_queue_dir_has_stale_pending(
+        self, tmp_path: Path,
+    ):
+        """Bug repro: queue_dir has stale pending copy, archive has resolved copy.
+
+        When get_by_task('42', status='resolved') is called, it must return the
+        archive's resolved copy, not skip it because the pending copy was seen first.
+
+        Failure mode in current main: dedup runs before filter — the pending
+        queue_dir copy adds the id to 'seen', then the resolved archive copy is
+        skipped as a duplicate, returning [].
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Simulated crash-mid-resolve: pending copy stuck in queue_dir
+        pending_copy = _make_escalation('esc-42-1', task_id='42', status='pending')
+        (queue.queue_dir / 'esc-42-1.json').write_text(pending_copy.to_json())
+
+        # Resolved copy in archive (what the caller wants to see)
+        archive_dir = queue.queue_dir / 'archive' / '2025-06-15'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        resolved_copy = _make_escalation('esc-42-1', task_id='42', status='resolved')
+        resolved_copy.resolution = 'archive_copy'
+        (archive_dir / 'esc-42-1.json').write_text(resolved_copy.to_json())
+
+        results = queue.get_by_task('42', status='resolved')
+
+        assert len(results) == 1, (
+            f'Expected exactly 1 resolved result but got {len(results)}: '
+            f'{[e.resolution for e in results]}'
+        )
+        assert results[0].status == 'resolved'
+        assert results[0].resolution == 'archive_copy'
+
+    def test_get_by_task_status_filter_prefers_queue_dir_when_both_copies_match(
+        self, tmp_path: Path,
+    ):
+        """Invariant: queue_dir copy wins when both copies pass the status filter.
+
+        Both queue_dir and archive hold a resolved esc-42-1. After the fix
+        (filter-before-dedup), the first copy that passes the filter wins.
+        Because queue_dir is iterated first, the queue_dir copy must win.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Both copies are resolved — queue_dir copy must win by iteration order
+        queue_dir_copy = _make_escalation('esc-42-1', task_id='42', status='resolved')
+        queue_dir_copy.resolution = 'queue_dir_wins'
+        (queue.queue_dir / 'esc-42-1.json').write_text(queue_dir_copy.to_json())
+
+        archive_dir = queue.queue_dir / 'archive' / '2025-06-15'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_copy = _make_escalation('esc-42-1', task_id='42', status='resolved')
+        archive_copy.resolution = 'archive_loses'
+        (archive_dir / 'esc-42-1.json').write_text(archive_copy.to_json())
+
+        results = queue.get_by_task('42', status='resolved')
+
+        assert len(results) == 1, (
+            f'Expected exactly 1 result (deduped) but got {len(results)}: '
+            f'{[e.resolution for e in results]}'
+        )
+        assert results[0].resolution == 'queue_dir_wins', (
+            f"Expected queue_dir copy to win, got {results[0].resolution!r}"
         )
 
 
