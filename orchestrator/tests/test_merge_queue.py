@@ -716,6 +716,77 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_merge_commit_done_step_deletions_are_detected(
+        self, git_ops: GitOps,
+    ):
+        """Merge-commit done step: deletions are not silenced by combined-diff.
+
+        Gap 2: git show defaults to combined-diff format for merge commits,
+        which prints nothing under --diff-filter=D.  diff-tree -r <sha>^ <sha>
+        forces two-way comparison against the first parent, correctly surfacing
+        file deletions that happen to occur at a merge-commit boundary.
+        """
+        worktree = (await git_ops.create_worktree('merge-commit-del')).path
+
+        # Add f.py on the task branch and commit
+        (worktree / 'f.py').write_text('f = 1\n')
+        create_sha = await git_ops.commit(worktree, 'Add f.py')
+        assert create_sha
+
+        # Create a sidekick branch from HEAD~1 (the initial commit, before f.py)
+        # so that the merge produces a genuine two-parent commit.
+        await _run(['git', 'branch', 'sidekick', 'HEAD~1'], cwd=worktree)
+        await _run(['git', 'checkout', 'sidekick'], cwd=worktree)
+
+        # Add g.py on the sidekick branch and commit
+        (worktree / 'g.py').write_text('g = 1\n')
+        await _run(['git', 'add', '-A'], cwd=worktree)
+        await _run(['git', 'commit', '-m', 'Add g.py'], cwd=worktree)
+
+        # Return to the task branch
+        await _run(['git', 'checkout', '-'], cwd=worktree)
+
+        # Start the merge without committing, then also delete f.py before
+        # finalising the merge commit.
+        await _run(['git', 'merge', '--no-ff', '--no-commit', 'sidekick'], cwd=worktree)
+        await _run(['git', 'rm', 'f.py'], cwd=worktree)
+        await _run(
+            ['git', 'commit', '-m', 'Merge sidekick and delete f.py'],
+            cwd=worktree,
+        )
+
+        # Capture the merge-commit SHA in the task branch
+        _, merge_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-merge-del', 'T-merge-del', 'desc')
+        artifacts.write_plan({
+            'files': ['f.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'merge+del',
+                    'status': 'done',
+                    'commit': merge_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'merge-commit-del')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            # f.py was intentionally deleted inside the done step's merge commit.
+            # It must NOT be reported as a drop.
+            assert missing == []
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 class TestMergeWorker:
