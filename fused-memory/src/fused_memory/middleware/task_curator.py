@@ -32,7 +32,7 @@ import json
 import logging
 import time
 import uuid as uuid_mod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -797,10 +797,20 @@ class TaskCurator:
             ]
 
         # Merge: unique candidates use LLM/fallback decisions; duplicates use pre_dedup.
-        unique_decision_map: dict[int, CuratorDecision] = {
-            original_i: unique_decisions[k]
-            for k, original_i in enumerate(unique_indices)
-        }
+        # IMPORTANT: remap batch_target_index from unique-space (0..K-1, the positions
+        # the LLM sees and emits) to original-space (positions in `candidates`) so that
+        # the downstream worker's `resolved_task_ids` keying scheme works correctly.
+        # Example: if unique_indices=[0,1,3,5] and the LLM emits batch_target_index=2,
+        # that means position 2 in unique-space = original index unique_indices[2] = 3.
+        unique_decision_map: dict[int, CuratorDecision] = {}
+        for k, original_i in enumerate(unique_indices):
+            dec = unique_decisions[k]
+            if dec.batch_target_index is not None:
+                # Remap unique-space → original-space
+                orig_target = unique_indices[dec.batch_target_index]
+                dec = replace(dec, batch_target_index=orig_target)
+            unique_decision_map[original_i] = dec
+
         decisions = [
             pre_dedup_decisions[i] if i in pre_dedup_decisions else unique_decision_map[i]
             for i in range(len(candidates))
