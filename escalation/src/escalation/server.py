@@ -191,6 +191,7 @@ def create_server(
             'status': outcome.status,
             'reason': outcome.reason,
             'conflict_details': outcome.conflict_details,
+            'push_status': outcome.push_status,
         }
 
     return mcp

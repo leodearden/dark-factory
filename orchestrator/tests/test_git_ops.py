@@ -81,6 +81,8 @@ def git_config() -> GitConfig:
         branch_prefix='task/',
         remote='origin',
         worktree_dir='.worktrees',
+        # Default push off in tests; TestPushMain enables it explicitly per-case.
+        push_after_advance=False,
     )
 
 
@@ -2394,3 +2396,102 @@ class TestScrubResultFormatError:
         """FAILED with error='   ' (whitespace only) is also rejected."""
         with pytest.raises(ValueError, match='empty or whitespace-only'):
             ScrubResult(outcome=ScrubOutcome.FAILED, error='   ')
+
+
+@pytest.mark.asyncio
+class TestPushMain:
+    """Best-effort push of local main to <remote>/<main_branch>.
+
+    Lives next to advance_main: each successful CAS advance is mirrored to
+    origin so an external clone (humans, CI, mirrors) sees the same history
+    the merge worker just produced.
+    """
+
+    async def test_push_main_pushes_local_advance(
+        self, git_repo_with_remote: tuple[Path, Path],
+    ):
+        """Happy path: a commit added locally lands on the bare origin."""
+        origin, local = git_repo_with_remote
+        git_ops = GitOps(GitConfig(push_after_advance=True), local)
+
+        (local / 'local.txt').write_text('local\n')
+        await _run(['git', 'add', '-A'], cwd=local)
+        await _run(['git', 'commit', '-m', 'local commit'], cwd=local)
+        _, local_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=local)
+
+        result = await git_ops.push_main()
+
+        assert result == 'pushed'
+        _, origin_sha, _ = await _run(['git', 'rev-parse', 'main'], cwd=origin)
+        assert origin_sha == local_sha
+
+    async def test_push_main_noop_when_disabled(
+        self, git_repo_with_remote: tuple[Path, Path],
+    ):
+        """push_after_advance=False short-circuits to 'noop' without contacting origin."""
+        origin, local = git_repo_with_remote
+        cfg = GitConfig(push_after_advance=False)
+        git_ops = GitOps(cfg, local)
+
+        (local / 'local.txt').write_text('local\n')
+        await _run(['git', 'add', '-A'], cwd=local)
+        await _run(['git', 'commit', '-m', 'local commit'], cwd=local)
+        _, origin_sha_before, _ = await _run(['git', 'rev-parse', 'main'], cwd=origin)
+
+        result = await git_ops.push_main()
+
+        assert result == 'noop'
+        _, origin_sha_after, _ = await _run(['git', 'rev-parse', 'main'], cwd=origin)
+        assert origin_sha_after == origin_sha_before  # origin unchanged
+
+    async def test_push_main_rejected_on_diverged_origin(
+        self, git_repo_with_remote: tuple[Path, Path], caplog,
+    ):
+        """When origin has commits we lack, push must be rejected and NOT forced."""
+        origin, local = git_repo_with_remote
+        git_ops = GitOps(GitConfig(push_after_advance=True), local)
+
+        # Origin gets a commit we don't have
+        await _push_n_commits_to_origin(origin, 1, prefix='diverge')
+
+        # Local diverges with its own commit (without fetching/merging)
+        (local / 'local.txt').write_text('local\n')
+        await _run(['git', 'add', '-A'], cwd=local)
+        await _run(['git', 'commit', '-m', 'local divergent commit'], cwd=local)
+
+        _, origin_sha_before, _ = await _run(['git', 'rev-parse', 'main'], cwd=origin)
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.git_ops'):
+            result = await git_ops.push_main()
+
+        assert result == 'rejected'
+        # Origin must be unchanged — no force-push
+        _, origin_sha_after, _ = await _run(['git', 'rev-parse', 'main'], cwd=origin)
+        assert origin_sha_after == origin_sha_before
+        assert any('rejected (non-fast-forward)' in r.message for r in caplog.records)
+
+    async def test_push_main_error_on_unreachable_remote(
+        self, tmp_path: Path, caplog,
+    ):
+        """Unreachable remote returns 'error' — best-effort, never raises."""
+        # Local repo with origin pointing at a path that does not exist
+        local = tmp_path / 'local'
+        local.mkdir()
+        await _run(['git', 'init', '-b', 'main'], cwd=local)
+        await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=local)
+        await _run(['git', 'config', 'user.name', 'Test'], cwd=local)
+        (local / 'README.md').write_text('# Test\n')
+        await _run(['git', 'add', '-A'], cwd=local)
+        await _run(['git', 'commit', '-m', 'Initial commit'], cwd=local)
+        await _run(
+            ['git', 'remote', 'add', 'origin', str(tmp_path / 'does-not-exist')],
+            cwd=local,
+        )
+
+        git_ops = GitOps(GitConfig(), local)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.push_main()
+
+        assert result == 'error'
+        assert any('Push of main to origin failed' in r.message for r in caplog.records)
