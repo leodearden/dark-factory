@@ -1990,6 +1990,85 @@ class TestHarnessFetchFilteredTaskTree:
         assert result.done_count == 1
         assert result.cancelled_count == 1
 
+    @pytest.mark.asyncio
+    async def test_fetch_filtered_task_tree_logs_info_when_taskmaster_none(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """_fetch_filtered_task_tree emits an INFO log when taskmaster is None.
+
+        When taskmaster is None (disabled or not configured), the short-circuit
+        must emit a distinct INFO-level marker so ops can grep logs and confirm
+        the branch that fired rather than wondering why Stage 2 sees an empty tree.
+
+        Asserts:
+        (a) an INFO-level record exists with the marker
+            'reconciliation.task_tree_taskmaster_disabled'
+        (b) the project_root '/abs/path' appears in the record (via message or
+            extra so structured-log tools can correlate it)
+        (c) no WARNING-level records from this branch (the non-absolute-path
+            warning must not fire here — different branch)
+        """
+        import logging
+
+        from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        config = FusedMemoryConfig(
+            reconciliation=ReconciliationConfig(
+                enabled=True,
+                explore_codebase_root='/tmp/test',
+                agent_llm_provider='anthropic',
+                agent_llm_model='claude-sonnet-4-20250514',
+            )
+        )
+        harness = ReconciliationHarness(
+            memory_service=mock_memory_service,
+            taskmaster=None,
+            journal=journal,
+            event_buffer=event_buffer,
+            config=config,
+        )
+
+        with caplog.at_level(logging.INFO):
+            result = await harness._fetch_filtered_task_tree('/abs/path')
+
+        # Still returns empty tree
+        assert isinstance(result, FilteredTaskTree)
+        assert result.active_tasks == []
+
+        # (a) INFO record with distinct event marker
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            'reconciliation.task_tree_taskmaster_disabled' in r.getMessage()
+            for r in info_records
+        ), (
+            f"Expected INFO record containing 'reconciliation.task_tree_taskmaster_disabled';"
+            f" got INFO messages: {[r.getMessage() for r in info_records]}"
+        )
+
+        # (b) project_root must appear somewhere in the record (message or extra)
+        marker_record = next(
+            r for r in info_records
+            if 'reconciliation.task_tree_taskmaster_disabled' in r.getMessage()
+        )
+        record_repr = repr(marker_record.__dict__)
+        assert '/abs/path' in record_repr or '/abs/path' in marker_record.getMessage(), (
+            f"project_root '/abs/path' not found in record; record={record_repr}"
+        )
+
+        # (c) no WARNING from this branch (non-absolute-path warning belongs to a
+        #     different code path)
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warning_records, (
+            f"Expected no WARNING records from taskmaster-None branch; got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+
 
 # ── Tests for task 455: harness wires filtered_task_tree into stages ──────────
 
