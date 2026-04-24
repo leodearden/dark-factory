@@ -3237,7 +3237,10 @@ class TestRecoverIfAlreadyMerged:
         - return value is WorkflowOutcome.DONE
         - workflow.state == WorkflowState.DONE
         - scheduler.statuses[task_id][-1] == 'done'
-        - scheduler.provenance[task_id] == {'note': 'branch already on main after escalation resolution'}
+        - scheduler.provenance[task_id] == {
+              'note': 'branch already on main at workflow start (pre-PLAN recovery)',
+              'main_sha': <sha captured before the call>,
+          }
 
         Previously asserted against _mark_blocked; now retargeted to the
         new helper directly.
@@ -3270,6 +3273,11 @@ class TestRecoverIfAlreadyMerged:
         if result.merge_worktree:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
 
+        # Capture main_sha BEFORE calling _recover_if_already_merged — this is
+        # the value the helper reads internally from _check_branch_on_main and
+        # must appear as prov['main_sha'] in the provenance dict.
+        expected_main_sha = await git_ops.get_main_sha()
+
         # 2. Build workflow, wire up worktree and artifacts
         stub = AgentStub()
         workflow, scheduler, _queue = _build_workflow_no_merge_worker(
@@ -3292,11 +3300,15 @@ class TestRecoverIfAlreadyMerged:
         assert statuses[-1] == 'done', (
             f"Last scheduler status must be 'done', got: {statuses}"
         )
-        assert scheduler.provenance.get(task_assignment.task_id) == {
-            'note': 'branch already on main after escalation resolution'
-        }, (
-            f"Expected note provenance but got: "
-            f"{scheduler.provenance.get(task_assignment.task_id)!r}"
+        prov = scheduler.provenance.get(task_assignment.task_id)
+        assert set(prov.keys()) == {'note', 'main_sha'}, (
+            f"Provenance must have exactly keys {{'note', 'main_sha'}}, got: {set(prov.keys())!r}"
+        )
+        assert prov['note'] == 'branch already on main at workflow start (pre-PLAN recovery)', (
+            f"Unexpected provenance note: {prov['note']!r}"
+        )
+        assert prov['main_sha'] == expected_main_sha, (
+            f"Provenance main_sha {prov['main_sha']!r} != expected {expected_main_sha!r}"
         )
 
 
