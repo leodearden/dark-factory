@@ -1568,6 +1568,30 @@ async def test_event_roundtrip_preserves_both_ids(taskmaster, event_buffer, tmp_
                     await _wt
 
 
+# ── Tests for get_statuses ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_returns_all_id_to_status_mapping(taskmaster, event_buffer):
+    """get_statuses returns {id_str: status_str} for every task; no events emitted."""
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {'id': 1, 'status': 'pending'},
+            {'id': 2, 'status': 'done'},
+            {'id': 3, 'status': 'in-progress'},
+        ]
+    })
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+
+    result = await interceptor.get_statuses('/project')
+
+    assert result == {'1': 'pending', '2': 'done', '3': 'in-progress'}
+
+    # Pure read — must not emit any events
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 0
+
+
 # ── Tests for None / disconnected taskmaster ───────────────────────
 
 
