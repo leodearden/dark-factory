@@ -123,16 +123,25 @@ class EscalationQueue:
         - status == 'pending': scan queue root only (fast path, skips archive).
         - status is None or another value: scan queue root PLUS archive/**/ to
           include resolved/dismissed escalations that have been moved out.
+
+        Deduplication: if the same escalation id appears in both the queue root
+        and the archive (e.g. crash mid-resolve, backup restore), only the first
+        occurrence is returned.  Iteration order is queue root first, archive
+        second, so the queue_dir copy wins when both exist.
         """
         # Build the candidate path list.
         paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
         if status != 'pending':
             paths.extend(self._iter_archive_paths('esc-*.json'))
 
+        seen: set[str] = set()
         results = []
         for path in paths:
             try:
                 esc = Escalation.from_json(path.read_text())
+                if esc.id in seen:
+                    continue
+                seen.add(esc.id)
                 if esc.task_id != task_id:
                     continue
                 if status is not None and esc.status != status:
