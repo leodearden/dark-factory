@@ -342,6 +342,12 @@ class Scheduler:
                 try:
                     data = json.loads(block['text'])
                 except (ValueError, TypeError):
+                    logger.warning(
+                        'Failed to parse MCP tool text block as JSON '
+                        '(key=%r, text_prefix=%r)',
+                        key,
+                        block.get('text', '')[:200],
+                    )
                     return None
                 # Unwrap taskmaster's {data: {...}} envelope when present.
                 inner = (
