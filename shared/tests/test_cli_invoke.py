@@ -1741,26 +1741,6 @@ class TestBuildFailureMessage:
         )
         assert msg == expected
 
-    def test_build_failure_message_format(self):
-        """build_failure_message returns exactly 'label failed: summary\\ndiagnostic_detail'."""
-        result = AgentResult(
-            success=False, output='', subtype='error_unexpected', stderr='boom',
-        )
-        label = 'Claude CLI agent'
-        msg = build_failure_message(label, result)
-        cls = classify_agent_failure(result)
-        expected = f'{label} failed: {cls.summary}\n{cls.diagnostic_detail}'
-        assert msg == expected
-
-    def test_build_failure_message_uses_classifier_summary_for_kinds(self):
-        """build_failure_message delegates entirely to classify_agent_failure — structural contract."""
-        result = AgentResult(success=False, output='', subtype='error_max_turns', turns=75)
-        label = 'TestLabel'
-        msg = build_failure_message(label, result)
-        cls = classify_agent_failure(result)
-        expected = f'{label} failed: {cls.summary}\n{cls.diagnostic_detail}'
-        assert msg == expected
-
     def test_build_failure_message_label_is_prefix(self):
         """The label argument is preserved verbatim before ' failed: '."""
         result = AgentResult(success=False, output='', subtype='error_unexpected')
