@@ -157,16 +157,26 @@ class EscalationQueue:
         # Pre-scan: detect ids that span both queue_dir root and archive subtree.
         # Uses filename stems only (no JSON parsing) to avoid extra I/O.
         #
-        # Tier-membership invariant: self.queue_dir.glob('esc-*.json') is
-        # non-recursive, so every path from that source has parent ==
-        # self.queue_dir; every path from _iter_archive_paths comes from
-        # archive_root.rglob(...) and cannot have parent == self.queue_dir.
-        # Therefore any id with len(paths) >= 2 necessarily spans both tiers.
+        # Tier-membership: classify each path by comparing its parent directory
+        # to self.queue_dir.  Files written by queue_dir.glob('esc-*.json') are
+        # non-recursive, so their parent IS self.queue_dir (root tier).  Files
+        # from _iter_archive_paths come from archive_root.rglob(...) and land
+        # inside a dated subdir (e.g. archive/2025-06-15/); their parent is that
+        # date dir, NOT self.queue_dir (archive tier).
+        #
+        # A single id can legitimately appear multiple times within the archive
+        # tier (the same stem in two different dated subdirs after a requeue or
+        # backup-restore).  That situation is handled by get()'s newest-by-date
+        # selection (queue.py:102-117) and is NOT a cross-tier inconsistency.
+        # We warn only when an id has members in BOTH tiers — that signals a
+        # crash-mid-resolve or backup-restore scenario requiring reconciliation.
         id_to_paths: dict[str, list[Path]] = {}
         for path in paths:
             id_to_paths.setdefault(path.stem, []).append(path)
         for esc_id, esc_paths in id_to_paths.items():
-            if len(esc_paths) >= 2:
+            has_root = any(p.parent == self.queue_dir for p in esc_paths)
+            has_archive = any(p.parent != self.queue_dir for p in esc_paths)
+            if has_root and has_archive:
                 logger.warning(
                     f'Escalation {esc_id!r} exists in both queue_dir and archive: '
                     f'{[str(p) for p in esc_paths]}; reconciliation may be needed'
