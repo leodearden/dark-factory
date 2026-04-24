@@ -2553,16 +2553,12 @@ async def test_two_projects_do_not_serialise(
             # without relying on event-loop scheduling timing.
             if key == resolve_project_id('/projA'):
                 projA_entered.set()
-                try:
+                with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(projB_entered.wait(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    pass
             else:
                 projB_entered.set()
-                try:
+                with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(projA_entered.wait(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    pass
             return {'id': '1', 'title': kwargs.get('title', '')}
         finally:
             tracker.in_flight[key] -= 1
