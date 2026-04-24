@@ -561,6 +561,40 @@ class TestGetByTaskDedupAcrossArchive:
         )
 
 
+class TestGetPendingParseFailure:
+    """get_pending() must emit a WARNING when a queue file cannot be parsed."""
+
+    def test_get_pending_logs_warning_for_corrupt_file(self, tmp_path: Path, caplog):
+        """Corrupt JSON file in queue_dir: get_pending() returns [] and logs a WARNING.
+
+        Failure mode on current main: the except branch is silent — the corrupt
+        file is silently dropped without any operator-visible log message.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Write a syntactically broken JSON file directly into queue_dir
+        (queue.queue_dir / 'esc-1-1.json').write_text('not valid json')
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            results = queue.get_pending()
+
+        # (a) Parse failure drops the entry — return value is empty
+        assert results == [], f'Expected [] for corrupt file, got {results}'
+
+        # (b) A WARNING must be emitted at logger 'escalation.queue'
+        warning_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert warning_records, (
+            f"Expected a WARNING at logger 'escalation.queue'; got records: {caplog.records}"
+        )
+        assert any('Failed to parse' in r.message for r in warning_records), (
+            f"Expected a WARNING containing 'Failed to parse'; "
+            f"got: {[r.message for r in warning_records]}"
+        )
+
+
 class TestMakeIdAcrossArchive:
     """make_id() must consider archived sequence numbers to avoid post-restart collisions."""
 
