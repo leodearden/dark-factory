@@ -371,6 +371,16 @@ class Harness:
                 logger.info('No PRD given — running existing tasks')
                 existing_statuses = await self.scheduler.get_statuses()
                 if 'pending' not in existing_statuses.values():
+                    if not existing_statuses:
+                        # An empty mapping could mean a genuine empty task tree
+                        # OR a transport failure in get_statuses (which swallows
+                        # exceptions and returns {}).  Point operators at the
+                        # fused-memory logs so they can distinguish the two.
+                        logger.error(
+                            'get_statuses returned an empty mapping — if tasks '
+                            'should exist, check fused-memory logs for transport '
+                            'errors before assuming the task tree is empty.'
+                        )
                     raise RuntimeError(
                         'No PRD given and no pending tasks found. '
                         'Pass --prd to decompose a PRD, or create tasks first.'
