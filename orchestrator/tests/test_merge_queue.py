@@ -787,6 +787,59 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_renamed_file_in_done_step_treats_old_name_as_expected_absent(
+        self, git_ops: GitOps,
+    ):
+        """Renamed file in done step: old name is treated as expected absent.
+
+        Gap 3: git's default rename detection converts D+A pairs to R.  A
+        planned file renamed by a done step does not appear in the D list, so
+        the old name is falsely flagged as a drop.  --no-renames disables
+        detection so the rename surfaces as an explicit deletion of a.py,
+        placing it in expected_absent.
+        """
+        worktree = (await git_ops.create_worktree('rename-step')).path
+
+        # High-similarity content (5× repeated function body) ensures git's
+        # default rename detection (50% similarity threshold) fires.
+        (worktree / 'a.py').write_text('def helper():\n    return 42\n' * 5)
+        await git_ops.commit(worktree, 'Add a.py')
+
+        # Rename a.py → b.py via git mv (preserves exact content → 100% similarity)
+        await _run(['git', 'mv', 'a.py', 'b.py'], cwd=worktree)
+        rename_sha = await git_ops.commit(worktree, 'Rename a.py to b.py')
+        assert rename_sha
+
+        # Plan lists the OLD name; the rename is recorded as a done step.
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-rename', 'T-rename', 'desc')
+        artifacts.write_plan({
+            'files': ['a.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'rename',
+                    'status': 'done',
+                    'commit': rename_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'rename-step')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            # a.py was legitimately renamed to b.py in the done step.
+            # It must NOT be reported as a drop.
+            assert missing == []
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 class TestMergeWorker:
