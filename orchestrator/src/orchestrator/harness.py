@@ -886,14 +886,13 @@ Output JSON matching the schema. Every task must appear in the output.
         plan.lock for recovered worktrees) and BEFORE the first
         scheduler.acquire_next() call, so self._dispatched is always empty here.
         """
-        tasks = await self.scheduler.get_tasks()
+        statuses = await self.scheduler.get_statuses()
         reverted = 0
 
-        for t in tasks:
-            if t.get('status') != 'in-progress':
+        for tid, status in statuses.items():
+            if status != 'in-progress':
                 continue
 
-            tid = str(t.get('id', ''))
             worktree_path = self.git_ops.worktree_base / tid
             lock_path = worktree_path / '.task' / 'plan.lock'
 
