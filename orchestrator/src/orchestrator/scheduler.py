@@ -300,6 +300,12 @@ class Scheduler:
         # fresh (no accumulated age).
         self._pending_anchor: dict[str, int] = {}
         self._was_non_pending: set[str] = set()
+        # Caches the last transport exception from get_statuses so callers
+        # (e.g. Harness) can distinguish a genuine empty task tree from a
+        # swallowed transport failure.  Reset to None at the start of each
+        # get_statuses call so a prior failure never contaminates a subsequent
+        # success.
+        self._last_get_statuses_error: Exception | None = None
 
     async def _dispatch_tool(
         self,
@@ -452,6 +458,7 @@ class Scheduler:
             A ``{id_str: status_str}`` dict; always a dict, never None.
             Returns ``{}`` on any failure.
         """
+        self._last_get_statuses_error = None  # reset before each attempt
         try:
             arguments: dict = {'project_root': self._project_root}
             if ids is not None:
@@ -461,6 +468,7 @@ class Scheduler:
             if isinstance(statuses, dict):
                 return statuses
         except Exception as e:
+            self._last_get_statuses_error = e
             logger.exception(
                 'Failed to fetch task statuses: %s: %s', type(e).__name__, e,
             )
