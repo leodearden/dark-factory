@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import pathlib
 import uuid
 from datetime import UTC, datetime
@@ -760,6 +761,62 @@ async def test_read_dead_letters_streams_without_loading_whole_files(tmp_path, m
         f'Older rotation files should not be opened when limit is satisfied '
         f'by the current file, but found: {rotation_opens}'
     )
+
+
+@pytest.mark.asyncio
+async def test_read_dead_letters_tolerates_oserror(tmp_path, monkeypatch, caplog):
+    """read_dead_letters never raises when a dead-letter file cannot be opened.
+
+    The OSError handler at event_queue.py:481 catches OSError raised by
+    _iter_lines_reversed() (which opens the file via path.open('rb')), emits a
+    WARNING containing 'cannot read', and continues.  The result is an empty
+    list rather than a raised exception.
+
+    The monkeypatch is selective: only the dead-letter path's open() raises;
+    all other Path.open calls (SQLite fixtures, etc.) use the real open.
+    """
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dl.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+    finally:
+        await q.close()
+
+    # Confirm the dead-letter file was actually written.
+    assert dl.exists(), 'dead-letter file must exist before patching open'
+
+    # Patch Path.open selectively: only fail when opening the dead-letter path.
+    _original_open = pathlib.Path.open
+
+    def _failing_open(self: pathlib.Path, *args, **kwargs):
+        if str(self) == str(dl):
+            raise OSError('simulated unreadable file')
+        return _original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, 'open', _failing_open)
+
+    with caplog.at_level(logging.WARNING):
+        result = q.read_dead_letters()
+
+    # (a) Returns [] without raising.
+    assert result == [], f'expected empty list, got {result!r}'
+
+    # (b) At least one WARNING containing 'cannot read'.
+    assert any(
+        'cannot read' in r.message for r in caplog.records
+    ), f"Expected 'cannot read' warning; got: {[r.message for r in caplog.records]}"
 
 
 def test_read_dead_letters_cross_file_ordering(tmp_path):
