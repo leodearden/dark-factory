@@ -400,6 +400,99 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_pending_step_deletion_is_not_trusted_as_expected_absent(
+        self, git_ops: GitOps,
+    ):
+        """A file deleted in a *pending* step's commit is NOT treated as expected_absent.
+
+        Only done steps' deletions are trusted.  If the step that deleted the file
+        has status='pending', the file's absence is still treated as a real drop.
+        """
+        worktree = (await git_ops.create_worktree('plan-pending-del')).path
+
+        (worktree / 'would_delete.py').write_text('# would be deleted\n')
+        create_sha = await git_ops.commit(worktree, 'Add would_delete.py')
+        assert create_sha is not None
+
+        (worktree / 'would_delete.py').unlink()
+        delete_sha = await git_ops.commit(worktree, 'Delete would_delete.py')
+        assert delete_sha is not None
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-pend', 'T-pend', 'desc')
+        # Step that performed the deletion has status='pending' — must NOT be trusted
+        artifacts.write_plan({
+            'files': ['would_delete.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'delete would_delete.py',
+                    'status': 'pending',   # ← not done
+                    'commit': delete_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'plan-pending-del')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            # pending step → deletion not trusted → file is a real drop
+            assert missing == ['would_delete.py']
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_done_step_with_null_commit_is_not_trusted_as_expected_absent(
+        self, git_ops: GitOps,
+    ):
+        """A done step with commit=None is skipped — its deletions are not trusted.
+
+        If a step is marked done but has no recorded commit SHA (e.g. it was
+        marked done before the commit was recorded), the absence of its planned
+        files is still treated as a real drop.
+        """
+        worktree = (await git_ops.create_worktree('plan-null-commit')).path
+
+        (worktree / 'would_delete.py').write_text('# would be deleted\n')
+        await git_ops.commit(worktree, 'Add would_delete.py')
+
+        (worktree / 'would_delete.py').unlink()
+        await git_ops.commit(worktree, 'Delete would_delete.py')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-null', 'T-null', 'desc')
+        # Step is done but commit is None — must NOT be trusted
+        artifacts.write_plan({
+            'files': ['would_delete.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'delete would_delete.py',
+                    'status': 'done',
+                    'commit': None,   # ← no commit recorded
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'plan-null-commit')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            # done but commit=None → deletion not trusted → file is a real drop
+            assert missing == ['would_delete.py']
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 class TestMergeWorker:
