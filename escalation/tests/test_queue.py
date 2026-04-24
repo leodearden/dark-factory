@@ -887,6 +887,64 @@ class TestGetByTaskDedupAcrossArchive:
             )
 
 
+    def test_get_by_task_pending_silent_on_cross_tier_duplicate(
+        self, tmp_path: Path, caplog,
+    ):
+        """Pre-scan stays silent when status='pending' and a cross-tier duplicate exists.
+
+        Characterizes the documented limitation at queue.py:148-150: when status ==
+        'pending' the archive is skipped entirely, so a cross-tier duplicate is
+        invisible to the pre-scan in that mode.
+
+        Complements the sibling tests in this class:
+        - does_not_warn_on_archive_only_multi_date_duplicates: archive-only is benign
+        - does_not_warn_without_cross_tier_duplicate: no cross-tier → silent
+        - warns_on_three_path_cross_tier_duplicate: real cross-tier → WARNING
+
+        Regression prevented: a future refactor that extends `paths` with archive
+        entries regardless of `status == 'pending'` would start warning here and this
+        test would catch it.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Pending copy in queue_dir root
+        pending_copy = _make_escalation('esc-42-1', task_id='42', status='pending')
+        (queue.queue_dir / 'esc-42-1.json').write_text(pending_copy.to_json())
+
+        # Resolved copy in archive with a sentinel marker to prove it is never surfaced
+        archive_dir = queue.queue_dir / 'archive' / '2025-06-15'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        resolved_copy = _make_escalation('esc-42-1', task_id='42', status='resolved')
+        resolved_copy.resolution = 'archive_copy'
+        (archive_dir / 'esc-42-1.json').write_text(resolved_copy.to_json())
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            results = queue.get_by_task('42', status='pending')
+
+        # (a) Exactly one result — the pending queue_dir root copy
+        assert len(results) == 1, (
+            f'Expected exactly 1 result (pending queue_dir copy), got {len(results)}'
+        )
+
+        # (b) The returned copy is the queue_dir pending one, NOT the archive copy
+        assert results[0].id == 'esc-42-1'
+        assert results[0].status == 'pending'
+        assert results[0].resolution != 'archive_copy', (
+            'Archive copy must NOT be surfaced when status="pending" skips the archive'
+        )
+
+        # (c) No WARNING from the pre-scan — archive was never scanned, so the
+        #     cross-tier duplicate was invisible to the pre-scan
+        warning_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert not any('esc-42-1' in r.message for r in warning_records), (
+            'Pre-scan must stay silent when status="pending" skips the archive; '
+            f'offending WARNING records: {[r.message for r in warning_records]}'
+        )
+
+
 class TestGetPendingParseFailure:
     """get_pending() must emit a WARNING when a queue file cannot be parsed."""
 
