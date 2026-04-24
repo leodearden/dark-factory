@@ -728,6 +728,7 @@ version = "0.1.0"
 source = { editable = "dashboard" }
 dependencies = [
     { name = "aiosqlite" },
+    { name = "escalation" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "jinja2" },
@@ -748,6 +749,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20.0" },
+    { name = "escalation", editable = "escalation" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "jinja2", specifier = ">=3.1" },
