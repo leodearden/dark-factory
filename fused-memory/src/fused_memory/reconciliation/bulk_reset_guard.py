@@ -39,17 +39,25 @@ logger = logging.getLogger(__name__)
 # Public helpers
 # ---------------------------------------------------------------------------
 
-def _is_reversal(old_status: str, new_status: str) -> bool:
-    """Return True iff the transition is a guarded reversal.
+def _reversal_kind(
+    old_status: str, new_status: str
+) -> Literal['done_to_pending', 'in_progress_to_pending'] | None:
+    """Classify a status transition into a guarded reversal kind, or None.
 
     Exactly two patterns qualify:
-      * ``done``        → ``pending``
-      * ``in-progress`` → ``pending``
+      * ``done``        → ``pending``  → ``'done_to_pending'``
+      * ``in-progress`` → ``pending``  → ``'in_progress_to_pending'``
 
-    All other transitions (including blocked→pending) are not reversals and
-    do not consume window slots.
+    All other transitions (including ``blocked``→``pending``) are not
+    reversals and do not consume window slots.  Returns ``None`` for those.
     """
-    return new_status == 'pending' and old_status in ('done', 'in-progress')
+    if new_status != 'pending':
+        return None
+    if old_status == 'done':
+        return 'done_to_pending'
+    if old_status == 'in-progress':
+        return 'in_progress_to_pending'
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +254,7 @@ class BulkResetGuard:
             return BulkResetVerdict(outcome='ok', project_id=project_id)
 
         # 2. Non-reversal fast-path — ignore; do not touch the deque.
-        if not _is_reversal(old_status, new_status):
+        if _reversal_kind(old_status, new_status) is None:
             return BulkResetVerdict(outcome='ok', project_id=project_id)
 
         now = self._now()
