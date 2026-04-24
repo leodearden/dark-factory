@@ -317,8 +317,8 @@ class ReconciliationHarness:
         try:
             tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
             # Defensively unwrap {'data': {'tasks': [...]}} wrapper shape that
-            # some Taskmaster MCP calls emit (mirrors _extract_task_dict at
-            # task_interceptor.py:2820).
+            # some Taskmaster MCP calls emit (analogous to _extract_task_dict at
+            # task_interceptor.py:2820, but applied to the list response shape).
             wrapper_unwrapped = False
             if (
                 isinstance(tasks_data, dict)

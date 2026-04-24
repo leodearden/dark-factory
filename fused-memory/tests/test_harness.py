@@ -2021,25 +2021,10 @@ class TestHarnessFetchFilteredTaskTree:
         """
         import logging
 
-        from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
-        from fused_memory.reconciliation.harness import ReconciliationHarness
         from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
-        config = FusedMemoryConfig(
-            reconciliation=ReconciliationConfig(
-                enabled=True,
-                explore_codebase_root='/tmp/test',
-                agent_llm_provider='anthropic',
-                agent_llm_model='claude-sonnet-4-20250514',
-            )
-        )
-        harness = ReconciliationHarness(
-            memory_service=mock_memory_service,
-            taskmaster=None,
-            journal=journal,
-            event_buffer=event_buffer,
-            config=config,
-        )
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.taskmaster = None
 
         with caplog.at_level(logging.INFO):
             result = await harness._fetch_filtered_task_tree('/abs/path')
@@ -2196,27 +2181,6 @@ class TestHarnessFetchFilteredTaskTree:
             f"Expected project_root='/abs/path' in log extra; got: {rec_dict}"
         )
 
-        # Existing DEBUG-test semantic also still holds:
-        # raw_count and project_root still appear in a log record at DEBUG-visible level
-        with caplog.at_level(logging.DEBUG):
-            caplog.clear()
-            harness.taskmaster.get_tasks.reset_mock()  # type: ignore[union-attr,attr-defined]
-            harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
-                'tasks': [
-                    {'id': 1, 'title': 'T1', 'status': 'in-progress', 'dependencies': []},
-                    {'id': 2, 'title': 'T2', 'status': 'done', 'dependencies': []},
-                    {'id': 3, 'title': 'T3', 'status': 'cancelled', 'dependencies': []},
-                    {'id': 4, 'title': 'T4', 'status': 'pending', 'dependencies': []},
-                ]
-            }
-            await harness._fetch_filtered_task_tree('/abs/path')
-
-        # raw_count=4 and project_root='/abs/path' are in extra dict of the INFO record
-        assert any(
-            getattr(r, 'raw_count', None) == 4
-            and getattr(r, 'project_root', None) == '/abs/path'
-            for r in caplog.records
-        ), "Expected a log record with raw_count=4 and project_root='/abs/path' at DEBUG-visible level"
     @pytest.mark.asyncio
     async def test_fetch_filtered_task_tree_unwraps_data_wrapper_response_shape(
         self,
