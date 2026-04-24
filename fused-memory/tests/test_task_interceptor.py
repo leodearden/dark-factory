@@ -1643,6 +1643,26 @@ async def test_get_statuses_handles_data_envelope(taskmaster, event_buffer):
     assert result == {'10': 'blocked', '11': 'done'}
 
 
+@pytest.mark.asyncio
+async def test_get_statuses_raises_when_taskmaster_not_configured(event_buffer):
+    """TaskInterceptor(None, None, buf) → get_statuses() raises RuntimeError."""
+    interceptor = TaskInterceptor(None, None, event_buffer)
+    with pytest.raises(RuntimeError, match='not configured'):
+        await interceptor.get_statuses('/project')
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_calls_ensure_connected(event_buffer):
+    """ensure_connected is called before proxying to taskmaster in get_statuses."""
+    tm = AsyncMock()
+    tm.ensure_connected = AsyncMock()
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+    interceptor = TaskInterceptor(tm, None, event_buffer)
+
+    await interceptor.get_statuses('/project')
+    tm.ensure_connected.assert_called_once()
+
+
 # ── Tests for None / disconnected taskmaster ───────────────────────
 
 
