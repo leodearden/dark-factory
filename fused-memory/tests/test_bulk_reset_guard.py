@@ -823,6 +823,7 @@ async def test_write_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
     )
 
     # Phase 1: trip the guard at t=1001..1004; write_text raises → rejection.
+    v: BulkResetVerdict | None = None
     for i in range(4):
         clock[0] += 1.0
         v = await guard.observe_attempt(
@@ -832,6 +833,7 @@ async def test_write_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
             new_status='pending',
             project_root=str(tmp_path),
         )
+    assert v is not None
     assert v.outcome == 'rejection', f'Phase 1: expected rejection, got {v.outcome}'
     assert write_text_calls[0] == 1, (
         f'Phase 1: expected 1 write_text call, got {write_text_calls[0]}'
