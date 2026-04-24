@@ -141,11 +141,36 @@ class EscalationQueue:
         never shadows a matching copy in the other tier.  Iteration order is
         queue root first, archive second, so the queue_dir copy wins when both
         copies pass the filter.
+
+        Pre-scan warning: before applying any filter, if the same escalation id
+        appears in BOTH the queue_dir root AND the archive subtree, a single
+        WARNING is logged regardless of which (if any) copies pass the caller's
+        filter.  This ensures cross-tier duplicates are visible to operators
+        even when the filter excludes all copies.
         """
         # Build the candidate path list.
         paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
         if status != 'pending':
             paths.extend(self._iter_archive_paths('esc-*.json'))
+
+        # Pre-scan: detect ids that span both queue_dir root and archive subtree.
+        # Uses filename stems only (no JSON parsing) to avoid extra I/O.
+        archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
+        id_to_paths: dict[str, list[Path]] = {}
+        for path in paths:
+            id_to_paths.setdefault(path.stem, []).append(path)
+        for esc_id, esc_paths in id_to_paths.items():
+            if len(esc_paths) >= 2:
+                in_root = any(p.parent == self.queue_dir for p in esc_paths)
+                in_archive = any(
+                    p.parent != self.queue_dir and str(p).startswith(str(archive_root))
+                    for p in esc_paths
+                )
+                if in_root and in_archive:
+                    logger.warning(
+                        f'Escalation {esc_id!r} exists in both queue_dir and archive: '
+                        f'{[str(p) for p in esc_paths]}; reconciliation may be needed'
+                    )
 
         seen: set[str] = set()
         results = []
