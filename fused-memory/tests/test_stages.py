@@ -2712,8 +2712,8 @@ class TestFormatFlaggedCharBudget:
             f'{[(r.message, getattr(r, "__dict__", {})) for r in warning_records]}'
         )
         rec = warning_records[0]
-        # All four structured-extra keys must be present
-        for key in ('total', 'rendered', 'dropped', 'budget_chars'):
+        # All five structured-extra keys must be present
+        for key in ('total', 'rendered', 'dropped', 'budget_chars', 'first_item_fragmented'):
             assert hasattr(rec, key), (
                 f'Expected extra key {key!r} on WARNING record; '
                 f'record __dict__: {rec.__dict__}'
@@ -2727,7 +2727,14 @@ class TestFormatFlaggedCharBudget:
         )
         assert rendered > 0, f'rendered must be > 0, got {rendered}'
         assert dropped > 0, f'dropped must be > 0, got {dropped}'
-        assert budget_chars == 40000, f'budget_chars must be 40000, got {budget_chars}'
+        assert budget_chars == _FLAGGED_ITEMS_CHAR_BUDGET, (
+            f'budget_chars must be {_FLAGGED_ITEMS_CHAR_BUDGET}, got {budget_chars}'
+        )
+        # 200×~330-char items — none of them is the oversized-first-item case
+        assert rec.first_item_fragmented is False, (
+            f'first_item_fragmented must be False for multi-item over-budget; '
+            f'got {rec.first_item_fragmented!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2789,6 +2796,74 @@ class TestFormatFlaggedFirstItemEdgeCase:
         # The second item was not rendered; the footer should note it
         assert '... and 1 more (truncated: char budget)' in text, (
             f'Expected "... and 1 more" footer; got last 200 chars: {text[-200:]!r}'
+        )
+
+    def test_first_item_exceeds_budget_warning_has_rendered_zero_and_fragmented_true(
+        self, caplog
+    ):
+        """When the first item alone exceeds the budget, rendered==0 and first_item_fragmented==True."""
+        items = [{'description': 'y' * 50_000, 'severity': 'critical'}]
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            _format_flagged(items)
+
+        warning_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.message == 'reconciliation.flagged_items_truncated'
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 truncation WARNING; got {len(warning_records)}'
+        )
+        rec = warning_records[0]
+        assert rec.rendered == 0, (
+            f'rendered must be 0 when first item exceeds budget (fragment != full); '
+            f'got {rec.rendered}'
+        )
+        assert rec.first_item_fragmented is True, (
+            f'first_item_fragmented must be True; got {rec.first_item_fragmented!r}'
+        )
+        assert rec.total == 1, f'total must be 1, got {rec.total}'
+        assert rec.dropped == 1, f'dropped must be 1, got {rec.dropped}'
+        assert rec.total == rec.rendered + rec.dropped, (
+            f'total={rec.total} must equal rendered={rec.rendered} + dropped={rec.dropped}'
+        )
+
+    def test_two_item_first_exceeds_budget_warning_and_footer(self, caplog):
+        """Two items, first oversized: rendered==0, first_item_fragmented==True, dropped==2, footer shows 1 more."""
+        items = [
+            {'description': 'z' * 50_000, 'severity': 'critical'},
+            {'description': 'small', 'severity': 'minor'},
+        ]
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            text = _format_flagged(items)
+
+        # Footer shows only completely_missing items (not the fragmented first item)
+        assert '... and 1 more (truncated: char budget)' in text, (
+            f'Expected "... and 1 more" footer; last 200 chars: {text[-200:]!r}'
+        )
+
+        warning_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.message == 'reconciliation.flagged_items_truncated'
+        ]
+        assert len(warning_records) == 1
+        rec = warning_records[0]
+        assert rec.rendered == 0, f'rendered must be 0; got {rec.rendered}'
+        assert rec.first_item_fragmented is True, (
+            f'first_item_fragmented must be True; got {rec.first_item_fragmented!r}'
+        )
+        assert rec.dropped == 2, f'dropped must be 2 (fragmented+missing); got {rec.dropped}'
+        assert rec.total == rec.rendered + rec.dropped, (
+            f'total={rec.total} must equal rendered={rec.rendered} + dropped={rec.dropped}'
         )
 
 
