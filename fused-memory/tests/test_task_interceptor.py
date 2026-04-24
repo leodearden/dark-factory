@@ -3521,3 +3521,64 @@ async def test_set_task_status_csv_in_progress_to_pending_trips_guard(
     # tm.set_task_status NOT called for task 4
     called_ids = {call.args[0] for call in taskmaster.set_task_status.call_args_list}
     assert '4' not in called_ids, 'set_task_status should not have been called for task 4'
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Intra-batch deduplication (task-1004)
+# Step-3: integration tests — written before step-4 adds the pre-pass.
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_expand_task_removes_intra_batch_duplicates(
+    curator_interceptor, taskmaster,
+):
+    """expand_task should remove intra-batch duplicates before passing unique
+    survivors to the curator.
+
+    Three new subtasks are created: '1.2' is a case+whitespace variant of
+    '1.1' → intra-batch duplicate and must be removed.  '1.3' is unrelated.
+    Expectations:
+      - removed has 1 entry: task_id='1.2', reason='intra_batch_duplicate',
+        matched_task_id='1.1'
+      - kept has 2 entries: '1.1' and '1.3'
+      - taskmaster.remove_task called exactly once (for '1.2')
+      - curator.curate called exactly twice (for '1.1' and '1.3' only)
+    """
+    pre_snapshot = {'tasks': []}
+    post_snapshot = {'tasks': [
+        {'id': '1', 'title': 'Parent', 'status': 'pending', 'subtasks': [
+            {'id': '1.1', 'title': 'Fix foo', 'description': 'bar'},
+            {'id': '1.2', 'title': 'FIX FOO', 'description': ' bar '},
+            {'id': '1.3', 'title': 'Unrelated', 'description': 'baz'},
+        ]},
+    ]}
+
+    taskmaster.get_tasks = AsyncMock(side_effect=[pre_snapshot, post_snapshot])
+    taskmaster.remove_task = AsyncMock(return_value={'success': True})
+
+    curator_interceptor._curator = _mock_curator(
+        CuratorDecision(action='create', justification='new')
+    )
+
+    result = await curator_interceptor.expand_task('1', '/project')
+
+    dedup = result['dedup']
+
+    # (a) removed has exactly 1 entry for '1.2'
+    assert len(dedup['removed']) == 1, f"removed={dedup['removed']}"
+    removed_entry = dedup['removed'][0]
+    assert removed_entry['task_id'] == '1.2', removed_entry
+    assert removed_entry['reason'] == 'intra_batch_duplicate', removed_entry
+    assert removed_entry['matched_task_id'] == '1.1', removed_entry
+
+    # (b) kept has exactly 2 entries: '1.1' and '1.3'
+    kept_ids = {k['task_id'] for k in dedup['kept']}
+    assert kept_ids == {'1.1', '1.3'}, f"kept_ids={kept_ids}"
+
+    # (c) remove_task called exactly once for '1.2'
+    assert taskmaster.remove_task.await_count == 1
+    taskmaster.remove_task.assert_awaited_once_with('1.2', '/project')
+
+    # (d) curator.curate called exactly twice — unique survivors only
+    assert curator_interceptor._curator.curate.await_count == 2
