@@ -1114,3 +1114,152 @@ async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
     assert v3.outcome == 'escalated', (
         f'Phase 3: expected escalated after backoff cleared, got {v3.outcome}'
     )
+
+
+# ---------------------------------------------------------------------------
+# task-1016 step-7: per-kind counter isolation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_per_kind_counter_isolation(tmp_path):
+    """done→pending and in-progress→pending counts are independent.
+
+    Scenario A (done trips first):
+      done_threshold=3, in_progress_threshold=50
+      - Fire 3 done→pending: all ok (done counter at 3, in-progress at 0).
+      - Fire 49 in-progress→pending: all ok (in-progress at 49 < 50; done untouched).
+      - Fire 4th done→pending: trips done counter;
+        affected_task_ids contains only the 4 done task-ids (no in-progress ids).
+
+    Scenario B (in-progress trips first):
+      done_threshold=50, in_progress_threshold=3
+      - Fire 3 in-progress→pending: all ok.
+      - Fire 3 done→pending: all ok (done at 3 < 50; in-progress untouched at 3).
+      - Fire 4th in-progress→pending: trips in-progress counter;
+        affected_task_ids contains only the 4 in-progress task-ids.
+    """
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    # ---- Scenario A ----
+    guard_a = BulkResetGuard(
+        done_threshold=3,
+        in_progress_threshold=50,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    done_ids = [f'done-{i}' for i in range(4)]
+    ip_ids = [f'ip-{i}' for i in range(49)]
+
+    # (a) 3 done→pending — all ok
+    for tid in done_ids[:3]:
+        clock[0] += 1.0
+        v = await guard_a.observe_attempt(
+            project_id='scenario-a',
+            task_id=tid,
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'{tid}: expected ok, got {v.outcome}'
+
+    # (b) 49 in-progress→pending — all ok (in-progress counter at 49 < 50)
+    for tid in ip_ids:
+        clock[0] += 0.01
+        v = await guard_a.observe_attempt(
+            project_id='scenario-a',
+            task_id=tid,
+            old_status='in-progress',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'{tid}: expected ok, got {v.outcome}'
+
+    # (c) 4th done→pending trips the done counter
+    clock[0] += 1.0
+    v_trip = await guard_a.observe_attempt(
+        project_id='scenario-a',
+        task_id=done_ids[3],
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert v_trip.is_rejection is True, (
+        f'Scenario A: expected rejection on 4th done→pending, got {v_trip.outcome}'
+    )
+    assert set(v_trip.affected_task_ids) == set(done_ids), (
+        f'Scenario A: affected_task_ids should contain only done ids; '
+        f'got {v_trip.affected_task_ids}'
+    )
+    for ip_id in ip_ids:
+        assert ip_id not in v_trip.affected_task_ids, (
+            f'Scenario A: in-progress id {ip_id} leaked into done verdict'
+        )
+
+    # ---- Scenario B ----
+    clock2 = [5000.0]
+
+    def fake_clock2() -> float:
+        return clock2[0]
+
+    guard_b = BulkResetGuard(
+        done_threshold=50,
+        in_progress_threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock2,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    ip2_ids = [f'ip2-{i}' for i in range(4)]
+    done2_ids = [f'done2-{i}' for i in range(3)]
+
+    # (i) 3 in-progress→pending — all ok
+    for tid in ip2_ids[:3]:
+        clock2[0] += 1.0
+        v = await guard_b.observe_attempt(
+            project_id='scenario-b',
+            task_id=tid,
+            old_status='in-progress',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'{tid}: expected ok, got {v.outcome}'
+
+    # (ii) 3 done→pending — all ok (done counter at 3, well under 50)
+    for tid in done2_ids:
+        clock2[0] += 1.0
+        v = await guard_b.observe_attempt(
+            project_id='scenario-b',
+            task_id=tid,
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'{tid}: expected ok, got {v.outcome}'
+
+    # (iii) 4th in-progress→pending trips the in-progress counter
+    clock2[0] += 1.0
+    v_trip_b = await guard_b.observe_attempt(
+        project_id='scenario-b',
+        task_id=ip2_ids[3],
+        old_status='in-progress',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert v_trip_b.is_rejection is True, (
+        f'Scenario B: expected rejection on 4th in-progress→pending, got {v_trip_b.outcome}'
+    )
+    assert set(v_trip_b.affected_task_ids) == set(ip2_ids), (
+        f'Scenario B: affected_task_ids should contain only in-progress ids; '
+        f'got {v_trip_b.affected_task_ids}'
+    )
+    for d_id in done2_ids:
+        assert d_id not in v_trip_b.affected_task_ids, (
+            f'Scenario B: done id {d_id} leaked into in-progress verdict'
+        )
