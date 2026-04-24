@@ -545,6 +545,31 @@ def _mock_curator(decision: CuratorDecision) -> MagicMock:
     return curator
 
 
+def _seed_existing_r4_task(
+    taskmaster,
+    *,
+    task_id: str,
+    escalation_id: str,
+    suggestion_hash: str,
+    title: str = 'Existing R4 task',
+    status: str = 'pending',
+) -> None:
+    """Seed taskmaster.get_tasks with a single pending task carrying R4 idempotency keys."""
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {
+                'id': task_id,
+                'title': title,
+                'status': status,
+                'metadata': {
+                    'escalation_id': escalation_id,
+                    'suggestion_hash': suggestion_hash,
+                },
+            },
+        ],
+    })
+
+
 @pytest.mark.asyncio
 async def test_curator_drop_short_circuits_add_task(
     curator_interceptor, taskmaster,
@@ -1055,6 +1080,101 @@ async def test_pre_llm_exact_match_via_note_created(curator_enabled_config, task
 # ─────────────────────────────────────────────────────────────────────
 # R4: escalation-level idempotency on (escalation_id, suggestion_hash)
 # ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('entry_path', ['add_task', 'submit_task_direct'])
+async def test_idempotency_hit_via_entry_path(
+    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
+    entry_path,
+):
+    """R4: idempotency hit short-circuits both add_task and submit_task entry paths.
+
+    Covers two entry points into the R4 gate to ensure a stamped
+    (escalation_id, suggestion_hash) pair returns the existing task without
+    consulting the curator or creating a new task.
+    """
+    from fused_memory.middleware.ticket_store import TicketStore
+
+    _seed_existing_r4_task(
+        taskmaster,
+        task_id='555',
+        escalation_id='esc-r4-986',
+        suggestion_hash='h986h986h986h986',
+    )
+    curator_mock = _mock_curator(CuratorDecision(action='create', justification='novel'))
+
+    store = TicketStore(tmp_path / 'idemp_hit_entry_paths_tickets.db')
+    await store.initialize()
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        ticket_store=store,
+    )
+    interceptor._curator = curator_mock
+
+    metadata = {
+        'escalation_id': 'esc-r4-986',
+        'suggestion_hash': 'h986h986h986h986',
+        'modules': ['fused-memory/src'],
+    }
+    try:
+        if entry_path == 'add_task':
+            result = await interceptor.add_task(
+                '/project',
+                title='T',
+                description='D',
+                metadata=metadata,
+            )
+        else:  # submit_task_direct
+            # Phase 1: submit_task returns {'ticket': 'tkt_...'} immediately.
+            submit_result = await interceptor.submit_task(
+                '/project',
+                title='T',
+                description='D',
+                metadata=metadata,
+            )
+            assert isinstance(submit_result, dict), (
+                f'submit_task should return a dict, got {submit_result!r}'
+            )
+            assert 'ticket' in submit_result, (
+                f'submit_task should return {{ticket: tkt_...}}, got {submit_result!r}'
+            )
+            ticket = submit_result['ticket']
+            assert ticket.startswith('tkt_'), (
+                f'ticket id should start with tkt_, got {ticket!r}'
+            )
+            # Phase 2: resolve_ticket waits for the worker and returns the R4 decision.
+            result = await interceptor.resolve_ticket(ticket, '/project', timeout_seconds=5.0)
+    finally:
+        await store.close()
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
+
+    if entry_path == 'add_task':
+        assert result['id'] == '555'
+        assert result['deduplicated'] is True
+        assert result['action'] == 'idempotency_hit'
+    else:  # submit_task_direct
+        assert result.get('reason') != 'timeout', (
+            f'Worker timed out before returning R4 decision — possible regression '
+            f'where R4 gate is bypassed or worker stalled: {result!r}'
+        )
+        assert result.get('status') == 'combined', (
+            f"resolve_ticket should return status='combined' on R4 hit, got {result!r}"
+        )
+        assert result.get('task_id') == '555', (
+            f"resolve_ticket should return task_id of existing task, got {result!r}"
+        )
+        assert result.get('reason') == 'idempotency_hit', (
+            f"resolve_ticket should return reason='idempotency_hit', got {result!r}"
+        )
+
+    # Shared tail assertions — apply unconditionally for both entry paths.
+    curator_mock.curate.assert_not_called()
+    taskmaster.add_task.assert_not_called()
 
 
 @pytest.mark.asyncio
