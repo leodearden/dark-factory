@@ -186,6 +186,51 @@ class TestDeadLetter:
         assert dead[0]['attempts'] == 2
         await q.close()
 
+    @pytest.mark.asyncio
+    async def test_get_dead_items_limit_and_order(self, tmp_path):
+        """get_dead_items(limit=N) returns at most N items, newest-first."""
+        execute = AsyncMock(side_effect=RuntimeError('always fails'))
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+
+        # Enqueue 4 items that will all be dead-lettered.
+        for i in range(4):
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': f'item {i}', 'group_id': 'proj1', 'name': f'ep{i}'},
+            )
+        await asyncio.sleep(1.0)
+
+        # All 4 should be dead.
+        all_dead = await q.get_dead_items()
+        assert len(all_dead) == 4, f'Expected 4 dead items, got {len(all_dead)}'
+
+        # With limit=2, must return exactly 2 newest items (highest ids first).
+        limited = await q.get_dead_items(limit=2)
+        assert len(limited) == 2
+        assert limited[0]['id'] > limited[1]['id'], 'Items must be newest-first (id DESC)'
+
+        # The 2 returned must be the 2 highest-id items.
+        all_ids = sorted([item['id'] for item in all_dead], reverse=True)
+        limited_ids = [item['id'] for item in limited]
+        assert limited_ids == all_ids[:2], (
+            f'Limited result should be the top-2 newest: {limited_ids} vs {all_ids[:2]}'
+        )
+
+        # No-limit call returns all items (backward compat).
+        all_again = await q.get_dead_items()
+        assert len(all_again) == 4
+
+        await q.close()
+
 
 class TestReplayDead:
     @pytest.mark.asyncio

@@ -410,18 +410,35 @@ class DurableWriteQueue:
             'oldest_pending_age_seconds': oldest_pending_age,
         }
 
-    async def get_dead_items(self, group_id: str | None = None) -> list[dict[str, Any]]:
-        """Return dead-lettered items."""
+    async def get_dead_items(
+        self,
+        group_id: str | None = None,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return dead-lettered items, newest-first.
+
+        Args:
+            group_id: Optional filter by group_id.
+            limit: Optional maximum number of items to return.  When *None*
+                all dead items are returned (backward-compatible default).
+        """
         assert self._db is not None
         if group_id:
-            cursor = await self._db.execute(
-                "SELECT * FROM write_queue WHERE status = 'dead' AND group_id = ?",
-                (group_id,),
+            sql = (
+                "SELECT * FROM write_queue WHERE status = 'dead' AND group_id = ?"
+                " ORDER BY id DESC"
             )
+            params: tuple = (group_id,)
         else:
-            cursor = await self._db.execute(
-                "SELECT * FROM write_queue WHERE status = 'dead'"
-            )
+            sql = "SELECT * FROM write_queue WHERE status = 'dead' ORDER BY id DESC"
+            params = ()
+
+        if limit is not None:
+            sql += ' LIMIT ?'
+            params = (*params, limit)
+
+        cursor = await self._db.execute(sql, params)
         rows = await cursor.fetchall()
         results = []
         for row in rows:
