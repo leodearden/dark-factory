@@ -716,6 +716,286 @@ class TestCheckPlanTargetsInTree:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
+    async def test_merge_commit_done_step_deletions_are_detected(
+        self, git_ops: GitOps,
+    ):
+        """Merge-commit done step: deletions are not silenced by combined-diff.
+
+        Gap 2: git show defaults to combined-diff format for merge commits,
+        which prints nothing under --diff-filter=D.  diff-tree -r <sha>^ <sha>
+        forces two-way comparison against the first parent, correctly surfacing
+        file deletions that happen to occur at a merge-commit boundary.
+        """
+        worktree = (await git_ops.create_worktree('merge-commit-del')).path
+
+        # Add f.py on the task branch and commit
+        (worktree / 'f.py').write_text('f = 1\n')
+        create_sha = await git_ops.commit(worktree, 'Add f.py')
+        assert create_sha
+
+        # Create a sidekick branch from HEAD~1 (the initial commit, before f.py)
+        # so that the merge produces a genuine two-parent commit.
+        await _run(['git', 'branch', 'sidekick', 'HEAD~1'], cwd=worktree)
+        await _run(['git', 'checkout', 'sidekick'], cwd=worktree)
+
+        # Add g.py on the sidekick branch and commit
+        (worktree / 'g.py').write_text('g = 1\n')
+        await _run(['git', 'add', '-A'], cwd=worktree)
+        await _run(['git', 'commit', '-m', 'Add g.py'], cwd=worktree)
+
+        # Return to the task branch
+        await _run(['git', 'checkout', '-'], cwd=worktree)
+
+        # Start the merge without committing, then also delete f.py before
+        # finalising the merge commit.
+        await _run(['git', 'merge', '--no-ff', '--no-commit', 'sidekick'], cwd=worktree)
+        await _run(['git', 'rm', 'f.py'], cwd=worktree)
+        await _run(
+            ['git', 'commit', '-m', 'Merge sidekick and delete f.py'],
+            cwd=worktree,
+        )
+
+        # Capture the merge-commit SHA in the task branch
+        _, merge_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-merge-del', 'T-merge-del', 'desc')
+        artifacts.write_plan({
+            'files': ['f.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'merge+del',
+                    'status': 'done',
+                    'commit': merge_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'merge-commit-del')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            # f.py was intentionally deleted inside the done step's merge commit.
+            # It must NOT be reported as a drop.
+            assert missing == []
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_renamed_file_in_done_step_treats_old_name_as_expected_absent(
+        self, git_ops: GitOps,
+    ):
+        """Renamed file in done step: old name is treated as expected absent.
+
+        Gap 3: git's default rename detection converts D+A pairs to R.  A
+        planned file renamed by a done step does not appear in the D list, so
+        the old name is falsely flagged as a drop.  --no-renames disables
+        detection so the rename surfaces as an explicit deletion of a.py,
+        placing it in expected_absent.
+        """
+        worktree = (await git_ops.create_worktree('rename-step')).path
+
+        # High-similarity content (5× repeated function body) ensures git's
+        # default rename detection (50% similarity threshold) fires.
+        (worktree / 'a.py').write_text('def helper():\n    return 42\n' * 5)
+        await git_ops.commit(worktree, 'Add a.py')
+
+        # Rename a.py → b.py via git mv (preserves exact content → 100% similarity)
+        await _run(['git', 'mv', 'a.py', 'b.py'], cwd=worktree)
+        rename_sha = await git_ops.commit(worktree, 'Rename a.py to b.py')
+        assert rename_sha
+
+        # Plan lists the OLD name; the rename is recorded as a done step.
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-rename', 'T-rename', 'desc')
+        artifacts.write_plan({
+            'files': ['a.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'rename',
+                    'status': 'done',
+                    'commit': rename_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'rename-step')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            # a.py was legitimately renamed to b.py in the done step.
+            # It must NOT be reported as a drop.
+            assert missing == []
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_done_step_diff_tree_calls_run_concurrently(
+        self, git_ops: GitOps,
+    ):
+        """diff-tree queries for done steps run concurrently via asyncio.gather.
+
+        Performance concern: the merge hot-path's wall-clock latency must be
+        O(1) not O(N) in done-step count — total subprocess work stays O(N),
+        but asyncio.gather runs them concurrently so latency tracks the
+        slowest single call.  This test verifies concurrent execution by
+        confirming all three intercepted coroutines enter before any exits:
+
+            max(start_times) < min(end_times)
+
+        With a sequential for-loop each call is spaced 0.2 s apart, so
+        max(starts) ≈ 0.4 >= min(ends) ≈ 0.2 and the assertion fails.
+        With asyncio.gather all three overlap and the invariant holds.
+
+        Each done step references a DISTINCT commit so the deduplication pass
+        does not collapse the three queries into one.
+        """
+        worktree = (await git_ops.create_worktree('concurrent-done')).path
+
+        # Create three distinct commits so deduplication keeps all three queries.
+        (worktree / 'file_a.py').write_text('a = 1\n')
+        sha_c1 = await git_ops.commit(worktree, 'Add file_a.py')
+        assert sha_c1
+
+        (worktree / 'file_b.py').write_text('b = 1\n')
+        sha_c2 = await git_ops.commit(worktree, 'Add file_b.py')
+        assert sha_c2
+
+        (worktree / 'file_c.py').write_text('c = 1\n')
+        sha_c3 = await git_ops.commit(worktree, 'Add file_c.py')
+        assert sha_c3
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-concurrent', 'T-concurrent', 'desc')
+        # forces_loop.py is a phantom file: it is absent from the merge tree,
+        # so missing is non-empty and the done-step loop is entered.
+        artifacts.write_plan({
+            'files': ['file_a.py', 'forces_loop.py'],
+            'modules': [],
+            'steps': [
+                {'id': 'step-1', 'description': 's1', 'status': 'done', 'commit': sha_c1},
+                {'id': 'step-2', 'description': 's2', 'status': 'done', 'commit': sha_c2},
+                {'id': 'step-3', 'description': 's3', 'status': 'done', 'commit': sha_c3},
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'concurrent-done')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            from orchestrator import merge_queue as mq
+            original_run = mq._run
+            start_times: list[float] = []
+            end_times: list[float] = []
+
+            async def _intercept(cmd, cwd=None, **kwargs):
+                if '--diff-filter=D' in cmd:
+                    start_times.append(asyncio.get_running_loop().time())
+                    await asyncio.sleep(0.2)
+                    end_times.append(asyncio.get_running_loop().time())
+                    return 0, '', ''
+                return await original_run(cmd, cwd=cwd, **kwargs)
+
+            with patch('orchestrator.merge_queue._run', new=_intercept):
+                await _check_plan_targets_in_tree(
+                    merge_result.merge_commit, worktree, git_ops,
+                )
+
+            assert len(start_times) == 3, (
+                f'Expected 3 diff-tree calls, got {len(start_times)}'
+            )
+            assert len(end_times) == 3, (
+                f'Expected 3 diff-tree calls to complete, got {len(end_times)}'
+            )
+            assert max(start_times) < min(end_times), (
+                f'Sequential execution detected: starts={start_times}, '
+                f'ends={end_times}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_malformed_step_shapes_do_not_raise_or_query_git(
+        self, git_ops: GitOps,
+    ):
+        """Malformed step shapes are silently skipped — no exceptions, no git queries.
+
+        The defensive ``isinstance(step, dict)`` and ``isinstance(commit, str)``
+        guards in the asyncio.gather refactor had no previous test coverage.
+        This test feeds a plan whose steps list contains:
+          - None (non-dict)
+          - a plain string (non-dict, normalised to a dict with no "status")
+          - a dict whose "commit" key is absent
+          - a dict whose "commit" is None (non-string)
+          - a dict whose "commit" is an integer (non-string)
+          - a dict with a valid string commit but status != 'done'
+
+        Assertions:
+          1. No exception is raised.
+          2. No ``git diff-tree`` subprocess is fired (steps_to_query is empty).
+          3. The phantom file that is absent from the merge tree is still
+             reported as dropped (the guards don't suppress legitimate drops).
+        """
+        worktree = (await git_ops.create_worktree('malformed-steps')).path
+        (worktree / 'real.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add real.py')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-malformed', 'T-malformed', 'desc')
+        artifacts.write_plan({
+            'files': ['phantom.py', 'real.py'],
+            'modules': [],
+            'steps': [
+                None,                                                   # non-dict
+                'plain string step',                                    # non-dict
+                {'id': 'step-A', 'description': 'a', 'status': 'done'},  # no commit
+                {'id': 'step-B', 'description': 'b', 'status': 'done', 'commit': None},
+                {'id': 'step-C', 'description': 'c', 'status': 'done', 'commit': 123},
+                {'id': 'step-D', 'description': 'd', 'status': 'pending', 'commit': 'abc'},
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'malformed-steps')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            from orchestrator import merge_queue as mq
+            original_run = mq._run
+            diff_tree_calls: list[list[str]] = []
+
+            async def _intercept(cmd, cwd=None, **kwargs):
+                if '--diff-filter=D' in cmd:
+                    diff_tree_calls.append(list(cmd))
+                return await original_run(cmd, cwd=cwd, **kwargs)
+
+            with patch('orchestrator.merge_queue._run', new=_intercept):
+                missing = await _check_plan_targets_in_tree(
+                    merge_result.merge_commit, worktree, git_ops,
+                )
+
+            # phantom.py is absent from the merge tree → correctly reported as dropped
+            assert 'phantom.py' in missing
+            # real.py is present in the merge tree → not reported as dropped
+            assert 'real.py' not in missing
+            # No diff-tree subprocess should have been launched for any of the
+            # malformed / non-done steps — steps_to_query must be empty.
+            assert diff_tree_calls == [], (
+                f'Unexpected diff-tree calls fired: {diff_tree_calls}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
 
 @pytest.mark.asyncio
 class TestMergeWorker:
