@@ -845,10 +845,11 @@ class TestCheckPlanTargetsInTree:
     ):
         """diff-tree queries for done steps run concurrently via asyncio.gather.
 
-        Performance concern: the merge hot-path must scale O(1) not O(N) in
-        done-step count.  asyncio.gather over independent git queries is the
-        minimal fix.  This test verifies concurrent execution by confirming
-        all three intercepted coroutines enter before any exits:
+        Performance concern: the merge hot-path's wall-clock latency must be
+        O(1) not O(N) in done-step count — total subprocess work stays O(N),
+        but asyncio.gather runs them concurrently so latency tracks the
+        slowest single call.  This test verifies concurrent execution by
+        confirming all three intercepted coroutines enter before any exits:
 
             max(start_times) < min(end_times)
 

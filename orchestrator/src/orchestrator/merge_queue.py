@@ -54,8 +54,9 @@ async def _check_plan_targets_in_tree(
     Returns an empty list when:
     - no plan.json exists (architect never ran — nothing to check)
     - plan['files'] is empty or missing
-    - every planned file that exists at task HEAD also exists at the merge
-      commit
+    - every planned file is present in the merge commit, or is explained
+      by a trusted done-step deletion, or (only when plan has no structured
+      steps) is absent from task HEAD as well.
     """
     artifacts = TaskArtifacts(task_worktree)
     plan = artifacts.read_plan()
@@ -63,27 +64,38 @@ async def _check_plan_targets_in_tree(
     if not files:
         return []
 
-    rc_head, task_head_out, head_err = await _run(
-        ['git', 'rev-parse', 'HEAD'],
-        cwd=task_worktree,
-    )
-    if rc_head == 0:
-        task_head = task_head_out.strip()
-    else:
-        # rev-parse HEAD on a valid worktree essentially always succeeds;
-        # a non-zero rc signals an unexpected problem (corrupt worktree,
-        # detached state with no HEAD). Log visibly so regressions surface
-        # in operations rather than as mystery false positives — with an
-        # empty task_head the loop below falls back to the pre-narrow
-        # behaviour of flagging every missing planned file as a drop.
-        logger.warning(
-            'drop-guard: git rev-parse HEAD failed in %s (rc=%d, stderr=%s); '
-            'falling back to flag-every-missing behaviour. '
-            'task_id=%s merge_commit_sha=%s',
-            task_worktree, rc_head, head_err.strip(),
-            task_id or '<unknown>', merge_commit_sha,
-        )
+    # Narrow-against-task-HEAD filter only applies when plan has no
+    # structured steps. When steps exist, the done-step cross-reference below
+    # is the authoritative intent signal: files absent from task HEAD without
+    # a trusted done-step deletion must fail closed as real drops rather than
+    # be silently dismissed by the narrow filter.
+    steps_raw = plan.get('steps') or []
+    has_structured_steps = any(isinstance(s, dict) for s in steps_raw)
+
+    if has_structured_steps:
         task_head = ''
+    else:
+        rc_head, task_head_out, head_err = await _run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=task_worktree,
+        )
+        if rc_head == 0:
+            task_head = task_head_out.strip()
+        else:
+            # rev-parse HEAD on a valid worktree essentially always succeeds;
+            # a non-zero rc signals an unexpected problem (corrupt worktree,
+            # detached state with no HEAD). Log visibly so regressions surface
+            # in operations rather than as mystery false positives — with an
+            # empty task_head the loop below falls back to the pre-narrow
+            # behaviour of flagging every missing planned file as a drop.
+            logger.warning(
+                'drop-guard: git rev-parse HEAD failed in %s (rc=%d, stderr=%s); '
+                'falling back to flag-every-missing behaviour. '
+                'task_id=%s merge_commit_sha=%s',
+                task_worktree, rc_head, head_err.strip(),
+                task_id or '<unknown>', merge_commit_sha,
+            )
+            task_head = ''
 
     missing: list[str] = []
     for f in files:
@@ -92,6 +104,11 @@ async def _check_plan_targets_in_tree(
             cwd=git_ops.project_root,
         )
         if rc_merge == 0:
+            continue
+        # When structured steps are present, skip the narrow filter — the
+        # done-step cross-reference below decides expected-absence.
+        if has_structured_steps:
+            missing.append(f)
             continue
         if not task_head:
             missing.append(f)
@@ -131,6 +148,15 @@ async def _check_plan_targets_in_tree(
     # done-step count on the merge hot-path.  Multiple done steps may point
     # at the same commit SHA; queries are deduplicated before gather to avoid
     # redundant subprocess launches.
+    #
+    # Trade-off: if a done-step commit is itself a merge commit that dropped
+    # a planned file during conflict resolution, `-m` surfaces that deletion
+    # against at least one parent and we silence it as expected_absent — the
+    # exact false-negative this guard was designed to catch.  In the current
+    # flow done-step commits are produced by individual coding agents and are
+    # overwhelmingly unlikely to be merge commits; if that ever changes, gate
+    # `-m` on `git rev-list --parents -n 1 <sha> | wc -w > 2` and skip
+    # done-step commits that are themselves merges.
 
     # Pass 1: collect (step_idx, commit) for every qualifying done step.
     steps_to_query: list[tuple[int, str]] = []
