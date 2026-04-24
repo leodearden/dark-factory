@@ -14,13 +14,13 @@ and GREEN after the step-16 impl migrates those three sites.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.config import GitConfig
 from orchestrator.harness import Harness
-
 
 # ---------------------------------------------------------------------------
 # Shared fixture
@@ -98,19 +98,21 @@ async def test_startup_noprd_uses_get_statuses_to_check_pending(
     After step-16 migration: get_statuses is called; get_tasks is not.
     """
     h = startup_harness
+    get_tasks_mock = cast(AsyncMock, h.scheduler.get_tasks)
+    get_statuses_mock = cast(AsyncMock, h.scheduler.get_statuses)
     # Signal "no tasks" via both mocks.
     # Pre-migration: get_tasks returns [] → any(...) is False → RuntimeError.
     # Post-migration: get_statuses returns {} → 'pending' not in values → RuntimeError.
-    h.scheduler.get_tasks.return_value = []
-    h.scheduler.get_statuses.return_value = {}
+    get_tasks_mock.return_value = []
+    get_statuses_mock.return_value = {}
 
     with pytest.raises(RuntimeError, match='No PRD given and no pending tasks found'):
         await h.run(prd_path=None)
 
     # After migration: get_statuses used for the check.
-    h.scheduler.get_statuses.assert_called()
+    get_statuses_mock.assert_called()
     # After migration: get_tasks NOT called in the startup block.
-    h.scheduler.get_tasks.assert_not_called()
+    get_tasks_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +129,10 @@ async def test_startup_total_tasks_counted_via_get_statuses(
     After step-16 migration: get_statuses is used instead.
     """
     h = startup_harness
+    get_tasks_mock = cast(AsyncMock, h.scheduler.get_tasks)
+    get_statuses_mock = cast(AsyncMock, h.scheduler.get_statuses)
     # Three tasks: two pending, one done.
-    h.scheduler.get_statuses.return_value = {
+    get_statuses_mock.return_value = {
         '1': 'pending',
         '2': 'done',
         '3': 'pending',
@@ -139,7 +143,7 @@ async def test_startup_total_tasks_counted_via_get_statuses(
 
     assert h.report.total_tasks == 2
     # After migration: get_tasks never called for the startup block.
-    h.scheduler.get_tasks.assert_not_called()
+    get_tasks_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +164,9 @@ async def test_populate_prd_uses_get_statuses_for_pre_ids(
     prd.write_text('# PRD')
 
     h = startup_harness
-    h.scheduler.get_statuses.return_value = {
+    get_tasks_mock = cast(AsyncMock, h.scheduler.get_tasks)
+    get_statuses_mock = cast(AsyncMock, h.scheduler.get_statuses)
+    get_statuses_mock.return_value = {
         '10': 'done',
         '20': 'pending',
     }
@@ -178,4 +184,4 @@ async def test_populate_prd_uses_get_statuses_for_pre_ids(
 
     assert captured_pre_ids == {'10', '20'}
     # After migration: get_tasks NOT called for the pre_ids snapshot.
-    h.scheduler.get_tasks.assert_not_called()
+    get_tasks_mock.assert_not_called()
