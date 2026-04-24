@@ -3304,8 +3304,8 @@ class TestRecoverIfAlreadyMerged:
         assert prov is not None, (
             f"Expected provenance entry for task {task_assignment.task_id!r}, got None"
         )
-        assert set(prov.keys()) == {'note', 'main_sha'}, (
-            f"Provenance must have exactly keys {{'note', 'main_sha'}}, got: {set(prov.keys())!r}"
+        assert {'note', 'main_sha'} <= prov.keys(), (  # additive expansion won't break this
+            f"Provenance must contain keys {{'note', 'main_sha'}}, got: {set(prov.keys())!r}"
         )
         assert prov['note'] == 'branch already on main at workflow start (pre-PLAN recovery)', (
             f"Unexpected provenance note: {prov['note']!r}"

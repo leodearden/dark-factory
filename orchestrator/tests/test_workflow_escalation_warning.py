@@ -176,9 +176,6 @@ class TestFirstInvocationBudgetExhaustion:
     This test drives workflow.run() through the _SessionBudgetExhausted handler
     on the FIRST invoke_agent call — before the architect writes plan.json, so
     _last_completed_role stays None throughout.
-
-    RED condition: current code uses the label 'last_role' (the old name), so both
-    assertions below fail until the rename in step-2 impl lands.
     """
 
     async def test_label_is_last_completed_role_na_when_no_role_completed(
@@ -198,6 +195,7 @@ class TestFirstInvocationBudgetExhaustion:
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
             config, git_ops, task_assignment, stub, tmp_path,
+            spawn_merge_worker=False,
         )
 
         # Raise SessionBudgetExhausted on the very first invoke_agent call —
