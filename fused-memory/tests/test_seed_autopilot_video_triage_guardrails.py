@@ -154,6 +154,45 @@ def test_load_guardrail_payloads_missing_source_raises():
     )
 
 
+def test_load_guardrail_payloads_syntax_error_wraps_with_path(tmp_path: Path):
+    """A SyntaxError in the source file surfaces with the source path named."""
+    from fused_memory.maintenance.seed_autopilot_video_triage_guardrails import (
+        load_guardrail_payloads,
+    )
+
+    broken = tmp_path / "guardrails.py"
+    broken.write_text("def def def oops\n")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        load_guardrail_payloads(agent_id="x", source_path=broken)
+
+    assert str(broken) in str(exc_info.value), (
+        f"Expected path {broken!s} in error, got: {exc_info.value}"
+    )
+    assert "SyntaxError" in str(exc_info.value) or isinstance(
+        exc_info.value.__cause__, SyntaxError
+    )
+
+
+def test_load_guardrail_payloads_missing_symbol_wraps_with_path(tmp_path: Path):
+    """A module missing get_guardrail_payloads surfaces a pointed error."""
+    from fused_memory.maintenance.seed_autopilot_video_triage_guardrails import (
+        load_guardrail_payloads,
+    )
+
+    stub = tmp_path / "guardrails.py"
+    stub.write_text('"""Valid module with no get_guardrail_payloads."""\n')
+
+    with pytest.raises(RuntimeError) as exc_info:
+        load_guardrail_payloads(agent_id="x", source_path=stub)
+
+    msg = str(exc_info.value)
+    assert str(stub) in msg, f"Expected path {stub!s} in error, got: {msg}"
+    assert "get_guardrail_payloads" in msg, (
+        f"Expected symbol name in error, got: {msg}"
+    )
+
+
 def test_load_guardrail_payloads_metadata_not_aliased_across_calls(guardrails_source: Path):
     """Two successive calls return independent metadata dict objects.
 

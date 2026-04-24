@@ -74,13 +74,29 @@ def load_guardrail_payloads(
     if spec is None or spec.loader is None:
         raise RuntimeError(f'Could not build ModuleSpec for {path!s}')
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise RuntimeError(
+            f'Failed to exec autopilot-video guardrails source at {path!s} '
+            f'({type(exc).__name__}: {exc}). Verify the file is valid Python '
+            f'and has no missing imports on its module body.'
+        ) from exc
+    try:
+        builder = module.get_guardrail_payloads
+    except AttributeError as exc:
+        raise RuntimeError(
+            f'autopilot-video guardrails source at {path!s} is missing the '
+            f'expected get_guardrail_payloads(agent_id) symbol. Task 1040 '
+            f'depends on this contract; upstream autopilot-video may have '
+            f'renamed or removed it.'
+        ) from exc
     # Delegate to the source module's canonical payload builder, then
     # deep-copy the result so the caller's payloads are fully independent
     # of the source module's internal state.  This makes non-aliasing the
     # loader's own guarantee rather than relying on whatever the source
     # module's get_guardrail_payloads happens to do internally.
-    return copy.deepcopy(list(module.get_guardrail_payloads(agent_id)))
+    return copy.deepcopy(list(builder(agent_id)))
 
 
 @dataclass
