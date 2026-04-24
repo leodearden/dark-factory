@@ -365,7 +365,7 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
             click.echo(
                 f'{score.diff_id:<26s} {lang:<5s} {source:<10s} '
                 f'{score.recall:>7.3f} {score.blocking_recall:>7.3f} {score.f1:>7.3f} '
-                f'${score.cost_usd:>6.2f}'
+                f'${score.total_cost_usd:>6.2f}'
             )
             if diff and diff.source == 'synthetic':
                 synthetic_recalls.append(score.recall)
@@ -378,7 +378,7 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
         mean_blocking = sum(synthetic_blocking_recalls) / len(synthetic_blocking_recalls) if synthetic_blocking_recalls else 0.0
         all_recalls = [s.recall for s in scores]
         all_f1s = [s.f1 for s in scores]
-        total_cost = sum(s.cost_usd for s in scores)
+        total_cost = sum(s.total_cost_usd for s in scores)
 
         click.echo()
         click.echo(click.style('Aggregate Metrics:', bold=True))
