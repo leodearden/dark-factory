@@ -117,39 +117,56 @@ async def _check_plan_targets_in_tree(
     #   (b) disable rename detection so renamed plan files correctly surface
     #       as expected_absent (git show with renames converts D+A to R,
     #       which --diff-filter=D does not match).
-    expected_absent: set[str] = set()
+    #
+    # All diff-tree queries run concurrently via asyncio.gather — each is
+    # independent and the sequential loop would otherwise scale O(N) in
+    # done-step count on the merge hot-path.
+
+    # Pass 1: collect (step_idx, commit) for every qualifying done step.
+    steps_to_query: list[tuple[int, str]] = []
     for step_idx, step in enumerate(plan.get('steps') or []):
+        if not isinstance(step, dict):
+            continue
         if step.get('status') != 'done':
             continue
         commit = step.get('commit')
-        if not commit:
+        if not isinstance(commit, str) or not commit:
             continue
-        rc, stdout, stderr = await _run(
-            [
-                'git', 'diff-tree',
-                '--no-renames',
-                '--diff-filter=D',
-                '--name-only',
-                '-r',
-                f'{commit}^',
-                commit,
-            ],
-            cwd=git_ops.project_root,
-        )
-        if rc != 0:
-            logger.warning(
-                'git diff-tree --diff-filter=D failed for step %d commit %s: %s',
-                step_idx, commit, stderr.strip(),
+        steps_to_query.append((step_idx, commit))
+
+    # Pass 2: fire all diff-tree queries concurrently, then process results.
+    expected_absent: set[str] = set()
+    if steps_to_query:
+        results = await asyncio.gather(*[
+            _run(
+                [
+                    'git', 'diff-tree',
+                    '--no-renames',
+                    '--diff-filter=D',
+                    '--name-only',
+                    '-r',
+                    f'{commit}^',
+                    commit,
+                ],
+                cwd=git_ops.project_root,
             )
-            continue
-        for line in stdout.splitlines():
-            path = line.strip()
-            if path:
-                expected_absent.add(path)
-                logger.debug(
-                    'File %s expected absent (deleted in step %d: %s)',
-                    path, step_idx, commit,
+            for _, commit in steps_to_query
+        ])
+        for (step_idx, commit), (rc, stdout, stderr) in zip(steps_to_query, results):
+            if rc != 0:
+                logger.warning(
+                    'git diff-tree --diff-filter=D failed for step %d commit %s: %s',
+                    step_idx, commit, stderr.strip(),
                 )
+                continue
+            for line in stdout.splitlines():
+                path = line.strip()
+                if path:
+                    expected_absent.add(path)
+                    logger.debug(
+                        'File %s expected absent (deleted in step %d: %s)',
+                        path, step_idx, commit,
+                    )
 
     return [f for f in missing if f not in expected_absent]
 
