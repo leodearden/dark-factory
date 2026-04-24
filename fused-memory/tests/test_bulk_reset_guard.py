@@ -884,3 +884,134 @@ async def test_write_failure_triggers_per_project_backoff(tmp_path, monkeypatch)
     assert v3.outcome == 'escalated', (
         f'Phase 3: expected escalated after backoff cleared, got {v3.outcome}'
     )
+
+
+# ---------------------------------------------------------------------------
+# task-979 step-8: mkdir-failure backoff (symmetric to step-5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mkdir_failure_triggers_per_project_backoff(tmp_path, monkeypatch):
+    """An OSError from esc_dir.mkdir arms a per-project backoff identically to
+    a write_text failure — and must NOT propagate out of observe_attempt.
+
+    Scenario:
+      1. Trip guard at t=1001..1004 (threshold=3); mkdir raises on first call —
+         NO exception propagates; verdict is 'rejection'; mkdir call count == 1;
+         write_text call count == 0 (short-circuited before write).
+      2. Advance clock by 30s (inside the 60s backoff window); fire another
+         reversal — verdict is 'rejection' AND mkdir call count still == 1
+         (backoff suppressed the retry, so neither mkdir NOR write_text called).
+      3. Advance clock to t=3000 (past window+backoff); seed 3 fresh ok
+         reversals then trip again.  mkdir is called a 2nd time and now
+         succeeds, write_text is called and succeeds; verdict is 'escalated'.
+
+    This test fails today because esc_dir.mkdir at bulk_reset_guard.py:352 is
+    NOT wrapped in try/except — the OSError propagates rather than arming the
+    backoff.
+    """
+    mkdir_calls: list[int] = [0]
+    write_text_calls: list[int] = [0]
+    real_mkdir = Path.mkdir
+    real_write_text = Path.write_text
+
+    def flaky_mkdir(self, *args, **kwargs):
+        mkdir_calls[0] += 1
+        if mkdir_calls[0] == 1:
+            raise OSError('simulated read-only mount')
+        return real_mkdir(self, *args, **kwargs)
+
+    def tracking_write_text(self, data, *args, **kwargs):
+        write_text_calls[0] += 1
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'mkdir', flaky_mkdir)
+    monkeypatch.setattr(Path, 'write_text', tracking_write_text)
+
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        write_failure_backoff_seconds=60.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    # Phase 1: trip guard at t=1001..1004; mkdir raises → rejection (no propagation).
+    v: BulkResetVerdict | None = None
+    for i in range(4):
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='proj',
+            task_id=f't{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    assert v is not None
+    assert v.outcome == 'rejection', f'Phase 1: expected rejection, got {v.outcome}'
+    assert mkdir_calls[0] == 1, (
+        f'Phase 1: expected 1 mkdir call, got {mkdir_calls[0]}'
+    )
+    assert write_text_calls[0] == 0, (
+        f'Phase 1: OSError from mkdir should short-circuit before write_text; '
+        f'write_text call count is {write_text_calls[0]}'
+    )
+
+    # Phase 2: 30s later — still inside 60s backoff window.
+    clock[0] += 30.0
+    v2 = await guard.observe_attempt(
+        project_id='proj',
+        task_id='t4',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert v2.outcome == 'rejection', (
+        f'Phase 2: expected rejection (backoff suppressed retry), got {v2.outcome}'
+    )
+    assert mkdir_calls[0] == 1, (
+        f'Phase 2: backoff should have suppressed mkdir retry; '
+        f'mkdir call count is {mkdir_calls[0]}'
+    )
+    assert write_text_calls[0] == 0, (
+        f'Phase 2: write_text should not be called during backoff; '
+        f'write_text call count is {write_text_calls[0]}'
+    )
+
+    # Phase 3: advance past window+backoff; seed 3 fresh ok reversals then trip.
+    clock[0] = 3000.0
+    for i in range(3):
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='proj',
+            task_id=f'new-{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'Phase 3 ok reversal {i}: expected ok, got {v.outcome}'
+
+    # Trip again — mkdir 2nd time (succeeds), write_text 1st time (succeeds) → escalated.
+    clock[0] += 1.0
+    v3 = await guard.observe_attempt(
+        project_id='proj',
+        task_id='new-3',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert mkdir_calls[0] == 2, (
+        f'Phase 3: expected 2 mkdir calls total, got {mkdir_calls[0]}'
+    )
+    assert write_text_calls[0] == 1, (
+        f'Phase 3: expected 1 write_text call after backoff cleared, got {write_text_calls[0]}'
+    )
+    assert v3.outcome == 'escalated', (
+        f'Phase 3: expected escalated after backoff cleared, got {v3.outcome}'
+    )
