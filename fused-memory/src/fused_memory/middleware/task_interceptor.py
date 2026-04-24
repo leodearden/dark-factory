@@ -14,7 +14,16 @@ from typing import TYPE_CHECKING, Any
 try:
     from shared.cli_invoke import AllAccountsCappedException  # type: ignore[import]
 except ImportError:
-    AllAccountsCappedException = Exception  # type: ignore[assignment,misc]
+    # Sentinel that can never be raised by real code, so the
+    # `except (CuratorFailureError, AllAccountsCappedException)` clause
+    # below still has tuple-compatible semantics without silently catching
+    # every Exception (which would collapse the cap-retry fallback path
+    # into the generic decisions=[None]*N degrade path and make the
+    # subsequent `except Exception` branch dead code).
+    class _UnavailableAllAccountsCapped(Exception):
+        """Placeholder used only when shared.cli_invoke is not importable."""
+
+    AllAccountsCappedException = _UnavailableAllAccountsCapped  # type: ignore[assignment,misc]
 
 from fused_memory.backends.taskmaster_client import TaskmasterBackend
 from fused_memory.middleware.task_curator import (

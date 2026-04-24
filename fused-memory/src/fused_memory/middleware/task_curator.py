@@ -1575,12 +1575,19 @@ def _parse_decision_dict(
 
     # batch_target_index: valid only for 'drop'; carries the sibling index when
     # the candidate is a duplicate of another batch item (not yet materialised).
+    # Wrap int() coercion: if the LLM emits a non-numeric string or other
+    # schema-drifted value, treat it as absent (degrade gracefully like every
+    # other invalid field in this parser) rather than raising ValueError out
+    # of the single-item path where no try/except wraps us.
     batch_target_index_raw = raw.get('batch_target_index')
-    batch_target_index: int | None = (
-        int(batch_target_index_raw)
-        if batch_target_index_raw is not None
-        else None
-    )
+    batch_target_index: int | None
+    if batch_target_index_raw is None:
+        batch_target_index = None
+    else:
+        try:
+            batch_target_index = int(batch_target_index_raw)
+        except (TypeError, ValueError):
+            batch_target_index = None
 
     # Safety: drop/combine must reference a pool task id that actually exists,
     # UNLESS this is a within-batch drop (batch_target_index set, target_id None).

@@ -1089,6 +1089,37 @@ class TestParseDecisionDict:
         assert result.action == 'drop'
         assert result.batch_target_index == 2
 
+    def test_parse_decision_dict_non_numeric_batch_target_index_does_not_raise(self):
+        """A schema-drifted batch_target_index (e.g. 'foo') must not raise
+        ValueError out of the single-item path; it should degrade to None so
+        the parser's "invalid field → create" contract holds."""
+        pool = _pool_with_ids(('10', 'pending'))
+        # Non-numeric string → int() would raise ValueError; coercion must
+        # swallow that and fall through to a safe create.
+        result = self._call(
+            {
+                'action': 'create',
+                'batch_target_index': 'foo',
+                'justification': 'normal work',
+            },
+            pool,
+        )
+        assert result.action == 'create'
+        assert result.batch_target_index is None
+
+    def test_parse_decision_dict_float_batch_target_index_coerces(self):
+        """float-as-string should also not raise — fall back to None."""
+        result = self._call(
+            {
+                'action': 'create',
+                'batch_target_index': '1.5',
+                'justification': 'x',
+            },
+            pool=[],
+        )
+        assert result.action == 'create'
+        assert result.batch_target_index is None
+
 
 # ----------------------------------------------------------------------
 # _parse_batch_decisions
