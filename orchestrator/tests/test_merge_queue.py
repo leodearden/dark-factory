@@ -324,6 +324,84 @@ class TestCheckPlanTargetsInTree:
         )
         assert missing == ['dropped.py']
 
+    async def test_real_conflict_resolution_drop_is_flagged(
+        self, git_ops: GitOps,
+    ):
+        """Genuine conflict-time drop (file removed during resolution) → flagged.
+
+        Complements ``test_plan_target_on_head_dropped_by_merge_is_flagged``
+        which synthesises the detector input from a pre-drop task commit.
+        Here we build an actual merge commit produced by resolving a
+        real conflict via `git rm`, which is the failure mode the guard
+        was originally designed to catch.
+        """
+        # Task branch: adds contested.py + other.py
+        worktree = (await git_ops.create_worktree('real-conflict-drop')).path
+        (worktree / 'contested.py').write_text('task_version = 1\n')
+        (worktree / 'other.py').write_text('other = 1\n')
+        await git_ops.commit(worktree, 'Task: add contested + other')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t2d', 'T2d', 'desc')
+        artifacts.write_plan({
+            'files': ['contested.py', 'other.py'],
+            'modules': [],
+            'steps': [],
+        })
+
+        # Main: independently add contested.py with different content →
+        # guaranteed conflict when task branch is merged in.
+        (git_ops.project_root / 'contested.py').write_text(
+            'main_version = 1\n'
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Main: add contested'],
+            cwd=git_ops.project_root,
+        )
+
+        # Manually build a merge commit that resolves the conflict by
+        # dropping contested.py — emulating a human (or LLM) resolving
+        # the merge by removing the contested file entirely.
+        merge_wt = (
+            git_ops.worktree_base / '_real-merge'
+        )
+        await _run(
+            ['git', 'worktree', 'add', '--detach', str(merge_wt), 'main'],
+            cwd=git_ops.project_root,
+        )
+        try:
+            rc, out, err = await _run(
+                ['git', 'merge', '--no-ff', '--no-commit', 'task/real-conflict-drop'],
+                cwd=merge_wt,
+            )
+            # Expect a real conflict
+            assert 'CONFLICT' in out or 'CONFLICT' in err, (
+                f'Expected conflict; got rc={rc} out={out!r} err={err!r}'
+            )
+            # Resolve by dropping contested.py entirely
+            await _run(['git', 'rm', '-f', 'contested.py'], cwd=merge_wt)
+            rc, _, err = await _run(
+                ['git', 'commit', '--no-edit'], cwd=merge_wt,
+            )
+            assert rc == 0, f'merge commit failed: {err}'
+            _, merge_sha, _ = await _run(
+                ['git', 'rev-parse', 'HEAD'], cwd=merge_wt,
+            )
+            merge_sha = merge_sha.strip()
+
+            # Detector must flag contested.py (on task HEAD, absent from merge)
+            # but leave other.py (present on both) alone.
+            missing = await _check_plan_targets_in_tree(
+                merge_sha, worktree, git_ops,
+            )
+            assert missing == ['contested.py']
+        finally:
+            await _run(
+                ['git', 'worktree', 'remove', str(merge_wt), '--force'],
+                cwd=git_ops.project_root,
+            )
+
     async def test_no_plan_json_returns_empty(
         self, git_ops: GitOps,
     ):
@@ -459,6 +537,71 @@ class TestMergeWorker:
             cwd=git_ops.project_root,
         )
         assert 'kept.py' not in main_files
+
+        await worker.stop()
+        worker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker_task
+
+    async def test_blocks_when_merge_drops_plan_target_real_detector(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """MergeWorker drives the real detector and blocks on a synthesised drop.
+
+        Companion to ``test_blocks_when_merge_drops_plan_target``: that test
+        mocks the detector to pin the reason-text contract; this one leaves
+        the detector in place and mocks ``git_ops.merge_to_main`` so a
+        future refactor of the wiring (argument order, return-value
+        interpretation) cannot pass both tests while silently breaking the
+        guard in production.
+        """
+        worktree = (await git_ops.create_worktree('drop-guard-real')).path
+        (worktree / 'retained.py').write_text('retained = 1\n')
+        await git_ops.commit(worktree, 'Add retained')
+        rc, pre_drop_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
+        )
+        assert rc == 0
+        pre_drop_sha = pre_drop_sha.strip()
+
+        (worktree / 'dropped.py').write_text('dropped = 1\n')
+        await git_ops.commit(worktree, 'Add dropped')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('drop-guard-real', 'Drop guard real', 'desc')
+        artifacts.write_plan({
+            'files': ['retained.py', 'dropped.py'],
+            'modules': [],
+            'steps': [],
+        })
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        # Point the "merge commit" at a task-branch SHA that predates the
+        # addition of dropped.py. The real detector sees dropped.py on task
+        # HEAD but absent from that tree → flags it as a drop.
+        async def _fake_merge_to_main(*_args: Any, **_kwargs: Any) -> MergeResult:
+            return MergeResult(
+                success=True,
+                merge_commit=pre_drop_sha,
+                pre_merge_sha=pre_drop_sha,
+                merge_worktree=None,
+            )
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass(),
+        ), patch.object(git_ops, 'merge_to_main', _fake_merge_to_main):
+            req = _make_request(
+                'drop-guard-real', 'drop-guard-real', worktree, config,
+            )
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked'
+        assert 'dropped.py' in outcome.reason
+        assert 'plan target' in outcome.reason.lower()
 
         await worker.stop()
         worker_task.cancel()

@@ -61,11 +61,25 @@ async def _check_plan_targets_in_tree(
     if not files:
         return []
 
-    rc_head, task_head_out, _ = await _run(
+    rc_head, task_head_out, head_err = await _run(
         ['git', 'rev-parse', 'HEAD'],
         cwd=task_worktree,
     )
-    task_head = task_head_out.strip() if rc_head == 0 else ''
+    if rc_head == 0:
+        task_head = task_head_out.strip()
+    else:
+        # rev-parse HEAD on a valid worktree essentially always succeeds;
+        # a non-zero rc signals an unexpected problem (corrupt worktree,
+        # detached state with no HEAD). Log visibly so regressions surface
+        # in operations rather than as mystery false positives — with an
+        # empty task_head the loop below falls back to the pre-narrow
+        # behaviour of flagging every missing planned file as a drop.
+        logger.warning(
+            'drop-guard: git rev-parse HEAD failed in %s (rc=%d, stderr=%s); '
+            'falling back to flag-every-missing behaviour.',
+            task_worktree, rc_head, head_err.strip(),
+        )
+        task_head = ''
 
     missing: list[str] = []
     for f in files:
