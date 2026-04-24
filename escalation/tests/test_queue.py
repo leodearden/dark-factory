@@ -759,6 +759,73 @@ class TestGetByTaskDedupAcrossArchive:
         )
 
 
+    def test_get_by_task_per_call_dedup_logs_at_debug_not_warning(
+        self, tmp_path: Path, caplog,
+    ):
+        """Per-call dedup message is logged at DEBUG, NOT WARNING.
+
+        Locks in amend b89a8fae80's WARNING→DEBUG demotion of the per-call dedup
+        log path.  A regression restoring it to WARNING would be caught here.
+
+        Setup: both queue_dir root AND archive/2025-06-15/ hold a resolved
+        esc-42-1 (cross-tier duplicate).  With status='resolved', both copies
+        pass the status filter, so the second one (archive copy) hits the `seen`
+        dedup branch and the per-call debug message fires.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Cross-tier: resolved copy in queue_dir root (wins by iteration order)
+        queue_dir_copy = _make_escalation('esc-42-1', task_id='42', status='resolved')
+        queue_dir_copy.resolution = 'queue_dir_copy'
+        (queue.queue_dir / 'esc-42-1.json').write_text(queue_dir_copy.to_json())
+
+        # Resolved copy in archive (will be deduped; triggers per-call debug log)
+        archive_dir = queue.queue_dir / 'archive' / '2025-06-15'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_copy = _make_escalation('esc-42-1', task_id='42', status='resolved')
+        archive_copy.resolution = 'archive_copy'
+        (archive_dir / 'esc-42-1.json').write_text(archive_copy.to_json())
+
+        with caplog.at_level(logging.DEBUG, logger='escalation.queue'):
+            results = queue.get_by_task('42', status='resolved')
+
+        # (a) Exactly one result — dedup still works; queue_dir copy wins
+        assert len(results) == 1, (
+            f'Expected exactly 1 result (deduped), got {len(results)}'
+        )
+        assert results[0].resolution == 'queue_dir_copy', (
+            f"Expected queue_dir copy to win, got {results[0].resolution!r}"
+        )
+
+        # (b) At least one DEBUG record mentions 'Duplicate escalation id' and esc-42-1
+        debug_dedup_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue'
+            and r.levelno == logging.DEBUG
+            and 'Duplicate escalation id' in r.message
+            and 'esc-42-1' in r.message
+        ]
+        assert debug_dedup_records, (
+            "Expected at least one DEBUG record with 'Duplicate escalation id' "
+            f"mentioning esc-42-1, but got none. All records: "
+            f"{[(r.levelno, r.message) for r in caplog.records if r.name == 'escalation.queue']}"
+        )
+
+        # (c) No per-call dedup message at WARNING level
+        #     ('Duplicate escalation id' is the unique substring for the per-call path,
+        #     distinct from the pre-scan's "exists in both queue_dir and archive" wording)
+        warning_dedup_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue'
+            and r.levelno == logging.WARNING
+            and 'Duplicate escalation id' in r.message
+        ]
+        assert warning_dedup_records == [], (
+            "Per-call dedup must log at DEBUG, not WARNING. "
+            f"Found WARNING records: {[r.message for r in warning_dedup_records]}"
+        )
+
+
 class TestGetPendingParseFailure:
     """get_pending() must emit a WARNING when a queue file cannot be parsed."""
 
