@@ -2,13 +2,16 @@
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import signal
+import socket
 import sys
 import threading
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
 
@@ -44,6 +47,164 @@ logger = logging.getLogger(__name__)
 # Maximum seconds to wait for harness_loop_task to honour cancellation before
 # giving up and continuing with the rest of the shutdown sequence.
 _HARNESS_CANCEL_TIMEOUT = 25.0
+
+# Per-step cleanup budget inside _graceful_shutdown. Harness step uses
+# _HARNESS_CANCEL_TIMEOUT instead; all other steps are capped by this.
+_CLEANUP_STEP_TIMEOUT = 5.0
+
+# Total wall-clock budget between _graceful_shutdown starting and a hard
+# os._exit(1) firing from a background thread. Must exceed the sum of per-step
+# timeouts plus headroom so clean shutdowns never trip it.
+_FORCE_EXIT_BUDGET = 45.0
+
+# systemd watchdog heartbeat interval. Must be comfortably less than
+# WatchdogSec in the unit file (we use 30s there) so a single missed tick
+# doesn't trigger a restart.
+_WATCHDOG_INTERVAL = 10.0
+
+
+def _sd_notify(state: str) -> None:
+    """Send a single message to systemd's notify socket (no-op if unset).
+
+    Implements the sd_notify protocol directly so we don't need a
+    python-systemd / cysystemd dependency. Silent on failure: systemd
+    integration is advisory and must never break local-dev runs.
+    """
+    addr = os.environ.get('NOTIFY_SOCKET')
+    if not addr:
+        return
+    # Abstract-namespace sockets are advertised with a leading "@".
+    if addr.startswith('@'):
+        addr = '\0' + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.sendto(state.encode('utf-8'), addr)
+    except OSError:
+        logger.exception('sd_notify failed (state=%s)', state)
+
+
+_shutdown_watchdog: threading.Timer | None = None
+
+
+def _arm_force_exit(budget_secs: float = _FORCE_EXIT_BUDGET) -> None:
+    """Start a daemon timer that hard-exits the process after `budget_secs`.
+
+    Idempotent. Runs in a separate OS thread so it fires even if the asyncio
+    loop is wedged or deadlocked. Covers the case where _graceful_shutdown
+    hangs or non-daemon third-party threads (e.g. mem0 PostHog consumers)
+    keep the interpreter alive after asyncio.run() returns.
+    """
+    global _shutdown_watchdog
+    if _shutdown_watchdog is not None:
+        return
+
+    def _force_exit() -> None:
+        # Write directly to stderr — logger may already be torn down.
+        sys.stderr.write(
+            f'[fused-memory] shutdown watchdog fired after {budget_secs}s — os._exit(1)\n'
+        )
+        sys.stderr.flush()
+        os._exit(1)
+
+    t = threading.Timer(budget_secs, _force_exit)
+    t.daemon = True
+    t.start()
+    _shutdown_watchdog = t
+
+
+def _cancel_force_exit() -> None:
+    """Cancel the force-exit watchdog (call after clean asyncio.run exit)."""
+    global _shutdown_watchdog
+    if _shutdown_watchdog is not None:
+        _shutdown_watchdog.cancel()
+        _shutdown_watchdog = None
+
+
+async def _run_shielded(
+    name: str,
+    coro_factory: Callable[[], Awaitable[Any]],
+    timeout: float = _CLEANUP_STEP_TIMEOUT,
+) -> None:
+    """Run a single cleanup step with asyncio.shield + bounded timeout.
+
+    `coro_factory` is a zero-arg callable that returns the coroutine to run.
+    Shielding decouples the cleanup task from the caller's cancellation, so
+    cleanup actually makes progress even when _graceful_shutdown itself is
+    running inside a cancelled task. If the step exceeds `timeout`, we log
+    and move on — the force-exit watchdog is the backstop.
+    """
+    try:
+        await asyncio.wait_for(asyncio.shield(coro_factory()), timeout=timeout)
+    except TimeoutError:
+        logger.warning('_graceful_shutdown: %s timed out after %.1fs', name, timeout)
+    except asyncio.CancelledError:
+        # Caller was cancelled. The shielded task keeps running in the
+        # background; we log and move on so subsequent steps still fire.
+        logger.warning('_graceful_shutdown: %s cancelled (shielded task continues)', name)
+    except Exception:
+        logger.exception('_graceful_shutdown: %s raised', name)
+
+
+class _ASGIExceptionShield:
+    """ASGI middleware that contains BaseException escapes from the MCP app.
+
+    Wraps mcp.streamable_http_app() so unhandled exceptions inside a request
+    (including CancelledError from client disconnect, BaseExceptionGroup from
+    anyio, etc.) cannot reach the StreamableHTTPSessionManager's shared task
+    group. This is the direct defence against the 2026-04-23 wedge, where a
+    client-disconnect CancelledError poisoned the shared task group and
+    cascaded into uvicorn's main_loop.
+
+    Trade-off: we swallow CancelledError at this boundary to break the
+    cascade. That deviates from textbook asyncio semantics but is the only
+    way to keep the server up when the MCP SDK's own except-Exception guard
+    lets a BaseException through. KeyboardInterrupt/SystemExit are always
+    re-raised so legitimate interpreter shutdown still works.
+    """
+
+    _RESPONSE_START = {
+        'type': 'http.response.start',
+        'status': 500,
+        'headers': [(b'content-type', b'application/json')],
+    }
+    _RESPONSE_BODY = {
+        'type': 'http.response.body',
+        'body': b'{"error":"Internal Server Error"}',
+    }
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
+        if scope.get('type') != 'http':
+            # lifespan / websocket — pass through untouched.
+            await self.app(scope, receive, send)
+            return
+        response_started = False
+
+        async def _tracking_send(message: dict) -> None:
+            nonlocal response_started
+            if message.get('type') == 'http.response.start':
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, _tracking_send)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            logger.exception(
+                'MCP request failed (%s); emitting 500 and suppressing cascade',
+                type(exc).__name__,
+            )
+            if not response_started:
+                with contextlib.suppress(Exception):
+                    await send(self._RESPONSE_START)
+                    await send(self._RESPONSE_BODY)
+            # Deliberate: do NOT re-raise. Letting CancelledError or any
+            # other BaseException escape here is exactly what wedged the
+            # server overnight.
+            return
 
 
 def configure_uvicorn_logging():
@@ -340,6 +501,7 @@ async def run_server():
     transport = config.server.transport
     logger.info(f'Starting MCP server with transport: {transport}')
 
+    watchdog_task: asyncio.Task[None] | None = None
     try:
         if transport == 'stdio':
             await mcp.run_stdio_async()
@@ -364,18 +526,38 @@ async def run_server():
                 return JSONResponse({'error': exc.detail}, status_code=exc.status_code)
 
             starlette_app.add_exception_handler(HTTPException, _json_http_error)  # type: ignore[arg-type]
+
+            # Outermost ASGI layer: catches any BaseException escaping the
+            # MCP app before it can poison the SDK's shared task group.
+            shielded_app = _ASGIExceptionShield(starlette_app)
+
             uv_config = uvicorn.Config(
-                starlette_app,
+                shielded_app,
                 host=config.server.host,
                 port=config.server.port,
                 log_level='info',
                 timeout_keep_alive=config.server.keepalive_timeout,
             )
             server = uvicorn.Server(uv_config)
+
+            # Systemd watchdog heartbeat: ping every _WATCHDOG_INTERVAL so a
+            # wedged asyncio loop (no ticks) triggers a restart via
+            # WatchdogSec in the unit file. No-op when NOTIFY_SOCKET unset.
+            async def _watchdog_heartbeat() -> None:
+                while True:
+                    _sd_notify('WATCHDOG=1')
+                    await asyncio.sleep(_WATCHDOG_INTERVAL)
+
+            watchdog_task = asyncio.create_task(_watchdog_heartbeat())
+            _sd_notify('READY=1')
             await server.serve()
         else:
             raise ValueError(f'Unsupported transport: {transport}')
     finally:
+        if watchdog_task is not None:
+            watchdog_task.cancel()
+            with contextlib.suppress(BaseException):
+                await watchdog_task
         await _graceful_shutdown(
             memory_service=memory_service,
             task_interceptor=task_interceptor,
@@ -461,52 +643,42 @@ async def _graceful_shutdown(
     6. Close memory_service (backends, durable queue, write journal, event buffer).
     7. Close reconciliation journal (separate SQLite connection).
 
-    Each step is independently guarded so a failure in one step does not
-    prevent subsequent steps from running.
+    Each step runs under asyncio.shield with a bounded timeout so cleanup
+    makes progress even when this coroutine itself is being cancelled, and
+    one stuck step can't starve the rest. A force-exit watchdog armed at
+    entry guarantees the process dies if cleanup hangs past the total
+    budget — systemd then restarts the unit.
     """
+    _arm_force_exit()
+    _sd_notify('STOPPING=1')
+
     if task_interceptor is not None:
-        try:
-            await task_interceptor.drain()
-        except Exception:
-            logger.exception('_graceful_shutdown: error draining task_interceptor')
-        try:
-            await task_interceptor.close()
-        except Exception:
-            logger.exception('_graceful_shutdown: error closing task_interceptor')
+        await _run_shielded('task_interceptor.drain', task_interceptor.drain)
+        await _run_shielded('task_interceptor.close', task_interceptor.close)
 
     if sqlite_watchdog is not None:
-        try:
-            await sqlite_watchdog.close()
-        except Exception:
-            logger.exception('_graceful_shutdown: error closing sqlite_watchdog')
+        await _run_shielded('sqlite_watchdog.close', sqlite_watchdog.close)
 
     if event_queue is not None:
-        try:
-            await event_queue.close()
-        except Exception:
-            logger.exception('_graceful_shutdown: error closing event_queue')
+        await _run_shielded('event_queue.close', event_queue.close)
 
     if harness_loop_task is not None:
-        try:
-            harness_loop_task.cancel()
-            await asyncio.wait_for(harness_loop_task, timeout=_HARNESS_CANCEL_TIMEOUT)
-        except asyncio.CancelledError:
-            pass
-        except TimeoutError:
-            logger.warning('_graceful_shutdown: harness_loop_task timed out during cancellation')
-        except Exception:
-            logger.exception('_graceful_shutdown: unexpected error from harness_loop_task')
+        harness_loop_task.cancel()
 
-    try:
-        await memory_service.close()
-    except Exception:
-        logger.exception('_graceful_shutdown: error closing memory_service')
+        async def _await_harness() -> None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await harness_loop_task
+
+        await _run_shielded(
+            'harness_loop_task',
+            _await_harness,
+            timeout=_HARNESS_CANCEL_TIMEOUT,
+        )
+
+    await _run_shielded('memory_service.close', memory_service.close)
 
     if recon_journal is not None:
-        try:
-            await recon_journal.close()
-        except Exception:
-            logger.exception('_graceful_shutdown: error closing recon_journal')
+        await _run_shielded('recon_journal.close', recon_journal.close)
 
 
 
@@ -535,13 +707,22 @@ def _acquire_singleton_lock() -> None:
 
 def main():
     _acquire_singleton_lock()
+    exit_code = 0
     try:
         asyncio.run(run_server())
     except KeyboardInterrupt:
         logger.info('Server shutting down...')
-    except Exception as e:
-        logger.error(f'Server error: {e}')
-        raise
+    except Exception:
+        logger.exception('Server error')
+        exit_code = 1
+    finally:
+        # asyncio.run() has returned; cleanup either succeeded or the
+        # force-exit watchdog will fire. Hard-exit so non-daemon third-party
+        # threads (mem0 PostHog consumer, etc.) can't keep the interpreter
+        # alive with a dead event loop and a still-bound listen socket.
+        _cancel_force_exit()
+        sys.stderr.flush()
+        os._exit(exit_code)
 
 
 if __name__ == '__main__':

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid as uuid_mod
@@ -312,8 +313,10 @@ def create_mcp_server(
                 _source=op_source,
             )
             return result.model_dump()
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'add_episode error: {e}')
+            logger.exception(f'add_episode error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -368,8 +371,10 @@ def create_mcp_server(
                 _source=source,
             )
             return result.model_dump()
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'add_memory error: {e}')
+            logger.exception(f'add_memory error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
@@ -446,8 +451,10 @@ def create_mcp_server(
                 result_summary={'count': len(results)},
             )
             return response
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'search error: {e}')
+            logger.exception(f'search error: {e}')
             await _log_read(
                 operation='search',
                 project_id=project_id,
@@ -496,8 +503,10 @@ def create_mcp_server(
                 },
             )
             return result
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'get_entity error: {e}')
+            logger.exception(f'get_entity error: {e}')
             await _log_read(
                 operation='get_entity',
                 project_id=project_id,
@@ -551,8 +560,10 @@ def create_mcp_server(
                 result_summary={'count': len(episodes)},
             )
             return {'episodes': episodes}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'get_episodes error: {e}')
+            logger.exception(f'get_episodes error: {e}')
             await _log_read(
                 operation='get_episodes',
                 project_id=project_id,
@@ -614,8 +625,10 @@ def create_mcp_server(
                 agent_id=agent_id, session_id=session_id,
                 causation_id=causation_id, _source=source,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'delete_memory error: {e}')
+            logger.exception(f'delete_memory error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -652,8 +665,10 @@ def create_mcp_server(
                 agent_id=agent_id, session_id=session_id,
                 causation_id=causation_id, _source=source,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'delete_episode error: {e}')
+            logger.exception(f'delete_episode error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -724,8 +739,10 @@ def create_mcp_server(
                 causation_id=causation_id, _source=source,
                 invalid_at=parsed_invalid_at,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'update_edge error: {e}')
+            logger.exception(f'update_edge error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -779,8 +796,10 @@ def create_mcp_server(
                 agent_id=agent_id, session_id=session_id,
                 causation_id=causation_id, _source=source,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'refresh_entity_summary error: {e}')
+            logger.exception(f'refresh_entity_summary error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -831,8 +850,10 @@ def create_mcp_server(
                 causation_id=causation_id,
                 _source=source,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'merge_entities error: {e}')
+            logger.exception(f'merge_entities error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -879,8 +900,10 @@ def create_mcp_server(
                 causation_id=causation_id,
                 _source=source,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'rebuild_entity_summaries error: {e}')
+            logger.exception(f'rebuild_entity_summaries error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
@@ -898,8 +921,10 @@ def create_mcp_server(
         """
         try:
             return await memory_service.get_status(project_id=project_id)
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'get_status error: {e}')
+            logger.exception(f'get_status error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
@@ -931,8 +956,10 @@ def create_mcp_server(
                 limit=limit,
             )
             return {'status': 'queued', 'items_queued': count, 'project_id': project_id}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'replay_to_graphiti error: {e}')
+            logger.exception(f'replay_to_graphiti error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -944,8 +971,10 @@ def create_mcp_server(
             if memory_service.durable_queue is None:
                 return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
             return await memory_service.durable_queue.get_stats()
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'get_queue_stats error: {e}')
+            logger.exception(f'get_queue_stats error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -966,8 +995,10 @@ def create_mcp_server(
                 return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
             count = await memory_service.durable_queue.replay_dead(group_id=project_id)
             return {'status': 'replayed', 'items_reset': count}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'replay_dead_letters error: {e}')
+            logger.exception(f'replay_dead_letters error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------
@@ -998,8 +1029,10 @@ def create_mcp_server(
                 'project_id': project_id,
                 'message': 'Reconciliation will trigger within ~5 seconds',
             }
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'trigger_reconciliation error: {e}')
+            logger.exception(f'trigger_reconciliation error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -1103,8 +1136,10 @@ def create_mcp_server(
         project_root = _normalized
         try:
             return await task_interceptor.get_tasks(project_root=project_root, tag=tag)
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'get_tasks error: {e}')
+            logger.exception(f'get_tasks error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -1128,8 +1163,10 @@ def create_mcp_server(
             return await task_interceptor.get_task(
                 task_id=id, project_root=project_root, tag=tag
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'get_task error: {e}')
+            logger.exception(f'get_task error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -1190,8 +1227,10 @@ def create_mcp_server(
                 done_provenance=done_provenance,
                 reopen_reason=reopen_reason,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'set_task_status error: {e}')
+            logger.exception(f'set_task_status error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -1243,8 +1282,10 @@ def create_mcp_server(
                 metadata=metadata,
                 tag=tag,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'add_task error: {e}')
+            logger.exception(f'add_task error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -1386,8 +1427,10 @@ def create_mcp_server(
                 append=append,
                 tag=tag,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'update_task error: {e}')
+            logger.exception(f'update_task error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -1424,8 +1467,10 @@ def create_mcp_server(
                 details=details,
                 tag=tag,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'add_subtask error: {e}')
+            logger.exception(f'add_subtask error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -1451,8 +1496,10 @@ def create_mcp_server(
             return await task_interceptor.remove_task(
                 task_id=id, project_root=project_root, tag=tag
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'remove_task error: {e}')
+            logger.exception(f'remove_task error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -1485,8 +1532,10 @@ def create_mcp_server(
                 project_root=project_root,
                 tag=tag,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'add_dependency error: {e}')
+            logger.exception(f'add_dependency error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -1519,8 +1568,10 @@ def create_mcp_server(
                 project_root=project_root,
                 tag=tag,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'remove_dependency error: {e}')
+            logger.exception(f'remove_dependency error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -1555,8 +1606,10 @@ def create_mcp_server(
                 force=force,
                 tag=tag,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'expand_task error: {e}')
+            logger.exception(f'expand_task error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
@@ -1585,8 +1638,10 @@ def create_mcp_server(
                 num_tasks=num_tasks,
                 tag=tag,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            logger.error(f'parse_prd error: {e}')
+            logger.exception(f'parse_prd error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     return mcp
