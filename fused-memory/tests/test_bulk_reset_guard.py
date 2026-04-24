@@ -49,6 +49,32 @@ def test_reconciliation_config_bulk_reset_guard_defaults():
 
 
 # ---------------------------------------------------------------------------
+# step-2b: BulkResetGuard constructor accepts split thresholds
+# ---------------------------------------------------------------------------
+
+def test_guard_constructor_accepts_split_thresholds(tmp_path):
+    """BulkResetGuard must accept done_threshold/in_progress_threshold kwargs.
+
+    (a) The new signature constructs without error.
+    (b) The legacy ``threshold=`` kwarg raises TypeError — it is no longer
+        accepted so callers cannot silently wire only one counter.
+    """
+    # (a) New split-threshold signature succeeds.
+    guard = BulkResetGuard(
+        done_threshold=10,
+        in_progress_threshold=100,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        escalations_fallback_dir=tmp_path,
+    )
+    assert guard is not None
+
+    # (b) Legacy ``threshold=`` kwarg must be rejected.
+    with pytest.raises(TypeError, match="threshold"):
+        BulkResetGuard(threshold=10, window_seconds=60.0)
+
+
+# ---------------------------------------------------------------------------
 # step-3: observe_attempt returns ok for all calls under threshold
 # ---------------------------------------------------------------------------
 
