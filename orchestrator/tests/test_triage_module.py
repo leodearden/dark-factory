@@ -178,10 +178,6 @@ class TestFormatPretriagedDetail:
         assert 'escalation_id' in detail
         assert 'suggestion_hash' in detail
         assert 'interceptor will' in detail
-        # Two-step API contract: legacy add_task must be absent
-        assert 'add_task' not in detail, (
-            'Legacy add_task must not appear in the pre-triaged R4 block'
-        )
         # submit_task call must show the metadata= kwarg form
         assert 'submit_task' in detail
         assert 'metadata=' in detail

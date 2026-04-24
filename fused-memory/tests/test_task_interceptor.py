@@ -1197,6 +1197,13 @@ async def test_idempotency_hit_via_submit_task_direct(
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await _wt
 
+    # Guard: fail loudly if the worker timed out instead of resolving via R4,
+    # so a future regression where the R4 gate is bypassed surfaces as
+    # 'timed out waiting for worker' rather than an opaque 'combined' mismatch.
+    assert result.get('reason') != 'timeout', (
+        f'Worker timed out before returning R4 decision — possible regression '
+        f'where R4 gate is bypassed or worker stalled: {result!r}'
+    )
     assert result.get('status') == 'combined', (
         f"resolve_ticket should return status='combined' on R4 hit, got {result!r}"
     )
@@ -2553,12 +2560,10 @@ async def test_two_projects_do_not_serialise(
             # without relying on event-loop scheduling timing.
             if key == resolve_project_id('/projA'):
                 projA_entered.set()
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(projB_entered.wait(), timeout=10.0)
+                await asyncio.wait_for(projB_entered.wait(), timeout=10.0)
             else:
                 projB_entered.set()
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(projA_entered.wait(), timeout=10.0)
+                await asyncio.wait_for(projA_entered.wait(), timeout=10.0)
             return {'id': '1', 'title': kwargs.get('title', '')}
         finally:
             tracker.in_flight[key] -= 1
