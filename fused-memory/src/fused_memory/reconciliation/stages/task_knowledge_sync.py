@@ -119,7 +119,7 @@ class TaskKnowledgeSync(BaseStage):
                 f'{format_task_list(sample)}\n'
             )
 
-        flagged_text, stage1_render_count = _format_flagged(
+        flagged_text = _format_flagged(
             stage1_report.items_flagged if stage1_report else [],
             run_stage='stage2',
         )
@@ -243,7 +243,7 @@ class IntegrityCheck(BaseStage):
         if stage2_report:
             flagged.extend(stage2_report.items_flagged)
 
-        flagged_text, _ = _format_flagged(flagged, run_stage='stage3')
+        flagged_text = _format_flagged(flagged, run_stage='stage3')
 
         return f"""## Stage 3: Cross-System Integrity Check
 ## Project: {self.project_id}
@@ -291,12 +291,13 @@ def _format_flagged(
     *,
     budget_chars: int = _FLAGGED_ITEMS_CHAR_BUDGET,
     run_stage: str | None = None,
-) -> tuple[str, int]:
+) -> str:
     """Render flagged items as a bullet list, capped by *budget_chars*.
 
-    Returns ``(text, rendered_count)`` where *rendered_count* is the number of
-    items whose JSON appears IN FULL (not fragmented) in *text*.  Emits a
-    single structured ``logger.warning`` when the budget truncates items.
+    Returns the rendered bullet-list text.  The per-render breakdown
+    (``rendered``, ``dropped``, ``first_item_fragmented``) is emitted in the
+    structured warning's ``extra`` when truncation fires — callers that need
+    telemetry should read it from the warning record, not the return value.
 
     When *run_stage* is provided it is embedded in the warning's ``extra`` dict
     so ops can correlate the drop to its call site without a separate
@@ -305,12 +306,12 @@ def _format_flagged(
     Edge case: if the very first item's JSON alone exceeds *budget_chars*, a
     truncated fragment is always rendered (with a ``… [item truncated]`` marker)
     so the LLM receives at least some signal rather than an opaque footer-only
-    body.  In this case *rendered_count* remains 0 (the fragment is not a full
-    render) and the warning's ``extra`` includes ``first_item_fragmented=True``
-    so callers/telemetry can distinguish fragmented-first-item from all-dropped.
+    body.  ``rendered`` stays 0 (the fragment is not a full render) and the
+    warning's ``extra`` includes ``first_item_fragmented=True`` so
+    callers/telemetry can distinguish fragmented-first-item from all-dropped.
     """
     if not items:
-        return ('No flagged items.', 0)
+        return 'No flagged items.'
     lines: list[str] = []
     running_chars = 0
     rendered_count = 0
@@ -347,11 +348,11 @@ def _format_flagged(
             if run_stage is not None:
                 extra['run_stage'] = run_stage
             logger.warning('reconciliation.flagged_items_truncated', extra=extra)
-            return ('\n'.join(lines), rendered_count)
+            return '\n'.join(lines)
         lines.append(line)
         running_chars += separator + len(line)
         rendered_count += 1
-    return ('\n'.join(lines), rendered_count)
+    return '\n'.join(lines)
 
 
 async def _render_done_provenance_section(
