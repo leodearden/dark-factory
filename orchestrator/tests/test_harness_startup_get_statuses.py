@@ -179,3 +179,53 @@ async def test_populate_prd_uses_get_statuses_for_pre_ids(
     assert captured_pre_ids == {'10', '20'}
     # After migration: get_tasks NOT called for the pre_ids snapshot.
     h.scheduler.get_tasks.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Transport-failure vs genuinely-empty distinction (Task 1010)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_startup_noprd_transport_failure_raises_distinct_error(
+    startup_harness: Harness,
+):
+    """No-PRD startup: a get_statuses transport failure raises a distinct error.
+
+    When get_statuses returns {} AND _last_get_statuses_error is set, Harness
+    must raise RuntimeError('Failed to reach fused-memory: …') chained from
+    the original exception — NOT the generic 'No PRD given' message.
+    """
+    h = startup_harness
+    # Simulate: get_statuses swallowed a transport error and cached it.
+    h.scheduler.get_statuses = AsyncMock(return_value={})
+    h.scheduler._last_get_statuses_error = OSError(2, 'No such file')
+
+    with pytest.raises(RuntimeError, match=r'[Ff]ailed to reach fused-memory') as excinfo:
+        await h.run(prd_path=None)
+
+    msg = str(excinfo.value)
+    # Error message must include the exception class name and the message.
+    assert 'OSError' in msg, f'Expected OSError class name in message: {msg}'
+    assert 'No such file' in msg, f'Expected OSError message in error: {msg}'
+
+    # Exception must be chained from the original OSError.
+    assert excinfo.value.__cause__ is h.scheduler._last_get_statuses_error
+
+
+@pytest.mark.asyncio
+async def test_startup_noprd_empty_without_cached_error_raises_legitimate_error(
+    startup_harness: Harness,
+):
+    """No-PRD startup: genuinely empty task tree still raises the original error.
+
+    When get_statuses returns {} AND _last_get_statuses_error is None (no
+    transport failure), the existing 'No PRD given and no pending tasks found'
+    RuntimeError is raised unchanged — regression protection for the
+    legitimately-empty path.
+    """
+    h = startup_harness
+    h.scheduler.get_statuses = AsyncMock(return_value={})
+    h.scheduler._last_get_statuses_error = None
+
+    with pytest.raises(RuntimeError, match='No PRD given and no pending tasks found'):
+        await h.run(prd_path=None)
