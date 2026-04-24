@@ -1720,6 +1720,27 @@ class TestClassifyAgentFailure:
 class TestBuildFailureMessage:
     """Tests for the build_failure_message formatting helper."""
 
+    def test_build_failure_message_format_is_hardcoded_literal(self):
+        """Full format pinned as a static literal — NOT derived from classify_agent_failure."""
+        result = AgentResult(
+            success=False, output='', subtype='error_max_turns', turns=75,
+        )
+        msg = build_failure_message('Claude CLI agent', result)
+        expected = (
+            "Claude CLI agent failed: agent hit max_turns (75 turns, output_tokens=None)\n"
+            "subtype='error_max_turns'\n"
+            "turns=75\n"
+            "cost_usd=0.0\n"
+            "duration_ms=0\n"
+            "timed_out=False\n"
+            "api_error_status=None\n"
+            "len(output)=0\n"
+            "output (last 500 chars):\n"
+            "\n"
+            "stderr (last 500 chars):\n"
+        )
+        assert msg == expected
+
     def test_build_failure_message_format(self):
         """build_failure_message returns exactly 'label failed: summary\\ndiagnostic_detail'."""
         result = AgentResult(
