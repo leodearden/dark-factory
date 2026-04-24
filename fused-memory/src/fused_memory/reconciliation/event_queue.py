@@ -26,6 +26,7 @@ import os
 import random
 import time
 from collections import deque
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -37,6 +38,66 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
 
 logger = logging.getLogger(__name__)
+
+
+def _iter_lines_reversed(
+    path: Path,
+    chunk_size: int = 8192,
+    max_line_bytes: int = 1_048_576,
+) -> Iterator[str]:
+    """Yield lines from *path* newest-first without materialising the whole file.
+
+    Opens *path* in binary mode, seeks to the end, and walks backward in
+    *chunk_size* chunks, stitching partial lines across chunk boundaries.
+    Decodes each line as UTF-8 with ``errors='replace'`` so malformed bytes
+    pass through rather than raising — the ``json.JSONDecodeError`` path in
+    :meth:`EventQueue.read_dead_letters` handles them gracefully.
+
+    Empty lines are yielded as-is; callers should strip and skip blank lines.
+
+    Args:
+        path: Path to the JSONL file.
+        chunk_size: Read granularity in bytes (default 8 KiB).
+        max_line_bytes: Safety cap on the internal carry buffer.  When a
+            partial-line fragment exceeds this threshold (e.g. from a
+            corrupted file or a rogue writer), the accumulated bytes are
+            yielded immediately with a warning so the downstream
+            ``json.loads`` call treats them as a malformed line and skips
+            them.  Defaults to 1 MiB.
+
+    Raises:
+        OSError: If the file cannot be opened or read.  Callers should catch
+            and log.
+    """
+    with path.open('rb') as f:
+        remaining = f.seek(0, 2)
+        carry = b''
+        while remaining > 0:
+            to_read = min(chunk_size, remaining)
+            remaining -= to_read
+            f.seek(remaining)
+            chunk = f.read(to_read)
+            # Prepend older bytes to the fragment accumulated from the right.
+            data = chunk + carry
+            lines = data.split(b'\n')
+            # lines[0]  — leftmost fragment; may extend further left in the file.
+            # lines[1:] — complete lines (each starts after a '\n' boundary).
+            carry = lines[0]
+            if len(carry) > max_line_bytes:
+                logger.warning(
+                    '_iter_lines_reversed: carry buffer exceeded %d bytes in %s; '
+                    'yielding truncated fragment as malformed — downstream '
+                    'json.loads will skip it',
+                    max_line_bytes, path,
+                )
+                yield carry.decode('utf-8', errors='replace')
+                carry = b''
+            for line in reversed(lines[1:]):
+                yield line.decode('utf-8', errors='replace')
+        # Yield the oldest fragment (the first line in the file, which has no
+        # preceding '\n' so it stays in carry after the loop).
+        if carry:
+            yield carry.decode('utf-8', errors='replace')
 
 
 class EventQueue:
@@ -394,36 +455,34 @@ class EventQueue:
                 if not path.exists():
                     continue
                 try:
-                    lines = path.read_text(encoding='utf-8').splitlines()
+                    # Stream lines newest-first without materialising the file.
+                    for line in _iter_lines_reversed(path):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError as exc:
+                            logger.warning(
+                                'EventQueue.read_dead_letters: malformed line in %s: %s',
+                                path, exc,
+                            )
+                            continue
+
+                        # Filter by project_id if requested.
+                        if project_id is not None:
+                            event = rec.get('event') or {}
+                            if event.get('project_id') != project_id:
+                                continue
+
+                        results.append(rec)
+                        if limit is not None and len(results) >= limit:
+                            return results
                 except OSError as exc:
                     logger.warning(
                         'EventQueue.read_dead_letters: cannot read %s: %s', path, exc,
                     )
                     continue
-
-                # Reverse so newest (last-appended) lines come first.
-                for line in reversed(lines):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        logger.warning(
-                            'EventQueue.read_dead_letters: malformed line in %s: %s',
-                            path, exc,
-                        )
-                        continue
-
-                    # Filter by project_id if requested.
-                    if project_id is not None:
-                        event = rec.get('event') or {}
-                        if event.get('project_id') != project_id:
-                            continue
-
-                    results.append(rec)
-                    if limit is not None and len(results) >= limit:
-                        return results
 
         except Exception as exc:
             logger.warning(

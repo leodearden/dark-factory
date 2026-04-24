@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pathlib
 import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
@@ -634,3 +635,151 @@ async def test_read_dead_letters_tolerates_malformed_line(tmp_path):
     # Must not raise, must return the 1 valid record (malformed line skipped).
     records = q.read_dead_letters()
     assert len(records) == 1
+
+
+@pytest.mark.asyncio
+async def test_read_dead_letters_streams_without_loading_whole_files(tmp_path, monkeypatch):
+    """Streaming implementation never calls read_text; older rotation files not opened when limit satisfied."""
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dl.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=1000,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+        max_bytes=500,
+        keep_rotations=2,
+    )
+    await q.start()
+    try:
+        for _ in range(10):
+            q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+    finally:
+        await q.close()
+
+    # Precondition: both dl.jsonl and dl.jsonl.1 must exist so the test
+    # exercises the short-circuit optimization across rotation files.
+    assert dl.exists(), 'dl.jsonl must exist (precondition)'
+    assert (tmp_path / 'dl.jsonl.1').exists(), (
+        'dl.jsonl.1 must exist after rotation (precondition)'
+    )
+
+    # Track every path opened by read_dead_letters.
+    opened_paths: list[str] = []
+    _original_open = pathlib.Path.open
+
+    def _tracking_open(self: pathlib.Path, *args, **kwargs):
+        opened_paths.append(str(self))
+        return _original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, 'open', _tracking_open)
+
+    # Patch read_text to raise — the new implementation must NOT call it.
+    # If the old implementation is still in place it will call read_text,
+    # the AssertionError is caught by the outer `except Exception` guard,
+    # and read_dead_letters returns [] — causing the len==1 assertion below
+    # to fail and clearly pinpointing the regression.
+    def _raise_on_read_text(self: pathlib.Path, *args, **kwargs):
+        raise AssertionError('read_text must not be called; use streaming open()')
+
+    monkeypatch.setattr(pathlib.Path, 'read_text', _raise_on_read_text)
+
+    result = q.read_dead_letters(limit=1)
+
+    # (1) Exactly 1 record returned — implicitly proves read_text was never called.
+    assert len(result) == 1, (
+        f'Expected 1 record; got {len(result)}. '
+        'If 0, read_text was called (raising AssertionError caught by outer guard).'
+    )
+
+    # (2) Older rotation files must not have been opened when limit is already
+    #     satisfied by the current file.
+    rotation_opens = [
+        p for p in opened_paths if 'dl.jsonl.1' in p or 'dl.jsonl.2' in p
+    ]
+    assert rotation_opens == [], (
+        f'Older rotation files should not be opened when limit is satisfied '
+        f'by the current file, but found: {rotation_opens}'
+    )
+
+
+def test_read_dead_letters_cross_file_ordering(tmp_path):
+    """Newest-first ordering holds across file boundaries (current file → rotated .1).
+
+    Writes records directly to dl.jsonl and dl.jsonl.1 with known timestamps so
+    the expected order is deterministic.  The current file (dl.jsonl) must appear
+    before the rotated file in the results, and within each file lines must be
+    reversed (last-written = newest = first in results).
+    """
+    buf = AsyncMock()
+    dl = tmp_path / 'dl.jsonl'
+    dl_1 = tmp_path / 'dl.jsonl.1'
+
+    # Write 3 records to the rotated file (older timestamps: 2026-01-01).
+    with dl_1.open('w', encoding='utf-8') as fh:
+        for i in range(3):
+            rec = {
+                'event': {
+                    'id': f'old-{i}',
+                    'project_id': 'test-project',
+                    'timestamp': f'2026-01-01T00:00:0{i}+00:00',
+                },
+                'reason': 'test',
+                'attempts': 1,
+                'failed_at': f'2026-01-01T00:00:0{i}+00:00',
+            }
+            fh.write(json.dumps(rec) + '\n')
+
+    # Write 2 records to the current file (newer timestamps: 2026-01-02).
+    with dl.open('w', encoding='utf-8') as fh:
+        for i in range(2):
+            rec = {
+                'event': {
+                    'id': f'new-{i}',
+                    'project_id': 'test-project',
+                    'timestamp': f'2026-01-02T00:00:0{i}+00:00',
+                },
+                'reason': 'test',
+                'attempts': 1,
+                'failed_at': f'2026-01-02T00:00:0{i}+00:00',
+            }
+            fh.write(json.dumps(rec) + '\n')
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+        keep_rotations=2,
+    )
+
+    all_records = q.read_dead_letters()
+    assert len(all_records) == 5, (
+        f'Expected 5 records (2 from current + 3 from rotated); got {len(all_records)}'
+    )
+
+    ids = [r['event']['id'] for r in all_records]
+    # Current file (dl.jsonl) comes first, newest-first within the file:
+    #   wrote new-0 then new-1  →  reversed: new-1, new-0
+    # Rotated file (dl.jsonl.1) comes second, newest-first within the file:
+    #   wrote old-0, old-1, old-2  →  reversed: old-2, old-1, old-0
+    assert ids == ['new-1', 'new-0', 'old-2', 'old-1', 'old-0'], (
+        f'Expected newest-first across file boundaries, got: {ids}'
+    )
+
+    # Cross-boundary: the oldest record from the current file must be newer
+    # than the newest record from the rotated file.
+    boundary_current_oldest = all_records[1]['failed_at']   # 'new-0' → 2026-01-02T00:00:00
+    boundary_rotated_newest = all_records[2]['failed_at']   # 'old-2' → 2026-01-01T00:00:02
+    assert boundary_current_oldest > boundary_rotated_newest, (
+        f'Cross-file boundary ordering violated: '
+        f'last current-file record ({boundary_current_oldest}) should be newer than '
+        f'first rotated-file record ({boundary_rotated_newest})'
+    )
