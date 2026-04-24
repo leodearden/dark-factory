@@ -26,6 +26,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _normalize_report,
     run_stage_via_cli,
 )
+from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
@@ -1447,6 +1448,34 @@ class TestProjectIdGuidelineConstants:
         """Stage 3 guideline must not mention resolve_ticket (Stage 3 is read-only)."""
         from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
         assert 'resolve_ticket' not in _STAGE3_PROJECT_ID_GUIDELINE
+
+
+class TestStage2SystemPromptTaskCreationSurface:
+    """STAGE2_SYSTEM_PROMPT correctly advertises the two-phase task-creation API."""
+
+    def test_stage2_prompt_includes_submit_task(self):
+        """STAGE2_SYSTEM_PROMPT must reference mcp__fused-memory__submit_task."""
+        assert 'mcp__fused-memory__submit_task' in STAGE2_SYSTEM_PROMPT
+
+    def test_stage2_prompt_includes_resolve_ticket(self):
+        """STAGE2_SYSTEM_PROMPT must reference mcp__fused-memory__resolve_ticket."""
+        assert 'mcp__fused-memory__resolve_ticket' in STAGE2_SYSTEM_PROMPT
+
+    def test_stage2_prompt_does_not_include_add_task(self):
+        """STAGE2_SYSTEM_PROMPT must not reference deprecated mcp__fused-memory__add_task."""
+        assert 'mcp__fused-memory__add_task' not in STAGE2_SYSTEM_PROMPT
+
+    def test_stage2_prompt_documents_created_status(self):
+        """STAGE2_SYSTEM_PROMPT must document the 'created' resolve_ticket status."""
+        assert 'created' in STAGE2_SYSTEM_PROMPT
+
+    def test_stage2_prompt_documents_combined_status(self):
+        """STAGE2_SYSTEM_PROMPT must document the 'combined' resolve_ticket status."""
+        assert 'combined' in STAGE2_SYSTEM_PROMPT
+
+    def test_stage2_prompt_documents_failed_status(self):
+        """STAGE2_SYSTEM_PROMPT must document the 'failed' resolve_ticket status."""
+        assert 'failed' in STAGE2_SYSTEM_PROMPT
 
 
 class TestStagePayloadProjectIdGuideline:
