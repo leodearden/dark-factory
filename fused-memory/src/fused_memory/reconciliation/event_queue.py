@@ -330,20 +330,28 @@ class EventQueue:
         ``dead_letter.jsonl``   → ``dead_letter.jsonl.1``
         ``dead_letter.jsonl.1`` → ``dead_letter.jsonl.2``
         …
-        ``dead_letter.jsonl.{keep}`` → unlinked (dropped)
+        ``dead_letter.jsonl.{keep}`` → overwritten/dropped by the cascade
 
-        Uses ``os.replace`` for atomicity.  Any single-file error is caught
-        and logged so the caller's best-effort contract is preserved.
+        When ``keep_rotations == 0``, the current file is simply unlinked so
+        the byte cap is still honoured (nothing is archived).
+
+        Uses ``os.replace`` for atomicity — it already overwrites the
+        destination on POSIX and Windows, so no pre-unlink is needed.
+        Any error is caught and logged to preserve the best-effort contract.
         """
         try:
+            if self._keep_rotations == 0:
+                # No archival rotations: just discard the current file.
+                self._dead_letter_path.unlink(missing_ok=True)
+                return
             # Work from oldest → newest so we never overwrite unsaved data.
+            # os.replace atomically overwrites the destination; the oldest
+            # file (index keep_rotations) is simply replaced/dropped by the
+            # cascade without a separate unlink step.
             for i in range(self._keep_rotations, 0, -1):
                 src = Path(f'{self._dead_letter_path}.{i - 1}') if i > 1 else self._dead_letter_path
                 dst = Path(f'{self._dead_letter_path}.{i}')
                 if src.exists():
-                    if i == self._keep_rotations and dst.exists():
-                        # Drop the file that would become .{keep+1}.
-                        dst.unlink(missing_ok=True)
                     os.replace(src, dst)
         except Exception as exc:
             logger.error(

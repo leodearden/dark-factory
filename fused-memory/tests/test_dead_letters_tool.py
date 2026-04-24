@@ -259,10 +259,14 @@ class TestGetDeadLettersPayloadTruncation:
         assert len(items) == 1
         item = items[0]
         assert item.get('payload_truncated') is True
-        # payload must serialise to ≤ 2048 bytes
-        import json as _json
-        serialised = _json.dumps(item['payload'], default=str)
-        assert len(serialised.encode()) <= 2048
+        # Truncated payload is a stable-typed envelope dict, never a bare string.
+        payload = item['payload']
+        assert isinstance(payload, dict), f'Expected dict envelope, got {type(payload)}'
+        assert payload.get('_truncated') is True
+        assert 'text' in payload
+        assert 'original_type' in payload
+        # The 'text' field must fit within the byte budget.
+        assert len(payload['text'].encode()) <= 2048
 
     @pytest.mark.asyncio
     async def test_small_durable_queue_payload_not_truncated(self):
@@ -297,7 +301,7 @@ class TestGetDeadLettersPayloadTruncation:
         dl = tmp_path / 'dl.jsonl'
         big_payload = {'blob': 'x' * 5000}
         event = _make_recon_event('proj-trunc')
-        # Manually write a record with an oversized payload
+        # Manually write a record with an oversized payload into the JSONL file.
         record = {
             'event': {
                 **event.model_dump(mode='json'),
@@ -309,21 +313,33 @@ class TestGetDeadLettersPayloadTruncation:
         }
         dl.write_text(_json.dumps(record) + '\n')
 
+        # Use start/close symmetry so the test is resilient to future init
+        # changes in EventQueue (drainer task lifecycle etc.).  No events are
+        # enqueued — the queue drains immediately on close.
         buf = AsyncMock()
         eq = EventQueue(buf, dead_letter_path=dl)
+        await eq.start()
+        try:
+            svc = AsyncMock()
+            svc.durable_queue = None
+            server = create_mcp_server(svc, event_queue=eq)
 
-        svc = AsyncMock()
-        svc.durable_queue = None
-        server = create_mcp_server(svc, event_queue=eq)
-
-        result = await server._tool_manager.call_tool(
-            'get_dead_letters',
-            {'project_id': 'proj-trunc'},
-        )
+            result = await server._tool_manager.call_tool(
+                'get_dead_letters',
+                {'project_id': 'proj-trunc'},
+            )
+        finally:
+            await eq.close()
 
         items = result['items']
         assert len(items) == 1
         item = items[0]
         assert item.get('payload_truncated') is True
-        serialised = _json.dumps(item['payload'], default=str)
-        assert len(serialised.encode()) <= 2048
+        # Truncated payload is a stable-typed envelope dict, never a bare string.
+        payload = item['payload']
+        assert isinstance(payload, dict), f'Expected dict envelope, got {type(payload)}'
+        assert payload.get('_truncated') is True
+        assert 'text' in payload
+        assert 'original_type' in payload
+        # The 'text' field must fit within the byte budget.
+        assert len(payload['text'].encode()) <= 2048

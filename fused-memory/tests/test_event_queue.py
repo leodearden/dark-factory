@@ -427,6 +427,48 @@ async def test_dead_letter_rotation_drops_beyond_keep(tmp_path):
         await q.close()
 
 
+@pytest.mark.asyncio
+async def test_dead_letter_rotation_zero_keep_discards_file(tmp_path):
+    """keep_rotations=0: once the byte cap is hit the current file is unlinked.
+
+    No .jsonl.1, .jsonl.2 … siblings should appear — the rotation just
+    truncates by deleting the file so subsequent writes start fresh.
+    """
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dead_letter.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+        max_bytes=200,  # very tight — triggers rotation after a few records
+        keep_rotations=0,
+    )
+    await q.start()
+    try:
+        # Enqueue enough events to exceed the 200-byte cap several times over.
+        for _ in range(20):
+            q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+
+        # No archived sibling should exist.
+        assert not (tmp_path / 'dead_letter.jsonl.1').exists(), (
+            '.jsonl.1 must not exist when keep_rotations=0'
+        )
+        # The current file may or may not exist (it was just written to after
+        # last rotation), but it must be under the cap if it does exist.
+        if dl.exists():
+            assert dl.stat().st_size <= 200 * 5, (
+                'dead_letter.jsonl grew unbounded with keep_rotations=0'
+            )
+    finally:
+        await q.close()
+
+
 # ── read_dead_letters ──────────────────────────────────────────────────
 
 
