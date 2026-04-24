@@ -15,10 +15,10 @@ from collections import defaultdict
 from pathlib import Path
 
 import aiosqlite
+from escalation.queue import iter_all_escalation_paths
 
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
-from escalation.queue import iter_all_escalation_paths
 
 logger = logging.getLogger(__name__)
 
