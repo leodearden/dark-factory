@@ -31,7 +31,20 @@ class IssueMatch:
 
 @dataclass
 class ScoringResult:
-    """Scoring outcome for one (variant, diff) pair."""
+    """Scoring outcome for one (variant, diff) pair.
+
+    Cost fields (kept separate for audit granularity):
+
+    - ``cost_usd``       — reviewer-panel cost only (sum of all reviewer
+                           invocations for this diff via ``PanelRunResult``).
+    - ``match_cost_usd`` — haiku matcher cost for this diff (the LLM call
+                           inside ``match_issues()``).  0.0 when no LLM call
+                           was made (empty inputs) or when the field is not
+                           yet populated (backward-compatible default).
+
+    Use the ``total_cost_usd`` property when you need the combined figure,
+    so callers cannot accidentally read only ``cost_usd`` and undercount.
+    """
 
     variant_name: str
     diff_id: str
@@ -42,9 +55,14 @@ class ScoringResult:
     precision: float = 0.0
     f1: float = 0.0
     blocking_recall: float = 0.0
-    cost_usd: float = 0.0
-    match_cost_usd: float = 0.0
+    cost_usd: float = 0.0       # panel cost only — see class docstring
+    match_cost_usd: float = 0.0  # haiku matcher cost — see class docstring
     wall_clock_ms: int = 0
+
+    @property
+    def total_cost_usd(self) -> float:
+        """Combined panel + matcher cost for this (variant, diff) pair."""
+        return self.cost_usd + self.match_cost_usd
 
 
 # Schema for the LLM matcher output
