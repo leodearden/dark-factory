@@ -8,6 +8,9 @@ from pathlib import Path
 _SRC = Path(__file__).parent.parent / 'src'
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+_TESTS_DIR = Path(__file__).parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
 
 # Cooperative jobserver: block at session start until a slot is free on the
 # system-wide FIFO (pytest-jobserver.service).  No-op when PYTEST_JOBSERVER_FIFO

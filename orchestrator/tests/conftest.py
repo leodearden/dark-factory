@@ -17,6 +17,9 @@ if str(_SRC) not in sys.path:
 _SHARED_SRC = Path(__file__).parent.parent.parent / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
+_TESTS_DIR = Path(__file__).parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
 
 from shared.config_models import AccountConfig, UsageCapConfig  # noqa: E402
 from shared.usage_gate import AccountState, UsageGate  # noqa: E402
