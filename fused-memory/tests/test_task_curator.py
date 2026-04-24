@@ -1811,3 +1811,67 @@ class TestCurateBatchCacheCheck:
         assert result[0].justification == 'c1-cached'
         assert result[1].justification == 'new-from-llm'
         assert result[2].justification == 'c2-cached'
+
+
+# ─────────────────────────────────────────────────────────────────────
+# TaskCurator._intra_batch_key (step-1: tests written before impl)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestIntraBatchKey:
+    """Unit tests for the intra-batch dedup key helper.
+
+    These tests are written before the implementation exists (TDD step-1);
+    they must FAIL until _intra_batch_key is added in step-2.
+    """
+
+    def test_identical_inputs_produce_same_key(self):
+        """(a) identical inputs → identical keys."""
+        k1 = TaskCurator._intra_batch_key('Fix the parser', 'The parser is broken')
+        k2 = TaskCurator._intra_batch_key('Fix the parser', 'The parser is broken')
+        assert k1 == k2
+
+    def test_title_case_normalised(self):
+        """(b) case difference on title is normalised away."""
+        k1 = TaskCurator._intra_batch_key('Fix Bug', 'same description')
+        k2 = TaskCurator._intra_batch_key('fix bug', 'same description')
+        assert k1 == k2
+
+    def test_whitespace_drift_normalised(self):
+        """(c) leading/trailing and internal whitespace collapse to same key."""
+        k1 = TaskCurator._intra_batch_key('  Fix   bug ', 'desc')
+        k2 = TaskCurator._intra_batch_key('fix bug', 'desc')
+        assert k1 == k2
+
+    def test_description_whitespace_normalised(self):
+        """(c) description whitespace drift also normalised."""
+        k1 = TaskCurator._intra_batch_key('title', '  do   something ')
+        k2 = TaskCurator._intra_batch_key('title', 'do something')
+        assert k1 == k2
+
+    def test_different_description_yields_different_key(self):
+        """(d) same title but different description → different keys."""
+        k1 = TaskCurator._intra_batch_key('Fix parser', 'in module A')
+        k2 = TaskCurator._intra_batch_key('Fix parser', 'in module B')
+        assert k1 != k2
+
+    def test_empty_description_does_not_raise(self):
+        """(e) empty description is handled without raising."""
+        k = TaskCurator._intra_batch_key('Some title', '')
+        assert isinstance(k, str)
+
+    def test_none_description_does_not_raise(self):
+        """(e) None description is handled without raising."""
+        k = TaskCurator._intra_batch_key('Some title', None)  # type: ignore[arg-type]
+        assert isinstance(k, str)
+
+    def test_returns_16_hex_chars(self):
+        """(f) returns a stable 16-character hex string."""
+        k = TaskCurator._intra_batch_key('hello', 'world')
+        assert len(k) == 16
+        assert all(c in '0123456789abcdef' for c in k)
+
+    def test_empty_title_and_description(self):
+        """(e) both empty — no raise, returns 16-char string."""
+        k = TaskCurator._intra_batch_key('', '')
+        assert len(k) == 16
