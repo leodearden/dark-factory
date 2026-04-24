@@ -1965,6 +1965,92 @@ class TestCuratorWorkerBatchDrain:
             f'Expected 2 add_task calls, got {taskmaster.add_task.call_count}'
         )
 
+    @pytest.mark.asyncio
+    async def test_non_int_batch_max_falls_back_to_default_of_five(
+        self, taskmaster, event_buffer, ticket_store,
+    ):
+        """Regression: when config.curator.batch_max is a non-int (e.g. MagicMock,
+        bool, or 0), _curator_worker falls back to batch_max=5 rather than
+        silently serialising all work (batch_max=0 or 1).
+
+        Verifies the new guard:
+          _raw = getattr(getattr(self._config, 'curator', None), 'batch_max', None)
+          batch_max = _raw if isinstance(_raw, int) and not isinstance(_raw, bool) and _raw >= 1 else 5
+
+        Test strategy: inject a config with a MagicMock batch_max, pre-fill the
+        queue with 3 tickets, start the worker, and assert all 3 land in a single
+        _process_add_tickets_batch call (which is only possible when batch_max >= 3).
+        """
+        # Config with non-int batch_max (MagicMock — mimics a mock/sentinel escaping validation)
+        mock_config = MagicMock()
+        mock_config.curator.batch_max = MagicMock()  # non-int
+
+        ti = TaskInterceptor(
+            taskmaster, None, event_buffer,
+            ticket_store=ticket_store, config=mock_config,
+        )
+        project_id = 'project'
+
+        mock_curator = MagicMock()
+        mock_curator.curate_batch = AsyncMock(return_value=[
+            CuratorDecision(action='create', justification=f'item {i}')
+            for i in range(3)
+        ])
+        mock_curator.note_created = MagicMock()
+        mock_curator.record_task = AsyncMock()
+
+        taskmaster.add_task = AsyncMock(side_effect=[
+            {'id': str(i), 'title': f'Task {i}'} for i in range(3)
+        ])
+
+        t1 = await ticket_store.submit(project_id, self._make_candidate_json('Task 1'))
+        t2 = await ticket_store.submit(project_id, self._make_candidate_json('Task 2'))
+        t3 = await ticket_store.submit(project_id, self._make_candidate_json('Task 3'))
+
+        queue = ti._ticket_queues.setdefault(project_id, asyncio.Queue())
+        for tid in [t1, t2, t3]:
+            queue.put_nowait(tid)
+
+        call_args_log: list[list[str]] = []
+        original_impl = ti._process_add_tickets_batch
+
+        async def tracking_batch(ticket_ids: list[str]) -> None:
+            call_args_log.append(list(ticket_ids))
+            return await original_impl(ticket_ids)
+
+        try:
+            with patch.object(
+                type(ti), '_get_curator',
+                new=AsyncMock(return_value=mock_curator),
+            ), patch.object(
+                type(ti), '_ensure_taskmaster',
+                new=AsyncMock(return_value=taskmaster),
+            ), patch.object(
+                ti, '_process_add_tickets_batch',
+                side_effect=tracking_batch,
+            ):
+                ti._start_worker_if_needed(project_id)
+                await asyncio.sleep(0.5)
+        finally:
+            workers = list(ti._worker_tasks.values()) if hasattr(ti, '_worker_tasks') else []
+            for t in workers:
+                if not t.done():
+                    t.cancel()
+            for t in workers:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
+
+        # All 3 tickets must land in a single batch — proves batch_max defaulted to 5
+        # (not 0 or 1 from a bool/MagicMock leaking through).
+        assert len(call_args_log) == 1, (
+            f'Expected 1 batch call (batch_max=5 default), got {len(call_args_log)}: '
+            f'{call_args_log}. If batch_max fell through to 0 or 1 the worker would '
+            f'serialise tickets into N=3 separate calls.'
+        )
+        assert set(call_args_log[0]) == {t1, t2, t3}, (
+            f'All 3 tickets should be in the single batch, got: {call_args_log[0]}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # AllAccountsCappedException sentinel guard — suggestion 7

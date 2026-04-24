@@ -1472,13 +1472,12 @@ class TaskInterceptor:
         # Determine batch_max from config; fall back to the documented default (5)
         # when no config is available so that tests without explicit config still
         # exercise the batch path rather than silently falling back to serial.
-        try:
-            _raw_batch_max = self._config.curator.batch_max  # type: ignore[union-attr]
-            if not isinstance(_raw_batch_max, int):
-                raise TypeError('batch_max is not an int')
-            batch_max: int = _raw_batch_max
-        except (AttributeError, TypeError):
-            batch_max = 5  # matches CuratorConfig default
+        _raw = getattr(getattr(self._config, 'curator', None), 'batch_max', None)
+        batch_max: int = (
+            _raw
+            if isinstance(_raw, int) and not isinstance(_raw, bool) and _raw >= 1
+            else 5
+        )  # falls back to CuratorConfig default (5) for None, bool, non-int, or ≤0
 
         try:
             while True:
