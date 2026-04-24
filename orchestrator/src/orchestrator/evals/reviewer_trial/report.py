@@ -194,7 +194,7 @@ def build_trial_report(
             found_by_any.add(m.ground_truth_id)
     missed_by_all = sorted(all_gt_ids - found_by_any)
 
-    total_cost = sum(s.cost_usd for s in scores)
+    total_cost = sum(s.cost_usd + s.match_cost_usd for s in scores)
 
     return TrialReport(
         summaries=summaries,
