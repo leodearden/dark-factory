@@ -197,3 +197,37 @@ async def test_prd_metadata_roundtrips_through_scheduler(harness, tmp_path, monk
     # Must round-trip to the correct PRD path
     parsed = json.loads(metadata)
     assert parsed == {'prd': str(prd.resolve())}
+
+
+@pytest.mark.asyncio
+async def test_tag_prd_metadata_robust_to_pre_ids_never_containing_empty_string(
+    harness, tmp_path
+):
+    """pre_ids never contains '' — _tag_prd_metadata must not rely on it.
+
+    The old code used `{str(t.get('id', '')) for t in tasks}` which could
+    include '' for tasks with a missing id.  The new get_statuses-based
+    snapshot skips tasks with empty ids, so '' is never in pre_ids.
+
+    This test confirms that _tag_prd_metadata's new_ids = all_ids - pre_ids
+    logic is unaffected by '' being absent: when pre_ids = {'1', '2'} (no
+    empty string) and tasks include id '3', only task '3' is tagged.
+    """
+    prd = tmp_path / 'feature.md'
+    prd.touch()
+    # Explicitly exclude '' from pre_ids — the new behaviour never puts it in.
+    pre_ids: set[str] = {'1', '2'}
+
+    tasks = [
+        _task('1'),
+        _task('2'),
+        _task('3'),  # genuinely new task
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+
+    await harness._tag_prd_metadata(prd, pre_ids)
+
+    # Only task 3 is new — it must be tagged.
+    assert harness.scheduler.update_task.call_count == 1
+    assert harness.scheduler.update_task.call_args.args[0] == '3'

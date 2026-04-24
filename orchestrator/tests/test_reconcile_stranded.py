@@ -642,6 +642,13 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     assert recover_idx < reconcile_idx, "_recover_crashed_tasks must precede _reconcile_stranded_in_progress"
     assert reconcile_idx < acquire_idx, "_reconcile_stranded_in_progress must precede scheduler.acquire_next"
 
+    # prd_path=None means _tag_prd_metadata is never called, so get_tasks
+    # (which _tag_prd_metadata uses for full task data) must not be called.
+    # This assertion locks in the migration boundary: all startup-block status
+    # checks have moved to get_statuses; get_tasks is only retained for the
+    # prd_path code paths that need full task metadata.
+    h.scheduler.get_tasks.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Non-in-progress statuses are ignored (regression guard for non-goal)
