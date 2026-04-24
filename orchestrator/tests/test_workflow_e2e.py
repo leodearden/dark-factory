@@ -2474,6 +2474,77 @@ class TestMarkBlockedFalseDoneGuard:
 
 
 # ---------------------------------------------------------------------------
+# Tests: _check_branch_on_main helper unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCheckBranchOnMain:
+    """Unit tests for TaskWorkflow._check_branch_on_main().
+
+    Each test exercises the helper directly without a full workflow.run() cycle.
+    The helper returns (wt_head, main_sha) when the branch is merged to main,
+    else None.
+    """
+
+    async def test_returns_tuple_for_merged_branch(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Happy path: merged branch returns (wt_head, main_sha) tuple.
+
+        Create a worktree, commit a real file, merge to main, advance main,
+        then call _check_branch_on_main() directly.  Asserts a non-None tuple
+        is returned where both elements are 40-char SHAs, wt_head matches the
+        worktree's git rev-parse HEAD, and main_sha matches git_ops.get_main_sha().
+
+        Fails on unmodified code with AttributeError
+        ('TaskWorkflow object has no attribute _check_branch_on_main').
+        """
+        # 1. Create worktree and make a real implementation commit
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        (wt / 'cbom_impl.py').write_text('def impl():\n    return 1\n')
+        await git_ops.commit(wt, 'Implement feature (test_returns_tuple_for_merged_branch)')
+
+        # 2. Merge to main, advance main, cleanup merge worktree
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        # 3. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 4. Call _check_branch_on_main directly
+        result_tuple = await workflow._check_branch_on_main()
+
+        # 5. Assertions
+        assert result_tuple is not None, (
+            '_check_branch_on_main() must return a tuple for a merged branch'
+        )
+        wt_head, main_sha = result_tuple
+        assert len(wt_head) == 40, f'wt_head must be a 40-char SHA, got: {wt_head!r}'
+        assert len(main_sha) == 40, f'main_sha must be a 40-char SHA, got: {main_sha!r}'
+
+        # wt_head must match the actual worktree HEAD
+        _, actual_wt_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert wt_head == actual_wt_head_raw.strip(), (
+            f'wt_head {wt_head!r} must match actual HEAD {actual_wt_head_raw.strip()!r}'
+        )
+        # main_sha must match git_ops.get_main_sha()
+        expected_main = await git_ops.get_main_sha()
+        assert main_sha == expected_main, (
+            f'main_sha {main_sha!r} must match git_ops.get_main_sha() {expected_main!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tests: _recover_if_already_merged unit tests
 # ---------------------------------------------------------------------------
 
