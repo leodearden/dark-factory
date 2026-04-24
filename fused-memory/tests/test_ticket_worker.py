@@ -1536,6 +1536,104 @@ class TestProcessAddTicketsBatch:
         assert r3 is not None and r3['status'] == 'created'
         assert r3['task_id'] == '33'
 
+    def _make_titleless_candidate_json(self) -> str:
+        """Return candidate_json with no title so _build_candidate returns None."""
+        return json.dumps({
+            'project_root': '/project',
+            'kwargs': {'prompt': 'do something'},  # no 'title' key → candidate = None
+            'metadata': None,
+        })
+
+    @pytest.mark.asyncio
+    async def test_batch_target_index_remapped_to_ticket_data_space_when_candidates_contain_none(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """Regression: batch_target_index from curate_batch is in non_none_candidates-space
+        but the worker's resolved_task_ids lookup uses ticket_data-space.
+
+        Setup: 4 tickets where t2 is titleless (None-candidate), so:
+          candidates          = [c1, None, c3, c4]  (ticket_data-space: 0,1,2,3)
+          non_none_candidates = [c1, c3, c4]         (non_none-space: 0,1,2)
+
+        curate_batch sees [c1, c3, c4] and returns:
+          idx 0 (c1) → create
+          idx 1 (c3) → create
+          idx 2 (c4) → drop, batch_target_index=1  (c3 in non_none-space)
+
+        batch_target_index=1 must be remapped to 2 (c3's index in ticket_data-space)
+        so that t4 is combined with t3's task_id ('101'), not t2's task_id.
+        """
+        # Submit tickets in order; t2 is titleless.
+        t1 = await ticket_store.submit('project', self._make_candidate_json('Task One'))
+        t2 = await ticket_store.submit('project', self._make_titleless_candidate_json())
+        t3 = await ticket_store.submit('project', self._make_candidate_json('Task Two'))
+        t4 = await ticket_store.submit('project', self._make_candidate_json('Task Two dup'))
+
+        mock_curator = MagicMock()
+        # curate_batch sees non_none_candidates = [c1, c3, c4] (indices 0,1,2 in non_none-space).
+        mock_curator.curate_batch = AsyncMock(return_value=[
+            CuratorDecision(action='create', justification='new1'),
+            CuratorDecision(action='create', justification='new3'),
+            CuratorDecision(
+                action='drop',
+                target_id=None,
+                batch_target_index=1,   # non_none-space: points to c3 (index 1 there)
+                justification='dup of non_none index 1 (c3)',
+            ),
+        ])
+        mock_curator.note_created = MagicMock()
+        mock_curator.record_task = AsyncMock()
+
+        # add_task is called 3 times: t1 (create), t2 (None-candidate fallback to create),
+        # t3 (create).  t4 must NOT call add_task — it should be combined via remapping.
+        taskmaster.add_task = AsyncMock(side_effect=[
+            {'id': '100', 'title': 'Task One'},
+            {'id': 't2-fallback', 'title': ''},    # None-candidate → falls through to create
+            {'id': '101', 'title': 'Task Two'},
+        ])
+
+        with patch.object(
+            type(interceptor_with_store), '_get_curator',
+            new=AsyncMock(return_value=mock_curator),
+        ), patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            await interceptor_with_store._process_add_tickets_batch([t1, t2, t3, t4])
+
+        r1 = await ticket_store.get(t1)
+        r2 = await ticket_store.get(t2)
+        r3 = await ticket_store.get(t3)
+        r4 = await ticket_store.get(t4)
+
+        # t1: created with '100'
+        assert r1 is not None and r1['status'] == 'created'
+        assert r1['task_id'] == '100'
+
+        # t2: any terminal status (None-candidate falls through to create)
+        assert r2 is not None and r2['status'] in {'created', 'combined', 'failed'}, (
+            f'Expected t2 to be terminal, got: {r2!r}'
+        )
+
+        # t3: created with '101'
+        assert r3 is not None and r3['status'] == 'created'
+        assert r3['task_id'] == '101'
+
+        # CRITICAL: t4 must be combined with '101' (t3's task_id).
+        # Without the fix, batch_target_index=1 stays in non_none-space, which maps to
+        # ticket_data-space index 1 (= t2), so t4 would get combined with 't2-fallback'.
+        assert r4 is not None and r4['status'] == 'combined', (
+            f"Expected t4 status='combined', got {r4!r}. "
+            f"Likely batch_target_index was not remapped from non_none-space to ticket_data-space."
+        )
+        assert r4['task_id'] == '101', (
+            f"Expected t4 task_id='101' (t3's task_id), got {r4['task_id']!r}. "
+            f"Without the fix it would be 't2-fallback' (t2's wrong task) — index space mismatch."
+        )
+
+        # t1 + t2-fallback + t3 → 3 add_task calls; t4 combined → no additional call.
+        assert taskmaster.add_task.call_count == 3
+
 
 # ---------------------------------------------------------------------------
 # TestCuratorWorkerBatchDrain — step-39 / step-41 / step-43 / step-45
