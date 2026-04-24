@@ -9,7 +9,6 @@ from orchestrator.evals.reviewer_trial.report import build_trial_report
 from orchestrator.evals.reviewer_trial.scorer import ScoringResult
 from orchestrator.evals.reviewer_trial.variants import ReviewerSpec, VariantConfig
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
