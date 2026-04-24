@@ -3961,8 +3961,8 @@ class TestSessionBudgetExhaustionEscalation:
             f'Expected "agent_invocations=1" in detail (only architect ran), got: {detail!r}'
         )
         assert 'total_turns=' in detail, f'Expected "total_turns=" label in detail, got: {detail!r}'
-        assert 'last_role' in detail, f'Expected "last_role" label in detail, got: {detail!r}'
-        assert 'architect' in detail, f'Expected "architect" (last role) in detail, got: {detail!r}'
+        assert 'last_completed_role' in detail, f'Expected "last_completed_role" label in detail, got: {detail!r}'
+        assert 'architect' in detail, f'Expected "architect" (last completed role) in detail, got: {detail!r}'
 
 
 def _make_done_setting_steward(
