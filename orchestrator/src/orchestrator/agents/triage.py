@@ -20,14 +20,18 @@ def sha256_16(data: str) -> str:
 
     Canonical shape contract: every 16-char sha256-hex token in this module
     (``suggestion_hash``, ``_combine_suggestion_hashes``) is produced through
-    this helper, as is the ``cleanup_needed`` R4 snippet in
-    ``skills/escalation-watcher/SKILL.md``.  Any change to the length or
-    algorithm here must be reflected at all three sites.
+    this helper.  The ``cleanup_needed`` R4 snippet in
+    ``skills/escalation-watcher/SKILL.md`` uses an equivalent inline
+    ``hashlib.sha256(payload.encode()).hexdigest()[:16]`` expression (stdlib-only,
+    so the skill works without the orchestrator package installed); any change to
+    the length or algorithm here must be mirrored there.
 
-    Note: ``sha256_16('')`` returns the fixed prefix ``'e3b0c44298fc1c14'``.
-    Callers that may receive blank input must use a non-empty fallback before
-    calling this function to avoid hash collisions across blank inputs.
+    :raises ValueError: if *data* is empty — callers must ensure a non-empty
+        payload (e.g. via a ``detail or summary or id`` fallback chain) before
+        calling this function.
     """
+    if not data:
+        raise ValueError("sha256_16 requires non-empty input")
     return hashlib.sha256(data.encode()).hexdigest()[:16]
 
 

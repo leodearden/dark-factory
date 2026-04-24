@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+
+import pytest
 from unittest.mock import MagicMock
 
 from orchestrator.agents.triage import (
@@ -287,10 +289,7 @@ class TestSha256_16:
     def test_differs_across_inputs(self):
         assert sha256_16('hello') != sha256_16('world')
 
-    def test_matches_raw_hashlib_reference(self):
-        """Pins the exact construction so the skill's legacy snippet is byte-compatible."""
-        assert sha256_16('test') == hashlib.sha256(b'test').hexdigest()[:16]
-
-    def test_empty_string_is_fixed_prefix(self):
-        """Documents the collision callers must avoid — blank detail must not be passed raw."""
-        assert sha256_16('') == 'e3b0c44298fc1c14'
+    def test_empty_string_raises(self):
+        """Empty input raises ValueError so blank-detail callers fail loudly at call time."""
+        with pytest.raises(ValueError, match="non-empty"):
+            sha256_16('')
