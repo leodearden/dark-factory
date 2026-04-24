@@ -54,6 +54,8 @@ logger = logging.getLogger(__name__)
 # Peek window size for BacklogIterator's project_root resolution.
 # Large enough that an older event lacking `_project_root` doesn't force a
 # fallback when a later buffered event carries the key (see BacklogIterator.run).
+# See the peek-window regression test in tests/test_harness.py — reducing this
+# below the realistic mix of buffered events will trip that test.
 _PROJECT_ROOT_PEEK_LIMIT = 10
 
 

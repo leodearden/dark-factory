@@ -2,13 +2,14 @@
 
 import contextlib
 import uuid
-from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 
 from fused_memory.models.reconciliation import (
+    AssembledPayload,
     EventSource,
     EventType,
     ReconciliationEvent,
@@ -18,6 +19,7 @@ from fused_memory.models.reconciliation import (
     StageReport,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.harness import BacklogIterator
 from fused_memory.reconciliation.journal import ReconciliationJournal
 
 
@@ -3137,11 +3139,6 @@ async def test_backlog_iterator_uses_harness_project_root_when_events_lack_overr
 ):
     """BacklogIterator.run should pass harness.project_root to ContextAssembler
     when peeked events carry no _project_root key in their payload."""
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    from fused_memory.models.reconciliation import AssembledPayload
-    from fused_memory.reconciliation.harness import BacklogIterator
-
     # Push one event with NO _project_root in payload
     await event_buffer.push(_make_event('dark_factory'))
 
@@ -3174,30 +3171,12 @@ async def test_backlog_iterator_uses_harness_project_root_when_events_lack_overr
 async def test_backlog_iterator_peek_window_finds_later_project_root_override(
     journal, event_buffer, mock_memory_service
 ):
-    """Regression guard: BacklogIterator's peek window must be wide enough that
-    a `_project_root` override on a LATER buffered event is still found, even
-    when several earlier buffered events lack the key.
+    """Regression guard: a ``_project_root`` override on a later buffered event must be
+    found even when earlier events in the peek window lack the key (window >= N positions).
 
-    This pins the actual behavioral invariant (window >= N for realistic N)
-    without referencing the module-private `_PROJECT_ROOT_PEEK_LIMIT` constant
-    or its exact value — so the window size can be tuned freely as long as it
-    stays large enough to accommodate a realistic mix of buffered events.
-
-    Replaces the prior meta-test flagged by reviewer as locking implementation
-    detail (asserting `first_limit == _PROJECT_ROOT_PEEK_LIMIT` and
-    `_PROJECT_ROOT_PEEK_LIMIT == 10`).
+    Uses a 9+1=10 buffered-event setup so the override is the last peeked item under
+    the current window; reducing the window below 10 will trip this test.
     """
-    from datetime import timedelta
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    from fused_memory.models.reconciliation import (
-        AssembledPayload,
-        EventSource,
-        EventType,
-        ReconciliationEvent,
-    )
-    from fused_memory.reconciliation.harness import BacklogIterator
-
     # peek_buffered orders by `timestamp ASC LIMIT ?` (FIFO). Push 9 events that
     # LACK _project_root with monotonically-increasing timestamps, then 1 event
     # carrying _project_root='/from/event' with the latest timestamp. With FIFO
@@ -3267,14 +3246,14 @@ async def test_backlog_iterator_event_project_root_wins_over_configured(
     but exercises the event-override path: events carry _project_root='/from/event'
     while the harness is configured with '/from/config'.  The event value must win.
 
+    Pure-precedence case: ALL buffered events carry _project_root — pins that event value
+    beats the configured fallback.  Contrast with
+    test_backlog_iterator_peek_window_finds_later_project_root_override, which uses
+    9 events without the key + 1 with (mixed setup) to probe peek-window width.
+
     Peek-window semantics differ from run_full_cycle's full-drain coverage at
     test_harness.py:341, making this a distinct regression guard.
     """
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    from fused_memory.models.reconciliation import AssembledPayload
-    from fused_memory.reconciliation.harness import BacklogIterator
-
     # Push two events WITH _project_root key — both within the peek window
     await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
     await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
