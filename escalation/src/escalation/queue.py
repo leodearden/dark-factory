@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import tempfile
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
@@ -104,8 +105,16 @@ class EscalationQueue:
                     f'{[str(p) for p in candidates]}; selecting newest by parent dir date'
                 )
                 # YYYY-MM-DD sorts lexicographically == chronologically.
-                # Non-date parent names get empty-string key (treated as oldest).
-                path = max(candidates, key=lambda p: p.parent.name)
+                # Non-YYYY-MM-DD parent names fall back to '' (treated as oldest),
+                # matching the comment and ensuring valid date dirs always win.
+                path = max(
+                    candidates,
+                    key=lambda p: (
+                        p.parent.name
+                        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', p.parent.name)
+                        else ''
+                    ),
+                )
             else:
                 path = candidates[0]
         try:
@@ -125,9 +134,9 @@ class EscalationQueue:
           include resolved/dismissed escalations that have been moved out.
 
         Deduplication: if the same escalation id appears in both the queue root
-        and the archive (e.g. crash mid-resolve, backup restore), only the first
-        occurrence is returned.  Iteration order is queue root first, archive
-        second, so the queue_dir copy wins when both exist.
+        and the archive (e.g. crash mid-resolve), only the first occurrence is
+        returned and a WARNING is logged.  Iteration order is queue root first,
+        archive second, so the queue_dir copy wins when both exist.
         """
         # Build the candidate path list.
         paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
@@ -140,6 +149,10 @@ class EscalationQueue:
             try:
                 esc = Escalation.from_json(path.read_text())
                 if esc.id in seen:
+                    logger.warning(
+                        f'Duplicate escalation id {esc.id!r} at {path}; '
+                        'skipping (queue_dir copy takes precedence)'
+                    )
                     continue
                 seen.add(esc.id)
                 if esc.task_id != task_id:
@@ -261,8 +274,13 @@ class EscalationQueue:
     def dismiss_all_pending(self, resolution: str) -> int:
         """Dismiss all pending escalations with the given resolution message.
 
-        Returns the number of escalations dismissed.
-        Already-resolved or already-dismissed escalations are not modified.
+        Returns the number of escalations where resolve() returned non-None.
+        In the common single-writer case this equals the number actually dismissed.
+        In a concurrent-write race (another process resolves an escalation between
+        get_pending() and resolve()), resolve() is a no-op but still returns the
+        existing escalation, so the count may include those no-ops.  The counter
+        is best read as "attempted dismissals, including no-ops for concurrent
+        resolutions".  This function is single-writer in practice.
         """
         pending = self.get_pending()
         count = 0
