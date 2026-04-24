@@ -44,6 +44,15 @@ retry (under `timeout`) + optional 1 re-submit (under `server_restart`, or
 under `timeout` when its retry returns `unknown_ticket` / `expired`).  After
 the second submit, any further failure is terminal — do not submit a third time.
 
+| Action | Max per logical work item |
+|--------|--------------------------|
+| `submit_task` | 2 |
+| `resolve_ticket` | unbounded† |
+
+_† Bounded in practice by the per-reason rules above: `server_restart` allows
+one re-submit; `timeout` allows one `resolve_ticket` retry before (conditionally)
+one re-submit.  Only `submit_task` is hard-capped at 2._
+
 **Dedup caveat:** if the caller does not supply `(escalation_id,
 suggestion_hash)` in the `submit_task` metadata, the R4 idempotency gate
 (see §R4 below) does not fire on retry.  The curator may still merge the
@@ -176,6 +185,11 @@ submit_task(
 - **Unblock triage** (`skills/unblock/SKILL.md`) — use the non-blocker
   description + parent task id as the stable payload; prefix with
   `"unblock-triage-"`.
+- **Review-cycle / phase3-triage** (`skills/review/references/phase3-triage.md`) —
+  prefix `escalation_id` with `"review-cycle-"` and append the `review_id` (e.g.
+  `f"review-cycle-{review_id}"`).  For `suggestion_hash`, sha256 the finding's
+  stable key (file path + line number + title concatenated), truncated to 16 hex
+  chars.
 
 Adding idempotency metadata changes retry behaviour from "the curator may or may
 not de-duplicate" to "the R4 gate guarantees exactly-once task creation".

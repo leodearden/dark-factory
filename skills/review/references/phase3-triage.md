@@ -109,7 +109,9 @@ elif resolve["status"] == "combined":
 elif resolve["status"] == "failed":
     # On `failed`: record the reason in the review report and skip this finding.
     # See skills/_shared/ticket-failure-handling.md for the retryable/terminal
-    # reason matrix and R4 idempotency guidance.
+    # reason matrix and R4 idempotency guidance. Review-cycle tasks don't natively
+    # set escalation_id/suggestion_hash; to opt into R4 de-duplication on retry,
+    # synthesize a stable pair per that doc's guidance.
     log_failure(resolve["reason"])
 ```
 
