@@ -472,6 +472,51 @@ async def test_dead_letter_rotation_zero_keep_discards_file(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_rotation_keep_zero_purges_orphan_rotations(tmp_path):
+    """keep_rotations=0: pre-existing orphan siblings are purged on the next rotation.
+
+    Simulates an operator who previously ran with keep_rotations=5 by pre-creating
+    dead_letter.jsonl.1 through .5 on disk.  The current run uses keep_rotations=0.
+    After triggering a rotation, all five orphan siblings must be unlinked and no
+    new .1 sibling must appear (zero-keep never archives).
+    """
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dead_letter.jsonl'
+
+    # Pre-create orphan rotation files simulating a prior run with keep_rotations=5.
+    for n in range(1, 6):
+        orphan = tmp_path / f'dead_letter.jsonl.{n}'
+        orphan.write_text('{"orphan": true}\n', encoding='utf-8')
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+        max_bytes=200,  # very tight — triggers rotation after a few records
+        keep_rotations=0,
+    )
+    await q.start()
+    try:
+        # Enqueue enough events to trigger at least one _rotate_dead_letter call.
+        for _ in range(10):
+            q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+
+        # All orphan siblings must have been purged.
+        for n in range(1, 6):
+            orphan = tmp_path / f'dead_letter.jsonl.{n}'
+            assert not orphan.exists(), (
+                f'dead_letter.jsonl.{n} must be purged when keep_rotations=0'
+            )
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
 async def test_rotation_purges_orphan_rotations(tmp_path):
     """After keep_rotations is reduced, orphaned rotation files are purged on next rotation.
 
