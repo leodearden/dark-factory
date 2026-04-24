@@ -1866,3 +1866,40 @@ class TestCuratorWorkerBatchDrain:
         assert taskmaster.add_task.call_count == 2, (
             f'Expected 2 add_task calls, got {taskmaster.add_task.call_count}'
         )
+
+
+# ---------------------------------------------------------------------------
+# AllAccountsCappedException sentinel guard — suggestion 7
+# ---------------------------------------------------------------------------
+
+
+class TestAllAccountsCappedSentinel:
+    """Guard that the AllAccountsCappedException import in task_interceptor.py
+    resolves to the real class from shared.cli_invoke, not the fallback
+    ``Exception`` sentinel.
+
+    If this ever breaks (e.g. the import path changes and the ImportError
+    fallback silently activates), the ``except (CuratorFailureError,
+    AllAccountsCappedException)`` clause in curate_batch would widen to catch
+    bare Exception, making the cap-retry fallback path dead code.
+    """
+
+    def test_allaccountscapped_is_not_bare_exception(self):
+        """The imported symbol must NOT be the built-in ``Exception`` class."""
+        from fused_memory.middleware.task_interceptor import AllAccountsCappedException
+        assert AllAccountsCappedException is not Exception, (
+            'AllAccountsCappedException resolves to the bare Exception sentinel; '
+            'the shared.cli_invoke import must have failed silently'
+        )
+
+    def test_allaccountscapped_is_real_import(self):
+        """The imported symbol should come from shared.cli_invoke, not the fallback."""
+        import fused_memory.middleware.task_interceptor as interceptor_mod
+        # The sentinel defined in the ImportError fallback is named
+        # _UnavailableAllAccountsCapped.  The real class is NOT that name.
+        sentinel_name = '_UnavailableAllAccountsCapped'
+        cls = interceptor_mod.AllAccountsCappedException
+        assert cls.__name__ != sentinel_name, (
+            f'AllAccountsCappedException is the placeholder {sentinel_name!r}; '
+            'shared.cli_invoke import failed'
+        )
