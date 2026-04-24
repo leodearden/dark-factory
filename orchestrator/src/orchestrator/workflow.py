@@ -2410,13 +2410,21 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         iteration-log format changes and avoids the false-done regression where
         a stale iteration entry triggers the guard on a branch with no commits.
 
-        When *wt_head* is not provided (or when base_commit is absent from
-        metadata.json), falls back to scanning .task/iterations.jsonl for
-        implementer/debugger entries.  Planning-only runs don't write these, so
-        absence means stale branch point rather than a legitimately merged prior
-        run.  This fallback is also used by the ghost-loop guard and the
-        merge-phase guard, where a post-rebase HEAD may coincide with
-        base_commit even on a genuinely-implemented branch.
+        When *wt_head* is not provided, falls back to scanning
+        .task/iterations.jsonl for implementer/debugger entries.
+        Planning-only runs don't write these, so absence means stale branch
+        point rather than a legitimately merged prior run.  This fallback is
+        also used by the ghost-loop guard and the merge-phase guard, where a
+        post-rebase HEAD may coincide with base_commit even on a genuinely-
+        implemented branch.
+
+        When *wt_head* IS provided but base_commit is absent (metadata.json
+        not yet stamped), returns ``has_work=False`` — this is the
+        fail-closed safety net for SHA-primary callers.  Refusing to fall
+        back to the iteration-log scan prevents false-DONE from inherited
+        .task/iterations.jsonl contamination.  See
+        test_returns_none_when_wt_head_provided_but_metadata_missing for the
+        regression case.
 
         Returns a :class:`_PriorImplStatus` NamedTuple with ``has_work``,
         ``entries`` (full iteration-log list — callers can use ``len(entries)``
@@ -2453,7 +2461,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 entries=entries,
                 base_commit=base_commit,
             )
-        # Fallback: no wt_head provided, or no base_commit stamp — use entry scan
+        if wt_head is not None:
+            # Fail-closed: caller signaled SHA-primary semantics by passing
+            # wt_head, but base_commit is absent (metadata.json not stamped).
+            # Refuse to fall back to the iteration-log scan — on a worktree
+            # with inherited .task/iterations.jsonl contamination this would
+            # still produce has_work=True and false-DONE.  See
+            # test_returns_none_when_wt_head_provided_but_metadata_missing
+            # for the regression case.
+            return _PriorImplStatus(has_work=False, entries=entries, base_commit=None)
+        # Fallback (no wt_head): iteration-log scan for pre-EXECUTE / merge-phase guards
         return _PriorImplStatus(
             has_work=any(e.get('agent') in ('implementer', 'debugger') for e in entries),
             entries=entries,
@@ -2516,6 +2533,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # and incorrectly returns DONE for an unimplemented task — catastrophic
         # silent failure.  See test_returns_none_for_inherited_iterations_log_on_fresh_worktree
         # for the regression case this guards.
+        #
+        # Additional safety net: if metadata.json was never stamped
+        # (base_commit is None), _has_prior_implementation() now returns
+        # has_work=False from its fail-closed branch rather than falling back
+        # to the iteration-log scan.  This covers edge cases where
+        # artifacts.init() was not called before this guard (e.g. eval-mode
+        # paths or future refactors that re-order setup).  See
+        # test_returns_none_when_wt_head_provided_but_metadata_missing.
         #
         # Trade-off: if create_worktree rebased a genuinely-implemented branch
         # onto a new main tip so that wt_head == new_base_commit, the SHA-primary
