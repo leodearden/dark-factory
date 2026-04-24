@@ -975,14 +975,34 @@ class TaskInterceptor:
         pre_snapshot: dict,
         parent_task_id: str | None = None,
     ) -> dict:
-        """Post-hoc curator pass after a bulk task-creation operation.
+        """Post-hoc deduplication after a bulk task-creation operation.
 
-        Reads the current task tree, diffs against pre_snapshot, and invokes
-        the curator on each newly-created task. Drop → remove the new task.
-        Combine → rewrite the target, then remove the new task. Create → keep
-        and record.
+        Reads the current task tree, diffs against pre_snapshot, then runs
+        a two-pass deduplication on the newly-created tasks:
 
-        Returns {'removed': [...], 'kept': [...], 'errors': []}
+        **Pass 1 — intra-batch dedup (pre-pass)**:
+        Groups new tasks by normalised (title, description) hash.  First
+        occurrence wins; each subsequent duplicate is removed immediately
+        under ``_write_lock`` with ``reason='intra_batch_duplicate'``.
+        This is cheap (no LLM) and prevents duplicate curator calls.
+
+        **Pass 2 — cross-task curator pass**:
+        Invokes ``curator.curate()`` on each unique survivor from pass 1.
+        Drop → remove the new task.  Combine → rewrite the target then
+        remove the new task.  Create → keep and record.
+
+        Called by both ``expand_task`` and ``parse_prd``; the two-pass
+        structure is path-agnostic (``parent_task_id`` is only used as
+        ``spawned_from`` metadata for curator candidates).
+
+        Returns ``{'removed': [...], 'kept': [...], 'errors': []}``.
+        Each ``removed`` entry carries a ``reason`` field that is one of:
+
+        - ``'intra_batch_duplicate'`` — removed in pass 1 (mechanical,
+          no LLM); entry has ``matched_task_id`` (first-occurrence id)
+          but no ``justification``.
+        - ``'curator_drop'`` — removed in pass 2 by the curator.
+        - ``'curator_combine'`` — merged into an existing task in pass 2.
         """
         removed: list[dict] = []
         kept: list[dict] = []
