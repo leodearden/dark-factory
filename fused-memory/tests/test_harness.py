@@ -2069,6 +2069,51 @@ class TestHarnessFetchFilteredTaskTree:
             f"{[r.getMessage() for r in warning_records]}"
         )
 
+    @pytest.mark.asyncio
+    async def test_fetch_filtered_task_tree_logs_info_when_project_root_empty(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """_fetch_filtered_task_tree emits an INFO log when project_root is empty string.
+
+        When project_root is '' the short-circuit returns an empty tree without
+        calling taskmaster.get_tasks.  Ops must be able to see this happening so
+        they can distinguish 'project root never set' from a healthy-but-empty
+        project in production logs.
+
+        Asserts:
+        (a) an INFO-level record with marker 'reconciliation.task_tree_empty_project_root'
+        (b) taskmaster.get_tasks was NOT called (short-circuit still fires)
+        """
+        import logging
+
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        with caplog.at_level(logging.INFO):
+            result = await harness._fetch_filtered_task_tree('')
+
+        # Still returns empty tree
+        assert isinstance(result, FilteredTaskTree)
+        assert result.active_tasks == []
+
+        # (a) INFO record with distinct event marker
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            'reconciliation.task_tree_empty_project_root' in r.getMessage()
+            for r in info_records
+        ), (
+            f"Expected INFO record containing 'reconciliation.task_tree_empty_project_root';"
+            f" got INFO messages: {[r.getMessage() for r in info_records]}"
+        )
+
+        # (b) short-circuit must NOT call taskmaster.get_tasks
+        harness.taskmaster.get_tasks.assert_not_called()  # type: ignore[union-attr,attr-defined]
+
 
 # ── Tests for task 455: harness wires filtered_task_tree into stages ──────────
 
