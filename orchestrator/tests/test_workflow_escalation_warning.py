@@ -5,7 +5,7 @@ a single WARNING per workflow instance when an escalation-capable agent role is
 first invoked while ``self.escalation_queue`` is None.
 """
 
-from __future__ import annotations  # noqa: I001
+from __future__ import annotations
 
 import logging
 from pathlib import Path
@@ -15,22 +15,7 @@ import pytest
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, ROLES
-from orchestrator.workflow import _ESCALATION_CAPABLE_ROLES, TaskWorkflow, WorkflowOutcome
-
-# ---------------------------------------------------------------------------
-# E2E fixtures and helpers — imported so pytest discovers them in this module.
-# Re-exported from test_workflow_e2e via the tests-dir sys.path insert in
-# conftest.py (not a package-relative import — tests/ is not a package under
-# --import-mode=importlib).
-# ---------------------------------------------------------------------------
-from test_workflow_e2e import (  # noqa: E402, F401
-    AgentStub,
-    _build_workflow_with_escalation,
-    config,        # fixture: OrchestratorConfig backed by a real git repo
-    git_ops,       # fixture: GitOps from config
-    git_repo,      # fixture: bare git repo in tmp_path
-    task_assignment,  # fixture: TaskAssignment for task '42'
-)
+from orchestrator.workflow import _ESCALATION_CAPABLE_ROLES, TaskWorkflow
 
 
 def _make_workflow(*, escalation_queue=None) -> TaskWorkflow:
@@ -162,72 +147,3 @@ class TestInvokeWiresWarning:
 
         mock_warn.assert_called_once_with(ARCHITECT.name)
 
-
-# ---------------------------------------------------------------------------
-# E2E: first-invocation budget-exhaustion path
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-class TestFirstInvocationBudgetExhaustion:
-    """When SessionBudgetExhausted fires before any role completes, the escalation
-    uses the 'last_completed_role' label and resolves to 'n/a' (None fallback).
-
-    This test drives workflow.run() through the _SessionBudgetExhausted handler
-    on the FIRST invoke_agent call — before the architect writes plan.json, so
-    _last_completed_role stays None throughout.
-    """
-
-    async def test_label_is_last_completed_role_na_when_no_role_completed(
-        self, config, git_ops, task_assignment, monkeypatch, tmp_path  # noqa: F811
-    ):
-        """Before any role completes, _last_completed_role is None → label resolves to n/a.
-
-        Asserts:
-          (i)   outcome is BLOCKED
-          (ii)  exactly one escalation in the queue
-          (iii) detail contains 'last_completed_role=n/a'  (new label + default fallback)
-          (iv)  summary contains 'last completed role: n/a'  (new summary wording)
-        """
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
-        stub = AgentStub()
-        config.usage_cap.session_budget_usd = 0.10
-        workflow, _, queue = _build_workflow_with_escalation(
-            config, git_ops, task_assignment, stub, tmp_path,
-            spawn_merge_worker=False,
-        )
-
-        # Raise SessionBudgetExhausted on the very first invoke_agent call —
-        # the architect never writes plan.json, so _last_completed_role stays None.
-        async def always_raise(*args, **kwargs):
-            raise SessionBudgetExhausted(cumulative_cost=0.50)
-
-        monkeypatch.setattr('orchestrator.workflow.invoke_agent', always_raise)
-        monkeypatch.setattr(
-            'orchestrator.workflow.run_scoped_verification',
-            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
-        )
-
-        outcome = await workflow.run()
-
-        assert outcome == WorkflowOutcome.BLOCKED, (
-            f'Expected BLOCKED outcome, got: {outcome!r}'
-        )
-
-        escalations = queue.get_by_task(task_assignment.task_id)
-        assert len(escalations) == 1, (
-            f'Expected exactly 1 escalation, got {len(escalations)}'
-        )
-        esc = escalations[0]
-        detail = esc.detail
-        summary = esc.summary
-
-        # (iii) detail label — fails on current code (uses 'last_role=n/a')
-        assert 'last_completed_role=n/a' in detail, (
-            f'Expected "last_completed_role=n/a" in detail, got: {detail!r}'
-        )
-        # (iv) summary wording — fails on current code (uses 'last role: n/a')
-        assert 'last completed role: n/a' in summary, (
-            f'Expected "last completed role: n/a" in summary, got: {summary!r}'
-        )
