@@ -24,11 +24,6 @@ if str(_TESTS_DIR) not in sys.path:
 from shared.config_models import AccountConfig, UsageCapConfig  # noqa: E402
 from shared.usage_gate import AccountState, UsageGate  # noqa: E402
 
-# Cooperative jobserver: block at session start until a slot is free on the
-# system-wide FIFO (pytest-jobserver.service).  No-op when PYTEST_JOBSERVER_FIFO
-# is unset or the FIFO is absent.
-pytest_plugins = ('shared.pytest_jobserver',)
-
 
 def build_usage_gate(
     account_configs: list[AccountConfig],
