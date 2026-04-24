@@ -21,7 +21,6 @@ import pytest
 from orchestrator.config import GitConfig
 from orchestrator.harness import Harness
 
-
 # ---------------------------------------------------------------------------
 # Shared fixture
 # ---------------------------------------------------------------------------
@@ -103,16 +102,16 @@ async def test_startup_noprd_uses_get_statuses_to_check_pending(
     # Signal "no tasks" via both mocks.
     # Pre-migration: get_tasks returns [] → any(...) is False → RuntimeError.
     # Post-migration: get_statuses returns {} → 'pending' not in values → RuntimeError.
-    h.scheduler.get_tasks.return_value = []
-    h.scheduler.get_statuses.return_value = {}
+    h.scheduler.get_tasks.return_value = []  # type: ignore[attr-defined]
+    h.scheduler.get_statuses.return_value = {}  # type: ignore[attr-defined]
 
     with pytest.raises(RuntimeError, match='No PRD given and no pending tasks found'):
         await h.run(prd_path=None)
 
     # After migration: get_statuses used for the check.
-    h.scheduler.get_statuses.assert_called()
+    h.scheduler.get_statuses.assert_called()  # type: ignore[attr-defined]
     # After migration: get_tasks NOT called in the startup block.
-    h.scheduler.get_tasks.assert_not_called()
+    h.scheduler.get_tasks.assert_not_called()  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +129,7 @@ async def test_startup_total_tasks_counted_via_get_statuses(
     """
     h = startup_harness
     # Three tasks: two pending, one done.
-    h.scheduler.get_statuses.return_value = {
+    h.scheduler.get_statuses.return_value = {  # type: ignore[attr-defined]
         '1': 'pending',
         '2': 'done',
         '3': 'pending',
@@ -141,7 +140,7 @@ async def test_startup_total_tasks_counted_via_get_statuses(
 
     assert h.report.total_tasks == 2
     # After migration: get_tasks never called for the startup block.
-    h.scheduler.get_tasks.assert_not_called()
+    h.scheduler.get_tasks.assert_not_called()  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +161,7 @@ async def test_populate_prd_uses_get_statuses_for_pre_ids(
     prd.write_text('# PRD')
 
     h = startup_harness
-    h.scheduler.get_statuses.return_value = {
+    h.scheduler.get_statuses.return_value = {  # type: ignore[attr-defined]
         '10': 'done',
         '20': 'pending',
     }
@@ -180,7 +179,7 @@ async def test_populate_prd_uses_get_statuses_for_pre_ids(
 
     assert captured_pre_ids == {'10', '20'}
     # After migration: get_tasks NOT called for the pre_ids snapshot.
-    h.scheduler.get_tasks.assert_not_called()
+    h.scheduler.get_tasks.assert_not_called()  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
