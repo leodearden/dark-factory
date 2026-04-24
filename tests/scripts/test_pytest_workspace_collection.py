@@ -118,3 +118,35 @@ def test_no_tests_namespace_imports_in_subproject_tests() -> None:
         + 'Offenders:\n'
         + '\n'.join(f'  {o}' for o in offenders)
     )
+
+
+def test_no_subproject_tests_init_py() -> None:
+    """No subproject tests/ directory may contain an __init__.py file.
+
+    Under --import-mode=importlib, pytest assigns each conftest.py a unique
+    importlib-generated module name *only when* tests/ is NOT a Python package.
+    Any __init__.py in tests/ causes pytest to treat it as a package, forcing
+    the `tests.conftest` module name — which collides across subprojects.
+
+    The seven paths below are the ones that existed before this refactor.
+    If any are present, pytest root-collection will fail with:
+      ValueError: Plugin already registered: conftest (tests.conftest)
+    """
+    _INIT_PY_PATHS = [
+        REPO_ROOT / 'dashboard' / 'tests' / '__init__.py',
+        REPO_ROOT / 'escalation' / 'tests' / '__init__.py',
+        REPO_ROOT / 'fused-memory' / 'tests' / '__init__.py',
+        REPO_ROOT / 'orchestrator' / 'tests' / '__init__.py',
+        REPO_ROOT / 'shared' / 'tests' / '__init__.py',
+        REPO_ROOT / 'tests' / '__init__.py',
+        REPO_ROOT / 'tests' / 'scripts' / '__init__.py',
+    ]
+
+    present = [str(p.relative_to(REPO_ROOT)) for p in _INIT_PY_PATHS if p.exists()]
+
+    assert not present, (
+        'The following tests/__init__.py files must be removed '
+        '(they cause tests.conftest namespace collision under --import-mode=importlib):\n'
+        + '\n'.join(f'  {p}' for p in present)
+        + '\n\nDelete them with: git rm ' + ' '.join(present)
+    )
