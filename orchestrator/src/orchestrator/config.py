@@ -479,6 +479,19 @@ class OrchestratorConfig(BaseSettings):
     max_merge_retries: int = Field(default=3)
     inter_iteration_rebase: bool = Field(default=True)
     requeue_cooldown_secs: float = Field(default=30.0)
+    requeue_cap: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Max WorkflowOutcome.REQUEUED iterations per task before '
+            'L1-escalating to a human.  Prevents tight requeue loops from '
+            'burning budget when the steward repeatedly resolves the same '
+            'transient failure.  Counter is per task_id and process-local: '
+            'orchestrator restart resets it.  A DONE outcome clears the '
+            'counter; triggering cap-exhaustion also clears it so a human '
+            'resolution starts from zero.'
+        ),
+    )
 
     # Verification timeouts
     verify_command_timeout_secs: float = Field(default=1800.0)

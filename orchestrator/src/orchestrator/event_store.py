@@ -80,6 +80,10 @@ class EventType(StrEnum):
     # Plan revalidation
     plan_revalidated = 'plan_revalidated'
 
+    # Retry cap — per-task REQUEUED counter exceeded; emitted once per
+    # cap-exhaustion event by Scheduler.trigger_retry_cap_exhausted.
+    retry_cap_exhausted = 'retry_cap_exhausted'
+
 
 class EventStore:
     """Append-only SQLite event store.

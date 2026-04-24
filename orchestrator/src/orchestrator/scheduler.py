@@ -10,6 +10,8 @@ import statistics
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Protocol
 
 from shared.locking import files_to_modules, normalize_lock
@@ -38,10 +40,86 @@ __all__ = [
     'normalize_lock',
     'files_to_modules',
     'McpSessionLike',
+    'RequeueRecord',
     'TaskAssignment',
     'ModuleLockTable',
     'Scheduler',
 ]
+
+
+@dataclass(frozen=True)
+class RequeueRecord:
+    """A single REQUEUED outcome for a task, tracked for the retry cap.
+
+    Instances accumulate in ``Scheduler._requeue_history`` until a DONE
+    outcome clears them or the cap is hit and a cap-exhaust escalation is
+    submitted.  Fields mirror the cap-exhaust report layout.
+    """
+
+    attempt: int
+    phase: str
+    reason: str
+    detail: str
+    run_id: str
+    cost_usd: float
+    timestamp: float
+
+
+def _render_retry_cap_report(
+    *,
+    task_id: str,
+    run_id: str,
+    cap: int,
+    history: list[RequeueRecord],
+    cost_usd: float,
+) -> str:
+    """Render the markdown report artifact for a retry-cap exhaustion event.
+
+    Progressive-disclosure layout: header with totals, per-attempt timeline,
+    then a documented SQL query for digging deeper into the event_store.
+    """
+    exhausted_at = datetime.now(UTC).isoformat()
+    lines = [
+        f'# Retry Cap Exhausted: task {task_id}',
+        '',
+        f'- **Run ID:** {run_id}',
+        f'- **Cap:** {cap}',
+        f'- **Attempts recorded:** {len(history)}',
+        f'- **Cost-to-date (this run):** ${cost_usd:.2f}',
+        f'- **Exhausted at:** {exhausted_at}',
+        '',
+        '## Timeline',
+        '',
+    ]
+    if not history:
+        lines.append('_No attempts recorded._')
+        lines.append('')
+    for record in history:
+        iso = datetime.fromtimestamp(record.timestamp, UTC).isoformat()
+        lines.extend([
+            f'### Attempt {record.attempt} — phase={record.phase} at {iso}',
+            '- **Outcome:** REQUEUED',
+            f'- **Block reason:** {record.reason}',
+            f'- **Block detail:** {record.detail[:500]}',
+            f'- **Cost (this attempt):** ${record.cost_usd:.2f}',
+            '',
+        ])
+    lines.extend([
+        '## Dig deeper',
+        '',
+        f'Full phase/outcome stream for task `{task_id}` in run `{run_id}`:',
+        '',
+        '```sql',
+        '-- Run from the project root:',
+        'sqlite3 data/orchestrator/runs.db \\',
+        "  \"SELECT timestamp, event_type, phase, role, data \\",
+        "   FROM events \\",
+        f"   WHERE task_id='{task_id}' AND run_id='{run_id}' \\",
+        '   ORDER BY timestamp\"',
+        '```',
+        '',
+    ])
+    return '\n'.join(lines)
 
 
 class McpSessionLike(Protocol):
@@ -284,6 +362,12 @@ class Scheduler:
         self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
         self._fallback_warned: set[str] = set()  # task IDs already warned about fallback
         self._requeue_until: dict[str, float] = {}  # task_id -> monotonic deadline
+        # Per-task retry-cap tracking.  Count of REQUEUED outcomes since the
+        # last DONE (or cap-exhaust); history is the per-attempt record used
+        # by the cap-exhaust escalation report.  Both are process-local — an
+        # orchestrator restart is an acceptable implicit reset.
+        self._requeue_counts: dict[str, int] = {}
+        self._requeue_history: dict[str, list[RequeueRecord]] = {}
         # --- Fairness state (see orchestrator.config.FairnessConfig) ---
         self._skip_count: dict[str, int] = {}  # task_id -> consecutive top-skip count
         self._task_start_times: dict[str, float] = {}  # task_id -> monotonic start
@@ -1015,6 +1099,162 @@ class Scheduler:
                 task_id=task_id,
                 data={'modules': modules},
             )
+
+    # --- Retry cap (per-task REQUEUED counter) ---
+
+    def record_requeue(
+        self,
+        task_id: str,
+        *,
+        phase: str,
+        reason: str,
+        detail: str,
+        run_id: str,
+        cost_usd: float,
+    ) -> int:
+        """Append a requeue record and return the new cumulative count.
+
+        Called by the harness from ``_run_slot`` when a workflow returns
+        ``WorkflowOutcome.REQUEUED``.  The returned count is compared against
+        ``config.requeue_cap`` to decide whether to trigger cap exhaustion.
+        """
+        count = self._requeue_counts.get(task_id, 0) + 1
+        self._requeue_counts[task_id] = count
+        self._requeue_history.setdefault(task_id, []).append(
+            RequeueRecord(
+                attempt=count,
+                phase=phase,
+                reason=reason,
+                detail=detail,
+                run_id=run_id,
+                cost_usd=cost_usd,
+                timestamp=time.time(),
+            )
+        )
+        return count
+
+    def clear_requeue_count(self, task_id: str) -> None:
+        """Clear the requeue counter and history for *task_id*.
+
+        Invoked on a DONE outcome (task recovered) and at the end of
+        ``trigger_retry_cap_exhausted`` (human-resolution starts from zero).
+        """
+        self._requeue_counts.pop(task_id, None)
+        self._requeue_history.pop(task_id, None)
+
+    async def trigger_retry_cap_exhausted(
+        self,
+        task_id: str,
+        *,
+        run_id: str,
+        cost_usd: float,
+        escalation_queue=None,
+        reports_dir: Path | None = None,
+    ) -> Path | None:
+        """Handle cap exhaustion: write report, set blocked, submit L1 escalation.
+
+        Args:
+            task_id: Task whose requeue counter hit the cap.
+            run_id: Orchestrator run for the report header + SQL hint.
+            cost_usd: Cost for the current run's attempts (harness passes
+                either the cumulative run-level cost or the current-attempt
+                cost from the RunStore).
+            escalation_queue: The shared ``EscalationQueue``; when None, the
+                escalation step is skipped (tests inject a stub or None).
+            reports_dir: Where to write the markdown report.  Defaults to
+                ``<project_root>/data/orchestrator/retry_cap_reports/``.
+
+        Returns the report path written, or None when writing fails.
+        """
+        history = list(self._requeue_history.get(task_id, ()))
+        cap = self.config.requeue_cap
+        n_attempts = len(history)
+        last_reason = history[-1].reason if history else 'unknown'
+
+        if reports_dir is None:
+            reports_dir = (
+                Path(self.config.project_root)
+                / 'data' / 'orchestrator' / 'retry_cap_reports'
+            )
+        report_path: Path | None = None
+        try:
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            report_path = reports_dir / f'{task_id}_{run_id}.md'
+            report_path.write_text(
+                _render_retry_cap_report(
+                    task_id=task_id,
+                    run_id=run_id,
+                    cap=cap,
+                    history=history,
+                    cost_usd=cost_usd,
+                )
+            )
+        except Exception:
+            logger.exception(
+                'Failed to write retry-cap report for task %s (run %s)',
+                task_id, run_id,
+            )
+            report_path = None
+
+        # Best-effort set blocked BEFORE escalating so a resume-on-L1 flow
+        # (pending→unblock) doesn't race an acquire.
+        try:
+            await self.set_task_status(task_id, 'blocked')
+        except Exception:
+            logger.exception(
+                'Failed to set task %s status to blocked on retry-cap exhaust',
+                task_id,
+            )
+
+        if self.event_store:
+            self.event_store.emit(
+                EventType.retry_cap_exhausted,
+                task_id=task_id,
+                cost_usd=cost_usd,
+                data={
+                    'requeue_count': n_attempts,
+                    'cap': cap,
+                    'last_reason': last_reason[:200],
+                    'report_path': str(report_path) if report_path else '',
+                },
+            )
+
+        if escalation_queue is not None:
+            try:
+                from escalation.models import Escalation
+                summary = (
+                    f'Retry cap hit: {n_attempts} REQUEUED iterations '
+                    f'(cap={cap}); last reason: {last_reason[:120]}'
+                )
+                detail_lines = [
+                    f'Task {task_id} exceeded requeue cap after {n_attempts} '
+                    f'REQUEUED outcomes (cap={cap}).',
+                    f'Run: {run_id}',
+                    f'Cost-to-date: ${cost_usd:.2f}',
+                    f'Last reason: {last_reason}',
+                ]
+                if report_path is not None:
+                    detail_lines.append(f'See report: {report_path}')
+                esc = Escalation(
+                    id=escalation_queue.make_id(task_id),
+                    task_id=task_id,
+                    agent_role='orchestrator',
+                    severity='blocking',
+                    category='retry_cap_exhausted',
+                    summary=summary[:200],
+                    detail='\n'.join(detail_lines),
+                    suggested_action='investigate_and_retry',
+                    level=1,
+                )
+                escalation_queue.submit(esc)
+            except Exception:
+                logger.exception(
+                    'Failed to submit L1 escalation for task %s retry-cap exhaust',
+                    task_id,
+                )
+
+        self.clear_requeue_count(task_id)
+        return report_path
 
     def _get_modules(self, task: dict) -> list[str]:
         """Extract module list from task metadata, normalized for locking.

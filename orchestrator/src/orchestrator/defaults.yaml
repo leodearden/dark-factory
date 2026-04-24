@@ -21,6 +21,12 @@ max_pre_merge_retries: 2
 max_merge_retries: 3
 inter_iteration_rebase: true
 
+# Per-task retry cap — max WorkflowOutcome.REQUEUED iterations before L1
+# escalation.  Backstop against tight steward→REQUEUED loops (e.g. architect
+# returns empty output every time, steward classes it as transient).
+# Process-local; orchestrator restart resets it.
+requeue_cap: 3
+
 # Verification timeouts
 verify_command_timeout_secs: 1800
 # Cold-build timeout: used for the *first* verify in a freshly created worktree

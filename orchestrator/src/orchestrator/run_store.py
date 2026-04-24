@@ -133,6 +133,28 @@ class RunStore:
             f'({task_report.outcome.value}) for run {run_id}'
         )
 
+    def get_task_cost(self, run_id: str, task_id: str) -> float:
+        """Return latest persisted ``cost_usd + steward_cost_usd`` for a task.
+
+        Only the most recent ``save_task_result`` row is retained per
+        ``(run_id, task_id)`` — prior requeue attempts are overwritten.
+        Returns ``0.0`` when no row exists.
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            cur = conn.execute(
+                'SELECT cost_usd, steward_cost_usd FROM task_results '
+                'WHERE run_id = ? AND task_id = ?',
+                (run_id, task_id),
+            )
+            row = cur.fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return 0.0
+        cost_usd, steward_cost_usd = row
+        return float(cost_usd or 0.0) + float(steward_cost_usd or 0.0)
+
     def finish_run(
         self,
         run_id: str,

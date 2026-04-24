@@ -269,6 +269,13 @@ class TaskWorkflow:
         self._merge_sha: str | None = None  # merge commit SHA set by _submit_to_merge_queue on success
         self._last_completed_role: str | None = None  # role of the last successfully-completed invocation
         self._last_verify_result: VerifyResult | None = None  # most recent failing VerifyResult from _verify_debugfix_loop
+        # Block-reason surfacing for the harness-level retry cap.  Populated
+        # when _mark_blocked takes the REQUEUED return path; the harness reads
+        # these after workflow.run() returns to decide whether to increment
+        # the per-task requeue counter.
+        self._last_block_reason: str = ''
+        self._last_block_detail: str = ''
+        self._last_block_phase: str = ''
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -2699,6 +2706,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 self.task_id, reason,
             )
             return WorkflowOutcome.DONE
+        # Capture the phase we were in before transitioning to BLOCKED so the
+        # harness-level retry cap can report *which* phase looped.  _enter_phase
+        # overwrites self.state, so stash first.
+        self._last_block_phase = self.state.value
+        self._last_block_reason = reason
+        self._last_block_detail = detail or reason
         if not merge_phase:
             self._enter_phase(WorkflowState.BLOCKED)
             await self.scheduler.set_task_status(self.task_id, 'blocked')
