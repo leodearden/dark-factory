@@ -366,6 +366,51 @@ class TestGetTasksExceptionLogging:
         assert 'Traceback' in caplog.text
 
 
+class TestParseToolTextResultWarning:
+    """_parse_tool_text_result must emit a WARNING when JSON parsing fails.
+
+    A malformed text block should still return None (preserving existing
+    contract) but must log a WARNING containing a ≤200-char prefix of the
+    offending text so operators can identify the source of bad output.
+    """
+
+    def test_invalid_json_returns_none_and_logs_warning(self, caplog):
+        import logging as _logging
+
+        # Build a long invalid-JSON payload so we can validate truncation.
+        bad_text = 'not valid json payload ' * 30  # 23*30 = 690 chars
+        result_envelope = {
+            'result': {
+                'content': [
+                    {'type': 'text', 'text': bad_text},
+                ]
+            }
+        }
+
+        with caplog.at_level(_logging.WARNING, logger='orchestrator.scheduler'):
+            value = Scheduler._parse_tool_text_result(result_envelope, 'tasks')
+
+        # (1) Return contract is preserved.
+        assert value is None
+
+        # (2) A WARNING is emitted.
+        warnings = [r for r in caplog.records if r.levelno == _logging.WARNING]
+        assert warnings, f'Expected a WARNING log. Records: {[r.message for r in caplog.records]}'
+
+        warning_text = ' '.join(r.getMessage() for r in warnings)
+
+        # (3) The log contains a truncated prefix of the offending text.
+        truncated_prefix = bad_text[:200]
+        assert truncated_prefix in warning_text, (
+            f'Expected log to contain truncated text prefix. Got: {warning_text}'
+        )
+
+        # (4) The full original text is NOT present in the log (validates truncation).
+        assert bad_text not in warning_text, (
+            'Full (690-char) text must NOT appear in log — only the truncated ≤200-char prefix.'
+        )
+
+
 class TestAcquireNextNoDuplicates:
     """acquire_next() must not return the same task twice while its locks are held."""
 
