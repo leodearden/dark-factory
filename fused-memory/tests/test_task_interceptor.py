@@ -1126,6 +1126,100 @@ async def test_idempotency_hit_skips_curator_and_returns_existing(
 
 
 @pytest.mark.asyncio
+async def test_idempotency_hit_via_submit_task_direct(
+    taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
+):
+    """R4: direct submit_task → resolve_ticket path dedupes on idempotency hit.
+
+    Confirms that the R4 gate fires when the caller uses submit_task directly
+    (the path the STEWARD now takes) rather than the deprecated add_task facade.
+    resolve_ticket must return status='combined' with the existing task_id and
+    reason='idempotency_hit'; curator must not be consulted; tm.add_task must
+    not be called.
+    """
+    from fused_memory.middleware.ticket_store import TicketStore
+
+    # Seed an existing non-cancelled task with the idempotency keys.
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {
+                'id': '555',
+                'title': 'Existing pre-triaged task',
+                'status': 'pending',
+                'metadata': {
+                    'escalation_id': 'esc-968',
+                    'suggestion_hash': 'h968h968h968h968',
+                },
+            },
+        ],
+    })
+
+    curator_mock = _mock_curator(CuratorDecision(action='create', justification='novel'))
+
+    store = TicketStore(tmp_path / 'idemp_submit_tickets.db')
+    await store.initialize()
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=curator_enabled_config,
+        ticket_store=store,
+    )
+    interceptor._curator = curator_mock
+
+    try:
+        # Phase 1: submit_task returns {'ticket': 'tkt_...'} immediately.
+        submit_result = await interceptor.submit_task(
+            '/project',
+            title='T',
+            description='D',
+            metadata={
+                'escalation_id': 'esc-968',
+                'suggestion_hash': 'h968h968h968h968',
+                'modules': ['orchestrator/src/orchestrator/agents'],
+            },
+        )
+        assert isinstance(submit_result, dict), (
+            f'submit_task should return a dict, got {submit_result!r}'
+        )
+        assert 'ticket' in submit_result, (
+            f'submit_task should return {{ticket: tkt_...}}, got {submit_result!r}'
+        )
+        ticket = submit_result['ticket']
+        assert ticket.startswith('tkt_'), (
+            f'ticket id should start with tkt_, got {ticket!r}'
+        )
+
+        # Phase 2: resolve_ticket waits for the worker and returns the R4 decision.
+        result = await interceptor.resolve_ticket(ticket, '/project', timeout_seconds=5.0)
+    finally:
+        await store.close()
+        for _wt in list(interceptor._worker_tasks.values()):
+            if not _wt.done():
+                _wt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _wt
+
+    # Guard: fail loudly if the worker timed out instead of resolving via R4,
+    # so a future regression where the R4 gate is bypassed surfaces as
+    # 'timed out waiting for worker' rather than an opaque 'combined' mismatch.
+    assert result.get('reason') != 'timeout', (
+        f'Worker timed out before returning R4 decision — possible regression '
+        f'where R4 gate is bypassed or worker stalled: {result!r}'
+    )
+    assert result.get('status') == 'combined', (
+        f"resolve_ticket should return status='combined' on R4 hit, got {result!r}"
+    )
+    assert result.get('task_id') == '555', (
+        f"resolve_ticket should return task_id of existing task, got {result!r}"
+    )
+    assert result.get('reason') == 'idempotency_hit', (
+        f"resolve_ticket should return reason='idempotency_hit', got {result!r}"
+    )
+    # Curator must not have been consulted — R4 short-circuits before curator.
+    curator_mock.curate.assert_not_called()
+    # tm.add_task must not have been called — no new task was created.
+    taskmaster.add_task.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_idempotency_accepts_metadata_as_json_string(
     taskmaster, reconciler, event_buffer, curator_enabled_config, tmp_path,
 ):
@@ -2447,6 +2541,13 @@ async def test_two_projects_do_not_serialise(
     tracker = _OverlapTracker()
     assert resolve_project_id('/projA') != resolve_project_id('/projB')
 
+    # Events for guaranteed rendezvous: each project signals when it has
+    # entered tm.add_task and waits for the other project to also be in-flight.
+    # This replaces the previous timing-based approach (50 sleep(0) iterations)
+    # which was flaky under heavy CI load (16 xdist workers).
+    projA_entered = asyncio.Event()
+    projB_entered = asyncio.Event()
+
     async def side_effect(**kwargs):
         pr = kwargs.get('project_root', '')
         key = resolve_project_id(pr)
@@ -2454,14 +2555,15 @@ async def test_two_projects_do_not_serialise(
         tracker._global_in_flight += 1
         tracker.total_peak = max(tracker.total_peak, tracker._global_in_flight)
         try:
-            # Enough ticks for the other project's task to enter.
-            # aiosqlite's background thread needs multiple event-loop ticks to
-            # complete ticket_store.get() (execute + fetchone, each routed
-            # through the thread executor).  Under system load (e.g. 16 xdist
-            # workers in parallel), the thread takes longer; 50 iterations gives
-            # comfortable margin even on a heavily loaded CI machine.
-            for _ in range(50):
-                await asyncio.sleep(0)
+            # Signal this project's entry and wait for the other project to
+            # enter too — guaranteeing true simultaneous overlap (total_peak==2)
+            # without relying on event-loop scheduling timing.
+            if key == resolve_project_id('/projA'):
+                projA_entered.set()
+                await asyncio.wait_for(projB_entered.wait(), timeout=10.0)
+            else:
+                projB_entered.set()
+                await asyncio.wait_for(projA_entered.wait(), timeout=10.0)
             return {'id': '1', 'title': kwargs.get('title', '')}
         finally:
             tracker.in_flight[key] -= 1

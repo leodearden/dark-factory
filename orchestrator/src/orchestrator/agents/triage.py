@@ -229,20 +229,31 @@ def format_pretriaged_detail(
             '',
             f'ESCALATION_ID: `{escalation_id}`',
             '',
-            'When you call `submit_task` for a group below, include this '
-            'metadata JSON so the interceptor can dedupe re-queued '
-            'triages (see plan R4):',
+            'When you call `submit_task` for a group below, pass the '
+            '`metadata=` kwarg with the R4 idempotency keys so the '
+            'interceptor can dedupe re-queued triages (see plan R4). '
+            'These keys are *additions* to the base stamps your role prompt '
+            'already describes (source, spawn_context, spawned_from, etc.):',
             '',
-            '```json',
-            '{"escalation_id": "' + escalation_id + '", '
-            '"suggestion_hash": "<hash from the group header>", '
-            '"modules": ["<file-or-module paths>"]}',
+            '```python',
+            'submit_task(',
+            '    title=..., description=..., priority=...,',
+            '    metadata={',
+            f'        "escalation_id": "{escalation_id}",',
+            '        "suggestion_hash": "<hash from the group header>",',
+            '        "modules": ["<file-or-module paths>"],',
+            '        # plus your base role stamps: source, spawn_context, etc.',
+            '    },',
+            '    project_root=...,',
+            ')',
             '```',
             '',
-            'Before creating, the fused-memory interceptor will check '
-            '`(escalation_id, suggestion_hash)` against existing tasks '
-            'and return the existing task id if a match is found — you '
-            'do not need to search for duplicates yourself.',
+            'Before the curator runs, the fused-memory interceptor will check '
+            '`(escalation_id, suggestion_hash)` against existing '
+            'non-cancelled tasks. On a match, `resolve_ticket` returns '
+            "`status='combined'` with `task_id` pointing at the existing "
+            'task — record it the same way as `created`. '
+            'You do not need to search for duplicates yourself.',
             '',
         ])
 
