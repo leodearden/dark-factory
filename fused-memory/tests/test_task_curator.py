@@ -1565,3 +1565,102 @@ class TestBatchTargetIndex:
         assert result[1].action == 'create'
         assert 'batch-cycle' in result[0].justification
         assert 'batch-cycle' in result[1].justification
+
+
+# ----------------------------------------------------------------------
+# curate_batch: batch_target_index remap from unique-space to original-space
+# ----------------------------------------------------------------------
+
+
+class TestCurateBatchBatchTargetIndexRemap:
+    """Regression for reviewer_comprehensive/data_correctness finding.
+
+    When ``unique_indices`` is non-contiguous (due to pre-batch dedup),
+    a within-batch ``batch_target_index`` emitted by the LLM is in
+    *unique-space* (positions 0..K-1).  The merge site must remap it to
+    *original-space* (positions in the full ``candidates`` list) before
+    returning, because ``_process_add_tickets_batch`` keys
+    ``resolved_task_ids`` by original-space index.
+    """
+
+    @pytest.mark.asyncio
+    async def test_batch_target_index_remapped_to_original_space_when_unique_indices_noncontiguous(
+        self,
+    ):
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        # Six candidates: [A, B, A(dup), C, B(dup), D]
+        # payload_hash groups: A={0,2}, B={1,4}, C={3}, D={5}
+        A1 = CandidateTask(title='A', description='group-a')
+        B1 = CandidateTask(title='B', description='group-b')
+        A2 = CandidateTask(title='A', description='group-a')  # dup of A1
+        C = CandidateTask(title='C', description='group-c')
+        B2 = CandidateTask(title='B', description='group-b')  # dup of B1
+        D = CandidateTask(title='D', description='group-d')
+
+        # Verify payload_hash groupings
+        assert A1.payload_hash() == A2.payload_hash()
+        assert B1.payload_hash() == B2.payload_hash()
+        assert A1.payload_hash() != B1.payload_hash()
+        assert C.payload_hash() not in {
+            A1.payload_hash(), B1.payload_hash(), D.payload_hash(),
+        }
+
+        # Pre-batch dedup produces:
+        #   unique_indices = [0, 1, 3, 5]
+        #   pre_dedup_decisions = {2: drop→0, 4: drop→1}
+        # The LLM sees unique_candidates = [A1, B1, C, D] (positions 0..3).
+        #
+        # LLM emits batch_target_index=2 for D, meaning "position 2 in
+        # unique-space" = C.  After remapping, original-space index of C is
+        # unique_indices[2] = 3.
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        batch_result = AgentResult(
+            success=True,
+            output='',
+            structured_output={'decisions': [
+                {'candidate_index': 0, 'action': 'create', 'justification': 'A'},
+                {'candidate_index': 1, 'action': 'create', 'justification': 'B'},
+                {'candidate_index': 2, 'action': 'create', 'justification': 'C'},
+                {'candidate_index': 3, 'action': 'drop', 'batch_target_index': 2,
+                 'justification': 'D dups C within batch'},
+            ]},
+            cost_usd=0.04,
+        )
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=batch_result)):
+            decisions = await curator.curate_batch([A1, B1, A2, C, B2, D], 'p', '/x')
+
+        # (a) correct length
+        assert len(decisions) == 6
+
+        # (b) D (original index 5): batch_target_index must be ORIGINAL-space
+        #     index of C (=3), NOT unique-space 2 (which maps to A2, the
+        #     duplicate at original index 2).
+        assert decisions[5].action == 'drop'
+        assert decisions[5].batch_target_index == 3, (
+            f'Expected original-space index 3 (C), got {decisions[5].batch_target_index!r} '
+            '(unique-space 2 = A2 is wrong)'
+        )
+        # (c) still a within-batch drop (no existing task)
+        assert decisions[5].target_id is None
+
+        # (d) pre-dedup decisions: already in original-space — must be untouched
+        assert decisions[2].action == 'drop'
+        assert decisions[2].batch_target_index == 0  # A2 → A1 (original index 0)
+        assert decisions[4].action == 'drop'
+        assert decisions[4].batch_target_index == 1  # B2 → B1 (original index 1)
+
+        # (e) sanity on unique candidates
+        assert decisions[0].action == 'create'
+        assert decisions[1].action == 'create'
+        assert decisions[3].action == 'create'
+
+        # Second regression assertion: downstream consumer's lookup works correctly.
+        resolved_task_ids = {3: 'task-for-C', 0: 'task-for-A'}
+        assert resolved_task_ids.get(decisions[5].batch_target_index) == 'task-for-C'
