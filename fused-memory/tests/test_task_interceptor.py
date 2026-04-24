@@ -3630,3 +3630,84 @@ async def test_parse_prd_removes_intra_batch_duplicates(
 
     # curator.curate called exactly twice (unique survivors only, not 3)
     assert curator_interceptor._curator.curate.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_expand_task_intra_batch_remove_is_locked(
+    reconciler, event_buffer,
+):
+    """WP-E: the intra-batch remove_task in _dedupe_bulk_created acquires
+    the per-project write_lock, so it cannot overlap with concurrent
+    mutations (e.g. add_task) on the same project.
+
+    Modelled on test_expand_task_dedup_mutations_are_locked.
+    """
+    tracker = _OverlapTracker()
+
+    tm = AsyncMock()
+
+    async def _mut(kind, retval):
+        tracker.in_flight['p'] = tracker.in_flight.get('p', 0) + 1
+        tracker.peak['p'] = max(
+            tracker.peak.get('p', 0), tracker.in_flight['p'],
+        )
+        try:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return retval
+        finally:
+            tracker.in_flight['p'] -= 1
+
+    async def expand_side(*a, **k):
+        return await _mut('expand', {'subtasks': []})
+
+    async def add_side(**k):
+        return await _mut('add', {'id': '99', 'title': 'x'})
+
+    async def remove_side(*a, **k):
+        return await _mut('remove', {'success': True})
+
+    async def get_task_side(*a, **k):
+        await asyncio.sleep(0)
+        return {'id': '1', 'status': 'pending', 'title': 'T'}
+
+    # Two-call get_tasks: pre-snapshot (empty) then post-snapshot with two
+    # intra-batch duplicates so the pre-pass fires remove_task.
+    parent_task = {'id': '1', 'title': 'T', 'status': 'pending'}
+    pre_snapshot = {'tasks': [parent_task]}
+    post_snapshot = {'tasks': [{
+        **parent_task,
+        'subtasks': [
+            {'id': '1.1', 'title': 'Dup task', 'description': 'same'},
+            {'id': '1.2', 'title': 'DUP TASK', 'description': ' same '},
+        ],
+    }]}
+
+    tm.get_tasks = AsyncMock(side_effect=[pre_snapshot, post_snapshot])
+    tm.get_task = AsyncMock(side_effect=get_task_side)
+    tm.expand_task = AsyncMock(side_effect=expand_side)
+    tm.add_task = AsyncMock(side_effect=add_side)
+    tm.remove_task = AsyncMock(side_effect=remove_side)
+    tm.ensure_connected = AsyncMock()
+
+    interceptor = TaskInterceptor(tm, reconciler, event_buffer)
+
+    # Fire expand (which will trigger intra-batch remove for the dup) +
+    # a concurrent add_task. The lock must prevent remove_task and the
+    # tracked mutations from overlapping.
+    results = await asyncio.gather(
+        interceptor.expand_task('1', '/project'),
+        interceptor.add_task('/project', title='concurrent add'),
+    )
+
+    assert results[0] is not None
+    assert results[1] is not None
+
+    # The intra-batch remove_task for '1.2' should have been called.
+    tm.remove_task.assert_awaited_once_with('1.2', '/project')
+
+    # Peak must be 1: no overlap between expand, intra-batch remove_task,
+    # and any concurrent tracked mutation.
+    assert tracker.peak.get('p', 0) == 1, (
+        f'overlap detected during expand + intra-batch remove: peak={tracker.peak}'
+    )
