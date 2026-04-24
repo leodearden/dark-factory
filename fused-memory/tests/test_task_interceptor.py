@@ -3834,14 +3834,12 @@ async def test_dedupe_bulk_blank_title_tasks_bypass_intra_batch_pre_pass(
     and subsequent malformed subtasks would be incorrectly removed.  The guard
     passes them straight through so both tasks reach pass-2.
 
-    Note: pass-2's own empty-title short-circuit (``if not candidate.title:``)
-    only catches the empty string, not whitespace-only titles (truthiness:
-    bool('   ') is True).  So the curator IS called for both whitespace tasks;
-    with the mock returning CuratorDecision(action='create') both end up in
-    `kept`.  The asymmetry between pass-1 (title.strip()) and pass-2
-    (candidate.title) is tracked as a follow-up — this test verifies the
-    pass-1 bypass specifically and the overall contract that blank-title tasks
-    are not lost or collapsed.
+    Pass-1 uses ``if not title.strip():`` and pass-2 uses
+    ``if not candidate.title.strip():``, so both passes reject empty and
+    whitespace-only titles symmetrically.  Whitespace tasks bypass pass-1's
+    hash-collapse and short-circuit in pass-2 before reaching the curator,
+    landing in ``kept`` without any curator call or removal.  This is the
+    resolution of the formerly-tracked pass-1/pass-2 asymmetry.
     """
     PROJECT = '/project'
     post_snapshot = {'tasks': [
@@ -3875,13 +3873,12 @@ async def test_dedupe_bulk_blank_title_tasks_bypass_intra_batch_pre_pass(
         f'remove_task should not have been called: {taskmaster.remove_task.call_args_list}'
     )
 
-    # (e) curator.curate WAS called once per task (pass-2's empty-title
-    # short-circuit only catches the empty string, not whitespace-only titles,
-    # so both tasks reach the curator).  The mock returns action='create' so
-    # both still end up in `kept` — no removal, no error, contract preserved.
-    assert curator_interceptor._curator.curate.await_count == 2, (
-        f'curate should have been called once per whitespace task: '
-        f'{curator_interceptor._curator.curate.call_args_list}'
+    # (e) pass-2's blank-title short-circuit (``if not candidate.title.strip():``)
+    # catches whitespace-only titles, so the curator is never invoked for these
+    # tasks; they still land in `kept` via the short-circuit's own kept.append.
+    assert curator_interceptor._curator.curate.await_count == 0, (
+        f'pass-2 blank-title short-circuit must prevent curator calls for '
+        f'whitespace titles: {curator_interceptor._curator.curate.call_args_list}'
     )
 
 
