@@ -109,6 +109,14 @@ async def _check_plan_targets_in_tree(
     # Cross-reference missing files against intentional deletions performed
     # by done plan-steps.  A file absent from the merge tree but deleted by
     # a done step is "expected absent" and should NOT be flagged as a drop.
+    #
+    # Uses `git diff-tree --no-renames -r <sha>^ <sha>` rather than
+    # `git show` to:
+    #   (a) force a two-way diff against the first parent on merge commits —
+    #       git show defaults to combined-diff which silences deletions, and
+    #   (b) disable rename detection so renamed plan files correctly surface
+    #       as expected_absent (git show with renames converts D+A to R,
+    #       which --diff-filter=D does not match).
     expected_absent: set[str] = set()
     for step_idx, step in enumerate(plan.get('steps') or []):
         if step.get('status') != 'done':
@@ -118,17 +126,19 @@ async def _check_plan_targets_in_tree(
             continue
         rc, stdout, stderr = await _run(
             [
-                'git', 'show',
+                'git', 'diff-tree',
+                '--no-renames',
                 '--diff-filter=D',
                 '--name-only',
-                '--format=',
+                '-r',
+                f'{commit}^',
                 commit,
             ],
             cwd=git_ops.project_root,
         )
         if rc != 0:
             logger.warning(
-                'git show --diff-filter=D failed for step %d commit %s: %s',
+                'git diff-tree --diff-filter=D failed for step %d commit %s: %s',
                 step_idx, commit, stderr.strip(),
             )
             continue
