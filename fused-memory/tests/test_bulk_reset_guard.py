@@ -30,7 +30,11 @@ from pathlib import Path
 
 import pytest
 
-from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard, BulkResetVerdict, _reversal_kind
+from fused_memory.reconciliation.bulk_reset_guard import (
+    BulkResetGuard,
+    BulkResetVerdict,
+    _reversal_kind,
+)
 
 # ---------------------------------------------------------------------------
 # step-1: ReconciliationConfig defaults
@@ -80,7 +84,7 @@ def test_guard_constructor_accepts_split_thresholds(tmp_path):
 
     # (b) Legacy ``threshold=`` kwarg must be rejected.
     with pytest.raises(TypeError, match="threshold"):
-        BulkResetGuard(threshold=10, window_seconds=60.0)
+        BulkResetGuard(threshold=10, window_seconds=60.0)  # type: ignore[call-arg]
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +648,7 @@ async def test_escalation_filename_and_body_include_kind(tmp_path):
         time_provider=fake_clock,
         escalations_fallback_dir=tmp_path,
     )
+    v: BulkResetVerdict | None = None
     for i in range(4):
         clock[0] += 1.0
         v = await guard.observe_attempt(
@@ -653,7 +658,9 @@ async def test_escalation_filename_and_body_include_kind(tmp_path):
             new_status='pending',
             project_root=str(tmp_path),
         )
+    assert v is not None
     assert v.outcome == 'escalated', f'(a) expected escalated, got {v.outcome}'
+    assert v.escalation_path is not None
     esc_file_a = Path(v.escalation_path)
     assert re.search(r'esc-bulk-reset-done-kind-proj-', esc_file_a.name), (
         f'(a) filename {esc_file_a.name!r} missing done kind slug'
@@ -684,6 +691,7 @@ async def test_escalation_filename_and_body_include_kind(tmp_path):
         )
     assert v_b is not None
     assert v_b.outcome == 'escalated', f'(b) expected escalated, got {v_b.outcome}'
+    assert v_b.escalation_path is not None
     esc_file_b = Path(v_b.escalation_path)
     assert re.search(r'esc-bulk-reset-in-progress-kind-proj-ip-', esc_file_b.name), (
         f'(b) filename {esc_file_b.name!r} missing in-progress kind slug'
@@ -1566,6 +1574,7 @@ def test_server_wires_split_thresholds(tmp_path):
     main.py still contains `threshold=config.reconciliation.bulk_reset_guard_threshold`.
     """
     from pathlib import Path as _Path
+
     from fused_memory.config.schema import ReconciliationConfig
 
     # (a) Guard construction using the new split-threshold kwarg pattern.
