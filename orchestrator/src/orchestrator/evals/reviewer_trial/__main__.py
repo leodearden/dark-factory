@@ -351,7 +351,7 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
 
         # Per-diff results table
         click.echo(f'\n{click.style("Per-Diff Results", bold=True)}:')
-        click.echo(f'{"Diff":<26s} {"Lang":<5s} {"Source":<10s} {"Recall":>7s} {"BlkRcl":>7s} {"F1":>7s} {"Cost":>7s}')
+        click.echo(f'{"Diff":<26s} {"Lang":<5s} {"Source":<10s} {"Recall":>7s} {"BlkRcl":>7s} {"F1":>7s} {"TotCost":>7s}')
         click.echo('-' * 76)
 
         synthetic_recalls: list[float] = []
