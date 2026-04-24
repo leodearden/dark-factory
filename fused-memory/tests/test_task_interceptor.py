@@ -2553,10 +2553,24 @@ async def test_two_projects_do_not_serialise(
             # without relying on event-loop scheduling timing.
             if key == resolve_project_id('/projA'):
                 projA_entered.set()
-                await asyncio.wait_for(projB_entered.wait(), timeout=10.0)
+                try:
+                    await asyncio.wait_for(projB_entered.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    pytest.fail(
+                        f"project A entered but B never did — "
+                        f"projA_entered={projA_entered.is_set()} "
+                        f"projB_entered={projB_entered.is_set()}"
+                    )
             else:
                 projB_entered.set()
-                await asyncio.wait_for(projA_entered.wait(), timeout=10.0)
+                try:
+                    await asyncio.wait_for(projA_entered.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    pytest.fail(
+                        f"project B entered but A never did — "
+                        f"projA_entered={projA_entered.is_set()} "
+                        f"projB_entered={projB_entered.is_set()}"
+                    )
             return {'id': '1', 'title': kwargs.get('title', '')}
         finally:
             tracker.in_flight[key] -= 1
