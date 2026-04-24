@@ -47,11 +47,7 @@ the second submit, any further failure is terminal — do not submit a third tim
 | Action | Max per logical work item |
 |--------|--------------------------|
 | `submit_task` | 2 |
-| `resolve_ticket` | unbounded† |
-
-_† Bounded in practice by the per-reason rules above: `server_restart` allows
-one re-submit; `timeout` allows one `resolve_ticket` retry before (conditionally)
-one re-submit.  Only `submit_task` is hard-capped at 2._
+| `resolve_ticket` | 2 |
 
 **Dedup caveat:** if the caller does not supply `(escalation_id,
 suggestion_hash)` in the `submit_task` metadata, the R4 idempotency gate
