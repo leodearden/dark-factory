@@ -43,6 +43,7 @@ class ScoringResult:
     f1: float = 0.0
     blocking_recall: float = 0.0
     cost_usd: float = 0.0
+    match_cost_usd: float = 0.0
     wall_clock_ms: int = 0
 
 
@@ -267,7 +268,7 @@ async def score_panel_run(
     deduped = _deduplicate_issues(clean_reviews)
 
     # Match against ground truth
-    matches, false_positives, _match_cost_usd = await match_issues(
+    matches, false_positives, match_cost_usd = await match_issues(
         reviewer_issues=deduped,
         ground_truth=corpus_diff.ground_truth,
         diff_text=corpus_diff.diff_text,
@@ -303,5 +304,6 @@ async def score_panel_run(
         f1=round(f1, 4),
         blocking_recall=round(blocking_recall, 4),
         cost_usd=run.total_cost_usd,
+        match_cost_usd=round(match_cost_usd, 4),
         wall_clock_ms=run.wall_clock_ms,
     )
