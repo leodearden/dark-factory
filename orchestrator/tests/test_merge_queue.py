@@ -916,14 +916,24 @@ class TestCheckPlanTargetsInTree:
             with patch('orchestrator.merge_queue._run', new=_intercept):
                 # Tight timeout: concurrent execution releases the barrier
                 # effectively instantly; any sequential regression will hang
-                # until this fires.  Generous enough to tolerate CI scheduler
-                # latency without being long enough to mask real deadlocks.
-                await asyncio.wait_for(
-                    _check_plan_targets_in_tree(
-                        merge_result.merge_commit, worktree, git_ops,
-                    ),
-                    timeout=5.0,
-                )
+                # until this fires.  1 s is ample for CI scheduler latency
+                # (barrier releases in microseconds under asyncio.gather);
+                # failing fast avoids a 5 s dead wait on a real regression.
+                # The except block re-raises as AssertionError so the failure
+                # message is self-describing rather than a bare TimeoutError.
+                try:
+                    await asyncio.wait_for(
+                        _check_plan_targets_in_tree(
+                            merge_result.merge_commit, worktree, git_ops,
+                        ),
+                        timeout=1.0,
+                    )
+                except TimeoutError:
+                    raise AssertionError(
+                        'Sequential execution detected: barrier never '
+                        'released within 1 s — asyncio.gather concurrency '
+                        'regression in _check_plan_targets_in_tree'
+                    ) from None
 
             assert call_count == 3, (
                 f'Expected 3 diff-tree calls, got {call_count}'
