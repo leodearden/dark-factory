@@ -10,7 +10,7 @@ import statistics
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from shared.locking import files_to_modules, normalize_lock
 
@@ -324,6 +324,34 @@ class Scheduler:
             timeout=timeout,
         )
 
+    @staticmethod
+    def _parse_tool_text_result(result: dict, key: str) -> Any:
+        """Parse a text-content MCP result block and return ``inner[key]``.
+
+        Handles the ``{data: {...}}`` envelope that taskmaster sometimes wraps
+        responses in.  Returns ``None`` if no text block is found, JSON cannot
+        be parsed, or the key is absent.
+
+        Args:
+            result: Raw response from ``_dispatch_tool``.
+            key: The key to retrieve from the (optionally unwrapped) payload.
+        """
+        content = result.get('result', {}).get('content', [])
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'text':
+                try:
+                    data = json.loads(block['text'])
+                except (ValueError, TypeError):
+                    return None
+                # Unwrap taskmaster's {data: {...}} envelope when present.
+                inner = (
+                    data.get('data')
+                    if isinstance(data.get('data'), dict)
+                    else data
+                )
+                return inner.get(key) if isinstance(inner, dict) else None
+        return None
+
     async def get_tasks(self) -> list[dict]:
         """Fetch all tasks from fused-memory/taskmaster."""
         try:
@@ -332,17 +360,9 @@ class Scheduler:
                 {'project_root': self._project_root},
                 timeout=15,
             )
-            content = result.get('result', {}).get('content', [])
-            for block in content:
-                if isinstance(block, dict) and block.get('type') == 'text':
-                    import json
-                    data = json.loads(block['text'])
-                    # Handle taskmaster's nested response format: {data: {tasks: [...]}}
-                    if 'data' in data and isinstance(data['data'], dict):
-                        tasks = data['data'].get('tasks', [])
-                    else:
-                        tasks = data.get('tasks', [])
-                    return tasks
+            tasks = self._parse_tool_text_result(result, 'tasks')
+            if isinstance(tasks, list):
+                return tasks
         except Exception as e:
             # logger.exception preserves the traceback + exception class so the
             # next time this fires we have more than str(e) to go on — str()
@@ -405,18 +425,9 @@ class Scheduler:
                 task_id, type(e).__name__, e,
             )
             return None
-        content = result.get('result', {}).get('content', [])
-        for block in content:
-            if isinstance(block, dict) and block.get('type') == 'text':
-                try:
-                    data = json.loads(block['text'])
-                except (ValueError, TypeError):
-                    return None
-                # Taskmaster envelope: {data: {...}} — unwrap if present.
-                inner = data.get('data') if isinstance(data.get('data'), dict) else data
-                status = inner.get('status') if isinstance(inner, dict) else None
-                if isinstance(status, str):
-                    return status
+        status = self._parse_tool_text_result(result, 'status')
+        if isinstance(status, str):
+            return status
         return None
 
     async def get_statuses(
@@ -440,15 +451,9 @@ class Scheduler:
             if ids is not None:
                 arguments['ids'] = list(ids)
             result = await self._dispatch_tool('get_statuses', arguments, timeout=15)
-            content = result.get('result', {}).get('content', [])
-            for block in content:
-                if isinstance(block, dict) and block.get('type') == 'text':
-                    data = json.loads(block['text'])
-                    # Unwrap {data: {...}} envelope if present
-                    inner = data.get('data') if isinstance(data.get('data'), dict) else data
-                    statuses = inner.get('statuses') if isinstance(inner, dict) else None
-                    if isinstance(statuses, dict):
-                        return statuses
+            statuses = self._parse_tool_text_result(result, 'statuses')
+            if isinstance(statuses, dict):
+                return statuses
         except Exception as e:
             logger.exception(
                 'Failed to fetch task statuses: %s: %s', type(e).__name__, e,
