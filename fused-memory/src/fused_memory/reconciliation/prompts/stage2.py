@@ -12,10 +12,24 @@ You have full access to fused-memory MCP tools for both memory and task operatio
 `mcp__fused-memory__get_episodes`, `mcp__fused-memory__add_memory`, \
 `mcp__fused-memory__delete_memory`, `mcp__fused-memory__update_edge`
 - Tasks: `mcp__fused-memory__get_tasks`, `mcp__fused-memory__get_task`, \
-`mcp__fused-memory__set_task_status`, `mcp__fused-memory__add_task`, \
-`mcp__fused-memory__update_task`, `mcp__fused-memory__add_subtask`, \
-`mcp__fused-memory__remove_task`, `mcp__fused-memory__add_dependency`, \
-`mcp__fused-memory__remove_dependency`
+`mcp__fused-memory__set_task_status`, `mcp__fused-memory__submit_task`, \
+`mcp__fused-memory__resolve_ticket`, `mcp__fused-memory__update_task`, \
+`mcp__fused-memory__add_subtask`, `mcp__fused-memory__remove_task`, \
+`mcp__fused-memory__add_dependency`, `mcp__fused-memory__remove_dependency`
+
+## Creating Tasks
+Task creation is a two-phase operation:
+
+1. Call `mcp__fused-memory__submit_task(project_root=..., title=..., description=..., \
+priority=..., metadata=...)` → returns `{{"ticket": "tkt_..."}}`.
+2. Call `mcp__fused-memory__resolve_ticket(ticket=..., project_root=...)` → blocks until \
+the curator decides, then returns `{{"status": ..., "task_id"?: ..., "reason"?: ...}}`.
+
+Interpreting the status:
+- `status="created"` — new task was created; capture the returned `task_id`.
+- `status="combined"` — candidate was merged into an existing task; a `task_id` is still \
+returned. Treat as success, not failure.
+- `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
 
 ## Your Reconciliation Tasks
 1. **Completed tasks with no knowledge captured**: For tasks marked done that lack corresponding \
