@@ -31,18 +31,12 @@ escalation = { workspace = true }
 pythonpath = ["src"]
 asyncio_mode = "strict"
 addopts = "-n auto --dist loadgroup"
-# Default per-test timeout. Catches accidental asyncio-sleep hangs (misconfigured
-# UsageGate mock returning a truthy MagicMock from slot.detect_cap_hit — see
-# shared.testing.make_gate_mock) and the TaskInterceptor._curator_worker
-# queue.get() infinite loop (see fused_memory.middleware.task_interceptor).
+# Default per-test timeout — see shared/pyproject.toml for the full rationale
+# (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns).
 # Slow tests opt out with @pytest.mark.timeout(N).
-# thread method is load-bearing: signal method only works in the main thread and
-# is incompatible with pytest-xdist ("-n auto --dist loadgroup" above). thread
-# terminates hung tests via _thread.interrupt_main/os._exit — less clean than
-# signal, but the only xdist-compatible option. (shared/pyproject.toml uses
-# signal and warns thread "can't interrupt a blocking asyncio.sleep"; that caveat
-# applies to C-level blocking syscalls like selector.poll, not pure-Python
-# asyncio.sleep, which both methods catch.)
+# thread method instead of signal: signal proved unreliable under pytest-xdist
+# workers in practice ("-n auto --dist loadgroup" above). See
+# orchestrator/pyproject.toml where signal is used without xdist.
 timeout = 60
 timeout_method = "thread"
 
