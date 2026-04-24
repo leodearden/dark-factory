@@ -98,7 +98,16 @@ class EscalationQueue:
             candidates = list(self._iter_archive_paths(f'{escalation_id}.json'))
             if not candidates:
                 return None
-            path = candidates[0]
+            if len(candidates) > 1:
+                logger.warning(
+                    f'Multiple archive files for {escalation_id}: '
+                    f'{[str(p) for p in candidates]}; selecting newest by parent dir date'
+                )
+                # YYYY-MM-DD sorts lexicographically == chronologically.
+                # Non-date parent names get empty-string key (treated as oldest).
+                path = max(candidates, key=lambda p: p.parent.name)
+            else:
+                path = candidates[0]
         try:
             return Escalation.from_json(path.read_text())
         except (json.JSONDecodeError, KeyError, TypeError) as e:
