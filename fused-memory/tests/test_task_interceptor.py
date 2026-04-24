@@ -3768,16 +3768,18 @@ async def test_dedupe_bulk_remove_failure_keeps_task_in_both_errors_and_kept(
     """Remove-failure fall-through invariant: when intra-batch duplicate removal
     raises transiently the failing task must appear in BOTH errors AND kept.
 
-    Pins the defensive contract at task_interceptor.py:1075-1077:
-    "Removal failed transiently — fall through to curator so this task still
-    appears in `kept` rather than silently disappearing from both `removed`
-    and `kept`."
+    Pins the defensive contract of the remove-failure fall-through (the except
+    block in the intra-batch pre-pass that appends the failing task back to
+    unique_new_tasks rather than discarding it): "Removal failed transiently —
+    fall through to curator so this task still appears in `kept` rather than
+    silently disappearing from both `removed` and `kept`."
 
     The dual-membership invariant (task lives in BOTH errors and kept) is
     intentional: asserting only the errors entry would allow a future refactor
     that drops the task from unique_new_tasks (e.g. a bare `continue` in the
     except block) to regress silently.
     """
+    PROJECT = '/project'
     post_snapshot = {'tasks': [
         {'id': '10', 'title': 'Fix foo', 'description': 'bar'},
         {'id': '11', 'title': 'FIX FOO', 'description': ' bar '},
@@ -3792,7 +3794,7 @@ async def test_dedupe_bulk_remove_failure_keeps_task_in_both_errors_and_kept(
     )
 
     result = await curator_interceptor._dedupe_bulk_created(
-        '/project', pre_snapshot={'tasks': []},
+        PROJECT, pre_snapshot={'tasks': []},
     )
 
     # (a) Exactly one error entry, for task '11', mentioning the backend failure.
@@ -3812,7 +3814,7 @@ async def test_dedupe_bulk_remove_failure_keeps_task_in_both_errors_and_kept(
     )
 
     # (d) remove_task was called exactly once, for task '11'.
-    taskmaster.remove_task.assert_awaited_once_with('11', '/project')
+    taskmaster.remove_task.assert_awaited_once_with('11', PROJECT)
 
     # (e) Both '10' and '11' reach pass-2 (curate called twice: '11' was
     # re-appended to unique_new_tasks after the except block).
@@ -3826,21 +3828,22 @@ async def test_dedupe_bulk_blank_title_tasks_bypass_intra_batch_pre_pass(
     """Blank-title bypass: tasks with whitespace-only titles must not be
     collapsed by the intra-batch pre-pass into the first occurrence.
 
-    Without the guard at task_interceptor.py:1049 every blank-title task
-    would hash to the same _intra_batch_key('', ...) bucket regardless of
-    description (because title normalises to ''), so the second and subsequent
-    malformed subtasks would be incorrectly removed.  The guard passes them
-    straight through so both tasks reach pass-2.
+    Without the blank-title bypass in the intra-batch pre-pass every
+    blank-title task would hash to the same _intra_batch_key('', ...) bucket
+    regardless of description (because title normalises to ''), so the second
+    and subsequent malformed subtasks would be incorrectly removed.  The guard
+    passes them straight through so both tasks reach pass-2.
 
-    Note: pass-2's own short-circuit at task_interceptor.py:1103 uses
-    `if not candidate.title:` which only catches the empty string, not
-    whitespace-only titles (truthiness: bool('   ') is True).  So the curator
-    IS called for both whitespace tasks; with the mock returning
-    CuratorDecision(action='create') both end up in `kept`.  The asymmetry
-    between pass-1 (title.strip()) and pass-2 (candidate.title) is tracked
-    as a follow-up — this test verifies the pass-1 bypass specifically and
-    the overall contract that blank-title tasks are not lost or collapsed.
+    Note: pass-2's own empty-title short-circuit (``if not candidate.title:``)
+    only catches the empty string, not whitespace-only titles (truthiness:
+    bool('   ') is True).  So the curator IS called for both whitespace tasks;
+    with the mock returning CuratorDecision(action='create') both end up in
+    `kept`.  The asymmetry between pass-1 (title.strip()) and pass-2
+    (candidate.title) is tracked as a follow-up — this test verifies the
+    pass-1 bypass specifically and the overall contract that blank-title tasks
+    are not lost or collapsed.
     """
+    PROJECT = '/project'
     post_snapshot = {'tasks': [
         {'id': '20', 'title': '   ', 'description': 'first malformed task'},
         {'id': '21', 'title': '\t\n', 'description': 'second malformed task'},
@@ -3853,7 +3856,7 @@ async def test_dedupe_bulk_blank_title_tasks_bypass_intra_batch_pre_pass(
     )
 
     result = await curator_interceptor._dedupe_bulk_created(
-        '/project', pre_snapshot={'tasks': []},
+        PROJECT, pre_snapshot={'tasks': []},
     )
 
     # (a) No removals.
@@ -3872,11 +3875,10 @@ async def test_dedupe_bulk_blank_title_tasks_bypass_intra_batch_pre_pass(
         f'remove_task should not have been called: {taskmaster.remove_task.call_args_list}'
     )
 
-    # (e) curator.curate WAS called once per task (pass-2's short-circuit at
-    # task_interceptor.py:1103 only catches the empty string, not
-    # whitespace-only titles, so both tasks reach the curator).  The mock
-    # returns action='create' so both still end up in `kept` — no removal,
-    # no error, contract preserved.
+    # (e) curator.curate WAS called once per task (pass-2's empty-title
+    # short-circuit only catches the empty string, not whitespace-only titles,
+    # so both tasks reach the curator).  The mock returns action='create' so
+    # both still end up in `kept` — no removal, no error, contract preserved.
     assert curator_interceptor._curator.curate.await_count == 2, (
         f'curate should have been called once per whitespace task: '
         f'{curator_interceptor._curator.curate.call_args_list}'
@@ -3905,6 +3907,7 @@ async def test_dedupe_bulk_pass1_intra_batch_and_pass2_curator_drops_compose(
     Per-candidate routing curator: returns 'drop' for '62' (target '50'),
       'create' for everything else.
     """
+    PROJECT = '/project'
     pre_snapshot = {'tasks': [
         {'id': '50', 'title': 'Existing alpha work', 'status': 'pending'},
     ]}
@@ -3918,8 +3921,10 @@ async def test_dedupe_bulk_pass1_intra_batch_and_pass2_curator_drops_compose(
     taskmaster.get_tasks = AsyncMock(return_value=post_snapshot)
     taskmaster.remove_task = AsyncMock(return_value={'success': True})
 
-    curator = MagicMock()
-
+    # Per-candidate routing: use _mock_curator as base (consistent mock surface)
+    # then override curate with a side_effect that routes by candidate title.
+    # _mock_curator's curate_batch delegates to curator.curate at call time, so
+    # it automatically picks up the new side_effect without re-wiring.
     async def _route(candidate, *a, **kw):
         if candidate.title == 'Refactor alpha module':
             return CuratorDecision(
@@ -3928,19 +3933,12 @@ async def test_dedupe_bulk_pass1_intra_batch_and_pass2_curator_drops_compose(
             )
         return CuratorDecision(action='create', justification='novel')
 
+    curator = _mock_curator(CuratorDecision(action='create', justification='novel'))
     curator.curate = AsyncMock(side_effect=_route)
-
-    async def _curate_batch(candidates, *a, **kw):
-        return [await curator.curate(c, *a, **kw) for c in candidates]
-
-    curator.curate_batch = AsyncMock(side_effect=_curate_batch)
-    curator.record_task = AsyncMock()
-    curator.reembed_task = AsyncMock()
-    curator.note_created = MagicMock()
     curator_interceptor._curator = curator
 
     result = await curator_interceptor._dedupe_bulk_created(
-        '/project', pre_snapshot=pre_snapshot,
+        PROJECT, pre_snapshot=pre_snapshot,
     )
 
     # (a) Exactly two removals total (one from each pass).
@@ -3969,12 +3967,12 @@ async def test_dedupe_bulk_pass1_intra_batch_and_pass2_curator_drops_compose(
     assert result['errors'] == [], f"unexpected errors: {result['errors']}"
 
     # (f) remove_task called twice — once for '61' (pass-1) and once for
-    # '62' (pass-2), both against '/project'.
+    # '62' (pass-2) — coupling to PROJECT makes the path explicit.
     assert taskmaster.remove_task.await_count == 2, (
         f'remove_task call count wrong: {taskmaster.remove_task.call_args_list}'
     )
     actual_calls = {tuple(c.args) for c in taskmaster.remove_task.call_args_list}
-    assert actual_calls == {('61', '/project'), ('62', '/project')}, (
+    assert actual_calls == {('61', PROJECT), ('62', PROJECT)}, (
         f'remove_task called with unexpected args: {actual_calls}'
     )
 
