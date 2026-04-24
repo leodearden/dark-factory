@@ -22,6 +22,7 @@ from shared.cli_invoke import (
     _run_subprocess,
     _SubprocessResult,
     _to_token_count,
+    build_failure_message,
     classify_agent_failure,
     invoke_claude_agent,
     invoke_with_cap_retry,
@@ -1714,3 +1715,36 @@ class TestClassifyAgentFailure:
         cls = classify_agent_failure(result)
         assert cls.kind is AgentFailureKind.TIMED_OUT
         assert '1800000ms' in cls.summary
+
+
+class TestBuildFailureMessage:
+    """Tests for the build_failure_message formatting helper."""
+
+    def test_build_failure_message_format(self):
+        """build_failure_message returns exactly 'label failed: summary\\ndiagnostic_detail'."""
+        result = AgentResult(
+            success=False, output='', subtype='error_unexpected', stderr='boom',
+        )
+        label = 'Claude CLI agent'
+        msg = build_failure_message(label, result)
+        cls = classify_agent_failure(result)
+        expected = f'{label} failed: {cls.summary}\n{cls.diagnostic_detail}'
+        assert msg == expected
+
+    def test_build_failure_message_uses_classifier_summary_for_kinds(self):
+        """build_failure_message delegates entirely to classify_agent_failure — structural contract."""
+        result = AgentResult(success=False, output='', subtype='error_max_turns', turns=75)
+        label = 'TestLabel'
+        msg = build_failure_message(label, result)
+        cls = classify_agent_failure(result)
+        expected = f'{label} failed: {cls.summary}\n{cls.diagnostic_detail}'
+        assert msg == expected
+
+    def test_build_failure_message_label_is_prefix(self):
+        """The label argument is preserved verbatim before ' failed: '."""
+        result = AgentResult(success=False, output='', subtype='error_unexpected')
+        for label in ('Reconciliation agent (claude-opus-4)', 'arbitrary-label-123'):
+            msg = build_failure_message(label, result)
+            assert msg.startswith(f'{label} failed: '), (
+                f'Expected message to start with {label!r} + " failed: ", got {msg[:100]!r}'
+            )

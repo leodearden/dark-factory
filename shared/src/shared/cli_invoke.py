@@ -54,6 +54,7 @@ __all__ = [
     'AgentFailureKind',
     'AgentResult',
     'AllAccountsCappedException',
+    'build_failure_message',
     'classify_agent_failure',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
@@ -233,6 +234,18 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
         ),
         diagnostic_detail=diagnostic_detail,
     )
+
+
+def build_failure_message(label: str, result: AgentResult) -> str:
+    """Format the canonical '{label} failed: {summary}\\n{diagnostic_detail}' message.
+
+    Thin wrapper around classify_agent_failure that pins the message format
+    used by RuntimeError-raising call sites in the reconciliation loop and
+    the CLI judge, so the format evolves in one place as
+    AgentFailureClass.diagnostic_detail grows.
+    """
+    cls = classify_agent_failure(result)
+    return f'{label} failed: {cls.summary}\n{cls.diagnostic_detail}'
 
 
 def _to_token_count(v: int | None) -> int | None:
