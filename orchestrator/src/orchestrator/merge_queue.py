@@ -152,7 +152,7 @@ async def _check_plan_targets_in_tree(
             )
             for _, commit in steps_to_query
         ])
-        for (step_idx, commit), (rc, stdout, stderr) in zip(steps_to_query, results):
+        for (step_idx, commit), (rc, stdout, stderr) in zip(steps_to_query, results, strict=True):
             if rc != 0:
                 logger.warning(
                     'git diff-tree --diff-filter=D failed for step %d commit %s: %s',
