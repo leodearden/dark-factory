@@ -392,7 +392,7 @@ Technical debt or cleanup discovered during development.
 - **Info**: queue as a follow-up task using `mcp__fused-memory__submit_task` → `mcp__fused-memory__resolve_ticket` (two-phase pattern; see `review_suggestions` §2 above for the full snippet). When adapting the snippet:
   1. Substitute `"source": "escalation-info"` (only this field changes).
   2. Keep `"spawn_context": "steward-triage"` — unchanged from §2; both sites feed the same steward pipeline.
-  3. Set `"suggestion_hash"` to `hashlib.sha256(escalation.detail.encode()).hexdigest()[:16]` — a retry token (not a per-item discriminator) for single-finding info escalations; aligns with the 16-char sha256 shape in `orchestrator/agents/triage.py :: suggestion_hash()`.
+  3. Set `"suggestion_hash"` to `hashlib.sha256((escalation['detail'] or escalation['summary'] or escalation['id']).encode()).hexdigest()[:16]` (stdlib `hashlib` only — no orchestrator import needed) — a retry token (not a per-item discriminator) for single-finding info escalations. The fallback chain is required: if `detail` is blank, `sha256(b'')` returns the fixed prefix `e3b0c44298fc1c14` and would collapse unrelated blank-detail escalations into the same R4 follow-up task; falling through to `summary` then `id` guarantees a non-empty payload (`id` is always `"esc-{task_id}-{seq}"` by the `Escalation` dataclass contract). This expression mirrors the canonical 16-char sha256-hex shape owned by `orchestrator.agents.triage.sha256_16`; any algorithm change must be made at both sites.
   4. Both `escalation_id` and `suggestion_hash` must be non-empty strings for the R4 gate (`task_interceptor.py :: _check_escalation_idempotency`) to activate.
 
   Resolve via `mcp__escalation__resolve_issue` once the ticket resolves.
