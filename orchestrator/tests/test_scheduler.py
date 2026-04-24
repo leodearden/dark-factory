@@ -2223,7 +2223,7 @@ class TestSchedulerMcpSessionDI:
 
 
 class TestGetStatuses:
-    """``Scheduler.get_statuses`` returns a compact id→status mapping via MCP."""
+    """``Scheduler.get_statuses`` returns a ``(statuses, error)`` tuple via MCP."""
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
@@ -2234,7 +2234,7 @@ class TestGetStatuses:
     async def test_get_statuses_returns_parsed_mapping(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """get_statuses parses the MCP get_statuses response and returns the statuses dict."""
+        """get_statuses parses the MCP response and returns (statuses_dict, None)."""
         import json
         response = {
             'result': {
@@ -2250,7 +2250,7 @@ class TestGetStatuses:
             'orchestrator.scheduler.mcp_call',
             AsyncMock(return_value=response),
         )
-        assert await scheduler.get_statuses() == {'1': 'done', '2': 'pending'}
+        assert await scheduler.get_statuses() == ({'1': 'done', '2': 'pending'}, None)
 
     @pytest.mark.asyncio
     async def test_get_statuses_passes_ids_argument(
@@ -2267,8 +2267,9 @@ class TestGetStatuses:
         })
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
 
-        await scheduler.get_statuses(ids=['1', '2'])
+        statuses, err = await scheduler.get_statuses(ids=['1', '2'])
 
+        assert err is None
         mcp_mock.assert_called_once()
         arguments = mcp_mock.call_args[0][2]['arguments']
         assert arguments.get('ids') == ['1', '2']
@@ -2278,13 +2279,15 @@ class TestGetStatuses:
     async def test_get_statuses_exception_returns_empty_dict(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """OSError from mcp_call returns {} and errors are logged."""
+        """OSError from mcp_call returns ({}, OSError) tuple."""
         monkeypatch.setattr(
             'orchestrator.scheduler.mcp_call',
             AsyncMock(side_effect=OSError(2, 'No such file')),
         )
-        result = await scheduler.get_statuses()
+        result, err = await scheduler.get_statuses()
         assert result == {}
+        assert isinstance(err, OSError)
+        assert err.errno == 2
 
     @pytest.mark.asyncio
     async def test_get_statuses_routes_through_stub(self):
@@ -2297,37 +2300,34 @@ class TestGetStatuses:
         )
 
         with patch('orchestrator.scheduler.mcp_call', new=no_http):
-            result = await sched.get_statuses()
+            result, err = await sched.get_statuses()
 
         assert isinstance(result, dict)
+        assert err is None
         no_http.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_get_statuses_caches_transport_error_and_clears_on_success(
+    async def test_get_statuses_returns_exception_on_failure_and_none_on_success(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """_last_get_statuses_error: None before first call, set on failure, cleared on success.
+        """Failing call returns ({}, OSError); subsequent success returns (dict, None).
 
-        (a) Before any call: _last_get_statuses_error is None.
-        (b) After a failing call (OSError): returns {} AND caches the OSError.
-        (c) After a subsequent successful call: returns the dict AND resets to None.
+        (a) After a failing call (OSError): returns ({}, OSError) with correct errno.
+        (b) After a subsequent successful call: returns (dict, None) — no cross-call state.
         """
         import json
 
-        # (a) Initial state.
-        assert scheduler._last_get_statuses_error is None
-
-        # (b) Transport failure: OSError cached.
+        # (a) Transport failure: error returned in tuple.
         monkeypatch.setattr(
             'orchestrator.scheduler.mcp_call',
             AsyncMock(side_effect=OSError(2, 'No such file')),
         )
-        result_fail = await scheduler.get_statuses()
+        result_fail, err_fail = await scheduler.get_statuses()
         assert result_fail == {}
-        assert isinstance(scheduler._last_get_statuses_error, OSError)
-        assert scheduler._last_get_statuses_error.errno == 2
+        assert isinstance(err_fail, OSError)
+        assert err_fail.errno == 2
 
-        # (c) Subsequent success: error attribute reset to None.
+        # (b) Subsequent success: None error, no cross-call state leakage.
         success_response = {
             'result': {
                 'content': [
@@ -2342,33 +2342,49 @@ class TestGetStatuses:
             'orchestrator.scheduler.mcp_call',
             AsyncMock(return_value=success_response),
         )
-        result_ok = await scheduler.get_statuses()
+        result_ok, err_ok = await scheduler.get_statuses()
         assert result_ok == {'1': 'pending'}
-        assert scheduler._last_get_statuses_error is None
+        assert err_ok is None
 
     @pytest.mark.asyncio
-    async def test_get_statuses_consecutive_failures_store_latest_error(
+    async def test_get_statuses_returns_fresh_exception_per_call(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """Two consecutive transport failures: second exception overwrites the first.
+        """Two consecutive failing calls each return their own distinct exception.
 
-        Validates that the cached attribute is updated per-call, not stuck on
-        the first error seen.
+        Validates that error state lives on the stack (no cross-call leakage via
+        a shared attribute): each call's error is independent.
         """
         # First failing call: OSError.
         monkeypatch.setattr(
             'orchestrator.scheduler.mcp_call',
             AsyncMock(side_effect=OSError(2, 'No such file')),
         )
-        await scheduler.get_statuses()
-        assert isinstance(scheduler._last_get_statuses_error, OSError)
+        _result1, err1 = await scheduler.get_statuses()
+        assert isinstance(err1, OSError)
 
-        # Second failing call: ValueError should overwrite OSError.
+        # Second failing call: ValueError — independent from first.
         monkeypatch.setattr(
             'orchestrator.scheduler.mcp_call',
             AsyncMock(side_effect=ValueError('malformed response')),
         )
-        result2 = await scheduler.get_statuses()
+        result2, err2 = await scheduler.get_statuses()
         assert result2 == {}
-        assert isinstance(scheduler._last_get_statuses_error, ValueError)
-        assert 'malformed response' in str(scheduler._last_get_statuses_error)
+        assert isinstance(err2, ValueError)
+        assert 'malformed response' in str(err2)
+        # err1 must be unchanged (no side-channel mutation)
+        assert isinstance(err1, OSError)
+
+    def test_scheduler_has_no_last_get_statuses_error_attribute(self):
+        """Regression guard: the _last_get_statuses_error side-channel is gone.
+
+        Neither the private underscore name nor the public property may exist on
+        a freshly constructed Scheduler — future callers must use the tuple return.
+        """
+        sched = Scheduler(OrchestratorConfig())
+        assert not hasattr(sched, 'last_get_statuses_error'), (
+            'last_get_statuses_error property must be removed'
+        )
+        assert not hasattr(sched, '_last_get_statuses_error'), (
+            '_last_get_statuses_error attribute must be removed'
+        )
