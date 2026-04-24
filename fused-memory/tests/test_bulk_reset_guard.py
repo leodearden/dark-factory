@@ -789,3 +789,112 @@ async def test_idle_project_state_is_not_evicted_across_attempts(tmp_path):
         f'got {guard._state["proj"].last_escalation_ts}. '
         'The dead eviction block (lines 243-250) replaced state with a fresh _GuardState.'
     )
+
+
+# ---------------------------------------------------------------------------
+# task-979 step-5: write-failure backoff
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_write_failure_triggers_per_project_backoff(tmp_path, monkeypatch):
+    """A write_text OSError arms a per-project backoff that suppresses retries.
+
+    Scenario:
+      1. Trip guard at t=1001..1004 (threshold=3); write_text raises on first
+         call — verdict is 'rejection'; write_text call count == 1.
+      2. Advance clock by 30s (inside the 60s backoff window); fire another
+         reversal — verdict is 'rejection' AND write_text call count still == 1
+         (backoff suppressed the retry).
+      3. Advance clock to t=3000 (past window+backoff); seed 3 fresh ok
+         reversals then trip again.  The guard attempts write_text again
+         (call count becomes 2) and this time succeeds; verdict is 'escalated'.
+
+    This test fails today because:
+      - BulkResetGuard has no write_failure_backoff_seconds parameter.
+      - _maybe_write_escalation has no backoff check.
+    """
+    write_text_calls: list[int] = [0]
+    real_write_text = Path.write_text
+
+    def flaky_write_text(self, data, *args, **kwargs):
+        write_text_calls[0] += 1
+        if write_text_calls[0] == 1:
+            raise OSError('simulated flaky mount')
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'write_text', flaky_write_text)
+
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        write_failure_backoff_seconds=60.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    # Phase 1: trip the guard at t=1001..1004; write_text raises → rejection.
+    for i in range(4):
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='proj',
+            task_id=f't{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    assert v.outcome == 'rejection', f'Phase 1: expected rejection, got {v.outcome}'
+    assert write_text_calls[0] == 1, (
+        f'Phase 1: expected 1 write_text call, got {write_text_calls[0]}'
+    )
+
+    # Phase 2: 30s later — still inside 60s backoff window.
+    clock[0] += 30.0
+    v2 = await guard.observe_attempt(
+        project_id='proj',
+        task_id='t4',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert v2.outcome == 'rejection', (
+        f'Phase 2: expected rejection (backoff suppressed retry), got {v2.outcome}'
+    )
+    assert write_text_calls[0] == 1, (
+        f'Phase 2: backoff should have suppressed write_text retry; '
+        f'call count is {write_text_calls[0]}'
+    )
+
+    # Phase 3: advance past window+backoff; seed 3 fresh ok reversals then trip.
+    clock[0] = 3000.0
+    for i in range(3):
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='proj',
+            task_id=f'new-{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+        assert v.outcome == 'ok', f'Phase 3 ok reversal {i}: expected ok, got {v.outcome}'
+
+    # Trip again — write_text is called (2nd time) and now succeeds → escalated.
+    clock[0] += 1.0
+    v3 = await guard.observe_attempt(
+        project_id='proj',
+        task_id='new-3',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert write_text_calls[0] == 2, (
+        f'Phase 3: expected 2 write_text calls total, got {write_text_calls[0]}'
+    )
+    assert v3.outcome == 'escalated', (
+        f'Phase 3: expected escalated after backoff cleared, got {v3.outcome}'
+    )
