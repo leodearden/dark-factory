@@ -1070,13 +1070,38 @@ def create_mcp_server(
                         item['payload_truncated'] = True
                     items.append(item)
 
-            # --- event queue dead-letter JSONL (populated later in step-12) ---
+            # --- event queue dead-letter JSONL ---
+            eq_items: list[dict[str, Any]] = []
+            if event_queue is not None:
+                remaining = limit - len(items)
+                if remaining > 0:
+                    records = event_queue.read_dead_letters(
+                        limit=remaining, project_id=project_id,
+                    )
+                    for rec in records:
+                        ev = rec.get('event') or {}
+                        payload, truncated = _truncate_payload(ev.get('payload'))
+                        eq_item: dict[str, Any] = {
+                            'source': 'event_queue',
+                            'id': ev.get('id'),
+                            'type': ev.get('type'),
+                            'payload': payload,
+                            'reason': rec.get('reason'),
+                            'timestamp': rec.get('failed_at'),
+                            'attempts': rec.get('attempts'),
+                            'project_id': ev.get('project_id'),
+                        }
+                        if truncated:
+                            eq_item['payload_truncated'] = True
+                        eq_items.append(eq_item)
+
+            all_items = items + eq_items
             counts: dict[str, int] = {
-                'durable_queue': sum(1 for i in items if i['source'] == 'durable_queue'),
-                'event_queue': 0,
+                'durable_queue': sum(1 for i in all_items if i['source'] == 'durable_queue'),
+                'event_queue': sum(1 for i in all_items if i['source'] == 'event_queue'),
             }
 
-            return {'items': items[:limit], 'counts': counts}
+            return {'items': all_items[:limit], 'counts': counts}
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception as e:
