@@ -1720,26 +1720,15 @@ class TestClassifyAgentFailure:
 class TestBuildFailureMessage:
     """Tests for the build_failure_message formatting helper."""
 
-    def test_build_failure_message_format_is_hardcoded_literal(self):
-        """Full format pinned as a static literal — NOT derived from classify_agent_failure."""
+    def test_build_failure_message_delegates_to_classifier(self):
+        """Wrapper prepends '{label} failed: ' and joins classifier summary + diagnostic_detail
+        with '\\n' — the classifier's literal output is tested in TestClassifyAgentFailure."""
         result = AgentResult(
             success=False, output='', subtype='error_max_turns', turns=75,
         )
+        cls = classify_agent_failure(result)
         msg = build_failure_message('Claude CLI agent', result)
-        expected = (
-            "Claude CLI agent failed: agent hit max_turns (75 turns, output_tokens=None)\n"
-            "subtype='error_max_turns'\n"
-            "turns=75\n"
-            "cost_usd=0.0\n"
-            "duration_ms=0\n"
-            "timed_out=False\n"
-            "api_error_status=None\n"
-            "len(output)=0\n"
-            "output (last 500 chars):\n"
-            "\n"
-            "stderr (last 500 chars):\n"
-        )
-        assert msg == expected
+        assert msg == f'Claude CLI agent failed: {cls.summary}\n{cls.diagnostic_detail}'
 
     def test_build_failure_message_label_is_prefix(self):
         """The label argument is preserved verbatim before ' failed: '."""
