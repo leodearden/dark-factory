@@ -360,6 +360,8 @@ async def run_server():
             retry_initial_seconds=config.reconciliation.event_queue_retry_initial_seconds,
             retry_max_seconds=config.reconciliation.event_queue_retry_max_seconds,
             shutdown_flush_seconds=config.reconciliation.event_queue_shutdown_flush_seconds,
+            max_bytes=config.reconciliation.event_dead_letter_max_bytes,
+            keep_rotations=config.reconciliation.event_dead_letter_keep_rotations,
         )
         await event_queue.start()
 

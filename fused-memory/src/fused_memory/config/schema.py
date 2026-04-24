@@ -217,6 +217,11 @@ class ReconciliationConfig(BaseModel):
     event_queue_retry_initial_seconds: float = Field(default=0.1)
     event_queue_retry_max_seconds: float = Field(default=30.0)
     event_queue_shutdown_flush_seconds: float = Field(default=10.0)
+    # Dead-letter JSONL rotation: rotate when the file reaches max_bytes,
+    # keeping at most keep_rotations archived copies (oldest is dropped).
+    # Default: 10 MB cap, keep 3 rotations (~40 MB max retention).
+    event_dead_letter_max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    event_dead_letter_keep_rotations: int = Field(default=3, ge=0)
 
     # WP-C: SQLite drainer watchdog. Logs ERROR with structured diagnostics
     # when the drainer hasn't committed in `stall_threshold` and the queue
