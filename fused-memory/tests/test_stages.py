@@ -1510,14 +1510,14 @@ class TestStagePayloadProjectIdGuideline:
                 '_STAGE1_PROJECT_ID_GUIDELINE',
                 'limits',
                 ['add_memory'],                          # Stage 1 has memory write access
-                ['get_tasks', 'set_task_status', 'add_task'],  # Stage 1 has no task tools
+                ['get_tasks', 'set_task_status', 'add_task', 'submit_task', 'resolve_ticket'],  # Stage 1 has no task tools
             ),
             (
                 'TaskKnowledgeSync',
                 StageId.task_knowledge_sync,
                 '_STAGE2_PROJECT_ID_GUIDELINE',
                 'taskmaster',
-                ['expand_task', 'parse_prd'],            # Stage 2 has full MCP access
+                ['expand_task', 'parse_prd', 'submit_task', 'resolve_ticket'],  # Stage 2 has full MCP access
                 [],
             ),
             (
@@ -1526,7 +1526,7 @@ class TestStagePayloadProjectIdGuideline:
                 '_STAGE3_PROJECT_ID_GUIDELINE',
                 None,
                 ['get_tasks'],                           # Stage 3 reads tasks
-                ['add_memory', 'delete_memory', 'set_task_status', 'add_task'],  # read-only
+                ['add_memory', 'delete_memory', 'set_task_status', 'add_task', 'submit_task', 'resolve_ticket'],  # read-only
             ),
         ],
     )
