@@ -345,3 +345,82 @@ async def test_stats_tracks_commits(queue, real_buffer):
     stats = queue.stats()
     assert stats['events_committed'] == 1
     assert stats['last_commit_ts'] is not None
+
+
+# ── Rotation ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_rotation_basic(tmp_path):
+    """After file exceeds max_bytes, it is rotated to .jsonl.1 and a fresh .jsonl starts."""
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dead_letter.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=1000,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+        max_bytes=500,
+        keep_rotations=2,
+    )
+    await q.start()
+    try:
+        # Enqueue enough events so dead-letter JSONL exceeds 500 bytes.
+        # Each dead-letter record is ~300+ bytes, so 3 events should trigger rotation.
+        for _ in range(6):
+            q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+
+        # (a) Current dead_letter.jsonl must exist and be under 500 bytes.
+        assert dl.exists(), 'dead_letter.jsonl must exist'
+        current_size = dl.stat().st_size
+        assert current_size < 500, (
+            f'After rotation .jsonl should be under 500 bytes, got {current_size}'
+        )
+
+        # (b) At least one rotation must have been made.
+        rotated = tmp_path / 'dead_letter.jsonl.1'
+        assert rotated.exists(), 'dead_letter.jsonl.1 must exist after rotation'
+        assert rotated.stat().st_size > 0
+
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_rotation_drops_beyond_keep(tmp_path):
+    """Rotation beyond keep_rotations=2 drops the oldest; .jsonl.3 must never appear."""
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dead_letter.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=1000,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+        max_bytes=300,   # very tight — triggers rotation quickly
+        keep_rotations=2,
+    )
+    await q.start()
+    try:
+        # Enqueue many events to trigger 3+ rotations.
+        for _ in range(15):
+            q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=5.0)
+
+        # (c) .jsonl.2 may exist (keep_rotations=2 means keep up to .2).
+        #     .jsonl.3 must NOT exist (dropped beyond keep_rotations).
+        over_limit = tmp_path / 'dead_letter.jsonl.3'
+        assert not over_limit.exists(), (
+            'dead_letter.jsonl.3 must not exist when keep_rotations=2'
+        )
+
+    finally:
+        await q.close()
