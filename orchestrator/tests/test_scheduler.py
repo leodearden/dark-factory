@@ -2175,3 +2175,84 @@ class TestSchedulerMcpSessionDI:
             await sched.set_task_status('42', 'pending', reopen_reason='un-defer script')
 
         assert stub._statuses['42'] == 'pending'
+
+
+class TestGetStatuses:
+    """``Scheduler.get_statuses`` returns a compact id→status mapping via MCP."""
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_returns_parsed_mapping(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """get_statuses parses the MCP get_statuses response and returns the statuses dict."""
+        import json
+        response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': json.dumps({'statuses': {'1': 'done', '2': 'pending'}}),
+                    }
+                ]
+            }
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=response),
+        )
+        assert await scheduler.get_statuses() == {'1': 'done', '2': 'pending'}
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_passes_ids_argument(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """When ids=['1','2'] is passed, mcp_call arguments include ids=['1','2']."""
+        import json
+        mcp_mock = AsyncMock(return_value={
+            'result': {
+                'content': [
+                    {'type': 'text', 'text': json.dumps({'statuses': {'1': 'done'}})}
+                ]
+            }
+        })
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+
+        await scheduler.get_statuses(ids=['1', '2'])
+
+        mcp_mock.assert_called_once()
+        arguments = mcp_mock.call_args[0][2]['arguments']
+        assert arguments.get('ids') == ['1', '2']
+        assert 'project_root' in arguments
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_exception_returns_empty_dict(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """OSError from mcp_call returns {} and errors are logged."""
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(side_effect=OSError(2, 'No such file')),
+        )
+        result = await scheduler.get_statuses()
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_routes_through_stub(self):
+        """When mcp_session is injected, get_statuses uses the stub (not HTTP mcp_call)."""
+        stub = _StubMcpSession()
+        cfg = OrchestratorConfig()
+        sched = Scheduler(cfg, mcp_session=stub)
+        no_http = AsyncMock(
+            side_effect=AssertionError('HTTP path must not be used when mcp_session is injected')
+        )
+
+        with patch('orchestrator.scheduler.mcp_call', new=no_http):
+            result = await sched.get_statuses()
+
+        assert isinstance(result, dict)
+        no_http.assert_not_called()
