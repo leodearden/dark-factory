@@ -15,6 +15,22 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def sha256_16(data: str) -> str:
+    """Return the first 16 hex chars of the SHA-256 digest of *data*.
+
+    Canonical shape contract: every 16-char sha256-hex token in this module
+    (``suggestion_hash``, ``_combine_suggestion_hashes``) is produced through
+    this helper, as is the ``cleanup_needed`` R4 snippet in
+    ``skills/escalation-watcher/SKILL.md``.  Any change to the length or
+    algorithm here must be reflected at all three sites.
+
+    Note: ``sha256_16('')`` returns the fixed prefix ``'e3b0c44298fc1c14'``.
+    Callers that may receive blank input must use a non-empty fallback before
+    calling this function to avoid hash collisions across blank inputs.
+    """
+    return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+
 def suggestion_hash(suggestion: dict) -> str:
     """Stable 16-char hash over a review suggestion's identity fields.
 
