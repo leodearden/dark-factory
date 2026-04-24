@@ -9,7 +9,7 @@ that hit non-retriable errors or overflow the queue are appended to a
 dead-letter JSONL file for manual replay.
 
 Design rationale: before WP-B, a locked ``reconciliation.db`` surfaced as
-an MCP error on ``add_task`` / ``set_task_status`` / etc., even after the
+an MCP error on ``submit_task`` / ``set_task_status`` / etc., even after the
 canonical tasks.json / Graphiti / Mem0 write succeeded. Agents retried and
 created duplicates (2026-04-17 reify incident). The queue lets the canonical
 write return success immediately; journal persistence becomes eventually

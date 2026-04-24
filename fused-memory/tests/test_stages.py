@@ -100,6 +100,19 @@ class TestDisallowedToolLists:
         for tool in DISALLOW_BUILTIN:
             assert not tool.startswith('mcp__'), f'{tool} should not have MCP prefix'
 
+    def test_submit_task_in_disallow_task_writes(self):
+        """submit_task must be blocked in Stage 1/3 (only Stage 2 may create tasks)."""
+        assert 'mcp__fused-memory__submit_task' in DISALLOW_TASK_WRITES
+
+    def test_resolve_ticket_in_disallow_task_writes(self):
+        """resolve_ticket must be blocked in Stage 1/3 (only Stage 2 may create tasks)."""
+        assert 'mcp__fused-memory__resolve_ticket' in DISALLOW_TASK_WRITES
+
+    def test_add_task_still_in_disallow_task_writes(self):
+        """Deprecated add_task facade must still be blocked (defence-in-depth)."""
+        assert 'mcp__fused-memory__add_task' in DISALLOW_TASK_WRITES
+
+
 
 class TestStageSubclasses:
     """Each stage subclass returns the correct disallowed list."""
@@ -1368,6 +1381,8 @@ class TestProjectIdGuidelineConstants:
         assert 'get_tasks' not in _STAGE1_PROJECT_ID_GUIDELINE
         assert 'set_task_status' not in _STAGE1_PROJECT_ID_GUIDELINE
         assert 'add_task' not in _STAGE1_PROJECT_ID_GUIDELINE
+        assert 'submit_task' not in _STAGE1_PROJECT_ID_GUIDELINE
+        assert 'resolve_ticket' not in _STAGE1_PROJECT_ID_GUIDELINE
 
     def test_stage3_does_not_include_write_tools(self):
         """Stage 3 guideline does not include write tools (Stage 3 is read-only)."""
@@ -1376,6 +1391,8 @@ class TestProjectIdGuidelineConstants:
         assert 'delete_memory' not in _STAGE3_PROJECT_ID_GUIDELINE
         assert 'set_task_status' not in _STAGE3_PROJECT_ID_GUIDELINE
         assert 'add_task' not in _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'submit_task' not in _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'resolve_ticket' not in _STAGE3_PROJECT_ID_GUIDELINE
 
 
 class TestStagePayloadProjectIdGuideline:
@@ -1410,14 +1427,14 @@ class TestStagePayloadProjectIdGuideline:
                 '_STAGE1_PROJECT_ID_GUIDELINE',
                 'limits',
                 ['add_memory'],                          # Stage 1 has memory write access
-                ['get_tasks', 'set_task_status', 'add_task'],  # Stage 1 has no task tools
+                ['get_tasks', 'set_task_status', 'add_task', 'submit_task', 'resolve_ticket'],  # Stage 1 has no task tools
             ),
             (
                 'TaskKnowledgeSync',
                 StageId.task_knowledge_sync,
                 '_STAGE2_PROJECT_ID_GUIDELINE',
                 'taskmaster',
-                ['expand_task', 'parse_prd'],            # Stage 2 has full MCP access
+                ['expand_task', 'parse_prd', 'submit_task', 'resolve_ticket'],  # Stage 2 has full MCP access
                 [],
             ),
             (
@@ -1426,7 +1443,7 @@ class TestStagePayloadProjectIdGuideline:
                 '_STAGE3_PROJECT_ID_GUIDELINE',
                 None,
                 ['get_tasks'],                           # Stage 3 reads tasks
-                ['add_memory', 'delete_memory', 'set_task_status', 'add_task'],  # read-only
+                ['add_memory', 'delete_memory', 'set_task_status', 'add_task', 'submit_task', 'resolve_ticket'],  # read-only
             ),
         ],
     )

@@ -27,6 +27,8 @@ DISALLOW_BUILTIN = ['Bash', 'Edit', 'Write', 'NotebookEdit']
 DISALLOW_TASK_WRITES = [
     'mcp__fused-memory__set_task_status',
     'mcp__fused-memory__add_task',
+    'mcp__fused-memory__submit_task',
+    'mcp__fused-memory__resolve_ticket',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__add_subtask',
     'mcp__fused-memory__remove_task',
