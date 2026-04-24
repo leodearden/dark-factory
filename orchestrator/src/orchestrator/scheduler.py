@@ -419,6 +419,42 @@ class Scheduler:
                     return status
         return None
 
+    async def get_statuses(
+        self, ids: list[str] | None = None
+    ) -> dict[str, str]:
+        """Return a compact ``{id: status}`` mapping from fused-memory.
+
+        Uses the ``get_statuses`` MCP tool which returns ~95% less data than
+        ``get_tasks``.  Suitable for hot-loop callers that only need status.
+
+        Args:
+            ids: Optional list of task ids to filter by (unknown ids silently
+                 omitted).  Pass ``None`` for all tasks.
+
+        Returns:
+            A ``{id_str: status_str}`` dict; always a dict, never None.
+            Returns ``{}`` on any failure.
+        """
+        try:
+            arguments: dict = {'project_root': self._project_root}
+            if ids is not None:
+                arguments['ids'] = list(ids)
+            result = await self._dispatch_tool('get_statuses', arguments, timeout=15)
+            content = result.get('result', {}).get('content', [])
+            for block in content:
+                if isinstance(block, dict) and block.get('type') == 'text':
+                    data = json.loads(block['text'])
+                    # Unwrap {data: {...}} envelope if present
+                    inner = data.get('data') if isinstance(data.get('data'), dict) else data
+                    statuses = inner.get('statuses') if isinstance(inner, dict) else None
+                    if isinstance(statuses, dict):
+                        return statuses
+        except Exception as e:
+            logger.exception(
+                'Failed to fetch task statuses: %s: %s', type(e).__name__, e,
+            )
+        return {}
+
     async def update_task(self, task_id: str, metadata: str | dict) -> bool:
         """Update task metadata via fused-memory. Returns True on success."""
         # fused-memory update_task expects metadata as a JSON string
