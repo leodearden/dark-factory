@@ -495,6 +495,8 @@ async def test_emits_l1_escalation_on_trip(tmp_path):
     assert data['threshold'] == 3
     assert data['window_seconds'] == 60.0
     assert data['project_id'] == 'proj-esc'
+    # kind must be present in the JSON record (step-12 writes it).
+    assert 'kind' in data, f"escalation JSON missing 'kind' key; keys: {list(data)}"
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +598,90 @@ async def test_escalation_rate_limited(tmp_path):
     esc_files = list(esc_dir.glob('*.json'))
     assert len(esc_files) == 2, (
         f'Expected 2 escalation files, found {len(esc_files)}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-1016 step-11: escalation filename and JSON body carry kind slug
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_escalation_filename_and_body_include_kind(tmp_path):
+    """The escalation filename slug and JSON 'kind' field must reflect which
+    reversal kind tripped the guard.
+
+    (a) done counter trips: filename matches esc-bulk-reset-done-<project>-...
+        and JSON data['kind'] == 'done_to_pending'.
+    (b) in-progress counter trips (fresh project to bypass rate-limit):
+        filename matches esc-bulk-reset-in-progress-<project>-...
+        and JSON data['kind'] == 'in_progress_to_pending'.
+
+    Fails until step-12 inserts the kind slug into the filename and records
+    'kind' in the JSON body.
+    """
+    import re
+
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    # --- (a) done counter trips ---
+    guard = BulkResetGuard(
+        done_threshold=3,
+        in_progress_threshold=100,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+    for i in range(4):
+        clock[0] += 1.0
+        v = await guard.observe_attempt(
+            project_id='kind-proj',
+            task_id=f'done-{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    assert v.outcome == 'escalated', f'(a) expected escalated, got {v.outcome}'
+    esc_file_a = Path(v.escalation_path)
+    assert re.search(r'esc-bulk-reset-done-kind_proj-', esc_file_a.name), (
+        f'(a) filename {esc_file_a.name!r} missing done kind slug'
+    )
+    data_a = json.loads(esc_file_a.read_text(encoding='utf-8'))
+    assert data_a.get('kind') == 'done_to_pending', (
+        f"(a) JSON kind: expected 'done_to_pending', got {data_a.get('kind')!r}"
+    )
+
+    # --- (b) in-progress counter trips (fresh project avoids rate-limit) ---
+    guard_b = BulkResetGuard(
+        done_threshold=100,
+        in_progress_threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+    v_b = None
+    for i in range(4):
+        clock[0] += 1.0
+        v_b = await guard_b.observe_attempt(
+            project_id='kind-proj-ip',
+            task_id=f'ip-{i}',
+            old_status='in-progress',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    assert v_b is not None
+    assert v_b.outcome == 'escalated', f'(b) expected escalated, got {v_b.outcome}'
+    esc_file_b = Path(v_b.escalation_path)
+    assert re.search(r'esc-bulk-reset-in-progress-kind_proj_ip-', esc_file_b.name), (
+        f'(b) filename {esc_file_b.name!r} missing in-progress kind slug'
+    )
+    data_b = json.loads(esc_file_b.read_text(encoding='utf-8'))
+    assert data_b.get('kind') == 'in_progress_to_pending', (
+        f"(b) JSON kind: expected 'in_progress_to_pending', got {data_b.get('kind')!r}"
     )
 
 
