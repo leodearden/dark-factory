@@ -87,7 +87,17 @@ class Mem0Backend:
         scope: Scope,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Add a memory to Mem0."""
+        """Add a memory to Mem0.
+
+        Callers into this backend (add_memory, classify_and_add, queued
+        mem0_add dispatch) all pass already-distilled content per the
+        CLAUDE.md contract. We pin ``infer=False`` so Mem0 stores the
+        content verbatim and returns the assigned ID, rather than running
+        its LLM fact-extractor over the input — which silently drops any
+        content the extractor does not classify as a declarative fact
+        (normative/procedural/behavioral text) and returns
+        ``{'results': []}`` with no error.
+        """
         instance = await self._get_instance(scope)
         return await asyncio.wait_for(
             instance.add(
@@ -96,6 +106,7 @@ class Mem0Backend:
                 agent_id=scope.agent_id,
                 run_id=scope.session_id,
                 metadata=metadata,
+                infer=False,
             ),
             timeout=self._write_timeout,
         )
