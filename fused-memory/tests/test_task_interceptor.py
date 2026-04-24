@@ -1663,6 +1663,30 @@ async def test_get_statuses_calls_ensure_connected(event_buffer):
     tm.ensure_connected.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_get_statuses_missing_status_key_defaults_to_unknown(
+    taskmaster, event_buffer
+):
+    """A task dict without a 'status' key is included with status='unknown'.
+
+    Contract: the sentinel 'unknown' is the documented default when the raw
+    task dict omits 'status'.  Callers that need to distinguish a genuine
+    'unknown' status from a missing field should treat any 'unknown' as
+    indeterminate.
+    """
+    taskmaster.get_tasks = AsyncMock(return_value={
+        'tasks': [
+            {'id': 1},              # no 'status' key
+            {'id': 2, 'status': 'done'},
+        ]
+    })
+    interceptor = TaskInterceptor(taskmaster, None, event_buffer)
+
+    result = await interceptor.get_statuses('/project')
+
+    assert result == {'1': 'unknown', '2': 'done'}
+
+
 # ── Tests for None / disconnected taskmaster ───────────────────────
 
 

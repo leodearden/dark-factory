@@ -2605,6 +2605,12 @@ class TaskInterceptor:
                  silently omitted).  ``None`` returns all tasks.  ``[]`` returns
                  ``{}``.
             tag: Tag context forwarded to ``get_tasks`` (optional).
+
+        Notes:
+            Tasks whose dict is missing the ``'status'`` key are included with
+            the sentinel value ``'unknown'``.  Callers that need to distinguish
+            a genuine ``'unknown'`` status from a missing field should treat any
+            ``'unknown'`` value as indeterminate.
         """
         tm = await self._ensure_taskmaster()
         raw = await tm.get_tasks(project_root, tag)
@@ -2615,16 +2621,19 @@ class TaskInterceptor:
         else:
             task_list = raw.get('tasks', [])
 
+        ids_set: set[str] | None = (
+            {str(i) for i in ids} if ids is not None else None
+        )
         mapping: dict[str, str] = {}
         for t in task_list:
             tid = str(t.get('id', ''))
             if not tid:
                 continue
+            # Filter early: if the caller supplied an ids list, skip tasks
+            # that are not in it rather than building the full mapping first.
+            if ids_set is not None and tid not in ids_set:
+                continue
             mapping[tid] = str(t.get('status', 'unknown'))
-
-        if ids is not None:
-            ids_set = {str(i) for i in ids}
-            mapping = {k: v for k, v in mapping.items() if k in ids_set}
 
         return mapping
 
