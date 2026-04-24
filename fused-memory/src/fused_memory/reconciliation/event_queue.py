@@ -396,34 +396,50 @@ class EventQueue:
         When ``keep_rotations == 0``, the current file is simply unlinked so
         the byte cap is still honoured (nothing is archived).
 
-        After the cascade, :meth:`_purge_orphan_rotations` removes any
-        siblings whose numeric suffix exceeds ``keep_rotations``.  This makes
-        retention self-repairing: if an operator lowers ``keep_rotations``
-        between runs (e.g. 5 → 2), previously-created ``.3``, ``.4``, ``.5``
-        files are cleaned up the next time a rotation fires.
+        After the cascade (or the zero-keep discard), :meth:`_purge_orphan_rotations`
+        runs unconditionally via a ``finally`` block.  This makes retention
+        self-repairing in all branches: if an operator lowers ``keep_rotations``
+        between runs (e.g. 5 → 0 or 5 → 2), previously-created ``.3``, ``.4``,
+        ``.5`` files are cleaned up the next time a rotation fires — regardless
+        of which branch executes or whether the cascade loop itself raises
+        mid-iteration.
+
+        **Safety note for the finally-on-exception case**: the cascade loop
+        only writes to indices ``1`` … ``keep_rotations`` (i.e. ``dl.1``,
+        ``dl.2``, …, ``dl.{keep}``), while :meth:`_purge_orphan_rotations`
+        only removes siblings with index ``> keep_rotations``.  These ranges
+        are disjoint, so invoking the purge in the ``finally`` block after a
+        mid-cascade failure cannot remove any file the partial cascade just
+        placed.  The only data that could be lost is the oldest rotation slot
+        (``dl.{keep}``) that the cascade would have overwritten anyway when it
+        ran successfully — that slot is subject to the best-effort contract.
 
         Uses ``os.replace`` for atomicity — it already overwrites the
         destination on POSIX and Windows, so no pre-unlink is needed.
         Any error is caught and logged to preserve the best-effort contract.
         """
         try:
-            if self._keep_rotations == 0:
-                # No archival rotations: just discard the current file.
-                self._dead_letter_path.unlink(missing_ok=True)
-                return
-            # Work from oldest → newest so we never overwrite unsaved data.
-            # os.replace atomically overwrites the destination; the oldest
-            # file (index keep_rotations) is simply replaced/dropped by the
-            # cascade without a separate unlink step.
-            for i in range(self._keep_rotations, 0, -1):
-                src = Path(f'{self._dead_letter_path}.{i - 1}') if i > 1 else self._dead_letter_path
-                dst = Path(f'{self._dead_letter_path}.{i}')
-                if src.exists():
-                    os.replace(src, dst)
-            # After the cascade, remove any siblings whose numeric suffix
-            # exceeds the current keep_rotations bound (orphans from a prior
-            # run with a higher keep_rotations setting).
-            self._purge_orphan_rotations()
+            try:
+                if self._keep_rotations == 0:
+                    # No archival rotations: just discard the current file.
+                    # The finally clause below still runs, purging any orphan
+                    # siblings left over from a prior higher-keep_rotations run.
+                    self._dead_letter_path.unlink(missing_ok=True)
+                    return
+                # Work from oldest → newest so we never overwrite unsaved data.
+                # os.replace atomically overwrites the destination; the oldest
+                # file (index keep_rotations) is simply replaced/dropped by the
+                # cascade without a separate unlink step.
+                for i in range(self._keep_rotations, 0, -1):
+                    src = Path(f'{self._dead_letter_path}.{i - 1}') if i > 1 else self._dead_letter_path
+                    dst = Path(f'{self._dead_letter_path}.{i}')
+                    if src.exists():
+                        os.replace(src, dst)
+            finally:
+                # Remove any siblings whose numeric suffix exceeds the current
+                # keep_rotations bound.  Runs unconditionally — including the
+                # zero-keep branch above and when the cascade raises mid-loop.
+                self._purge_orphan_rotations()
         except Exception as exc:
             logger.error(
                 'EventQueue: dead-letter rotation failed: %s', exc,

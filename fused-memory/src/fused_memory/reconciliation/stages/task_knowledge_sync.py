@@ -119,7 +119,7 @@ class TaskKnowledgeSync(BaseStage):
                 f'{format_task_list(sample)}\n'
             )
 
-        flagged_text, stage1_render_count = _format_flagged(
+        flagged_text = _format_flagged(
             stage1_report.items_flagged if stage1_report else [],
             run_stage='stage2',
         )
@@ -243,7 +243,7 @@ class IntegrityCheck(BaseStage):
         if stage2_report:
             flagged.extend(stage2_report.items_flagged)
 
-        flagged_text, _ = _format_flagged(flagged, run_stage='stage3')
+        flagged_text = _format_flagged(flagged, run_stage='stage3')
 
         return f"""## Stage 3: Cross-System Integrity Check
 ## Project: {self.project_id}
@@ -291,12 +291,13 @@ def _format_flagged(
     *,
     budget_chars: int = _FLAGGED_ITEMS_CHAR_BUDGET,
     run_stage: str | None = None,
-) -> tuple[str, int]:
+) -> str:
     """Render flagged items as a bullet list, capped by *budget_chars*.
 
-    Returns ``(text, rendered_count)`` where *rendered_count* is the number of
-    items whose JSON appears in full in *text*.  Emits a single structured
-    ``logger.warning`` when the budget truncates items.
+    Returns the rendered bullet-list text.  The per-render breakdown
+    (``rendered``, ``dropped``, ``first_item_fragmented``) is emitted in the
+    structured warning's ``extra`` when truncation fires — callers that need
+    telemetry should read it from the warning record, not the return value.
 
     When *run_stage* is provided it is embedded in the warning's ``extra`` dict
     so ops can correlate the drop to its call site without a separate
@@ -305,46 +306,51 @@ def _format_flagged(
     Edge case: if the very first item's JSON alone exceeds *budget_chars*, a
     truncated fragment is always rendered (with a ``… [item truncated]`` marker)
     so the LLM receives at least some signal rather than an opaque footer-only
-    body.
+    body.  ``rendered`` stays 0 (the fragment is not a full render) and the
+    warning's ``extra`` includes ``first_item_fragmented=True`` so
+    callers/telemetry can distinguish fragmented-first-item from all-dropped.
     """
     if not items:
-        return ('No flagged items.', 0)
+        return 'No flagged items.'
     lines: list[str] = []
     running_chars = 0
-    rendered_count = 0
-    for item in items:
-        line = f'- {json.dumps(item, default=str)}'
+    first_item_fragmented = False
+    for idx, item in enumerate(items):
+        json_str = json.dumps(item, default=str)
+        line = f'- {json_str}'
         # +1 for the '\n' separator between lines
         separator = 1 if lines else 0
         if running_chars + separator + len(line) > budget_chars:
             # Budget exceeded — stop and emit a truncation footer + warning.
-            if rendered_count == 0:
+            if idx == 0:
                 # First item alone exceeds the budget.  Always show at least a
                 # truncated fragment so the LLM has some signal rather than an
                 # opaque footer-only body.
                 marker = '… [item truncated]'
                 available = budget_chars - len('- ') - len(marker)
                 if available > 0:
-                    json_str = json.dumps(item, default=str)
                     lines.append(f'- {json_str[:available]}{marker}')
-                    rendered_count = 1
-            dropped = len(items) - rendered_count
-            if dropped > 0:
-                lines.append(f'... and {dropped} more (truncated: char budget)')
+                    first_item_fragmented = True
+            dropped = len(items) - idx
+            # Footer shows only items that are completely absent (not the
+            # fragmented first item, which already appears as a truncated line).
+            completely_missing = dropped - (1 if first_item_fragmented else 0)
+            if completely_missing > 0:
+                lines.append(f'... and {completely_missing} more (truncated: char budget)')
             extra: dict = {
                 'total': len(items),
-                'rendered': rendered_count,
+                'rendered': idx,
                 'dropped': dropped,
                 'budget_chars': budget_chars,
+                'first_item_fragmented': first_item_fragmented,
             }
             if run_stage is not None:
                 extra['run_stage'] = run_stage
             logger.warning('reconciliation.flagged_items_truncated', extra=extra)
-            return ('\n'.join(lines), rendered_count)
+            return '\n'.join(lines)
         lines.append(line)
         running_chars += separator + len(line)
-        rendered_count += 1
-    return ('\n'.join(lines), rendered_count)
+    return '\n'.join(lines)
 
 
 async def _render_done_provenance_section(
