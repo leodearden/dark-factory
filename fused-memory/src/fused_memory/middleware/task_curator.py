@@ -518,6 +518,10 @@ class TaskCurator:
         subtasks frequently omit that field, so including it would produce
         false negatives for otherwise-identical tasks.
         """
+        # NOTE: intentional duplication of task_interceptor._normalize_title
+        # (task_interceptor.py ~line 2945: `' '.join(title.strip().lower().split())`).
+        # Kept here to avoid a cross-module import from task_curator →
+        # task_interceptor.  If either normalisation changes, keep both in sync.
         def _norm(s: str | None) -> str:
             return ' '.join((s or '').strip().lower().split())
 

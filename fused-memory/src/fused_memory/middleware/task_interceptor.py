@@ -1040,6 +1040,16 @@ class TaskInterceptor:
             tid = str(t.get('id', ''))
             title = str(t.get('title', ''))
             description = str(t.get('description', '') or '')
+
+            # Guard: tasks with a blank title get an identical
+            # _intra_batch_key('', '') hash regardless of description,
+            # which would incorrectly collapse all malformed subtasks
+            # into the first one.  Pass them straight through and let
+            # the curator path's own empty-title guard decide.
+            if not title.strip():
+                unique_new_tasks.append(t)
+                continue
+
             key = TaskCurator._intra_batch_key(title, description)
             if key not in seen_keys:
                 seen_keys[key] = tid
@@ -1062,6 +1072,10 @@ class TaskInterceptor:
                     )
                 except Exception as exc:
                     errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
+                    # Removal failed transiently — fall through to curator so
+                    # this task still appears in `kept` rather than silently
+                    # disappearing from both `removed` and `kept`.
+                    unique_new_tasks.append(t)
 
         curator = await self._get_curator()
         if curator is None:
