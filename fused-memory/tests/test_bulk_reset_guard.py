@@ -703,7 +703,9 @@ def test_verdict_to_error_dict_rejection(threshold, window_seconds):
 
 
 def test_verdict_to_error_dict_escalated():
-    """outcome='escalated' produces the same rejection payload PLUS escalation_path."""
+    """outcome='escalated' produces the same rejection payload PLUS escalation_path.
+    When the verdict carries a kind, to_error_dict() must surface it as d['kind'].
+    """
     v = BulkResetVerdict(
         outcome='escalated',
         affected_task_ids=('t1', 't2'),
@@ -713,12 +715,15 @@ def test_verdict_to_error_dict_escalated():
         project_id='proj',
         error_type='BulkResetGuardTripped',
         escalation_path='/tmp/esc-bulk-reset-xyz.json',
+        kind='done_to_pending',
     )
     d = v.to_error_dict()
     assert d['success'] is False
     assert d['error_type'] == 'BulkResetGuardTripped'
     assert d['escalation_path'] == '/tmp/esc-bulk-reset-xyz.json'
     assert d['project_id'] == 'proj'
+    # kind must be surfaced in the error payload (step-10 wires this).
+    assert d.get('kind') == 'done_to_pending'
 
 
 # ---------------------------------------------------------------------------
@@ -1270,3 +1275,100 @@ async def test_per_kind_counter_isolation(tmp_path):
         assert d_id not in v_trip_b.affected_task_ids, (
             f'Scenario B: done id {d_id} leaked into in-progress verdict'
         )
+
+
+# ---------------------------------------------------------------------------
+# task-1016 step-9: BulkResetVerdict.kind field
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_verdict_carries_tripped_kind(tmp_path):
+    """BulkResetVerdict.kind must carry the reversal kind that tripped the guard,
+    or None on an ok outcome.
+
+    (a) Tripping the done counter yields verdict.kind == 'done_to_pending'.
+    (b) Tripping the in-progress counter yields verdict.kind == 'in_progress_to_pending'.
+    (c) An ok outcome (below threshold) has verdict.kind is None.
+
+    Fails until step-10 adds the kind field to BulkResetVerdict and populates
+    it inside observe_attempt.
+    """
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    # (c) ok verdict — kind must be None
+    guard_ok = BulkResetGuard(
+        done_threshold=10,
+        in_progress_threshold=100,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+    clock[0] += 1.0
+    v_ok = await guard_ok.observe_attempt(
+        project_id='proj-kind',
+        task_id='ok-task',
+        old_status='done',
+        new_status='pending',
+        project_root=str(tmp_path),
+    )
+    assert v_ok.outcome == 'ok'
+    assert v_ok.kind is None, (
+        f'ok verdict should have kind=None, got {v_ok.kind!r}'
+    )
+
+    # (a) Trip the done counter — kind must be 'done_to_pending'
+    guard_done = BulkResetGuard(
+        done_threshold=3,
+        in_progress_threshold=100,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+    done_trip_ids = ['d0', 'd1', 'd2', 'd3']
+    v_done_trip = None
+    for tid in done_trip_ids:
+        clock[0] += 1.0
+        v_done_trip = await guard_done.observe_attempt(
+            project_id='proj-done',
+            task_id=tid,
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    assert v_done_trip is not None
+    assert v_done_trip.is_rejection is True
+    assert v_done_trip.kind == 'done_to_pending', (
+        f'done counter trip: expected kind=done_to_pending, got {v_done_trip.kind!r}'
+    )
+
+    # (b) Trip the in-progress counter — kind must be 'in_progress_to_pending'
+    guard_ip = BulkResetGuard(
+        done_threshold=100,
+        in_progress_threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+    ip_trip_ids = ['ip0', 'ip1', 'ip2', 'ip3']
+    v_ip_trip = None
+    for tid in ip_trip_ids:
+        clock[0] += 1.0
+        v_ip_trip = await guard_ip.observe_attempt(
+            project_id='proj-ip',
+            task_id=tid,
+            old_status='in-progress',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+    assert v_ip_trip is not None
+    assert v_ip_trip.is_rejection is True
+    assert v_ip_trip.kind == 'in_progress_to_pending', (
+        f'in-progress counter trip: expected kind=in_progress_to_pending, '
+        f'got {v_ip_trip.kind!r}'
+    )
