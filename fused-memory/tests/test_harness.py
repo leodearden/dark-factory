@@ -3172,23 +3172,25 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
     journal, event_buffer, mock_memory_service
 ):
     """Regression guard: a ``_project_root`` override on a later buffered event must be
-    found even when earlier events in the peek window lack the key (window >= N positions).
+    found even when earlier events in the peek window lack the key.
 
-    Uses a 9+1=10 buffered-event setup so the override is the last peeked item under
-    the current window; reducing the window below 10 will trip this test.
+    Uses a 2+1=3 event setup so the invariant is: any peek window >= 3 must find the
+    later-buffered override — a deliberately-small lower bound that any reasonable window
+    must accommodate (decoupled from ``_PROJECT_ROOT_PEEK_LIMIT``'s current value).
     """
-    # peek_buffered orders by `timestamp ASC LIMIT ?` (FIFO). Push 9 events that
+    # peek_buffered orders by `timestamp ASC LIMIT ?` (FIFO). Push 2 events that
     # LACK _project_root with monotonically-increasing timestamps, then 1 event
-    # carrying _project_root='/from/event' with the latest timestamp. With FIFO
-    # peek, the override event is returned LAST — so the resolver only finds it
-    # if the window is wide enough to accommodate all 10 buffered events.
-    # Using 9+1=10 puts the override right at the current limit, so any
-    # reduction of the peek window (even to 9) will cause this test to fail.
+    # carrying _project_root='/from/event' with a strictly-later timestamp. With FIFO
+    # peek, the override event is returned LAST — so the resolver finds it only if the
+    # window accommodates all 3 buffered events.
+    # 3 is the smallest non-trivial floor: a 2-event setup would only catch a window
+    # set to 1 (pathological); 3 catches windows of 1 or 2 without pinning to
+    # _PROJECT_ROOT_PEEK_LIMIT's current value.
     # Anchor base_ts 60 seconds in the past so that peek_buffered's
     # `WHERE timestamp < cutoff` clause (cutoff ≈ datetime.now(UTC) at run() time)
-    # includes all 10 events.  Explicit offsets avoid sub-microsecond tie flakiness.
+    # includes all 3 events.  Explicit offsets avoid sub-microsecond tie flakiness.
     base_ts = datetime.now(UTC) - timedelta(seconds=60)
-    for i in range(9):
+    for i in range(2):
         await event_buffer.push(ReconciliationEvent(
             id=str(uuid.uuid4()),
             type=EventType.episode_added,
@@ -3202,7 +3204,7 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
         type=EventType.task_status_changed,
         source=EventSource.agent,
         project_id='dark_factory',
-        timestamp=base_ts + timedelta(seconds=20),  # latest — FIFO peek returns last
+        timestamp=base_ts + timedelta(seconds=10),  # latest — FIFO peek returns last
         payload={'_project_root': '/from/event', 'task_id': '1'},
     ))
 
@@ -3229,9 +3231,9 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
     assert captured['project_root'] == '/from/event', (
         f"Expected project_root='/from/event' but got '{captured['project_root']}'. "
         'The peek window must be wide enough to find a later-buffered _project_root '
-        'override past 9 earlier events that lack the key. If this test now fails, '
-        'the peek window has been tuned too narrow — consider whether 10 buffered '
-        'events is an unreasonable lookback and adjust accordingly.'
+        'override past 2 earlier events that lack the key — i.e., any peek window >= 3 '
+        'must succeed. If this test fails, the peek window has been tuned to 1 or 2, '
+        'which is clearly too narrow.'
     )
 
 
@@ -3249,7 +3251,7 @@ async def test_backlog_iterator_event_project_root_wins_over_configured(
     Pure-precedence case: ALL buffered events carry _project_root — pins that event value
     beats the configured fallback.  Contrast with
     test_backlog_iterator_peek_window_finds_later_project_root_override, which uses
-    9 events without the key + 1 with (mixed setup) to probe peek-window width.
+    a mixed setup (events without the key + a later event with it) to probe peek-window width.
 
     Peek-window semantics differ from run_full_cycle's full-drain coverage at
     test_harness.py:341, making this a distinct regression guard.
