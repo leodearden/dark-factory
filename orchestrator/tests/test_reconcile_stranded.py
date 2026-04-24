@@ -603,11 +603,14 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     h._start_orphan_l0_reaper = MagicMock()
     h._tag_task_modules = AsyncMock()
 
-    # Provide one pending task so the "no pending tasks" check passes
+    # Provide one pending task so the "no pending tasks" check passes.
+    # get_statuses is used by the startup block (post-step-16);
+    # get_tasks is retained for methods not yet migrated (e.g. _tag_prd_metadata).
     h.scheduler = MagicMock()
     h.scheduler.get_tasks = AsyncMock(return_value=[
         {'id': 1, 'status': 'pending', 'title': 'A task'},
     ])
+    h.scheduler.get_statuses = AsyncMock(return_value={'1': 'pending'})
     h.scheduler.set_task_status = AsyncMock()
 
     # Track ordering: _recover_crashed_tasks

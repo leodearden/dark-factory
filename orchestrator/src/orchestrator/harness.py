@@ -362,15 +362,15 @@ class Harness:
             # 2. Parse PRD into tasks (skipped when no PRD given)
             if prd_path is not None:
                 logger.info(f'Parsing PRD: {prd_path}')
-                pre_ids = {str(t.get('id', '')) for t in await self.scheduler.get_tasks()}
+                pre_ids = set((await self.scheduler.get_statuses()).keys())
                 await self._populate_tasks(prd_path)
 
                 # 2a. Tag newly-created tasks with PRD source
                 await self._tag_prd_metadata(prd_path, pre_ids)
             else:
                 logger.info('No PRD given — running existing tasks')
-                existing = await self.scheduler.get_tasks()
-                if not any(t.get('status') == 'pending' for t in existing):
+                existing_statuses = await self.scheduler.get_statuses()
+                if 'pending' not in existing_statuses.values():
                     raise RuntimeError(
                         'No PRD given and no pending tasks found. '
                         'Pass --prd to decompose a PRD, or create tasks first.'
@@ -386,8 +386,8 @@ class Harness:
             # 2d. Reconcile stranded in-progress tasks (live-claimant-aware)
             await self._reconcile_stranded_in_progress()
 
-            tasks = await self.scheduler.get_tasks()
-            self.report.total_tasks = len([t for t in tasks if t.get('status') == 'pending'])
+            statuses = await self.scheduler.get_statuses()
+            self.report.total_tasks = sum(1 for s in statuses.values() if s == 'pending')
             logger.info(f'Task tree populated: {self.report.total_tasks} pending tasks')
 
             if dry_run:
