@@ -174,9 +174,9 @@ class EscalationQueue:
         for path in paths:
             id_to_paths.setdefault(path.stem, []).append(path)
         for esc_id, esc_paths in id_to_paths.items():
-            root_paths = [p for p in esc_paths if p.parent == self.queue_dir]
-            archive_paths = [p for p in esc_paths if p.parent != self.queue_dir]
-            if root_paths and archive_paths:
+            has_root = any(p.parent == self.queue_dir for p in esc_paths)
+            has_archive = any(p.parent != self.queue_dir for p in esc_paths)
+            if has_root and has_archive:
                 logger.warning(
                     f'Escalation {esc_id!r} exists in both queue_dir and archive: '
                     f'{[str(p) for p in esc_paths]}; reconciliation may be needed'

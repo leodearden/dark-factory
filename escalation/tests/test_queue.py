@@ -826,6 +826,67 @@ class TestGetByTaskDedupAcrossArchive:
         )
 
 
+    def test_get_by_task_warns_on_three_path_cross_tier_duplicate(
+        self, tmp_path: Path, caplog,
+    ):
+        """Pre-scan must warn when the same id has one queue_dir root copy AND two
+        archive-dated copies (3-path cross-tier case).
+
+        This is the intersection of the two regressions this PR addresses:
+        - The cross-tier detection must still fire (real reconciliation signal).
+        - The legitimate multi-date-dir aspect of the archive copies must NOT
+          suppress the warning — only archive-only duplicates are benign.
+
+        Exactly one WARNING is expected (the pre-scan loop body runs once per id
+        regardless of how many archive copies exist), and the log message must
+        mention all three on-disk paths so an operator can trace the situation.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # One copy in queue_dir root (root tier)
+        root_copy = _make_escalation('esc-42-1', task_id='42', status='pending')
+        (queue.queue_dir / 'esc-42-1.json').write_text(root_copy.to_json())
+
+        # Two archive-dated copies of the same id (archive tier)
+        archive_dir_old = queue.queue_dir / 'archive' / '2025-06-15'
+        archive_dir_old.mkdir(parents=True, exist_ok=True)
+        arc_old = _make_escalation('esc-42-1', task_id='42', status='resolved')
+        arc_old.resolution = 'older_archive'
+        (archive_dir_old / 'esc-42-1.json').write_text(arc_old.to_json())
+
+        archive_dir_new = queue.queue_dir / 'archive' / '2025-06-16'
+        archive_dir_new.mkdir(parents=True, exist_ok=True)
+        arc_new = _make_escalation('esc-42-1', task_id='42', status='resolved')
+        arc_new.resolution = 'newer_archive'
+        (archive_dir_new / 'esc-42-1.json').write_text(arc_new.to_json())
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.get_by_task('42')
+
+        # Exactly one WARNING for esc-42-1 (the pre-scan loop body runs once per id)
+        warning_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue'
+            and r.levelno == logging.WARNING
+            and 'esc-42-1' in r.message
+        ]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING for esc-42-1 cross-tier duplicate, '
+            f'got {len(warning_records)}: {[r.message for r in warning_records]}'
+        )
+
+        # The warning message must reference all three paths so an operator can
+        # trace which files need reconciliation
+        msg = warning_records[0].message
+        root_path = str(queue.queue_dir / 'esc-42-1.json')
+        arc_old_path = str(archive_dir_old / 'esc-42-1.json')
+        arc_new_path = str(archive_dir_new / 'esc-42-1.json')
+        for expected_path in (root_path, arc_old_path, arc_new_path):
+            assert expected_path in msg, (
+                f'Expected path {expected_path!r} in WARNING message, but got: {msg!r}'
+            )
+
+
 class TestGetPendingParseFailure:
     """get_pending() must emit a WARNING when a queue file cannot be parsed."""
 
