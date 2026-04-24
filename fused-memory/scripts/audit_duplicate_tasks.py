@@ -41,7 +41,7 @@ import difflib
 import json
 import logging
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger('audit_duplicate_tasks')

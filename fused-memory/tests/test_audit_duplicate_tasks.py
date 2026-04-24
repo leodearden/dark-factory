@@ -44,6 +44,7 @@ pick_survivor = _mod.pick_survivor
 compute_dependency_updates = _mod.compute_dependency_updates
 DependencyUpdate = _mod.DependencyUpdate
 apply_changes = _mod.apply_changes
+build_audit_plan = _mod.build_audit_plan
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +561,6 @@ class TestComputeDependencyUpdatesIntDependencies:
 #
 # Uses assert_awaited_* (not assert_called_*) per check_asyncmock_assertion_style.py lint rule.
 
-import pytest
 
 
 @pytest.mark.asyncio
@@ -652,7 +652,7 @@ class TestApplyChangesDependencyUpdates:
 
     async def test_cancellations_precede_dependency_updates(self):
         """Call order: all set_task_status calls complete before any remove/add_dependency."""
-        from unittest.mock import AsyncMock, MagicMock, call  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
 
         call_order: list[str] = []
 
@@ -707,3 +707,142 @@ class TestApplyChangesDependencyUpdates:
         # Dep updates still proceed despite cancel failure.
         backend.remove_dependency.assert_awaited_once()
         backend.add_dependency.assert_awaited_once()
+
+
+# ===========================================================================
+# Step-11: build_audit_plan
+# ===========================================================================
+
+class TestBuildAuditPlanFiltering:
+    """Tasks with status done/cancelled or id < min_id are filtered out."""
+
+    def test_done_and_cancelled_tasks_excluded(self):
+        """Only pending and in-progress tasks are scanned."""
+        tasks = [
+            _task('1000', 'Duplicate title'),
+            _task('1001', 'Duplicate title', status='done'),
+            _task('1002', 'Duplicate title', status='cancelled'),
+        ]
+        plan = build_audit_plan(tasks, min_id=1000)
+        # Only tasks 1000 is left as a candidate — no duplicate group.
+        assert plan['candidates_total'] == 1
+        assert plan['auto_cancel'] == []
+
+    def test_tasks_below_min_id_excluded(self):
+        """Tasks with id < min_id are not scanned."""
+        tasks = [
+            _task('999', 'Duplicate title'),
+            _task('1000', 'Duplicate title'),
+        ]
+        plan = build_audit_plan(tasks, min_id=1000)
+        # Task 999 is below the cutoff — only 1000 is a candidate.
+        assert plan['candidates_total'] == 1
+        assert plan['auto_cancel'] == []
+
+
+class TestBuildAuditPlanExactGroups:
+    """Exact duplicate handling: pending losers auto-cancelled, in-progress → human review."""
+
+    def test_pending_and_inprogress_both_in_same_exact_group(self):
+        """Both pending and in-progress duplicates of the same title form one exact group."""
+        tasks = [
+            _task('1010', 'Analyse telemetry', status='pending', priority='medium'),
+            _task('1011', 'Analyse telemetry', status='in-progress', priority='medium'),
+        ]
+        plan = build_audit_plan(tasks, min_id=1000)
+        # Should have one exact group.
+        assert len(plan['exact_groups']) == 1
+
+    def test_pending_loser_auto_cancelled(self):
+        """Pending loser (lower priority / higher ID) goes into auto_cancel."""
+        tasks = [
+            _task('1020', 'Build cache layer', status='pending', priority='high'),
+            _task('1021', 'Build cache layer', status='pending', priority='medium'),
+        ]
+        plan = build_audit_plan(tasks, min_id=1000)
+        # 1020 = survivor (high prio); 1021 = loser (medium prio) → auto_cancel.
+        assert '1021' in plan['auto_cancel']
+        assert '1020' not in plan['auto_cancel']
+
+    def test_inprogress_loser_goes_to_human_review(self):
+        """In-progress loser is reported under needs_human_review, NOT auto-cancelled."""
+        tasks = [
+            _task('1030', 'Migrate schema', status='pending', priority='high'),
+            _task('1031', 'Migrate schema', status='in-progress', priority='low'),
+        ]
+        plan = build_audit_plan(tasks, min_id=1000)
+        # 1031 is in-progress loser → human review, NOT auto_cancel.
+        assert '1031' not in plan['auto_cancel']
+        human_ids = {r['id'] for r in plan['needs_human_review']}
+        assert '1031' in human_ids
+
+    def test_dependency_updates_only_for_auto_cancelled_ids(self):
+        """Dependency remaps are computed only for auto-cancelled (pending) losers."""
+        tasks = [
+            _task('1040', 'Core feature', status='pending', priority='high'),
+            _task('1041', 'Core feature', status='pending', priority='low'),
+            # Task that depends on the loser.
+            _task('1042', 'Follow-up task', dependencies=['1041']),
+        ]
+        plan = build_audit_plan(tasks, min_id=1000)
+        assert '1041' in plan['auto_cancel']
+        # Dependency remap: 1042 depends on loser 1041 → remap to survivor 1040.
+        dep_updates = plan['dependency_updates']
+        assert len(dep_updates) >= 1
+        remap = next(u for u in dep_updates if u['dependent_id'] == '1042')
+        assert remap['remove_dep'] == '1041'
+        assert remap['add_dep'] == '1040'
+
+
+class TestBuildAuditPlanNearDuplicates:
+    """Near-duplicate groups are reported separately — no auto-cancel."""
+
+    def test_near_duplicates_in_separate_bucket_no_auto_cancel(self):
+        """Near-dups appear in near_duplicate_groups and are NOT auto-cancelled."""
+        tasks = [
+            _task('1050', 'Setup CI pipeline'),
+            _task('1051', 'Setup the CI pipeline'),
+        ]
+        plan = build_audit_plan(tasks, threshold=0.80, min_id=1000)
+        # No exact match, so auto_cancel should be empty.
+        assert plan['auto_cancel'] == []
+        # Near-dup group should be reported.
+        assert len(plan['near_duplicate_groups']) >= 1
+
+    def test_exact_match_ids_not_in_near_duplicate_groups(self):
+        """Tasks already in exact groups must be excluded from near-dup search."""
+        tasks = [
+            _task('1060', 'Deploy service'),
+            _task('1061', 'Deploy service'),          # exact duplicate of 1060
+            _task('1062', 'Deploy service layer'),     # near-dup of 1060/1061
+        ]
+        plan = build_audit_plan(tasks, threshold=0.85, min_id=1000)
+        # 1060 and 1061 are exact duplicates → excluded from near-dup groups.
+        # 1062 should not be grouped with them (excluded IDs).
+        near_ids = {t['id'] for g in plan['near_duplicate_groups'] for t in g['tasks']}
+        # Exact match tasks must not leak into near_duplicate_groups.
+        assert '1060' not in near_ids
+        assert '1061' not in near_ids
+
+
+class TestBuildAuditPlanPlanShape:
+    """Return value always has the expected keys."""
+
+    def test_plan_has_required_keys(self):
+        """build_audit_plan always returns a dict with all required keys."""
+        plan = build_audit_plan([], min_id=1000)
+        required = {
+            'candidates_total', 'exact_groups', 'near_duplicate_groups',
+            'auto_cancel', 'needs_human_review', 'dependency_updates',
+        }
+        assert required <= set(plan.keys())
+
+    def test_empty_input_produces_empty_plan(self):
+        """No tasks → all lists/counts empty."""
+        plan = build_audit_plan([], min_id=1000)
+        assert plan['candidates_total'] == 0
+        assert plan['exact_groups'] == []
+        assert plan['near_duplicate_groups'] == []
+        assert plan['auto_cancel'] == []
+        assert plan['needs_human_review'] == []
+        assert plan['dependency_updates'] == []
