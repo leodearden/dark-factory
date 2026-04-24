@@ -41,6 +41,8 @@ _mod = _load_module()
 find_exact_duplicate_groups = _mod.find_exact_duplicate_groups
 find_near_duplicate_groups = _mod.find_near_duplicate_groups
 pick_survivor = _mod.pick_survivor
+compute_dependency_updates = _mod.compute_dependency_updates
+DependencyUpdate = _mod.DependencyUpdate
 
 
 # ---------------------------------------------------------------------------
@@ -419,3 +421,127 @@ class TestPickSurvivorEdgeCases:
             random.shuffle(shuffled)
             survivor, _ = pick_survivor(shuffled)
             assert survivor['id'] == expected_survivor_id
+
+
+# ===========================================================================
+# Step-7: compute_dependency_updates
+# ===========================================================================
+
+class TestComputeDependencyUpdatesBasic:
+    """Core: remapping cancelled deps to the survivor."""
+
+    def test_no_task_references_cancelled_id_returns_empty(self):
+        """No task has a cancelled task in its deps → empty list."""
+        all_tasks = [
+            _task('300', 'Survivor'),
+            _task('301', 'Other task', dependencies=['300']),  # depends on survivor, not cancelled
+        ]
+        result = compute_dependency_updates(
+            survivor_id='300',
+            cancelled_ids={'999'},
+            all_tasks=all_tasks,
+        )
+        assert result == []
+
+    def test_single_task_with_cancelled_dep(self):
+        """Task A depends on cancelled X → emit (remove=X, add=survivor)."""
+        all_tasks = [
+            _task('310', 'Survivor'),
+            _task('311', 'Task A', dependencies=['399']),
+        ]
+        result = compute_dependency_updates(
+            survivor_id='310',
+            cancelled_ids={'399'},
+            all_tasks=all_tasks,
+        )
+        assert len(result) == 1
+        u = result[0]
+        assert u.dependent_id == '311'
+        assert u.remove_dep == '399'
+        assert u.add_dep == '310'
+
+    def test_task_already_depends_on_survivor_only_remove(self):
+        """Task B depends on [cancelled X, survivor] → remove X, do NOT add survivor again."""
+        all_tasks = [
+            _task('320', 'Survivor'),
+            _task('321', 'Task B', dependencies=['399', '320']),
+        ]
+        result = compute_dependency_updates(
+            survivor_id='320',
+            cancelled_ids={'399'},
+            all_tasks=all_tasks,
+        )
+        assert len(result) == 1
+        u = result[0]
+        assert u.dependent_id == '321'
+        assert u.remove_dep == '399'
+        assert u.add_dep is None  # survivor already present
+
+
+class TestComputeDependencyUpdatesMultipleCancelledDeps:
+    """One task depending on two different cancelled IDs → two remove ops, one add."""
+
+    def test_two_cancelled_deps_two_removes_one_add(self):
+        """Task C depends on cancelled_X and cancelled_Y (both → same survivor).
+
+        Expect: two DependencyUpdates — first has add_dep=survivor, second has add_dep=None.
+        """
+        all_tasks = [
+            _task('330', 'Survivor'),
+            _task('331', 'Task C', dependencies=['397', '398']),
+        ]
+        result = compute_dependency_updates(
+            survivor_id='330',
+            cancelled_ids={'397', '398'},
+            all_tasks=all_tasks,
+        )
+        assert len(result) == 2
+        remove_deps = {u.remove_dep for u in result}
+        assert remove_deps == {'397', '398'}
+        # Survivor should be added exactly once across all updates for task C.
+        add_deps = [u.add_dep for u in result if u.add_dep is not None]
+        assert len(add_deps) == 1
+        assert add_deps[0] == '330'
+
+
+class TestComputeDependencyUpdatesCancelledTaskSkipped:
+    """Cancelled tasks themselves are NOT included as dependents."""
+
+    def test_cancelled_task_not_remapped(self):
+        """If a task is in cancelled_ids, its own outgoing deps are not remapped."""
+        all_tasks = [
+            _task('340', 'Survivor'),
+            _task('341', 'Cancelled loser', dependencies=['399']),  # being cancelled
+            _task('342', 'Active task', dependencies=['341']),
+        ]
+        result = compute_dependency_updates(
+            survivor_id='340',
+            cancelled_ids={'341'},
+            all_tasks=all_tasks,
+        )
+        # Task 341 is being cancelled — it must NOT appear as a dependent.
+        dependent_ids = {u.dependent_id for u in result}
+        assert '341' not in dependent_ids
+        # Task 342 depends on 341 (cancelled) → should be remapped.
+        assert '342' in dependent_ids
+
+
+class TestComputeDependencyUpdatesIntDependencies:
+    """Dependencies stored as int OR str → both shapes handled."""
+
+    def test_int_dependency_ids_normalised(self):
+        """Dependencies given as integers (not strings) are normalised correctly."""
+        all_tasks = [
+            _task('350', 'Survivor'),
+            {'id': '351', 'title': 'Task D', 'status': 'pending', 'dependencies': [399]},  # int
+        ]
+        result = compute_dependency_updates(
+            survivor_id='350',
+            cancelled_ids={'399'},
+            all_tasks=all_tasks,
+        )
+        assert len(result) == 1
+        u = result[0]
+        assert u.dependent_id == '351'
+        assert u.remove_dep == '399'
+        assert u.add_dep == '350'
