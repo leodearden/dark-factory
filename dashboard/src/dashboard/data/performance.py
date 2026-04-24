@@ -15,6 +15,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import aiosqlite
+from escalation.queue import iter_all_escalation_paths
 
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
@@ -23,11 +24,16 @@ logger = logging.getLogger(__name__)
 
 
 def _load_escalations(escalations_dir: Path) -> list[dict]:
-    """Load all escalation JSON files from the directory."""
-    if not escalations_dir.is_dir():
-        return []
-    results = []
-    for path in escalations_dir.glob('esc-*.json'):
+    """Load all escalation JSON files from the queue root and archive subtree.
+
+    Uses :func:`escalation.queue.iter_all_escalation_paths` to perform a
+    two-tier scan: queue root first, then ``archive/YYYY-MM-DD/`` subdirs.
+    Deduplication by filename stem is handled by the helper (root wins on
+    id collisions).  A missing or non-directory *escalations_dir* yields an
+    empty list without raising.
+    """
+    results: list[dict] = []
+    for path in iter_all_escalation_paths(escalations_dir):
         try:
             results.append(json.loads(path.read_text()))
         except (json.JSONDecodeError, OSError):
@@ -49,7 +55,8 @@ SELECT project_id,
 
 
 async def _project_cutoffs(
-    db: aiosqlite.Connection, days: int,
+    db: aiosqlite.Connection,
+    days: int,
 ) -> dict[str, str]:
     """Return {project_id: cutoff_iso} based on most recent completed_at."""
     # aiosqlite doesn't support f-string in execute safely, use replace
@@ -61,6 +68,7 @@ async def _project_cutoffs(
 # ---------------------------------------------------------------------------
 # 1. Completion paths
 # ---------------------------------------------------------------------------
+
 
 async def get_completion_paths(
     db: aiosqlite.Connection | None,
@@ -174,8 +182,10 @@ async def aggregate_completion_paths(
         return {}
 
     results = await asyncio.gather(
-        *(get_completion_paths(db, edir, days=days)
-          for db, edir in zip(dbs, escalations_dirs, strict=True))
+        *(
+            get_completion_paths(db, edir, days=days)
+            for db, edir in zip(dbs, escalations_dirs, strict=True)
+        )
     )
 
     # Merge: sum counts per project_id per path
@@ -221,8 +231,10 @@ async def aggregate_escalation_rates(
         return {}
 
     results = await asyncio.gather(
-        *(get_escalation_rates(db, edir, days=days)
-          for db, edir in zip(dbs, escalations_dirs, strict=True))
+        *(
+            get_escalation_rates(db, edir, days=days)
+            for db, edir in zip(dbs, escalations_dirs, strict=True)
+        )
     )
 
     merged: dict[str, dict] = {}
@@ -246,9 +258,7 @@ async def aggregate_escalation_rates(
     for _pid, m in merged.items():
         total = m['total_tasks']
         m['steward_rate'] = round(m['steward_count'] / total * 100, 1) if total else 0.0
-        m['interactive_rate'] = (
-            round(m['interactive_count'] / total * 100, 1) if total else 0.0
-        )
+        m['interactive_rate'] = round(m['interactive_count'] / total * 100, 1) if total else 0.0
     return merged
 
 
@@ -293,7 +303,10 @@ async def aggregate_loop_histograms(
                             'aggregate_loop_histograms: label list mismatch'
                             ' for project %r key %r'
                             ' (base=%r, incoming=%r)',
-                            pid, key, m[key]['labels'], info[key]['labels'],
+                            pid,
+                            key,
+                            m[key]['labels'],
+                            info[key]['labels'],
                         )
                         label_map = dict(zip(m[key]['labels'], m[key]['values'], strict=True))
                         for lbl, val in zip(info[key]['labels'], info[key]['values'], strict=True):
@@ -332,10 +345,7 @@ async def _durations_by_project(
                 ' ORDER BY duration_ms ',
                 (project_id, cutoff),
             )
-            result[project_id] = [
-                row[0] for row in rows
-                if row[0] is not None and row[0] > 0
-            ]
+            result[project_id] = [row[0] for row in rows if row[0] is not None and row[0] > 0]
 
         return result
 
@@ -358,9 +368,7 @@ async def aggregate_time_centiles(
     if not dbs:
         return {}
 
-    results = await asyncio.gather(
-        *(_durations_by_project(db, days=days) for db in dbs)
-    )
+    results = await asyncio.gather(*(_durations_by_project(db, days=days) for db in dbs))
 
     # Merge: concatenate raw duration lists per project_id
     merged: dict[str, list[int]] = {}
@@ -391,6 +399,7 @@ async def aggregate_time_centiles(
 # 2. Escalation rates
 # ---------------------------------------------------------------------------
 
+
 async def get_escalation_rates(
     db: aiosqlite.Connection | None,
     escalations_dir: Path,
@@ -419,12 +428,14 @@ async def get_escalation_rates(
 
         result: dict[str, dict] = {}
         for project_id, cutoff in cutoffs.items():
-            rows = list(await db.execute_fetchall(
-                'SELECT task_id, steward_invocations '
-                '  FROM task_results '
-                ' WHERE project_id = ? AND completed_at >= ? ',
-                (project_id, cutoff),
-            ))
+            rows = list(
+                await db.execute_fetchall(
+                    'SELECT task_id, steward_invocations '
+                    '  FROM task_results '
+                    ' WHERE project_id = ? AND completed_at >= ? ',
+                    (project_id, cutoff),
+                )
+            )
 
             total = len(rows)
             steward_count = 0
@@ -440,8 +451,7 @@ async def get_escalation_rates(
 
                 task_escs = esc_by_task.get(task_id, [])
                 has_interactive = any(
-                    e.get('level') == 1
-                    and e.get('status') in ('resolved', 'dismissed')
+                    e.get('level') == 1 and e.get('status') in ('resolved', 'dismissed')
                     for e in task_escs
                 )
                 if has_interactive:
@@ -449,9 +459,7 @@ async def get_escalation_rates(
 
                     # Classify human effort from resolution_turns
                     max_turns = max(
-                        (e.get('resolution_turns') or 0)
-                        for e in task_escs
-                        if e.get('level') == 1
+                        (e.get('resolution_turns') or 0) for e in task_escs if e.get('level') == 1
                     )
                     if max_turns == 0:
                         attention['zero'] += 1
@@ -477,6 +485,7 @@ async def get_escalation_rates(
 # ---------------------------------------------------------------------------
 # 3. Loop histograms
 # ---------------------------------------------------------------------------
+
 
 async def get_loop_histograms(
     db: aiosqlite.Connection | None,
@@ -536,6 +545,7 @@ async def get_loop_histograms(
 # 4. Time-to-completion centiles
 # ---------------------------------------------------------------------------
 
+
 async def get_time_centiles(
     db: aiosqlite.Connection | None,
     *,
@@ -556,7 +566,11 @@ async def get_time_centiles(
     for project_id, durations in durations_by_pid.items():
         if not durations:
             result[project_id] = {
-                'p50': 0, 'p75': 0, 'p90': 0, 'p95': 0, 'count': 0,
+                'p50': 0,
+                'p75': 0,
+                'p90': 0,
+                'p95': 0,
+                'count': 0,
             }
             continue
 

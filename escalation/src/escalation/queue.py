@@ -18,6 +18,49 @@ from escalation.models import Escalation
 logger = logging.getLogger(__name__)
 
 
+def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
+    """Yield all ``esc-*.json`` paths from *escalations_dir* and its archive subtree.
+
+    Two-tier scan with root precedence (mirrors the convention in
+    ``EscalationQueue.get_by_task``):
+
+    1. Queue root — ``escalations_dir.glob('esc-*.json')`` is iterated first.
+       Each yielded path's stem is added to ``seen``.
+    2. Archive subtree — ``escalations_dir/archive/`` (``archive.ARCHIVE_SUBDIR``)
+       is scanned with ``rglob('esc-*.json')``.  Paths whose stem is already in
+       ``seen`` (i.e. a root copy was found) are skipped so the root copy wins
+       on id collisions.  Stems are added to ``seen`` as they are yielded so
+       archive-only multi-date duplicates (same id under two dated subdirs) are
+       also deduplicated.
+
+    If *escalations_dir* does not exist or is not a directory, the iterator
+    yields nothing without raising an exception.  This matches the
+    dashboard's read-only usage: a missing or misconfigured path produces an
+    empty result rather than a hard failure.
+
+    Primary caller: ``dashboard.data.performance._load_escalations`` — bulk
+    read of all escalation files for performance aggregation.
+    """
+    escalations_dir = Path(escalations_dir)
+    if not escalations_dir.is_dir():
+        return
+
+    seen: set[str] = set()
+
+    # Tier 1: queue root
+    for path in escalations_dir.glob('esc-*.json'):
+        seen.add(path.stem)
+        yield path
+
+    # Tier 2: archive subtree (root wins on id collisions)
+    archive_root = escalations_dir / archive.ARCHIVE_SUBDIR
+    if archive_root.exists():
+        for path in archive_root.rglob('esc-*.json'):
+            if path.stem not in seen:
+                seen.add(path.stem)
+                yield path
+
+
 class EscalationQueue:
     """Filesystem queue for escalations.
 

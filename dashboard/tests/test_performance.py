@@ -12,6 +12,7 @@ import aiosqlite
 import pytest
 
 from dashboard.data.performance import (
+    _load_escalations,
     aggregate_completion_paths,
     aggregate_escalation_rates,
     aggregate_loop_histograms,
@@ -69,6 +70,7 @@ CREATE INDEX IF NOT EXISTS idx_task_results_project
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture()
 def runs_db(tmp_path):
     """Populated runs.db with diverse task results across two projects."""
@@ -82,30 +84,122 @@ def runs_db(tmp_path):
     conn.execute(
         'INSERT INTO runs (run_id, project_id, prd_path, started_at, completed_at, '
         ' total_tasks, completed, blocked) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        ('run-001', 'dark_factory', '/prd.md', (now - timedelta(hours=2)).isoformat(),
-         (now - timedelta(hours=1)).isoformat(), 6, 5, 1),
+        (
+            'run-001',
+            'dark_factory',
+            '/prd.md',
+            (now - timedelta(hours=2)).isoformat(),
+            (now - timedelta(hours=1)).isoformat(),
+            6,
+            5,
+            1,
+        ),
     )
 
     # Task results for dark_factory
     tasks = [
         # one-pass: outcome=done, review_cycles=0, steward=0
-        ('run-001', '101', 'dark_factory', 'Widget A', 'done', 0.5, 300_000,
-         3, 1, 0, 0, 0.0, 0, (now - timedelta(hours=1, minutes=50)).isoformat()),
+        (
+            'run-001',
+            '101',
+            'dark_factory',
+            'Widget A',
+            'done',
+            0.5,
+            300_000,
+            3,
+            1,
+            0,
+            0,
+            0.0,
+            0,
+            (now - timedelta(hours=1, minutes=50)).isoformat(),
+        ),
         # one-pass: another clean task
-        ('run-001', '102', 'dark_factory', 'Widget B', 'done', 0.4, 200_000,
-         2, 1, 1, 0, 0.0, 0, (now - timedelta(hours=1, minutes=40)).isoformat()),
+        (
+            'run-001',
+            '102',
+            'dark_factory',
+            'Widget B',
+            'done',
+            0.4,
+            200_000,
+            2,
+            1,
+            1,
+            0,
+            0.0,
+            0,
+            (now - timedelta(hours=1, minutes=40)).isoformat(),
+        ),
         # multi-pass: review_cycles > 0, no steward
-        ('run-001', '103', 'dark_factory', 'Refactor C', 'done', 0.8, 600_000,
-         5, 3, 2, 2, 0.0, 0, (now - timedelta(hours=1, minutes=30)).isoformat()),
+        (
+            'run-001',
+            '103',
+            'dark_factory',
+            'Refactor C',
+            'done',
+            0.8,
+            600_000,
+            5,
+            3,
+            2,
+            2,
+            0.0,
+            0,
+            (now - timedelta(hours=1, minutes=30)).isoformat(),
+        ),
         # via-steward: steward_invocations > 0
-        ('run-001', '104', 'dark_factory', 'Fix D', 'done', 1.0, 900_000,
-         7, 2, 3, 1, 0.5, 2, (now - timedelta(hours=1, minutes=20)).isoformat()),
+        (
+            'run-001',
+            '104',
+            'dark_factory',
+            'Fix D',
+            'done',
+            1.0,
+            900_000,
+            7,
+            2,
+            3,
+            1,
+            0.5,
+            2,
+            (now - timedelta(hours=1, minutes=20)).isoformat(),
+        ),
         # blocked: outcome=blocked
-        ('run-001', '105', 'dark_factory', 'Feature E', 'blocked', 0.3, 150_000,
-         2, 1, 1, 0, 0.0, 0, (now - timedelta(hours=1, minutes=10)).isoformat()),
+        (
+            'run-001',
+            '105',
+            'dark_factory',
+            'Feature E',
+            'blocked',
+            0.3,
+            150_000,
+            2,
+            1,
+            1,
+            0,
+            0.0,
+            0,
+            (now - timedelta(hours=1, minutes=10)).isoformat(),
+        ),
         # via-interactive: outcome=done (will be matched by escalation file with level=1)
-        ('run-001', '106', 'dark_factory', 'Auth F', 'done', 0.6, 450_000,
-         4, 2, 1, 0, 0.0, 0, (now - timedelta(hours=1, minutes=5)).isoformat()),
+        (
+            'run-001',
+            '106',
+            'dark_factory',
+            'Auth F',
+            'done',
+            0.6,
+            450_000,
+            4,
+            2,
+            1,
+            0,
+            0.0,
+            0,
+            (now - timedelta(hours=1, minutes=5)).isoformat(),
+        ),
     ]
     for t in tasks:
         conn.execute(
@@ -113,15 +207,23 @@ def runs_db(tmp_path):
             '(run_id, task_id, project_id, title, outcome, cost_usd, duration_ms, '
             ' agent_invocations, execute_iterations, verify_attempts, review_cycles, '
             ' steward_cost_usd, steward_invocations, completed_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', t,
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            t,
         )
 
     # Run for reify project
     conn.execute(
         'INSERT INTO runs (run_id, project_id, prd_path, started_at, completed_at, '
         ' total_tasks, completed) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        ('run-002', 'reify', '/reify/prd.md', (now - timedelta(hours=3)).isoformat(),
-         (now - timedelta(hours=2)).isoformat(), 2, 2),
+        (
+            'run-002',
+            'reify',
+            '/reify/prd.md',
+            (now - timedelta(hours=3)).isoformat(),
+            (now - timedelta(hours=2)).isoformat(),
+            2,
+            2,
+        ),
     )
     conn.execute(
         'INSERT INTO task_results '
@@ -129,8 +231,22 @@ def runs_db(tmp_path):
         ' agent_invocations, execute_iterations, verify_attempts, review_cycles, '
         ' steward_cost_usd, steward_invocations, completed_at) '
         'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        ('run-002', '201', 'reify', 'Reify task', 'done', 0.3, 180_000,
-         2, 1, 0, 0, 0.0, 0, (now - timedelta(hours=2, minutes=30)).isoformat()),
+        (
+            'run-002',
+            '201',
+            'reify',
+            'Reify task',
+            'done',
+            0.3,
+            180_000,
+            2,
+            1,
+            0,
+            0,
+            0.0,
+            0,
+            (now - timedelta(hours=2, minutes=30)).isoformat(),
+        ),
     )
     conn.execute(
         'INSERT INTO task_results '
@@ -138,8 +254,22 @@ def runs_db(tmp_path):
         ' agent_invocations, execute_iterations, verify_attempts, review_cycles, '
         ' steward_cost_usd, steward_invocations, completed_at) '
         'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        ('run-002', '202', 'reify', 'Reify task 2', 'done', 0.4, 240_000,
-         3, 2, 1, 1, 0.0, 0, (now - timedelta(hours=2, minutes=20)).isoformat()),
+        (
+            'run-002',
+            '202',
+            'reify',
+            'Reify task 2',
+            'done',
+            0.4,
+            240_000,
+            3,
+            2,
+            1,
+            1,
+            0.0,
+            0,
+            (now - timedelta(hours=2, minutes=20)).isoformat(),
+        ),
     )
 
     conn.commit()
@@ -178,30 +308,58 @@ def escalations_dir(tmp_path):
     esc_dir.mkdir()
 
     # Level-0 resolved (steward handled)
-    (esc_dir / 'esc-104-1.json').write_text(json.dumps({
-        'id': 'esc-104-1', 'task_id': '104', 'agent_role': 'debugger',
-        'severity': 'blocking', 'category': 'infra_issue',
-        'summary': 'Test infra down', 'level': 0,
-        'status': 'resolved', 'resolution': 'Fixed by steward',
-        'resolved_by': 'steward', 'resolution_turns': 5,
-    }))
+    (esc_dir / 'esc-104-1.json').write_text(
+        json.dumps(
+            {
+                'id': 'esc-104-1',
+                'task_id': '104',
+                'agent_role': 'debugger',
+                'severity': 'blocking',
+                'category': 'infra_issue',
+                'summary': 'Test infra down',
+                'level': 0,
+                'status': 'resolved',
+                'resolution': 'Fixed by steward',
+                'resolved_by': 'steward',
+                'resolution_turns': 5,
+            }
+        )
+    )
 
     # Level-1 resolved (interactive — matches task 106)
-    (esc_dir / 'esc-106-1.json').write_text(json.dumps({
-        'id': 'esc-106-1', 'task_id': '106', 'agent_role': 'implementer',
-        'severity': 'blocking', 'category': 'scope_violation',
-        'summary': 'Needs design decision', 'level': 1,
-        'status': 'resolved', 'resolution': 'Human resolved it',
-        'resolved_by': 'interactive', 'resolution_turns': 3,
-    }))
+    (esc_dir / 'esc-106-1.json').write_text(
+        json.dumps(
+            {
+                'id': 'esc-106-1',
+                'task_id': '106',
+                'agent_role': 'implementer',
+                'severity': 'blocking',
+                'category': 'scope_violation',
+                'summary': 'Needs design decision',
+                'level': 1,
+                'status': 'resolved',
+                'resolution': 'Human resolved it',
+                'resolved_by': 'interactive',
+                'resolution_turns': 3,
+            }
+        )
+    )
 
     # Level-1 still pending (should not count)
-    (esc_dir / 'esc-999-1.json').write_text(json.dumps({
-        'id': 'esc-999-1', 'task_id': '999', 'agent_role': 'debugger',
-        'severity': 'blocking', 'category': 'design_concern',
-        'summary': 'Still pending', 'level': 1,
-        'status': 'pending',
-    }))
+    (esc_dir / 'esc-999-1.json').write_text(
+        json.dumps(
+            {
+                'id': 'esc-999-1',
+                'task_id': '999',
+                'agent_role': 'debugger',
+                'severity': 'blocking',
+                'category': 'design_concern',
+                'summary': 'Still pending',
+                'level': 1,
+                'status': 'pending',
+            }
+        )
+    )
 
     return esc_dir
 
@@ -216,6 +374,7 @@ def empty_escalations_dir(tmp_path):
 # ---------------------------------------------------------------------------
 # Tests: get_completion_paths
 # ---------------------------------------------------------------------------
+
 
 class TestCompletionPaths:
     @pytest.mark.asyncio
@@ -260,6 +419,7 @@ class TestCompletionPaths:
 # Tests: get_escalation_rates
 # ---------------------------------------------------------------------------
 
+
 class TestEscalationRates:
     @pytest.mark.asyncio
     async def test_populated(self, runs_conn, escalations_dir):
@@ -288,6 +448,7 @@ class TestEscalationRates:
 # ---------------------------------------------------------------------------
 # Tests: get_loop_histograms
 # ---------------------------------------------------------------------------
+
 
 class TestLoopHistograms:
     @pytest.mark.asyncio
@@ -324,6 +485,7 @@ class TestLoopHistograms:
 # ---------------------------------------------------------------------------
 # Tests: get_time_centiles
 # ---------------------------------------------------------------------------
+
 
 class TestTimeCentiles:
     @pytest.mark.asyncio
@@ -386,6 +548,7 @@ class TestTimeCentiles:
 # Helpers for aggregate tests
 # ---------------------------------------------------------------------------
 
+
 def _make_runs_db(tmp_path, name: str, tasks: list[tuple]) -> Path:
     """Create a runs.db at tmp_path/name with provided task_results rows."""
     db_path = Path(tmp_path) / name
@@ -400,10 +563,8 @@ def _make_runs_db(tmp_path, name: str, tasks: list[tuple]) -> Path:
         run_id, project_id = t[0], t[2]
         if run_id not in seen_runs:
             conn.execute(
-                'INSERT INTO runs (run_id, project_id, prd_path, started_at) '
-                'VALUES (?, ?, ?, ?)',
-                (run_id, project_id, '/prd.md',
-                 (now - timedelta(hours=2)).isoformat()),
+                'INSERT INTO runs (run_id, project_id, prd_path, started_at) VALUES (?, ?, ?, ?)',
+                (run_id, project_id, '/prd.md', (now - timedelta(hours=2)).isoformat()),
             )
             seen_runs.add(run_id)
         conn.execute(
@@ -411,17 +572,18 @@ def _make_runs_db(tmp_path, name: str, tasks: list[tuple]) -> Path:
             '(run_id, task_id, project_id, title, outcome, cost_usd, duration_ms, '
             ' agent_invocations, execute_iterations, verify_attempts, review_cycles, '
             ' steward_cost_usd, steward_invocations, completed_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', t,
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            t,
         )
     conn.commit()
     conn.close()
     return db_path
 
 
-def _make_escalations_dir(tmp_path, name: str,
-                          esc_list: list[dict]) -> Path:
+def _make_escalations_dir(tmp_path, name: str, esc_list: list[dict]) -> Path:
     """Create an escalations directory with JSON files."""
     import json as _json
+
     esc_dir = Path(tmp_path) / name
     esc_dir.mkdir(parents=True, exist_ok=True)
     for i, esc in enumerate(esc_list):
@@ -432,6 +594,7 @@ def _make_escalations_dir(tmp_path, name: str,
 # ---------------------------------------------------------------------------
 # Tests: aggregate_completion_paths
 # ---------------------------------------------------------------------------
+
 
 class TestAggregateCompletionPaths:
     """Tests for aggregate_completion_paths across multiple DB connections."""
@@ -444,22 +607,85 @@ class TestAggregateCompletionPaths:
         ts2 = (now - timedelta(minutes=20)).isoformat()
 
         # DB1: dark_factory — 1 one-pass task, 1 via-steward
-        db1_path = _make_runs_db(tmp_path / 'db1', 'runs.db', [
-            ('run-a', 't1', 'dark_factory', 'T1', 'done',
-             0.5, 300_000, 2, 1, 0, 0, 0.0, 0, ts1),
-            ('run-a', 't2', 'dark_factory', 'T2', 'done',
-             0.5, 400_000, 3, 1, 0, 0, 0.2, 2, ts2),
-        ])
+        db1_path = _make_runs_db(
+            tmp_path / 'db1',
+            'runs.db',
+            [
+                (
+                    'run-a',
+                    't1',
+                    'dark_factory',
+                    'T1',
+                    'done',
+                    0.5,
+                    300_000,
+                    2,
+                    1,
+                    0,
+                    0,
+                    0.0,
+                    0,
+                    ts1,
+                ),
+                (
+                    'run-a',
+                    't2',
+                    'dark_factory',
+                    'T2',
+                    'done',
+                    0.5,
+                    400_000,
+                    3,
+                    1,
+                    0,
+                    0,
+                    0.2,
+                    2,
+                    ts2,
+                ),
+            ],
+        )
 
         # DB2: dark_factory — 2 more one-pass tasks; reify — 1 one-pass
-        db2_path = _make_runs_db(tmp_path / 'db2', 'runs.db', [
-            ('run-b', 't3', 'dark_factory', 'T3', 'done',
-             0.3, 200_000, 2, 1, 0, 0, 0.0, 0, ts1),
-            ('run-b', 't4', 'dark_factory', 'T4', 'done',
-             0.3, 250_000, 2, 1, 0, 0, 0.0, 0, ts2),
-            ('run-b', 't5', 'reify', 'T5', 'done',
-             0.2, 150_000, 1, 1, 0, 0, 0.0, 0, ts1),
-        ])
+        db2_path = _make_runs_db(
+            tmp_path / 'db2',
+            'runs.db',
+            [
+                (
+                    'run-b',
+                    't3',
+                    'dark_factory',
+                    'T3',
+                    'done',
+                    0.3,
+                    200_000,
+                    2,
+                    1,
+                    0,
+                    0,
+                    0.0,
+                    0,
+                    ts1,
+                ),
+                (
+                    'run-b',
+                    't4',
+                    'dark_factory',
+                    'T4',
+                    'done',
+                    0.3,
+                    250_000,
+                    2,
+                    1,
+                    0,
+                    0,
+                    0.0,
+                    0,
+                    ts2,
+                ),
+                ('run-b', 't5', 'reify', 'T5', 'done', 0.2, 150_000, 1, 1, 0, 0, 0.0, 0, ts1),
+            ],
+        )
 
         # No escalations (via-interactive = 0 in both)
         edir1 = _make_escalations_dir(tmp_path / 'esc1', 'e', [])
@@ -504,7 +730,9 @@ class TestAggregateCompletionPaths:
         """`dbs=[None, None]` (no valid connections) returns empty dict."""
         edir = _make_escalations_dir(tmp_path, 'esc', [])
         result = await aggregate_completion_paths(
-            [None, None], [edir, edir], days=7,
+            [None, None],
+            [edir, edir],
+            days=7,
         )
         assert result == {}
 
@@ -513,16 +741,21 @@ class TestAggregateCompletionPaths:
         """A non-existent escalations_dir does not crash; via-interactive=0."""
         now = datetime.now(UTC)
         ts = (now - timedelta(minutes=10)).isoformat()
-        db_path = _make_runs_db(tmp_path, 'runs.db', [
-            ('run-x', 'tx1', 'proj', 'T', 'done',
-             0.3, 100_000, 1, 1, 0, 0, 0.0, 0, ts),
-        ])
+        db_path = _make_runs_db(
+            tmp_path,
+            'runs.db',
+            [
+                ('run-x', 'tx1', 'proj', 'T', 'done', 0.3, 100_000, 1, 1, 0, 0, 0.0, 0, ts),
+            ],
+        )
         missing_dir = tmp_path / 'does_not_exist'
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
             result = await aggregate_completion_paths(
-                [conn], [missing_dir], days=7,
+                [conn],
+                [missing_dir],
+                days=7,
             )
 
         assert 'proj' in result
@@ -533,6 +766,7 @@ class TestAggregateCompletionPaths:
 # ---------------------------------------------------------------------------
 # Tests: aggregate_escalation_rates
 # ---------------------------------------------------------------------------
+
 
 class TestAggregateEscalationRates:
     """Tests for aggregate_escalation_rates across multiple DB connections."""
@@ -546,23 +780,116 @@ class TestAggregateEscalationRates:
         ts3 = (now - timedelta(minutes=20)).isoformat()
 
         # DB1: dark_factory — 3 tasks, 1 has steward_invocations > 0
-        db1_path = _make_runs_db(tmp_path / 'db1', 'runs.db', [
-            ('run-a', 't1', 'dark_factory', 'T1', 'done', 0.5, 300_000, 2, 1, 0, 0, 0.0, 0, ts1),
-            ('run-a', 't2', 'dark_factory', 'T2', 'done', 0.5, 400_000, 3, 1, 0, 0, 0.2, 2, ts2),
-            ('run-a', 't3', 'dark_factory', 'T3', 'blocked', 0.3, 150_000, 1, 1, 0, 0, 0.0, 0, ts3),
-        ])
+        db1_path = _make_runs_db(
+            tmp_path / 'db1',
+            'runs.db',
+            [
+                (
+                    'run-a',
+                    't1',
+                    'dark_factory',
+                    'T1',
+                    'done',
+                    0.5,
+                    300_000,
+                    2,
+                    1,
+                    0,
+                    0,
+                    0.0,
+                    0,
+                    ts1,
+                ),
+                (
+                    'run-a',
+                    't2',
+                    'dark_factory',
+                    'T2',
+                    'done',
+                    0.5,
+                    400_000,
+                    3,
+                    1,
+                    0,
+                    0,
+                    0.2,
+                    2,
+                    ts2,
+                ),
+                (
+                    'run-a',
+                    't3',
+                    'dark_factory',
+                    'T3',
+                    'blocked',
+                    0.3,
+                    150_000,
+                    1,
+                    1,
+                    0,
+                    0,
+                    0.0,
+                    0,
+                    ts3,
+                ),
+            ],
+        )
         # Escalation: task t2 had a level-1 interactive escalation with 4 turns
-        esc1 = _make_escalations_dir(tmp_path / 'esc1', 'e', [
-            {'id': 'e1', 'task_id': 't2', 'level': 1, 'status': 'resolved',
-             'resolution_turns': 4, 'resolved_by': 'interactive'},
-        ])
+        esc1 = _make_escalations_dir(
+            tmp_path / 'esc1',
+            'e',
+            [
+                {
+                    'id': 'e1',
+                    'task_id': 't2',
+                    'level': 1,
+                    'status': 'resolved',
+                    'resolution_turns': 4,
+                    'resolved_by': 'interactive',
+                },
+            ],
+        )
 
         # DB2: dark_factory — 2 more tasks; reify — 1 task
-        db2_path = _make_runs_db(tmp_path / 'db2', 'runs.db', [
-            ('run-b', 't4', 'dark_factory', 'T4', 'done', 0.3, 200_000, 2, 1, 0, 0, 0.0, 0, ts1),
-            ('run-b', 't5', 'dark_factory', 'T5', 'done', 0.3, 250_000, 2, 1, 0, 0, 0.3, 3, ts2),
-            ('run-b', 't6', 'reify', 'T6', 'done', 0.2, 100_000, 1, 1, 0, 0, 0.0, 0, ts3),
-        ])
+        db2_path = _make_runs_db(
+            tmp_path / 'db2',
+            'runs.db',
+            [
+                (
+                    'run-b',
+                    't4',
+                    'dark_factory',
+                    'T4',
+                    'done',
+                    0.3,
+                    200_000,
+                    2,
+                    1,
+                    0,
+                    0,
+                    0.0,
+                    0,
+                    ts1,
+                ),
+                (
+                    'run-b',
+                    't5',
+                    'dark_factory',
+                    'T5',
+                    'done',
+                    0.3,
+                    250_000,
+                    2,
+                    1,
+                    0,
+                    0,
+                    0.3,
+                    3,
+                    ts2,
+                ),
+                ('run-b', 't6', 'reify', 'T6', 'done', 0.2, 100_000, 1, 1, 0, 0, 0.0, 0, ts3),
+            ],
+        )
         esc2 = _make_escalations_dir(tmp_path / 'esc2', 'e', [])
 
         async with (
@@ -617,7 +944,9 @@ class TestAggregateEscalationRates:
         """`dbs=[None, None]` returns empty dict."""
         edir = _make_escalations_dir(tmp_path, 'esc', [])
         result = await aggregate_escalation_rates(
-            [None, None], [edir, edir], days=7,
+            [None, None],
+            [edir, edir],
+            days=7,
         )
         assert result == {}
 
@@ -625,6 +954,7 @@ class TestAggregateEscalationRates:
 # ---------------------------------------------------------------------------
 # Tests: aggregate_loop_histograms
 # ---------------------------------------------------------------------------
+
 
 class TestAggregateLoopHistograms:
     """Tests for aggregate_loop_histograms across multiple DB connections."""
@@ -638,23 +968,101 @@ class TestAggregateLoopHistograms:
         ts3 = (now - timedelta(minutes=20)).isoformat()
 
         # DB1: dark_factory — rc=0,va=0 and rc=2,va=3
-        db1_path = _make_runs_db(tmp_path / 'db1', 'runs.db', [
-            ('run-a', 't1', 'dark_factory', 'T1', 'done',
-             0.5, 300_000, 2, 1, 0, 0, 0.0, 0, ts1),   # rc=0, va=0
-            ('run-a', 't2', 'dark_factory', 'T2', 'done',
-             0.5, 400_000, 3, 1, 3, 2, 0.0, 0, ts2),   # rc=2, va=3
-        ])
+        db1_path = _make_runs_db(
+            tmp_path / 'db1',
+            'runs.db',
+            [
+                (
+                    'run-a',
+                    't1',
+                    'dark_factory',
+                    'T1',
+                    'done',
+                    0.5,
+                    300_000,
+                    2,
+                    1,
+                    0,
+                    0,
+                    0.0,
+                    0,
+                    ts1,
+                ),  # rc=0, va=0
+                (
+                    'run-a',
+                    't2',
+                    'dark_factory',
+                    'T2',
+                    'done',
+                    0.5,
+                    400_000,
+                    3,
+                    1,
+                    3,
+                    2,
+                    0.0,
+                    0,
+                    ts2,
+                ),  # rc=2, va=3
+            ],
+        )
 
         # DB2: dark_factory — rc=1,va=1 and rc=0,va=2
         # reify — rc=0,va=0
-        db2_path = _make_runs_db(tmp_path / 'db2', 'runs.db', [
-            ('run-b', 't3', 'dark_factory', 'T3', 'done',
-             0.3, 200_000, 2, 1, 1, 1, 0.0, 0, ts1),   # rc=1, va=1
-            ('run-b', 't4', 'dark_factory', 'T4', 'done',
-             0.3, 250_000, 2, 1, 2, 0, 0.0, 0, ts2),   # rc=0, va=2
-            ('run-b', 't5', 'reify', 'T5', 'done',
-             0.2, 150_000, 1, 1, 0, 0, 0.0, 0, ts3),   # rc=0, va=0
-        ])
+        db2_path = _make_runs_db(
+            tmp_path / 'db2',
+            'runs.db',
+            [
+                (
+                    'run-b',
+                    't3',
+                    'dark_factory',
+                    'T3',
+                    'done',
+                    0.3,
+                    200_000,
+                    2,
+                    1,
+                    1,
+                    1,
+                    0.0,
+                    0,
+                    ts1,
+                ),  # rc=1, va=1
+                (
+                    'run-b',
+                    't4',
+                    'dark_factory',
+                    'T4',
+                    'done',
+                    0.3,
+                    250_000,
+                    2,
+                    1,
+                    2,
+                    0,
+                    0.0,
+                    0,
+                    ts2,
+                ),  # rc=0, va=2
+                (
+                    'run-b',
+                    't5',
+                    'reify',
+                    'T5',
+                    'done',
+                    0.2,
+                    150_000,
+                    1,
+                    1,
+                    0,
+                    0,
+                    0.0,
+                    0,
+                    ts3,
+                ),  # rc=0, va=0
+            ],
+        )
 
         async with (
             aiosqlite.connect(str(db1_path)) as c1,
@@ -717,7 +1125,9 @@ class TestAggregateLoopHistograms:
 
     @pytest.mark.asyncio
     async def test_mismatched_histogram_longer_incoming_warns_and_merges(
-        self, monkeypatch, caplog,
+        self,
+        monkeypatch,
+        caplog,
     ):
         """Longer incoming label list triggers WARNING and is merged by label key.
 
@@ -790,7 +1200,9 @@ class TestAggregateLoopHistograms:
 
     @pytest.mark.asyncio
     async def test_mismatched_histogram_shorter_incoming_warns_and_merges(
-        self, monkeypatch, caplog,
+        self,
+        monkeypatch,
+        caplog,
     ):
         """Shorter incoming label list triggers WARNING and is merged by label key.
 
@@ -858,7 +1270,9 @@ class TestAggregateLoopHistograms:
 
     @pytest.mark.asyncio
     async def test_divergent_values_length_does_not_crash(
-        self, monkeypatch, caplog,
+        self,
+        monkeypatch,
+        caplog,
     ):
         """Mismatched label lists are merged by label key; no IndexError, WARNING emitted.
 
@@ -933,7 +1347,9 @@ class TestAggregateLoopHistograms:
 
     @pytest.mark.asyncio
     async def test_three_dbs_canonical_mismatched_canonical_two_warnings(
-        self, monkeypatch, caplog,
+        self,
+        monkeypatch,
+        caplog,
     ):
         """Three DBs (canonical → extended → canonical) emit two WARNINGs.
 
@@ -1018,6 +1434,7 @@ class TestAggregateLoopHistograms:
 # Tests: aggregate_time_centiles
 # ---------------------------------------------------------------------------
 
+
 class TestAggregateTimeCentiles:
     """Tests for aggregate_time_centiles across multiple DB connections."""
 
@@ -1031,22 +1448,85 @@ class TestAggregateTimeCentiles:
         ts3 = (now - timedelta(minutes=20)).isoformat()
 
         # DB1: dark_factory — durations 100k, 200k ms
-        db1_path = _make_runs_db(tmp_path / 'db1', 'runs.db', [
-            ('run-a', 't1', 'dark_factory', 'T1', 'done',
-             0.5, 100_000, 2, 1, 0, 0, 0.0, 0, ts1),
-            ('run-a', 't2', 'dark_factory', 'T2', 'done',
-             0.5, 200_000, 2, 1, 0, 0, 0.0, 0, ts2),
-        ])
+        db1_path = _make_runs_db(
+            tmp_path / 'db1',
+            'runs.db',
+            [
+                (
+                    'run-a',
+                    't1',
+                    'dark_factory',
+                    'T1',
+                    'done',
+                    0.5,
+                    100_000,
+                    2,
+                    1,
+                    0,
+                    0,
+                    0.0,
+                    0,
+                    ts1,
+                ),
+                (
+                    'run-a',
+                    't2',
+                    'dark_factory',
+                    'T2',
+                    'done',
+                    0.5,
+                    200_000,
+                    2,
+                    1,
+                    0,
+                    0,
+                    0.0,
+                    0,
+                    ts2,
+                ),
+            ],
+        )
 
         # DB2: dark_factory — durations 300k, 400k ms; reify — 500k ms
-        db2_path = _make_runs_db(tmp_path / 'db2', 'runs.db', [
-            ('run-b', 't3', 'dark_factory', 'T3', 'done',
-             0.3, 300_000, 2, 1, 0, 0, 0.0, 0, ts1),
-            ('run-b', 't4', 'dark_factory', 'T4', 'done',
-             0.3, 400_000, 2, 1, 0, 0, 0.0, 0, ts2),
-            ('run-b', 't5', 'reify', 'T5', 'done',
-             0.2, 500_000, 1, 1, 0, 0, 0.0, 0, ts3),
-        ])
+        db2_path = _make_runs_db(
+            tmp_path / 'db2',
+            'runs.db',
+            [
+                (
+                    'run-b',
+                    't3',
+                    'dark_factory',
+                    'T3',
+                    'done',
+                    0.3,
+                    300_000,
+                    2,
+                    1,
+                    0,
+                    0,
+                    0.0,
+                    0,
+                    ts1,
+                ),
+                (
+                    'run-b',
+                    't4',
+                    'dark_factory',
+                    'T4',
+                    'done',
+                    0.3,
+                    400_000,
+                    2,
+                    1,
+                    0,
+                    0,
+                    0.0,
+                    0,
+                    ts2,
+                ),
+                ('run-b', 't5', 'reify', 'T5', 'done', 0.2, 500_000, 1, 1, 0, 0, 0.0, 0, ts3),
+            ],
+        )
 
         async with (
             aiosqlite.connect(str(db1_path)) as c1,
@@ -1094,3 +1574,241 @@ class TestAggregateTimeCentiles:
         """`dbs=[None, None]` returns empty dict."""
         result = await aggregate_time_centiles([None, None], days=7)
         assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Helper for archive tests (not a fixture — mirrors _make_escalations_dir shape)
+# ---------------------------------------------------------------------------
+
+
+def _write_archived_escalation(esc_dir: Path, date: str, esc_dict: dict) -> Path:
+    """Write an escalation JSON under esc_dir/archive/<date>/<id>.json.
+
+    Returns the written path.  Creates parent directories as needed.
+    """
+    archive_sub = esc_dir / 'archive' / date
+    archive_sub.mkdir(parents=True, exist_ok=True)
+    path = archive_sub / f'{esc_dict["id"]}.json'
+    path.write_text(json.dumps(esc_dict))
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Tests: _load_escalations / get_completion_paths / get_escalation_rates
+#         with archive-resident escalations
+# ---------------------------------------------------------------------------
+
+
+class TestLoadEscalationsIncludesArchive:
+    """_load_escalations (via get_completion_paths / get_escalation_rates) must
+    scan both the queue root AND the archive subtree so that resolved escalations
+    that have been moved to archive/YYYY-MM-DD/ are counted correctly.
+
+    On current main all three tests fail because _load_escalations only scans
+    escalations_dir.glob('esc-*.json') (queue root), silently ignoring archives.
+    """
+
+    @pytest.fixture()
+    def _single_done_task_db(self, tmp_path):
+        """runs.db with a single 'done' task for task_id '106' in dark_factory."""
+        now = datetime.now(UTC)
+        db_path = _make_runs_db(
+            tmp_path,
+            'runs.db',
+            [
+                (
+                    'run-001',
+                    '106',
+                    'dark_factory',
+                    'Auth F',
+                    'done',
+                    0.6,
+                    450_000,
+                    4,
+                    2,
+                    1,
+                    0,
+                    0.0,
+                    0,
+                    (now - timedelta(hours=1)).isoformat(),
+                ),
+            ],
+        )
+        return db_path
+
+    @pytest.mark.asyncio
+    async def test_via_interactive_counts_archived_escalation(
+        self,
+        tmp_path,
+        _single_done_task_db,
+    ):
+        """(a) A level-1 resolved escalation in archive/ is counted as via-interactive.
+
+        Setup: runs.db has task_id='106' outcome='done'.  The matching level-1
+        resolved escalation lives ONLY under archive/2026-04-20/ (nothing in root).
+        On current main get_completion_paths misses it and returns 'one-pass'
+        instead of 'via-interactive' for task 106.
+        """
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+
+        _write_archived_escalation(
+            esc_dir,
+            '2026-04-20',
+            {
+                'id': 'esc-106-1',
+                'task_id': '106',
+                'agent_role': 'implementer',
+                'severity': 'blocking',
+                'category': 'scope_violation',
+                'summary': 'Needs design decision',
+                'level': 1,
+                'status': 'resolved',
+                'resolution': 'Human resolved it',
+                'resolved_by': 'interactive',
+                'resolution_turns': 3,
+            },
+        )
+
+        # Confirm nothing is in the root
+        assert list(esc_dir.glob('esc-*.json')) == []
+
+        async with aiosqlite.connect(str(_single_done_task_db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await get_completion_paths(conn, esc_dir)
+
+        assert 'dark_factory' in result
+        paths_by_name = {entry['path']: entry for entry in result['dark_factory']}
+        assert 'via-interactive' in paths_by_name, (
+            f'Expected via-interactive in paths; got: {list(paths_by_name)}'
+        )
+        assert paths_by_name['via-interactive']['count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_escalation_rates_count_archived_interactive(
+        self,
+        tmp_path,
+        _single_done_task_db,
+    ):
+        """(b) get_escalation_rates counts archived level-1 resolved esc correctly.
+
+        Same setup as (a): archived level-1 resolved esc for task 106 with
+        resolution_turns=3 (significant bucket).
+        On current main interactive_count == 0 and human_attention['significant'] == 0.
+        """
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+
+        _write_archived_escalation(
+            esc_dir,
+            '2026-04-20',
+            {
+                'id': 'esc-106-1',
+                'task_id': '106',
+                'agent_role': 'implementer',
+                'severity': 'blocking',
+                'category': 'scope_violation',
+                'summary': 'Needs design decision',
+                'level': 1,
+                'status': 'resolved',
+                'resolution': 'Human resolved it',
+                'resolved_by': 'interactive',
+                'resolution_turns': 3,
+            },
+        )
+
+        async with aiosqlite.connect(str(_single_done_task_db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await get_escalation_rates(conn, esc_dir)
+
+        assert 'dark_factory' in result
+        df = result['dark_factory']
+        assert df['interactive_count'] == 1, (
+            f'Expected interactive_count=1, got {df["interactive_count"]}'
+        )
+        assert df['human_attention']['significant'] == 1, (
+            f'Expected significant=1 (resolution_turns=3 > 2), '
+            f'got {df["human_attention"]["significant"]}'
+        )
+
+    def test_load_escalations_root_wins_over_archive(self, tmp_path):
+        """(c) _load_escalations deduplicates by stem with root-wins precedence.
+
+        Write esc-106-1.json under root with level=0 and under archive/2026-04-20/
+        with level=1.  After calling _load_escalations, exactly one dict for
+        esc-106-1 should be present and its level must be 0 (root copy won).
+
+        This pins the dedup contract at the dashboard seam so a future regression
+        in either iter_all_escalation_paths OR _load_escalations is caught here.
+        """
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+
+        # Root copy: level=0
+        root_esc = {
+            'id': 'esc-106-1',
+            'task_id': '106',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'Root copy',
+            'level': 0,
+            'status': 'resolved',
+            'resolution': 'Root wins',
+        }
+        (esc_dir / 'esc-106-1.json').write_text(json.dumps(root_esc))
+
+        # Archive copy: level=1 (different level to detect which one was returned)
+        archive_esc = {**root_esc, 'level': 1, 'resolution': 'Archive loses'}
+        _write_archived_escalation(esc_dir, '2026-04-20', archive_esc)
+
+        result = _load_escalations(esc_dir)
+
+        # Exactly one dict for esc-106-1
+        matching = [d for d in result if d.get('id') == 'esc-106-1']
+        assert len(matching) == 1, f'Expected exactly 1 esc-106-1, got {len(matching)}: {matching}'
+        assert matching[0]['level'] == 0, (
+            f'Root copy (level=0) must win over archive copy (level=1); '
+            f'got level={matching[0]["level"]!r}'
+        )
+
+    def test_load_escalations_archive_only_multidate_dedup(self, tmp_path):
+        """(d) _load_escalations deduplicates the same id across multiple archive dates.
+
+        Write the same esc id under two different archive/<date>/ subdirs with
+        nothing in the queue root.  _load_escalations must return exactly one
+        dict for that id.  rglob ordering across sibling dated subdirs is
+        non-deterministic, so we assert cardinality only (not which copy won).
+
+        This test pins the dedup contract at the dashboard boundary — a regression
+        in _load_escalations (e.g. calling the helper incorrectly) would not be
+        caught by the escalation-level test_archive_only_multidate_dedup which
+        only exercises iter_all_escalation_paths directly.
+        """
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+
+        esc_dict = {
+            'id': 'esc-106-1',
+            'task_id': '106',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'Archived esc duplicated across dates',
+            'level': 1,
+            'status': 'resolved',
+            'resolution': 'Human resolved it',
+        }
+        _write_archived_escalation(esc_dir, '2026-04-20', esc_dict)
+        _write_archived_escalation(esc_dir, '2026-04-21', esc_dict)
+
+        # Confirm no root copy exists
+        assert not (esc_dir / 'esc-106-1.json').exists()
+
+        result = _load_escalations(esc_dir)
+
+        matching = [d for d in result if d.get('id') == 'esc-106-1']
+        assert len(matching) == 1, (
+            f'Archive-only multi-date duplicate must be deduplicated to exactly 1 entry; '
+            f'got {len(matching)}: {matching}'
+        )

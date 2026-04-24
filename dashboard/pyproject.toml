@@ -17,11 +17,15 @@ dependencies = [
     "httpx>=0.27",
     "aiosqlite>=0.20.0",
     "pyyaml>=6.0",
+    "escalation>=0.1",
 ]
+
+[tool.uv.sources]
+escalation = { workspace = true }
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src"]
+extraPaths = ["src", "../escalation/src"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 venvPath = "."
