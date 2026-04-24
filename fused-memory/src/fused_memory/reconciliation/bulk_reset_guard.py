@@ -330,6 +330,7 @@ class BulkResetGuard:
             project_root=project_root,
             affected_task_ids=affected_ids,
             triggering_timestamps=trig_ts,
+            kind=kind,
         )
 
         if esc_path is not None:
@@ -374,6 +375,7 @@ class BulkResetGuard:
         project_root: str,
         affected_task_ids: tuple[str, ...],
         triggering_timestamps: tuple[str, ...],
+        kind: Literal['done_to_pending', 'in_progress_to_pending'],
     ) -> Path | None:
         """Write an L1 escalation JSON unless rate-limited.
 
@@ -432,11 +434,19 @@ class BulkResetGuard:
 
         ts = datetime.fromtimestamp(now, tz=UTC).isoformat()
         safe_ts = ts.replace(':', '').replace('+', '').replace('.', '_')
+        # Build a kind slug for the filename so operators can distinguish
+        # data-loss events (done) from benign startup-reconcile runaways
+        # (in-progress) without opening the file.
+        kind_slug = 'done' if kind == 'done_to_pending' else 'in-progress'
+        tripped_threshold = (
+            self._done_threshold if kind == 'done_to_pending'
+            else self._in_progress_threshold
+        )
         # Include a sanitised project_id in the filename so two projects that trip
         # within the same microsecond (or whose timestamps collide after stripping)
         # do not silently overwrite each other.
         safe_pid = ''.join(c if c.isalnum() or c in '-_' else '_' for c in project_id)
-        esc_id = f'esc-bulk-reset-{safe_pid}-{safe_ts}'
+        esc_id = f'esc-bulk-reset-{kind_slug}-{safe_pid}-{safe_ts}'
         path = esc_dir / f'{esc_id}.json'
 
         record = {
@@ -445,17 +455,18 @@ class BulkResetGuard:
             'agent_role': 'fused-memory',
             'severity': 'blocking',
             'category': 'infra_issue',
+            'kind': kind,
             'summary': (
                 f'Bulk task-status reversal detected for {project_id}: '
-                f'{len(affected_task_ids)} reversals in {self._window_seconds}s '
-                f'(threshold={self._done_threshold})'
+                f'{len(affected_task_ids)} {kind_slug}→pending reversals in '
+                f'{self._window_seconds}s (threshold={tripped_threshold})'
             ),
             'detail': (
                 f'The bulk-reset circuit-breaker (task 918) tripped for project '
-                f'{project_id}. {len(affected_task_ids)} done→pending or '
-                f'in-progress→pending reversal attempts landed within a '
-                f'{self._window_seconds}s window, exceeding the threshold of '
-                f'{self._done_threshold}. The first triggering attempt was at '
+                f'{project_id}. {len(affected_task_ids)} {kind_slug}→pending '
+                f'reversal attempts landed within a {self._window_seconds}s window, '
+                f'exceeding the {kind_slug}→pending threshold of {tripped_threshold}. '
+                f'The first triggering attempt was at '
                 f'{triggering_timestamps[0] if triggering_timestamps else "unknown"}.'
             ),
             'suggested_action': (
@@ -470,7 +481,11 @@ class BulkResetGuard:
             'workflow_state': 'infra',
             'affected_task_ids': list(affected_task_ids),
             'triggering_timestamps': list(triggering_timestamps),
-            'threshold': self._done_threshold,
+            'threshold': tripped_threshold,
+            'thresholds': {
+                'done_to_pending': self._done_threshold,
+                'in_progress_to_pending': self._in_progress_threshold,
+            },
             'window_seconds': self._window_seconds,
             'project_id': project_id,
         }
@@ -478,10 +493,11 @@ class BulkResetGuard:
             await asyncio.to_thread(path.write_text, json.dumps(record, indent=2), encoding='utf-8')
             logger.warning(
                 'bulk_reset_guard: wrote L1 escalation %s '
-                '(affected=%d, threshold=%d)',
+                '(kind=%s, affected=%d, threshold=%d)',
                 path,
+                kind,
                 len(affected_task_ids),
-                self._done_threshold,
+                tripped_threshold,
             )
         except OSError as exc:
             logger.error(

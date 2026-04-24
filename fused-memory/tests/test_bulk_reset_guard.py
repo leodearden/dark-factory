@@ -646,7 +646,7 @@ async def test_escalation_filename_and_body_include_kind(tmp_path):
         )
     assert v.outcome == 'escalated', f'(a) expected escalated, got {v.outcome}'
     esc_file_a = Path(v.escalation_path)
-    assert re.search(r'esc-bulk-reset-done-kind_proj-', esc_file_a.name), (
+    assert re.search(r'esc-bulk-reset-done-kind-proj-', esc_file_a.name), (
         f'(a) filename {esc_file_a.name!r} missing done kind slug'
     )
     data_a = json.loads(esc_file_a.read_text(encoding='utf-8'))
@@ -676,7 +676,7 @@ async def test_escalation_filename_and_body_include_kind(tmp_path):
     assert v_b is not None
     assert v_b.outcome == 'escalated', f'(b) expected escalated, got {v_b.outcome}'
     esc_file_b = Path(v_b.escalation_path)
-    assert re.search(r'esc-bulk-reset-in-progress-kind_proj_ip-', esc_file_b.name), (
+    assert re.search(r'esc-bulk-reset-in-progress-kind-proj-ip-', esc_file_b.name), (
         f'(b) filename {esc_file_b.name!r} missing in-progress kind slug'
     )
     data_b = json.loads(esc_file_b.read_text(encoding='utf-8'))
