@@ -240,16 +240,28 @@ class ReconciliationConfig(BaseModel):
     backlog_hard_limit: int = Field(default=500)
     backlog_escalation_rate_limit_seconds: float = Field(default=900.0)
 
-    # Defence-in-depth bulk-reset circuit-breaker (task 918).
+    # Defence-in-depth bulk-reset circuit-breaker (task 918, refined task 1016).
     # Two autopilot_video incidents (2026-04-21, 2026-04-22) pushed large
     # batches of tasks from done/in-progress back to pending despite the
     # orchestrator's _safe_stash_pop_with_recovery fix being deployed.  This
-    # guard refuses ≥threshold simultaneous done→pending or in-progress→pending
-    # reversals within window_seconds, halts further reversals, and emits an
-    # L1 escalation.  Enabled by default because the primary fix owns
-    # prevention; the guard limits blast radius when prevention fails.
+    # guard limits blast radius when the primary prevention fails.
+    #
+    # The guard tracks two reversal kinds with independent counters and
+    # thresholds sharing a single sliding window and rate limit:
+    #   done→pending        (bulk_reset_guard_done_to_pending_threshold, default 10)
+    #     — catches the March-2026 advance_main data-loss pattern (task 918).
+    #   in-progress→pending (bulk_reset_guard_in_progress_to_pending_threshold, default 100)
+    #     — catches pathological runaways while allowing the 27-task startup
+    #       stranded-task reconcile seen in the 2026-04-24 reify incident
+    #       (esc-bulk-reset-reify-2026-04-24T070944_6456580000).
+    #
+    # The shared per-project escalation rate limit (bulk_reset_guard_escalation_
+    # rate_limit_seconds) prevents the escalations directory from filling up
+    # when both kinds trip in quick succession; the escalation filename and JSON
+    # body include a kind slug so operators can distinguish at a glance.
     bulk_reset_guard_enabled: bool = Field(default=True)
-    bulk_reset_guard_threshold: int = Field(default=10, ge=1)
+    bulk_reset_guard_done_to_pending_threshold: int = Field(default=10, ge=1)
+    bulk_reset_guard_in_progress_to_pending_threshold: int = Field(default=100, ge=1)
     bulk_reset_guard_window_seconds: float = Field(default=60.0, gt=0)
     bulk_reset_guard_escalation_rate_limit_seconds: float = Field(default=900.0, ge=0)
 
