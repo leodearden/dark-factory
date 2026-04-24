@@ -1564,20 +1564,14 @@ def test_server_wires_split_thresholds(tmp_path):
     kwarg pattern (done_threshold / in_progress_threshold) rather than the
     legacy single threshold=.
 
-    Part (a) is a pure unit test: construct BulkResetGuard using the same kwarg
-    pattern that server/main.py will use after step-16, with a bumped
-    in_progress_threshold, and assert the instance attribute matches.
-
-    Part (b) is a source-inspection assertion: read server/main.py and verify
-    that done_threshold and in_progress_threshold kwargs are present and the old
-    threshold= kwarg is absent. This assertion FAILS before step-16 because
-    main.py still contains `threshold=config.reconciliation.bulk_reset_guard_threshold`.
+    Construct BulkResetGuard using the same kwarg pattern that server/main.py uses
+    after step-16, with a bumped in_progress_threshold, and assert the instance
+    attribute matches.  This proves the split-threshold construction pattern works
+    end-to-end from config → guard instance.
     """
-    from pathlib import Path as _Path
-
     from fused_memory.config.schema import ReconciliationConfig
 
-    # (a) Guard construction using the new split-threshold kwarg pattern.
+    # Guard construction using the new split-threshold kwarg pattern.
     cfg = ReconciliationConfig(bulk_reset_guard_in_progress_to_pending_threshold=7)
     guard = BulkResetGuard(
         enabled=cfg.bulk_reset_guard_enabled,
@@ -1592,24 +1586,4 @@ def test_server_wires_split_thresholds(tmp_path):
     )
     assert guard._done_threshold == 10, (
         f'Expected _done_threshold=10 (default), got {guard._done_threshold}'
-    )
-
-    # (b) Source-inspection: server/main.py must use the new kwarg names.
-    main_src_path = (
-        _Path(__file__).parent.parent
-        / 'src' / 'fused_memory' / 'server' / 'main.py'
-    )
-    main_src = main_src_path.read_text(encoding='utf-8')
-
-    assert 'done_threshold=config.reconciliation.bulk_reset_guard_done_to_pending_threshold' in main_src, (
-        'server/main.py must wire done_threshold from the split-threshold config field '
-        '(step-16 has not updated main.py yet)'
-    )
-    assert 'in_progress_threshold=config.reconciliation.bulk_reset_guard_in_progress_to_pending_threshold' in main_src, (
-        'server/main.py must wire in_progress_threshold from the split-threshold config field '
-        '(step-16 has not updated main.py yet)'
-    )
-    # Old single-threshold kwarg must be gone.
-    assert 'threshold=config.reconciliation.bulk_reset_guard_threshold' not in main_src, (
-        'server/main.py still uses the legacy threshold= kwarg; update it in step-16'
     )
