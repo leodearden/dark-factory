@@ -506,6 +506,17 @@ async def test_rotation_keep_zero_purges_orphan_rotations(tmp_path):
             q.enqueue(_make_event())
         await asyncio.wait_for(q._queue.join(), timeout=5.0)
 
+        # Rotation must have fired at least once.  With max_bytes=200 and
+        # each dead-letter record being ~300 bytes, the first write fills the
+        # file past the cap, so every subsequent write triggers a rotation.
+        # _dead_letters >= 2 is therefore a direct witness that
+        # _rotate_dead_letter ran (the 2nd dead letter can only be written
+        # after rotation cleared the file).
+        assert q._dead_letters >= 2, (
+            f'expected at least 2 dead letters (and thus at least one rotation), '
+            f'got {q._dead_letters}'
+        )
+
         # All orphan siblings must have been purged.
         for n in range(1, 6):
             orphan = tmp_path / f'dead_letter.jsonl.{n}'

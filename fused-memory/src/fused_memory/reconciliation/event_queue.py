@@ -404,6 +404,16 @@ class EventQueue:
         of which branch executes or whether the cascade loop itself raises
         mid-iteration.
 
+        **Safety note for the finally-on-exception case**: the cascade loop
+        only writes to indices ``1`` … ``keep_rotations`` (i.e. ``dl.1``,
+        ``dl.2``, …, ``dl.{keep}``), while :meth:`_purge_orphan_rotations`
+        only removes siblings with index ``> keep_rotations``.  These ranges
+        are disjoint, so invoking the purge in the ``finally`` block after a
+        mid-cascade failure cannot remove any file the partial cascade just
+        placed.  The only data that could be lost is the oldest rotation slot
+        (``dl.{keep}``) that the cascade would have overwritten anyway when it
+        ran successfully — that slot is subject to the best-effort contract.
+
         Uses ``os.replace`` for atomicity — it already overwrites the
         destination on POSIX and Windows, so no pre-unlink is needed.
         Any error is caught and logged to preserve the best-effort contract.
