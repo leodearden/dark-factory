@@ -28,15 +28,24 @@ from fused_memory.reconciliation.bulk_reset_guard import BulkResetGuard, BulkRes
 # ---------------------------------------------------------------------------
 
 def test_reconciliation_config_bulk_reset_guard_defaults():
-    """ReconciliationConfig() must carry the four new bulk-reset-guard fields
-    with their specified default values."""
+    """ReconciliationConfig() must carry the split-threshold bulk-reset-guard
+    fields with their specified default values.
+
+    The legacy single-field ``bulk_reset_guard_threshold`` was split into two
+    independent per-kind thresholds in task 1016 to distinguish the benign
+    startup-stranded-task reconcile pattern (in-progress→pending) from the
+    data-loss pattern caught by task 918 (done→pending).
+    """
     from fused_memory.config.schema import ReconciliationConfig
 
     cfg = ReconciliationConfig()
     assert cfg.bulk_reset_guard_enabled is True
-    assert cfg.bulk_reset_guard_threshold == 10
+    assert cfg.bulk_reset_guard_done_to_pending_threshold == 10
+    assert cfg.bulk_reset_guard_in_progress_to_pending_threshold == 100
     assert cfg.bulk_reset_guard_window_seconds == 60.0
     assert cfg.bulk_reset_guard_escalation_rate_limit_seconds == 900.0
+    # The legacy single-threshold field must be gone.
+    assert not hasattr(cfg, 'bulk_reset_guard_threshold')
 
 
 # ---------------------------------------------------------------------------
