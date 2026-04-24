@@ -2998,16 +2998,26 @@ class TestRunPrePlanRecovery:
     async def test_run_returns_done_early_via_pre_plan_recovery(
         self, config, git_ops, task_assignment, monkeypatch
     ):
-        """workflow.run exits DONE before architect is called on a merged branch.
+        """workflow.run exits DONE (via pre-EXECUTE guard) on a merged branch.
 
         Set up: pre-create a worktree, stamp iterations.jsonl with an
         implementer entry, commit a real file, merge to main.
 
-        The AgentStub's _architect is overridden to raise AssertionError so
-        the test fails loudly if workflow.run enters the PLAN phase.
+        Behaviour change after the SHA-primary fix (Option B):
+        - The pre-PLAN _recover_if_already_merged() call uses wt_head passed
+          to _has_prior_implementation().  At that point artifacts.init() has
+          already written base_commit = current HEAD, so wt_head == base_commit
+          → SHA-primary → has_work=False → returns None.
+        - The workflow therefore enters the PLAN phase and the architect IS
+          invoked (one wasted invocation — explicitly accepted trade-off; see
+          the design decisions in the task plan).
+        - After PLAN, the pre-EXECUTE ghost-loop guard (workflow.py:412-457)
+          still uses the iteration-log fallback (no wt_head passed), finds the
+          committed implementer entry, sees wt_head is already on main →
+          has_work=True → skips EXECUTE → falls through to the SUCCESS path →
+          marks DONE.
 
-        After step-14 adds the pre-PLAN recovery call in workflow.run, the
-        recovery fires before PLAN and the architect is never invoked.
+        Net: outcome == DONE, architect called once, implementer NOT called.
         """
         import json as _json
 
@@ -3028,18 +3038,15 @@ class TestRunPrePlanRecovery:
         if result.merge_worktree:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
 
-        # 2. Build workflow with a stub that raises if architect/implementer called
+        # 2. Build workflow with a stub that raises if implementer called.
+        #    NOTE: architect is NOT overridden — it IS called now (one wasted
+        #    invocation after the SHA-primary fix); the pre-EXECUTE guard
+        #    catches the ghost-loop and prevents the implementer from running.
         class _NoCallStub(AgentStub):
-            async def _architect(self, cwd):
-                raise AssertionError(
-                    'architect must NOT be called when branch is already on main '
-                    '— pre-PLAN recovery should have short-circuited'
-                )
-
             async def _implementer(self, cwd):
                 raise AssertionError(
                     'implementer must NOT be called when branch is already on main '
-                    '— pre-PLAN recovery should have short-circuited'
+                    '— the pre-EXECUTE ghost-loop guard should short-circuit EXECUTE'
                 )
 
         stub = _NoCallStub()
@@ -3053,18 +3060,21 @@ class TestRunPrePlanRecovery:
             )),
         )
 
-        # 3. Run workflow — should detect prior merge before PLAN
+        # 3. Run workflow — enters PLAN (architect runs once), then pre-EXECUTE
+        #    guard detects the already-merged branch and routes to SUCCESS.
         outcome = await workflow.run()
 
-        # 4. Assert DONE with no agent calls
+        # 4. Assert DONE; architect WAS called (once), implementer was NOT called.
         assert outcome == WorkflowOutcome.DONE, (
             f'Expected DONE but got {outcome!r}'
         )
-        assert 'architect' not in stub.calls, (
-            f'architect was unexpectedly called: {stub.calls}'
+        assert 'architect' in stub.calls, (
+            f'architect should have been called exactly once (SHA-primary fix trade-off): '
+            f'{stub.calls}'
         )
         assert 'implementer' not in stub.calls, (
-            f'implementer was unexpectedly called: {stub.calls}'
+            f'implementer must NOT be called — pre-EXECUTE ghost-loop guard should '
+            f'have prevented it: {stub.calls}'
         )
 
     async def test_run_proceeds_to_plan_when_recovery_returns_none(
