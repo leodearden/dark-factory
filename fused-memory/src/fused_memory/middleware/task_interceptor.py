@@ -1108,7 +1108,7 @@ class TaskInterceptor:
                 spawned_from=parent_task_id,
                 spawn_context='expand' if parent_task_id else 'parse_prd',
             )
-            if not candidate.title:
+            if not candidate.title.strip():
                 kept.append({'task_id': tid, 'title': title})
                 continue
 
