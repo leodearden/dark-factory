@@ -77,9 +77,11 @@ filterwarnings = [
 ]
 # Default per-test timeout. Catches accidental asyncio-sleep hangs (misconfigured
 # UsageGate mock returning a truthy MagicMock from slot.detect_cap_hit — see
-# shared/src/shared/testing.py:5-21). Slow tests opt out with @pytest.mark.timeout(N).
+# shared.testing.make_gate_mock). Slow tests opt out with @pytest.mark.timeout(N).
 # thread method chosen for cross-subproject consistency with fused-memory (which
 # requires thread for xdist compat); orchestrator does not run xdist today.
+# Note: shared/pyproject.toml intentionally uses signal (no xdist there); thread
+# here for consistency with fused-memory and to future-proof if xdist is added.
 timeout = 60
 timeout_method = "thread"
 
