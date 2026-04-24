@@ -12,6 +12,7 @@ import aiosqlite
 import pytest
 
 from dashboard.data.performance import (
+    _load_escalations,
     aggregate_completion_paths,
     aggregate_escalation_rates,
     aggregate_loop_histograms,
@@ -1094,3 +1095,173 @@ class TestAggregateTimeCentiles:
         """`dbs=[None, None]` returns empty dict."""
         result = await aggregate_time_centiles([None, None], days=7)
         assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Helper for archive tests (not a fixture — mirrors _make_escalations_dir shape)
+# ---------------------------------------------------------------------------
+
+def _write_archived_escalation(esc_dir: Path, date: str, esc_dict: dict) -> Path:
+    """Write an escalation JSON under esc_dir/archive/<date>/<id>.json.
+
+    Returns the written path.  Creates parent directories as needed.
+    """
+    archive_sub = esc_dir / 'archive' / date
+    archive_sub.mkdir(parents=True, exist_ok=True)
+    path = archive_sub / f'{esc_dict["id"]}.json'
+    path.write_text(json.dumps(esc_dict))
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Tests: _load_escalations / get_completion_paths / get_escalation_rates
+#         with archive-resident escalations
+# ---------------------------------------------------------------------------
+
+class TestLoadEscalationsIncludesArchive:
+    """_load_escalations (via get_completion_paths / get_escalation_rates) must
+    scan both the queue root AND the archive subtree so that resolved escalations
+    that have been moved to archive/YYYY-MM-DD/ are counted correctly.
+
+    On current main all three tests fail because _load_escalations only scans
+    escalations_dir.glob('esc-*.json') (queue root), silently ignoring archives.
+    """
+
+    @pytest.fixture()
+    def _single_done_task_db(self, tmp_path):
+        """runs.db with a single 'done' task for task_id '106' in dark_factory."""
+        now = datetime.now(UTC)
+        db_path = _make_runs_db(tmp_path, 'runs.db', [
+            (
+                'run-001', '106', 'dark_factory', 'Auth F', 'done',
+                0.6, 450_000, 4, 2, 1, 0, 0.0, 0,
+                (now - timedelta(hours=1)).isoformat(),
+            ),
+        ])
+        return db_path
+
+    @pytest.mark.asyncio
+    async def test_via_interactive_counts_archived_escalation(
+        self, tmp_path, _single_done_task_db,
+    ):
+        """(a) A level-1 resolved escalation in archive/ is counted as via-interactive.
+
+        Setup: runs.db has task_id='106' outcome='done'.  The matching level-1
+        resolved escalation lives ONLY under archive/2026-04-20/ (nothing in root).
+        On current main get_completion_paths misses it and returns 'one-pass'
+        instead of 'via-interactive' for task 106.
+        """
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+
+        _write_archived_escalation(esc_dir, '2026-04-20', {
+            'id': 'esc-106-1',
+            'task_id': '106',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'Needs design decision',
+            'level': 1,
+            'status': 'resolved',
+            'resolution': 'Human resolved it',
+            'resolved_by': 'interactive',
+            'resolution_turns': 3,
+        })
+
+        # Confirm nothing is in the root
+        assert list(esc_dir.glob('esc-*.json')) == []
+
+        async with aiosqlite.connect(str(_single_done_task_db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await get_completion_paths(conn, esc_dir)
+
+        assert 'dark_factory' in result
+        paths_by_name = {entry['path']: entry for entry in result['dark_factory']}
+        assert 'via-interactive' in paths_by_name, (
+            f'Expected via-interactive in paths; got: {list(paths_by_name)}'
+        )
+        assert paths_by_name['via-interactive']['count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_escalation_rates_count_archived_interactive(
+        self, tmp_path, _single_done_task_db,
+    ):
+        """(b) get_escalation_rates counts archived level-1 resolved esc correctly.
+
+        Same setup as (a): archived level-1 resolved esc for task 106 with
+        resolution_turns=3 (significant bucket).
+        On current main interactive_count == 0 and human_attention['significant'] == 0.
+        """
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+
+        _write_archived_escalation(esc_dir, '2026-04-20', {
+            'id': 'esc-106-1',
+            'task_id': '106',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'Needs design decision',
+            'level': 1,
+            'status': 'resolved',
+            'resolution': 'Human resolved it',
+            'resolved_by': 'interactive',
+            'resolution_turns': 3,
+        })
+
+        async with aiosqlite.connect(str(_single_done_task_db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await get_escalation_rates(conn, esc_dir)
+
+        assert 'dark_factory' in result
+        df = result['dark_factory']
+        assert df['interactive_count'] == 1, (
+            f"Expected interactive_count=1, got {df['interactive_count']}"
+        )
+        assert df['human_attention']['significant'] == 1, (
+            f"Expected significant=1 (resolution_turns=3 > 2), "
+            f"got {df['human_attention']['significant']}"
+        )
+
+    def test_load_escalations_root_wins_over_archive(self, tmp_path):
+        """(c) _load_escalations deduplicates by stem with root-wins precedence.
+
+        Write esc-106-1.json under root with level=0 and under archive/2026-04-20/
+        with level=1.  After calling _load_escalations, exactly one dict for
+        esc-106-1 should be present and its level must be 0 (root copy won).
+
+        This pins the dedup contract at the dashboard seam so a future regression
+        in either iter_all_escalation_paths OR _load_escalations is caught here.
+        """
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+
+        # Root copy: level=0
+        root_esc = {
+            'id': 'esc-106-1',
+            'task_id': '106',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'Root copy',
+            'level': 0,
+            'status': 'resolved',
+            'resolution': 'Root wins',
+        }
+        (esc_dir / 'esc-106-1.json').write_text(json.dumps(root_esc))
+
+        # Archive copy: level=1 (different level to detect which one was returned)
+        archive_esc = {**root_esc, 'level': 1, 'resolution': 'Archive loses'}
+        _write_archived_escalation(esc_dir, '2026-04-20', archive_esc)
+
+        result = _load_escalations(esc_dir)
+
+        # Exactly one dict for esc-106-1
+        matching = [d for d in result if d.get('id') == 'esc-106-1']
+        assert len(matching) == 1, (
+            f'Expected exactly 1 esc-106-1, got {len(matching)}: {matching}'
+        )
+        assert matching[0]['level'] == 0, (
+            f"Root copy (level=0) must win over archive copy (level=1); "
+            f"got level={matching[0]['level']!r}"
+        )
