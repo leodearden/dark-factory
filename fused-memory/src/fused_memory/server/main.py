@@ -479,6 +479,7 @@ async def run_server():
         memory_service, task_interceptor, write_journal,
         reconciliation_harness=reconciliation_harness,
         backlog_policy=backlog_policy,
+        event_queue=event_queue,
     )
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.port
