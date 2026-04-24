@@ -1121,47 +1121,55 @@ Output JSON matching the schema. Every task must appear in the output.
         finally:
             self._escalation_events.pop(assignment.task_id, None)
             requeued = report is not None and report.outcome == WorkflowOutcome.REQUEUED
-            # --- Per-task retry cap ---
-            # On REQUEUED: record this attempt; if the counter reaches the cap,
-            # trigger cap-exhaustion (sets task blocked, writes report, emits
-            # L1 escalation) and suppress the cooldown — the task isn't
-            # pending any more.  On DONE: clear any accumulated history so a
-            # future recurrence starts from zero.
-            if report is not None and self._run_id is not None:
-                if report.outcome == WorkflowOutcome.REQUEUED:
-                    attempt_cost = report.cost_usd + report.steward_cost_usd
-                    count = self.scheduler.record_requeue(
-                        assignment.task_id,
-                        phase=report.block_phase or 'unknown',
-                        reason=report.block_reason or 'unknown',
-                        detail=report.block_detail or '',
-                        run_id=self._run_id,
-                        cost_usd=attempt_cost,
-                    )
-                    if count >= self.config.requeue_cap:
-                        history = list(
-                            self.scheduler._requeue_history.get(
-                                assignment.task_id, (),
-                            )
-                        )
-                        cumulative_cost = sum(r.cost_usd for r in history)
-                        try:
-                            await self.scheduler.trigger_retry_cap_exhausted(
-                                assignment.task_id,
-                                run_id=self._run_id,
-                                cost_usd=cumulative_cost,
-                                escalation_queue=self._escalation_queue,
-                            )
-                        except Exception:
-                            logger.exception(
-                                'Retry-cap trigger failed for task %s',
-                                assignment.task_id,
-                            )
-                        requeued = False  # task is blocked, skip cooldown
-                elif report.outcome == WorkflowOutcome.DONE:
-                    self.scheduler.clear_requeue_count(assignment.task_id)
+            if report is not None:
+                requeued = await self._apply_retry_cap(
+                    assignment.task_id, report, requeued,
+                )
             self.scheduler.release(assignment.task_id, requeued=requeued)
             sem.release()
+
+    async def _apply_retry_cap(
+        self, task_id: str, report: TaskReport, requeued: bool,
+    ) -> bool:
+        """Update the per-task REQUEUED counter and fire cap exhaustion.
+
+        Called from ``_run_slot``'s finally block just before
+        ``scheduler.release``.  Returns the effective *requeued* flag — False
+        when cap exhaustion fires (task is blocked, cooldown is irrelevant),
+        otherwise the caller's original value.
+        """
+        if self._run_id is None:
+            return requeued
+        if report.outcome == WorkflowOutcome.REQUEUED:
+            attempt_cost = report.cost_usd + report.steward_cost_usd
+            count = self.scheduler.record_requeue(
+                task_id,
+                phase=report.block_phase or 'unknown',
+                reason=report.block_reason or 'unknown',
+                detail=report.block_detail or '',
+                run_id=self._run_id,
+                cost_usd=attempt_cost,
+            )
+            if count >= self.config.requeue_cap:
+                history = list(
+                    self.scheduler._requeue_history.get(task_id, ())
+                )
+                cumulative_cost = sum(r.cost_usd for r in history)
+                try:
+                    await self.scheduler.trigger_retry_cap_exhausted(
+                        task_id,
+                        run_id=self._run_id,
+                        cost_usd=cumulative_cost,
+                        escalation_queue=self._escalation_queue,
+                    )
+                except Exception:
+                    logger.exception(
+                        'Retry-cap trigger failed for task %s', task_id,
+                    )
+                return False  # task is blocked, skip cooldown
+        elif report.outcome == WorkflowOutcome.DONE:
+            self.scheduler.clear_requeue_count(task_id)
+        return requeued
 
     def _collect_done_reports(
         self, done: set[asyncio.Task], task_reports: list[TaskReport]
