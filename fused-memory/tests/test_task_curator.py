@@ -1120,6 +1120,26 @@ class TestParseDecisionDict:
         assert result.action == 'create'
         assert result.batch_target_index is None
 
+    def test_ambiguous_drop_degrades_to_create(self):
+        """drop with BOTH target_id and batch_target_index set must degrade.
+
+        The LLM violated the prompt by emitting both a pool reference and a
+        within-batch reference.  Accepting it would silently discard one field
+        downstream; degrading to 'create' is the safer fallback.
+        """
+        pool = _pool_with_ids(('task-99', 'pending'))
+        result = self._call(
+            {
+                'action': 'drop',
+                'target_id': 'task-99',
+                'batch_target_index': 1,
+                'justification': 'ambiguous',
+            },
+            pool,
+        )
+        assert result.action == 'create'
+        assert 'ambiguous-drop' in result.justification
+
 
 # ----------------------------------------------------------------------
 # _parse_batch_decisions
@@ -1699,3 +1719,97 @@ class TestCurateBatchBatchTargetIndexRemap:
         # Second regression assertion: downstream consumer's lookup works correctly.
         resolved_task_ids = {3: 'task-for-C', 0: 'task-for-A'}
         assert resolved_task_ids.get(decisions[5].batch_target_index) == 'task-for-C'
+
+
+# ----------------------------------------------------------------------
+# curate_batch: decision cache check before LLM (suggestion 1)
+# ----------------------------------------------------------------------
+
+
+class TestCurateBatchCacheCheck:
+    """curate_batch consults _check_cache before building corpus or calling LLM.
+
+    Cache hits are returned directly; only uncached unique candidates are sent
+    to _call_llm_batch.  If ALL unique candidates are cache hits, the LLM is
+    never called.
+    """
+
+    @pytest.mark.asyncio
+    async def test_all_cache_hits_skip_llm(self):
+        """Three candidates all in cache → LLM is never called."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        c1 = CandidateTask(title='Alpha')
+        c2 = CandidateTask(title='Beta')
+        c3 = CandidateTask(title='Gamma')
+
+        d1 = CuratorDecision(action='create', justification='cached-1')
+        d2 = CuratorDecision(action='create', justification='cached-2')
+        d3 = CuratorDecision(action='create', justification='cached-3')
+        curator._store_cache(c1.payload_hash(), d1)
+        curator._store_cache(c2.payload_hash(), d2)
+        curator._store_cache(c3.payload_hash(), d3)
+
+        mock_llm = AsyncMock()
+        with patch.object(curator, '_call_llm_batch', new=mock_llm), \
+             patch.object(curator, '_build_corpus', side_effect=Exception('no call expected')):
+            result = await curator.curate_batch([c1, c2, c3], 'p', '/x')
+
+        assert mock_llm.await_count == 0, 'LLM must not be called when all are cache hits'
+        assert len(result) == 3
+        assert result[0].justification == 'cached-1'
+        assert result[1].justification == 'cached-2'
+        assert result[2].justification == 'cached-3'
+
+    @pytest.mark.asyncio
+    async def test_partial_cache_hit_sends_only_uncached_to_llm(self):
+        """Two candidates cached, one uncached → LLM call contains only the uncached one."""
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None)
+        c_cached1 = CandidateTask(title='Cached-One')
+        c_new = CandidateTask(title='Brand-New')
+        c_cached2 = CandidateTask(title='Cached-Two')
+
+        d_cached1 = CuratorDecision(action='create', justification='c1-cached')
+        d_cached2 = CuratorDecision(action='create', justification='c2-cached')
+        curator._store_cache(c_cached1.payload_hash(), d_cached1)
+        curator._store_cache(c_cached2.payload_hash(), d_cached2)
+
+        d_new = CuratorDecision(action='create', justification='new-from-llm')
+        llm_result = AgentResult(
+            success=True,
+            output='',
+            structured_output={'decisions': [
+                {'candidate_index': 0, 'action': 'create', 'justification': 'new-from-llm'},
+            ]},
+            cost_usd=0.01,
+        )
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        call_candidates: list = []
+
+        async def capture_batch(candidates, pools, pool_sizes_list, start, pid, proot):
+            call_candidates.extend(candidates)
+            from fused_memory.middleware.task_curator import _parse_batch_decisions
+            from shared.cli_invoke import AgentResult as AR
+            return _parse_batch_decisions(
+                llm_result, pools=pools, pool_sizes_list=pool_sizes_list, latency_ms=0,
+            )
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch.object(curator, '_call_llm_batch', side_effect=capture_batch):
+            result = await curator.curate_batch(
+                [c_cached1, c_new, c_cached2], 'p', '/x',
+            )
+
+        # LLM should only see the one uncached candidate.
+        assert len(call_candidates) == 1
+        assert call_candidates[0] is c_new
+
+        # Result order matches original candidate list.
+        assert len(result) == 3
+        assert result[0].justification == 'c1-cached'
+        assert result[1].justification == 'new-from-llm'
+        assert result[2].justification == 'c2-cached'

@@ -755,10 +755,26 @@ class TaskCurator:
         unique_candidates = [candidates[i] for i in unique_indices]
         # ── End pre-batch dedup ────────────────────────────────────────────────
 
+        # ── Decision cache check ───────────────────────────────────────────────
+        # Consult the idempotency cache for each unique candidate before issuing
+        # an LLM call.  Under steady-state load (the same candidates repeat),
+        # cache-hit items are resolved without an LLM round-trip.
+        # `llm_k_list` holds positions *within unique_indices* (k values) for
+        # candidates that were NOT in the cache.
+        llm_k_list: list[int] = []
+        cache_hit_map: dict[int, CuratorDecision] = {}  # unique-space k → decision
+        for k, original_i in enumerate(unique_indices):
+            cached = self._check_cache(candidates[original_i].payload_hash())
+            if cached is not None:
+                cache_hit_map[k] = cached
+            else:
+                llm_k_list.append(k)
+
+        # ── Corpus assembly (only for non-cached unique candidates) ───────────
         pools: list[list[_PoolEntry]] = []
         pool_sizes_list: list[dict[str, int]] = []
-        for i in unique_indices:
-            candidate = candidates[i]
+        for k in llm_k_list:
+            candidate = candidates[unique_indices[k]]
             try:
                 pool, pool_sizes = await self._build_corpus(
                     candidate, project_id, project_root,
@@ -776,57 +792,76 @@ class TaskCurator:
             pools.append(pool)
             pool_sizes_list.append(pool_sizes)
 
-        try:
-            unique_decisions = await self._call_llm_batch(
-                unique_candidates, pools, pool_sizes_list, start, project_id, project_root,
-            )
-        except Exception as exc:
-            # Catches CuratorFailureError, AllAccountsCappedException, and
-            # unexpected exceptions from the LLM layer (e.g. subprocess errors
-            # in test environments without a real claude CLI).  CancelledError
-            # is a BaseException subclass (Python 3.8+) and is NOT caught here.
-            logger.warning(
-                'curate_batch: whole-batch LLM failed (%s), falling back to '
-                '%d size-1 curate calls',
-                exc,
-                len(unique_candidates),
-            )
-            unique_decisions = [
-                await self.curate(c, project_id, project_root) for c in unique_candidates
-            ]
+        # ── LLM call (only for non-cached unique candidates) ──────────────────
+        llm_raw_decisions: list[CuratorDecision] = []
+        if llm_k_list:
+            to_llm_candidates = [unique_candidates[k] for k in llm_k_list]
+            try:
+                llm_raw_decisions = await self._call_llm_batch(
+                    to_llm_candidates, pools, pool_sizes_list, start,
+                    project_id, project_root,
+                )
+            except Exception as exc:
+                # Catches CuratorFailureError, AllAccountsCappedException, and
+                # unexpected LLM-layer errors.  CancelledError (BaseException)
+                # is not caught here.
+                logger.warning(
+                    'curate_batch: whole-batch LLM failed (%s), falling back to '
+                    '%d size-1 curate calls',
+                    exc,
+                    len(to_llm_candidates),
+                )
+                # Each curate() call handles its own caching, so no re-store
+                # is needed for fallback decisions below.
+                llm_raw_decisions = [
+                    await self.curate(unique_candidates[k], project_id, project_root)
+                    for k in llm_k_list
+                ]
 
-        # Merge: unique candidates use LLM/fallback decisions; duplicates use pre_dedup.
-        # IMPORTANT: remap batch_target_index from unique-space (0..K-1, the positions
-        # the LLM sees and emits) to original-space (positions in `candidates`) so that
-        # the downstream worker's `resolved_task_ids` keying scheme works correctly.
-        # Example: if unique_indices=[0,1,3,5] and the LLM emits batch_target_index=2,
-        # that means position 2 in unique-space = original index unique_indices[2] = 3.
-        unique_decision_map: dict[int, CuratorDecision] = {}
-        for k, original_i in enumerate(unique_indices):
-            dec = unique_decisions[k]
+        # ── Merge: build unique_decision_map with original-space indices ───────
+        # The LLM (or fallback curate()) saw to_llm_candidates at LLM-local
+        # positions 0..M-1 (M = len(llm_k_list)).  batch_target_index from the
+        # LLM is in LLM-local space; remap to original-space via:
+        #   LLM-local j → llm_k_list[j] (unique-space k) → unique_indices[k]
+        # Cache hits have batch_target_index=None (within-batch drops are never
+        # cached, so there is nothing to remap for them).
+        unique_decisions_by_k: dict[int, CuratorDecision] = dict(cache_hit_map)
+        for llm_j, k in enumerate(llm_k_list):
+            dec = llm_raw_decisions[llm_j]
             if dec.batch_target_index is not None:
-                # Remap unique-space → original-space
-                orig_target = unique_indices[dec.batch_target_index]
-                dec = replace(dec, batch_target_index=orig_target)
-            unique_decision_map[original_i] = dec
+                local_target = dec.batch_target_index
+                if 0 <= local_target < len(llm_k_list):
+                    orig_target = unique_indices[llm_k_list[local_target]]
+                    dec = replace(dec, batch_target_index=orig_target)
+                else:
+                    # Out-of-range in LLM-local space; _parse_batch_decisions
+                    # should have caught this — degrade defensively.
+                    logger.warning(
+                        'curate_batch: LLM batch_target_index=%d out of '
+                        'LLM-local range [0, %d); clearing for unique k=%d',
+                        local_target, len(llm_k_list), k,
+                    )
+                    dec = replace(dec, batch_target_index=None)
+            unique_decisions_by_k[k] = dec
+
+        unique_decision_map: dict[int, CuratorDecision] = {
+            unique_indices[k]: unique_decisions_by_k[k]
+            for k in range(len(unique_indices))
+        }
 
         decisions = [
             pre_dedup_decisions[i] if i in pre_dedup_decisions else unique_decision_map[i]
             for i in range(len(candidates))
         ]
 
-        # Cache each decision so subsequent identical candidates hit the idempotency path.
-        # IMPORTANT: skip synthetic pre-batch-dedup decisions (batch_target_index
-        # set) — they share a payload_hash with the first sibling's real LLM
-        # decision, and caching them would overwrite the real decision with a
-        # degenerate action='drop', target_id=None entry.  A later single-item
-        # curate() hit on that hash would then return the synthetic drop, which
-        # _process_add_ticket's dispatch cannot safely interpret (no target_id
-        # and no batch context), leading to a duplicate-task bug.
-        for candidate, decision in zip(candidates, decisions, strict=True):
-            if decision.batch_target_index is not None:
+        # Cache only new LLM decisions (not cache hits — they're already stored;
+        # not batch_target_index decisions — they can't safely serve as single-item
+        # cache entries since they carry sibling references that become stale).
+        for k in llm_k_list:
+            dec = unique_decisions_by_k[k]
+            if dec.batch_target_index is not None:
                 continue
-            self._store_cache(candidate.payload_hash(), decision)
+            self._store_cache(candidates[unique_indices[k]].payload_hash(), dec)
 
         return decisions
 
