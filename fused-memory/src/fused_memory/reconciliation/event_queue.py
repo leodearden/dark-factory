@@ -40,7 +40,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _iter_lines_reversed(path: Path, chunk_size: int = 8192) -> Iterator[str]:
+def _iter_lines_reversed(
+    path: Path,
+    chunk_size: int = 8192,
+    max_line_bytes: int = 1_048_576,
+) -> Iterator[str]:
     """Yield lines from *path* newest-first without materialising the whole file.
 
     Opens *path* in binary mode, seeks to the end, and walks backward in
@@ -51,13 +55,22 @@ def _iter_lines_reversed(path: Path, chunk_size: int = 8192) -> Iterator[str]:
 
     Empty lines are yielded as-is; callers should strip and skip blank lines.
 
+    Args:
+        path: Path to the JSONL file.
+        chunk_size: Read granularity in bytes (default 8 KiB).
+        max_line_bytes: Safety cap on the internal carry buffer.  When a
+            partial-line fragment exceeds this threshold (e.g. from a
+            corrupted file or a rogue writer), the accumulated bytes are
+            yielded immediately with a warning so the downstream
+            ``json.loads`` call treats them as a malformed line and skips
+            them.  Defaults to 1 MiB.
+
     Raises:
         OSError: If the file cannot be opened or read.  Callers should catch
             and log.
     """
     with path.open('rb') as f:
-        f.seek(0, 2)
-        remaining = f.tell()
+        remaining = f.seek(0, 2)
         carry = b''
         while remaining > 0:
             to_read = min(chunk_size, remaining)
@@ -70,6 +83,15 @@ def _iter_lines_reversed(path: Path, chunk_size: int = 8192) -> Iterator[str]:
             # lines[0]  — leftmost fragment; may extend further left in the file.
             # lines[1:] — complete lines (each starts after a '\n' boundary).
             carry = lines[0]
+            if len(carry) > max_line_bytes:
+                logger.warning(
+                    '_iter_lines_reversed: carry buffer exceeded %d bytes in %s; '
+                    'yielding truncated fragment as malformed — downstream '
+                    'json.loads will skip it',
+                    max_line_bytes, path,
+                )
+                yield carry.decode('utf-8', errors='replace')
+                carry = b''
             for line in reversed(lines[1:]):
                 yield line.decode('utf-8', errors='replace')
         # Yield the oldest fragment (the first line in the file, which has no
