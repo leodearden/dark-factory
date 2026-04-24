@@ -174,7 +174,7 @@ def _make_matcher_result(cost_usd: float = 0.42, structured: dict | None = None,
         success=True,
         output=output,
         cost_usd=cost_usd,
-        structured_output=structured if structured is not None else {'matches': []},
+        structured_output=structured,
     )
 
 
@@ -246,8 +246,6 @@ class TestMatchIssuesCost:
     async def test_unparseable_output_still_reports_cost(self) -> None:
         """match_issues reports incurred cost even when LLM output is unparseable."""
         fake_result = _make_matcher_result(cost_usd=0.42, structured=None, output='not json at all')
-        # Override structured_output to be None explicitly
-        fake_result.structured_output = None
 
         reviewer_issues = [{'location': 'a.py:1', 'category': 'bug', 'description': 'x'}]
         ground_truth = [_make_gt('gt1')]
