@@ -39,12 +39,17 @@ def suggestion_hash(suggestion: dict) -> str:
     steward timeout that requeues an escalation produces the same
     ordered list of suggestions, so recomputing the hash per
     suggestion is deterministic across retries.
+
+    The output shape (16-char sha256-hex) is owned by :func:`sha256_16`.
     """
-    h = hashlib.sha256()
-    for field in ('reviewer', 'location', 'category', 'description'):
-        h.update(str(suggestion.get(field, '')).encode())
-        h.update(b'\x00')
-    return h.hexdigest()[:16]
+    payload = (
+        '\x00'.join(
+            str(suggestion.get(f, ''))
+            for f in ('reviewer', 'location', 'category', 'description')
+        )
+        + '\x00'
+    )
+    return sha256_16(payload)
 
 # ---------------------------------------------------------------------------
 # System prompt — classification only, no code edits
@@ -327,11 +332,10 @@ def _combine_suggestion_hashes(hashes: list[str]) -> str:
 
     Deterministic (sorted) so re-queued triages produce the same group
     hash even if the steward re-orders suggestions between retries.
+
+    The output shape (16-char sha256-hex) is owned by :func:`sha256_16`.
     """
     if len(hashes) == 1:
         return hashes[0]
-    h = hashlib.sha256()
-    for s in sorted(hashes):
-        h.update(s.encode())
-        h.update(b'|')
-    return h.hexdigest()[:16]
+    payload = '|'.join(sorted(hashes)) + '|'
+    return sha256_16(payload)
