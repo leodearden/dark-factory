@@ -384,3 +384,52 @@ async def test_dependency_tools_reject_ticket_shaped_depends_on(
         f'Expected ValidationError for ticket depends_on, got: {result}'
     )
     getattr(task_interceptor, tool_name).assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# get_statuses MCP tool tests (step-7)
+# ---------------------------------------------------------------------------
+
+
+def test_get_statuses_registered(mcp_server_with_tasks):
+    """get_statuses is registered as a tool in the MCP server."""
+    tool_names = [t.name for t in mcp_server_with_tasks._tool_manager.list_tools()]
+    assert 'get_statuses' in tool_names
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_forwards_to_interceptor(mcp_server_with_tasks, task_interceptor):
+    """get_statuses wraps the interceptor result in {'statuses': ...}."""
+    from unittest.mock import AsyncMock
+    task_interceptor.get_statuses = AsyncMock(return_value={'1': 'done'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_statuses', {'project_root': '/project'},
+    )
+    assert result == {'statuses': {'1': 'done'}}
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_relative_path_returns_validation_error(mcp_server_with_tasks):
+    """Relative project_root returns a ValidationError dict."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_statuses', {'project_root': 'relative/path'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert result['error_type'] == 'ValidationError'
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_interceptor_exception_returns_error_type(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """RuntimeError from the interceptor surfaces as {'error': ..., 'error_type': 'RuntimeError'}."""
+    from unittest.mock import AsyncMock
+    task_interceptor.get_statuses = AsyncMock(side_effect=RuntimeError('backend failure'))
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_statuses', {'project_root': '/project'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert 'backend failure' in result['error']
+    assert result['error_type'] == 'RuntimeError'
