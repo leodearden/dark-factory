@@ -160,9 +160,9 @@ submit_result = submit_task(
 )
 ticket = submit_result["ticket"]
 
-# Phase 2: block until the curator decides (timeout_seconds=60; see _shared/ticket-failure-handling.md)
+# Phase 2: block until the curator decides
 # "combined" is a normal outcome when PRD decomposition re-covers ground already in the task tree
-resolve = resolve_ticket(ticket=ticket, project_root="$TARGET_PROJECT", timeout_seconds=60)
+resolve = resolve_ticket(ticket=ticket, project_root="$TARGET_PROJECT", timeout_seconds=<see _shared/ticket-failure-handling.md>)
 
 if resolve["status"] == "created":
     task_id = resolve["task_id"]           # new task

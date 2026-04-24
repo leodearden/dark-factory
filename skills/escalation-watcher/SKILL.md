@@ -253,8 +253,8 @@ After the sub-agent returns:
    )
    ticket = submit_result["ticket"]
 
-   # Phase 2: block until the curator decides (timeout_seconds=60; see _shared/ticket-failure-handling.md)
-   resolve = mcp__fused-memory__resolve_ticket(ticket=ticket, project_root="<project_root>", timeout_seconds=60)
+   # Phase 2: block until the curator decides
+   resolve = mcp__fused-memory__resolve_ticket(ticket=ticket, project_root="<project_root>", timeout_seconds=<see _shared/ticket-failure-handling.md>)
 
    if resolve["status"] == "created":
        task_id = resolve["task_id"]           # new task
