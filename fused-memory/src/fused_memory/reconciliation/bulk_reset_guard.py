@@ -340,7 +340,7 @@ class BulkResetGuard:
             return None
 
         esc_dir = _esc_base
-        esc_dir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(esc_dir.mkdir, parents=True, exist_ok=True)
 
         ts = datetime.fromtimestamp(now, tz=UTC).isoformat()
         safe_ts = ts.replace(':', '').replace('+', '').replace('.', '_')
@@ -387,7 +387,7 @@ class BulkResetGuard:
             'project_id': project_id,
         }
         try:
-            path.write_text(json.dumps(record, indent=2), encoding='utf-8')
+            await asyncio.to_thread(path.write_text, json.dumps(record, indent=2), encoding='utf-8')
             logger.warning(
                 'bulk_reset_guard: wrote L1 escalation %s '
                 '(affected=%d, threshold=%d)',
