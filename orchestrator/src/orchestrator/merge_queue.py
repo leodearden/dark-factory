@@ -110,17 +110,27 @@ async def _check_plan_targets_in_tree(
     # by done plan-steps.  A file absent from the merge tree but deleted by
     # a done step is "expected absent" and should NOT be flagged as a drop.
     #
-    # Uses `git diff-tree --no-renames -r <sha>^ <sha>` rather than
-    # `git show` to:
-    #   (a) force a two-way diff against the first parent on merge commits —
-    #       git show defaults to combined-diff which silences deletions, and
+    # Uses `git diff-tree --root -m --no-commit-id --no-renames -r <sha>`
+    # rather than `git show` or the two-arg `<sha>^ <sha>` form to:
+    #   (a) surface deletions in merge commits: `git show` defaults to
+    #       combined-diff which silences deletions; the two-arg `<sha>^ <sha>`
+    #       form forces a two-way diff against the first parent but fails for
+    #       root commits; `-m` shows per-parent diffs for merge commits so
+    #       files deleted from any parent are captured, and
     #   (b) disable rename detection so renamed plan files correctly surface
     #       as expected_absent (git show with renames converts D+A to R,
     #       which --diff-filter=D does not match).
+    #   (c) `--root` makes root commits (no parents) diff against the empty
+    #       tree rather than failing — they can't delete files, so the output
+    #       is empty and the step is silently skipped.
+    #   (d) `--no-commit-id` suppresses the leading SHA line that
+    #       `git diff-tree <commit>` (single-arg form) emits per parent.
     #
     # All diff-tree queries run concurrently via asyncio.gather — each is
     # independent and the sequential loop would otherwise scale O(N) in
-    # done-step count on the merge hot-path.
+    # done-step count on the merge hot-path.  Multiple done steps may point
+    # at the same commit SHA; queries are deduplicated before gather to avoid
+    # redundant subprocess launches.
 
     # Pass 1: collect (step_idx, commit) for every qualifying done step.
     steps_to_query: list[tuple[int, str]] = []
@@ -135,24 +145,33 @@ async def _check_plan_targets_in_tree(
         steps_to_query.append((step_idx, commit))
 
     # Pass 2: fire all diff-tree queries concurrently, then process results.
+    # Deduplicate commit SHAs (preserving first-occurrence order) so each
+    # unique SHA is queried only once even when multiple done steps share it.
     expected_absent: set[str] = set()
     if steps_to_query:
-        results = await asyncio.gather(*[
+        unique_commits: list[str] = list(dict.fromkeys(c for _, c in steps_to_query))
+        commit_results = await asyncio.gather(*[
             _run(
                 [
                     'git', 'diff-tree',
+                    '--root',
+                    '-m',
+                    '--no-commit-id',
                     '--no-renames',
                     '--diff-filter=D',
                     '--name-only',
                     '-r',
-                    f'{commit}^',
                     commit,
                 ],
                 cwd=git_ops.project_root,
             )
-            for _, commit in steps_to_query
+            for commit in unique_commits
         ])
-        for (step_idx, commit), (rc, stdout, stderr) in zip(steps_to_query, results, strict=True):
+        commit_to_result: dict[str, tuple[int, str, str]] = dict(
+            zip(unique_commits, commit_results, strict=True),
+        )
+        for step_idx, commit in steps_to_query:
+            rc, stdout, stderr = commit_to_result[commit]
             if rc != 0:
                 logger.warning(
                     'git diff-tree --diff-filter=D failed for step %d commit %s: %s',

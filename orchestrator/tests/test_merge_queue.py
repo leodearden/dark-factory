@@ -852,32 +852,39 @@ class TestCheckPlanTargetsInTree:
 
             max(start_times) < min(end_times)
 
-        With a sequential for-loop each call is spaced 0.05 s apart, so
-        max(starts) ≈ 0.10 >= min(ends) ≈ 0.05 and the assertion fails.
+        With a sequential for-loop each call is spaced 0.2 s apart, so
+        max(starts) ≈ 0.4 >= min(ends) ≈ 0.2 and the assertion fails.
         With asyncio.gather all three overlap and the invariant holds.
+
+        Each done step references a DISTINCT commit so the deduplication pass
+        does not collapse the three queries into one.
         """
         worktree = (await git_ops.create_worktree('concurrent-done')).path
 
-        # Create a real commit so the three done steps have a valid SHA.
-        (worktree / 'stays.py').write_text('stays = 1\n')
-        sha_c1 = await git_ops.commit(worktree, 'Add stays.py')
+        # Create three distinct commits so deduplication keeps all three queries.
+        (worktree / 'file_a.py').write_text('a = 1\n')
+        sha_c1 = await git_ops.commit(worktree, 'Add file_a.py')
         assert sha_c1
+
+        (worktree / 'file_b.py').write_text('b = 1\n')
+        sha_c2 = await git_ops.commit(worktree, 'Add file_b.py')
+        assert sha_c2
+
+        (worktree / 'file_c.py').write_text('c = 1\n')
+        sha_c3 = await git_ops.commit(worktree, 'Add file_c.py')
+        assert sha_c3
 
         artifacts = TaskArtifacts(worktree)
         artifacts.init('t-concurrent', 'T-concurrent', 'desc')
         # forces_loop.py is a phantom file: it is absent from the merge tree,
         # so missing is non-empty and the done-step loop is entered.
         artifacts.write_plan({
-            'files': ['stays.py', 'forces_loop.py'],
+            'files': ['file_a.py', 'forces_loop.py'],
             'modules': [],
             'steps': [
-                {
-                    'id': f'step-{i}',
-                    'description': f's{i}',
-                    'status': 'done',
-                    'commit': sha_c1,
-                }
-                for i in range(1, 4)
+                {'id': 'step-1', 'description': 's1', 'status': 'done', 'commit': sha_c1},
+                {'id': 'step-2', 'description': 's2', 'status': 'done', 'commit': sha_c2},
+                {'id': 'step-3', 'description': 's3', 'status': 'done', 'commit': sha_c3},
             ],
         })
 
@@ -893,7 +900,7 @@ class TestCheckPlanTargetsInTree:
             async def _intercept(cmd, cwd=None, **kwargs):
                 if '--diff-filter=D' in cmd:
                     start_times.append(asyncio.get_running_loop().time())
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.2)
                     end_times.append(asyncio.get_running_loop().time())
                     return 0, '', ''
                 return await original_run(cmd, cwd=cwd, **kwargs)
@@ -912,6 +919,77 @@ class TestCheckPlanTargetsInTree:
             assert max(start_times) < min(end_times), (
                 f'Sequential execution detected: starts={start_times}, '
                 f'ends={end_times}'
+            )
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_malformed_step_shapes_do_not_raise_or_query_git(
+        self, git_ops: GitOps,
+    ):
+        """Malformed step shapes are silently skipped — no exceptions, no git queries.
+
+        The defensive ``isinstance(step, dict)`` and ``isinstance(commit, str)``
+        guards in the asyncio.gather refactor had no previous test coverage.
+        This test feeds a plan whose steps list contains:
+          - None (non-dict)
+          - a plain string (non-dict, normalised to a dict with no "status")
+          - a dict whose "commit" key is absent
+          - a dict whose "commit" is None (non-string)
+          - a dict whose "commit" is an integer (non-string)
+          - a dict with a valid string commit but status != 'done'
+
+        Assertions:
+          1. No exception is raised.
+          2. No ``git diff-tree`` subprocess is fired (steps_to_query is empty).
+          3. The phantom file that is absent from the merge tree is still
+             reported as dropped (the guards don't suppress legitimate drops).
+        """
+        worktree = (await git_ops.create_worktree('malformed-steps')).path
+        (worktree / 'real.py').write_text('x = 1\n')
+        await git_ops.commit(worktree, 'Add real.py')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-malformed', 'T-malformed', 'desc')
+        artifacts.write_plan({
+            'files': ['phantom.py', 'real.py'],
+            'modules': [],
+            'steps': [
+                None,                                                   # non-dict
+                'plain string step',                                    # non-dict
+                {'id': 'step-A', 'description': 'a', 'status': 'done'},  # no commit
+                {'id': 'step-B', 'description': 'b', 'status': 'done', 'commit': None},
+                {'id': 'step-C', 'description': 'c', 'status': 'done', 'commit': 123},
+                {'id': 'step-D', 'description': 'd', 'status': 'pending', 'commit': 'abc'},
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'malformed-steps')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            from orchestrator import merge_queue as mq
+            original_run = mq._run
+            diff_tree_calls: list[list[str]] = []
+
+            async def _intercept(cmd, cwd=None, **kwargs):
+                if '--diff-filter=D' in cmd:
+                    diff_tree_calls.append(list(cmd))
+                return await original_run(cmd, cwd=cwd, **kwargs)
+
+            with patch('orchestrator.merge_queue._run', new=_intercept):
+                missing = await _check_plan_targets_in_tree(
+                    merge_result.merge_commit, worktree, git_ops,
+                )
+
+            # phantom.py is absent from the merge tree → correctly reported as dropped
+            assert 'phantom.py' in missing
+            # real.py is present in the merge tree → not reported as dropped
+            assert 'real.py' not in missing
+            # No diff-tree subprocess should have been launched for any of the
+            # malformed / non-done steps — steps_to_query must be empty.
+            assert diff_tree_calls == [], (
+                f'Unexpected diff-tree calls fired: {diff_tree_calls}'
             )
         finally:
             if merge_result.merge_worktree:
