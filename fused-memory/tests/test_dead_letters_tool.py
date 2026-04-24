@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
@@ -15,7 +16,11 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.reconciliation.event_queue import EventQueue
-from fused_memory.server.tools import create_mcp_server
+from fused_memory.server.tools import (
+    _DEAD_LETTER_PAYLOAD_MAX_BYTES,
+    _truncate_payload,
+    create_mcp_server,
+)
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -343,3 +348,31 @@ class TestGetDeadLettersPayloadTruncation:
         assert 'original_type' in payload
         # The 'text' field must fit within the byte budget.
         assert len(payload['text'].encode()) <= 2048
+
+
+# ── _truncate_payload unit tests ───────────────────────────────────────────
+
+
+class TestTruncatePayloadHardening:
+    """Direct unit tests for _truncate_payload edge cases."""
+
+    def test_non_serialisable_small_payload_returned_as_string_with_truncated_true(self):
+        """Non-JSON-serialisable payload that fits the budget must NOT be returned raw."""
+        # Build a self-referencing dict — reliably raises ValueError from json.dumps.
+        payload: dict = {}
+        payload['self'] = payload
+
+        # Sanity-guard 1: confirm the payload genuinely triggers the except branch.
+        with pytest.raises((TypeError, ValueError)):
+            json.dumps(payload, default=str)
+
+        # Sanity-guard 2: confirm str() form fits under the budget.
+        assert len(str(payload).encode('utf-8')) < _DEAD_LETTER_PAYLOAD_MAX_BYTES
+
+        result, truncated = _truncate_payload(payload)
+
+        # The buggy behaviour returns (payload, False); the fix must return (str, True).
+        assert truncated is True
+        assert isinstance(result, str)
+        assert result == str(payload)
+        assert result is not payload
