@@ -1286,13 +1286,17 @@ class TaskCurator:
         n = len(candidates)
         user_prompt = self._build_batch_user_prompt(candidates, pools)
 
+        # Scale by (n-1): timeout_seconds / 3-turns already cover the first
+        # item's baseline; each additional item beyond the first adds its slack.
+        # This avoids over-provisioning a size-2 batch at 2× the single-call
+        # budget.  Note: _call_llm_batch is never called for n<2.
         timeout = min(
             self._config.curator.timeout_seconds
-            + self._config.curator.per_item_slack_seconds * n,
+            + self._config.curator.per_item_slack_seconds * (n - 1),
             self._config.curator.batch_timeout_cap_seconds,
         )
         max_turns = min(
-            3 + self._config.curator.per_item_turns * n,
+            3 + self._config.curator.per_item_turns * (n - 1),
             self._config.curator.batch_turns_cap,
         )
 
