@@ -102,6 +102,7 @@ def harness(tmp_path: Path, git_config: GitConfig):
     # Replace scheduler with async mocks
     h.scheduler = MagicMock()
     h.scheduler.get_tasks = AsyncMock(return_value=[])
+    h.scheduler.get_statuses = AsyncMock(return_value={})
     h.scheduler.set_task_status = AsyncMock()
 
     # Keep worktree_base real (under tmp_path) so we can create fake worktrees
