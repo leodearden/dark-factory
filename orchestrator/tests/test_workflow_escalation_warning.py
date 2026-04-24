@@ -5,7 +5,7 @@ a single WARNING per workflow instance when an escalation-capable agent role is
 first invoked while ``self.escalation_queue`` is None.
 """
 
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import logging
 from pathlib import Path
@@ -15,7 +15,7 @@ import pytest
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, ROLES
-from orchestrator.workflow import _ESCALATION_CAPABLE_ROLES, TaskWorkflow, WorkflowOutcome, WorkflowState
+from orchestrator.workflow import _ESCALATION_CAPABLE_ROLES, TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # E2E fixtures and helpers — imported so pytest discovers them in this module.
@@ -23,7 +23,7 @@ from orchestrator.workflow import _ESCALATION_CAPABLE_ROLES, TaskWorkflow, Workf
 # See plan.json design decision: placed here per task instructions; fixtures are
 # duplicated/re-imported to avoid conftest pollution.
 # ---------------------------------------------------------------------------
-from .test_workflow_e2e import (  # noqa: E402
+from .test_workflow_e2e import (  # noqa: E402, F401
     AgentStub,
     _build_workflow_with_escalation,
     config,        # fixture: OrchestratorConfig backed by a real git repo
@@ -44,17 +44,17 @@ def _make_workflow(*, escalation_queue=None) -> TaskWorkflow:
     assignment.task = {'id': '42', 'title': 'Test Task', 'description': 'd'}
     assignment.modules = ['some/module']
 
-    config = MagicMock()
-    config.fused_memory.project_id = 'dark_factory'
-    config.fused_memory.url = 'http://localhost:8002'
-    config.max_review_cycles = 2
-    config.max_amendment_rounds = 1
-    config.lock_depth = 2
-    config.steward_completion_timeout = 300.0
+    cfg = MagicMock()
+    cfg.fused_memory.project_id = 'dark_factory'
+    cfg.fused_memory.url = 'http://localhost:8002'
+    cfg.max_review_cycles = 2
+    cfg.max_amendment_rounds = 1
+    cfg.lock_depth = 2
+    cfg.steward_completion_timeout = 300.0
 
     return TaskWorkflow(
         assignment=assignment,
-        config=config,
+        config=cfg,
         git_ops=MagicMock(),
         scheduler=MagicMock(),
         briefing=MagicMock(),
@@ -182,7 +182,7 @@ class TestFirstInvocationBudgetExhaustion:
     """
 
     async def test_label_is_last_completed_role_na_when_no_role_completed(
-        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path  # noqa: F811
     ):
         """Before any role completes, _last_completed_role is None → label resolves to n/a.
 

@@ -3301,6 +3301,9 @@ class TestRecoverIfAlreadyMerged:
             f"Last scheduler status must be 'done', got: {statuses}"
         )
         prov = scheduler.provenance.get(task_assignment.task_id)
+        assert prov is not None, (
+            f"Expected provenance entry for task {task_assignment.task_id!r}, got None"
+        )
         assert set(prov.keys()) == {'note', 'main_sha'}, (
             f"Provenance must have exactly keys {{'note', 'main_sha'}}, got: {set(prov.keys())!r}"
         )
