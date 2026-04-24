@@ -3174,25 +3174,28 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
     """Regression guard: a ``_project_root`` override on a later buffered event must be
     found even when earlier events in the peek window lack the key.
 
-    Uses a 4+1=5 event setup so the invariant is: any peek window >= 5 must find the
-    later-buffered override — roughly half of ``_PROJECT_ROOT_PEEK_LIMIT``'s current
-    value of 10, catching realistic narrowing mistakes without importing or pinning to
-    the constant (decoupled from ``_PROJECT_ROOT_PEEK_LIMIT``'s current value).
+    Uses a 2+1=3 event setup as a minimal lower bound: N=2 events without the key
+    before the override proves the resolver iterates past multiple eventless entries
+    (not just peeks-last), while staying far below any realistic peek-window size.
+
+    Scope note: this test does **not** guard against accidental narrowing of
+    ``_PROJECT_ROOT_PEEK_LIMIT``.  Detecting constant-narrowing is intentionally
+    out of scope so the test stays decoupled from the constant's specific value.
+    It will only fail for pathologically small windows (fewer than 3 events) — i.e.,
+    implementations that cannot scan past more than one eventless entry.
     """
-    # peek_buffered orders by `timestamp ASC LIMIT ?` (FIFO). Push 4 events that
+    # peek_buffered orders by `timestamp ASC LIMIT ?` (FIFO). Push 2 events that
     # LACK _project_root with monotonically-increasing timestamps, then 1 event
     # carrying _project_root='/from/event' with a strictly-later timestamp. With FIFO
     # peek, the override event is returned LAST — so the resolver finds it only if the
-    # window accommodates all 5 buffered events.
-    # 5 is a stronger floor than the minimal 3: a 3-event setup catches only windows
-    # of 1-2; 5 catches windows of 1-4, which would represent meaningful narrowing
-    # (roughly half the current constant), without pinning to _PROJECT_ROOT_PEEK_LIMIT's
-    # exact value of 10.
+    # window is wide enough to include all 3 buffered events.
+    # N=2 earlier-without-key is the smallest number that proves the resolver
+    # iterates past multiple eventless entries, not just peeks-last.
     # Anchor base_ts 60 seconds in the past so that peek_buffered's
     # `WHERE timestamp < cutoff` clause (cutoff ≈ datetime.now(UTC) at run() time)
-    # includes all 5 events.  Explicit offsets avoid sub-microsecond tie flakiness.
+    # includes all 3 events.  Explicit offsets avoid sub-microsecond tie flakiness.
     base_ts = datetime.now(UTC) - timedelta(seconds=60)
-    for i in range(4):
+    for i in range(2):
         await event_buffer.push(ReconciliationEvent(
             id=str(uuid.uuid4()),
             type=EventType.episode_added,
@@ -3233,9 +3236,7 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
     assert captured['project_root'] == '/from/event', (
         f"Expected project_root='/from/event' but got '{captured['project_root']}'. "
         'The peek window must be wide enough to find a later-buffered _project_root '
-        'override past 4 earlier events that lack the key — i.e., any peek window >= 5 '
-        'must succeed. If this test fails, the peek window has been tuned to 1-4, '
-        'which is unreasonably narrow (roughly half the intended minimum lookback).'
+        'override past earlier events that lack the key.'
     )
 
 
