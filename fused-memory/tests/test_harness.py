@@ -2,13 +2,14 @@
 
 import contextlib
 import uuid
-from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 
 from fused_memory.models.reconciliation import (
+    AssembledPayload,
     EventSource,
     EventType,
     ReconciliationEvent,
@@ -18,6 +19,7 @@ from fused_memory.models.reconciliation import (
     StageReport,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.harness import BacklogIterator
 from fused_memory.reconciliation.journal import ReconciliationJournal
 
 
@@ -3137,11 +3139,6 @@ async def test_backlog_iterator_uses_harness_project_root_when_events_lack_overr
 ):
     """BacklogIterator.run should pass harness.project_root to ContextAssembler
     when peeked events carry no _project_root key in their payload."""
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    from fused_memory.models.reconciliation import AssembledPayload
-    from fused_memory.reconciliation.harness import BacklogIterator
-
     # Push one event with NO _project_root in payload
     await event_buffer.push(_make_event('dark_factory'))
 
@@ -3180,17 +3177,6 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
     Uses a 9+1 setup so the override sits at exactly the current limit — any reduction
     to the peek window will trip this test.
     """
-    from datetime import timedelta
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    from fused_memory.models.reconciliation import (
-        AssembledPayload,
-        EventSource,
-        EventType,
-        ReconciliationEvent,
-    )
-    from fused_memory.reconciliation.harness import BacklogIterator
-
     # peek_buffered orders by `timestamp ASC LIMIT ?` (FIFO). Push 9 events that
     # LACK _project_root with monotonically-increasing timestamps, then 1 event
     # carrying _project_root='/from/event' with the latest timestamp. With FIFO
@@ -3263,11 +3249,6 @@ async def test_backlog_iterator_event_project_root_wins_over_configured(
     Peek-window semantics differ from run_full_cycle's full-drain coverage at
     test_harness.py:341, making this a distinct regression guard.
     """
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    from fused_memory.models.reconciliation import AssembledPayload
-    from fused_memory.reconciliation.harness import BacklogIterator
-
     # Push two events WITH _project_root key — both within the peek window
     await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
     await event_buffer.push(_make_event_with_root('dark_factory', '/from/event'))
