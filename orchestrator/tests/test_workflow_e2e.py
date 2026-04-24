@@ -2928,6 +2928,89 @@ class TestRecoverIfAlreadyMerged:
             f'contamination: {workflow.state!r}'
         )
 
+    async def test_returns_none_when_wt_head_provided_but_metadata_missing(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """wt_head provided but metadata.json absent must return None, not false-DONE.
+
+        Regression test for the gap identified in task 989: when
+        _recover_if_already_merged() passes wt_head to
+        _has_prior_implementation(), the method only takes the SHA-primary
+        path when BOTH wt_head and base_commit are non-None.  When
+        metadata.json has NOT been stamped (read_base_commit() returns None),
+        the current code falls through to the iteration-log scan and returns
+        has_work=True if an 'implementer' entry exists — exactly the false-
+        DONE path that task 954 was meant to prevent.
+
+        On unmodified code: wt_head is not None, base_commit is None →
+        control falls through to the iteration-log fallback → finds the
+        'implementer' entry → has_work=True → _recover_if_already_merged()
+        returns WorkflowOutcome.DONE — false-DONE.
+
+        After the fail-closed fix (step-2): when wt_head is provided but
+        base_commit is None, _has_prior_implementation() returns
+        has_work=False immediately, without consulting iterations.jsonl.
+        _recover_if_already_merged() then logs a warning and returns None.
+
+        Distinguishing factor from the sibling test
+        test_returns_none_for_inherited_iterations_log_on_fresh_worktree:
+        that test WRITES metadata.json so the SHA-primary equality path is
+        exercised (wt_head == base_commit → has_work=False).  This test
+        deliberately OMITS metadata.json to exercise the new fail-closed
+        branch (wt_head is not None, base_commit is None → has_work=False).
+        Both tests write an 'implementer' entry in iterations.jsonl to prove
+        the iteration-log fallback is NOT consulted.
+        """
+        import json as _json
+
+        # 1. Create a fresh worktree (wt_head == base_commit, trivially ancestor of main)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Create .task/ directory and write iterations.jsonl with an implementer
+        #    entry — simulates inherited contamination (on-disk but untracked).
+        #    On unmodified code this entry causes has_work=True via the
+        #    iteration-log fallback when base_commit is None → false-DONE.
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+        # Deliberately do NOT write metadata.json — this is the distinguishing
+        # factor.  read_base_commit() will return None, and on unmodified code
+        # the method falls through to the iteration-log scan (false-DONE).
+        # After the fail-closed fix the new branch (wt_head is not None,
+        # base_commit is None) returns has_work=False instead.
+
+        # 3. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 4. Call _recover_if_already_merged directly
+        outcome = await workflow._recover_if_already_merged()
+
+        # 5. Assertions: missing metadata.json must NOT cause false-DONE
+        assert outcome is None, (
+            f'Expected None when wt_head is provided but metadata.json is absent '
+            f'(base_commit=None), but got {outcome!r} — '
+            'the iteration-log fallback fires when base_commit is None and '
+            'returns false-DONE; the fail-closed branch must catch this case '
+            'and return has_work=False before consulting iterations.jsonl'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses when metadata.json "
+            f"is absent: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE when metadata.json is absent: '
+            f'{workflow.state!r}'
+        )
+
     async def test_returns_none_when_branch_not_on_main(
         self, config, git_ops, task_assignment, tmp_path
     ):
