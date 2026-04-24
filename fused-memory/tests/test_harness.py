@@ -3174,18 +3174,11 @@ async def test_backlog_iterator_uses_harness_project_root_when_events_lack_overr
 async def test_backlog_iterator_peek_window_finds_later_project_root_override(
     journal, event_buffer, mock_memory_service
 ):
-    """Regression guard: BacklogIterator's peek window must be wide enough that
-    a `_project_root` override on a LATER buffered event is still found, even
-    when several earlier buffered events lack the key.
+    """Regression guard: a ``_project_root`` override on a later buffered event must be
+    found even when earlier events in the peek window lack the key (window >= N positions).
 
-    This pins the actual behavioral invariant (window >= N for realistic N)
-    without referencing the module-private `_PROJECT_ROOT_PEEK_LIMIT` constant
-    or its exact value — so the window size can be tuned freely as long as it
-    stays large enough to accommodate a realistic mix of buffered events.
-
-    Replaces the prior meta-test flagged by reviewer as locking implementation
-    detail (asserting `first_limit == _PROJECT_ROOT_PEEK_LIMIT` and
-    `_PROJECT_ROOT_PEEK_LIMIT == 10`).
+    Uses a 9+1 setup so the override sits at exactly the current limit — any reduction
+    to the peek window will trip this test.
     """
     from datetime import timedelta
     from unittest.mock import AsyncMock, MagicMock, patch
