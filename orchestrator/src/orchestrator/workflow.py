@@ -439,6 +439,15 @@ class TaskWorkflow:
                 # but never implemented, or a freshly-created worktree) also
                 # satisfies the ancestor check.  Only skip if there's
                 # evidence of prior implementation work.
+                #
+                # WT_HEAD INTENTIONALLY OMITTED — see _has_prior_implementation()
+                # docstring.  This caller is reached after a genuine rebase, so
+                # wt_head may equal the new base_commit even on a
+                # genuinely-implemented branch.  The iteration-log fallback is the
+                # correct signal here: if there's an implementer entry in the log,
+                # the branch has real work and we should skip to DONE.  Passing
+                # wt_head would cause the SHA-primary check to return has_work=False
+                # on any rebased branch, silently discarding completed work.
                 has_work = (
                     self._has_prior_implementation().has_work
                     or await self.git_ops.has_uncommitted_work(self.worktree)
@@ -518,6 +527,15 @@ class TaskWorkflow:
                     # Defense-in-depth: same stale-branch-point guard as
                     # the pre-EXECUTE check.  Should rarely fire since
                     # we just ran execute, but guards against edge cases.
+                    #
+                    # WT_HEAD INTENTIONALLY OMITTED — see _has_prior_implementation()
+                    # docstring.  At this call site we have just run EXECUTE and
+                    # any prior rebase already happened; the iteration-log fallback
+                    # is the right signal.  The base_commit rebased-head problem
+                    # does not apply here because we are checking for the ABSENCE
+                    # of implementation work (i.e. a spurious merge signal), and a
+                    # freshly-rebased branch that completed EXECUTE will always have
+                    # iteration-log entries.
                     if already_merged and not self._has_prior_implementation().has_work:
                         logger.warning(
                             f'Task {self.task_id}: branch appears merged at '
@@ -2465,10 +2483,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # We pass wt_head to _has_prior_implementation() so the SHA-primary
         # path is taken: has_work = (wt_head != base_commit).  This prevents
         # false-DONE when a fresh worktree (wt_head == base_commit, no real
-        # commits) has inherited an on-disk .task/iterations.jsonl from main
-        # contamination, eval mode, or a previous partial run.  Without wt_head
-        # the iteration-log fallback finds the implementer entry and incorrectly
-        # returns DONE for an unimplemented task — catastrophic silent failure.
+        # commits) has inherited an on-disk .task/iterations.jsonl written
+        # directly to the worktree's .task/ directory (e.g. main-branch
+        # contamination where the file exists on disk but is untracked by git).
+        # Without wt_head the iteration-log fallback finds the implementer entry
+        # and incorrectly returns DONE for an unimplemented task — catastrophic
+        # silent failure.  See test_returns_none_for_inherited_iterations_log_on_fresh_worktree
+        # for the regression case this guards.
         #
         # Trade-off: if create_worktree rebased a genuinely-implemented branch
         # onto a new main tip so that wt_head == new_base_commit, the SHA-primary

@@ -2988,14 +2988,31 @@ class TestRecoverIfAlreadyMerged:
 
 @pytest.mark.asyncio
 class TestRunPrePlanRecovery:
-    """workflow.run returns DONE before PLAN when the branch is already on main.
+    """workflow.run returns DONE on already-merged branches via the two-guard model.
 
-    The pre-PLAN call to _recover_if_already_merged() must fire before the
-    architect (PLAN phase) is invoked — neither architect nor implementer
-    should be called when the recovery detects a prior merge.
+    After the SHA-primary fix (Option B), recovery uses two guards:
+
+    1. Pre-PLAN guard (_recover_if_already_merged, called before the architect):
+       uses SHA-primary (wt_head != base_commit) to reject stale states.  If the
+       worktree has no real commits relative to its base — including the case where
+       .task/iterations.jsonl was inherited from main contamination — the guard
+       returns None and the workflow falls through to PLAN.  This prevents
+       false-DONE when a fresh worktree has no implementation work.
+
+    2. Pre-EXECUTE guard (workflow.py:412-457, called after PLAN):
+       uses the iteration-log fallback (no wt_head passed).  This is the backstop
+       that detects rebased ghost-loops: if create_worktree rebased a
+       genuinely-implemented branch so that wt_head == new_base_commit, the
+       pre-PLAN guard returns None, the architect runs (one wasted invocation —
+       explicitly accepted trade-off), and then the pre-EXECUTE guard finds the
+       committed implementer entry and routes to the SUCCESS path without calling
+       the implementer.
+
+    Net invariant: DONE is always reached; implementer is never called on an
+    already-merged branch; at most one architect invocation is wasted.
     """
 
-    async def test_run_returns_done_early_via_pre_plan_recovery(
+    async def test_run_returns_done_via_pre_execute_ghost_loop_guard(
         self, config, git_ops, task_assignment, monkeypatch
     ):
         """workflow.run exits DONE (via pre-EXECUTE guard) on a merged branch.
@@ -3068,9 +3085,9 @@ class TestRunPrePlanRecovery:
         assert outcome == WorkflowOutcome.DONE, (
             f'Expected DONE but got {outcome!r}'
         )
-        assert 'architect' in stub.calls, (
-            f'architect should have been called exactly once (SHA-primary fix trade-off): '
-            f'{stub.calls}'
+        assert stub.calls.count('architect') == 1, (
+            f'architect should have been called exactly once (SHA-primary fix trade-off — '
+            f'bounded cost invariant): {stub.calls}'
         )
         assert 'implementer' not in stub.calls, (
             f'implementer must NOT be called — pre-EXECUTE ghost-loop guard should '
