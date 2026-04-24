@@ -298,7 +298,13 @@ class ReconciliationHarness:
             Non-absolute paths are rejected before calling taskmaster to avoid
             silent failures from TaskmasterBackend's absolute-path validator.
         """
-        if not self.taskmaster or not project_root:
+        if not self.taskmaster:
+            logger.info(
+                'reconciliation.task_tree_taskmaster_disabled',
+                extra={'project_root': project_root},
+            )
+            return FilteredTaskTree()
+        if not project_root:
             return FilteredTaskTree()
         if not os.path.isabs(project_root):
             logger.warning(
