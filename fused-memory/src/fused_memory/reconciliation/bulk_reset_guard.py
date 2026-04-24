@@ -254,7 +254,8 @@ class BulkResetGuard:
             return BulkResetVerdict(outcome='ok', project_id=project_id)
 
         # 2. Non-reversal fast-path — ignore; do not touch the deque.
-        if _reversal_kind(old_status, new_status) is None:
+        kind = _reversal_kind(old_status, new_status)
+        if kind is None:
             return BulkResetVerdict(outcome='ok', project_id=project_id)
 
         now = self._now()
@@ -284,28 +285,35 @@ class BulkResetGuard:
                 state = _GuardState()
                 self._state[project_id] = state
 
-            # 4. Record this attempt (always, even if we will reject it).
-            # Until step-8 introduces _reversal_kind routing, all reversals
-            # accumulate in done_entries; step-8 will route to the correct
-            # per-kind deque.
-            state.done_entries.append(_Entry(ts=now, task_id=task_id))
+            # 4. Route to the per-kind deque and select the matching threshold.
+            if kind == 'done_to_pending':
+                entries = state.done_entries
+                threshold = self._done_threshold
+            else:
+                entries = state.in_progress_entries
+                threshold = self._in_progress_threshold
 
-            # 5. Check threshold.
+            # 5. Record this attempt (always, even if we will reject it).
+            entries.append(_Entry(ts=now, task_id=task_id))
+
+            # 6. Check threshold.
             # Trip fires when the count EXCEEDS threshold (len > threshold),
             # i.e. the (threshold+1)-th attempt in the window is the first
             # rejection.  This means "up to threshold reversals are allowed;
             # the next one trips the circuit-breaker."
-            if len(state.done_entries) <= self._done_threshold:
+            if len(entries) <= threshold:
                 return BulkResetVerdict(outcome='ok', project_id=project_id)
 
-            # 6. Threshold crossed — collect window contents for the verdict.
-            affected_ids = tuple(e.task_id for e in state.done_entries)
+            # 7. Threshold crossed — collect window contents for the verdict.
+            # Only entries from the tripped deque are included; the other
+            # deque's entries do not leak into the rejection payload.
+            affected_ids = tuple(e.task_id for e in entries)
             trig_ts = tuple(
                 datetime.fromtimestamp(e.ts, tz=UTC).isoformat()
-                for e in state.done_entries
+                for e in entries
             )
 
-        # 7. Try to write escalation (outside lock to avoid I/O under lock).
+        # 8. Try to write escalation (outside lock to avoid I/O under lock).
         esc_path = await self._maybe_write_escalation(
             project_id=project_id,
             project_root=project_root,
@@ -318,7 +326,7 @@ class BulkResetGuard:
                 outcome='escalated',
                 affected_task_ids=affected_ids,
                 triggering_timestamps=trig_ts,
-                threshold=self._done_threshold,
+                threshold=threshold,
                 window_seconds=self._window_seconds,
                 project_id=project_id,
                 escalation_path=str(esc_path),
@@ -327,7 +335,7 @@ class BulkResetGuard:
             outcome='rejection',
             affected_task_ids=affected_ids,
             triggering_timestamps=trig_ts,
-            threshold=self._done_threshold,
+            threshold=threshold,
             window_seconds=self._window_seconds,
             project_id=project_id,
         )

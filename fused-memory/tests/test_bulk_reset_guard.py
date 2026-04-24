@@ -242,12 +242,17 @@ async def test_observe_attempt_ignores_non_reversal_transitions(tmp_path):
         )
         assert v.outcome == 'ok', f'reversal {i}: expected ok, got {v.outcome}'
 
-    # Fourth reversal should trip (non-reversals did not consume window slots)
+    # Fourth done→pending reversal should trip the done counter.
+    # (Using done→pending rather than in-progress→pending: the two counters are
+    # independent, and the in-progress threshold is 100, so an in-progress
+    # reversal here would NOT trip.  The test verifies that non-reversals do
+    # not consume done→pending window slots — the done counter is at 3 == done_threshold,
+    # so the next done→pending is the (threshold+1)-th and must be rejected.)
     clock[0] += 1.0
     v4 = await guard.observe_attempt(
         project_id='proj-a',
         task_id='rev-3',
-        old_status='in-progress',
+        old_status='done',
         new_status='pending',
         project_root=str(tmp_path),
     )
@@ -562,13 +567,15 @@ async def test_escalation_rate_limited(tmp_path):
     # Rate-limit is 900s; window is 60s. Move to t = 1000 + 1000 = 2000 to be safe.
     clock[0] = 2000.0
 
-    # Seed three new reversals (all ok at threshold=3).
+    # Seed three new done→pending reversals (all ok at done_threshold=3).
+    # Using done→pending (not in-progress→pending) because in_progress_threshold=100
+    # and we'd need 101 in-progress reversals to re-trip — use done_threshold=3 instead.
     for i in range(3):
         clock[0] += 1.0
         v = await guard.observe_attempt(
             project_id='proj-rl',
             task_id=f'new-{i}',
-            old_status='in-progress',
+            old_status='done',
             new_status='pending',
             project_root=str(tmp_path),
         )
@@ -579,7 +586,7 @@ async def test_escalation_rate_limited(tmp_path):
     v_new = await guard.observe_attempt(
         project_id='proj-rl',
         task_id='new-3',
-        old_status='in-progress',
+        old_status='done',
         new_status='pending',
         project_root=str(tmp_path),
     )
