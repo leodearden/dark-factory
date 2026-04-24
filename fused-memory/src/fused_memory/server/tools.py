@@ -50,6 +50,7 @@ Read operations:
 
 Task operations (when Taskmaster is connected):
 - get_tasks / get_task: Read task tree
+- get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers
 - set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
 - add_task / update_task / add_subtask / remove_task: Task CRUD
 - add_dependency / remove_dependency: Dependency management
@@ -1270,6 +1271,43 @@ def create_mcp_server(
             raise
         except Exception as e:
             logger.exception(f'get_tasks error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def get_statuses(
+        project_root: str,
+        ids: list[str] | None = None,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a compact ``{id: status}`` mapping — status-only, ~95% smaller than get_tasks.
+
+        Use this instead of get_tasks when callers only need task statuses (e.g.
+        reconcile loops, startup checks). Full task data is still available via
+        get_tasks or get_task.
+
+        Args:
+            project_root: Absolute path to project root
+            ids: Optional list of task ids to filter to (unknown ids silently omitted).
+                 Omit or pass null for all tasks.
+            tag: Tag context (optional)
+        """
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        try:
+            result = await task_interceptor.get_statuses(
+                project_root=project_root, ids=ids, tag=tag
+            )
+            await _log_read(
+                'get_statuses',
+                result_summary={'count': len(result)},
+            )
+            return {'statuses': result}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'get_statuses error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
