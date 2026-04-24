@@ -157,8 +157,11 @@ def test_load_guardrail_payloads_missing_source_raises():
 def test_load_guardrail_payloads_metadata_not_aliased_across_calls(guardrails_source: Path):
     """Two successive calls return independent metadata dict objects.
 
-    Mutating call-A's metadata must not alter call-B's (regression guard
-    mirroring autopilot-video test_get_guardrail_payloads_successive_calls_independent).
+    The loader deep-copies its output, so mutations to call-A's metadata
+    dicts must not alias into call-B's — regardless of whether the source
+    module's own get_guardrail_payloads copies metadata internally.  This
+    tests the loader's own non-aliasing guarantee (amendment 3), not the
+    upstream autopilot-video module's behavior.
     """
     from fused_memory.maintenance.seed_autopilot_video_triage_guardrails import (
         load_guardrail_payloads,
@@ -251,9 +254,16 @@ class TestSeedManager:
 
     @pytest.mark.asyncio
     async def test_seed_raises_on_empty_memory_ids(self, guardrails_source: Path):
-        """seed() raises RuntimeError naming the failing guardrail when memory_ids=[]."""
+        """seed() raises PartialSeedError naming the failing guardrail when memory_ids=[].
+
+        The raised PartialSeedError must carry a partial_report attribute so an
+        operator can tell which guardrails already succeeded (and therefore which
+        Graphiti episodes may need cleanup before a retry).
+        """
         from fused_memory.maintenance.seed_autopilot_video_triage_guardrails import (
+            PartialSeedError,
             SeedManager,
+            SeedReport,
         )
 
         mock_service = MagicMock()
@@ -276,6 +286,21 @@ class TestSeedManager:
         )
         assert "empty memory_ids" in error_msg, (
             f"Expected 'empty memory_ids' in error, got: {error_msg!r}"
+        )
+
+        # The exception must be a PartialSeedError with a partial_report so
+        # operators know which writes completed before the failure.
+        assert isinstance(exc_info.value, PartialSeedError), (
+            f"Expected PartialSeedError, got {type(exc_info.value).__name__}"
+        )
+        partial = exc_info.value.partial_report
+        assert isinstance(partial, SeedReport), (
+            f"Expected SeedReport, got {type(partial).__name__}"
+        )
+        # The first guardrail write failed — no successful writes in the partial report.
+        assert partial.memory_ids_by_name == {}, (
+            f"Expected empty memory_ids_by_name on failure of first write, "
+            f"got {partial.memory_ids_by_name!r}"
         )
 
     @pytest.mark.asyncio

@@ -14,8 +14,10 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib.util
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,8 +26,15 @@ from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_AUTOPILOT_VIDEO_GUARDRAILS_PATH = Path(
-    '/home/leo/src/autopilot-video/autopilot/guardrails.py'
+# Resolve the default source path from AUTOPILOT_VIDEO_ROOT if set, so the
+# CLI default is not anchored to a single developer's filesystem layout.
+# On any machine (CI, fresh clone, other devs) set:
+#   export AUTOPILOT_VIDEO_ROOT=/path/to/autopilot-video
+# When unset, the path falls back to the original author's workstation layout.
+_DEFAULT_AUTOPILOT_VIDEO_GUARDRAILS_PATH = (
+    Path(os.environ['AUTOPILOT_VIDEO_ROOT']) / 'autopilot' / 'guardrails.py'
+    if 'AUTOPILOT_VIDEO_ROOT' in os.environ
+    else Path('/home/leo/src/autopilot-video/autopilot/guardrails.py')
 )
 
 
@@ -56,7 +65,8 @@ def load_guardrail_payloads(
     if not path.exists():
         raise FileNotFoundError(
             f'autopilot_video guardrails source not found at {path!s}. '
-            f'Pass source_path= to override the default location.'
+            f'Set the AUTOPILOT_VIDEO_ROOT env var to point at your '
+            f'autopilot-video checkout, or pass source_path= to override.'
         )
     spec = importlib.util.spec_from_file_location(
         'autopilot_video_triage_guardrails_source', path
@@ -65,10 +75,12 @@ def load_guardrail_payloads(
         raise RuntimeError(f'Could not build ModuleSpec for {path!s}')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    # Delegate to the source module's canonical payload builder (preserves
-    # the shallow-copy metadata fix already unit-tested upstream in
-    # autopilot-video/tests/test_guardrails.py).
-    return list(module.get_guardrail_payloads(agent_id))
+    # Delegate to the source module's canonical payload builder, then
+    # deep-copy the result so the caller's payloads are fully independent
+    # of the source module's internal state.  This makes non-aliasing the
+    # loader's own guarantee rather than relying on whatever the source
+    # module's get_guardrail_payloads happens to do internally.
+    return copy.deepcopy(list(module.get_guardrail_payloads(agent_id)))
 
 
 @dataclass
@@ -78,6 +90,21 @@ class SeedReport:
     project_id: str
     memory_ids_by_name: dict[str, list[str]] = field(default_factory=dict)
     stores_written_by_name: dict[str, list[str]] = field(default_factory=dict)
+
+
+class PartialSeedError(RuntimeError):
+    """Raised when a guardrail seed write returns empty memory_ids.
+
+    The ``partial_report`` attribute records which guardrails were
+    successfully written before the failure occurred, so an operator
+    can identify which Graphiti episodes may need cleanup before
+    retrying the seed.  Check ``partial_report.memory_ids_by_name``
+    for completed writes.
+    """
+
+    def __init__(self, message: str, partial_report: SeedReport) -> None:
+        super().__init__(message)
+        self.partial_report = partial_report
 
 
 class SeedManager:
@@ -103,11 +130,14 @@ class SeedManager:
             name = payload['metadata']['name']
             response = await self.service.add_memory(**payload)
             if not response.memory_ids:
-                raise RuntimeError(
+                raise PartialSeedError(
                     f'Got empty memory_ids for guardrail {name!r}. '
                     f'This indicates the Task 360 Mem0 memory_ids=[] bug has '
                     f'recurred — do NOT retry blindly; investigate the '
-                    f'Mem0 synchronous write path before re-running.'
+                    f'Mem0 synchronous write path before re-running. '
+                    f'Completed writes before this failure: '
+                    f'{list(report.memory_ids_by_name.keys())!r}',
+                    partial_report=report,
                 )
             report.memory_ids_by_name[name] = list(response.memory_ids)
             report.stores_written_by_name[name] = [
