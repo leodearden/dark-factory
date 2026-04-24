@@ -150,3 +150,31 @@ def test_no_subproject_tests_init_py() -> None:
         + '\n'.join(f'  {p}' for p in present)
         + '\n\nDelete them with: git rm ' + ' '.join(present)
     )
+
+
+def test_root_pyproject_omits_norecursedirs() -> None:
+    """Root pyproject.toml must not set norecursedirs to exclude subprojects.
+
+    The norecursedirs workaround was needed to prevent pytest from collecting
+    fused-memory, orchestrator, and shared when those subprojects had
+    tests/__init__.py files that caused a `tests.conftest` namespace collision.
+    Now that the __init__.py files are removed, root pytest can collect all
+    subprojects without the workaround.
+
+    Asserts that `[tool.pytest.ini_options].norecursedirs` is either absent
+    or set to an empty list.  A non-empty list would re-introduce the asymmetry
+    where some subprojects are silently excluded from root-level pytest runs.
+    """
+    pyproject = REPO_ROOT / 'pyproject.toml'
+    data = tomllib.loads(pyproject.read_text(encoding='utf-8'))
+
+    ini_options = data.get('tool', {}).get('pytest', {}).get('ini_options', {})
+    norecursedirs = ini_options.get('norecursedirs', [])
+
+    assert not norecursedirs, (
+        f'[tool.pytest.ini_options].norecursedirs in pyproject.toml is set to '
+        f'{norecursedirs!r}.\n'
+        'This workaround was needed when subprojects had tests/__init__.py files '
+        'causing a tests.conftest namespace collision. Now that those files are '
+        'removed, delete the norecursedirs line and its associated comment.'
+    )
