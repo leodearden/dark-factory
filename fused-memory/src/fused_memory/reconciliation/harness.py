@@ -317,12 +317,16 @@ class ReconciliationHarness:
         try:
             tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
             raw_count = len(tasks_data.get('tasks', [])) if isinstance(tasks_data, dict) else 0
-            logger.debug(
-                '_fetch_filtered_task_tree fetched %d raw tasks for %r',
-                raw_count,
-                project_root,
+            filtered = filter_task_tree(tasks_data)
+            logger.info(
+                'reconciliation.task_tree_fetched',
+                extra={
+                    'project_root': project_root,
+                    'raw_count': raw_count,
+                    'total_count': filtered.total_count,
+                },
             )
-            return filter_task_tree(tasks_data)
+            return filtered
         except Exception as exc:
             logger.warning(
                 f'_fetch_filtered_task_tree failed for {project_root!r}: {exc}'

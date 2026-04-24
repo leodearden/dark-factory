@@ -1947,14 +1947,17 @@ class TestHarnessFetchFilteredTaskTree:
         mock_memory_service,
         caplog,
     ):
-        """_fetch_filtered_task_tree emits a DEBUG log with the raw task count after a successful fetch.
+        """_fetch_filtered_task_tree emits a log with the raw task count after a successful fetch.
 
-        The log message must contain 'raw tasks', the integer count of tasks
-        returned by taskmaster, and the project_root so operators can distinguish
+        The log record must contain the integer count of tasks returned by
+        taskmaster and the project_root so operators can distinguish
         'get_tasks returned 0 raw tasks' (upstream Taskmaster issue) from
         'get_tasks returned N tasks but filter partitioned all into other'
-        (task_filter regression).  DEBUG level keeps the happy-path heartbeat out
-        of the default INFO log stream at scale.
+        (task_filter regression).
+
+        Updated in task-958: the log was promoted from DEBUG to INFO under the
+        event marker 'reconciliation.task_tree_fetched' with raw_count and
+        project_root in the extra dict.
         """
         import logging
 
@@ -1975,13 +1978,17 @@ class TestHarnessFetchFilteredTaskTree:
         with caplog.at_level(logging.DEBUG):
             result = await harness._fetch_filtered_task_tree('/abs/path')
 
-        # (a) DEBUG log must contain 'raw tasks', the count 4, and the project_root
-        debug_msgs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
-        assert any(
-            'raw tasks' in msg and '4' in msg and '/abs/path' in msg
-            for msg in debug_msgs
-        ), (
-            f"Expected DEBUG log containing 'raw tasks', '4', '/abs/path'; got: {debug_msgs}"
+        # (a) A log record at >= DEBUG level must contain the count 4 and project_root.
+        #     The record is now at INFO level with raw_count=4 in the extra dict.
+        fetched_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.DEBUG
+            and getattr(r, 'raw_count', None) == 4
+            and getattr(r, 'project_root', None) == '/abs/path'
+        ]
+        assert fetched_records, (
+            f"Expected a log record with raw_count=4 and project_root='/abs/path';"
+            f" got records: {[r.__dict__ for r in caplog.records]}"
         )
 
         # (b) sanity: returned tree reflects the actual data
@@ -2190,7 +2197,7 @@ class TestHarnessFetchFilteredTaskTree:
         )
 
         # Existing DEBUG-test semantic also still holds:
-        # raw_count still appears in some log record at DEBUG-visible level
+        # raw_count and project_root still appear in a log record at DEBUG-visible level
         with caplog.at_level(logging.DEBUG):
             caplog.clear()
             harness.taskmaster.get_tasks.reset_mock()  # type: ignore[union-attr,attr-defined]
@@ -2204,10 +2211,12 @@ class TestHarnessFetchFilteredTaskTree:
             }
             await harness._fetch_filtered_task_tree('/abs/path')
 
+        # raw_count=4 and project_root='/abs/path' are in extra dict of the INFO record
         assert any(
-            '4' in r.getMessage() and '/abs/path' in r.getMessage()
+            getattr(r, 'raw_count', None) == 4
+            and getattr(r, 'project_root', None) == '/abs/path'
             for r in caplog.records
-        ), "Expected a log record containing '4' and '/abs/path' under DEBUG level"
+        ), "Expected a log record with raw_count=4 and project_root='/abs/path' at DEBUG-visible level"
 
 
 # ── Tests for task 455: harness wires filtered_task_tree into stages ──────────
