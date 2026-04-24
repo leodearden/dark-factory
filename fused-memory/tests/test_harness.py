@@ -3174,8 +3174,8 @@ async def test_backlog_iterator_peek_window_finds_later_project_root_override(
     """Regression guard: a ``_project_root`` override on a later buffered event must be
     found even when earlier events in the peek window lack the key (window >= N positions).
 
-    Uses a 9+1 setup so the override sits at exactly the current limit — any reduction
-    to the peek window will trip this test.
+    Uses a 9+1=10 buffered-event setup so the override is the last peeked item under
+    the current window; reducing the window below 10 will trip this test.
     """
     # peek_buffered orders by `timestamp ASC LIMIT ?` (FIFO). Push 9 events that
     # LACK _project_root with monotonically-increasing timestamps, then 1 event
