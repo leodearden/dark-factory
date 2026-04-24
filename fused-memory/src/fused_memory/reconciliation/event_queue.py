@@ -349,3 +349,78 @@ class EventQueue:
             logger.error(
                 'EventQueue: dead-letter rotation failed: %s', exc,
             )
+
+    # ── read dead-letters ──────────────────────────────────────────────
+
+    def read_dead_letters(
+        self,
+        *,
+        limit: int | None = None,
+        project_id: str | None = None,
+    ) -> list[dict]:
+        """Return dead-letter records from the JSONL file(s), newest-first.
+
+        Enumerates :attr:`_dead_letter_path`, then ``.1``, ``.2`` … up to
+        ``keep_rotations`` siblings.  Within each file lines are reversed so
+        the newest record appears first.  Records from the current file
+        precede those from rotated siblings.
+
+        Args:
+            limit: Maximum number of records to return.  *None* means all.
+            project_id: When given, only records whose
+                ``event['project_id']`` matches are included.
+
+        Returns:
+            A list of dicts with keys ``event``, ``reason``, ``attempts``,
+            ``failed_at``.  Never raises — I/O errors yield an empty list
+            plus a logged warning.
+        """
+        # Build the ordered list of paths: current first, then .1, .2, …
+        paths: list[Path] = [self._dead_letter_path]
+        for i in range(1, self._keep_rotations + 1):
+            paths.append(Path(f'{self._dead_letter_path}.{i}'))
+
+        results: list[dict] = []
+        try:
+            for path in paths:
+                if not path.exists():
+                    continue
+                try:
+                    lines = path.read_text(encoding='utf-8').splitlines()
+                except OSError as exc:
+                    logger.warning(
+                        'EventQueue.read_dead_letters: cannot read %s: %s', path, exc,
+                    )
+                    continue
+
+                # Reverse so newest (last-appended) lines come first.
+                for line in reversed(lines):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        logger.warning(
+                            'EventQueue.read_dead_letters: malformed line in %s: %s',
+                            path, exc,
+                        )
+                        continue
+
+                    # Filter by project_id if requested.
+                    if project_id is not None:
+                        event = rec.get('event') or {}
+                        if event.get('project_id') != project_id:
+                            continue
+
+                    results.append(rec)
+                    if limit is not None and len(results) >= limit:
+                        return results
+
+        except Exception as exc:
+            logger.warning(
+                'EventQueue.read_dead_letters: unexpected error: %s', exc,
+            )
+            return []
+
+        return results
