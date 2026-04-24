@@ -55,6 +55,18 @@ _PRIORITY_RANK: dict[str, int] = {
 }
 
 
+def _id_as_int(task: dict, fallback: int = 0) -> int:
+    """Return the task's numeric ID as int, or *fallback* for non-numeric IDs.
+
+    Handles dotted subtask IDs (e.g. ``'1.2'``), empty strings, and other
+    non-integer shapes safely — returns *fallback* rather than raising
+    ``ValueError``.  Uses ``str.isdecimal()`` to accept only pure ASCII
+    decimal strings.
+    """
+    raw = str(task.get('id', ''))
+    return int(raw) if raw.isdecimal() else fallback
+
+
 # ---------------------------------------------------------------------------
 # Pure-function core (no I/O — fully testable without a live Taskmaster)
 # ---------------------------------------------------------------------------
@@ -88,6 +100,12 @@ def find_near_duplicate_groups(
         List of groups (each a list of ≥ 2 tasks) formed by transitive closure
         of all pairs whose similarity ≥ threshold.  Groups are sorted by the
         minimum task ID within the group so output is deterministic.
+
+    Complexity:
+        O(n²) pairs × O(L) per ``SequenceMatcher.ratio()`` call (L = title
+        length).  Acceptable for typical Taskmaster task counts (≤ hundreds);
+        not suitable for thousands of tasks without a cheap pre-filter (e.g.
+        token-set Jaccard) to skip obviously dissimilar pairs.
     """
     _excluded = exclude_ids or set()
     candidates = [t for t in tasks if str(t.get('id', '')) not in _excluded]
@@ -125,9 +143,10 @@ def find_near_duplicate_groups(
 
     result = [g for g in groups.values() if len(g) >= 2]
     # Sort each group and the list of groups for determinism.
+    # Use _id_as_int to handle non-numeric IDs (e.g. subtask '1.2') safely.
     for g in result:
-        g.sort(key=lambda t: int(t.get('id', 0)))
-    result.sort(key=lambda g: int(g[0].get('id', 0)))
+        g.sort(key=lambda t: _id_as_int(t))
+    result.sort(key=lambda g: _id_as_int(g[0]))
     return result
 
 
@@ -145,7 +164,9 @@ def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
     def _rank(t: dict) -> tuple[int, int]:
         priority_score = _PRIORITY_RANK.get((t.get('priority') or '').lower(), 0)
         # Negate ID so that lower ID wins ties (max key → lowest ID).
-        return (priority_score, -int(t['id']))
+        # Use sys.maxsize fallback so non-numeric IDs (e.g. '1.2') rank last
+        # in tie-breaking rather than raising ValueError.
+        return (priority_score, -_id_as_int(t, fallback=sys.maxsize))
 
     survivor = max(group, key=_rank)
     losers = [t for t in group if t is not survivor]
@@ -229,10 +250,12 @@ def build_audit_plan(
           auto_cancel, needs_human_review, dependency_updates.
     """
     # 1. Filter to active tasks within ID range.
+    # _id_as_int handles non-numeric / dotted subtask IDs by returning 0,
+    # which is always < min_id (≥ 1000 by default), so they are safely skipped.
     active = [
         t for t in tasks
         if t.get('status') in {'pending', 'in-progress'}
-        and int(t.get('id', 0)) >= min_id
+        and _id_as_int(t) >= min_id
     ]
 
     # 2. Exact-duplicate groups.
@@ -245,12 +268,17 @@ def build_audit_plan(
     near_groups = find_near_duplicate_groups(active, threshold=threshold, exclude_ids=exact_ids)
 
     # 4. For each exact group: pick survivor, split losers by status.
+    #    Cache (survivor, losers) per group so step 5 can reuse without a
+    #    second pick_survivor call.
     auto_cancel: list[str] = []           # pending losers → safe to cancel
     needs_human_review: list[dict] = []   # in-progress losers → human needed
     exact_groups_report: list[dict] = []
+    group_decisions: list[tuple[dict, list[dict]]] = []  # cached per-group results
 
     for group in exact_groups:
         survivor, losers = pick_survivor(group)
+        group_decisions.append((survivor, losers))
+
         pending_losers = [t for t in losers if t.get('status') == 'pending']
         inprogress_losers = [t for t in losers if t.get('status') == 'in-progress']
 
@@ -267,10 +295,10 @@ def build_audit_plan(
         })
 
     # 5. Dependency updates only for auto-cancelled IDs.
+    #    Reuse the cached (survivor, losers) tuples — pick_survivor not called again.
     auto_cancel_set = set(auto_cancel)
     dep_updates = []
-    for group in exact_groups:
-        survivor, losers = pick_survivor(group)
+    for survivor, losers in group_decisions:
         cancelled_in_group = {str(t['id']) for t in losers if str(t['id']) in auto_cancel_set}
         if cancelled_in_group:
             updates = compute_dependency_updates(
@@ -317,35 +345,61 @@ async def apply_changes(
     project_root: str,
     plan: dict[str, Any],
     tag: str | None = None,
-) -> None:
+) -> dict[str, int]:
     """Apply the audit plan: cancel losers then remap dependencies.
 
     Cancellations are performed first; dependency updates follow.  Each
     operation is wrapped in try/except so partial progress is preserved even
     when individual calls fail.
+
+    Returns:
+        Dict with operation counts: ``cancelled``, ``cancel_errors``,
+        ``dep_updates_applied``, ``dep_update_errors``.  The caller should
+        check these to determine whether to exit non-zero.
     """
+    cancelled = 0
+    cancel_errors = 0
+    dep_updates_applied = 0
+    dep_update_errors = 0
+
     for task_id in plan.get('cancellations', []):
         try:
             await backend.set_task_status(task_id, 'cancelled', project_root, tag)
             logger.info('Cancelled task %s', task_id)
+            cancelled += 1
         except Exception as exc:
             logger.error('Failed to cancel task %s: %s', task_id, exc)
+            cancel_errors += 1
 
     for upd in plan.get('dependency_updates', []):
         dep_id = upd['dependent_id']
         remove_dep = upd['remove_dep']
         add_dep = upd.get('add_dep')
+        op_ok = True
         try:
             await backend.remove_dependency(dep_id, remove_dep, project_root, tag)
             logger.info('Removed dep %s→%s', dep_id, remove_dep)
         except Exception as exc:
             logger.error('Failed to remove dep %s→%s: %s', dep_id, remove_dep, exc)
+            op_ok = False
+            dep_update_errors += 1
         if add_dep is not None:
             try:
                 await backend.add_dependency(dep_id, add_dep, project_root, tag)
                 logger.info('Added dep %s→%s', dep_id, add_dep)
             except Exception as exc:
                 logger.error('Failed to add dep %s→%s: %s', dep_id, add_dep, exc)
+                op_ok = False
+                dep_update_errors += 1
+        if op_ok:
+            dep_updates_applied += 1
+
+    return {
+        'cancelled': cancelled,
+        'cancel_errors': cancel_errors,
+        'dep_updates_applied': dep_updates_applied,
+        'dep_update_errors': dep_update_errors,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +444,20 @@ async def _run(args: argparse.Namespace) -> int:
 
         logger.info('Fetched %d task(s) from Taskmaster', len(tasks))
 
+        # Warn when the response had content but no tasks could be extracted —
+        # silently producing an empty plan would look like "no duplicates found"
+        # when the real issue is an unexpected Taskmaster response shape.
+        if not tasks and raw:
+            shape_hint: Any = (
+                list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__
+            )
+            logger.warning(
+                'get_tasks returned a non-empty response but 0 tasks were '
+                'extracted — possible response-shape mismatch.  '
+                'Top-level keys/type: %s',
+                shape_hint,
+            )
+
         plan = build_audit_plan(tasks, threshold=args.threshold, min_id=args.min_id)
         print(json.dumps(plan, indent=2, default=str))
 
@@ -402,13 +470,17 @@ async def _run(args: argparse.Namespace) -> int:
             'cancellations': plan['auto_cancel'],
             'dependency_updates': plan['dependency_updates'],
         }
-        await apply_changes(backend, args.project_root, apply_plan, args.tag)
+        result = await apply_changes(backend, args.project_root, apply_plan, args.tag)
+        total_errors = result['cancel_errors'] + result['dep_update_errors']
         logger.info(
-            'Applied: cancelled %d task(s), %d dependency update(s)',
+            'Applied: cancelled %d/%d task(s), %d/%d dep update(s); %d error(s)',
+            result['cancelled'],
             len(plan['auto_cancel']),
+            result['dep_updates_applied'],
             len(plan['dependency_updates']),
+            total_errors,
         )
-        return 0
+        return 1 if total_errors > 0 else 0
     finally:
         await backend.close()
 
