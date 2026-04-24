@@ -36,18 +36,24 @@ async def _check_plan_targets_in_tree(
     task_worktree: Path,
     git_ops: GitOps,
 ) -> list[str]:
-    """Return plan.json `files` entries missing from the merge commit tree.
+    """Return plan.json `files` entries dropped by the merge.
+
+    A "drop" means the file was on the task branch tip but is absent from
+    the merge commit — i.e. conflict resolution discarded work the task
+    actually produced. Paths that are absent from *both* task HEAD and the
+    merge commit are not drops: the task branch itself intentionally
+    doesn't carry them (e.g. a plan step that adds a scaffold and a later
+    step that deletes it per review). Flagging those would trip on plans
+    whose terminal state legitimately removes a listed file.
 
     Reads the plan from the task worktree (plan.json lives in gitignored
     .task/, so it's only in the source worktree — not the merge worktree).
-    For each file in ``plan['files']``, checks whether the path exists at
-    the given commit.  Missing files mean conflict resolution dropped
-    planned content.
 
     Returns an empty list when:
     - no plan.json exists (architect never ran — nothing to check)
     - plan['files'] is empty or missing
-    - all planned files are present in the merge commit
+    - every planned file that exists at task HEAD also exists at the merge
+      commit
     """
     artifacts = TaskArtifacts(task_worktree)
     plan = artifacts.read_plan()
@@ -55,13 +61,28 @@ async def _check_plan_targets_in_tree(
     if not files:
         return []
 
+    rc_head, task_head_out, _ = await _run(
+        ['git', 'rev-parse', 'HEAD'],
+        cwd=task_worktree,
+    )
+    task_head = task_head_out.strip() if rc_head == 0 else ''
+
     missing: list[str] = []
     for f in files:
-        rc, _, _ = await _run(
+        rc_merge, _, _ = await _run(
             ['git', 'cat-file', '-e', f'{merge_commit_sha}:{f}'],
             cwd=git_ops.project_root,
         )
-        if rc != 0:
+        if rc_merge == 0:
+            continue
+        if not task_head:
+            missing.append(f)
+            continue
+        rc_head_f, _, _ = await _run(
+            ['git', 'cat-file', '-e', f'{task_head}:{f}'],
+            cwd=git_ops.project_root,
+        )
+        if rc_head_f == 0:
             missing.append(f)
     return missing
 
