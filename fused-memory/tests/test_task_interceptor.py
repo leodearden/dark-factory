@@ -3759,3 +3759,61 @@ async def test_no_intra_batch_duplicates_preserves_existing_behaviour(
 
     # curator.curate called for both tasks (2 unique survivors)
     assert curator_interceptor._curator.curate.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_dedupe_bulk_remove_failure_keeps_task_in_both_errors_and_kept(
+    curator_interceptor, taskmaster,
+):
+    """Remove-failure fall-through invariant: when intra-batch duplicate removal
+    raises transiently the failing task must appear in BOTH errors AND kept.
+
+    Pins the defensive contract at task_interceptor.py:1075-1077:
+    "Removal failed transiently — fall through to curator so this task still
+    appears in `kept` rather than silently disappearing from both `removed`
+    and `kept`."
+
+    The dual-membership invariant (task lives in BOTH errors and kept) is
+    intentional: asserting only the errors entry would allow a future refactor
+    that drops the task from unique_new_tasks (e.g. a bare `continue` in the
+    except block) to regress silently.
+    """
+    post_snapshot = {'tasks': [
+        {'id': '10', 'title': 'Fix foo', 'description': 'bar'},
+        {'id': '11', 'title': 'FIX FOO', 'description': ' bar '},
+    ]}
+
+    taskmaster.get_tasks = AsyncMock(return_value=post_snapshot)
+    taskmaster.remove_task = AsyncMock(
+        side_effect=RuntimeError('transient backend failure')
+    )
+    curator_interceptor._curator = _mock_curator(
+        CuratorDecision(action='create', justification='novel')
+    )
+
+    result = await curator_interceptor._dedupe_bulk_created(
+        '/project', pre_snapshot={'tasks': []},
+    )
+
+    # (a) Exactly one error entry, for task '11', mentioning the backend failure.
+    assert len(result['errors']) == 1
+    assert result['errors'][0]['task_id'] == '11'
+    assert 'transient backend failure' in result['errors'][0]['error']
+
+    # (b) Task '11' appears in kept (the fall-through re-added it to
+    # unique_new_tasks which then passed through pass-2 as a 'create').
+    assert any(k['task_id'] == '11' for k in result['kept']), (
+        f"expected '11' in kept, got: {result['kept']}"
+    )
+
+    # (c) Task '11' must NOT appear in removed (the removal attempt failed).
+    assert all(r['task_id'] != '11' for r in result['removed']), (
+        f"unexpected '11' in removed: {result['removed']}"
+    )
+
+    # (d) remove_task was called exactly once, for task '11'.
+    taskmaster.remove_task.assert_awaited_once_with('11', '/project')
+
+    # (e) Both '10' and '11' reach pass-2 (curate called twice: '11' was
+    # re-appended to unique_new_tasks after the except block).
+    assert curator_interceptor._curator.curate.await_count == 2
