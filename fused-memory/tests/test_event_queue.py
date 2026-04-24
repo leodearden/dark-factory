@@ -425,3 +425,170 @@ async def test_dead_letter_rotation_drops_beyond_keep(tmp_path):
 
     finally:
         await q.close()
+
+
+# ── read_dead_letters ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_read_dead_letters_basic_keys(tmp_path):
+    """read_dead_letters returns parsed records with required keys."""
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dl.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+
+        records = q.read_dead_letters()
+        assert len(records) == 1
+        rec = records[0]
+        assert 'event' in rec
+        assert 'reason' in rec
+        assert 'attempts' in rec
+        assert 'failed_at' in rec
+        assert rec['reason'] == 'non_retriable'
+        assert rec['attempts'] == 1
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_read_dead_letters_limit(tmp_path):
+    """read_dead_letters(limit=N) returns at most N records, newest-first."""
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dl.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        for _ in range(5):
+            q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+
+        limited = q.read_dead_letters(limit=2)
+        assert len(limited) == 2
+        # Newest-first: the last 2 written records should be returned first.
+        all_records = q.read_dead_letters()
+        assert len(all_records) == 5
+        assert limited == all_records[:2]
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_read_dead_letters_project_id_filter(tmp_path):
+    """read_dead_letters(project_id=X) returns only records matching that project."""
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dl.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        for _ in range(3):
+            q.enqueue(_make_event(project_id='proj-a'))
+        for _ in range(2):
+            q.enqueue(_make_event(project_id='proj-b'))
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+
+        proj_a_records = q.read_dead_letters(project_id='proj-a')
+        assert len(proj_a_records) == 3
+        assert all(r['event']['project_id'] == 'proj-a' for r in proj_a_records)
+
+        proj_b_records = q.read_dead_letters(project_id='proj-b')
+        assert len(proj_b_records) == 2
+        assert all(r['event']['project_id'] == 'proj-b' for r in proj_b_records)
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_read_dead_letters_after_rotation(tmp_path):
+    """After rotation, read_dead_letters merges current + rotated files newest-first."""
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dl.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+        max_bytes=500,
+        keep_rotations=2,
+    )
+    await q.start()
+    try:
+        # 3 events: events 1+2 fill the pre-rotation file, event 3 goes to fresh file.
+        for _ in range(3):
+            q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+
+        # Rotation should have happened; .jsonl has event3, .jsonl.1 has events1+2.
+        assert (tmp_path / 'dl.jsonl.1').exists(), 'Rotation must have occurred'
+
+        all_records = q.read_dead_letters()
+        assert len(all_records) == 3, (
+            f'Must return records from current + rotated file; got {len(all_records)}'
+        )
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_read_dead_letters_tolerates_malformed_line(tmp_path):
+    """A malformed JSON line is skipped; no exception is raised."""
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('non-retriable'))
+    dl = tmp_path / 'dl.jsonl'
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        q.enqueue(_make_event())
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+    finally:
+        await q.close()
+
+    # Inject a malformed line into the JSONL file.
+    with dl.open('a', encoding='utf-8') as fh:
+        fh.write('THIS IS NOT JSON\n')
+
+    # Must not raise, must return the 1 valid record (malformed line skipped).
+    records = q.read_dead_letters()
+    assert len(records) == 1
