@@ -654,3 +654,64 @@ def test_verdict_to_error_dict_escalated():
     assert d['error_type'] == 'BulkResetGuardTripped'
     assert d['escalation_path'] == '/tmp/esc-bulk-reset-xyz.json'
     assert d['project_id'] == 'proj'
+
+
+# ---------------------------------------------------------------------------
+# task-979 step-1: async I/O offloading
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_escalation_write_offloads_io_to_thread(tmp_path, monkeypatch):
+    """mkdir and write_text in _maybe_write_escalation must be offloaded to a
+    thread via asyncio.to_thread so they do not block the event loop.
+
+    Monkeypatches asyncio.to_thread with a tracking wrapper that records the
+    callable name and then delegates to the real asyncio.to_thread.  The guard
+    is tripped (4 reversals, threshold=3) and the test asserts that the wrapper
+    saw at least one call for 'mkdir' and one for 'write_text'.
+
+    This test fails today because _maybe_write_escalation calls both
+    synchronously on the event loop.
+    """
+    import asyncio as _asyncio
+
+    tracked_callables: list[str] = []
+    real_to_thread = _asyncio.to_thread
+
+    async def tracking_to_thread(func, *args, **kwargs):
+        tracked_callables.append(getattr(func, '__name__', repr(func)))
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(_asyncio, 'to_thread', tracking_to_thread)
+
+    clock = [1000.0]
+
+    def fake_clock() -> float:
+        return clock[0]
+
+    guard = BulkResetGuard(
+        threshold=3,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=fake_clock,
+        escalations_fallback_dir=tmp_path,
+    )
+
+    for i in range(4):
+        clock[0] += 1.0
+        await guard.observe_attempt(
+            project_id='proj-thread',
+            task_id=f't{i}',
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path),
+        )
+
+    assert 'mkdir' in tracked_callables, (
+        f'Expected asyncio.to_thread called with mkdir; '
+        f'recorded callables: {tracked_callables}'
+    )
+    assert 'write_text' in tracked_callables, (
+        f'Expected asyncio.to_thread called with write_text; '
+        f'recorded callables: {tracked_callables}'
+    )
