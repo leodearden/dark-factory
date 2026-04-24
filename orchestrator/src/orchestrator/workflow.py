@@ -2372,6 +2372,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         stdout, _ = await proc.communicate()
         return stdout.decode().strip()
 
+    async def _check_branch_on_main(self) -> tuple[str, str] | None:
+        """Probe whether the worktree HEAD is reachable from main. (placeholder)"""
+        wt_head = await self._get_head_commit()
+        main_sha = await self.git_ops.get_main_sha()
+        return (wt_head, main_sha)
+
     def _has_prior_implementation(self, wt_head: str | None = None) -> _PriorImplStatus:
         """Check whether a prior run did any implementation in this worktree.
 
