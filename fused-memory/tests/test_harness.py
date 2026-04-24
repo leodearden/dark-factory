@@ -2283,6 +2283,84 @@ class TestHarnessFetchFilteredTaskTree:
             f"Expected wrapper_unwrapped=True in log extra; got: {rec.__dict__}"
         )
 
+    @pytest.mark.asyncio
+    async def test_fetch_filtered_task_tree_distinguishes_fetch_zero_from_filter_zero_in_logs(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """INFO log unambiguously distinguishes zero-from-upstream vs zero-from-filter.
+
+        Two sub-scenarios:
+        (a) Taskmaster returns genuinely empty tasks list:
+            → raw_count=0, total_count=0 in log.
+        (b) Taskmaster returns tasks but filter_task_tree partitions all into
+            other_count (unknown status):
+            → raw_count=1, total_count=1, result.other_count=1, active/done/cancelled empty.
+
+        This is the exact signal Step 4 of the task description calls for:
+        operators can read a single log line and know whether the zero came
+        from upstream Taskmaster or from filter_task_tree's partitioning.
+        """
+        import logging
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        # ── Sub-scenario (a): Taskmaster returned genuinely empty ──────────
+        harness.taskmaster.get_tasks.return_value = {'tasks': []}  # type: ignore[union-attr,attr-defined]
+
+        with caplog.at_level(logging.INFO):
+            result_a = await harness._fetch_filtered_task_tree('/abs/path')
+
+        info_records_a = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO
+            and 'reconciliation.task_tree_fetched' in r.getMessage()
+        ]
+        assert info_records_a, "Expected reconciliation.task_tree_fetched for empty-tasks scenario"
+        rec_a = info_records_a[0]
+        assert getattr(rec_a, 'raw_count', None) == 0, (
+            f"Scenario (a): expected raw_count=0; got {rec_a.__dict__}"
+        )
+        assert getattr(rec_a, 'total_count', None) == 0, (
+            f"Scenario (a): expected total_count=0; got {rec_a.__dict__}"
+        )
+        assert result_a.total_count == 0
+        assert result_a.active_tasks == []
+
+        # ── Sub-scenario (b): tasks returned but all unknown status ────────
+        caplog.clear()
+        harness.taskmaster.get_tasks.reset_mock()  # type: ignore[union-attr,attr-defined]
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+            'tasks': [
+                {'id': 1, 'title': 'T1', 'status': 'some-unknown-status', 'dependencies': []}
+            ]
+        }
+
+        with caplog.at_level(logging.INFO):
+            result_b = await harness._fetch_filtered_task_tree('/abs/path')
+
+        info_records_b = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO
+            and 'reconciliation.task_tree_fetched' in r.getMessage()
+        ]
+        assert info_records_b, "Expected reconciliation.task_tree_fetched for unknown-status scenario"
+        rec_b = info_records_b[0]
+        assert getattr(rec_b, 'raw_count', None) == 1, (
+            f"Scenario (b): expected raw_count=1; got {rec_b.__dict__}"
+        )
+        assert getattr(rec_b, 'total_count', None) == 1, (
+            f"Scenario (b): expected total_count=1; got {rec_b.__dict__}"
+        )
+        assert result_b.total_count == 1
+        assert result_b.other_count == 1
+        assert result_b.active_tasks == []
+        assert result_b.done_count == 0
+        assert result_b.cancelled_count == 0
+
 
 # ── Tests for task 455: harness wires filtered_task_tree into stages ──────────
 
