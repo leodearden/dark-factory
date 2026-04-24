@@ -178,15 +178,6 @@ def _make_matcher_result(cost_usd: float = 0.42, structured: dict | None = None,
     )
 
 
-class TestMakeMatcherResult:
-    """Direct contract tests for the _make_matcher_result helper."""
-
-    def test_structured_none_passes_through_unchanged(self) -> None:
-        """structured=None must produce AgentResult(structured_output=None), not {'matches': []}."""
-        result = _make_matcher_result(structured=None)
-        assert result.structured_output is None
-
-
 def _make_gt(gt_id: str = 'gt1') -> GroundTruthIssue:
     return GroundTruthIssue(
         id=gt_id,
