@@ -36,7 +36,8 @@ def _load_escalations(escalations_dir: Path) -> list[dict]:
     for path in iter_all_escalation_paths(escalations_dir):
         try:
             results.append(json.loads(path.read_text()))
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning('Failed to load escalation %s: %s', path, exc)
             continue
     return results
 
