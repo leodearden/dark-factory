@@ -711,6 +711,54 @@ class TestGetByTaskDedupAcrossArchive:
         )
 
 
+    def test_get_by_task_does_not_warn_without_cross_tier_duplicate(
+        self, tmp_path: Path, caplog,
+    ):
+        """Pre-scan must stay silent when no id spans both queue_dir root and archive.
+
+        Setup: queue_dir root has one pending `esc-42-1`; archive has an unrelated
+        resolved `esc-99-1` (different id, different task). No id appears in both
+        tiers, so the pre-scan must emit zero WARNINGs.
+
+        This closes the "silently-passes-if-pre-scan-warns-unconditionally" gap:
+        a future regression that makes the pre-scan warn on any id with len>=1,
+        or that re-introduces the len>=2 check without tier discrimination, would
+        be caught here because esc-42-1 appears in only one tier and esc-99-1
+        appears in only one (different) tier — neither is cross-tier.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # One pending copy of esc-42-1 in queue_dir root only
+        pending_copy = _make_escalation('esc-42-1', task_id='42', status='pending')
+        (queue.queue_dir / 'esc-42-1.json').write_text(pending_copy.to_json())
+
+        # Unrelated resolved esc-99-1 in archive only
+        archive_dir = queue.queue_dir / 'archive' / '2025-06-15'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        unrelated = _make_escalation('esc-99-1', task_id='99', status='resolved')
+        (archive_dir / 'esc-99-1.json').write_text(unrelated.to_json())
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            results = queue.get_by_task('42')
+
+        # (a) Exactly one result — the pending esc-42-1 (archive is scanned because
+        #     no status filter, but esc-99-1 belongs to task '99', not '42')
+        ids = [e.id for e in results]
+        assert ids == ['esc-42-1'], (
+            f'Expected exactly [esc-42-1], got {ids}'
+        )
+
+        # (b) No WARNING emitted — no id spans both tiers
+        warning_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert warning_records == [], (
+            'Expected NO WARNINGs when no id is cross-tier, '
+            f'but got: {[r.message for r in warning_records]}'
+        )
+
+
 class TestGetPendingParseFailure:
     """get_pending() must emit a WARNING when a queue file cannot be parsed."""
 
