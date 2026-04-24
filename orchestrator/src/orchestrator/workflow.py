@@ -2373,7 +2373,30 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         return stdout.decode().strip()
 
     async def _check_branch_on_main(self) -> tuple[str, str] | None:
-        """Probe whether the worktree HEAD is reachable from main. (placeholder)"""
+        """Probe whether the worktree HEAD is reachable from main.
+
+        Returns ``(wt_head, main_sha)`` when ``git merge-base --is-ancestor
+        wt_head main_sha`` succeeds (i.e. the branch has been merged to main
+        or the HEAD is exactly main).  Returns ``None`` in three cases:
+
+        1. ``self.worktree`` or ``self.git_ops`` is None — partially-wired
+           workflow; callers that reach this state should treat the branch as
+           not-on-main.
+        2. HEAD is not an ancestor of main — branch has unmerged commits.
+        3. Any of the above when combined with the caller's own guard logic.
+
+        Does NOT catch subprocess or git exceptions — callers wrap as needed.
+        ``_recover_if_already_merged`` wraps the call in ``try/except`` and
+        logs ``'merge-check failed'`` before returning None; the pre-EXECUTE
+        ghost-loop guard in ``workflow.run()`` lets exceptions propagate.  The
+        divergent downstream logic at each call site is intentional — do not
+        collapse them.
+
+        See also: ``_recover_if_already_merged`` (pre-PLAN guard) and the
+        ghost-loop guard around ``workflow.py:431`` (pre-EXECUTE guard).
+        """
+        if self.worktree is None or self.git_ops is None:
+            return None
         wt_head = await self._get_head_commit()
         main_sha = await self.git_ops.get_main_sha()
         if await self.git_ops.is_ancestor(wt_head, main_sha):
