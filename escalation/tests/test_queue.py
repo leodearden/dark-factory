@@ -221,6 +221,61 @@ class TestGetArchiveFallback:
         assert result.resolution == 'Archive fallback works'
 
 
+class TestGetWithDuplicateArchiveCandidates:
+    """get() must warn and pick the newest when multiple archive files share one id."""
+
+    def test_get_with_duplicate_archive_files_logs_warning_and_returns_newest(
+        self, tmp_path: Path, caplog,
+    ):
+        """When two archive files exist for the same id, get() warns and returns the newest.
+
+        Failure mode in current main: candidates[0] is returned without a warning,
+        and the order is filesystem-dependent (not deterministic).
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Manually create two archive files for the same id under different dated subdirs.
+        # Neither file exists in queue_dir root (simulating a duplicate-archive state).
+        older_dir = queue.queue_dir / 'archive' / '2025-01-01'
+        newer_dir = queue.queue_dir / 'archive' / '2025-06-15'
+        older_dir.mkdir(parents=True, exist_ok=True)
+        newer_dir.mkdir(parents=True, exist_ok=True)
+
+        older_esc = _make_escalation('esc-1-1', status='resolved')
+        older_esc.resolution = 'older'
+        (older_dir / 'esc-1-1.json').write_text(older_esc.to_json())
+
+        newer_esc = _make_escalation('esc-1-1', status='resolved')
+        newer_esc.resolution = 'newer'
+        (newer_dir / 'esc-1-1.json').write_text(newer_esc.to_json())
+
+        # Confirm setup: no root file, two archive files
+        assert not (queue.queue_dir / 'esc-1-1.json').exists()
+        archive_files = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archive_files) == 2
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            result = queue.get('esc-1-1')
+
+        # (a) Must return the newest (2025-06-15), not arbitrary candidates[0]
+        assert result is not None
+        assert result.resolution == 'newer', (
+            f"Expected resolution='newer' (from 2025-06-15 dir), got {result.resolution!r}"
+        )
+
+        # (b) A warning must mention the escalation id and both candidate paths
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('esc-1-1' in msg for msg in warning_messages), (
+            f'Expected a WARNING mentioning esc-1-1; got: {warning_messages}'
+        )
+        assert any('2025-01-01' in msg for msg in warning_messages), (
+            f'Expected a WARNING mentioning 2025-01-01; got: {warning_messages}'
+        )
+        assert any('2025-06-15' in msg for msg in warning_messages), (
+            f'Expected a WARNING mentioning 2025-06-15; got: {warning_messages}'
+        )
+
+
 class TestGetByTaskAcrossArchive:
     """get_by_task() two-tier scan: hot path skips archive; broad path includes it."""
 
