@@ -2301,3 +2301,47 @@ class TestGetStatuses:
 
         assert isinstance(result, dict)
         no_http.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_caches_transport_error_and_clears_on_success(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """_last_get_statuses_error: None before first call, set on failure, cleared on success.
+
+        (a) Before any call: _last_get_statuses_error is None.
+        (b) After a failing call (OSError): returns {} AND caches the OSError.
+        (c) After a subsequent successful call: returns the dict AND resets to None.
+        """
+        import json
+
+        # (a) Initial state.
+        assert scheduler._last_get_statuses_error is None
+
+        # (b) Transport failure: OSError cached.
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(side_effect=OSError(2, 'No such file')),
+        )
+        result_fail = await scheduler.get_statuses()
+        assert result_fail == {}
+        assert isinstance(scheduler._last_get_statuses_error, OSError)
+        assert scheduler._last_get_statuses_error.errno == 2
+
+        # (c) Subsequent success: error attribute reset to None.
+        success_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': json.dumps({'statuses': {'1': 'pending'}}),
+                    }
+                ]
+            }
+        }
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=success_response),
+        )
+        result_ok = await scheduler.get_statuses()
+        assert result_ok == {'1': 'pending'}
+        assert scheduler._last_get_statuses_error is None
