@@ -166,8 +166,8 @@ submit_result = submit_task(
 )
 ticket = submit_result["ticket"]
 
-# Phase 2: block until the curator decides (default 115 s)
-resolve = resolve_ticket(ticket=ticket, project_root="<PROJECT_ROOT>")
+# Phase 2: block until the curator decides (60 s is intentionally conservative; server default is 115 s)
+resolve = resolve_ticket(ticket=ticket, project_root="<PROJECT_ROOT>", timeout_seconds=60)
 
 if resolve["status"] == "created":
     task_id = resolve["task_id"]           # new task queued successfully
