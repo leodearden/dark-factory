@@ -2481,18 +2481,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return None
 
         # ── Git layer ─────────────────────────────────────
-        # Subprocess calls that can fail for git/infra reasons
-        # (e.g. corrupted index, network mount offline).
+        # Delegates to _check_branch_on_main() which can fail for git/infra
+        # reasons (e.g. corrupted index, network mount offline).
         # Returns (wt_head, main_sha) when the branch is on main, else None.
-        _git_check: tuple[str, str] | None = None
         try:
-            _, _wt_head_raw, _ = await _run(
-                ['git', 'rev-parse', 'HEAD'],
-                cwd=self.worktree,
-            )
-            _main_sha = await self.git_ops.get_main_sha()
-            if await self.git_ops.is_ancestor(_wt_head_raw.strip(), _main_sha):
-                _git_check = (_wt_head_raw.strip(), _main_sha)
+            _git_check = await self._check_branch_on_main()
         except Exception:
             logger.warning(
                 'Task %s: merge-check failed, proceeding with requeue',
