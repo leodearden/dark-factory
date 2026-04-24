@@ -501,6 +501,37 @@ class TaskCurator:
     # memory after a task is removed.
 
     @staticmethod
+    def _intra_batch_key(title: str, description: str) -> str:
+        """Stable 16-char hash over normalised (title, description).
+
+        Used in the intra-batch duplicate-detection pre-pass inside
+        ``_dedupe_bulk_created`` to identify near-identical subtasks that
+        a bulk-creation LLM call (expand_task / parse_prd) emits within
+        the same batch.
+
+        Normalisation: lowercase, strip leading/trailing whitespace, and
+        collapse internal whitespace on both *title* and *description*.
+        This makes the key case- and whitespace-insensitive — matching the
+        ``_normalize_title`` convention used elsewhere in task_interceptor.
+
+        Does NOT include files_to_modify because Taskmaster-generated
+        subtasks frequently omit that field, so including it would produce
+        false negatives for otherwise-identical tasks.
+        """
+        # NOTE: intentional duplication of task_interceptor._normalize_title
+        # (task_interceptor.py ~line 2945: `' '.join(title.strip().lower().split())`).
+        # Kept here to avoid a cross-module import from task_curator →
+        # task_interceptor.  If either normalisation changes, keep both in sync.
+        def _norm(s: str | None) -> str:
+            return ' '.join((s or '').strip().lower().split())
+
+        h = hashlib.sha256()
+        h.update(_norm(title).encode())
+        h.update(b'|')
+        h.update(_norm(description).encode())
+        return h.hexdigest()[:16]
+
+    @staticmethod
     def _normalize_key(candidate: CandidateTask) -> str:
         """Stable 16-char hash over normalised (title, files_to_modify).
 

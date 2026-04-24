@@ -3521,3 +3521,241 @@ async def test_set_task_status_csv_in_progress_to_pending_trips_guard(
     # tm.set_task_status NOT called for task 4
     called_ids = {call.args[0] for call in taskmaster.set_task_status.call_args_list}
     assert '4' not in called_ids, 'set_task_status should not have been called for task 4'
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Intra-batch deduplication (task-1004)
+# Step-3: integration tests — written before step-4 adds the pre-pass.
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_expand_task_removes_intra_batch_duplicates(
+    curator_interceptor, taskmaster,
+):
+    """expand_task should remove intra-batch duplicates before passing unique
+    survivors to the curator.
+
+    Three new subtasks are created: '1.2' is a case+whitespace variant of
+    '1.1' → intra-batch duplicate and must be removed.  '1.3' is unrelated.
+    Expectations:
+      - removed has 1 entry: task_id='1.2', reason='intra_batch_duplicate',
+        matched_task_id='1.1'
+      - kept has 2 entries: '1.1' and '1.3'
+      - taskmaster.remove_task called exactly once (for '1.2')
+      - curator.curate called exactly twice (for '1.1' and '1.3' only)
+    """
+    # Parent task '1' exists before expand; subtasks are newly created.
+    parent_task = {'id': '1', 'title': 'Parent', 'status': 'pending'}
+    pre_snapshot = {'tasks': [parent_task]}
+    post_snapshot = {'tasks': [
+        {**parent_task, 'subtasks': [
+            {'id': '1.1', 'title': 'Fix foo', 'description': 'bar'},
+            {'id': '1.2', 'title': 'FIX FOO', 'description': ' bar '},
+            {'id': '1.3', 'title': 'Unrelated', 'description': 'baz'},
+        ]},
+    ]}
+
+    taskmaster.get_tasks = AsyncMock(side_effect=[pre_snapshot, post_snapshot])
+    taskmaster.remove_task = AsyncMock(return_value={'success': True})
+
+    curator_interceptor._curator = _mock_curator(
+        CuratorDecision(action='create', justification='new')
+    )
+
+    result = await curator_interceptor.expand_task('1', '/project')
+
+    dedup = result['dedup']
+
+    # (a) removed has exactly 1 entry for '1.2'
+    assert len(dedup['removed']) == 1, f"removed={dedup['removed']}"
+    removed_entry = dedup['removed'][0]
+    assert removed_entry['task_id'] == '1.2', removed_entry
+    assert removed_entry['reason'] == 'intra_batch_duplicate', removed_entry
+    assert removed_entry['matched_task_id'] == '1.1', removed_entry
+
+    # (b) kept has exactly 2 entries: '1.1' and '1.3'
+    kept_ids = {k['task_id'] for k in dedup['kept']}
+    assert kept_ids == {'1.1', '1.3'}, f"kept_ids={kept_ids}"
+
+    # (c) remove_task called exactly once for '1.2'
+    assert taskmaster.remove_task.await_count == 1
+    taskmaster.remove_task.assert_awaited_once_with('1.2', '/project')
+
+    # (d) curator.curate called exactly twice — unique survivors only
+    assert curator_interceptor._curator.curate.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_parse_prd_removes_intra_batch_duplicates(
+    curator_interceptor, taskmaster,
+):
+    """parse_prd routes through _dedupe_bulk_created so the intra-batch
+    pre-pass applies identically.
+
+    Three top-level tasks: id=11 is a case+whitespace variant of id=10 →
+    intra-batch duplicate removed.  id=12 is unrelated.
+    Proves the pre-pass is shared between expand_task and parse_prd paths.
+    """
+    pre_snapshot = {'tasks': []}
+    post_snapshot = {'tasks': [
+        {'id': '10', 'title': 'Setup DB', 'description': 'postgres'},
+        {'id': '11', 'title': 'SETUP db', 'description': 'Postgres'},
+        {'id': '12', 'title': 'Write tests', 'description': 'unit tests'},
+    ]}
+
+    taskmaster.get_tasks = AsyncMock(side_effect=[pre_snapshot, post_snapshot])
+    taskmaster.remove_task = AsyncMock(return_value={'success': True})
+    # parse_prd must return a dict so result['dedup'] assignment works
+    taskmaster.parse_prd = AsyncMock(return_value={'tasks': []})
+
+    curator_interceptor._curator = _mock_curator(
+        CuratorDecision(action='create', justification='new')
+    )
+
+    result = await curator_interceptor.parse_prd('prd.md', '/project')
+
+    dedup = result['dedup']
+
+    # exactly 1 removed entry for '11'
+    assert len(dedup['removed']) == 1, f"removed={dedup['removed']}"
+    removed_entry = dedup['removed'][0]
+    assert removed_entry['task_id'] == '11', removed_entry
+    assert removed_entry['reason'] == 'intra_batch_duplicate', removed_entry
+    assert removed_entry['matched_task_id'] == '10', removed_entry
+
+    # 2 kept entries: '10' and '12'
+    kept_ids = {k['task_id'] for k in dedup['kept']}
+    assert kept_ids == {'10', '12'}, f"kept_ids={kept_ids}"
+
+    # curator.curate called exactly twice (unique survivors only, not 3)
+    assert curator_interceptor._curator.curate.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_expand_task_intra_batch_remove_is_locked(
+    reconciler, event_buffer,
+):
+    """WP-E: the intra-batch remove_task in _dedupe_bulk_created acquires
+    the per-project write_lock, so it cannot overlap with concurrent
+    mutations (e.g. add_task) on the same project.
+
+    Modelled on test_expand_task_dedup_mutations_are_locked.
+    """
+    tracker = _OverlapTracker()
+
+    tm = AsyncMock()
+
+    async def _mut(kind, retval):
+        tracker.in_flight['p'] = tracker.in_flight.get('p', 0) + 1
+        tracker.peak['p'] = max(
+            tracker.peak.get('p', 0), tracker.in_flight['p'],
+        )
+        try:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return retval
+        finally:
+            tracker.in_flight['p'] -= 1
+
+    async def expand_side(*a, **k):
+        return await _mut('expand', {'subtasks': []})
+
+    async def add_side(**k):
+        return await _mut('add', {'id': '99', 'title': 'x'})
+
+    async def remove_side(*a, **k):
+        return await _mut('remove', {'success': True})
+
+    async def get_task_side(*a, **k):
+        await asyncio.sleep(0)
+        return {'id': '1', 'status': 'pending', 'title': 'T'}
+
+    # Two-call get_tasks: pre-snapshot (empty) then post-snapshot with two
+    # intra-batch duplicates so the pre-pass fires remove_task.
+    parent_task = {'id': '1', 'title': 'T', 'status': 'pending'}
+    pre_snapshot = {'tasks': [parent_task]}
+    post_snapshot = {'tasks': [{
+        **parent_task,
+        'subtasks': [
+            {'id': '1.1', 'title': 'Dup task', 'description': 'same'},
+            {'id': '1.2', 'title': 'DUP TASK', 'description': ' same '},
+        ],
+    }]}
+
+    tm.get_tasks = AsyncMock(side_effect=[pre_snapshot, post_snapshot])
+    tm.get_task = AsyncMock(side_effect=get_task_side)
+    tm.expand_task = AsyncMock(side_effect=expand_side)
+    tm.add_task = AsyncMock(side_effect=add_side)
+    tm.remove_task = AsyncMock(side_effect=remove_side)
+    tm.ensure_connected = AsyncMock()
+
+    interceptor = TaskInterceptor(tm, reconciler, event_buffer)
+
+    # Fire expand (which will trigger intra-batch remove for the dup) +
+    # a concurrent add_task. The lock must prevent remove_task and the
+    # tracked mutations from overlapping.
+    results = await asyncio.gather(
+        interceptor.expand_task('1', '/project'),
+        interceptor.add_task('/project', title='concurrent add'),
+    )
+
+    assert results[0] is not None
+    assert results[1] is not None
+
+    # The intra-batch remove_task for '1.2' should have been called.
+    tm.remove_task.assert_awaited_once_with('1.2', '/project')
+
+    # Peak must be 1: no overlap between expand, intra-batch remove_task,
+    # and any concurrent tracked mutation.
+    assert tracker.peak.get('p', 0) == 1, (
+        f'overlap detected during expand + intra-batch remove: peak={tracker.peak}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_intra_batch_duplicates_preserves_existing_behaviour(
+    curator_interceptor, taskmaster,
+):
+    """Regression guard: when no intra-batch duplicates exist the pre-pass
+    is a true no-op — removed is empty, kept has all tasks, remove_task
+    is NOT called, and curator.curate is called exactly once per unique task.
+
+    This ensures the pre-pass does not alter existing cross-task dedup
+    behaviour when the batch contains genuinely distinct tasks.
+    """
+    parent_task = {'id': '1', 'title': 'Parent', 'status': 'pending'}
+    pre_snapshot = {'tasks': [parent_task]}
+    post_snapshot = {'tasks': [{
+        **parent_task,
+        'subtasks': [
+            {'id': '1.1', 'title': 'Task Alpha', 'description': 'does alpha work'},
+            {'id': '1.2', 'title': 'Task Beta', 'description': 'does beta work'},
+        ],
+    }]}
+
+    taskmaster.get_tasks = AsyncMock(side_effect=[pre_snapshot, post_snapshot])
+    taskmaster.remove_task = AsyncMock(return_value={'success': True})
+
+    curator_interceptor._curator = _mock_curator(
+        CuratorDecision(action='create', justification='new')
+    )
+
+    result = await curator_interceptor.expand_task('1', '/project')
+
+    dedup = result['dedup']
+
+    # No intra-batch removals
+    assert dedup['removed'] == [], f"expected no removals, got: {dedup['removed']}"
+
+    # Both tasks kept
+    kept_ids = {k['task_id'] for k in dedup['kept']}
+    assert kept_ids == {'1.1', '1.2'}, f"kept_ids={kept_ids}"
+
+    # remove_task NOT called at all
+    assert taskmaster.remove_task.await_count == 0, (
+        f'remove_task should not have been called: {taskmaster.remove_task.call_args_list}'
+    )
+
+    # curator.curate called for both tasks (2 unique survivors)
+    assert curator_interceptor._curator.curate.await_count == 2

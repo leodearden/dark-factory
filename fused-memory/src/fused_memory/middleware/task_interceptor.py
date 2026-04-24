@@ -975,14 +975,34 @@ class TaskInterceptor:
         pre_snapshot: dict,
         parent_task_id: str | None = None,
     ) -> dict:
-        """Post-hoc curator pass after a bulk task-creation operation.
+        """Post-hoc deduplication after a bulk task-creation operation.
 
-        Reads the current task tree, diffs against pre_snapshot, and invokes
-        the curator on each newly-created task. Drop → remove the new task.
-        Combine → rewrite the target, then remove the new task. Create → keep
-        and record.
+        Reads the current task tree, diffs against pre_snapshot, then runs
+        a two-pass deduplication on the newly-created tasks:
 
-        Returns {'removed': [...], 'kept': [...], 'errors': []}
+        **Pass 1 — intra-batch dedup (pre-pass)**:
+        Groups new tasks by normalised (title, description) hash.  First
+        occurrence wins; each subsequent duplicate is removed immediately
+        under ``_write_lock`` with ``reason='intra_batch_duplicate'``.
+        This is cheap (no LLM) and prevents duplicate curator calls.
+
+        **Pass 2 — cross-task curator pass**:
+        Invokes ``curator.curate()`` on each unique survivor from pass 1.
+        Drop → remove the new task.  Combine → rewrite the target then
+        remove the new task.  Create → keep and record.
+
+        Called by both ``expand_task`` and ``parse_prd``; the two-pass
+        structure is path-agnostic (``parent_task_id`` is only used as
+        ``spawned_from`` metadata for curator candidates).
+
+        Returns ``{'removed': [...], 'kept': [...], 'errors': []}``.
+        Each ``removed`` entry carries a ``reason`` field that is one of:
+
+        - ``'intra_batch_duplicate'`` — removed in pass 1 (mechanical,
+          no LLM); entry has ``matched_task_id`` (first-occurrence id)
+          but no ``justification``.
+        - ``'curator_drop'`` — removed in pass 2 by the curator.
+        - ``'curator_combine'`` — merged into an existing task in pass 2.
         """
         removed: list[dict] = []
         kept: list[dict] = []
@@ -1003,16 +1023,70 @@ class TaskInterceptor:
         if not new_task_dicts:
             return {'removed': removed, 'kept': kept, 'errors': errors}
 
+        # ── Intra-batch dedup pre-pass ──────────────────────────────────────
+        # Detect and remove tasks that are near-identical duplicates of another
+        # task created in the SAME batch (e.g. the LLM emits 3 variants of the
+        # same subtask).  This runs BEFORE the per-task curator loop so we
+        # avoid wasting LLM calls on tasks we are about to remove.
+        #
+        # Key: normalised (title, description) hash — case + whitespace
+        # insensitive, excluding files_to_modify (often absent).
+        # First occurrence wins (matches curate_batch hash_to_first_idx
+        # convention).  Each removal acquires _write_lock independently to
+        # match WP-E discipline (same pattern as post-hoc drop/combine).
+        seen_keys: dict[str, str] = {}   # key → first-occurrence task_id
+        unique_new_tasks: list[dict] = []
+        for t in new_task_dicts:
+            tid = str(t.get('id', ''))
+            title = str(t.get('title', ''))
+            description = str(t.get('description', '') or '')
+
+            # Guard: tasks with a blank title get an identical
+            # _intra_batch_key('', '') hash regardless of description,
+            # which would incorrectly collapse all malformed subtasks
+            # into the first one.  Pass them straight through and let
+            # the curator path's own empty-title guard decide.
+            if not title.strip():
+                unique_new_tasks.append(t)
+                continue
+
+            key = TaskCurator._intra_batch_key(title, description)
+            if key not in seen_keys:
+                seen_keys[key] = tid
+                unique_new_tasks.append(t)
+            else:
+                # Duplicate — remove it under the write lock.
+                first_id = seen_keys[key]
+                try:
+                    async with self._write_lock(project_id):
+                        await tm.remove_task(tid, project_root)
+                    removed.append({
+                        'task_id': tid,
+                        'title': title,
+                        'reason': 'intra_batch_duplicate',
+                        'matched_task_id': first_id,
+                    })
+                    logger.info(
+                        'bulk_dedup: intra-batch duplicate %s removed (matches %s)',
+                        tid, first_id,
+                    )
+                except Exception as exc:
+                    errors.append({'task_id': tid, 'title': title, 'error': str(exc)})
+                    # Removal failed transiently — fall through to curator so
+                    # this task still appears in `kept` rather than silently
+                    # disappearing from both `removed` and `kept`.
+                    unique_new_tasks.append(t)
+
         curator = await self._get_curator()
         if curator is None:
-            for t in new_task_dicts:
+            for t in unique_new_tasks:
                 kept.append({
                     'task_id': str(t.get('id', '')),
                     'title': str(t.get('title', '')),
                 })
             return {'removed': removed, 'kept': kept, 'errors': errors}
 
-        for t in new_task_dicts:
+        for t in unique_new_tasks:
             tid = str(t.get('id', ''))
             title = str(t.get('title', ''))
             pool_entry = _to_pool_entry(t, source='module', lock_depth=2)
