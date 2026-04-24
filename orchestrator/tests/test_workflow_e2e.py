@@ -2680,6 +2680,85 @@ class TestRecoverIfAlreadyMerged:
             f'{workflow.state!r}'
         )
 
+    async def test_returns_none_for_inherited_iterations_log_on_fresh_worktree(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Fresh worktree with inherited iterations.jsonl contamination must return None.
+
+        Regression test for the false-DONE bug in pre-PLAN
+        _recover_if_already_merged(): a freshly-created worktree whose HEAD
+        equals base_commit (no implementation commits) but whose
+        .task/iterations.jsonl was inherited from contamination (e.g. left over
+        from a prior run on main, eval mode, race condition) must NOT return
+        WorkflowOutcome.DONE.
+
+        On unmodified code the call `self._has_prior_implementation()` (no
+        wt_head argument) falls back to the iteration-log scan, finds the
+        'implementer' entry, sets has_work=True and returns DONE — false-DONE.
+
+        After the fix (passing wt_head), `_has_prior_implementation` takes the
+        SHA-primary path: wt_head.strip() == base_commit → has_work=False →
+        recovery correctly returns None.
+
+        Design decision: we also write metadata.json (mimicking artifacts.init())
+        so that _has_prior_implementation(wt_head=...) finds a non-None
+        base_commit and takes the SHA-primary path.  Without metadata.json
+        read_base_commit() returns None → iteration-log fallback → still
+        has_work=True even after the wt_head change.
+        """
+        import json as _json
+
+        # 1. Create a fresh worktree (wt_head == base_commit, trivially ancestor of main)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Read current HEAD (= base_commit) and stamp metadata.json so the
+        #    SHA-primary path is taken in _has_prior_implementation(wt_head=...).
+        _, base_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        base_sha = base_sha_raw.strip()
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'metadata.json').write_text(
+            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': base_sha})
+        )
+
+        # 3. Write iterations.jsonl with an implementer entry — simulates
+        #    inherited contamination (on-disk but untracked; NOT git-committed).
+        #    On unmodified code this entry causes has_work=True via the
+        #    iteration-log fallback → false-DONE.
+        (task_dir / 'iterations.jsonl').write_text(
+            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+        )
+        # Explicitly do NOT make any git commit: wt_head remains == base_commit.
+
+        # 4. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 5. Call _recover_if_already_merged directly
+        outcome = await workflow._recover_if_already_merged()
+
+        # 6. Assertions: inherited contamination must NOT cause false-DONE
+        assert outcome is None, (
+            f'Expected None for fresh worktree with inherited iterations.jsonl '
+            f'contamination but got {outcome!r} — '
+            'iteration-log fallback would false-DONE on inherited contamination; '
+            'the SHA-primary check (wt_head != base_commit) must reject this state'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses for fresh worktree "
+            f"with only inherited contamination: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE for fresh worktree with inherited '
+            f'contamination: {workflow.state!r}'
+        )
+
     async def test_returns_none_when_branch_not_on_main(
         self, config, git_ops, task_assignment, tmp_path
     ):
