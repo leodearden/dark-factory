@@ -2507,7 +2507,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             _git_check = await self._check_branch_on_main()
         except Exception:
             logger.warning(
-                'Task %s: merge-check failed, proceeding with requeue',
+                'Task %s: merge-check failed, proceeding with normal workflow',
                 self.task_id, exc_info=True,
             )
             return None
@@ -2559,7 +2559,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     'Task %s: branch HEAD %s is ancestor '
                     'of main %s but no implementation '
                     'entries (base=%s, entries=%d) — '
-                    'proceeding with requeue',
+                    'proceeding with normal workflow',
                     self.task_id,
                     wt_head[:8],
                     main_sha[:8],
@@ -2570,7 +2570,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         except Exception:
             logger.warning(
                 'Task %s: artifacts read failed during merge-check, '
-                'proceeding with requeue',
+                'proceeding with normal workflow',
                 self.task_id, exc_info=True,
             )
             return None
@@ -2583,7 +2583,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         await self.scheduler.set_task_status(
             self.task_id, 'done',
             done_provenance={
-                'note': 'branch already on main after escalation resolution',
+                'note': 'branch already on main at workflow start (pre-PLAN recovery)',
+                'main_sha': main_sha,
             },
         )
         return WorkflowOutcome.DONE
