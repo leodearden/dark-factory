@@ -100,6 +100,42 @@ class TestDisallowedToolLists:
         for tool in DISALLOW_BUILTIN:
             assert not tool.startswith('mcp__'), f'{tool} should not have MCP prefix'
 
+    def test_submit_task_in_disallow_task_writes(self):
+        """submit_task must be blocked in Stage 1/3 (only Stage 2 may create tasks)."""
+        assert 'mcp__fused-memory__submit_task' in DISALLOW_TASK_WRITES
+
+    def test_resolve_ticket_in_disallow_task_writes(self):
+        """resolve_ticket must be blocked in Stage 1/3 (only Stage 2 may create tasks)."""
+        assert 'mcp__fused-memory__resolve_ticket' in DISALLOW_TASK_WRITES
+
+    def test_add_task_still_in_disallow_task_writes(self):
+        """Deprecated add_task facade must still be blocked (defence-in-depth)."""
+        assert 'mcp__fused-memory__add_task' in DISALLOW_TASK_WRITES
+
+    def test_submit_task_not_in_stage2_disallowed(self):
+        """Stage 2 must be allowed to call submit_task (it creates tasks)."""
+        assert 'mcp__fused-memory__submit_task' not in STAGE2_DISALLOWED
+
+    def test_resolve_ticket_not_in_stage2_disallowed(self):
+        """Stage 2 must be allowed to call resolve_ticket (it finalises task creation)."""
+        assert 'mcp__fused-memory__resolve_ticket' not in STAGE2_DISALLOWED
+
+    def test_submit_task_in_stage1_disallowed(self):
+        """Stage 1 must not be able to call submit_task."""
+        assert 'mcp__fused-memory__submit_task' in STAGE1_DISALLOWED
+
+    def test_resolve_ticket_in_stage1_disallowed(self):
+        """Stage 1 must not be able to call resolve_ticket."""
+        assert 'mcp__fused-memory__resolve_ticket' in STAGE1_DISALLOWED
+
+    def test_submit_task_in_stage3_disallowed(self):
+        """Stage 3 must not be able to call submit_task."""
+        assert 'mcp__fused-memory__submit_task' in STAGE3_DISALLOWED
+
+    def test_resolve_ticket_in_stage3_disallowed(self):
+        """Stage 3 must not be able to call resolve_ticket."""
+        assert 'mcp__fused-memory__resolve_ticket' in STAGE3_DISALLOWED
+
 
 class TestStageSubclasses:
     """Each stage subclass returns the correct disallowed list."""
