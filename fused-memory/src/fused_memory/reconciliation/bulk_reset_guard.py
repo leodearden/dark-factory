@@ -66,7 +66,15 @@ def _reversal_kind(
 
 @dataclass(frozen=True)
 class BulkResetVerdict:
-    """Outcome of a single :meth:`BulkResetGuard.observe_attempt` call."""
+    """Outcome of a single :meth:`BulkResetGuard.observe_attempt` call.
+
+    Attributes
+    ----------
+    kind:
+        The reversal kind that tripped the guard: ``'done_to_pending'`` or
+        ``'in_progress_to_pending'``.  ``None`` for ``outcome='ok'`` verdicts
+        where the circuit-breaker was not tripped.
+    """
 
     outcome: Literal['ok', 'rejection', 'escalated']
     affected_task_ids: tuple[str, ...] = ()
@@ -76,6 +84,7 @@ class BulkResetVerdict:
     project_id: str = ''
     error_type: str = 'BulkResetGuardTripped'
     escalation_path: str | None = None
+    kind: Literal['done_to_pending', 'in_progress_to_pending'] | None = None
 
     @property
     def is_rejection(self) -> bool:
@@ -129,6 +138,8 @@ class BulkResetVerdict:
         }
         if self.outcome == 'escalated' and self.escalation_path is not None:
             payload['escalation_path'] = self.escalation_path
+        if self.kind is not None:
+            payload['kind'] = self.kind
         return payload
 
 
@@ -330,6 +341,7 @@ class BulkResetGuard:
                 window_seconds=self._window_seconds,
                 project_id=project_id,
                 escalation_path=str(esc_path),
+                kind=kind,
             )
         return BulkResetVerdict(
             outcome='rejection',
@@ -338,6 +350,7 @@ class BulkResetGuard:
             threshold=threshold,
             window_seconds=self._window_seconds,
             project_id=project_id,
+            kind=kind,
         )
 
     # ------------------------------------------------------------------
