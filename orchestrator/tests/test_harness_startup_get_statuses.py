@@ -199,7 +199,7 @@ async def test_startup_noprd_transport_failure_raises_distinct_error(
     h = startup_harness
     # Simulate: get_statuses swallowed a transport error and cached it.
     h.scheduler.get_statuses = AsyncMock(return_value={})
-    h.scheduler.last_get_statuses_error = OSError(2, 'No such file')
+    h.scheduler._last_get_statuses_error = OSError(2, 'No such file')
 
     with pytest.raises(RuntimeError, match=r'[Ff]ailed to reach fused-memory') as excinfo:
         await h.run(prd_path=None)
@@ -229,7 +229,7 @@ async def test_startup_noprd_empty_without_cached_error_raises_legitimate_error(
     """
     h = startup_harness
     h.scheduler.get_statuses = AsyncMock(return_value={})
-    h.scheduler.last_get_statuses_error = None
+    h.scheduler._last_get_statuses_error = None
 
     with pytest.raises(RuntimeError, match='No PRD given and no pending tasks found'):
         await h.run(prd_path=None)
