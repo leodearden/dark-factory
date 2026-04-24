@@ -2604,6 +2604,48 @@ class TestCheckBranchOnMain:
             f'None worktree must short-circuit before any git call; got {result!r}'
         )
 
+    async def test_returns_none_when_git_ops_missing(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """workflow.git_ops = None must short-circuit before any git call.
+
+        Exercises the ``or self.git_ops is None`` arm of the None-guard at the
+        top of _check_branch_on_main(). A real worktree is wired up so that
+        ``workflow.worktree is not None`` and the first arm (``self.worktree is
+        None``) does NOT short-circuit; only the second arm is exercised.
+
+        Why this test exists: prevents a future refactor from silently dropping
+        the ``or self.git_ops is None`` half of the OR condition. If that arm is
+        removed, the helper continues past the guard to
+        ``main_sha = await self.git_ops.get_main_sha()``, which crashes with
+        ``AttributeError: 'NoneType' object has no attribute 'get_main_sha'``
+        — surfacing the regression as an uncaught exception rather than a
+        silent wrong result.
+        """
+        # 1. Create a real worktree so workflow.worktree is not None
+        #    (ensures the first arm of the guard does NOT short-circuit)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # 2. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. Clear git_ops to trigger the second arm of the None-guard
+        workflow.git_ops = None  # type: ignore[assignment]
+
+        # 4. Call _check_branch_on_main — must return None without crashing
+        result = await workflow._check_branch_on_main()
+
+        # 5. Assert
+        assert result is None, (
+            f'None git_ops must short-circuit before any git call; got {result!r}'
+        )
+
     async def test_propagates_git_exceptions(
         self, config, git_ops, task_assignment, tmp_path, monkeypatch
     ):
