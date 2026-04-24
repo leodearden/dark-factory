@@ -35,6 +35,8 @@ async def _check_plan_targets_in_tree(
     merge_commit_sha: str,
     task_worktree: Path,
     git_ops: GitOps,
+    *,
+    task_id: str | None = None,
 ) -> list[str]:
     """Return plan.json `files` entries dropped by the merge.
 
@@ -76,8 +78,10 @@ async def _check_plan_targets_in_tree(
         # behaviour of flagging every missing planned file as a drop.
         logger.warning(
             'drop-guard: git rev-parse HEAD failed in %s (rc=%d, stderr=%s); '
-            'falling back to flag-every-missing behaviour.',
+            'falling back to flag-every-missing behaviour. '
+            'task_id=%s merge_commit_sha=%s',
             task_worktree, rc_head, head_err.strip(),
+            task_id or '<unknown>', merge_commit_sha,
         )
         task_head = ''
 
@@ -479,6 +483,7 @@ class MergeWorker:
         assert merge_result.merge_commit is not None
         dropped = await _check_plan_targets_in_tree(
             merge_result.merge_commit, req.worktree, self._git_ops,
+            task_id=req.task_id,
         )
         if dropped:
             if merge_result.merge_worktree:
@@ -1055,6 +1060,7 @@ class SpeculativeMergeWorker:
                     # Drop-guard: every file the task planned must survive.
                     dropped = await _check_plan_targets_in_tree(
                         merge_commit, req.worktree, self._git_ops,
+                        task_id=req.task_id,
                     )
                     if dropped:
                         if merge_result.merge_worktree:

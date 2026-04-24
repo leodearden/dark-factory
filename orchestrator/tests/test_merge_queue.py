@@ -337,6 +337,7 @@ class TestCheckPlanTargetsInTree:
         """
         # Task branch: adds contested.py + other.py
         worktree = (await git_ops.create_worktree('real-conflict-drop')).path
+        full_branch = f'{git_ops.config.branch_prefix}real-conflict-drop'
         (worktree / 'contested.py').write_text('task_version = 1\n')
         (worktree / 'other.py').write_text('other = 1\n')
         await git_ops.commit(worktree, 'Task: add contested + other')
@@ -372,7 +373,7 @@ class TestCheckPlanTargetsInTree:
         )
         try:
             rc, out, err = await _run(
-                ['git', 'merge', '--no-ff', '--no-commit', 'task/real-conflict-drop'],
+                ['git', 'merge', '--no-ff', '--no-commit', full_branch],
                 cwd=merge_wt,
             )
             # Expect a real conflict
