@@ -335,6 +335,7 @@ class MergeOutcome:
     recovery_branch: str | None = None
     overlap_files: list[str] | None = None
     merge_sha: str | None = None
+    push_status: str | None = None
 
 
 @dataclass
@@ -681,17 +682,21 @@ class MergeWorker:
             self._post_merge_verify_timeouts.pop(req.task_id, None)
             logger.info(f'Task {req.task_id}: merged to main successfully')
             _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(t0))
-            return MergeOutcome('done', merge_sha=merge_result.merge_commit)
+            push_status = await self._git_ops.push_main()
+            return MergeOutcome('done', merge_sha=merge_result.merge_commit, push_status=push_status)
 
         if result in ('wip_overlap', 'pop_conflict'):
             # Halt the queue globally — no more merges until resolved
             self.halt_for_wip(f'advance_main: {result}')
             if result == 'pop_conflict':
+                # Main was advanced — push origin even though stash pop failed.
+                push_status = await self._git_ops.push_main()
                 recovery = getattr(self._git_ops, '_last_recovery_branch', None)
                 return MergeOutcome(
                     'done_wip_recovery',
                     reason=f'Merge advanced but stash pop conflicted. Recovery branch: {recovery}',
                     recovery_branch=recovery,
+                    push_status=push_status,
                 )
             else:
                 overlap = getattr(self._git_ops, '_last_overlap_files', None)
@@ -1506,8 +1511,9 @@ class SpeculativeMergeWorker:
                 logger.info(f'Task {req.task_id}: merged to main successfully')
                 _emit_merge_attempt(self._event_store, req.task_id, 'done', duration_ms=_elapsed_ms(item.started_monotonic))
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
+                push_status = await self._git_ops.push_main()
                 if not req.result.done():
-                    req.result.set_result(MergeOutcome('done', merge_sha=merge_commit))
+                    req.result.set_result(MergeOutcome('done', merge_sha=merge_commit, push_status=push_status))
                 return True
 
             if result in ('wip_overlap', 'pop_conflict'):
@@ -1515,12 +1521,15 @@ class SpeculativeMergeWorker:
                 self.halt_for_wip(f'advance_main: {result}')
                 await self._git_ops.cleanup_merge_worktree(merge_wt)
                 if result == 'pop_conflict':
+                    # Main was advanced — push origin even though stash pop failed.
+                    push_status = await self._git_ops.push_main()
                     recovery = getattr(self._git_ops, '_last_recovery_branch', None)
                     if not req.result.done():
                         req.result.set_result(MergeOutcome(
                             'done_wip_recovery',
                             reason=f'Merge advanced but stash pop conflicted. Recovery branch: {recovery}',
                             recovery_branch=recovery,
+                            push_status=push_status,
                         ))
                 else:
                     overlap = getattr(self._git_ops, '_last_overlap_files', None)

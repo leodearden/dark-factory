@@ -55,6 +55,10 @@ def git_config() -> GitConfig:
         branch_prefix='task/',
         remote='origin',
         worktree_dir='.worktrees',
+        # Tests use a tmp repo with no real remote; disabling the push avoids
+        # per-test subprocess noise. Push behavior is exercised explicitly in
+        # test_git_ops.TestPushMain and TestPushHook below.
+        push_after_advance=False,
     )
 
 
@@ -4560,3 +4564,105 @@ class TestEscalationServerUsesEnqueueHelper:
         assert call_req.task_id == '9'
         assert call_req.branch == 'task/9'
         assert call_es is event_store
+
+
+# ---------------------------------------------------------------------------
+# TestPushHook — main is mirrored to origin after every successful CAS advance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPushHook:
+    """push_main fires once per successful CAS advance, in both worker paths.
+
+    Push status is surfaced on MergeOutcome.push_status. A push failure must
+    not change the merge outcome — local main has already been advanced.
+    """
+
+    async def test_merge_worker_invokes_push_main_on_success(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """Normal MergeWorker success path calls push_main exactly once and
+        propagates the result onto MergeOutcome.push_status."""
+        worktree = await _make_branch_with_file(
+            git_ops, 'push-hook-1', 'push_hook_1.py', 'x = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        push_mock = AsyncMock(return_value='pushed')
+        with patch.object(git_ops, 'push_main', push_mock), \
+             patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req = _make_request('push-hook-1', 'push-hook-1', worktree, config)
+            await queue.put(req)
+            result = await asyncio.wait_for(req.result, timeout=30)
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+        assert result.status == 'done'
+        assert result.push_status == 'pushed'
+        assert push_mock.await_count == 1
+
+    async def test_merge_worker_done_when_push_fails(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """A push 'error' must not change merge status — main was advanced."""
+        worktree = await _make_branch_with_file(
+            git_ops, 'push-hook-fail', 'push_hook_fail.py', 'y = 2\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        push_mock = AsyncMock(return_value='error')
+        with patch.object(git_ops, 'push_main', push_mock), \
+             patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            req = _make_request('push-hook-fail', 'push-hook-fail', worktree, config)
+            await queue.put(req)
+            result = await asyncio.wait_for(req.result, timeout=30)
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+        assert result.status == 'done'
+        assert result.push_status == 'error'
+        assert push_mock.await_count == 1
+
+    async def test_speculative_worker_invokes_push_main_on_success(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """SpeculativeMergeWorker success path also calls push_main once."""
+        worktree = await _make_branch_with_file(
+            git_ops, 'spec-push', 'spec_push.py', 'z = 3\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        push_mock = AsyncMock(return_value='pushed')
+        with patch.object(git_ops, 'push_main', push_mock), \
+             patch(
+                 'orchestrator.merge_queue.run_scoped_verification',
+                 _mock_verify_pass(),
+             ):
+            req = _make_request('spec-push', 'spec-push', worktree, config)
+            await queue.put(req)
+            result = await asyncio.wait_for(req.result, timeout=30)
+
+        await worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+        assert result.status == 'done'
+        assert result.push_status == 'pushed'
+        assert push_mock.await_count == 1

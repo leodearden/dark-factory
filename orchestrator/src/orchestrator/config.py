@@ -384,6 +384,13 @@ class GitConfig(BaseModel):
     branch_prefix: str = Field(default='task/')
     remote: str = Field(default='origin')
     worktree_dir: str = Field(default='.worktrees')
+    push_after_advance: bool = Field(
+        default=True,
+        description=(
+            'Push main to <remote> after each successful CAS advance. '
+            'Best-effort: failures are logged but do not fail the merge.'
+        ),
+    )
 
 
 # --- Per-module overrides ---

@@ -45,6 +45,9 @@ AdvanceResult = Literal[
 ]
 
 
+PushResult = Literal['pushed', 'noop', 'rejected', 'error']
+
+
 class ScrubOutcome(Enum):
     """Outcome discriminant for :class:`ScrubResult`.
 
@@ -1223,6 +1226,53 @@ class GitOps:
                     return 'pop_conflict'
 
         return 'advanced'
+
+    async def push_main(self) -> PushResult:
+        """Push local main to ``<remote>/<main_branch>`` as a fast-forward.
+
+        Best-effort mirror step for ``advance_main``: keeps origin in sync
+        without ever blocking the merge worker. Local main is the source of
+        truth; this is a one-way replication. Never raises and never uses
+        ``--force``.
+
+        Returns:
+            ``'pushed'``   — push succeeded.
+            ``'noop'``     — disabled via ``config.push_after_advance``.
+            ``'rejected'`` — non-fast-forward (origin diverged); logged at ERROR.
+            ``'error'``    — network / auth / other transient failure;
+                             logged at WARNING.
+        """
+        if not self.config.push_after_advance:
+            return 'noop'
+
+        refspec = f'{self.config.main_branch}:{self.config.main_branch}'
+        rc, _, err = await _run(
+            ['git', 'push', self.config.remote, refspec],
+            cwd=self.project_root,
+        )
+        if rc == 0:
+            logger.info(
+                'Pushed %s to %s', self.config.main_branch, self.config.remote,
+            )
+            return 'pushed'
+
+        # Classify the failure. git push surfaces non-ff in stderr with one of
+        # several phrasings depending on version/locale.
+        err_lower = err.lower()
+        if any(s in err_lower for s in ('non-fast-forward', 'fetch first', '! [rejected]')):
+            logger.error(
+                'Push of %s to %s rejected (non-fast-forward) — origin has '
+                'diverged. NOT force-pushing. stderr=%s',
+                self.config.main_branch, self.config.remote, err,
+            )
+            return 'rejected'
+
+        logger.warning(
+            'Push of %s to %s failed (rc=%d) — leaving origin behind; '
+            'next successful push will catch up. stderr=%s',
+            self.config.main_branch, self.config.remote, rc, err,
+        )
+        return 'error'
 
     async def _create_recovery_branch_from_stash(self, label: str) -> str:
         """Create a branch from the current stash to preserve WIP, then clean up.
