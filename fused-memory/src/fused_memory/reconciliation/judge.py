@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from shared.cli_invoke import classify_agent_failure, invoke_with_cap_retry
+from shared.cli_invoke import build_failure_message, invoke_with_cap_retry
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
@@ -265,10 +265,7 @@ Review this run and provide your verdict as JSON.
             return ''
 
         if not result.success:
-            cls = classify_agent_failure(result)
-            raise RuntimeError(
-                f'Claude CLI judge failed: {cls.summary}\n{cls.diagnostic_detail}'
-            )
+            raise RuntimeError(build_failure_message('Claude CLI judge', result))
 
         return result.output.strip()
 
