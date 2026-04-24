@@ -300,29 +300,6 @@ class Scheduler:
         # fresh (no accumulated age).
         self._pending_anchor: dict[str, int] = {}
         self._was_non_pending: set[str] = set()
-        # Caches the last transport exception from get_statuses so callers
-        # (e.g. Harness) can distinguish a genuine empty task tree from a
-        # swallowed transport failure.  Reset to None at the start of each
-        # get_statuses call and again on success, so a prior failure never
-        # contaminates a subsequent success — even under concurrent callers.
-        # Exposed as the public ``last_get_statuses_error`` property.
-        self._last_get_statuses_error: Exception | None = None
-
-    @property
-    def last_get_statuses_error(self) -> Exception | None:
-        """Transport exception from the most recent :meth:`get_statuses` call.
-
-        Set in the ``except`` branch when a call fails; reset to ``None``
-        at call entry *and* again on a successful return so the attribute
-        always reflects *this* call's outcome, not a prior one.
-
-        .. note::
-            Designed for a single-caller pattern (Harness).  Concurrent
-            callers on the same Scheduler instance may observe interleaved
-            state; drive ``get_statuses`` from a single coroutine at a time.
-        """
-        return self._last_get_statuses_error
-
     async def _dispatch_tool(
         self,
         name: str,
@@ -460,8 +437,8 @@ class Scheduler:
 
     async def get_statuses(
         self, ids: list[str] | None = None
-    ) -> dict[str, str]:
-        """Return a compact ``{id: status}`` mapping from fused-memory.
+    ) -> tuple[dict[str, str], Exception | None]:
+        """Return a ``(statuses, error)`` tuple from fused-memory.
 
         Uses the ``get_statuses`` MCP tool which returns ~95% less data than
         ``get_tasks``.  Suitable for hot-loop callers that only need status.
@@ -471,10 +448,10 @@ class Scheduler:
                  omitted).  Pass ``None`` for all tasks.
 
         Returns:
-            A ``{id_str: status_str}`` dict; always a dict, never None.
-            Returns ``{}`` on any failure.
+            A ``(statuses, error)`` tuple.  On success: ``({id: status}, None)``.
+            On any failure: ``({}, exception)``.  Error state lives on the stack
+            — no shared mutable attribute, safe under concurrent callers.
         """
-        self._last_get_statuses_error = None  # reset before each attempt
         try:
             arguments: dict = {'project_root': self._project_root}
             if ids is not None:
@@ -482,14 +459,13 @@ class Scheduler:
             result = await self._dispatch_tool('get_statuses', arguments, timeout=15)
             statuses = self._parse_tool_text_result(result, 'statuses')
             if isinstance(statuses, dict):
-                self._last_get_statuses_error = None  # explicit clear: guards concurrent callers
-                return statuses
+                return statuses, None
         except Exception as e:
-            self._last_get_statuses_error = e
             logger.exception(
                 'Failed to fetch task statuses: %s: %s', type(e).__name__, e,
             )
-        return {}
+            return {}, e
+        return {}, None
 
     async def update_task(self, task_id: str, metadata: str | dict) -> bool:
         """Update task metadata via fused-memory. Returns True on success."""
