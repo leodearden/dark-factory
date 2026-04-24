@@ -561,6 +561,98 @@ class TestGetByTaskDedupAcrossArchive:
         )
 
 
+    def test_get_by_task_warns_when_id_in_both_queue_and_archive_regardless_of_filter(
+        self, tmp_path: Path, caplog,
+    ):
+        """Pre-scan WARNING is emitted even when a filter is applied that selects
+        only the archive copy (status='resolved').
+
+        The pre-scan fires before the filter loop, so the operator sees the
+        cross-tier duplicate regardless of which copy (if any) passes the filter.
+
+        Failure mode on current main: no pre-scan exists; the per-call dedup
+        WARNING only fires when the queue_dir copy passes the filter.
+        With status='resolved', the pending queue_dir copy is excluded, so
+        the per-call warning never fires and the cross-tier duplicate is invisible.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Stale pending copy stuck in queue_dir root
+        pending_copy = _make_escalation('esc-42-1', task_id='42', status='pending')
+        (queue.queue_dir / 'esc-42-1.json').write_text(pending_copy.to_json())
+
+        # Resolved copy in archive (what the caller wants)
+        archive_dir = queue.queue_dir / 'archive' / '2025-06-15'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        resolved_copy = _make_escalation('esc-42-1', task_id='42', status='resolved')
+        resolved_copy.resolution = 'archive_copy'
+        (archive_dir / 'esc-42-1.json').write_text(resolved_copy.to_json())
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            results = queue.get_by_task('42', status='resolved')
+
+        # (a) Exactly one result — the archive's resolved copy
+        assert len(results) == 1, (
+            f'Expected exactly 1 resolved result, got {len(results)}: '
+            f'{[e.resolution for e in results]}'
+        )
+        assert results[0].status == 'resolved'
+        assert results[0].resolution == 'archive_copy'
+
+        # (b) A WARNING mentioning the id must have been logged (pre-scan)
+        warning_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert any('esc-42-1' in r.message for r in warning_records), (
+            f"Expected a WARNING mentioning 'esc-42-1'; "
+            f"got: {[r.message for r in warning_records]}"
+        )
+
+    def test_get_by_task_warns_on_cross_tier_duplicate_even_when_filter_excludes_both(
+        self, tmp_path: Path, caplog,
+    ):
+        """Pre-scan WARNING fires even when the status filter excludes BOTH copies.
+
+        Core contract: the pre-scan is independent of the filter loop.
+        With status='dismissed', neither the pending queue_dir copy nor the
+        resolved archive copy passes the filter, so no per-call dedup warning
+        can fire (no entry ever hits the ``seen`` check). The pre-scan must
+        therefore be the source of any id-mentioning WARNING in this scenario.
+
+        Failure mode on current main: no pre-scan exists — results == [] with
+        no WARNING, making the cross-tier duplicate invisible to the operator.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Stale pending copy stuck in queue_dir root
+        pending_copy = _make_escalation('esc-42-1', task_id='42', status='pending')
+        (queue.queue_dir / 'esc-42-1.json').write_text(pending_copy.to_json())
+
+        # Resolved copy in archive
+        archive_dir = queue.queue_dir / 'archive' / '2025-06-15'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        resolved_copy = _make_escalation('esc-42-1', task_id='42', status='resolved')
+        resolved_copy.resolution = 'archive_copy'
+        (archive_dir / 'esc-42-1.json').write_text(resolved_copy.to_json())
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            results = queue.get_by_task('42', status='dismissed')
+
+        # (a) No copy passes the filter
+        assert results == [], f'Expected [] (filter excludes both copies), got {results}'
+
+        # (b) A WARNING mentioning the id must have been logged (pre-scan, not per-call dedup)
+        warning_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert any('esc-42-1' in r.message for r in warning_records), (
+            f"Expected a WARNING mentioning 'esc-42-1' from pre-scan; "
+            f"got: {[r.message for r in warning_records]}"
+        )
+
+
 class TestGetPendingParseFailure:
     """get_pending() must emit a WARNING when a queue file cannot be parsed."""
 
