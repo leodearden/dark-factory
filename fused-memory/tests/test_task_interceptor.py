@@ -3881,3 +3881,105 @@ async def test_dedupe_bulk_blank_title_tasks_bypass_intra_batch_pre_pass(
         f'curate should have been called once per whitespace task: '
         f'{curator_interceptor._curator.curate.call_args_list}'
     )
+
+
+@pytest.mark.asyncio
+async def test_dedupe_bulk_pass1_intra_batch_and_pass2_curator_drops_compose(
+    curator_interceptor, taskmaster,
+):
+    """Composition contract: a single batch can drop in pass-1 AND pass-2.
+
+    Pins that when both an intra-batch duplicate (pass-1) and a
+    curator-drop (pass-2) occur in the same batch, both appear correctly
+    in result['removed'] — one with reason='intra_batch_duplicate', one
+    with reason='curator_drop' — and the sole surviving new task ends up
+    in result['kept'].
+
+    Setup
+    -----
+    pre_snapshot: one pre-existing task '50' (becomes the curator drop
+      target for task '62').
+    post_snapshot: '50' plus three new top-level tasks '60', '61', '62'.
+      '61' is a case+whitespace dup of '60' → pass-1 drops it.
+      '62' is semantically subsumed by '50' → curator drops it in pass-2.
+    Per-candidate routing curator: returns 'drop' for '62' (target '50'),
+      'create' for everything else.
+    """
+    pre_snapshot = {'tasks': [
+        {'id': '50', 'title': 'Existing alpha work', 'status': 'pending'},
+    ]}
+    post_snapshot = {'tasks': [
+        {'id': '50', 'title': 'Existing alpha work', 'status': 'pending'},
+        {'id': '60', 'title': 'Build feature', 'description': 'core impl'},
+        {'id': '61', 'title': 'BUILD FEATURE', 'description': ' core IMPL '},
+        {'id': '62', 'title': 'Refactor alpha module', 'description': 'cleanup'},
+    ]}
+
+    taskmaster.get_tasks = AsyncMock(return_value=post_snapshot)
+    taskmaster.remove_task = AsyncMock(return_value={'success': True})
+
+    curator = MagicMock()
+
+    async def _route(candidate, *a, **kw):
+        if candidate.title == 'Refactor alpha module':
+            return CuratorDecision(
+                action='drop', target_id='50',
+                justification='subsumed by existing alpha task',
+            )
+        return CuratorDecision(action='create', justification='novel')
+
+    curator.curate = AsyncMock(side_effect=_route)
+
+    async def _curate_batch(candidates, *a, **kw):
+        return [await curator.curate(c, *a, **kw) for c in candidates]
+
+    curator.curate_batch = AsyncMock(side_effect=_curate_batch)
+    curator.record_task = AsyncMock()
+    curator.reembed_task = AsyncMock()
+    curator.note_created = MagicMock()
+    curator_interceptor._curator = curator
+
+    result = await curator_interceptor._dedupe_bulk_created(
+        '/project', pre_snapshot=pre_snapshot,
+    )
+
+    # (a) Exactly two removals total (one from each pass).
+    assert len(result['removed']) == 2, f"expected 2 removals, got: {result['removed']}"
+
+    # (b) '61' removed as intra-batch duplicate of '60'; no justification key
+    # (pass-1 is mechanical — no LLM involvement, no justification emitted).
+    removed_61 = next((r for r in result['removed'] if r['task_id'] == '61'), None)
+    assert removed_61 is not None, "'61' missing from removed"
+    assert removed_61['reason'] == 'intra_batch_duplicate'
+    assert removed_61['matched_task_id'] == '60'
+    assert 'justification' not in removed_61 or not removed_61.get('justification')
+
+    # (c) '62' removed by the curator, matched to pre-existing task '50'.
+    removed_62 = next((r for r in result['removed'] if r['task_id'] == '62'), None)
+    assert removed_62 is not None, "'62' missing from removed"
+    assert removed_62['reason'] == 'curator_drop'
+    assert removed_62['matched_task_id'] == '50'
+    assert removed_62.get('justification'), f"expected non-empty justification: {removed_62}"
+
+    # (d) Only '60' ends up in kept (the unique survivor from both passes).
+    kept_ids = {k['task_id'] for k in result['kept']}
+    assert kept_ids == {'60'}, f"kept_ids={kept_ids}"
+
+    # (e) No errors.
+    assert result['errors'] == [], f"unexpected errors: {result['errors']}"
+
+    # (f) remove_task called twice — once for '61' (pass-1) and once for
+    # '62' (pass-2), both against '/project'.
+    assert taskmaster.remove_task.await_count == 2, (
+        f'remove_task call count wrong: {taskmaster.remove_task.call_args_list}'
+    )
+    actual_calls = {tuple(c.args) for c in taskmaster.remove_task.call_args_list}
+    assert actual_calls == {('61', '/project'), ('62', '/project')}, (
+        f'remove_task called with unexpected args: {actual_calls}'
+    )
+
+    # (g) curator.curate called exactly twice: pass-2 sees only the unique
+    # survivors '60' and '62', not '61' (which was already removed in pass-1).
+    assert curator.curate.await_count == 2, (
+        f'curate call count wrong: {curator.curate.call_args_list}'
+    )
