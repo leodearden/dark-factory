@@ -12,12 +12,15 @@ class TestTopLevelImports:
         from shared import (
             AccountConfig,
             AccountState,
+            AgentFailureClass,
+            AgentFailureKind,
             AgentResult,
             AllAccountsCappedException,
             CostStore,
             SessionBudgetExhausted,
             UsageCapConfig,
             UsageGate,
+            classify_agent_failure,
             files_to_modules,
             invoke_claude_agent,
             invoke_with_cap_retry,
@@ -36,6 +39,9 @@ class TestTopLevelImports:
         assert normalize_lock is not None
         assert files_to_modules is not None
         assert AllAccountsCappedException is not None
+        assert AgentFailureClass is not None
+        assert AgentFailureKind is not None
+        assert classify_agent_failure is not None
 
 
 class TestModuleLevelAll:
