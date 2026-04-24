@@ -2543,6 +2543,40 @@ class TestCheckBranchOnMain:
             f'main_sha {main_sha!r} must match git_ops.get_main_sha() {expected_main!r}'
         )
 
+    async def test_returns_none_for_unmerged_branch(
+        self, config, git_ops, task_assignment, tmp_path
+    ):
+        """Branch with real commit but NOT merged to main must return None.
+
+        Create a worktree, write and commit a file, but do NOT merge to main.
+        is_ancestor(wt_head, main_sha) returns False, so _check_branch_on_main()
+        must return None.
+
+        Fails on the step-2 minimal impl which returns (wt_head, main_sha)
+        unconditionally without the ancestor check.
+        """
+        # 1. Create worktree and make a real implementation commit (no merge)
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        (wt / 'unmerged_impl.py').write_text('def impl():\n    return 99\n')
+        await git_ops.commit(wt, 'Implement feature (unmerged)')
+
+        # 2. Build workflow, wire up worktree and artifacts
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        # 3. Call _check_branch_on_main directly
+        result = await workflow._check_branch_on_main()
+
+        # 4. Assert: unmerged branch must return None
+        assert result is None, (
+            f'unmerged branch must return None; is_ancestor=False guard missing, got {result!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: _recover_if_already_merged unit tests
