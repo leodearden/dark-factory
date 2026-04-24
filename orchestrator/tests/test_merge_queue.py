@@ -848,14 +848,17 @@ class TestCheckPlanTargetsInTree:
         Performance concern: the merge hot-path's wall-clock latency must be
         O(1) not O(N) in done-step count — total subprocess work stays O(N),
         but asyncio.gather runs them concurrently so latency tracks the
-        slowest single call.  This test verifies concurrent execution by
-        confirming all three intercepted coroutines enter before any exits:
+        slowest single call.
 
-            max(start_times) < min(end_times)
-
-        With a sequential for-loop each call is spaced 0.2 s apart, so
-        max(starts) ≈ 0.4 >= min(ends) ≈ 0.2 and the assertion fails.
-        With asyncio.gather all three overlap and the invariant holds.
+        Uses ``asyncio.Barrier(3)`` as a deterministic synchronization point:
+        each intercepted coroutine waits at the barrier, which only releases
+        once all three parties arrive.  Under the concurrent ``asyncio.gather``
+        path all three coroutines enter and the barrier releases immediately.
+        A sequential regression would block at the first call — the second
+        and third parties never arrive — so the surrounding ``asyncio.wait_for``
+        raises ``TimeoutError`` and fails the test with a clear signal.  No
+        scheduler-timing slack (``asyncio.sleep`` + wall-clock assertion) is
+        involved, so the test is immune to loaded-runner jitter.
 
         Each done step references a DISTINCT commit so the deduplication pass
         does not collapse the three queries into one.
@@ -895,31 +898,45 @@ class TestCheckPlanTargetsInTree:
         try:
             from orchestrator import merge_queue as mq
             original_run = mq._run
-            start_times: list[float] = []
-            end_times: list[float] = []
+            # Barrier(3) releases only once all three intercepted coroutines
+            # have arrived — i.e. only under concurrent execution.  Sequential
+            # execution leaves the first caller blocked indefinitely, caught
+            # below by asyncio.wait_for.
+            barrier = asyncio.Barrier(3)
+            call_count = 0
 
             async def _intercept(cmd, cwd=None, **kwargs):
+                nonlocal call_count
                 if '--diff-filter=D' in cmd:
-                    start_times.append(asyncio.get_running_loop().time())
-                    await asyncio.sleep(0.2)
-                    end_times.append(asyncio.get_running_loop().time())
+                    call_count += 1
+                    await barrier.wait()
                     return 0, '', ''
                 return await original_run(cmd, cwd=cwd, **kwargs)
 
             with patch('orchestrator.merge_queue._run', new=_intercept):
-                await _check_plan_targets_in_tree(
-                    merge_result.merge_commit, worktree, git_ops,
-                )
+                # Tight timeout: concurrent execution releases the barrier
+                # effectively instantly; any sequential regression will hang
+                # until this fires.  1 s is ample for CI scheduler latency
+                # (barrier releases in microseconds under asyncio.gather);
+                # failing fast avoids a 5 s dead wait on a real regression.
+                # The except block re-raises as AssertionError so the failure
+                # message is self-describing rather than a bare TimeoutError.
+                try:
+                    await asyncio.wait_for(
+                        _check_plan_targets_in_tree(
+                            merge_result.merge_commit, worktree, git_ops,
+                        ),
+                        timeout=1.0,
+                    )
+                except TimeoutError:
+                    raise AssertionError(
+                        'Sequential execution detected: barrier never '
+                        'released within 1 s — asyncio.gather concurrency '
+                        'regression in _check_plan_targets_in_tree'
+                    ) from None
 
-            assert len(start_times) == 3, (
-                f'Expected 3 diff-tree calls, got {len(start_times)}'
-            )
-            assert len(end_times) == 3, (
-                f'Expected 3 diff-tree calls to complete, got {len(end_times)}'
-            )
-            assert max(start_times) < min(end_times), (
-                f'Sequential execution detected: starts={start_times}, '
-                f'ends={end_times}'
+            assert call_count == 3, (
+                f'Expected 3 diff-tree calls, got {call_count}'
             )
         finally:
             if merge_result.merge_worktree:
