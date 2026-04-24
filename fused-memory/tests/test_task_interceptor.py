@@ -3584,3 +3584,49 @@ async def test_expand_task_removes_intra_batch_duplicates(
 
     # (d) curator.curate called exactly twice — unique survivors only
     assert curator_interceptor._curator.curate.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_parse_prd_removes_intra_batch_duplicates(
+    curator_interceptor, taskmaster,
+):
+    """parse_prd routes through _dedupe_bulk_created so the intra-batch
+    pre-pass applies identically.
+
+    Three top-level tasks: id=11 is a case+whitespace variant of id=10 →
+    intra-batch duplicate removed.  id=12 is unrelated.
+    Proves the pre-pass is shared between expand_task and parse_prd paths.
+    """
+    pre_snapshot = {'tasks': []}
+    post_snapshot = {'tasks': [
+        {'id': '10', 'title': 'Setup DB', 'description': 'postgres'},
+        {'id': '11', 'title': 'SETUP db', 'description': 'Postgres'},
+        {'id': '12', 'title': 'Write tests', 'description': 'unit tests'},
+    ]}
+
+    taskmaster.get_tasks = AsyncMock(side_effect=[pre_snapshot, post_snapshot])
+    taskmaster.remove_task = AsyncMock(return_value={'success': True})
+    # parse_prd must return a dict so result['dedup'] assignment works
+    taskmaster.parse_prd = AsyncMock(return_value={'tasks': []})
+
+    curator_interceptor._curator = _mock_curator(
+        CuratorDecision(action='create', justification='new')
+    )
+
+    result = await curator_interceptor.parse_prd('prd.md', '/project')
+
+    dedup = result['dedup']
+
+    # exactly 1 removed entry for '11'
+    assert len(dedup['removed']) == 1, f"removed={dedup['removed']}"
+    removed_entry = dedup['removed'][0]
+    assert removed_entry['task_id'] == '11', removed_entry
+    assert removed_entry['reason'] == 'intra_batch_duplicate', removed_entry
+    assert removed_entry['matched_task_id'] == '10', removed_entry
+
+    # 2 kept entries: '10' and '12'
+    kept_ids = {k['task_id'] for k in dedup['kept']}
+    assert kept_ids == {'10', '12'}, f"kept_ids={kept_ids}"
+
+    # curator.curate called exactly twice (unique survivors only, not 3)
+    assert curator_interceptor._curator.curate.await_count == 2
