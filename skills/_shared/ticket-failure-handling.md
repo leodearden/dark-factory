@@ -15,7 +15,7 @@ pattern.  Four skills reference it:
 
 ```
 ticket = submit_task(title=..., description=..., metadata=...)
-resolve = resolve_ticket(ticket=ticket, project_root=...)
+resolve = resolve_ticket(ticket=ticket, project_root=..., timeout_seconds=60)
 ```
 
 `resolve["status"]` is one of `"created"`, `"combined"`, or `"failed"`.
@@ -58,8 +58,9 @@ duplicate into an existing task via `"combined"`, but this is not guaranteed.
 
 ### `timeout`
 
-The `resolve_ticket` call hit its timeout limit (default 115 s); the worker
-may still be processing the original ticket.
+The `resolve_ticket` call hit its configured timeout (60 s by convention;
+115 s is the server default if omitted); the worker may still be processing
+the original ticket.
 
 **Policy:**
 1. First, retry `resolve_ticket(ticket=same_ticket, ...)` with the **original
