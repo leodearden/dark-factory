@@ -2675,6 +2675,18 @@ class TestRecoverIfAlreadyMerged:
         wt = wt_info.path
         task_dir = wt / '.task'
         task_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1a. Capture base_commit BEFORE making the implementation commit and
+        #     stamp metadata.json so _has_prior_implementation(wt_head=...) takes
+        #     the SHA-primary path: wt_head (post-commit) != base_commit → has_work=True.
+        #     Without metadata.json the fail-closed branch fires (wt_head not None,
+        #     base_commit None) and returns has_work=False — silent false-not-DONE.
+        _, base_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        base_sha = base_sha_raw.strip()
+        (task_dir / 'metadata.json').write_text(
+            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': base_sha})
+        )
+
         (task_dir / 'iterations.jsonl').write_text(
             _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
         )
@@ -2870,10 +2882,13 @@ class TestRecoverIfAlreadyMerged:
         recovery correctly returns None.
 
         Design decision: we also write metadata.json (mimicking artifacts.init())
-        so that _has_prior_implementation(wt_head=...) finds a non-None
-        base_commit and takes the SHA-primary path.  Without metadata.json
-        read_base_commit() returns None → iteration-log fallback → still
-        has_work=True even after the wt_head change.
+        so that _has_prior_implementation(wt_head=...) takes the SHA-equality
+        path: wt_head == base_commit → has_work=False.  Stamping metadata.json
+        is no longer strictly required for safety (the fail-closed branch at
+        step-2 also returns has_work=False when base_commit is None), but we
+        keep it here to exercise that specific SHA-equality path.  The
+        companion test (test_returns_none_when_wt_head_provided_but_metadata_missing)
+        deliberately omits metadata.json to cover the fail-closed branch.
         """
         import json as _json
 
@@ -3192,6 +3207,16 @@ class TestRecoverIfAlreadyMerged:
         wt = wt_info.path
         task_dir = wt / '.task'
         task_dir.mkdir(parents=True, exist_ok=True)
+
+        # Capture base_commit BEFORE the implementation commit and stamp metadata.json
+        # so _has_prior_implementation(wt_head=...) takes the SHA-primary path:
+        # wt_head (post-commit) != base_commit → has_work=True → DONE.
+        _, base_sha_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        base_sha = base_sha_raw.strip()
+        (task_dir / 'metadata.json').write_text(
+            _json.dumps({'task_id': task_assignment.task_id, 'base_commit': base_sha})
+        )
+
         (task_dir / 'iterations.jsonl').write_text(
             _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
         )
