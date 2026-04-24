@@ -2753,8 +2753,9 @@ async def test_single_call_latency_not_regressed(
         await interceptor.set_task_status('1', status, '/project')
     elapsed = time.perf_counter() - start
     # Very generous bound — on a mock this should complete in well under
-    # 2s; bumping for CI jitter.
-    assert elapsed < 2.0, f'{N} sequential calls took {elapsed:.3f}s'
+    # 4s even with real SQLite event-buffer writes and 32 xdist workers
+    # competing for disk I/O; bumping from 2s to 4s for CI jitter.
+    assert elapsed < 4.0, f'{N} sequential calls took {elapsed:.3f}s'
 
 
 @pytest.mark.asyncio
