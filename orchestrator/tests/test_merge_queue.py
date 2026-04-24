@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -448,6 +449,269 @@ class TestCheckPlanTargetsInTree:
                 merge_result.merge_commit, worktree, git_ops,
             )
             assert missing == []
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_file_deleted_by_done_step_is_not_reported_as_dropped(
+        self, git_ops: GitOps,
+    ):
+        """File missing from merge tree but deleted in a done step → excluded from result.
+
+        This guards against false-positive drop reports when a TDD task's later
+        steps intentionally delete files that earlier steps created.  The file
+        appears in plan['files'] (it was a planned target) but it was legitimately
+        removed by a done step whose commit is recorded in the plan.
+        """
+        worktree = (await git_ops.create_worktree('plan-deleted-done')).path
+
+        # Step 1: create the file and commit it
+        (worktree / 'created_then_deleted.py').write_text('# created\n')
+        create_sha = await git_ops.commit(worktree, 'Create created_then_deleted.py')
+        assert create_sha is not None
+
+        # Step 2: delete the file and commit the deletion
+        (worktree / 'created_then_deleted.py').unlink()
+        delete_sha = await git_ops.commit(worktree, 'Delete created_then_deleted.py')
+        assert delete_sha is not None
+
+        # Plan still lists the file (it was a planned target), but one done
+        # step deleted it — so it should NOT be reported as a drop.
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-del', 'T-del', 'desc')
+        artifacts.write_plan({
+            'files': ['created_then_deleted.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'create',
+                    'status': 'done',
+                    'commit': create_sha,
+                },
+                {
+                    'id': 'step-2',
+                    'description': 'delete',
+                    'status': 'done',
+                    'commit': delete_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'plan-deleted-done')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            # File is absent from merge tree but was intentionally deleted →
+            # must NOT appear in the dropped list.
+            assert missing == []
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_true_drop_still_reported_when_mixed_with_expected_deletion(
+        self, git_ops: GitOps,
+    ):
+        """True conflict-resolution drops are still returned alongside expected deletions.
+
+        Plan has three files:
+        - kept.py:         present in the merge tree (no issue)
+        - deleted.py:      absent from the merge tree, but deleted by a done step → expected_absent
+        - never_created.py: absent from the merge tree with no done-step deletion → real drop
+
+        Only never_created.py should be in the returned list.
+        """
+        worktree = (await git_ops.create_worktree('plan-mixed-drops')).path
+
+        # kept.py stays in the tree
+        (worktree / 'kept.py').write_text('kept = 1\n')
+        # deleted.py will be created and then deleted
+        (worktree / 'deleted.py').write_text('deleted = 1\n')
+        await git_ops.commit(worktree, 'Add kept.py and deleted.py')
+
+        # Deletion commit — only deleted.py is removed
+        (worktree / 'deleted.py').unlink()
+        delete_sha = await git_ops.commit(worktree, 'Delete deleted.py')
+        assert delete_sha is not None
+
+        # never_created.py is never committed — simulates a conflict-resolution drop
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-mixed', 'T-mixed', 'desc')
+        artifacts.write_plan({
+            'files': ['kept.py', 'deleted.py', 'never_created.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'delete deleted.py',
+                    'status': 'done',
+                    'commit': delete_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'plan-mixed-drops')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            # kept.py is present, deleted.py is expected_absent, only the
+            # true drop remains.
+            assert missing == ['never_created.py']
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_pending_step_deletion_is_not_trusted_as_expected_absent(
+        self, git_ops: GitOps,
+    ):
+        """A file deleted in a *pending* step's commit is NOT treated as expected_absent.
+
+        Only done steps' deletions are trusted.  If the step that deleted the file
+        has status='pending', the file's absence is still treated as a real drop.
+        """
+        worktree = (await git_ops.create_worktree('plan-pending-del')).path
+
+        (worktree / 'would_delete.py').write_text('# would be deleted\n')
+        create_sha = await git_ops.commit(worktree, 'Add would_delete.py')
+        assert create_sha is not None
+
+        (worktree / 'would_delete.py').unlink()
+        delete_sha = await git_ops.commit(worktree, 'Delete would_delete.py')
+        assert delete_sha is not None
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-pend', 'T-pend', 'desc')
+        # Step that performed the deletion has status='pending' — must NOT be trusted
+        artifacts.write_plan({
+            'files': ['would_delete.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'delete would_delete.py',
+                    'status': 'pending',   # ← not done
+                    'commit': delete_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'plan-pending-del')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            # pending step → deletion not trusted → file is a real drop
+            assert missing == ['would_delete.py']
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_done_step_with_null_commit_is_not_trusted_as_expected_absent(
+        self, git_ops: GitOps,
+    ):
+        """A done step with commit=None is skipped — its deletions are not trusted.
+
+        If a step is marked done but has no recorded commit SHA (e.g. it was
+        marked done before the commit was recorded), the absence of its planned
+        files is still treated as a real drop.
+        """
+        worktree = (await git_ops.create_worktree('plan-null-commit')).path
+
+        (worktree / 'would_delete.py').write_text('# would be deleted\n')
+        await git_ops.commit(worktree, 'Add would_delete.py')
+
+        (worktree / 'would_delete.py').unlink()
+        await git_ops.commit(worktree, 'Delete would_delete.py')
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-null', 'T-null', 'desc')
+        # Step is done but commit is None — must NOT be trusted
+        artifacts.write_plan({
+            'files': ['would_delete.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'delete would_delete.py',
+                    'status': 'done',
+                    'commit': None,   # ← no commit recorded
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'plan-null-commit')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            missing = await _check_plan_targets_in_tree(
+                merge_result.merge_commit, worktree, git_ops,
+            )
+            # done but commit=None → deletion not trusted → file is a real drop
+            assert missing == ['would_delete.py']
+        finally:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_git_log_error_logs_warning_and_treats_file_as_dropped(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        """git log non-zero rc → warning logged, file remains in dropped list (fail-closed).
+
+        A done step with a non-existent/bad commit SHA causes the git log call to fail.
+        The implementation must (a) log a WARNING mentioning the step/commit, and (b)
+        conservatively leave the file as a real drop (not mask it as expected_absent).
+        """
+        worktree = (await git_ops.create_worktree('plan-bad-sha')).path
+
+        # gone.py is never committed to the worktree → it will be missing from
+        # the merge tree (simulates a conflict-resolution drop).
+        # We need at least one file so merge_to_main succeeds
+        (worktree / 'anchor.py').write_text('anchor = 1\n')
+        await git_ops.commit(worktree, 'Add anchor.py')
+
+        bad_sha = '0' * 40  # plausible SHA shape but non-existent
+
+        artifacts = TaskArtifacts(worktree)
+        artifacts.init('t-bad-sha', 'T-bad-sha', 'desc')
+        artifacts.write_plan({
+            'files': ['gone.py'],
+            'modules': [],
+            'steps': [
+                {
+                    'id': 'step-1',
+                    'description': 'supposedly deleted gone.py',
+                    'status': 'done',
+                    'commit': bad_sha,
+                },
+            ],
+        })
+
+        merge_result = await git_ops.merge_to_main(worktree, 'plan-bad-sha')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        try:
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                missing = await _check_plan_targets_in_tree(
+                    merge_result.merge_commit, worktree, git_ops,
+                )
+            # (a) git log fails → file stays as dropped (fail-closed)
+            assert missing == ['gone.py']
+            # (b) a warning was emitted mentioning the bad commit
+            warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert warning_records, 'Expected at least one WARNING log record'
+            assert any(bad_sha in r.getMessage() for r in warning_records), (
+                f'Expected WARNING mentioning the bad SHA {bad_sha!r}; '
+                f'got: {[r.getMessage() for r in warning_records]}'
+            )
         finally:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)

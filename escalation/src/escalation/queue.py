@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import tempfile
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
@@ -98,7 +99,24 @@ class EscalationQueue:
             candidates = list(self._iter_archive_paths(f'{escalation_id}.json'))
             if not candidates:
                 return None
-            path = candidates[0]
+            if len(candidates) > 1:
+                logger.warning(
+                    f'Multiple archive files for {escalation_id}: '
+                    f'{[str(p) for p in candidates]}; selecting newest by parent dir date'
+                )
+                # YYYY-MM-DD sorts lexicographically == chronologically.
+                # Non-YYYY-MM-DD parent names fall back to '' (treated as oldest),
+                # matching the comment and ensuring valid date dirs always win.
+                path = max(
+                    candidates,
+                    key=lambda p: (
+                        p.parent.name
+                        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', p.parent.name)
+                        else ''
+                    ),
+                )
+            else:
+                path = candidates[0]
         try:
             return Escalation.from_json(path.read_text())
         except (json.JSONDecodeError, KeyError, TypeError) as e:
@@ -114,16 +132,29 @@ class EscalationQueue:
         - status == 'pending': scan queue root only (fast path, skips archive).
         - status is None or another value: scan queue root PLUS archive/**/ to
           include resolved/dismissed escalations that have been moved out.
+
+        Deduplication: if the same escalation id appears in both the queue root
+        and the archive (e.g. crash mid-resolve), only the first occurrence is
+        returned and a WARNING is logged.  Iteration order is queue root first,
+        archive second, so the queue_dir copy wins when both exist.
         """
         # Build the candidate path list.
         paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
         if status != 'pending':
             paths.extend(self._iter_archive_paths('esc-*.json'))
 
+        seen: set[str] = set()
         results = []
         for path in paths:
             try:
                 esc = Escalation.from_json(path.read_text())
+                if esc.id in seen:
+                    logger.warning(
+                        f'Duplicate escalation id {esc.id!r} at {path}; '
+                        'skipping (queue_dir copy takes precedence)'
+                    )
+                    continue
+                seen.add(esc.id)
                 if esc.task_id != task_id:
                     continue
                 if status is not None and esc.status != status:
@@ -159,10 +190,21 @@ class EscalationQueue:
         self, escalation_id: str, resolution: str, dismiss: bool = False,
         *, resolved_by: str | None = None, resolution_turns: int | None = None,
     ) -> Escalation | None:
-        """Update an escalation's status to resolved or dismissed."""
+        """Update an escalation's status to resolved or dismissed.
+
+        Idempotent: if the escalation is already resolved or dismissed, this
+        method returns the existing escalation unchanged without re-archiving
+        or re-firing the _resolve_callback.
+        """
         esc = self.get(escalation_id)
         if esc is None:
             return None
+
+        if esc.status != 'pending':
+            logger.info(
+                f'Escalation {escalation_id} already {esc.status}; resolve() is a no-op'
+            )
+            return esc
 
         esc.status = 'dismissed' if dismiss else 'resolved'
         esc.resolution = resolution
@@ -232,8 +274,13 @@ class EscalationQueue:
     def dismiss_all_pending(self, resolution: str) -> int:
         """Dismiss all pending escalations with the given resolution message.
 
-        Returns the number of escalations dismissed.
-        Already-resolved or already-dismissed escalations are not modified.
+        Returns the number of escalations where resolve() returned non-None.
+        In the common single-writer case this equals the number actually dismissed.
+        In a concurrent-write race (another process resolves an escalation between
+        get_pending() and resolve()), resolve() is a no-op but still returns the
+        existing escalation, so the count may include those no-ops.  The counter
+        is best read as "attempted dismissals, including no-ops for concurrent
+        resolutions".  This function is single-writer in practice.
         """
         pending = self.get_pending()
         count = 0

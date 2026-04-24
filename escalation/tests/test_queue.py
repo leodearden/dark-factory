@@ -221,6 +221,67 @@ class TestGetArchiveFallback:
         assert result.resolution == 'Archive fallback works'
 
 
+class TestGetWithDuplicateArchiveCandidates:
+    """get() must warn and pick the newest when multiple archive files share one id."""
+
+    def test_get_with_duplicate_archive_files_logs_warning_and_returns_newest(
+        self, tmp_path: Path, caplog,
+    ):
+        """When two archive files exist for the same id, get() warns and returns the newest.
+
+        Failure mode in current main: candidates[0] is returned without a warning,
+        and the order is filesystem-dependent (not deterministic).
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Manually create two archive files for the same id under different dated subdirs.
+        # Neither file exists in queue_dir root (simulating a duplicate-archive state).
+        older_dir = queue.queue_dir / 'archive' / '2025-01-01'
+        newer_dir = queue.queue_dir / 'archive' / '2025-06-15'
+        older_dir.mkdir(parents=True, exist_ok=True)
+        newer_dir.mkdir(parents=True, exist_ok=True)
+
+        older_esc = _make_escalation('esc-1-1', status='resolved')
+        older_esc.resolution = 'older'
+        (older_dir / 'esc-1-1.json').write_text(older_esc.to_json())
+
+        newer_esc = _make_escalation('esc-1-1', status='resolved')
+        newer_esc.resolution = 'newer'
+        (newer_dir / 'esc-1-1.json').write_text(newer_esc.to_json())
+
+        # Confirm setup: no root file, two archive files
+        assert not (queue.queue_dir / 'esc-1-1.json').exists()
+        archive_files = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archive_files) == 2
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            result = queue.get('esc-1-1')
+
+        # (a) Must return the newest (2025-06-15), not arbitrary candidates[0]
+        assert result is not None
+        assert result.resolution == 'newer', (
+            f"Expected resolution='newer' (from 2025-06-15 dir), got {result.resolution!r}"
+        )
+
+        # (b) A warning must mention the escalation id and both candidate paths.
+        # We check for the full path strings rather than just date substrings so
+        # that the assertion remains meaningful if the log format changes (e.g. a
+        # refactor that logs a count instead of the date components would still
+        # need to include the actual paths to be useful).
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        older_path_str = str(older_dir / 'esc-1-1.json')
+        newer_path_str = str(newer_dir / 'esc-1-1.json')
+        assert any('esc-1-1' in msg for msg in warning_messages), (
+            f'Expected a WARNING mentioning esc-1-1; got: {warning_messages}'
+        )
+        assert any(older_path_str in msg for msg in warning_messages), (
+            f'Expected a WARNING mentioning {older_path_str!r}; got: {warning_messages}'
+        )
+        assert any(newer_path_str in msg for msg in warning_messages), (
+            f'Expected a WARNING mentioning {newer_path_str!r}; got: {warning_messages}'
+        )
+
+
 class TestGetByTaskAcrossArchive:
     """get_by_task() two-tier scan: hot path skips archive; broad path includes it."""
 
@@ -333,6 +394,106 @@ class TestResolveArchives:
         warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert any('esc-1-1' in msg for msg in warning_messages), (
             f'Expected a warning mentioning esc-1-1; got: {warning_messages}'
+        )
+
+
+class TestResolveIdempotent:
+    """EscalationQueue.resolve() is idempotent: a second call returns the first resolution unchanged."""
+
+    def test_resolve_twice_returns_same_escalation_without_orphan(self, tmp_path: Path):
+        """Second resolve() call must be a no-op: same resolution, same archive file.
+
+        Failure mode in current main: the second call re-reads from archive, writes a
+        fresh queue_dir copy, and archives it again — creating an orphan archive file
+        and overwriting resolution/resolved_at.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        # First resolve
+        first_result = queue.resolve('esc-1-1', 'Fixed once')
+        assert first_result is not None
+        assert first_result.status == 'resolved'
+
+        # Exactly one archive file after first resolve
+        archive_files_after_first = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archive_files_after_first) == 1, (
+            f'Expected 1 archive file after first resolve, got {archive_files_after_first}'
+        )
+        first_archive_path = archive_files_after_first[0]
+        first_resolved_at = first_result.resolved_at
+
+        # Second resolve — must be a no-op
+        second_result = queue.resolve('esc-1-1', 'Fixed again')
+
+        # (a) Return value is non-None with status='resolved'
+        assert second_result is not None
+        assert second_result.status == 'resolved'
+
+        # (b) Resolution and resolved_at are from the FIRST call, not overwritten
+        assert second_result.resolution == 'Fixed once', (
+            f"Expected resolution='Fixed once' (first call), got {second_result.resolution!r}"
+        )
+        assert second_result.resolved_at == first_resolved_at, (
+            f'Expected resolved_at to be unchanged; '
+            f'first={first_resolved_at!r}, second={second_result.resolved_at!r}'
+        )
+
+        # (c) Still exactly one archive file, same path as before (no orphan)
+        archive_files_after_second = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archive_files_after_second) == 1, (
+            f'Expected 1 archive file after second resolve (no orphan), '
+            f'got {[str(p) for p in archive_files_after_second]}'
+        )
+        assert archive_files_after_second[0] == first_archive_path, (
+            f'Archive file path changed: first={first_archive_path}, '
+            f'second={archive_files_after_second[0]}'
+        )
+
+
+class TestGetByTaskDedupAcrossArchive:
+    """get_by_task() must deduplicate when the same escalation id appears in both
+    the queue root and the archive (crash-mid-resolve / backup-restore scenario)."""
+
+    def test_get_by_task_dedups_when_id_in_both_queue_and_archive(self, tmp_path: Path):
+        """get_by_task() returns exactly one item when id exists in both locations.
+
+        Failure mode in current main: two-tier scan concatenates without dedup,
+        so the caller receives two Escalation instances for the same id.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        # Submit and resolve esc-42-1 — moves into archive
+        queue.submit(_make_escalation('esc-42-1', task_id='42'))
+        queue.resolve('esc-42-1', 'original_resolution')
+
+        # Sanity: file should now be in archive, not in queue root
+        assert not (queue.queue_dir / 'esc-42-1.json').exists()
+        archive_files = list((queue.queue_dir / 'archive').rglob('esc-42-1.json'))
+        assert len(archive_files) == 1
+
+        # Simulate crash-mid-resolve / backup-restore: copy the archived file
+        # back into the queue root with a modified resolution to test dedup precedence.
+        archived_esc = _make_escalation('esc-42-1', task_id='42', status='resolved')
+        archived_esc.resolution = 'from_queue_root'
+        (queue.queue_dir / 'esc-42-1.json').write_text(archived_esc.to_json())
+
+        # Confirm the "maybe-in-two-places" state
+        assert (queue.queue_dir / 'esc-42-1.json').exists()
+        assert len(list((queue.queue_dir / 'archive').rglob('esc-42-1.json'))) == 1
+
+        # get_by_task must return exactly one item (deduped)
+        results = queue.get_by_task('42')
+        ids = [e.id for e in results]
+        assert ids.count('esc-42-1') == 1, (
+            f'Expected exactly one esc-42-1 in results, got {len(ids)} entries: {ids}'
+        )
+
+        # queue_dir copy must win (iteration order: root first, archive second)
+        returned_esc = next(e for e in results if e.id == 'esc-42-1')
+        assert returned_esc.resolution == 'from_queue_root', (
+            f"Expected queue_dir copy to win (resolution='from_queue_root'), "
+            f"got {returned_esc.resolution!r}"
         )
 
 

@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import random
 import time
 from collections import deque
@@ -58,6 +59,8 @@ class EventQueue:
         retry_max_seconds: float = 30.0,
         shutdown_flush_seconds: float = 10.0,
         overflow_warn_interval_seconds: float = 60.0,
+        max_bytes: int | None = None,
+        keep_rotations: int = 3,
     ):
         self._buffer = event_buffer
         self._dead_letter_path = Path(dead_letter_path)
@@ -66,6 +69,8 @@ class EventQueue:
         self._retry_max = retry_max_seconds
         self._shutdown_flush = shutdown_flush_seconds
         self._overflow_warn_interval = overflow_warn_interval_seconds
+        self._max_bytes = max_bytes
+        self._keep_rotations = keep_rotations
         self._drainer_task: asyncio.Task | None = None
         self._closed = False
         # Stats surface for WP-C watchdog / WP-D policy.
@@ -303,6 +308,13 @@ class EventQueue:
         }
         try:
             self._dead_letter_path.parent.mkdir(parents=True, exist_ok=True)
+            # Rotate before appending when the file has grown past the byte cap.
+            if (
+                self._max_bytes is not None
+                and self._dead_letter_path.exists()
+                and self._dead_letter_path.stat().st_size >= self._max_bytes
+            ):
+                self._rotate_dead_letter()
             with self._dead_letter_path.open('a', encoding='utf-8') as fh:
                 fh.write(json.dumps(record) + '\n')
             self._dead_letters += 1
@@ -311,3 +323,112 @@ class EventQueue:
                 'EventQueue: failed to append dead-letter record for event=%s: %s',
                 event.id, exc,
             )
+
+    def _rotate_dead_letter(self) -> None:
+        """Cascade-rotate dead-letter files.
+
+        ``dead_letter.jsonl``   → ``dead_letter.jsonl.1``
+        ``dead_letter.jsonl.1`` → ``dead_letter.jsonl.2``
+        …
+        ``dead_letter.jsonl.{keep}`` → overwritten/dropped by the cascade
+
+        When ``keep_rotations == 0``, the current file is simply unlinked so
+        the byte cap is still honoured (nothing is archived).
+
+        Uses ``os.replace`` for atomicity — it already overwrites the
+        destination on POSIX and Windows, so no pre-unlink is needed.
+        Any error is caught and logged to preserve the best-effort contract.
+        """
+        try:
+            if self._keep_rotations == 0:
+                # No archival rotations: just discard the current file.
+                self._dead_letter_path.unlink(missing_ok=True)
+                return
+            # Work from oldest → newest so we never overwrite unsaved data.
+            # os.replace atomically overwrites the destination; the oldest
+            # file (index keep_rotations) is simply replaced/dropped by the
+            # cascade without a separate unlink step.
+            for i in range(self._keep_rotations, 0, -1):
+                src = Path(f'{self._dead_letter_path}.{i - 1}') if i > 1 else self._dead_letter_path
+                dst = Path(f'{self._dead_letter_path}.{i}')
+                if src.exists():
+                    os.replace(src, dst)
+        except Exception as exc:
+            logger.error(
+                'EventQueue: dead-letter rotation failed: %s', exc,
+            )
+
+    # ── read dead-letters ──────────────────────────────────────────────
+
+    def read_dead_letters(
+        self,
+        *,
+        limit: int | None = None,
+        project_id: str | None = None,
+    ) -> list[dict]:
+        """Return dead-letter records from the JSONL file(s), newest-first.
+
+        Enumerates :attr:`_dead_letter_path`, then ``.1``, ``.2`` … up to
+        ``keep_rotations`` siblings.  Within each file lines are reversed so
+        the newest record appears first.  Records from the current file
+        precede those from rotated siblings.
+
+        Args:
+            limit: Maximum number of records to return.  *None* means all.
+            project_id: When given, only records whose
+                ``event['project_id']`` matches are included.
+
+        Returns:
+            A list of dicts with keys ``event``, ``reason``, ``attempts``,
+            ``failed_at``.  Never raises — I/O errors yield an empty list
+            plus a logged warning.
+        """
+        # Build the ordered list of paths: current first, then .1, .2, …
+        paths: list[Path] = [self._dead_letter_path]
+        for i in range(1, self._keep_rotations + 1):
+            paths.append(Path(f'{self._dead_letter_path}.{i}'))
+
+        results: list[dict] = []
+        try:
+            for path in paths:
+                if not path.exists():
+                    continue
+                try:
+                    lines = path.read_text(encoding='utf-8').splitlines()
+                except OSError as exc:
+                    logger.warning(
+                        'EventQueue.read_dead_letters: cannot read %s: %s', path, exc,
+                    )
+                    continue
+
+                # Reverse so newest (last-appended) lines come first.
+                for line in reversed(lines):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        logger.warning(
+                            'EventQueue.read_dead_letters: malformed line in %s: %s',
+                            path, exc,
+                        )
+                        continue
+
+                    # Filter by project_id if requested.
+                    if project_id is not None:
+                        event = rec.get('event') or {}
+                        if event.get('project_id') != project_id:
+                            continue
+
+                    results.append(rec)
+                    if limit is not None and len(results) >= limit:
+                        return results
+
+        except Exception as exc:
+            logger.warning(
+                'EventQueue.read_dead_letters: unexpected error: %s', exc,
+            )
+            return []
+
+        return results

@@ -20,6 +20,7 @@ from fused_memory.utils.validation import validate_project_id, validate_project_
 if TYPE_CHECKING:
     from fused_memory.middleware.task_interceptor import TaskInterceptor
     from fused_memory.reconciliation.backlog_policy import BacklogPolicy
+    from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
     from fused_memory.services.write_journal import WriteJournal
 
@@ -138,6 +139,54 @@ def _resolve_identity(
     return agent_id, session_id
 
 
+# ---------------------------------------------------------------------------
+# Dead-letter payload truncation
+# ---------------------------------------------------------------------------
+
+_DEAD_LETTER_PAYLOAD_MAX_BYTES = 2048
+
+
+def _truncate_payload(payload: Any) -> tuple[Any, bool]:
+    """Truncate *payload* if its JSON serialisation exceeds the byte budget.
+
+    Returns ``(payload, truncated)`` where *truncated* is ``True`` when the
+    payload was cut.  Small payloads are returned unchanged with ``False``.
+
+    When truncated, a typed envelope dict is returned instead of the original
+    value, so callers never receive a surprising type change::
+
+        {
+            '_truncated': True,
+            'text': '<first N bytes of the JSON text>',
+            'original_type': '<type name>',
+        }
+
+    This lets downstream consumers key into ``payload['text']`` without having
+    to special-case a str-vs-dict union on the ``payload`` field.
+
+    The budget check is applied to ``json.dumps(payload)`` so that the result
+    is safe for MCP JSON transport (where the payload field gets JSON-encoded).
+    The ``text`` field in the returned envelope is capped to
+    ``_DEAD_LETTER_PAYLOAD_MAX_BYTES`` bytes when UTF-8 encoded.
+    """
+    try:
+        serialised = json.dumps(payload, default=str)
+    except (TypeError, ValueError):
+        serialised = str(payload)
+    if len(serialised.encode()) <= _DEAD_LETTER_PAYLOAD_MAX_BYTES:
+        return payload, False
+    # Cap the raw JSON text to the byte budget, then return a stable-typed
+    # envelope so the `payload` field stays a dict regardless of truncation.
+    text = serialised.encode()[:_DEAD_LETTER_PAYLOAD_MAX_BYTES].decode(
+        'utf-8', errors='replace'
+    )
+    return {
+        '_truncated': True,
+        'text': text,
+        'original_type': type(payload).__name__,
+    }, True
+
+
 def create_mcp_server(
     memory_service: MemoryService,
     task_interceptor: TaskInterceptor | None = None,
@@ -145,6 +194,7 @@ def create_mcp_server(
     *,
     reconciliation_harness: ReconciliationHarness | None = None,
     backlog_policy: BacklogPolicy | None = None,
+    event_queue: EventQueue | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
@@ -999,6 +1049,86 @@ def create_mcp_server(
             raise
         except Exception as e:
             logger.exception(f'replay_dead_letters error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def get_dead_letters(
+        project_id: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Inspect dead-lettered items from both the durable write queue and
+        the event dead-letter JSONL file.
+
+        Returns a merged list of dead-letter records from all sources,
+        newest-first, with a ``source`` discriminator so operators can triage
+        in one place.
+
+        Args:
+            project_id: Filter to a specific project (optional — all if omitted)
+            limit: Maximum total items to return (default 100)
+        """
+        try:
+            items: list[dict[str, Any]] = []
+
+            # --- durable write queue ---
+            if memory_service.durable_queue is not None:
+                dead = await memory_service.durable_queue.get_dead_items(
+                    group_id=project_id, limit=limit,
+                )
+                for row in dead:
+                    payload, truncated = _truncate_payload(row.get('payload'))
+                    item: dict[str, Any] = {
+                        'source': 'durable_queue',
+                        'id': row.get('id'),
+                        'operation': row.get('operation'),
+                        'payload': payload,
+                        'error': row.get('error'),
+                        'timestamp': row.get('created_at'),
+                        'attempts': row.get('attempts'),
+                    }
+                    if truncated:
+                        item['payload_truncated'] = True
+                    items.append(item)
+
+            # --- event queue dead-letter JSONL ---
+            eq_items: list[dict[str, Any]] = []
+            if event_queue is not None:
+                remaining = limit - len(items)
+                if remaining > 0:
+                    # read_dead_letters does synchronous file I/O; offload to a
+                    # thread so the event loop is not blocked on large files.
+                    records = await asyncio.to_thread(
+                        event_queue.read_dead_letters,
+                        limit=remaining, project_id=project_id,
+                    )
+                    for rec in records:
+                        ev = rec.get('event') or {}
+                        payload, truncated = _truncate_payload(ev.get('payload'))
+                        eq_item: dict[str, Any] = {
+                            'source': 'event_queue',
+                            'id': ev.get('id'),
+                            'type': ev.get('type'),
+                            'payload': payload,
+                            'reason': rec.get('reason'),
+                            'timestamp': rec.get('failed_at'),
+                            'attempts': rec.get('attempts'),
+                            'project_id': ev.get('project_id'),
+                        }
+                        if truncated:
+                            eq_item['payload_truncated'] = True
+                        eq_items.append(eq_item)
+
+            all_items = items + eq_items
+            counts: dict[str, int] = {
+                'durable_queue': sum(1 for i in all_items if i['source'] == 'durable_queue'),
+                'event_queue': sum(1 for i in all_items if i['source'] == 'event_queue'),
+            }
+
+            return {'items': all_items[:limit], 'counts': counts}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'get_dead_letters error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     # ------------------------------------------------------------------

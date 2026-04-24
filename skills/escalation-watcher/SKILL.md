@@ -389,7 +389,7 @@ Technical debt or cleanup discovered during development.
      At this callsite (Case A — the escalation's id is already in scope), the concrete
      synthesis is:
      ```python
-     suggestion_hash = hashlib.sha256(escalation.detail.encode()).hexdigest()[:16]
+     suggestion_hash = hashlib.sha256((escalation['detail'] or escalation['summary'] or escalation['id']).encode()).hexdigest()[:16]
      ```
 
   Resolve via `mcp__escalation__resolve_issue` once the ticket resolves.
