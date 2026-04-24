@@ -112,29 +112,6 @@ class TestDisallowedToolLists:
         """Deprecated add_task facade must still be blocked (defence-in-depth)."""
         assert 'mcp__fused-memory__add_task' in DISALLOW_TASK_WRITES
 
-    def test_submit_task_not_in_stage2_disallowed(self):
-        """Stage 2 must be allowed to call submit_task (it creates tasks)."""
-        assert 'mcp__fused-memory__submit_task' not in STAGE2_DISALLOWED
-
-    def test_resolve_ticket_not_in_stage2_disallowed(self):
-        """Stage 2 must be allowed to call resolve_ticket (it finalises task creation)."""
-        assert 'mcp__fused-memory__resolve_ticket' not in STAGE2_DISALLOWED
-
-    def test_submit_task_in_stage1_disallowed(self):
-        """Stage 1 must not be able to call submit_task."""
-        assert 'mcp__fused-memory__submit_task' in STAGE1_DISALLOWED
-
-    def test_resolve_ticket_in_stage1_disallowed(self):
-        """Stage 1 must not be able to call resolve_ticket."""
-        assert 'mcp__fused-memory__resolve_ticket' in STAGE1_DISALLOWED
-
-    def test_submit_task_in_stage3_disallowed(self):
-        """Stage 3 must not be able to call submit_task."""
-        assert 'mcp__fused-memory__submit_task' in STAGE3_DISALLOWED
-
-    def test_resolve_ticket_in_stage3_disallowed(self):
-        """Stage 3 must not be able to call resolve_ticket."""
-        assert 'mcp__fused-memory__resolve_ticket' in STAGE3_DISALLOWED
 
 
 class TestStageSubclasses:
@@ -1404,6 +1381,8 @@ class TestProjectIdGuidelineConstants:
         assert 'get_tasks' not in _STAGE1_PROJECT_ID_GUIDELINE
         assert 'set_task_status' not in _STAGE1_PROJECT_ID_GUIDELINE
         assert 'add_task' not in _STAGE1_PROJECT_ID_GUIDELINE
+        assert 'submit_task' not in _STAGE1_PROJECT_ID_GUIDELINE
+        assert 'resolve_ticket' not in _STAGE1_PROJECT_ID_GUIDELINE
 
     def test_stage3_does_not_include_write_tools(self):
         """Stage 3 guideline does not include write tools (Stage 3 is read-only)."""
@@ -1412,6 +1391,8 @@ class TestProjectIdGuidelineConstants:
         assert 'delete_memory' not in _STAGE3_PROJECT_ID_GUIDELINE
         assert 'set_task_status' not in _STAGE3_PROJECT_ID_GUIDELINE
         assert 'add_task' not in _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'submit_task' not in _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'resolve_ticket' not in _STAGE3_PROJECT_ID_GUIDELINE
 
 
 class TestStagePayloadProjectIdGuideline:
