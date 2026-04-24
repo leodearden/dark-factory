@@ -75,6 +75,13 @@ filterwarnings = [
     # Pins: pytest_asyncio/plugin.py (message emitted at the collection phase).
     "error:The test .* is marked with '@pytest.mark.asyncio' but it is not an async function:pytest.PytestWarning",
 ]
+# Default per-test timeout — see shared/pyproject.toml for the full rationale
+# (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns).
+# Slow tests opt out with @pytest.mark.timeout(N).
+# signal method matches shared/pyproject.toml. If xdist is ever added here,
+# switch to thread — see fused-memory/pyproject.toml for that divergence.
+timeout = 60
+timeout_method = "signal"
 
 [dependency-groups]
 dev = [
