@@ -40,6 +40,7 @@ def _load_module() -> types.ModuleType:
 _mod = _load_module()
 find_exact_duplicate_groups = _mod.find_exact_duplicate_groups
 find_near_duplicate_groups = _mod.find_near_duplicate_groups
+pick_survivor = _mod.pick_survivor
 
 
 # ---------------------------------------------------------------------------
@@ -316,3 +317,105 @@ class TestFindNearDuplicateGroupsEdgeCases:
         ids_a = sorted(sorted(t['id'] for t in g) for g in result_a)
         ids_b = sorted(sorted(t['id'] for t in g) for g in result_b)
         assert ids_a == ids_b
+
+
+# ===========================================================================
+# Step-5: pick_survivor
+# ===========================================================================
+
+class TestPickSurvivorPriority:
+    """Survivor = highest priority; ties broken by lowest ID."""
+
+    def test_high_priority_wins_over_medium(self):
+        """Task with 'high' priority beats one with 'medium' regardless of ID order."""
+        group = [
+            _task('200', 'Do thing', priority='medium'),
+            _task('201', 'Do thing', priority='high'),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == '201'
+        assert len(losers) == 1
+        assert losers[0]['id'] == '200'
+
+    def test_critical_wins_over_high(self):
+        """'critical' outranks 'high'."""
+        group = [
+            _task('210', 'Do thing', priority='high'),
+            _task('211', 'Do thing', priority='critical'),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == '211'
+
+    def test_all_same_priority_lowest_id_wins(self):
+        """All tasks same priority → lowest ID wins (earliest created)."""
+        group = [
+            _task('220', 'Do thing', priority='medium'),
+            _task('221', 'Do thing', priority='medium'),
+            _task('222', 'Do thing', priority='medium'),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == '220'
+        assert len(losers) == 2
+        loser_ids = {t['id'] for t in losers}
+        assert loser_ids == {'221', '222'}
+
+
+class TestPickSurvivorMissingPriority:
+    """Tasks with absent / unknown priority rank below any explicit priority."""
+
+    def test_absent_priority_ranks_below_low(self):
+        """Task with priority='low' beats one with no priority field."""
+        group = [
+            {'id': '230', 'title': 'Task X'},                   # no priority key
+            _task('231', 'Task X', priority='low'),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == '231'
+
+    def test_none_priority_ranks_below_low(self):
+        """priority=None is treated the same as absent (rank=0)."""
+        group = [
+            {'id': '240', 'title': 'Task Y', 'priority': None},
+            _task('241', 'Task Y', priority='low'),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == '241'
+
+    def test_two_absent_priority_tasks_lowest_id_wins(self):
+        """Two tasks with no priority → lowest ID wins."""
+        group = [
+            {'id': '250', 'title': 'Task Z'},
+            {'id': '251', 'title': 'Task Z'},
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == '250'
+
+
+class TestPickSurvivorEdgeCases:
+    """Degenerate input and determinism guarantees."""
+
+    def test_single_task_raises_value_error(self):
+        """A group of 1 task is degenerate — ValueError must be raised."""
+        with pytest.raises(ValueError):
+            pick_survivor([_task('260', 'Solo task')])
+
+    def test_empty_group_raises_value_error(self):
+        """Empty group is also degenerate."""
+        with pytest.raises(ValueError):
+            pick_survivor([])
+
+    def test_deterministic_with_shuffled_input(self):
+        """Shuffling input order always yields the same survivor."""
+        import random  # noqa: PLC0415
+        group = [
+            _task('270', 'Work item', priority='high'),
+            _task('271', 'Work item', priority='medium'),
+            _task('272', 'Work item', priority='high'),    # same prio as 270, higher ID
+            _task('273', 'Work item', priority='low'),
+        ]
+        expected_survivor_id = '270'  # high priority, lowest ID among high-prio tasks
+        for _ in range(10):
+            shuffled = list(group)
+            random.shuffle(shuffled)
+            survivor, _ = pick_survivor(shuffled)
+            assert survivor['id'] == expected_survivor_id
