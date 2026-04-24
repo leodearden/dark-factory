@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
+from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, GroundTruthIssue
+from orchestrator.evals.reviewer_trial.runner import PanelRunResult
 from orchestrator.evals.reviewer_trial.scorer import (
     IssueMatch,
     ScoringResult,
     _deduplicate_issues,
     _normalize_location,
+    match_issues,
+    score_panel_run,
 )
 
 
@@ -155,3 +162,96 @@ class TestScoringMetrics:
         assert result.recall == pytest.approx(0.5)
         assert result.precision == pytest.approx(0.6667, abs=0.001)
         assert result.f1 > 0
+
+
+def _make_matcher_result(cost_usd: float = 0.42, structured: dict | None = None, output: str = '') -> SimpleNamespace:
+    """Build a fake AgentResult for invoke_agent in match_issues."""
+    return SimpleNamespace(
+        success=True,
+        output=output,
+        cost_usd=cost_usd,
+        duration_ms=1000,
+        turns=1,
+        session_id='test-session',
+        structured_output=structured if structured is not None else {'matches': []},
+        stderr='',
+    )
+
+
+def _make_gt(gt_id: str = 'gt1') -> GroundTruthIssue:
+    return GroundTruthIssue(
+        id=gt_id,
+        location='a.py:1',
+        category='bug',
+        severity='blocking',
+        description='A bug',
+        mutation_type='logic',
+    )
+
+
+class TestMatchIssuesCost:
+    """Tests that match_issues returns a 3-tuple (matches, unmatched, cost_usd)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_three_tuple_with_cost(self) -> None:
+        """match_issues returns (matches, unmatched, cost_usd) capturing the LLM call cost."""
+        fake_result = _make_matcher_result(cost_usd=0.42, structured={'matches': []})
+        reviewer_issues = [{'location': 'a.py:1', 'category': 'bug', 'description': 'x'}]
+        ground_truth = [_make_gt('gt1')]
+
+        with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = fake_result
+            result = await match_issues(
+                reviewer_issues=reviewer_issues,
+                ground_truth=ground_truth,
+                diff_text='diff',
+            )
+
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+        matches, unmatched, cost = result
+        assert isinstance(matches, list)
+        assert isinstance(unmatched, list)
+        assert cost == pytest.approx(0.42)
+
+    @pytest.mark.asyncio
+    async def test_empty_inputs_cost_is_zero(self) -> None:
+        """match_issues returns 0.0 cost and does NOT call invoke_agent for empty inputs."""
+        with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            result_empty_reviewers = await match_issues(
+                reviewer_issues=[],
+                ground_truth=[_make_gt('gt1')],
+                diff_text='diff',
+            )
+            result_empty_gt = await match_issues(
+                reviewer_issues=[{'location': 'a.py:1', 'category': 'bug', 'description': 'x'}],
+                ground_truth=[],
+                diff_text='diff',
+            )
+            mock_invoke.assert_not_called()
+
+        assert result_empty_reviewers[2] == 0.0
+        assert result_empty_gt[2] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_unparseable_output_still_reports_cost(self) -> None:
+        """match_issues reports incurred cost even when LLM output is unparseable."""
+        fake_result = _make_matcher_result(cost_usd=0.42, structured=None, output='not json at all')
+        # Override structured_output to be None explicitly
+        fake_result.structured_output = None
+
+        reviewer_issues = [{'location': 'a.py:1', 'category': 'bug', 'description': 'x'}]
+        ground_truth = [_make_gt('gt1')]
+
+        with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = fake_result
+            result = await match_issues(
+                reviewer_issues=reviewer_issues,
+                ground_truth=ground_truth,
+                diff_text='diff',
+            )
+
+        matches, unmatched, cost = result
+        assert matches == []
+        assert unmatched == reviewer_issues
+        assert cost == pytest.approx(0.42)
