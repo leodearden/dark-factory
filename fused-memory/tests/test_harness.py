@@ -3246,6 +3246,11 @@ async def test_backlog_iterator_event_project_root_wins_over_configured(
     but exercises the event-override path: events carry _project_root='/from/event'
     while the harness is configured with '/from/config'.  The event value must win.
 
+    Pure-precedence case: ALL buffered events carry _project_root — pins that event value
+    beats the configured fallback.  Contrast with
+    test_backlog_iterator_peek_window_finds_later_project_root_override, which uses
+    9 events without the key + 1 with (mixed setup) to probe peek-window width.
+
     Peek-window semantics differ from run_full_cycle's full-drain coverage at
     test_harness.py:341, making this a distinct regression guard.
     """
