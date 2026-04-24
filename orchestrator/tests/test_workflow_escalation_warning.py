@@ -19,11 +19,11 @@ from orchestrator.workflow import _ESCALATION_CAPABLE_ROLES, TaskWorkflow, Workf
 
 # ---------------------------------------------------------------------------
 # E2E fixtures and helpers — imported so pytest discovers them in this module.
-# Re-exported from test_workflow_e2e (relative import within the tests package).
-# See plan.json design decision: placed here per task instructions; fixtures are
-# duplicated/re-imported to avoid conftest pollution.
+# Re-exported from test_workflow_e2e via the tests-dir sys.path insert in
+# conftest.py (not a package-relative import — tests/ is not a package under
+# --import-mode=importlib).
 # ---------------------------------------------------------------------------
-from .test_workflow_e2e import (  # noqa: E402, F401
+from test_workflow_e2e import (  # noqa: E402, F401
     AgentStub,
     _build_workflow_with_escalation,
     config,        # fixture: OrchestratorConfig backed by a real git repo

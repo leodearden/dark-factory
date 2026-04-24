@@ -41,6 +41,11 @@ _FROM_TESTS_RE = re.compile(r'^\s*from\s+tests\.')
 # Regex that matches `from conftest import ...` (including indented, lazy imports).
 _FROM_CONFTEST_RE = re.compile(r'^\s*from\s+conftest\s+import\b')
 
+# Regex that matches `from .xxx import ...` and `from ..xxx import ...` —
+# package-relative imports. These fail under --import-mode=importlib once
+# tests/__init__.py is gone (no parent package).
+_RELATIVE_IMPORT_RE = re.compile(r'^\s*from\s+\.+\w')
+
 # All test directories to scan for namespace-relative imports and __init__.py files.
 # Vendored sub-libraries (graphiti, mem0, taskmaster-ai) inside fused-memory are excluded.
 _ALL_TEST_DIRS = [
@@ -161,6 +166,39 @@ def test_no_from_conftest_imports_in_subproject_tests() -> None:
         + '  fused-memory/tests/*  → `from _fm_helpers import X`\n'
         + '  orchestrator/tests/*  → `from _orch_helpers import X`\n'
         + '  dashboard/tests/*     → `from _dashboard_helpers import X`\n'
+        + 'Offenders:\n'
+        + '\n'.join(f'  {o}' for o in offenders)
+    )
+
+
+def test_no_package_relative_imports_in_subproject_tests() -> None:
+    """No test file may use `from .<module> import ...` package-relative imports.
+
+    Once tests/__init__.py is dropped (step-6 of this refactor), tests/ is no
+    longer a Python package — relative imports raise
+    ImportError: attempted relative import with no known parent package at
+    collection time.  Use flat imports resolved via the conftest's
+    sys.path.insert instead: `from test_workflow_e2e import X`.
+
+    Offender format in the assertion message: path:lineno: line
+    """
+    offenders: list[str] = []
+    for test_dir in _ALL_TEST_DIRS:
+        if not test_dir.exists():
+            continue
+        for py_file in sorted(test_dir.rglob('*.py')):
+            rel = py_file.relative_to(REPO_ROOT)
+            if _VENDORED_PARTS & set(rel.parts):
+                continue
+            source = py_file.read_text(encoding='utf-8')
+            for lineno, line in enumerate(source.splitlines(), start=1):
+                if _RELATIVE_IMPORT_RE.match(line):
+                    offenders.append(f'{rel}:{lineno}: {line.rstrip()}')
+
+    assert not offenders, (
+        f'Found {len(offenders)} package-relative import(s) in test files.\n'
+        + 'These fail under --import-mode=importlib once tests/__init__.py is gone.\n'
+        + 'Rewrite `from .test_foo import X` → `from test_foo import X`.\n'
         + 'Offenders:\n'
         + '\n'.join(f'  {o}' for o in offenders)
     )
