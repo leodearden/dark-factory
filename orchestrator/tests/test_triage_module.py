@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
+from unittest.mock import MagicMock
 
 import pytest
-from unittest.mock import MagicMock
 
 from orchestrator.agents.triage import (
     _combine_suggestion_hashes,
