@@ -165,9 +165,11 @@ def _truncate_payload(payload: Any) -> tuple[Any, bool]:
     This lets downstream consumers key into ``payload['text']`` without having
     to special-case a str-vs-dict union on the ``payload`` field.
 
-    The budget check is applied to ``json.dumps(payload)`` so that the result
-    is safe for MCP JSON transport (where the payload field gets JSON-encoded).
-    The ``text`` field in the returned envelope is capped to
+    The budget check is applied to ``json.dumps(payload, ensure_ascii=False)``
+    so that the byte count reflects actual UTF-8 transport size rather than the
+    inflated ASCII-escape form.  If the caller requires ASCII-safe output at the
+    envelope layer, that conversion should happen there, not in the budget
+    measurement.  The ``text`` field in the returned envelope is capped to
     ``_DEAD_LETTER_PAYLOAD_MAX_BYTES`` bytes when UTF-8 encoded.
 
     Non-JSON-serialisable payloads (e.g. circular references) cannot be safely
@@ -176,14 +178,14 @@ def _truncate_payload(payload: Any) -> tuple[Any, bool]:
     ``truncated=True`` to signal the lossy conversion to the caller.
     """
     try:
-        serialised = json.dumps(payload, default=str)
+        serialised = json.dumps(payload, default=str, ensure_ascii=False)
     except (TypeError, ValueError):
         return str(payload), True
-    if len(serialised.encode()) <= _DEAD_LETTER_PAYLOAD_MAX_BYTES:
+    if len(serialised.encode('utf-8')) <= _DEAD_LETTER_PAYLOAD_MAX_BYTES:
         return payload, False
     # Cap the raw JSON text to the byte budget, then return a stable-typed
     # envelope so the `payload` field stays a dict regardless of truncation.
-    text = serialised.encode()[:_DEAD_LETTER_PAYLOAD_MAX_BYTES].decode(
+    text = serialised.encode('utf-8')[:_DEAD_LETTER_PAYLOAD_MAX_BYTES].decode(
         'utf-8', errors='replace'
     )
     return {
